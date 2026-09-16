@@ -565,7 +565,7 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// A stdio JSON-RPC provider speaking just enough of the app-server wire
 /// to reach each failure mode. Writes its pid to a file for leak checks.
 const MOCK_PY: &str = r#"
-import json, os, sys
+import json, os, sys, time
 pidfile, mode = sys.argv[1], sys.argv[2]
 with open(pidfile, "w") as f:
     f.write(str(os.getpid()))
@@ -577,6 +577,7 @@ for line in sys.stdin:
     mid, method = msg.get("id"), msg.get("method")
     if mid is None: continue
     if method == "initialize":
+        if mode == "slow-init": time.sleep(30)
         emit({"id": mid, "result": {"serverInfo": {"name": "mock", "version": "0"}}})
     elif method in ("thread/start", "thread/resume"):
         if mode == "bad-thread":
@@ -742,5 +743,88 @@ fn malformed_init_leaves_no_provider_process() {
     let agent = d.wait_agent("w1", "attention", 15);
     assert!(agent["error"].as_str().unwrap().contains("thread"));
     // The failed initialization must not leave its provider running.
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn stop_on_fenced_agent_preserves_attention() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "DISCONNECT", "message": "m1"}),
+    )
+    .unwrap();
+    let fenced = d.wait_agent("w1", "attention", 10);
+    let reason = fenced["error"].clone();
+    assert!(reason.as_str().unwrap().contains("Uncertain"));
+    // Stop only disables: the fence state and its reason stay visible.
+    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert_eq!(stopped["state"], "attention");
+    let agent = d.wait_agent("w1", "attention", 10);
+    assert_eq!(agent["enabled"], false);
+    assert_eq!(agent["error"], reason);
+    // Repeated stop is idempotent and still does not mask the fence.
+    let again = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert_eq!(again["state"], "attention");
+    let agent = d.wait_agent("w1", "attention", 5);
+    assert_eq!(agent["error"], reason);
+    assert_eq!(d.message_state("w1", "m1"), "unknown");
+    let fenced = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    assert_eq!(fenced["state"], "attention");
+}
+
+#[test]
+fn concurrent_stops_are_idempotent() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT:x", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 10);
+    let mut racers = Vec::new();
+    for _ in 0..2 {
+        let state = d.state.clone();
+        racers.push(thread::spawn(move || {
+            client::rpc(&state, "agent_stop", json!({"alias": "w1"}))
+        }));
+    }
+    for racer in racers {
+        let result = racer.join().unwrap().unwrap();
+        assert_eq!(result["state"], "stopped");
+    }
+    d.wait_agent("w1", "stopped", 10);
+    assert_eq!(d.message_state("w1", "m1"), "interrupted");
+    // Ownership was fully released: a resume works on the first try.
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 10);
+}
+
+#[test]
+fn stop_during_initialization_is_bounded() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("slow-init");
+    d.register_codex("w1");
+    // Wait until the provider process exists: the adapter is then
+    // published and the initialize RPC (30s) is in flight.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mock.pidfile.exists() {
+        assert!(Instant::now() < deadline, "provider never launched");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let began = Instant::now();
+    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "stop during initialization was not bounded: {:?}",
+        began.elapsed()
+    );
+    // Init was force-closed mid-flight: outcome uncertain -> attention,
+    // and no provider process is left behind.
+    assert_eq!(stopped["state"], "attention");
     wait_pid_gone(&mock.pidfile, 10);
 }

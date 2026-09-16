@@ -9,7 +9,7 @@
 //! start — except actors fenced by an `unknown` in-flight attempt, which
 //! stay in `attention` until a human reconciles them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -74,11 +74,43 @@ struct PendingRequest {
 
 /// Per-agent control surface shared by dispatch and the actor thread.
 struct AgentCtl {
-    /// The actor's live adapter, published so `agent respond` can answer
-    /// provider requests while a turn waits.
+    /// The actor's live adapter, published before `open` so a stop can
+    /// force-close it even while initialization is still in flight.
     adapter: Mutex<Option<Arc<dyn ProviderAdapter>>>,
     wake: Notify,
     thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Alias ownership: an alias is owned while an actor ctl exists OR while
+/// a stop reservation is held. The reservation covers the whole stop —
+/// interrupt through the final state write — so a resume can never start
+/// a new actor generation underneath a finishing stop.
+#[derive(Default)]
+struct Lifecycle {
+    agents: HashMap<String, Arc<AgentCtl>>,
+    stopping: HashSet<String>,
+}
+
+impl Lifecycle {
+    fn owned(&self, alias: &str) -> bool {
+        self.agents.contains_key(alias) || self.stopping.contains(alias)
+    }
+}
+
+/// Drops the caller's stop reservation on scope exit; reservations left
+/// by a *different* in-flight stop are left alone.
+struct StopReservation<'a> {
+    lifecycle: &'a Mutex<Lifecycle>,
+    alias: &'a str,
+    owned: bool,
+}
+
+impl Drop for StopReservation<'_> {
+    fn drop(&mut self) {
+        if self.owned {
+            self.lifecycle.lock().unwrap().stopping.remove(self.alias);
+        }
+    }
 }
 
 pub struct Shared {
@@ -86,7 +118,7 @@ pub struct Shared {
     /// Broadcast on any queue/event change.
     changed: Notify,
     pending: Mutex<HashMap<String, PendingRequest>>,
-    agents: Mutex<HashMap<String, Arc<AgentCtl>>>,
+    lifecycle: Mutex<Lifecycle>,
     closing: AtomicBool,
     provider_log_dir: PathBuf,
 }
@@ -100,7 +132,7 @@ impl Shared {
             store,
             changed: Notify::new(),
             pending: Mutex::new(HashMap::new()),
-            agents: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(Lifecycle::default()),
             closing: AtomicBool::new(false),
             provider_log_dir,
         }))
@@ -113,23 +145,23 @@ impl Shared {
     /// Spawn the actor for `alias` unless it is already owned (running or
     /// stopping) or fenced by an unknown outcome.
     pub fn launch_actor(self: &Arc<Self>, alias: &str) -> Result<()> {
-        let mut agents = self.agents.lock().unwrap();
-        if agents.contains_key(alias) {
+        let mut lc = self.lifecycle.lock().unwrap();
+        if lc.owned(alias) {
             return Err(Error::rejected("Agent is still running or stopping"));
         }
-        self.start_actor_locked(&mut agents, alias, false)?;
+        self.start_actor_locked(&mut lc, alias, false)?;
         Ok(())
     }
 
     /// Fence check, enable, state write, spawn and insert — all while the
-    /// agents map lock is held, so a concurrent stop/resume cannot
+    /// lifecycle lock is held, so a concurrent stop/resume cannot
     /// interleave. The map entry is the ownership record: it is inserted
     /// before the actor becomes visible and removed only by the actor
     /// itself after full termination, so a present entry always means
     /// "still owned". Returns false when the alias is fenced.
     fn start_actor_locked(
         self: &Arc<Self>,
-        agents: &mut HashMap<String, Arc<AgentCtl>>,
+        lc: &mut Lifecycle,
         alias: &str,
         enable: bool,
     ) -> Result<bool> {
@@ -161,7 +193,7 @@ impl Shared {
         let spawned = Arc::clone(&ctl);
         let handle = thread::spawn(move || shared.run_actor(&owned, spawned));
         *ctl.thread.lock().unwrap() = Some(handle);
-        agents.insert(alias.to_string(), ctl);
+        lc.agents.insert(alias.to_string(), ctl);
         Ok(true)
     }
 
@@ -238,11 +270,11 @@ impl Shared {
         }
         // Release the alias only after cleanup and the final state write:
         // until this removal, lifecycle callers still see the agent owned.
-        let mut agents = self.agents.lock().unwrap();
-        if agents.get(alias).is_some_and(|c| Arc::ptr_eq(c, &ctl)) {
-            agents.remove(alias);
+        let mut lc = self.lifecycle.lock().unwrap();
+        if lc.agents.get(alias).is_some_and(|c| Arc::ptr_eq(c, &ctl)) {
+            lc.agents.remove(alias);
         }
-        drop(agents);
+        drop(lc);
         self.wake();
     }
 
@@ -263,6 +295,9 @@ impl Shared {
         };
         let adapter = adapter::build(&agent, hooks, &log_path)?;
         let adapter: Arc<dyn ProviderAdapter> = Arc::from(adapter);
+        // Publish before `open` so stop/shutdown can force-close the
+        // transport while initialization RPCs are still in flight.
+        *ctl.adapter.lock().unwrap() = Some(Arc::clone(&adapter));
         let opened = adapter.open(&agent).and_then(|identity| {
             self.store.set_identity(
                 alias,
@@ -278,7 +313,6 @@ impl Shared {
             adapter.close();
             return Err(error);
         }
-        *ctl.adapter.lock().unwrap() = Some(Arc::clone(&adapter));
         self.wake();
         loop {
             if self.closing.load(Ordering::SeqCst) {
@@ -425,13 +459,13 @@ impl Shared {
             "agent_resume" => {
                 let alias = required_str(params, "alias")?;
                 self.store.agent(alias)?;
-                let mut agents = self.agents.lock().unwrap();
-                if agents.contains_key(alias) {
+                let mut lc = self.lifecycle.lock().unwrap();
+                if lc.owned(alias) {
                     return Err(Error::rejected("Agent is still running or stopping"));
                 }
                 // Enable only after the ownership/fence checks pass —
                 // a rejected resume must leave no side effects behind.
-                let started = self.start_actor_locked(&mut agents, alias, true)?;
+                let started = self.start_actor_locked(&mut lc, alias, true)?;
                 let state = if started { "starting" } else { "attention" };
                 Ok(json!({"alias": alias, "state": state}))
             }
@@ -588,9 +622,10 @@ impl Shared {
             )),
         };
         let adapter = self
-            .agents
+            .lifecycle
             .lock()
             .unwrap()
+            .agents
             .get(alias)
             .and_then(|ctl| ctl.adapter.lock().unwrap().clone());
         let adapter = adapter
@@ -608,17 +643,34 @@ impl Shared {
     fn rpc_stop(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = required_str(params, "alias")?;
         self.store.agent(alias)?;
+        // Reserve the alias for the whole stop — through the final state
+        // write — so a resume cannot start a new actor in the gap where
+        // the old actor already released ownership.
+        let (reserved, ctl) = {
+            let mut lc = self.lifecycle.lock().unwrap();
+            (
+                lc.stopping.insert(alias.to_string()),
+                lc.agents.get(alias).cloned(),
+            )
+        };
+        let _reservation = StopReservation {
+            lifecycle: &self.lifecycle,
+            alias,
+            owned: reserved,
+        };
         self.store.set_enabled(alias, false)?;
-        self.store.set_agent_state(alias, "stopping", None)?;
         let _ = self.store.event_public(alias, "stop_requested", json!({}));
-        let ctl = self.agents.lock().unwrap().get(alias).cloned();
+        // A fenced agent keeps its attention state and reason; the stop
+        // only disables it.
+        if self.store.agent(alias)?.state != "attention" {
+            self.store.set_agent_state(alias, "stopping", None)?;
+        }
         if let Some(ctl) = ctl {
             self.stop_ctls(&[ctl]);
         }
         // The actor writes its own terminal state on exit; do not mask a
         // fence it may have raised while finishing.
-        let agent = self.store.agent(alias)?;
-        let state = if agent.state == "attention" {
+        let state = if self.store.agent(alias)?.state == "attention" {
             "attention"
         } else {
             self.store.set_agent_state(alias, "stopped", None)?;
@@ -658,14 +710,21 @@ impl Shared {
     }
 
     fn notify_agent(&self, alias: &str) {
-        if let Some(ctl) = self.agents.lock().unwrap().get(alias) {
+        if let Some(ctl) = self.lifecycle.lock().unwrap().agents.get(alias) {
             ctl.wake.notify_all();
         }
     }
 
     /// Cooperative shutdown: bounded stop for every actor.
     fn shutdown(&self) {
-        let ctls: Vec<Arc<AgentCtl>> = self.agents.lock().unwrap().values().cloned().collect();
+        let ctls: Vec<Arc<AgentCtl>> = self
+            .lifecycle
+            .lock()
+            .unwrap()
+            .agents
+            .values()
+            .cloned()
+            .collect();
         self.stop_ctls(&ctls);
     }
 }
@@ -827,4 +886,85 @@ pub fn serve(state_dir: &Path) -> Result<()> {
     shared.shutdown();
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::NewAgent;
+
+    fn shared() -> (tempfile::TempDir, Arc<Shared>) {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Shared::new(dir.path()).unwrap();
+        (dir, shared)
+    }
+
+    fn register(shared: &Shared, dir: &Path, alias: &str) {
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias,
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: dir.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+            })
+            .unwrap();
+    }
+
+    /// Deterministic boundary for the stop/resume gap: while a stop
+    /// reservation is held — the state an alias is in between the old
+    /// actor's map removal and the stop's final write — a launch is
+    /// rejected; releasing the reservation unblocks it.
+    #[test]
+    fn stopping_reservation_blocks_relaunch() {
+        let (dir, shared) = shared();
+        register(&shared, dir.path(), "w1");
+        shared
+            .lifecycle
+            .lock()
+            .unwrap()
+            .stopping
+            .insert("w1".to_string());
+        let err = shared.launch_actor("w1").unwrap_err();
+        assert!(err.to_string().contains("running or stopping"));
+        // Reservation dropped (stop finalized): launch succeeds again.
+        shared.lifecycle.lock().unwrap().stopping.remove("w1");
+        shared.launch_actor("w1").unwrap();
+        // Let the spawned actor exit instead of leaking it into other tests.
+        shared.store.set_enabled("w1", false).unwrap();
+        let lc = shared.lifecycle.lock().unwrap();
+        if let Some(ctl) = lc.agents.get("w1") {
+            ctl.wake.notify_all();
+        }
+    }
+
+    /// A second stop reservation must not release the first owner's.
+    #[test]
+    fn overlapping_stop_reservations_keep_ownership() {
+        let (dir, shared) = shared();
+        register(&shared, dir.path(), "w1");
+        {
+            let mut lc = shared.lifecycle.lock().unwrap();
+            assert!(lc.stopping.insert("w1".to_string()));
+            assert!(!lc.stopping.insert("w1".to_string()));
+        }
+        // The non-owner's guard releases nothing.
+        drop(StopReservation {
+            lifecycle: &shared.lifecycle,
+            alias: "w1",
+            owned: false,
+        });
+        assert!(shared.lifecycle.lock().unwrap().stopping.contains("w1"));
+        assert!(shared.launch_actor("w1").is_err());
+        // The owner's release frees the alias.
+        drop(StopReservation {
+            lifecycle: &shared.lifecycle,
+            alias: "w1",
+            owned: true,
+        });
+        assert!(!shared.lifecycle.lock().unwrap().stopping.contains("w1"));
+    }
 }

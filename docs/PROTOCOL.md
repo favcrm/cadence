@@ -52,11 +52,15 @@ Error kinds:
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
 
 `agent_stop` is bounded: it interrupts the provider, waits a short grace
-(~3s), then force-closes the transport and joins the actor. A turn that
-was still in flight becomes `unknown` and the agent stays `attention` —
-a stop never masks a fence. `agent_resume` is `rejected` while the actor
-is still owned (running or stopping) and has no side effects in that
-case; on a fenced agent it returns `attention` and does not re-enable.
+(~3s), then force-closes the transport and joins the actor — the bound
+also covers provider initialization, since the adapter is published
+before `open`. A turn that was still in flight becomes `unknown` and the
+agent stays `attention` — a stop never masks a fence: on an agent already
+in `attention` it only disables and preserves the state and reason. While
+a stop is in flight the alias stays reserved, so `agent_resume` is
+`rejected` until the stop's final write is done — a stale stop cannot
+write over a new actor generation. Resume on a fenced agent returns
+`attention` and does not re-enable.
 
 ## Agents
 
