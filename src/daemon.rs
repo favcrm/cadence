@@ -604,13 +604,18 @@ impl Shared {
     fn rpc_send(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
-        let reply_to = optional_str(params, "reply_to");
+        // An explicit reply_to always wins; absent one, a worker joined
+        // to a group (params.upstream) reports results to its PM by
+        // default. `enqueue` still validates the target.
+        let reply_to = optional_str(params, "reply_to")
+            .map(str::to_string)
+            .or_else(|| self.upstream_of(&alias));
         let message = optional_str(params, "message")
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
-        let (duplicate, state) = self
-            .store
-            .enqueue(&alias, text, reply_to, &message, "user")?;
+        let (duplicate, state) =
+            self.store
+                .enqueue(&alias, text, reply_to.as_deref(), &message, "user")?;
         self.notify_agent(&alias);
         self.wake();
         Ok(json!({"message": message, "state": state, "duplicate": duplicate}))
@@ -928,6 +933,18 @@ impl Shared {
             .agent_by_native(name)?
             .map(|agent| agent.alias)
             .ok_or_else(|| Error::rejected("Unknown managed agent"))
+    }
+
+    /// The agent's registered upstream (`params.upstream`), if any —
+    /// used as the default `reply_to` for its sends.
+    fn upstream_of(&self, alias: &str) -> Option<String> {
+        let agent = self.store.agent(alias).ok()?;
+        agent
+            .params
+            .as_ref()?
+            .get("upstream")?
+            .as_str()
+            .map(str::to_string)
     }
 
     fn notify_agent(&self, alias: &str) {

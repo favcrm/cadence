@@ -25,10 +25,18 @@ cadence codex                   # Codex managed-ws endpoint, then `codex resume 
                                 # (--detach opts out; non-TTY or inside tmux prints
                                 #  the attach command instead of exec'ing it)
 
+cadence join <pm-slug> devin    # spawn a worker wired to a group: results route to the PM
+cadence attach [name]           # attach this terminal (alias, native id, or unambiguous
+                                #  provider name); no name lists live attachable agents
+
 cadence agent ready <slug>      # operator claim: pane inspected, idle, empty input
 cadence message send <slug> --text "task"   # gated literal paste into the TUI
 cadence agent attach <slug>     # print the tmux attach command (--run to exec)
 ```
+
+A **group** is a PM agent plus its workers; the PM's slug is the group
+handle. Workers join with `params.upstream` set to the PM's alias, which
+makes their result reports route back to the PM's queue by default.
 
 Everywhere a command takes an agent name, the provider-native session id
 (Devin slug, Codex thread) resolves to the registered alias.

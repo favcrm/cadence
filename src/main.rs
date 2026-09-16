@@ -96,6 +96,48 @@ enum Commands {
         #[arg(long)]
         instructions_file: Option<PathBuf>,
     },
+    /// Join a new worker agent to a group. `<group>` is the PM agent —
+    /// its alias or provider-native id — and `<provider>` is devin,
+    /// codex or fake. The worker's results route back to the PM by
+    /// default (its params gain `"upstream"`). This terminal attaches
+    /// once the endpoint is open, same rules as `cadence devin`.
+    Join {
+        /// Group handle — the PM agent's alias or native session id.
+        group: String,
+        /// Worker provider: devin, codex or fake.
+        provider: String,
+        /// Resume an existing native session as the worker (devin).
+        #[arg(short = 'r', long)]
+        resume: Option<String>,
+        /// Do not attach this terminal once the endpoint is up.
+        #[arg(long)]
+        detach: bool,
+        /// Working directory for the worker [default: the group
+        /// agent's cwd].
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Routing alias [default: <provider>-<random>].
+        #[arg(long)]
+        alias: Option<String>,
+        /// pm or worker.
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// File with reusable provider instructions.
+        #[arg(long)]
+        instructions_file: Option<PathBuf>,
+    },
+    /// Attach this terminal to a live agent's native endpoint. `name`
+    /// may be an alias, a provider-native id, or a provider name when
+    /// exactly one live agent of that provider exists. With no name,
+    /// lists live attachable agents — attaching only when exactly one
+    /// exists (never guesses).
+    Attach {
+        /// Agent alias, provider-native id, or provider name.
+        name: Option<String>,
+        /// Print the attach command instead of exec'ing it.
+        #[arg(long)]
+        print: bool,
+    },
     /// Read the durable event log for an agent.
     Events {
         /// Agent alias or provider-native id (Devin slug, Codex thread).
@@ -476,6 +518,7 @@ fn run() -> Result<i32> {
             resume,
             instructions_file,
             detach,
+            None,
         ),
         Commands::Codex {
             detach,
@@ -493,7 +536,29 @@ fn run() -> Result<i32> {
             None,
             instructions_file,
             detach,
+            None,
         ),
+        Commands::Join {
+            group,
+            provider,
+            resume,
+            detach,
+            cwd,
+            alias,
+            role,
+            instructions_file,
+        } => join_group(
+            &state_dir,
+            &group,
+            &provider,
+            resume,
+            detach,
+            cwd,
+            alias,
+            &role,
+            instructions_file,
+        ),
+        Commands::Attach { name, print } => attach_command(&state_dir, name, print),
         Commands::Message { action } => {
             let (result, pending) = match action {
                 MessageAction::Send {
@@ -680,6 +745,7 @@ fn provider_launch(
     resume: Option<String>,
     instructions_file: Option<PathBuf>,
     detach: bool,
+    upstream: Option<String>,
 ) -> Result<i32> {
     // `-r <slug>` first resolves the slug to an already-registered agent
     // (by alias or native session id) so re-running is a reopen, not a
@@ -710,7 +776,17 @@ fn provider_launch(
         None => std::env::current_dir()?,
     };
     let instructions = instructions_file.map(std::fs::read_to_string).transpose()?;
-    let params = resume.map(|session| json!({"session": session}).to_string());
+    let mut params_obj = serde_json::Map::new();
+    if let Some(session) = &resume {
+        params_obj.insert("session".to_string(), Value::String(session.clone()));
+    }
+    if let Some(upstream) = &upstream {
+        params_obj.insert("upstream".to_string(), Value::String(upstream.clone()));
+    }
+    let params = (!params_obj.is_empty()).then(|| Value::Object(params_obj).to_string());
+    // Reopening an already-registered name keeps its stored params — a
+    // requested upstream is not retro-applied to a pre-existing agent.
+    let mut registered_fresh = false;
     match client::rpc(
         state_dir,
         "agent_register",
@@ -719,7 +795,7 @@ fn provider_launch(
                "role": role, "sandbox": "read-only",
                "instructions": instructions, "params": params}),
     ) {
-        Ok(_) => {}
+        Ok(_) => registered_fresh = true,
         Err(err) if err.to_string().contains("UNIQUE") => {
             // Already registered — reopen rather than fail. A stopped
             // agent is resumed; a live one is reused as-is.
@@ -727,6 +803,12 @@ fn provider_launch(
             let state = show["agent"]["state"].as_str().unwrap_or_default();
             if matches!(state, "stopped" | "offline") {
                 client::rpc(state_dir, "agent_resume", json!({"alias": alias}))?;
+            }
+            if upstream.is_some() {
+                eprintln!(
+                    "note: '{alias}' was already registered — its stored params \
+                     (including upstream wiring) are unchanged"
+                );
             }
         }
         Err(err) => return Err(err),
@@ -757,6 +839,7 @@ fn provider_launch(
         "state": state,
         "session": native,
         "endpoint": agent["endpoint"],
+        "upstream": if registered_fresh { upstream.clone() } else { None },
         "next": {
             "attach": format!("cadence agent attach {alias}"),
             "ready": format!("cadence agent ready {alias}"),
@@ -779,6 +862,145 @@ fn provider_launch(
         return attach_agent(state_dir, &alias, true);
     }
     attach_agent(state_dir, &alias, false)
+}
+
+/// `cadence join <group> <provider>`: resolve the group agent (alias or
+/// provider-native id — `agent_show` resolves both), then launch a new
+/// worker through `provider_launch` with `params.upstream` pointing at
+/// the group's canonical alias. cwd defaults to the group agent's cwd.
+#[allow(clippy::too_many_arguments)]
+fn join_group(
+    state_dir: &Path,
+    group: &str,
+    provider: &str,
+    resume: Option<String>,
+    detach: bool,
+    cwd: Option<PathBuf>,
+    alias: Option<String>,
+    role: &str,
+    instructions_file: Option<PathBuf>,
+) -> Result<i32> {
+    let endpoint_kind = match provider {
+        "devin" => "pty",
+        "codex" => "managed-ws",
+        "fake" => "fake",
+        other => {
+            return Err(Error::rejected(format!(
+                "Unknown provider '{other}' — expected devin, codex or fake"
+            )))
+        }
+    };
+    let show = client::rpc(state_dir, "agent_show", json!({"alias": group}))
+        .map_err(|_| Error::rejected(format!("Unknown group '{group}' — no such agent")))?;
+    let pm = show["agent"].clone();
+    let pm_alias = pm["alias"].as_str().unwrap_or_default().to_string();
+    // The resumed slug must not resolve back to the group agent —
+    // an agent cannot be its own worker.
+    if let Some(name) = &resume {
+        if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": name})) {
+            if show["agent"]["alias"].as_str() == Some(pm_alias.as_str()) {
+                return Err(Error::rejected(
+                    "Cannot join an agent to itself — '-r' names the group agent",
+                ));
+            }
+        }
+    }
+    let cwd = cwd.or_else(|| pm["cwd"].as_str().map(PathBuf::from));
+    provider_launch(
+        state_dir,
+        provider,
+        endpoint_kind,
+        cwd,
+        role,
+        alias,
+        resume,
+        instructions_file,
+        detach,
+        Some(pm_alias),
+    )
+}
+
+/// Live agents with an attachable endpoint (pty or managed-ws).
+fn attachable(state_dir: &Path) -> Result<Vec<Value>> {
+    let list = client::rpc(state_dir, "agent_list", json!({}))?;
+    let agents = list["agents"].as_array().cloned().unwrap_or_default();
+    Ok(agents
+        .into_iter()
+        .filter(|a| {
+            matches!(
+                a["endpoint_kind"].as_str(),
+                Some("pty") | Some("managed-ws")
+            ) && a["endpoint"].is_string()
+        })
+        .collect())
+}
+
+fn print_attachable(agents: &[Value]) {
+    print_json(&json!({
+        "attachable": agents
+            .iter()
+            .map(|a| json!({
+                "alias": a["alias"],
+                "provider": a["provider"],
+                "session": a["session_id"],
+                "endpoint": a["endpoint"],
+                "attach": format!("cadence attach {}", a["alias"].as_str().unwrap_or_default()),
+            }))
+            .collect::<Vec<_>>(),
+    }));
+}
+
+/// `cadence attach [name]`: resolve an alias, a provider-native id, or
+/// a provider name with exactly one live agent — never guessing — then
+/// exec the same attach `agent attach --run` performs (`--print`
+/// prints the command instead). With no name, list live attachable
+/// agents; attach only when exactly one exists.
+fn attach_command(state_dir: &Path, name: Option<String>, print: bool) -> Result<i32> {
+    let alias = match name {
+        Some(name) => {
+            if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": name})) {
+                show["agent"]["alias"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                // Provider-name sugar: unambiguous only when exactly one
+                // live agent of that provider exists.
+                let live: Vec<String> = attachable(state_dir)?
+                    .iter()
+                    .filter(|a| a["provider"].as_str() == Some(name.as_str()))
+                    .filter_map(|a| a["alias"].as_str().map(str::to_string))
+                    .collect();
+                match live.len() {
+                    0 => {
+                        return Err(Error::rejected(format!(
+                            "Unknown agent '{name}' — no alias, native id, or \
+                             single live provider match"
+                        )))
+                    }
+                    1 => live.into_iter().next().unwrap(),
+                    _ => {
+                        return Err(Error::rejected(format!(
+                            "'{name}' matches {} live agents: {} — name one \
+                             explicitly",
+                            live.len(),
+                            live.join(", ")
+                        )))
+                    }
+                }
+            }
+        }
+        None => {
+            let live = attachable(state_dir)?;
+            if live.len() == 1 {
+                live[0]["alias"].as_str().unwrap_or_default().to_string()
+            } else {
+                print_attachable(&live);
+                return Ok(0);
+            }
+        }
+    };
+    attach_agent(state_dir, &alias, !print)
 }
 
 fn main() {
@@ -843,5 +1065,59 @@ mod tests {
     fn codex_detach_parses() {
         let cli = Cli::try_parse_from(["cadence", "codex", "--detach"]).unwrap();
         assert!(matches!(cli.command, Commands::Codex { detach: true, .. }));
+    }
+
+    #[test]
+    fn join_parses_group_and_provider() {
+        let cli = Cli::try_parse_from(["cadence", "join", "pm-alias", "devin"]).unwrap();
+        match cli.command {
+            Commands::Join {
+                group,
+                provider,
+                detach,
+                role,
+                ..
+            } => {
+                assert_eq!(group, "pm-alias");
+                assert_eq!(provider, "devin");
+                assert!(!detach);
+                assert_eq!(role, "worker");
+            }
+            _ => panic!("expected join"),
+        }
+    }
+
+    #[test]
+    fn join_detach_and_resume_parse() {
+        let cli = Cli::try_parse_from(["cadence", "join", "pm", "codex", "-r", "sess", "--detach"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Join {
+                detach: true,
+                resume: Some(r),
+                ..
+            } if r == "sess"
+        ));
+    }
+
+    #[test]
+    fn attach_parses_optional_name() {
+        let cli = Cli::try_parse_from(["cadence", "attach"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Attach {
+                name: None,
+                print: false
+            }
+        ));
+        let cli = Cli::try_parse_from(["cadence", "attach", "devin", "--print"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Attach {
+                name: Some(n),
+                print: true
+            } if n == "devin"
+        ));
     }
 }
