@@ -1707,6 +1707,11 @@ if cmd == "new-session":
     pane_cmd = rest[-1]
     pane = os.path.join(state, name)
     env = dict(os.environ, FAKE_PANE=pane)
+    # tmux -e VAR=value exports into the pane process env.
+    for i, a in enumerate(rest[:-1]):
+        if a == "-e" and "=" in rest[i + 1]:
+            k, v = rest[i + 1].split("=", 1)
+            env[k] = v
     # Detach the pane's stdio to a file — the adapter's Command::output
     # would otherwise wait on pipes the long-lived pane inherited.
     log = open(sess_path(name, "log"), "ab")
@@ -1784,6 +1789,11 @@ try:
 except BlockingIOError:
     print("session_locked: %s" % sid); sys.exit(1)
 open(os.environ["FAKE_PANE"] + ".sid", "w").write(sid)
+# Record the pane env the adapter exported via tmux -e.
+open(os.environ["FAKE_PANE"] + ".env", "w").write(
+    "CADENCE_ALIAS=%s\nCADENCE_STATE_DIR=%s\n" % (
+        os.environ.get("CADENCE_ALIAS", ""),
+        os.environ.get("CADENCE_STATE_DIR", "")))
 with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
     f.write("Mock Devin TUI [%s]\n" % sid)
 while True:
@@ -2288,8 +2298,23 @@ fn pty_routed_result_body_is_single_line() {
     thread::sleep(Duration::from_millis(400));
     let mid = d.message_state("pm", routed["id"].as_str().unwrap());
     assert!(matches!(mid.as_str(), "queued" | "submitting"), "{mid}");
+    // A routed notification is fire-and-forget on a pty endpoint: once
+    // the paste succeeds the message completes with a delivery receipt
+    // — the receiving PM is not expected to `message result` it.
     d.rpc("agent_ready", json!({"alias": "pm"})).unwrap();
-    pty_token(&d, "pm", routed["id"].as_str().unwrap());
+    let done = d.wait_message("pm", routed["id"].as_str().unwrap(), &["completed"], 15);
+    assert_eq!(
+        done["result"]["via"].as_str(),
+        Some("pty_deliver"),
+        "{done}"
+    );
+    assert!(
+        done["result"]["turn_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("pty-"),
+        "{done}"
+    );
 }
 
 #[test]
@@ -2343,4 +2368,119 @@ fn pty_send_rejects_control_chars() {
     )
     .unwrap();
     d.wait_message("dv1", "m2", &["completed"], 10);
+}
+
+#[test]
+fn pty_pane_env_exports_identity() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    // tmux -e exports land in the pane process env: the mock TUI
+    // records CADENCE_* so `cadence self` can identify the agent.
+    let path = d.pane_file(&_mock, "dv1", "env");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let env = loop {
+        if let Ok(env) = std::fs::read_to_string(&path) {
+            break env;
+        }
+        assert!(Instant::now() < deadline, "pane env file never appeared");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(env.contains("CADENCE_ALIAS=dv1"), "{env}");
+    assert!(
+        env.contains(&format!("CADENCE_STATE_DIR={}", d.state.display())),
+        "{env}"
+    );
+}
+
+#[test]
+fn cadence_self_reports_running_token() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "work", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "m1");
+
+    // Inside a cadence pane (CADENCE_ALIAS set): alias + report token.
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .arg("self")
+        .env("CADENCE_ALIAS", "dv1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["alias"], "dv1");
+    assert_eq!(v["running"][0]["id"], "m1");
+    assert_eq!(v["running"][0]["turn_id"].as_str().unwrap(), token);
+
+    // Outside a cadence pane the command fails with a clear error.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .arg("self")
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not inside a cadence-owned pane"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn message_send_ready_claims_then_sends() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.register("w1");
+    d.wait_agent("dv1", "idle", 20);
+    d.wait_agent("w1", "idle", 10);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+
+    // pty: --ready IS the operator claim — no separate agent_ready call.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["message", "send", "dv1", "--text", "hi"])
+        .args(["--message", "m9", "--ready"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let token = pty_token(&d, "dv1", "m9");
+    assert!(token.starts_with("pty-"), "{token}");
+
+    // non-pty: the claim is a silent no-op, the send proceeds normally.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["message", "send", "w1", "--text", "hi"])
+        .args(["--message", "m10", "--ready"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_message("w1", "m10", &["completed"], 15);
 }
