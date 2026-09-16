@@ -19,9 +19,11 @@ for creation, handover and cleanup instructions.
 ```bash
 cadence daemon start            # detached controller (CADENCE_STATE_DIR sets the state dir)
 
-cadence devin                   # fresh Devin official TUI in an owned tmux pane
+cadence devin                   # fresh Devin TUI in an owned tmux pane, then attach
 cadence devin -r cookie-cesium  # resume an existing Devin session, like `devin -r`
-cadence codex --attach          # Codex managed-ws endpoint + `codex resume --remote`
+cadence codex                   # Codex managed-ws endpoint, then `codex resume --remote`
+                                # (--detach opts out; non-TTY or inside tmux prints
+                                #  the attach command instead of exec'ing it)
 
 cadence agent ready <slug>      # operator claim: pane inspected, idle, empty input
 cadence message send <slug> --text "task"   # gated literal paste into the TUI
