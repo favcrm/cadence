@@ -68,6 +68,7 @@ impl ProviderAdapter for FakeAdapter {
             session_id: format!("fake-session-{}", agent.alias),
             model: Some("fake-1".to_string()),
             pid: std::process::id(),
+            endpoint: None,
         })
     }
 

@@ -58,6 +58,7 @@ pub struct Agent {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub pid: Option<i64>,
+    pub endpoint: Option<String>,
     pub state: String,
     pub enabled: bool,
     pub error: Option<String>,
@@ -129,6 +130,7 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         session_id: row.get("session_id")?,
         model: row.get("model")?,
         pid: row.get("pid")?,
+        endpoint: row.get("endpoint")?,
         state: row.get("state")?,
         enabled: row.get::<_, i64>("enabled")? != 0,
         error: row.get("error")?,
@@ -144,6 +146,7 @@ impl Agent {
             "thread_id": self.thread_id, "session_id": self.session_id,
             "model": self.model, "pid": self.pid, "state": self.state,
             "enabled": self.enabled, "error": self.error,
+            "endpoint": self.endpoint,
         })
     }
 }
@@ -207,6 +210,24 @@ impl Store {
                  UPDATE schema_version SET version=1;",
             )?;
         }
+        if version < 2 {
+            // Atomic: the column add and version bump commit together, so
+            // a crash cannot leave version=1 with the column present
+            // (which would permanently fail the next ALTER). The column
+            // check makes an already half-applied state converge instead
+            // of erroring on a duplicate column.
+            let has_endpoint = conn
+                .prepare("PRAGMA table_info(agents)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .any(|name| name == "endpoint");
+            let tx = conn.unchecked_transaction()?;
+            if !has_endpoint {
+                tx.execute_batch("ALTER TABLE agents ADD COLUMN endpoint TEXT")?;
+            }
+            tx.execute("UPDATE schema_version SET version=2", [])?;
+            tx.commit()?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -226,7 +247,7 @@ impl Store {
             [],
         )?;
         conn.execute(
-            "UPDATE agents SET state='offline', pid=NULL
+            "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL
              WHERE state != 'stopped'",
             [],
         )?;
@@ -521,6 +542,19 @@ impl Store {
         Ok(count > 0)
     }
 
+    /// Conditional transition: `to` applies only while the agent is in
+    /// `from`, in a single UPDATE — a concurrently written `idle` /
+    /// `attention` / `stopped` can never be overwritten. `error` is
+    /// untouched. Returns whether the row matched.
+    pub fn set_agent_state_if(&self, alias: &str, to: &str, from: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE agents SET state=?,updated=? WHERE alias=? AND state=?",
+            params![to, now(), alias, from],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn set_agent_state(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -531,6 +565,8 @@ impl Store {
     }
 
     /// Persist native provider identity after a successful adapter `open`.
+    /// `endpoint` is the attachable transport address (`ws://…`) when the
+    /// endpoint kind exposes one.
     pub fn set_identity(
         &self,
         alias: &str,
@@ -538,20 +574,29 @@ impl Store {
         session_id: &str,
         model: Option<&str>,
         pid: u32,
+        endpoint: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE agents SET thread_id=?,session_id=?,model=?,pid=?,
-                state='idle',updated=? WHERE alias=?",
-            params![thread_id, session_id, model, pid as i64, now(), alias],
+                endpoint=?,state='idle',updated=? WHERE alias=?",
+            params![
+                thread_id,
+                session_id,
+                model,
+                pid as i64,
+                endpoint,
+                now(),
+                alias
+            ],
         )?;
         Self::event(
             &tx,
             alias,
             "ready",
             json!({"thread_id": thread_id, "session_id": session_id,
-                   "model": model, "pid": pid}),
+                   "model": model, "pid": pid, "endpoint": endpoint}),
         )?;
         tx.commit()?;
         Ok(())
@@ -566,11 +611,14 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_pid(&self, alias: &str, pid: Option<u32>) -> Result<()> {
+    /// Clear runtime ownership markers when the actor exits: the pid and
+    /// any attachable endpoint belong to the dead process, so leaving
+    /// them would let `agent attach` point at a stale address.
+    pub fn clear_runtime(&self, alias: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE agents SET pid=? WHERE alias=?",
-            params![pid.map(|p| p as i64), alias],
+            "UPDATE agents SET pid=NULL, endpoint=NULL WHERE alias=?",
+            [alias],
         )?;
         Ok(())
     }
@@ -719,5 +767,85 @@ mod tests {
             .simple()
             .to_string();
         assert_eq!(pm_msgs[0].id, expected);
+    }
+
+    /// The conditional transition used by approval relaxation cannot
+    /// overwrite a finished/fenced state or its error reason.
+    #[test]
+    fn conditional_state_preserves_terminal_states() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "a1", &cwd);
+        // waiting_input -> busy applies.
+        s.set_agent_state("a1", "waiting_input", None).unwrap();
+        assert!(s.set_agent_state_if("a1", "busy", "waiting_input").unwrap());
+        assert_eq!(s.agent("a1").unwrap().state, "busy");
+        // attention + error are preserved — no busy overwrite.
+        s.set_agent_state("a1", "attention", Some("turn outcome unknown"))
+            .unwrap();
+        assert!(!s.set_agent_state_if("a1", "busy", "waiting_input").unwrap());
+        let agent = s.agent("a1").unwrap();
+        assert_eq!(agent.state, "attention");
+        assert_eq!(agent.error.as_deref(), Some("turn outcome unknown"));
+        // Same for stopped.
+        s.set_agent_state("a1", "stopped", None).unwrap();
+        assert!(!s.set_agent_state_if("a1", "busy", "waiting_input").unwrap());
+        assert_eq!(s.agent("a1").unwrap().state, "stopped");
+    }
+
+    /// A crash between ALTER and the version bump must not wedge the
+    /// database: the migration is one transaction, and a half-applied
+    /// state (column present, version still 1) converges on reopen.
+    #[test]
+    fn migration_v1_to_v2_is_atomic_and_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        let cwd = dir.path().join("w");
+        std::fs::create_dir(&cwd).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &cwd);
+            s.enqueue("a1", "keep me", None, "m1", "user").unwrap();
+        }
+        // Fabricate a genuine v1 database.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE agents DROP COLUMN endpoint;
+             UPDATE schema_version SET version=1;",
+        )
+        .unwrap();
+        drop(conn);
+        {
+            // Upgrade preserves v1 rows and restores the column.
+            let s = Store::open(&db).unwrap();
+            let agent = s.agent("a1").unwrap();
+            assert_eq!(agent.endpoint, None);
+            assert_eq!(s.message("m1").unwrap().unwrap().body, "keep me");
+            s.set_identity("a1", "th", "s", None, 1, Some("ws://x"))
+                .unwrap();
+            assert_eq!(s.agent("a1").unwrap().endpoint.as_deref(), Some("ws://x"));
+        }
+        // The interrupted-upgrade state (column present, version 1)
+        // converges instead of failing on a duplicate column.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("UPDATE schema_version SET version=1", [])
+            .unwrap();
+        drop(conn);
+        {
+            // `recover` clears runtime endpoint/pid on every open; the
+            // persisted thread identity proves the row survived.
+            let s = Store::open(&db).unwrap();
+            let agent = s.agent("a1").unwrap();
+            assert_eq!(agent.thread_id.as_deref(), Some("th"));
+            assert_eq!(agent.endpoint, None);
+        }
+        // Reopening a current-version store is a no-op.
+        let version: i64 = {
+            let conn = Connection::open(&db).unwrap();
+            conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(version, 2);
+        Store::open(&db).unwrap();
     }
 }

@@ -72,9 +72,50 @@ depend on it:
 | endpoint_kind | delivery | status |
 |---|---|---|
 | `managed` | owned provider process (JSON-RPC stdio) | implemented: provider `codex` |
+| `managed-ws` | owned `codex app-server --listen ws://127.0.0.1:*`; official TUI attachable | implemented: provider `codex` |
 | `fake` | in-process test double | test fixture only |
 | `pty` | terminal paste/capture | declared, not implemented |
 | `native_inbox` | provider-native inbox | declared, not implemented |
+
+`managed-ws` runs the same app-server protocol as `managed`, over a
+loopback WebSocket instead of stdio. The agent record exposes `endpoint`
+(`ws://127.0.0.1:<port>`) while the actor is alive; an official Codex
+TUI attaches to the same native thread with:
+
+```
+codex resume --remote <endpoint> <thread_id>
+```
+
+(`cadence agent attach <alias>` prints this command; `--run` executes it
+in the current terminal.) A fresh `managed-ws` thread is seeded with one
+minimal turn at open — Codex only persists a thread's rollout after its
+first turn, and `resume --remote` fails on an unseeded thread. The
+endpoint is cleared when the actor exits, so a printed command never
+points at a dead address; attaching to a `stopped`/`offline` or non-WS
+agent is `rejected`. Terminal echo of a submitted prompt is visibility,
+not receipt — message state remains authoritative.
+
+Trust boundary, stated plainly: the endpoint is an unauthenticated
+loopback port reachable by ANY local user — `SO_PEERCRED` does not
+apply to TCP, and the port is discoverable via `ss`. The URL lives only
+in the private 0700 state dir, but treat every local process as able to
+connect. Do not expose `managed-ws` on multi-user hosts you distrust.
+
+The wire is tungstenite with a single I/O owner: only one thread ever
+touches the `WebSocket`, and outbound payloads (requests, pongs, close
+replies) travel over a channel it drains between bounded reads — no two
+writers ever share the socket. Connect, handshake, writes, and close
+are bounded: the upgrade runs against an absolute deadline (a
+drip-feeding or silent peer fails startup within the connect deadline)
+and the owned child is killed — `stop` can interrupt setup because the
+child is published before the transport connects.
+
+Approval requests remain brokered through `agent_respond`; an attached
+TUI may also see and answer them. The provider then emits
+`serverRequest/resolved`; Cadence drops the matching pending handle,
+emits `input_resolved`, keeps any other pending requests, and a late
+`agent_respond` on the consumed handle is `rejected`. Nothing is ever
+auto-accepted by Cadence.
 
 Agent states: `starting → idle ⇄ busy → waiting_input →` and terminal-ish
 `attention | stopping → stopped | offline`. `attention` means an uncertain
@@ -102,15 +143,20 @@ no-op) and carries no `reply_to`, so routing cannot loop.
 
 `agent_events` pages the durable log: `{seq, alias, kind, payload, at}`.
 Kinds: `registered, queued, submitting, turn_started, turn_finished,
-provider_event, input_required, input_answered, result_routed, ready,
-attention, stop_requested`. `wait>0` long-polls up to 30s.
+provider_event, input_required, input_answered, input_resolved,
+result_routed, ready, attention, stop_requested`. `wait>0` long-polls
+up to 30s.
 
 ## Approvals
 
 Provider-initiated requests (e.g. `item/commandExecution/requestApproval`,
 `item/tool/requestUserInput`, `session/request_permission`) pause the
 agent at `waiting_input` and appear in `agent_requests`. `agent_respond`
-answers them per type; nothing is auto-accepted.
+answers them per type; nothing is auto-accepted. A request may also be
+resolved outside Cadence — an attached TUI answering the approval makes
+the provider emit `serverRequest/resolved`, which drops the pending
+handle (`input_resolved`); a late `agent_respond` is then `rejected`.
+The agent stays `waiting_input` while other requests remain pending.
 
 ## Recovery
 

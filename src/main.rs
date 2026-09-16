@@ -84,7 +84,8 @@ enum AgentAction {
         /// Provider driver: codex (managed) or fake (test double).
         #[arg(long)]
         provider: String,
-        /// Endpoint kind: managed or fake.
+        /// Endpoint kind: managed (stdio), managed-ws (official-TUI
+        /// attachable WebSocket app-server) or fake (test double).
         #[arg(long, default_value = "managed")]
         endpoint: String,
         /// Working directory for the provider session.
@@ -123,6 +124,14 @@ enum AgentAction {
     Stop { alias: String },
     /// Resume a stopped agent on its saved native thread.
     Resume { alias: String },
+    /// Show or run the official `codex resume --remote` attach command
+    /// for a `managed-ws` agent's native thread.
+    Attach {
+        alias: String,
+        /// Execute the attach in this terminal instead of printing it.
+        #[arg(long)]
+        run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -335,6 +344,47 @@ fn run() -> Result<i32> {
                 }
                 AgentAction::Resume { alias } => {
                     client::rpc(&state_dir, "agent_resume", json!({"alias": alias}))?
+                }
+                AgentAction::Attach { alias, run } => {
+                    let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
+                    let agent = &show["agent"];
+                    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
+                    if kind != "managed-ws" {
+                        return Err(Error::rejected(format!(
+                            "Agent '{alias}' uses endpoint kind '{kind}'; official TUI \
+                             attach requires endpoint kind 'managed-ws' \
+                             (register with --endpoint managed-ws)"
+                        )));
+                    }
+                    let state = agent["state"].as_str().unwrap_or_default();
+                    if matches!(state, "stopped" | "offline") {
+                        return Err(Error::rejected(format!(
+                            "Agent '{alias}' is {state} — resume it before attaching"
+                        )));
+                    }
+                    let endpoint = agent["endpoint"].as_str().ok_or_else(|| {
+                        Error::rejected(
+                            "No live endpoint — the agent's WebSocket app-server is not \
+                             running (start or resume the agent first)",
+                        )
+                    })?;
+                    let thread = agent["thread_id"]
+                        .as_str()
+                        .ok_or_else(|| Error::rejected("Agent has no native thread yet"))?;
+                    if run {
+                        let status = Command::new("codex")
+                            .args(["resume", "--remote", endpoint, thread])
+                            .status()?;
+                        return Ok(status.code().unwrap_or(1));
+                    }
+                    json!({
+                        "alias": alias,
+                        "endpoint": endpoint,
+                        "thread_id": thread,
+                        "command": format!("codex resume --remote {endpoint} {thread}"),
+                        "note": "Attach shows the native thread; terminal echo is not \
+                                 agent receipt — message state remains authoritative.",
+                    })
                 }
             };
             print_json(&result);

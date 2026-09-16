@@ -5,36 +5,20 @@
 //! flips `disconnected` and resolves every pending request with
 //! `OutcomeUnknown` — callers must not retry blindly.
 
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use super::link::{DisconnectHook, Incoming, MessageHandler, Pending};
 use crate::error::{Error, Result};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
-
-/// A decoded inbound frame that is not a response to one of our requests.
-pub enum Incoming {
-    Notification {
-        method: String,
-        params: Value,
-    },
-    Request {
-        id: Value,
-        method: String,
-        params: Value,
-    },
-}
-
-type MessageHandler = Box<dyn Fn(Incoming) + Send + Sync>;
-type DisconnectHook = Box<dyn Fn() + Send + Sync>;
 
 pub struct StdioAdapter {
     command: Vec<String>,
@@ -42,8 +26,7 @@ pub struct StdioAdapter {
     on_message: MessageHandler,
     on_disconnect: DisconnectHook,
     inner: Mutex<Inner>,
-    pending: Mutex<HashMap<u64, mpsc::Sender<Result<Value>>>>,
-    next_id: AtomicU64,
+    pending: Pending,
     disconnected: AtomicBool,
 }
 
@@ -68,8 +51,7 @@ impl StdioAdapter {
                 child: None,
                 stdin: None,
             }),
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(0),
+            pending: Pending::new(),
             disconnected: AtomicBool::new(false),
         })
     }
@@ -129,12 +111,7 @@ impl StdioAdapter {
             };
             if message.get("method").is_none() {
                 // Response to one of our requests.
-                if let Some(id) = message.get("id").and_then(Value::as_u64) {
-                    let target = self.pending.lock().unwrap().remove(&id);
-                    if let Some(target) = target {
-                        let _ = target.send(Ok(message));
-                    }
-                }
+                self.pending.resolve(&message);
                 continue;
             }
             let method = message["method"].as_str().unwrap_or_default().to_string();
@@ -146,9 +123,7 @@ impl StdioAdapter {
             }
         }
         self.disconnected.store(true, Ordering::SeqCst);
-        for (_, target) in self.pending.lock().unwrap().drain() {
-            let _ = target.send(Err(Error::unknown("Provider process disconnected")));
-        }
+        self.pending.fail_all("Provider process disconnected");
         // Wake protocol-level waiters (e.g. a turn-completion wait) that
         // do not sit on a pending RPC channel.
         (self.on_disconnect)();
@@ -180,28 +155,8 @@ impl StdioAdapter {
     }
 
     pub fn request_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        let request_id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
-        let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(request_id, tx);
-        let outcome = self.send(json!({"id": request_id, "method": method, "params": params}));
-        let result = match outcome {
-            Err(e) => Err(e),
-            Ok(()) => match rx.recv_timeout(timeout) {
-                Ok(inner) => inner,
-                Err(mpsc::RecvTimeoutError::Timeout) => Err(Error::unknown(format!(
-                    "No response to {method}; do not blindly retry"
-                ))),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    Err(Error::unknown("Provider process disconnected"))
-                }
-            },
-        };
-        self.pending.lock().unwrap().remove(&request_id);
-        let response = result?;
-        if let Some(error) = response.get("error") {
-            return Err(Error::provider(error.to_string()));
-        }
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+        self.pending
+            .request(|msg| self.send(msg), method, params, timeout)
     }
 
     /// Respond to a provider-initiated request (approval, user input).

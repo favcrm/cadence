@@ -606,6 +606,287 @@ struct MockCodex {
     pidfile: PathBuf,
 }
 
+// ---- mock Codex app-server over a real WebSocket (no model calls) ----
+
+/// A WebSocket JSON-RPC provider speaking the same app-server wire as
+/// MOCK_PY. Parses `--listen ws://host:port` from argv (appended by the
+/// transport), handshakes with stdlib sockets, and serves text frames.
+/// Turn text directives: `DIE` closes the TCP connection after the ack,
+/// `DIE2` sends a WS close frame instead, `FRAG` delivers
+/// turn/completed as two continuations with an interleaved ping,
+/// `NEED_INPUT:x` raises a server->client approval request that must be
+/// answered before the turn completes, `NEED_INPUT_EXT:x` raises one
+/// then resolves it externally via `serverRequest/resolved` once
+/// `<pidfile>.resolve` appears. Modes: `silent` never completes
+/// non-seed turns, `no-upgrade` accepts TCP but never answers the WS
+/// handshake, `drip` feeds a valid 101 one byte/second,
+/// `bad-upgrade` answers 200 instead of 101, `ping-first` pings before
+/// the non-seed ack and records pong receipt in `<pidfile>.pong`.
+/// The handshake is strict: a Sec-WebSocket-Key that does not decode
+/// to exactly 16 bytes is refused with 400.
+const MOCK_WS_PY: &str = r##"
+import base64, hashlib, json, os, socket, struct, sys, threading, time
+
+pidfile, mode = sys.argv[1], sys.argv[2]
+url = sys.argv[sys.argv.index("--listen") + 1]
+host, port = url.split("://", 1)[1].split(":")
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind((host, int(port)))
+srv.listen(4)
+with open(pidfile, "w") as f:
+    f.write(str(os.getpid()))
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+SEED = "Cadence endpoint initialization"
+
+def recv_exact(conn, n):
+    data = b""
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+def read_frame(conn):
+    hdr = recv_exact(conn, 2)
+    if hdr is None:
+        return None, None
+    opcode, flags = hdr[0] & 0x0F, hdr[1]
+    length = flags & 0x7F
+    if length == 126:
+        length = struct.unpack(">H", recv_exact(conn, 2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", recv_exact(conn, 8))[0]
+    mask = recv_exact(conn, 4) if flags & 0x80 else b""
+    payload = recv_exact(conn, length) if length else b""
+    if payload is None:
+        return None, None
+    if mask:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
+def send_frag(conn, fin, opcode, payload):
+    n = len(payload)
+    if n < 126:
+        hdr = bytes([(0x80 if fin else 0) | opcode, n])
+    elif n < 65536:
+        hdr = bytes([(0x80 if fin else 0) | opcode, 126]) + struct.pack(">H", n)
+    else:
+        hdr = bytes([(0x80 if fin else 0) | opcode, 127]) + struct.pack(">Q", n)
+    conn.sendall(hdr + payload)
+
+def send_frame(conn, opcode, payload):
+    send_frag(conn, True, opcode, payload)
+
+def send_json(conn, msg):
+    send_frame(conn, 1, json.dumps(msg).encode())
+
+def send_fragmented_complete(conn, turn, text):
+    # One message split across two continuations with an interleaved
+    # ping: the client must reassemble it and answer the control frame.
+    body = json.dumps({"method": "turn/completed", "params": {"turn": {
+        "id": turn, "status": "completed", "items": [
+            {"id": "i1", "type": "agentMessage",
+             "text": text, "phase": "final_answer"}]}}}).encode()
+    half = len(body) // 2
+    send_frag(conn, False, 0x1, body[:half])
+    send_frame(conn, 0x9, b"mid-frag")
+    send_frag(conn, True, 0x0, body[half:])
+
+def complete(conn, turn, text):
+    send_json(conn, {"method": "turn/completed", "params": {"turn": {
+        "id": turn, "status": "completed", "items": [
+            {"id": "i1", "type": "agentMessage",
+             "text": text, "phase": "final_answer"}]}}})
+
+def handshake(conn):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return False
+        data += chunk
+    key = ""
+    for line in data.decode().split("\r\n"):
+        if line.lower().startswith("sec-websocket-key:"):
+            key = line.split(":", 1)[1].strip()
+    # RFC 6455: the client nonce must decode to exactly 16 bytes.
+    # Refuse anything else, as a strict standards-compliant server does.
+    try:
+        valid = len(base64.b64decode(key)) == 16
+    except Exception:
+        valid = False
+    if not valid:
+        conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        return False
+    accept = base64.b64encode(
+        hashlib.sha1((key + GUID).encode()).digest()).decode()
+    conn.sendall((
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+    return True
+
+def ping_check(conn):
+    # Ping, then expect a pong before completing: proves the client
+    # serializes control replies on the same write path as requests.
+    send_frame(conn, 0x9, b"ping-check")
+    conn.settimeout(5)
+    pong = False
+    try:
+        while True:
+            op, _ = read_frame(conn)
+            if op is None:
+                break
+            if op == 0xA:
+                pong = True
+                break
+    except Exception:
+        pass
+    conn.settimeout(None)
+    with open(pidfile + ".pong", "w") as f:
+        f.write("yes" if pong else "no")
+
+def external_resolve(conn):
+    # An attached TUI answered the approval: once the test drops the
+    # trigger file, resolve the pending request outside the client and
+    # let the turn finish without a client response.
+    deadline = time.time() + 30
+    while not os.path.exists(pidfile + ".resolve"):
+        if time.time() > deadline:
+            break
+        time.sleep(0.05)
+    send_json(conn, {"method": "serverRequest/resolved",
+        "params": {"requestId": "srv-1", "threadId": "th-1"}})
+    complete(conn, "t-1", "MOCK_OK")
+
+def read_request(conn):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return None
+        data += chunk
+    key = ""
+    for line in data.decode().split("\r\n"):
+        if line.lower().startswith("sec-websocket-key:"):
+            key = line.split(":", 1)[1].strip()
+    return key
+
+def handle(conn):
+    if mode == "no-upgrade":
+        # Accept TCP, never answer the handshake. The client's bounded
+        # handshake must give up and clean up the owned process.
+        time.sleep(3600)
+        return
+    if mode == "drip":
+        # Answer with a valid 101 one byte per second: only an absolute
+        # deadline bounds this — per-read timeouts never fire.
+        key = read_request(conn)
+        if key is None:
+            return
+        accept = base64.b64encode(
+            hashlib.sha1((key + GUID).encode()).digest()).decode()
+        response = ("HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode()
+        for byte in response:
+            conn.sendall(bytes([byte]))
+            time.sleep(1)
+        time.sleep(3600)
+        return
+    if mode == "bad-upgrade":
+        # Refuse the upgrade outright: HTTP 200, not 101.
+        if read_request(conn) is None:
+            return
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        time.sleep(3600)
+        return
+    if not handshake(conn):
+        return
+    approvals = set()
+    while True:
+        op, payload = read_frame(conn)
+        if op is None or op == 8:
+            break
+        if op == 9:
+            send_frame(conn, 0xA, payload)
+            continue
+        if op != 1:
+            continue
+        try:
+            msg = json.loads(payload)
+        except Exception:
+            continue
+        mid, method = msg.get("id"), msg.get("method")
+        if method is None:
+            if mid in approvals:
+                approvals.discard(mid)
+                if not approvals:
+                    complete(conn, "t-1", "MOCK_OK")
+            continue
+        if method == "initialize":
+            if mode == "slow-init":
+                time.sleep(30)
+            send_json(conn, {"id": mid, "result": {
+                "serverInfo": {"name": "mock-ws", "version": "0"}}})
+        elif method in ("thread/start", "thread/resume"):
+            send_json(conn, {"id": mid, "result": {
+                "thread": {"id": "th-1", "sessionId": "s-1"}}})
+        elif method == "turn/start":
+            text = ""
+            try:
+                text = msg["params"]["input"][0]["text"]
+            except Exception:
+                pass
+            if mode == "ping-first" and not text.startswith(SEED):
+                ping_check(conn)
+            send_json(conn, {"id": mid, "result": {"turn": {"id": "t-1"}}})
+            if text.startswith("DIE2"):
+                send_frame(conn, 8, b"")
+                return
+            if text.startswith("DIE"):
+                conn.close()
+                return
+            if text.startswith("FRAG"):
+                send_fragmented_complete(conn, "t-1", "MOCK_OK")
+                continue
+            if text.startswith(SEED):
+                complete(conn, "t-1", "READY")
+            elif mode == "silent":
+                pass
+            elif text.startswith("NEED_INPUT_EXT"):
+                approvals.add("srv-1")
+                send_json(conn, {"id": "srv-1",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"command": "x"}})
+                external_resolve(conn)
+                return
+            elif text.startswith("NEED_INPUT2"):
+                # Two outstanding approvals: answering one must leave
+                # the agent waiting_input until both are answered.
+                approvals.update(("srv-1", "srv-2"))
+                for rid in ("srv-1", "srv-2"):
+                    send_json(conn, {"id": rid,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"command": "x"}})
+            elif text.startswith("NEED_INPUT"):
+                approvals.add("srv-1")
+                send_json(conn, {"id": "srv-1",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"command": "x"}})
+            else:
+                complete(conn, "t-1", "MOCK_OK")
+        elif method == "turn/interrupt":
+            send_json(conn, {"id": mid, "result": {}})
+    conn.close()
+
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+"##;
+
 impl TestDaemon {
     /// Install a mock codex command for `mode`, returning its pidfile.
     fn mock_codex(&self, mode: &str) -> MockCodex {
@@ -628,12 +909,47 @@ impl TestDaemon {
         }
     }
 
+    /// Install a mock WebSocket app-server command for `mode`. `dir`
+    /// hosts the script + pidfile and must outlive every daemon that
+    /// will spawn it (restart tests use the seeded state dir).
+    fn mock_codex_ws_at(&self, dir: &Path, mode: &str) -> MockCodex {
+        let guard = ENV_LOCK.lock().unwrap();
+        let pidfile = dir.join(format!("mock-ws-{mode}.pid"));
+        let script = dir.join(format!("mock-ws-{mode}.py"));
+        std::fs::write(&script, MOCK_WS_PY).unwrap();
+        std::env::set_var(
+            "CADENCE_CODEX_WS_COMMAND",
+            format!(
+                "python3 {} {} {}",
+                script.display(),
+                pidfile.display(),
+                mode
+            ),
+        );
+        MockCodex {
+            _guard: guard,
+            pidfile,
+        }
+    }
+
+    fn mock_codex_ws(&self, mode: &str) -> MockCodex {
+        self.mock_codex_ws_at(self.dir.path(), mode)
+    }
+
     fn register_codex(&self, alias: &str) {
+        self.register_kind(alias, "managed");
+    }
+
+    fn register_codex_ws(&self, alias: &str) {
+        self.register_kind(alias, "managed-ws");
+    }
+
+    fn register_kind(&self, alias: &str, endpoint_kind: &str) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
         self.rpc(
             "agent_register",
             json!({"alias": alias, "provider": "codex",
-                   "endpoint_kind": "managed", "cwd": cwd}),
+                   "endpoint_kind": endpoint_kind, "cwd": cwd}),
         )
         .unwrap();
     }
@@ -642,6 +958,7 @@ impl TestDaemon {
 impl Drop for MockCodex {
     fn drop(&mut self) {
         std::env::remove_var("CADENCE_CODEX_COMMAND");
+        std::env::remove_var("CADENCE_CODEX_WS_COMMAND");
     }
 }
 
@@ -835,4 +1152,437 @@ fn stop_during_initialization_is_bounded() {
     // and no provider process is left behind.
     assert_eq!(stopped["state"], "attention");
     wait_pid_gone(&mock.pidfile, 10);
+}
+
+// ---- managed-ws: WebSocket app-server endpoint ----
+
+#[test]
+fn ws_turn_roundtrip_exposes_endpoint() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    let agent = d.wait_agent("w1", "idle", 15);
+    // The endpoint is discoverable for `agent attach`; loopback only.
+    let endpoint = agent["endpoint"].as_str().unwrap();
+    assert!(endpoint.starts_with("ws://127.0.0.1:"), "{endpoint}");
+    assert_eq!(agent["thread_id"], "th-1");
+    let reply = d
+        .rpc(
+            "agent_ask",
+            json!({"alias": "w1", "text": "hello", "message": "m1", "wait": 30}),
+        )
+        .unwrap();
+    assert_eq!(reply["state"], "completed");
+    assert!(reply["result"].to_string().contains("MOCK_OK"), "{reply}");
+    // The provider process stays alive while the agent is up.
+    assert!(pid_alive(&mock.pidfile));
+}
+
+#[test]
+fn ws_disconnect_fences_turn_unknown() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    let began = Instant::now();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "DIE now", "message": "m1"}),
+    )
+    .unwrap();
+    // Server closed the socket mid-turn: EOF must reach the wait fast.
+    d.wait_message("w1", "m1", &["unknown"], 20);
+    assert!(began.elapsed() < Duration::from_secs(20));
+    d.wait_agent("w1", "attention", 10);
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_stop_is_bounded_when_silent() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("silent");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["running"], 15);
+    let began = Instant::now();
+    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "ws stop was not bounded"
+    );
+    assert_eq!(stopped["state"], "attention");
+    d.wait_message("w1", "m1", &["unknown"], 10);
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_approval_is_brokered() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT:x", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let handle = requests["requests"][0]["request"].as_str().unwrap();
+    let answered = d
+        .rpc(
+            "agent_respond",
+            json!({"alias": "w1", "request": handle, "decision": "accept"}),
+        )
+        .unwrap();
+    assert_eq!(answered["state"], "answered");
+    d.wait_message("w1", "m1", &["completed"], 20);
+}
+
+#[test]
+fn ws_stop_during_init_is_bounded() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("slow-init");
+    d.register_codex_ws("w1");
+    // Wait until the provider accepted the WebSocket: the adapter is
+    // published and the 30s initialize RPC is in flight.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mock.pidfile.exists() {
+        assert!(Instant::now() < deadline, "provider never launched");
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(500)); // let connect+handshake land
+    let began = Instant::now();
+    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "ws init stop was not bounded: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(stopped["state"], "attention");
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_restart_resumes_thread_with_fresh_endpoint() {
+    // State dir outlives both daemon instances (d.state dies with d);
+    // the agent cwd must too, so both point at `seeded`.
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    let cwd = seeded.path().to_str().unwrap().to_string();
+    let mock;
+    let first_endpoint;
+    {
+        let d = TestDaemon::start_on(state.clone());
+        mock = d.mock_codex_ws_at(seeded.path(), "ok");
+        d.rpc(
+            "agent_register",
+            json!({"alias": "w1", "provider": "codex",
+                   "endpoint_kind": "managed-ws", "cwd": cwd}),
+        )
+        .unwrap();
+        let first = d.wait_agent("w1", "idle", 15);
+        first_endpoint = first["endpoint"].as_str().unwrap().to_string();
+    }
+    // Restart relaunches the enabled actor: a fresh app-server process,
+    // a fresh loopback port, and thread/resume on the saved thread.
+    let d = TestDaemon::start_on(state);
+    let resumed = d.wait_agent("w1", "idle", 15);
+    assert_eq!(resumed["thread_id"], "th-1");
+    let new_endpoint = resumed["endpoint"].as_str().unwrap();
+    assert!(new_endpoint.starts_with("ws://127.0.0.1:"));
+    assert_ne!(new_endpoint, first_endpoint, "endpoint was not refreshed");
+    // The resumed adapter still answers turns on the same thread.
+    let reply = d
+        .rpc(
+            "agent_ask",
+            json!({"alias": "w1", "text": "hi", "message": "m2", "wait": 30}),
+        )
+        .unwrap();
+    assert_eq!(reply["state"], "completed");
+    assert!(pid_alive(&mock.pidfile));
+}
+
+#[test]
+fn ws_handshake_stall_is_bounded_and_cleans_child() {
+    // The reviewer's probe: TCP accepts but never upgrades. The bounded
+    // handshake must fail startup and kill the owned child — before the
+    // fix, connect blocked past the deadline and the child leaked.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("no-upgrade");
+    d.register_codex_ws("w1");
+    let began = Instant::now();
+    let agent = d.wait_agent("w1", "attention", 25);
+    assert!(
+        began.elapsed() < Duration::from_secs(25),
+        "handshake stall was not bounded"
+    );
+    let error = agent["error"].as_str().unwrap_or_default().to_string();
+    assert!(
+        error.contains("handshake") || error.contains("app-server"),
+        "unexpected error: {error}"
+    );
+    assert!(agent["endpoint"].is_null());
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_stop_during_handshake_is_bounded() {
+    // Close must reach a child still stuck in connect/handshake: the
+    // child is published before connecting so stop kills it, and the
+    // connect loop observes the removal instead of hanging.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("no-upgrade");
+    d.register_codex_ws("w1");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mock.pidfile.exists() {
+        assert!(Instant::now() < deadline, "provider never launched");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let began = Instant::now();
+    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "stop during handshake was not bounded"
+    );
+    assert!(
+        matches!(
+            stopped["state"].as_str(),
+            Some("attention") | Some("stopped")
+        ),
+        "{stopped}"
+    );
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_close_frame_disconnect_fences_unknown() {
+    // A WS close frame (not just TCP EOF) must sever the transport:
+    // the reader replies close, marks disconnected, and the in-flight
+    // turn resolves unknown without waiting out its deadline.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    let began = Instant::now();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "DIE2 now", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["unknown"], 20);
+    assert!(began.elapsed() < Duration::from_secs(20));
+    d.wait_agent("w1", "attention", 10);
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_control_frames_share_the_write_path() {
+    // The server pings mid-request; the client's pong must be written
+    // on the same serialized path as data frames. The mock records
+    // whether a pong arrived before it answered the turn.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ping-first");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    let reply = d
+        .rpc(
+            "agent_ask",
+            json!({"alias": "w1", "text": "hello", "message": "m1", "wait": 30}),
+        )
+        .unwrap();
+    assert_eq!(reply["state"], "completed");
+    let pong = std::fs::read_to_string(format!("{}.pong", mock.pidfile.display()))
+        .unwrap_or_else(|_| "missing".into());
+    assert_eq!(pong, "yes", "server never received a pong");
+}
+
+#[test]
+fn ws_external_approval_resolution_drops_pending() {
+    // An attached TUI answered the approval: `serverRequest/resolved`
+    // must drop the pending handle so a late Cadence respond is
+    // rejected rather than double-answering, and the turn completes
+    // without a Cadence response.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT_EXT:x", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let handle = requests["requests"][0]["request"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Resolve it externally, as an attached TUI would.
+    std::fs::write(format!("{}.resolve", mock.pidfile.display()), b"1").unwrap();
+    d.wait_message("w1", "m1", &["completed"], 20);
+    // The stale handle is rejected; the provider already resolved it.
+    let late = d.rpc(
+        "agent_respond",
+        json!({"alias": "w1", "request": handle, "decision": "accept"}),
+    );
+    let late = late.expect_err("late respond should be rejected");
+    assert!(
+        late.to_string().contains("no longer pending"),
+        "late respond should be rejected: {late}"
+    );
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    assert_eq!(requests["requests"].as_array().unwrap().len(), 0);
+    d.wait_agent("w1", "idle", 10);
+    // The rejected late respond must not regress the finished turn to
+    // busy — the conditional transition only relaxes waiting_input.
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(agent["agent"]["state"], "idle", "{agent}");
+}
+
+#[test]
+fn ws_drip_handshake_is_bounded() {
+    // The reviewer's drip probe: a peer feeding one header byte/second
+    // defeats per-read timeouts; only the absolute deadline bounds it.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("drip");
+    d.register_codex_ws("w1");
+    let began = Instant::now();
+    d.wait_agent("w1", "attention", 25);
+    assert!(
+        began.elapsed() < Duration::from_secs(25),
+        "drip handshake was not wall-clock bounded"
+    );
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_refused_upgrade_is_bounded() {
+    // A 200-instead-of-101 response must fail startup, not hang.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("bad-upgrade");
+    d.register_codex_ws("w1");
+    let began = Instant::now();
+    d.wait_agent("w1", "attention", 25);
+    assert!(began.elapsed() < Duration::from_secs(25));
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_fragmented_message_with_interleaved_ping() {
+    // turn/completed arrives as two continuations around a ping: the
+    // vetted codec must reassemble it and answer the control frame.
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    let reply = d
+        .rpc(
+            "agent_ask",
+            json!({"alias": "w1", "text": "FRAG me", "message": "m1", "wait": 30}),
+        )
+        .unwrap();
+    assert_eq!(reply["state"], "completed");
+    assert!(reply["result"].to_string().contains("MOCK_OK"), "{reply}");
+}
+
+#[test]
+fn ws_concurrent_respond_has_single_winner() {
+    // Two racing responds on one handle: the atomic claim gives exactly
+    // one winner; the loser is rejected before any provider write.
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT:x", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let handle = requests["requests"][0]["request"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut results = Vec::new();
+    thread::scope(|scope| {
+        let mut racers = Vec::new();
+        for _ in 0..2 {
+            let d = &d;
+            let handle = handle.clone();
+            racers.push(scope.spawn(move || {
+                d.rpc(
+                    "agent_respond",
+                    json!({"alias": "w1", "request": handle, "decision": "accept"}),
+                )
+            }));
+        }
+        for racer in racers {
+            results.push(racer.join().unwrap());
+        }
+    });
+    let winners = results
+        .iter()
+        .filter(|r| matches!(r, Ok(v) if v["state"] == "answered"))
+        .count();
+    let losers = results
+        .iter()
+        .filter(|r| matches!(r, Err(e) if e.to_string().contains("no longer pending")))
+        .count();
+    assert_eq!((winners, losers), (1, 1), "{results:?}");
+    d.wait_message("w1", "m1", &["completed"], 20);
+}
+
+#[test]
+fn ws_second_pending_request_keeps_waiting() {
+    // Two outstanding approvals: answering the first must NOT relax
+    // waiting_input while the second remains — the relaxation is
+    // coordinated with the pending set, not a check-then-write.
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT2:x", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let handles: Vec<String> = requests["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["request"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(handles.len(), 2, "{requests}");
+    let answered = d
+        .rpc(
+            "agent_respond",
+            json!({"alias": "w1", "request": handles[0], "decision": "accept"}),
+        )
+        .unwrap();
+    assert_eq!(answered["state"], "answered");
+    // One request still pending: the agent must stay waiting_input.
+    thread::sleep(Duration::from_millis(300));
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(
+        agent["agent"]["state"], "waiting_input",
+        "relaxation clobbered the remaining request"
+    );
+    let answered = d
+        .rpc(
+            "agent_respond",
+            json!({"alias": "w1", "request": handles[1], "decision": "accept"}),
+        )
+        .unwrap();
+    assert_eq!(answered["state"], "answered");
+    d.wait_message("w1", "m1", &["completed"], 20);
+    d.wait_agent("w1", "idle", 10);
 }
