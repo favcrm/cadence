@@ -805,7 +805,7 @@ def handle(conn):
         return
     if not handshake(conn):
         return
-    approval = None
+    approvals = set()
     while True:
         op, payload = read_frame(conn)
         if op is None or op == 8:
@@ -821,9 +821,10 @@ def handle(conn):
             continue
         mid, method = msg.get("id"), msg.get("method")
         if method is None:
-            if mid == approval:
-                approval = None
-                complete(conn, "t-1", "MOCK_OK")
+            if mid in approvals:
+                approvals.discard(mid)
+                if not approvals:
+                    complete(conn, "t-1", "MOCK_OK")
             continue
         if method == "initialize":
             if mode == "slow-init":
@@ -856,14 +857,22 @@ def handle(conn):
             elif mode == "silent":
                 pass
             elif text.startswith("NEED_INPUT_EXT"):
-                approval = "srv-1"
+                approvals.add("srv-1")
                 send_json(conn, {"id": "srv-1",
                     "method": "item/commandExecution/requestApproval",
                     "params": {"command": "x"}})
                 external_resolve(conn)
                 return
+            elif text.startswith("NEED_INPUT2"):
+                # Two outstanding approvals: answering one must leave
+                # the agent waiting_input until both are answered.
+                approvals.update(("srv-1", "srv-2"))
+                for rid in ("srv-1", "srv-2"):
+                    send_json(conn, {"id": rid,
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"command": "x"}})
             elif text.startswith("NEED_INPUT"):
-                approval = "srv-1"
+                approvals.add("srv-1")
                 send_json(conn, {"id": "srv-1",
                     "method": "item/commandExecution/requestApproval",
                     "params": {"command": "x"}})
@@ -1430,6 +1439,10 @@ fn ws_external_approval_resolution_drops_pending() {
     let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
     assert_eq!(requests["requests"].as_array().unwrap().len(), 0);
     d.wait_agent("w1", "idle", 10);
+    // The rejected late respond must not regress the finished turn to
+    // busy — the conditional transition only relaxes waiting_input.
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(agent["agent"]["state"], "idle", "{agent}");
 }
 
 #[test]
@@ -1524,4 +1537,52 @@ fn ws_concurrent_respond_has_single_winner() {
         .count();
     assert_eq!((winners, losers), (1, 1), "{results:?}");
     d.wait_message("w1", "m1", &["completed"], 20);
+}
+
+#[test]
+fn ws_second_pending_request_keeps_waiting() {
+    // Two outstanding approvals: answering the first must NOT relax
+    // waiting_input while the second remains — the relaxation is
+    // coordinated with the pending set, not a check-then-write.
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT2:x", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let handles: Vec<String> = requests["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["request"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(handles.len(), 2, "{requests}");
+    let answered = d
+        .rpc(
+            "agent_respond",
+            json!({"alias": "w1", "request": handles[0], "decision": "accept"}),
+        )
+        .unwrap();
+    assert_eq!(answered["state"], "answered");
+    // One request still pending: the agent must stay waiting_input.
+    thread::sleep(Duration::from_millis(300));
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(
+        agent["agent"]["state"], "waiting_input",
+        "relaxation clobbered the remaining request"
+    );
+    let answered = d
+        .rpc(
+            "agent_respond",
+            json!({"alias": "w1", "request": handles[1], "decision": "accept"}),
+        )
+        .unwrap();
+    assert_eq!(answered["state"], "answered");
+    d.wait_message("w1", "m1", &["completed"], 20);
+    d.wait_agent("w1", "idle", 10);
 }

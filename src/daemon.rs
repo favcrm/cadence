@@ -233,15 +233,25 @@ impl Shared {
                 .store
                 .event_public(alias, "input_resolved", json!({"request": handle}));
         }
-        let remaining = pending.values().any(|req| req.alias == alias);
         drop(pending);
-        if !remaining {
-            if let Ok(agent) = self.store.agent(alias) {
-                if agent.state == "waiting_input" {
-                    let _ = self.store.set_agent_state(alias, "busy", None);
-                }
-            }
+        self.relax_waiting(alias);
+    }
+
+    /// Relax `waiting_input` → `busy` only if no pending requests remain
+    /// for the alias AND the agent is still waiting. The pending mutex
+    /// is held across the conditional update, so a request arriving in
+    /// between cannot have its `waiting_input` clobbered, and the SQL
+    /// `WHERE state='waiting_input'` can never overwrite a concurrently
+    /// finished/fenced/stopped state. Lock order is pending → store
+    /// conn everywhere; nothing takes conn → pending.
+    fn relax_waiting(&self, alias: &str) {
+        let pending = self.pending.lock().unwrap();
+        if pending.values().any(|req| req.alias == alias) {
+            return;
         }
+        let _ = self
+            .store
+            .set_agent_state_if(alias, "busy", "waiting_input");
     }
 
     fn on_provider_request(self: &Arc<Self>, alias: &str, request: ProviderRequest) {
@@ -255,7 +265,11 @@ impl Shared {
                 params: request.params.clone(),
             },
         );
-        let _ = self.store.set_agent_state(alias, "waiting_input", None);
+        // Requests only arrive mid-turn; relax/stop may have moved the
+        // agent on already — never clobber a non-busy state.
+        let _ = self
+            .store
+            .set_agent_state_if(alias, "waiting_input", "busy");
         let _ = self.store.event_public(
             alias,
             "input_required",
@@ -663,18 +677,7 @@ impl Shared {
         let adapter = adapter
             .ok_or_else(|| Error::internal("Agent adapter is not available for this request"))?;
         adapter.respond(&request_id, response)?;
-        let remaining = self
-            .pending
-            .lock()
-            .unwrap()
-            .values()
-            .any(|req| req.alias == alias);
-        // Only relax waiting_input: a turn that meanwhile resolved or
-        // finished (idle/completed/attention/stopping) must not regress
-        // to busy.
-        if !remaining && self.store.agent(alias)?.state == "waiting_input" {
-            self.store.set_agent_state(alias, "busy", None)?;
-        }
+        self.relax_waiting(alias);
         let _ = self
             .store
             .event_public(alias, "input_answered", json!({"request": handle}));

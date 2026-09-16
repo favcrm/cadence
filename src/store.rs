@@ -542,6 +542,19 @@ impl Store {
         Ok(count > 0)
     }
 
+    /// Conditional transition: `to` applies only while the agent is in
+    /// `from`, in a single UPDATE — a concurrently written `idle` /
+    /// `attention` / `stopped` can never be overwritten. `error` is
+    /// untouched. Returns whether the row matched.
+    pub fn set_agent_state_if(&self, alias: &str, to: &str, from: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE agents SET state=?,updated=? WHERE alias=? AND state=?",
+            params![to, now(), alias, from],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn set_agent_state(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -754,6 +767,30 @@ mod tests {
             .simple()
             .to_string();
         assert_eq!(pm_msgs[0].id, expected);
+    }
+
+    /// The conditional transition used by approval relaxation cannot
+    /// overwrite a finished/fenced state or its error reason.
+    #[test]
+    fn conditional_state_preserves_terminal_states() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "a1", &cwd);
+        // waiting_input -> busy applies.
+        s.set_agent_state("a1", "waiting_input", None).unwrap();
+        assert!(s.set_agent_state_if("a1", "busy", "waiting_input").unwrap());
+        assert_eq!(s.agent("a1").unwrap().state, "busy");
+        // attention + error are preserved — no busy overwrite.
+        s.set_agent_state("a1", "attention", Some("turn outcome unknown"))
+            .unwrap();
+        assert!(!s.set_agent_state_if("a1", "busy", "waiting_input").unwrap());
+        let agent = s.agent("a1").unwrap();
+        assert_eq!(agent.state, "attention");
+        assert_eq!(agent.error.as_deref(), Some("turn outcome unknown"));
+        // Same for stopped.
+        s.set_agent_state("a1", "stopped", None).unwrap();
+        assert!(!s.set_agent_state_if("a1", "busy", "waiting_input").unwrap());
+        assert_eq!(s.agent("a1").unwrap().state, "stopped");
     }
 
     /// A crash between ALTER and the version bump must not wedge the
