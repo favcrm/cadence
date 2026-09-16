@@ -2257,6 +2257,42 @@ fn pty_respond_rejected_and_mode_blocks_send() {
 }
 
 #[test]
+fn pty_routed_result_body_is_single_line() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    // The PM is a pty agent; the worker is a fake provider reporting up.
+    d.register_devin("pm", None);
+    d.register("w1");
+    d.wait_agent("pm", "idle", 20);
+    d.wait_agent("w1", "idle", 10);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "work", "message": "j1",
+               "reply_to": "pm"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "j1", &["completed"], 15);
+    // The routed delivery is queued on pm with a single-line body —
+    // no raw newlines or control characters.
+    let show = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    let routed = &show["messages"].as_array().unwrap()[0];
+    assert_eq!(routed["source"], "worker_result");
+    let body = routed["body"].as_str().unwrap();
+    assert!(
+        !body.chars().any(|c| (c as u32) < 32 || c as u32 == 127),
+        "routed body is not pty-safe: {body:?}"
+    );
+    assert!(body.contains("j1"));
+    // Gated delivery, not a bypass: it waits queued for an operator
+    // claim, then pastes like any send (running = validation passed).
+    thread::sleep(Duration::from_millis(400));
+    let mid = d.message_state("pm", routed["id"].as_str().unwrap());
+    assert!(matches!(mid.as_str(), "queued" | "submitting"), "{mid}");
+    d.rpc("agent_ready", json!({"alias": "pm"})).unwrap();
+    pty_token(&d, "pm", routed["id"].as_str().unwrap());
+}
+
+#[test]
 fn pty_send_rejects_control_chars() {
     let d = TestDaemon::start();
     let _mock = d.mock_devin();
