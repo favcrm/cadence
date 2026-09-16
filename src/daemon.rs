@@ -513,20 +513,20 @@ impl Shared {
                 "agents": self.store.agents()?.iter().map(Agent::to_json).collect::<Vec<_>>()
             })),
             "agent_show" => {
-                let alias = required_str(params, "alias")?;
-                let agent = self.store.agent(alias)?;
-                let messages = self.store.messages(alias)?;
+                let alias = self.resolve_alias(required_str(params, "alias")?)?;
+                let agent = self.store.agent(&alias)?;
+                let messages = self.store.messages(&alias)?;
                 Ok(json!({
                     "agent": agent.to_json(),
                     "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
-                    "event_cursor": self.store.event_cursor(alias)?,
+                    "event_cursor": self.store.event_cursor(&alias)?,
                 }))
             }
             "agent_send" => self.rpc_send(params),
             "agent_ask" => self.rpc_ask(params),
             "agent_events" => self.rpc_events(params),
             "agent_requests" => {
-                let alias = required_str(params, "alias")?;
+                let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let requests = self
                     .pending
                     .lock()
@@ -545,15 +545,15 @@ impl Shared {
             "message_report" => self.rpc_message_report(params),
             "agent_stop" => self.rpc_stop(params),
             "agent_resume" => {
-                let alias = required_str(params, "alias")?;
-                self.store.agent(alias)?;
+                let alias = self.resolve_alias(required_str(params, "alias")?)?;
+                self.store.agent(&alias)?;
                 let mut lc = self.lifecycle.lock().unwrap();
-                if lc.owned(alias) {
+                if lc.owned(&alias) {
                     return Err(Error::rejected("Agent is still running or stopping"));
                 }
                 // Enable only after the ownership/fence checks pass —
                 // a rejected resume must leave no side effects behind.
-                let started = self.start_actor_locked(&mut lc, alias, true)?;
+                let started = self.start_actor_locked(&mut lc, &alias, true)?;
                 let state = if started { "starting" } else { "attention" };
                 Ok(json!({"alias": alias, "state": state}))
             }
@@ -587,7 +587,7 @@ impl Shared {
     }
 
     fn rpc_send(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let alias = required_str(params, "alias")?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
         let reply_to = optional_str(params, "reply_to");
         let message = optional_str(params, "message")
@@ -595,8 +595,8 @@ impl Shared {
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
         let (duplicate, state) = self
             .store
-            .enqueue(alias, text, reply_to, &message, "user")?;
-        self.notify_agent(alias);
+            .enqueue(&alias, text, reply_to, &message, "user")?;
+        self.notify_agent(&alias);
         self.wake();
         Ok(json!({"message": message, "state": state, "duplicate": duplicate}))
     }
@@ -621,7 +621,7 @@ impl Shared {
     }
 
     fn rpc_events(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let alias = required_str(params, "alias")?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let after = optional_i64(params, "after").unwrap_or(0);
         if after < 0 {
             return Err(Error::rejected("Event cursor must be nonnegative"));
@@ -629,7 +629,7 @@ impl Shared {
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
-            let events = self.store.events(alias, after, 100)?;
+            let events = self.store.events(&alias, after, 100)?;
             if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
                 let cursor = events.last().map(|e| e.seq).unwrap_or(after);
                 return Ok(json!({
@@ -646,7 +646,7 @@ impl Shared {
     }
 
     fn rpc_respond(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let alias = required_str(params, "alias")?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let handle = required_str(params, "request")?;
         let decision = optional_str(params, "decision");
         // Explicit JSON null means "not provided".
@@ -713,15 +713,15 @@ impl Shared {
             .lock()
             .unwrap()
             .agents
-            .get(alias)
+            .get(&alias)
             .and_then(|ctl| ctl.adapter.lock().unwrap().clone());
         let adapter = adapter
             .ok_or_else(|| Error::internal("Agent adapter is not available for this request"))?;
         adapter.respond(&request_id, response)?;
-        self.relax_waiting(alias);
+        self.relax_waiting(&alias);
         let _ = self
             .store
-            .event_public(alias, "input_answered", json!({"request": handle}));
+            .event_public(&alias, "input_answered", json!({"request": handle}));
         self.wake();
         Ok(json!({"state": "answered"}))
     }
@@ -741,16 +741,16 @@ impl Shared {
     /// terminal was inspected and is idle with an empty input. Single
     /// use, short TTL — see the adapter for semantics.
     fn rpc_ready(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let alias = required_str(params, "alias")?;
-        self.adapter_for(alias)?.claim_ready()?;
-        let _ = self.store.event_public(alias, "ready_claimed", json!({}));
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        self.adapter_for(&alias)?.claim_ready()?;
+        let _ = self.store.event_public(&alias, "ready_claimed", json!({}));
         Ok(json!({"alias": alias, "state": "ready-claimed"}))
     }
 
     /// Screen contents of a PTY endpoint for operator inspection.
     fn rpc_capture(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let alias = required_str(params, "alias")?;
-        let text = self.adapter_for(alias)?.capture()?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let text = self.adapter_for(&alias)?.capture()?;
         Ok(json!({"alias": alias, "capture": text}))
     }
 
@@ -831,8 +831,8 @@ impl Shared {
     }
 
     fn rpc_stop(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let alias = required_str(params, "alias")?;
-        self.store.agent(alias)?;
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        self.store.agent(&alias)?;
         // Reserve the alias for the whole stop — through the final state
         // write — so a resume cannot start a new actor in the gap where
         // the old actor already released ownership.
@@ -841,31 +841,31 @@ impl Shared {
             // A stop already in flight owns the alias through its final
             // write; reject before any mutation rather than letting a
             // second operation write stale state over a newer actor.
-            if !lc.stopping.insert(alias.to_string()) {
+            if !lc.stopping.insert(alias.clone()) {
                 return Err(Error::rejected("Agent is already stopping"));
             }
-            lc.agents.get(alias).cloned()
+            lc.agents.get(&alias).cloned()
         };
         let _reservation = StopReservation {
             lifecycle: &self.lifecycle,
-            alias,
+            alias: &alias,
         };
-        self.store.set_enabled(alias, false)?;
-        let _ = self.store.event_public(alias, "stop_requested", json!({}));
+        self.store.set_enabled(&alias, false)?;
+        let _ = self.store.event_public(&alias, "stop_requested", json!({}));
         // A fenced agent keeps its attention state and reason; the stop
         // only disables it.
-        if self.store.agent(alias)?.state != "attention" {
-            self.store.set_agent_state(alias, "stopping", None)?;
+        if self.store.agent(&alias)?.state != "attention" {
+            self.store.set_agent_state(&alias, "stopping", None)?;
         }
         if let Some(ctl) = ctl {
             self.stop_ctls(&[ctl]);
         }
         // The actor writes its own terminal state on exit; do not mask a
         // fence it may have raised while finishing.
-        let state = if self.store.agent(alias)?.state == "attention" {
+        let state = if self.store.agent(&alias)?.state == "attention" {
             "attention"
         } else {
-            self.store.set_agent_state(alias, "stopped", None)?;
+            self.store.set_agent_state(&alias, "stopped", None)?;
             "stopped"
         };
         self.wake();
@@ -899,6 +899,20 @@ impl Shared {
                 let _ = handle.join();
             }
         }
+    }
+
+    /// Resolve a user-facing agent name to the canonical alias. Accepts
+    /// an alias or a provider-native id — a Devin session slug or Codex
+    /// thread id — so agents stay addressable by their native handle.
+    /// Exact aliases always win over native ids.
+    fn resolve_alias(&self, name: &str) -> Result<String> {
+        if let Some(agent) = self.store.agent_opt(name)? {
+            return Ok(agent.alias);
+        }
+        self.store
+            .agent_by_native(name)?
+            .map(|agent| agent.alias)
+            .ok_or_else(|| Error::rejected("Unknown managed agent"))
     }
 
     fn notify_agent(&self, alias: &str) {
