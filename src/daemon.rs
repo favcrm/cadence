@@ -205,7 +205,43 @@ impl Shared {
                 "method": method, "data": params,
             }),
         );
+        if method == "serverRequest/resolved" {
+            self.resolve_external(alias, &params);
+        }
         self.wake();
+    }
+
+    /// The provider resolved a request outside Cadence — e.g. an
+    /// attached official TUI answered the approval. Drop the matching
+    /// pending handle so a late `agent respond` is rejected rather than
+    /// double-answering; other pending requests survive, and the agent
+    /// stays `waiting_input` while any remain.
+    fn resolve_external(&self, alias: &str, params: &Value) {
+        let request_id = params.get("requestId").cloned().unwrap_or(Value::Null);
+        let mut pending = self.pending.lock().unwrap();
+        let resolved: Vec<String> = pending
+            .iter()
+            .filter(|(_, req)| req.alias == alias && req.id == request_id)
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        if resolved.is_empty() {
+            return;
+        }
+        for handle in &resolved {
+            pending.remove(handle);
+            let _ = self
+                .store
+                .event_public(alias, "input_resolved", json!({"request": handle}));
+        }
+        let remaining = pending.values().any(|req| req.alias == alias);
+        drop(pending);
+        if !remaining {
+            if let Ok(agent) = self.store.agent(alias) {
+                if agent.state == "waiting_input" {
+                    let _ = self.store.set_agent_state(alias, "busy", None);
+                }
+            }
+        }
     }
 
     fn on_provider_request(self: &Arc<Self>, alias: &str, request: ProviderRequest) {
@@ -630,8 +666,14 @@ impl Shared {
         let adapter = adapter
             .ok_or_else(|| Error::internal("Agent adapter is not available for this request"))?;
         adapter.respond(&request_id, response)?;
-        self.pending.lock().unwrap().remove(handle);
-        self.store.set_agent_state(alias, "busy", None)?;
+        let remaining = {
+            let mut pending = self.pending.lock().unwrap();
+            pending.remove(handle);
+            pending.values().any(|req| req.alias == alias)
+        };
+        if !remaining {
+            self.store.set_agent_state(alias, "busy", None)?;
+        }
         let _ = self
             .store
             .event_public(alias, "input_answered", json!({"request": handle}));

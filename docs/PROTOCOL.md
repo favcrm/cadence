@@ -93,10 +93,25 @@ first turn, and `resume --remote` fails on an unseeded thread. The
 endpoint is cleared when the actor exits, so a printed command never
 points at a dead address; attaching to a `stopped`/`offline` or non-WS
 agent is `rejected`. Terminal echo of a submitted prompt is visibility,
-not receipt — message state remains authoritative. Approval requests
-remain brokered through `agent_respond`; an attached TUI may also see
-and answer them, in which case the pending request resolves or is
-cancelled provider-side (never auto-accepted by Cadence).
+not receipt — message state remains authoritative.
+
+Trust boundary, stated plainly: the endpoint is an unauthenticated
+loopback port reachable by ANY local user — `SO_PEERCRED` does not
+apply to TCP, and the port is discoverable via `ss`. The URL lives only
+in the private 0700 state dir, but treat every local process as able to
+connect. Do not expose `managed-ws` on multi-user hosts you distrust.
+
+Connect, handshake, writes, and close are all bounded: a provider that
+accepts TCP but never upgrades fails startup within the connect
+deadline and the owned child is killed — `stop` can interrupt setup
+because the child is published before the transport connects.
+
+Approval requests remain brokered through `agent_respond`; an attached
+TUI may also see and answer them. The provider then emits
+`serverRequest/resolved`; Cadence drops the matching pending handle,
+emits `input_resolved`, keeps any other pending requests, and a late
+`agent_respond` on the consumed handle is `rejected`. Nothing is ever
+auto-accepted by Cadence.
 
 Agent states: `starting → idle ⇄ busy → waiting_input →` and terminal-ish
 `attention | stopping → stopped | offline`. `attention` means an uncertain
@@ -124,15 +139,20 @@ no-op) and carries no `reply_to`, so routing cannot loop.
 
 `agent_events` pages the durable log: `{seq, alias, kind, payload, at}`.
 Kinds: `registered, queued, submitting, turn_started, turn_finished,
-provider_event, input_required, input_answered, result_routed, ready,
-attention, stop_requested`. `wait>0` long-polls up to 30s.
+provider_event, input_required, input_answered, input_resolved,
+result_routed, ready, attention, stop_requested`. `wait>0` long-polls
+up to 30s.
 
 ## Approvals
 
 Provider-initiated requests (e.g. `item/commandExecution/requestApproval`,
 `item/tool/requestUserInput`, `session/request_permission`) pause the
 agent at `waiting_input` and appear in `agent_requests`. `agent_respond`
-answers them per type; nothing is auto-accepted.
+answers them per type; nothing is auto-accepted. A request may also be
+resolved outside Cadence — an attached TUI answering the approval makes
+the provider emit `serverRequest/resolved`, which drops the pending
+handle (`input_resolved`); a late `agent_respond` is then `rejected`.
+The agent stays `waiting_input` while other requests remain pending.
 
 ## Recovery
 

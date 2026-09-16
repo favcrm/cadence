@@ -287,7 +287,7 @@ impl Shared {
                 }
                 self.emit(method, &params);
             }
-            "turn/started" | "error" => self.emit(method, &params),
+            "turn/started" | "error" | "serverRequest/resolved" => self.emit(method, &params),
             _ => {}
         }
     }

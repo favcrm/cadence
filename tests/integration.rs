@@ -611,10 +611,15 @@ struct MockCodex {
 /// A WebSocket JSON-RPC provider speaking the same app-server wire as
 /// MOCK_PY. Parses `--listen ws://host:port` from argv (appended by the
 /// transport), handshakes with stdlib sockets, and serves text frames.
-/// Turn text directives: `DIE` closes the connection after the ack,
-/// `NEED_INPUT:x` raises a server->client approval request that must be
-/// answered before the turn completes. `silent` mode applies only to
-/// non-seed turns so `open` can still finish its rollout seed.
+/// Turn text directives: `DIE` closes the TCP connection after the ack,
+/// `DIE2` sends a WS close frame instead, `NEED_INPUT:x` raises a
+/// server->client approval request that must be answered before the
+/// turn completes, `NEED_INPUT_EXT:x` raises one then resolves it
+/// externally via `serverRequest/resolved` once `<pidfile>.resolve`
+/// appears. Modes: `silent` never completes non-seed turns,
+/// `no-upgrade` accepts TCP but never answers the WS handshake,
+/// `ping-first` pings before the non-seed ack and records pong receipt
+/// in `<pidfile>.pong`.
 const MOCK_WS_PY: &str = r##"
 import base64, hashlib, json, os, socket, struct, sys, threading, time
 
@@ -695,7 +700,45 @@ def handshake(conn):
         f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
     return True
 
+def ping_check(conn):
+    # Ping, then expect a pong before completing: proves the client
+    # serializes control replies on the same write path as requests.
+    send_frame(conn, 0x9, b"ping-check")
+    conn.settimeout(5)
+    pong = False
+    try:
+        while True:
+            op, _ = read_frame(conn)
+            if op is None:
+                break
+            if op == 0xA:
+                pong = True
+                break
+    except Exception:
+        pass
+    conn.settimeout(None)
+    with open(pidfile + ".pong", "w") as f:
+        f.write("yes" if pong else "no")
+
+def external_resolve(conn):
+    # An attached TUI answered the approval: once the test drops the
+    # trigger file, resolve the pending request outside the client and
+    # let the turn finish without a client response.
+    deadline = time.time() + 30
+    while not os.path.exists(pidfile + ".resolve"):
+        if time.time() > deadline:
+            break
+        time.sleep(0.05)
+    send_json(conn, {"method": "serverRequest/resolved",
+        "params": {"requestId": "srv-1", "threadId": "th-1"}})
+    complete(conn, "t-1", "MOCK_OK")
+
 def handle(conn):
+    if mode == "no-upgrade":
+        # Accept TCP, never answer the handshake. The client's bounded
+        # handshake must give up and clean up the owned process.
+        time.sleep(3600)
+        return
     if not handshake(conn):
         return
     approval = None
@@ -732,7 +775,12 @@ def handle(conn):
                 text = msg["params"]["input"][0]["text"]
             except Exception:
                 pass
+            if mode == "ping-first" and not text.startswith(SEED):
+                ping_check(conn)
             send_json(conn, {"id": mid, "result": {"turn": {"id": "t-1"}}})
+            if text.startswith("DIE2"):
+                send_frame(conn, 8, b"")
+                return
             if text.startswith("DIE"):
                 conn.close()
                 return
@@ -740,6 +788,13 @@ def handle(conn):
                 complete(conn, "t-1", "READY")
             elif mode == "silent":
                 pass
+            elif text.startswith("NEED_INPUT_EXT"):
+                approval = "srv-1"
+                send_json(conn, {"id": "srv-1",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"command": "x"}})
+                external_resolve(conn)
+                return
             elif text.startswith("NEED_INPUT"):
                 approval = "srv-1"
                 send_json(conn, {"id": "srv-1",
@@ -1175,4 +1230,137 @@ fn ws_restart_resumes_thread_with_fresh_endpoint() {
         .unwrap();
     assert_eq!(reply["state"], "completed");
     assert!(pid_alive(&mock.pidfile));
+}
+
+#[test]
+fn ws_handshake_stall_is_bounded_and_cleans_child() {
+    // The reviewer's probe: TCP accepts but never upgrades. The bounded
+    // handshake must fail startup and kill the owned child — before the
+    // fix, connect blocked past the deadline and the child leaked.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("no-upgrade");
+    d.register_codex_ws("w1");
+    let began = Instant::now();
+    let agent = d.wait_agent("w1", "attention", 25);
+    assert!(
+        began.elapsed() < Duration::from_secs(25),
+        "handshake stall was not bounded"
+    );
+    let error = agent["error"].as_str().unwrap_or_default().to_string();
+    assert!(
+        error.contains("handshake") || error.contains("app-server"),
+        "unexpected error: {error}"
+    );
+    assert!(agent["endpoint"].is_null());
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_stop_during_handshake_is_bounded() {
+    // Close must reach a child still stuck in connect/handshake: the
+    // child is published before connecting so stop kills it, and the
+    // connect loop observes the removal instead of hanging.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("no-upgrade");
+    d.register_codex_ws("w1");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mock.pidfile.exists() {
+        assert!(Instant::now() < deadline, "provider never launched");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let began = Instant::now();
+    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "stop during handshake was not bounded"
+    );
+    assert!(
+        matches!(
+            stopped["state"].as_str(),
+            Some("attention") | Some("stopped")
+        ),
+        "{stopped}"
+    );
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_close_frame_disconnect_fences_unknown() {
+    // A WS close frame (not just TCP EOF) must sever the transport:
+    // the reader replies close, marks disconnected, and the in-flight
+    // turn resolves unknown without waiting out its deadline.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    let began = Instant::now();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "DIE2 now", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["unknown"], 20);
+    assert!(began.elapsed() < Duration::from_secs(20));
+    d.wait_agent("w1", "attention", 10);
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_control_frames_share_the_write_path() {
+    // The server pings mid-request; the client's pong must be written
+    // on the same serialized path as data frames. The mock records
+    // whether a pong arrived before it answered the turn.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ping-first");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    let reply = d
+        .rpc(
+            "agent_ask",
+            json!({"alias": "w1", "text": "hello", "message": "m1", "wait": 30}),
+        )
+        .unwrap();
+    assert_eq!(reply["state"], "completed");
+    let pong = std::fs::read_to_string(format!("{}.pong", mock.pidfile.display()))
+        .unwrap_or_else(|_| "missing".into());
+    assert_eq!(pong, "yes", "server never received a pong");
+}
+
+#[test]
+fn ws_external_approval_resolution_drops_pending() {
+    // An attached TUI answered the approval: `serverRequest/resolved`
+    // must drop the pending handle so a late Cadence respond is
+    // rejected rather than double-answering, and the turn completes
+    // without a Cadence response.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT_EXT:x", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let handle = requests["requests"][0]["request"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Resolve it externally, as an attached TUI would.
+    std::fs::write(format!("{}.resolve", mock.pidfile.display()), b"1").unwrap();
+    d.wait_message("w1", "m1", &["completed"], 20);
+    // The stale handle is rejected; the provider already resolved it.
+    let late = d.rpc(
+        "agent_respond",
+        json!({"alias": "w1", "request": handle, "decision": "accept"}),
+    );
+    let late = late.expect_err("late respond should be rejected");
+    assert!(
+        late.to_string().contains("no longer pending"),
+        "late respond should be rejected: {late}"
+    );
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    assert_eq!(requests["requests"].as_array().unwrap().len(), 0);
+    d.wait_agent("w1", "idle", 10);
 }
