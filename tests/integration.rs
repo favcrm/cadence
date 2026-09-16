@@ -2219,4 +2219,38 @@ fn pty_send_rejects_control_chars() {
     d.wait_message("dv1", "m1", &["failed"], 15);
     let input = std::fs::read_to_string(d.pane_file(&_mock, "dv1", "input")).unwrap_or_default();
     assert!(!input.contains("line1"));
+    let failed = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "m1")
+        .unwrap()
+        .clone();
+    assert!(
+        failed["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("control characters"),
+        "{failed}"
+    );
+    // A pre-write rejection must not fence the agent: it stays idle,
+    // the pane survives, and the queue keeps draining.
+    thread::sleep(Duration::from_millis(500));
+    let agent = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["state"].as_str().unwrap(), "idle", "{agent}");
+    assert!(agent["endpoint"].is_string(), "{agent}");
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "valid follow-up", "message": "m2"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "m2");
+    d.rpc(
+        "message_report",
+        json!({"message": "m2", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m2", &["completed"], 10);
 }
