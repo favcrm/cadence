@@ -1,4 +1,5 @@
 /target/
+/.worktrees/
 .state/
 .env
 *.log
