@@ -148,6 +148,28 @@ is one of the things the ready claim asserts absent. `agent_stop`
 kills the owned pane; daemon shutdown detaches instead, so a restart
 reattaches rather than destroying a terminal the operator may be using.
 
+**Worker-side conveniences.** The pane is spawned with
+`CADENCE_ALIAS` and `CADENCE_STATE_DIR` in its environment (`tmux
+new-session -e`), so a worker inside it can run `cadence self` to get
+`{alias, running: [{id, turn_id}]}` — its report token without asking
+the operator. `message send --ready` fuses the operator claim with the
+send: the flag *is* the explicit claim (idle, empty input, no prompt —
+verified by the human typing it), applied only on pty endpoints and
+skipped silently elsewhere. A `worker_result` routed *to* a pty PM is
+fire-and-forget: once the paste succeeds the delivery completes with
+`{"status":"completed","via":"pty_deliver"}` — the PM is not expected
+to report on a notification. Post-paste disconnect still fences
+`unknown` as usual.
+
+**Devin command approvals.** The Devin CLI persists command grants in
+the user-global `~/.config/devin/config.json` under
+`permissions.allow` as `Exec(<argv prefix>)` entries — the TUI's own
+"always allow" flow writes there. `Exec(cadence)` pre-allows every
+cadence subcommand. A project-scoped `.devin/config.json` accepts the
+same schema keys and can carry the grant with the repo, but the user
+file is the store the CLI is observed to write; both are listed here
+so the choice is deliberate rather than rediscovered.
+
 Trust boundary: the tmux socket lives under the private state dir name
 scheme but tmux sockets are reachable by the same user; the report
 route is token-possession only. Peer result text is recorded data,

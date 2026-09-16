@@ -75,6 +75,8 @@ pub struct DevinPtyAdapter {
     tmux: String,
     desired_session: Option<String>,
     cwd: String,
+    /// Cadence state dir, exported into the pane for `cadence self`.
+    state_dir: PathBuf,
 }
 
 fn short_hash(text: &str) -> String {
@@ -145,6 +147,7 @@ impl DevinPtyAdapter {
                 .unwrap_or_else(|| "tmux".to_string()),
             desired_session,
             cwd: agent.cwd.clone(),
+            state_dir,
         })
     }
 
@@ -360,6 +363,10 @@ impl ProviderAdapter for DevinPtyAdapter {
             // bare shell that would accept input meant for Devin.
             let command =
                 format!("{argv}; printf '\\nDevin exited. This pane will close.\\n'; sleep 3");
+            // Pane env identifies the agent to `cadence self`; -e args
+            // are tmux options, never shell-interpreted.
+            let env_alias = format!("CADENCE_ALIAS={session}");
+            let env_dir = format!("CADENCE_STATE_DIR={}", self.state_dir.display());
             self.tmux_ok(&[
                 "new-session",
                 "-d",
@@ -371,6 +378,10 @@ impl ProviderAdapter for DevinPtyAdapter {
                 "120",
                 "-y",
                 "40",
+                "-e",
+                &env_alias,
+                "-e",
+                &env_dir,
                 &command,
             ])?;
             let pane_pid = self.pane_pid(&session)?;
