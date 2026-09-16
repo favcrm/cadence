@@ -1,0 +1,19 @@
+name: Handover
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  handover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check shell syntax
+        run: |
+          for script in skills/agent-handover/scripts/*.sh; do
+            bash -n "$script"
+          done
+      - name: Run isolated lifecycle regressions
+        run: python3 -m unittest discover -s skills/agent-handover/tests -v
