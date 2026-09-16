@@ -54,6 +54,12 @@ Error kinds:
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
 
+Wherever a method takes `alias`, a provider-native id — `thread_id` or
+`session_id`, e.g. a Devin session slug — resolves to the canonical
+alias. An exact alias match always wins; a native id matching more than
+one agent is rejected as ambiguous. `agent_register` is the exception:
+its `alias` is a new name, never resolved.
+
 `agent_stop` is bounded: it interrupts the provider, waits a short grace
 (~3s), then force-closes the transport and joins the actor — the bound
 also covers provider initialization, since the adapter is published
