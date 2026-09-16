@@ -8,6 +8,7 @@
 pub mod codex;
 pub mod fake;
 pub mod link;
+pub mod pty;
 pub mod stdio;
 pub mod ws;
 
@@ -22,8 +23,11 @@ pub struct Identity {
     pub session_id: String,
     pub model: Option<String>,
     pub pid: u32,
-    /// Attachable endpoint (`ws://…`) for transports that support it.
+    /// Attachable endpoint (`ws://…`, `tmux://…`) when the kind has one.
     pub endpoint: Option<String>,
+    /// Live endpoint generation minted per `open` (pty uses it for
+    /// stale-report rejection); `None` where not applicable.
+    pub generation: Option<String>,
 }
 
 /// A provider-initiated request (approval, user input). `id` is the raw
@@ -75,8 +79,28 @@ pub trait ProviderAdapter: Send + Sync {
     fn interrupt(&self);
     /// Transport is gone; any outstanding turn is ambiguous.
     fn disconnected(&self) -> bool;
-    /// Release the provider process/connection.
+    /// Release the provider process/connection and any owned resources.
     fn close(&self);
+    /// Release control without killing user-visible resources — used on
+    /// daemon shutdown. Defaults to `close`; pty overrides it so an
+    /// owned tmux pane survives a controller restart (the operator may
+    /// be looking at it) and is revalidated/reattached on next open.
+    fn detach(&self) {
+        self.close();
+    }
+    /// Record an operator readiness claim (pty-style gated endpoints
+    /// only); the next send consumes it atomically.
+    fn claim_ready(&self) -> Result<()> {
+        Err(crate::error::Error::rejected(
+            "this endpoint kind has no readiness gate",
+        ))
+    }
+    /// Current terminal content for operator inspection (pty only).
+    fn capture(&self) -> Result<String> {
+        Err(crate::error::Error::rejected(
+            "this endpoint kind has no capturable screen",
+        ))
+    }
 }
 
 /// Build the adapter for an agent's `provider`/`endpoint_kind`.
@@ -100,9 +124,16 @@ pub fn build(
                 "No managed-ws adapter for provider '{other}' (implemented: codex)"
             ))),
         },
+        "pty" => match agent.provider.as_str() {
+            "devin" => Ok(Box::new(pty::DevinPtyAdapter::new(hooks, log_path, agent)?)),
+            other => Err(crate::error::Error::rejected(format!(
+                "No pty adapter for provider '{other}' (implemented: devin)"
+            ))),
+        },
         "fake" => Ok(Box::new(fake::FakeAdapter::new(hooks))),
         other => Err(crate::error::Error::rejected(format!(
-            "Endpoint kind '{other}' is not implemented (implemented: managed, managed-ws, fake)"
+            "Endpoint kind '{other}' is not implemented \
+             (implemented: managed, managed-ws, pty, fake)"
         ))),
     }
 }

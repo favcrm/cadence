@@ -360,6 +360,7 @@ impl ProviderAdapter for CodexAdapter {
                     .map(str::to_string),
                 pid: launched.pid,
                 endpoint: launched.endpoint.clone(),
+                generation: None,
             })
         })();
         opened.inspect_err(|_| self.transport.close())

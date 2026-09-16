@@ -59,6 +59,11 @@ pub struct Agent {
     pub model: Option<String>,
     pub pid: Option<i64>,
     pub endpoint: Option<String>,
+    /// Endpoint-specific registration options (`{"session": …}` for pty).
+    pub params: Option<Value>,
+    /// Minted by the owning adapter on every `open`; submission tokens
+    /// embed it so reports from a previous endpoint generation fail.
+    pub generation: Option<String>,
     pub state: String,
     pub enabled: bool,
     pub error: Option<String>,
@@ -92,6 +97,8 @@ pub struct NewAgent<'a> {
     pub cwd: &'a str,
     pub sandbox: &'a str,
     pub instructions: Option<&'a str>,
+    /// Endpoint-specific options as a JSON object (`{"session": "…"}`).
+    pub params: Option<&'a str>,
 }
 
 pub struct Store {
@@ -131,6 +138,10 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         model: row.get("model")?,
         pid: row.get("pid")?,
         endpoint: row.get("endpoint")?,
+        params: row
+            .get::<_, Option<String>>("params")?
+            .and_then(|p| serde_json::from_str(&p).ok()),
+        generation: row.get("generation")?,
         state: row.get("state")?,
         enabled: row.get::<_, i64>("enabled")? != 0,
         error: row.get("error")?,
@@ -146,7 +157,8 @@ impl Agent {
             "thread_id": self.thread_id, "session_id": self.session_id,
             "model": self.model, "pid": self.pid, "state": self.state,
             "enabled": self.enabled, "error": self.error,
-            "endpoint": self.endpoint,
+            "endpoint": self.endpoint, "params": self.params,
+            "generation": self.generation,
         })
     }
 }
@@ -228,6 +240,27 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=2", [])?;
             tx.commit()?;
         }
+        if version < 3 {
+            // v3: `params` holds endpoint-specific registration options
+            // (pty: native session to resume); `generation` is the live
+            // endpoint generation minted per `open` for stale-token
+            // rejection. Same atomic column-check + transaction pattern
+            // as v2.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(agents)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !columns.iter().any(|c| c == "params") {
+                tx.execute_batch("ALTER TABLE agents ADD COLUMN params TEXT")?;
+            }
+            if !columns.iter().any(|c| c == "generation") {
+                tx.execute_batch("ALTER TABLE agents ADD COLUMN generation TEXT")?;
+            }
+            tx.execute("UPDATE schema_version SET version=3", [])?;
+            tx.commit()?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -247,7 +280,8 @@ impl Store {
             [],
         )?;
         conn.execute(
-            "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL
+            "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL,
+                generation=NULL
              WHERE state != 'stopped'",
             [],
         )?;
@@ -308,12 +342,21 @@ impl Store {
                 ));
             }
         }
+        if let Some(p) = new.params {
+            let parsed: Value = serde_json::from_str(p)
+                .map_err(|_| Error::rejected("params must be a JSON object"))?;
+            if !parsed.is_object() || p.len() > 4_000 {
+                return Err(Error::rejected(
+                    "params must be a JSON object of at most 4000 characters",
+                ));
+            }
+        }
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,
-                               instructions,state,created,updated)
-             VALUES(?,?,?,?,?,?,?,'starting',?,?)",
+                               instructions,params,state,created,updated)
+             VALUES(?,?,?,?,?,?,?,?,'starting',?,?)",
             params![
                 new.alias,
                 new.provider,
@@ -322,6 +365,7 @@ impl Store {
                 new.cwd,
                 new.sandbox,
                 new.instructions,
+                new.params,
                 now(),
                 now()
             ],
@@ -462,6 +506,83 @@ impl Store {
         Ok(())
     }
 
+    /// Return a `submitting` message to `queued` — the submission gate
+    /// refused before any paste, so retry is safe.
+    pub fn requeue(&self, message_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET state='queued',started=NULL
+             WHERE id=? AND state='submitting'",
+            [message_id],
+        )?;
+        Ok(())
+    }
+
+    /// PTY submission was accepted by the terminal: the message stays
+    /// `running` (turn_id already recorded) with a durable `submitted`
+    /// marker until an explicit ack/result report lands.
+    pub fn mark_submitted(&self, message: &Message) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE messages SET result=? WHERE id=? AND state='running'",
+            params![
+                json!({"status": "submitted", "ack": Value::Null}).to_string(),
+                message.id
+            ],
+        )?;
+        Self::event(
+            &tx,
+            &message.alias,
+            "submitted",
+            json!({"message": message.id, "turn_id": message.turn_id}),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Explicit acknowledgement for a submitted PTY message; the
+    /// message stays `running` until a result report completes it.
+    pub fn mark_ack(&self, message: &Message, text: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let n = tx.execute(
+            "UPDATE messages SET result=? WHERE id=? AND state='running'",
+            params![
+                json!({"status": "submitted",
+                       "ack": {"text": text, "at": now()}})
+                .to_string(),
+                message.id
+            ],
+        )?;
+        if n == 0 {
+            return Err(Error::rejected(format!(
+                "Message {} is not awaiting a report (state {})",
+                message.id, message.state
+            )));
+        }
+        Self::event(
+            &tx,
+            &message.alias,
+            "acknowledged",
+            json!({"message": message.id, "turn_id": message.turn_id}),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Endpoint died while submitted PTY messages were in flight — each
+    /// may have reached the provider, so they are `unknown`, never retried.
+    pub fn orphan_running(&self, alias: &str, error: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET state='unknown',error=?,completed=?
+             WHERE alias=? AND state='running'",
+            params![error, now(), alias],
+        )?;
+        Ok(())
+    }
+
     /// Persist the result and route it to `reply_to` in the SAME
     /// transaction — the outbox pattern. Routed deliveries get a
     /// deterministic id and no `reply_to`, so they cannot create loops.
@@ -565,28 +686,30 @@ impl Store {
     }
 
     /// Persist native provider identity after a successful adapter `open`.
-    /// `endpoint` is the attachable transport address (`ws://…`) when the
-    /// endpoint kind exposes one.
-    pub fn set_identity(
-        &self,
-        alias: &str,
-        thread_id: &str,
-        session_id: &str,
-        model: Option<&str>,
-        pid: u32,
-        endpoint: Option<&str>,
-    ) -> Result<()> {
+    /// `endpoint` is the attachable transport address (`ws://…`,
+    /// `tmux://…`) when the endpoint kind exposes one; `generation`
+    /// partitions submission tokens per endpoint life.
+    pub fn set_identity(&self, alias: &str, id: &crate::adapter::Identity) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
+        // A fresh endpoint generation cannot claim reports for turns
+        // submitted through the previous one — fence them as unknown.
+        tx.execute(
+            "UPDATE messages SET state='unknown',
+                error='endpoint restarted during in-flight submission',
+                completed=? WHERE alias=? AND state='running'",
+            params![now(), alias],
+        )?;
         tx.execute(
             "UPDATE agents SET thread_id=?,session_id=?,model=?,pid=?,
-                endpoint=?,state='idle',updated=? WHERE alias=?",
+                endpoint=?,generation=?,state='idle',updated=? WHERE alias=?",
             params![
-                thread_id,
-                session_id,
-                model,
-                pid as i64,
-                endpoint,
+                id.thread_id,
+                id.session_id,
+                id.model,
+                id.pid as i64,
+                id.endpoint,
+                id.generation,
                 now(),
                 alias
             ],
@@ -595,8 +718,9 @@ impl Store {
             &tx,
             alias,
             "ready",
-            json!({"thread_id": thread_id, "session_id": session_id,
-                   "model": model, "pid": pid, "endpoint": endpoint}),
+            json!({"thread_id": id.thread_id, "session_id": id.session_id,
+                   "model": id.model, "pid": id.pid, "endpoint": id.endpoint,
+                   "generation": id.generation}),
         )?;
         tx.commit()?;
         Ok(())
@@ -617,7 +741,8 @@ impl Store {
     pub fn clear_runtime(&self, alias: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE agents SET pid=NULL, endpoint=NULL WHERE alias=?",
+            "UPDATE agents SET pid=NULL, endpoint=NULL, generation=NULL
+             WHERE alias=?",
             [alias],
         )?;
         Ok(())
@@ -690,6 +815,7 @@ mod tests {
             cwd: cwd.to_str().unwrap(),
             sandbox: "read-only",
             instructions: None,
+            params: None,
         })
         .unwrap();
     }
@@ -821,8 +947,18 @@ mod tests {
             let agent = s.agent("a1").unwrap();
             assert_eq!(agent.endpoint, None);
             assert_eq!(s.message("m1").unwrap().unwrap().body, "keep me");
-            s.set_identity("a1", "th", "s", None, 1, Some("ws://x"))
-                .unwrap();
+            s.set_identity(
+                "a1",
+                &crate::adapter::Identity {
+                    thread_id: "th".into(),
+                    session_id: "s".into(),
+                    model: None,
+                    pid: 1,
+                    endpoint: Some("ws://x".into()),
+                    generation: None,
+                },
+            )
+            .unwrap();
             assert_eq!(s.agent("a1").unwrap().endpoint.as_deref(), Some("ws://x"));
         }
         // The interrupted-upgrade state (column present, version 1)
@@ -845,7 +981,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         Store::open(&db).unwrap();
     }
 }
