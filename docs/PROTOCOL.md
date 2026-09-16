@@ -90,6 +90,14 @@ depend on it:
 pty uses `{"session": "<native-id>"}` to resume an existing Devin
 session instead of starting a fresh one.
 
+`params` also carries wiring metadata: `{"upstream": "<pm-alias>"}`
+marks the agent as a worker joined to a group (`cadence join` sets it).
+When a message is sent to such an agent without an explicit `reply_to`,
+`agent_send`/`agent_ask` default `reply_to` to the upstream alias, so
+the worker's result lands on the PM's queue. An explicit `reply_to`
+always wins; `reply_to` may still not equal the sender alias and must
+name a registered agent (both enforced by `enqueue`).
+
 ## pty endpoints (provider `devin`)
 
 Cadence launches `devin [-r <session>]` inside a detached tmux session
@@ -155,7 +163,11 @@ codex resume --remote <endpoint> <thread_id>
 ```
 
 (`cadence agent attach <alias>` prints this command; `--run` executes it
-in the current terminal.) A fresh `managed-ws` thread is seeded with one
+in the current terminal. The top-level `cadence attach [name]` is
+client-side sugar over `agent_show` + `agent_list`: it resolves an alias
+or native id, then a provider name when exactly one live agent of that
+provider exists — ambiguous or absent names list candidates rather than
+guess.) A fresh `managed-ws` thread is seeded with one
 minimal turn at open — Codex only persists a thread's rollout after its
 first turn, and `resume --remote` fails on an unseeded thread. The
 endpoint is cleared when the actor exits, so a printed command never
