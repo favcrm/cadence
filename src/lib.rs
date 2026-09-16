@@ -1,0 +1,14 @@
+//! Cadence agent controller — library surface.
+//!
+//! The CLI binary `cadence` is a thin client over this library plus the
+//! Unix-socket daemon defined in [`daemon`].
+
+pub mod adapter;
+pub mod client;
+pub mod daemon;
+pub mod doctor;
+pub mod error;
+pub mod proto;
+pub mod store;
+
+pub use error::{Error, Result};

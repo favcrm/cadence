@@ -1,6 +1,6 @@
 # Proposed favcrm/cadence — implementation plan
 
-Status: implementation authorized by the user, 2026-09-16. Suggested binary: `cadence` (avoid collision with Harbor container registry tooling). MIT. Org repository name is currently unused; global package/trademark availability not established.
+Status: implementation authorized by the user, 2026-09-16. Repository: https://github.com/favcrm/cadence. Binary: `cadence`; Rust package: `cadence-agent`. MIT. No crates.io publication or global name exclusivity is claimed.
 
 ## Outcome
 
@@ -58,7 +58,7 @@ Loop: assign -> ACK -> implement -> report revision/tests -> independent QA -> r
 
 ## Milestones / acceptance
 
-M0: review this plan, fix naming/scope; author public-safe source inventory and threat/failure cases. No publication yet.
+M0: review this plan, settle protocol/scope, and author public-safe source inventory and threat/failure cases. The documentation bootstrap is published; implementation proceeds through protected PRs.
 M1: Rust build, doctor, private socket, SQLite migration, registry, queue/events and CLI. Tests: concurrent send, idempotency conflict, restart replay, unknown execution, ownership. Linux build first.
 M2: native-terminal adapters, starting with original Devin and Codex. Tests: visible incoming prompt AND distinct actual reply, same native identity, preserved operator draft, idle/busy routing, permission prompt, disconnect/reconnect. Cursor official TUI and Claude inbox each get independent tests; mark blocked until passed.
 M3: job/task lifecycle, worktree scope, kickoff/result schema, revision-bound QA verdict, bounded revision loop. End-to-end seeded bug: worker fix -> reviewer rejects -> revision -> reviewer passes -> PM receives completion in original TUI.
