@@ -1,4 +1,5 @@
-//! Managed Codex adapter: `codex app-server --listen stdio://`.
+//! Managed Codex adapter over stdio or a loopback WebSocket app-server
+//! (`managed` / `managed_ws` endpoints).
 //!
 //! Ports the reference adapter: initialize + thread start/resume,
 //! `turn/start` correlated by `clientUserMessageId`, turn completion via
@@ -8,18 +9,26 @@
 //! initialize, not assumed.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::stdio::{Incoming, StdioAdapter};
+use super::link::Incoming;
+use super::stdio::StdioAdapter;
+use super::ws::WsAdapter;
 use super::{AdapterHooks, Identity, ProviderAdapter, ProviderRequest, TurnResult};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
 const TURN_DEADLINE: Duration = Duration::from_secs(600);
+
+const ENV_SCRUB: &[&str] = &[
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ID",
+];
 
 /// Provider command; `CADENCE_CODEX_COMMAND` overrides it (test/mock use).
 fn codex_command() -> Vec<String> {
@@ -35,8 +44,100 @@ fn codex_command() -> Vec<String> {
         .collect()
 }
 
+/// Command prefix for the WebSocket app-server; `--listen <url>` is
+/// appended by the transport. `CADENCE_CODEX_WS_COMMAND` overrides it.
+fn codex_ws_command() -> Vec<String> {
+    if let Ok(cmd) = std::env::var("CADENCE_CODEX_WS_COMMAND") {
+        let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+        if !parts.is_empty() {
+            return parts;
+        }
+    }
+    ["codex", "app-server"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Owned provider process + wire transport, selected by endpoint kind.
+pub enum Transport {
+    Stdio(Arc<StdioAdapter>),
+    Ws(Arc<WsAdapter>),
+}
+
+/// A launched transport: provider pid plus its attachable endpoint.
+pub struct Launched {
+    pub pid: u32,
+    pub endpoint: Option<String>,
+}
+
+impl Transport {
+    fn launch(&self, cwd: &str, log: &Path) -> Result<Launched> {
+        match self {
+            Transport::Stdio(adapter) => Ok(Launched {
+                pid: adapter.launch(cwd, log)?,
+                endpoint: None,
+            }),
+            Transport::Ws(adapter) => {
+                let launched = adapter.launch(cwd, log)?;
+                Ok(Launched {
+                    pid: launched.pid,
+                    endpoint: Some(launched.endpoint),
+                })
+            }
+        }
+    }
+
+    fn send(&self, message: Value) -> Result<()> {
+        match self {
+            Transport::Stdio(a) => a.send(message),
+            Transport::Ws(a) => a.send(message),
+        }
+    }
+
+    fn request(&self, method: &str, params: Value) -> Result<Value> {
+        match self {
+            Transport::Stdio(a) => a.request(method, params),
+            Transport::Ws(a) => a.request(method, params),
+        }
+    }
+
+    fn request_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        match self {
+            Transport::Stdio(a) => a.request_timeout(method, params, timeout),
+            Transport::Ws(a) => a.request_timeout(method, params, timeout),
+        }
+    }
+
+    fn respond(&self, request_id: &Value, result: Value) -> Result<()> {
+        match self {
+            Transport::Stdio(a) => a.respond(request_id, result),
+            Transport::Ws(a) => a.respond(request_id, result),
+        }
+    }
+
+    fn disconnected(&self) -> bool {
+        match self {
+            Transport::Stdio(a) => a.disconnected(),
+            Transport::Ws(a) => a.disconnected(),
+        }
+    }
+
+    fn close(&self) {
+        match self {
+            Transport::Stdio(a) => a.close(),
+            Transport::Ws(a) => a.close(),
+        }
+    }
+
+    /// True when an official Codex TUI can attach to this endpoint.
+    fn attachable(&self) -> bool {
+        matches!(self, Transport::Ws(_))
+    }
+}
+
 pub struct CodexAdapter {
-    stdio: Arc<StdioAdapter>,
+    transport: Transport,
     shared: Arc<Shared>,
     log_path: PathBuf,
 }
@@ -53,32 +154,96 @@ struct Shared {
     active_turn: Mutex<Option<String>>,
 }
 
+fn shared_state(hooks: AdapterHooks) -> Arc<Shared> {
+    Arc::new(Shared {
+        hooks,
+        items: Mutex::new(HashMap::new()),
+        completed: Mutex::new(HashMap::new()),
+        turn_cv: Condvar::new(),
+        thread_id: Mutex::new(None),
+        active_turn: Mutex::new(None),
+    })
+}
+
 impl CodexAdapter {
-    pub fn new(hooks: AdapterHooks, log_path: &std::path::Path) -> Self {
-        let shared = Arc::new(Shared {
-            hooks,
-            items: Mutex::new(HashMap::new()),
-            completed: Mutex::new(HashMap::new()),
-            turn_cv: Condvar::new(),
-            thread_id: Mutex::new(None),
-            active_turn: Mutex::new(None),
-        });
-        let routed = Arc::clone(&shared);
-        let disconnected = Arc::clone(&shared);
-        let stdio = StdioAdapter::new(
-            &codex_command(),
-            &[
-                "CODEX_THREAD_ID",
-                "CODEX_SESSION_ID",
-                "CLAUDE_CODE_SESSION_ID",
-            ],
-            Box::new(move |incoming| routed.dispatch(incoming)),
-            Box::new(move || disconnected.on_disconnect()),
-        );
+    /// Hooks wired into a fresh transport adapter.
+    fn build_transport(command: &[String], ws: bool, shared: &Arc<Shared>) -> Transport {
+        let routed = Arc::clone(shared);
+        let disconnected = Arc::clone(shared);
+        if ws {
+            Transport::Ws(WsAdapter::new(
+                command,
+                ENV_SCRUB,
+                Box::new(move |incoming| routed.dispatch(incoming)),
+                Box::new(move || disconnected.on_disconnect()),
+            ))
+        } else {
+            Transport::Stdio(StdioAdapter::new(
+                command,
+                ENV_SCRUB,
+                Box::new(move |incoming| routed.dispatch(incoming)),
+                Box::new(move || disconnected.on_disconnect()),
+            ))
+        }
+    }
+
+    /// stdio endpoint: `codex app-server --listen stdio://`.
+    pub fn new(hooks: AdapterHooks, log_path: &Path) -> Self {
+        let shared = shared_state(hooks);
         Self {
-            stdio,
+            transport: Self::build_transport(&codex_command(), false, &shared),
             shared,
             log_path: log_path.to_path_buf(),
+        }
+    }
+
+    /// WebSocket endpoint: `codex app-server --listen ws://127.0.0.1:PORT`,
+    /// attachable by an official TUI via `codex resume --remote`.
+    pub fn new_ws(hooks: AdapterHooks, log_path: &Path) -> Self {
+        let shared = shared_state(hooks);
+        Self {
+            transport: Self::build_transport(&codex_ws_command(), true, &shared),
+            shared,
+            log_path: log_path.to_path_buf(),
+        }
+    }
+
+    /// One minimal turn so a fresh thread's rollout is persisted and an
+    /// official TUI can attach to it. Bounded by its own deadline.
+    fn seed_turn(&self, thread_id: &str) -> Result<()> {
+        let result = self.transport.request_timeout(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": [{"type": "text",
+                    "text": "Cadence endpoint initialization. Reply READY."}],
+            }),
+            Duration::from_secs(120),
+        )?;
+        let turn_id = result
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::unknown("seed turn/start returned no turn id"))?
+            .to_string();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut completed = self.shared.completed.lock().unwrap();
+        loop {
+            if completed.remove(&turn_id).is_some() {
+                return Ok(());
+            }
+            if self.transport.disconnected() {
+                return Err(Error::unknown("Connection lost during seed turn"));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::unknown("Seed turn deadline reached"));
+            }
+            let (guard, _) = self
+                .shared
+                .turn_cv
+                .wait_timeout(completed, remaining)
+                .unwrap();
+            completed = guard;
         }
     }
 }
@@ -122,7 +287,7 @@ impl Shared {
                 }
                 self.emit(method, &params);
             }
-            "turn/started" | "error" => self.emit(method, &params),
+            "turn/started" | "error" | "serverRequest/resolved" => self.emit(method, &params),
             _ => {}
         }
     }
@@ -142,16 +307,15 @@ impl Shared {
 
 impl ProviderAdapter for CodexAdapter {
     fn open(&self, agent: &Agent) -> Result<Identity> {
-        self.stdio.launch(&agent.cwd, &self.log_path)?;
+        let launched = self.transport.launch(&agent.cwd, &self.log_path)?;
         // Everything after launch is guarded: any failure closes the
         // transport so no owned provider process is left behind.
         let opened = (|| -> Result<Identity> {
-            let pid = self.stdio.pid().unwrap_or(0);
-            self.stdio.request(
+            self.transport.request(
                 "initialize",
                 json!({"clientInfo": {"name": "cadence-agent", "version": "0.1.0"}}),
             )?;
-            self.stdio
+            self.transport
                 .send(json!({"method": "initialized", "params": {}}))?;
             let mut params = json!({
                 "cwd": agent.cwd,
@@ -164,18 +328,25 @@ impl ProviderAdapter for CodexAdapter {
             if let Some(thread) = &agent.thread_id {
                 params["threadId"] = json!(thread);
             }
-            let method = if agent.thread_id.is_some() {
-                "thread/resume"
-            } else {
+            let fresh = agent.thread_id.is_none();
+            let method = if fresh {
                 "thread/start"
+            } else {
+                "thread/resume"
             };
-            let result = self.stdio.request(method, params)?;
+            let result = self.transport.request(method, params)?;
             let thread_id = result
                 .pointer("/thread/id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::provider("thread/start returned no thread id"))?
                 .to_string();
             *self.shared.thread_id.lock().unwrap() = Some(thread_id.clone());
+            // A TUI can only resume a thread whose rollout is persisted —
+            // which happens after its first turn. Seed fresh WebSocket
+            // threads with one minimal turn so `agent attach` works.
+            if fresh && self.transport.attachable() {
+                self.seed_turn(&thread_id)?;
+            }
             Ok(Identity {
                 session_id: result
                     .pointer("/thread/sessionId")
@@ -187,10 +358,11 @@ impl ProviderAdapter for CodexAdapter {
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                pid,
+                pid: launched.pid,
+                endpoint: launched.endpoint.clone(),
             })
         })();
-        opened.inspect_err(|_| self.stdio.close())
+        opened.inspect_err(|_| self.transport.close())
     }
 
     fn run_turn(
@@ -206,7 +378,7 @@ impl ProviderAdapter for CodexAdapter {
             .unwrap()
             .clone()
             .ok_or_else(|| Error::provider("Codex thread is not open"))?;
-        let result = self.stdio.request(
+        let result = self.transport.request(
             "turn/start",
             json!({
                 "threadId": thread_id,
@@ -301,7 +473,7 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn respond(&self, request_id: &Value, result: Value) -> Result<()> {
-        self.stdio.respond(request_id, result)
+        self.transport.respond(request_id, result)
     }
 
     fn interrupt(&self) {
@@ -309,7 +481,7 @@ impl ProviderAdapter for CodexAdapter {
         let turn = self.shared.active_turn.lock().unwrap().clone();
         if let (Some(thread), Some(turn)) = (thread_id, turn) {
             if !self.disconnected() {
-                let _ = self.stdio.request_timeout(
+                let _ = self.transport.request_timeout(
                     "turn/interrupt",
                     json!({"threadId": thread, "turnId": turn}),
                     Duration::from_secs(5),
@@ -319,10 +491,10 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn disconnected(&self) -> bool {
-        self.stdio.disconnected()
+        self.transport.disconnected()
     }
 
     fn close(&self) {
-        self.stdio.close();
+        self.transport.close();
     }
 }

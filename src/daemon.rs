@@ -205,7 +205,53 @@ impl Shared {
                 "method": method, "data": params,
             }),
         );
+        if method == "serverRequest/resolved" {
+            self.resolve_external(alias, &params);
+        }
         self.wake();
+    }
+
+    /// The provider resolved a request outside Cadence — e.g. an
+    /// attached official TUI answered the approval. Drop the matching
+    /// pending handle so a late `agent respond` is rejected rather than
+    /// double-answering; other pending requests survive, and the agent
+    /// stays `waiting_input` while any remain.
+    fn resolve_external(&self, alias: &str, params: &Value) {
+        let request_id = params.get("requestId").cloned().unwrap_or(Value::Null);
+        let mut pending = self.pending.lock().unwrap();
+        let resolved: Vec<String> = pending
+            .iter()
+            .filter(|(_, req)| req.alias == alias && req.id == request_id)
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        if resolved.is_empty() {
+            return;
+        }
+        for handle in &resolved {
+            pending.remove(handle);
+            let _ = self
+                .store
+                .event_public(alias, "input_resolved", json!({"request": handle}));
+        }
+        drop(pending);
+        self.relax_waiting(alias);
+    }
+
+    /// Relax `waiting_input` → `busy` only if no pending requests remain
+    /// for the alias AND the agent is still waiting. The pending mutex
+    /// is held across the conditional update, so a request arriving in
+    /// between cannot have its `waiting_input` clobbered, and the SQL
+    /// `WHERE state='waiting_input'` can never overwrite a concurrently
+    /// finished/fenced/stopped state. Lock order is pending → store
+    /// conn everywhere; nothing takes conn → pending.
+    fn relax_waiting(&self, alias: &str) {
+        let pending = self.pending.lock().unwrap();
+        if pending.values().any(|req| req.alias == alias) {
+            return;
+        }
+        let _ = self
+            .store
+            .set_agent_state_if(alias, "busy", "waiting_input");
     }
 
     fn on_provider_request(self: &Arc<Self>, alias: &str, request: ProviderRequest) {
@@ -219,7 +265,11 @@ impl Shared {
                 params: request.params.clone(),
             },
         );
-        let _ = self.store.set_agent_state(alias, "waiting_input", None);
+        // Requests only arrive mid-turn; relax/stop may have moved the
+        // agent on already — never clobber a non-busy state.
+        let _ = self
+            .store
+            .set_agent_state_if(alias, "waiting_input", "busy");
         let _ = self.store.event_public(
             alias,
             "input_required",
@@ -241,7 +291,7 @@ impl Shared {
             pending.retain(|_, req| req.alias != alias);
         }
         let closing = self.closing.load(Ordering::SeqCst);
-        let _ = self.store.set_pid(alias, None);
+        let _ = self.store.clear_runtime(alias);
         match outcome {
             Err(ref error) => {
                 let _ = self
@@ -303,6 +353,7 @@ impl Shared {
                 &identity.session_id,
                 identity.model.as_deref(),
                 identity.pid,
+                identity.endpoint.as_deref(),
             )
         });
         if let Err(error) = opened {
@@ -559,28 +610,22 @@ impl Shared {
         let decision = optional_str(params, "decision");
         // Explicit JSON null means "not provided".
         let answers = params.get("answers").filter(|a| !a.is_null()).cloned();
-        let pending = {
-            let map = self.pending.lock().unwrap();
-            map.get(handle).map(|req| {
-                (
-                    req.alias.clone(),
-                    req.id.clone(),
-                    req.method.clone(),
-                    req.params.clone(),
-                )
-            })
-        };
-        let Some((owner, request_id, method, request_params)) = pending else {
-            return Err(Error::rejected(
-                "Request is no longer pending for this agent",
-            ));
-        };
-        if owner != alias {
-            return Err(Error::rejected(
-                "Request is no longer pending for this agent",
-            ));
-        }
-        let response = match method.as_str() {
+        // Claim the handle atomically: whichever path removes it first
+        // — this respond or an external `serverRequest/resolved` — owns
+        // the answer, and every other path sees "no longer pending".
+        // Validation runs under the same lock so a malformed respond
+        // leaves the request pending instead of consuming it. No I/O
+        // happens while the lock is held.
+        let (request_id, response) = {
+            let mut map = self.pending.lock().unwrap();
+            let req = map
+                .get(handle)
+                .filter(|req| req.alias == alias)
+                .ok_or_else(|| Error::rejected("Request is no longer pending for this agent"))?;
+            let request_id = req.id.clone();
+            let method = req.method.clone();
+            let request_params = req.params.clone();
+            let response = match method.as_str() {
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                 match decision {
                     Some("accept") | Some("decline") if answers.is_none() => {
@@ -618,6 +663,9 @@ impl Shared {
             _ => return Err(Error::rejected(
                 "This request type is not supported; stop the agent or use the provider directly",
             )),
+            };
+            map.remove(handle);
+            (request_id, response)
         };
         let adapter = self
             .lifecycle
@@ -629,8 +677,7 @@ impl Shared {
         let adapter = adapter
             .ok_or_else(|| Error::internal("Agent adapter is not available for this request"))?;
         adapter.respond(&request_id, response)?;
-        self.pending.lock().unwrap().remove(handle);
-        self.store.set_agent_state(alias, "busy", None)?;
+        self.relax_waiting(alias);
         let _ = self
             .store
             .event_public(alias, "input_answered", json!({"request": handle}));
