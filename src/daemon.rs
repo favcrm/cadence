@@ -461,6 +461,17 @@ impl Shared {
         // the message — it stays `running` meanwhile.
         if result.status == "submitted" {
             self.store.mark_submitted(message)?;
+            // A routed notification's delivery IS its completion — the
+            // receiving PM is not expected to report a result on it.
+            if message.source == "worker_result" {
+                self.store.finish(
+                    message,
+                    "completed",
+                    &json!({"status": "completed", "via": "pty_deliver",
+                            "turn_id": result.turn_id}),
+                    None,
+                )?;
+            }
             self.wake();
             return Ok(());
         }

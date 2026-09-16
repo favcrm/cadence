@@ -138,6 +138,11 @@ enum Commands {
         #[arg(long)]
         print: bool,
     },
+    /// Inside a cadence-owned pane: print this agent's alias, its
+    /// running message id and the report token for it. Errors when
+    /// `CADENCE_ALIAS` is absent (not a cadence pane).
+    #[command(name = "self")]
+    SelfInfo,
     /// Read the durable event log for an agent.
     Events {
         /// Agent alias or provider-native id (Devin slug, Codex thread).
@@ -250,6 +255,11 @@ enum MessageAction {
         /// Route the result to another agent when the turn finishes.
         #[arg(long)]
         reply_to: Option<String>,
+        /// Claim `agent ready` for the target first — the flag IS the
+        /// operator's explicit claim (idle, empty input, no prompt),
+        /// fused with the send. No-op on non-pty endpoints.
+        #[arg(long)]
+        ready: bool,
     },
     /// Send and wait for the turn's terminal state.
     Ask {
@@ -559,6 +569,23 @@ fn run() -> Result<i32> {
             instructions_file,
         ),
         Commands::Attach { name, print } => attach_command(&state_dir, name, print),
+        Commands::SelfInfo => {
+            let alias = std::env::var("CADENCE_ALIAS").map_err(|_| {
+                Error::rejected("CADENCE_ALIAS is not set — not inside a cadence-owned pane")
+            })?;
+            let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
+            let running = show["messages"]
+                .as_array()
+                .map(|ms| {
+                    ms.iter()
+                        .filter(|m| m["state"].as_str() == Some("running"))
+                        .map(|m| json!({"id": m["id"], "turn_id": m["turn_id"]}))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            print_json(&json!({"alias": alias, "running": running}));
+            Ok(0)
+        }
         Commands::Message { action } => {
             let (result, pending) = match action {
                 MessageAction::Send {
@@ -567,8 +594,19 @@ fn run() -> Result<i32> {
                     file,
                     message,
                     reply_to,
+                    ready,
                 } => {
                     let body = read_body(text, file)?;
+                    // --ready IS the operator's explicit claim — the
+                    // human typing it asserts the pane is idle with an
+                    // empty input. Skipped silently on endpoints where
+                    // readiness claims don't exist.
+                    if ready {
+                        let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
+                        if show["agent"]["endpoint_kind"].as_str() == Some("pty") {
+                            client::rpc(&state_dir, "agent_ready", json!({"alias": alias}))?;
+                        }
+                    }
                     (
                         client::rpc(
                             &state_dir,
@@ -1118,6 +1156,38 @@ mod tests {
                 name: Some(n),
                 print: true
             } if n == "devin"
+        ));
+    }
+
+    #[test]
+    fn self_command_parses() {
+        let cli = Cli::try_parse_from(["cadence", "self"]).unwrap();
+        assert!(matches!(cli.command, Commands::SelfInfo));
+    }
+
+    #[test]
+    fn send_ready_parses() {
+        let cli = Cli::try_parse_from([
+            "cadence", "message", "send", "w1", "--text", "hi", "--ready",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Message {
+                action: MessageAction::Send { ready, alias, .. },
+            } => {
+                assert!(ready);
+                assert_eq!(alias, "w1");
+            }
+            _ => panic!("expected message send"),
+        }
+        // Without --ready the flag defaults off.
+        let cli =
+            Cli::try_parse_from(["cadence", "message", "send", "w1", "--text", "hi"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Message {
+                action: MessageAction::Send { ready: false, .. }
+            }
         ));
     }
 }
