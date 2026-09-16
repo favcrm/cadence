@@ -425,12 +425,14 @@ impl ProviderAdapter for DevinPtyAdapter {
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         // Literal-only content: pasted verbatim, so reject anything the
-        // TUI could interpret as keys.
+        // TUI could interpret as keys. These are `pre_write` rejections —
+        // provably no bytes reached the pane, so the message fails
+        // without fencing the endpoint.
         if prompt.is_empty() || prompt.len() > 4000 {
-            return Err(Error::rejected("PTY messages must be 1–4000 characters"));
+            return Err(Error::pre_write("PTY messages must be 1–4000 characters"));
         }
         if prompt.chars().any(|c| (c as u32) < 32 || c as u32 == 127) {
-            return Err(Error::rejected(
+            return Err(Error::pre_write(
                 "PTY messages must be a single line without control characters",
             ));
         }
