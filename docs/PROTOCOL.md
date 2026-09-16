@@ -72,9 +72,31 @@ depend on it:
 | endpoint_kind | delivery | status |
 |---|---|---|
 | `managed` | owned provider process (JSON-RPC stdio) | implemented: provider `codex` |
+| `managed-ws` | owned `codex app-server --listen ws://127.0.0.1:*`; official TUI attachable | implemented: provider `codex` |
 | `fake` | in-process test double | test fixture only |
 | `pty` | terminal paste/capture | declared, not implemented |
 | `native_inbox` | provider-native inbox | declared, not implemented |
+
+`managed-ws` runs the same app-server protocol as `managed`, over a
+loopback WebSocket instead of stdio. The agent record exposes `endpoint`
+(`ws://127.0.0.1:<port>`) while the actor is alive; an official Codex
+TUI attaches to the same native thread with:
+
+```
+codex resume --remote <endpoint> <thread_id>
+```
+
+(`cadence agent attach <alias>` prints this command; `--run` executes it
+in the current terminal.) A fresh `managed-ws` thread is seeded with one
+minimal turn at open — Codex only persists a thread's rollout after its
+first turn, and `resume --remote` fails on an unseeded thread. The
+endpoint is cleared when the actor exits, so a printed command never
+points at a dead address; attaching to a `stopped`/`offline` or non-WS
+agent is `rejected`. Terminal echo of a submitted prompt is visibility,
+not receipt — message state remains authoritative. Approval requests
+remain brokered through `agent_respond`; an attached TUI may also see
+and answer them, in which case the pending request resolves or is
+cancelled provider-side (never auto-accepted by Cadence).
 
 Agent states: `starting → idle ⇄ busy → waiting_input →` and terminal-ish
 `attention | stopping → stopped | offline`. `attention` means an uncertain

@@ -39,6 +39,20 @@ prototype (`agent-harness-test/managed.py`, `service.py`,
   (uncorrelatable `turn/start`, unclassifiable status) persist `unknown`;
   adapter published before `open` and guarded so init stops are bounded
   and failed initialization leaves no provider process behind.
+- M2a — `managed-ws` endpoint: owned `codex app-server --listen
+  ws://127.0.0.1:<ephemeral>` (loopback only, own process group), the
+  same app-server JSON-RPC protocol over a blocking WebSocket
+  (`tungstenite`, split via `try_clone` + `from_raw_socket`). Shared
+  request/response correlation extracted to `adapter/link.rs` so stdio
+  and WS transports cannot diverge. Fresh threads get one minimal seed
+  turn at open — Codex persists a thread's rollout only after its first
+  turn, which is what `codex resume --remote` needs to attach. Agent
+  record carries `endpoint`; cleared on actor exit. `agent attach`
+  prints (or `--run` executes) `codex resume --remote <endpoint>
+  <thread>`; rejected for non-WS kinds, dead agents, or missing
+  endpoint/thread. Live smoke verified: official TUI attached to the
+  exact native thread showed an externally submitted prompt and its
+  separate actual reply (`CADENCE_WS_SMOKE_42`).
 
 ## Deferred (documented, not claimed)
 

@@ -241,7 +241,7 @@ impl Shared {
             pending.retain(|_, req| req.alias != alias);
         }
         let closing = self.closing.load(Ordering::SeqCst);
-        let _ = self.store.set_pid(alias, None);
+        let _ = self.store.clear_runtime(alias);
         match outcome {
             Err(ref error) => {
                 let _ = self
@@ -303,6 +303,7 @@ impl Shared {
                 &identity.session_id,
                 identity.model.as_deref(),
                 identity.pid,
+                identity.endpoint.as_deref(),
             )
         });
         if let Err(error) = opened {

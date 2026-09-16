@@ -58,6 +58,7 @@ pub struct Agent {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub pid: Option<i64>,
+    pub endpoint: Option<String>,
     pub state: String,
     pub enabled: bool,
     pub error: Option<String>,
@@ -129,6 +130,7 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         session_id: row.get("session_id")?,
         model: row.get("model")?,
         pid: row.get("pid")?,
+        endpoint: row.get("endpoint")?,
         state: row.get("state")?,
         enabled: row.get::<_, i64>("enabled")? != 0,
         error: row.get("error")?,
@@ -144,6 +146,7 @@ impl Agent {
             "thread_id": self.thread_id, "session_id": self.session_id,
             "model": self.model, "pid": self.pid, "state": self.state,
             "enabled": self.enabled, "error": self.error,
+            "endpoint": self.endpoint,
         })
     }
 }
@@ -207,6 +210,12 @@ impl Store {
                  UPDATE schema_version SET version=1;",
             )?;
         }
+        if version < 2 {
+            conn.execute_batch(
+                "ALTER TABLE agents ADD COLUMN endpoint TEXT;
+                 UPDATE schema_version SET version=2;",
+            )?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -226,7 +235,7 @@ impl Store {
             [],
         )?;
         conn.execute(
-            "UPDATE agents SET state='offline', pid=NULL
+            "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL
              WHERE state != 'stopped'",
             [],
         )?;
@@ -531,6 +540,8 @@ impl Store {
     }
 
     /// Persist native provider identity after a successful adapter `open`.
+    /// `endpoint` is the attachable transport address (`ws://…`) when the
+    /// endpoint kind exposes one.
     pub fn set_identity(
         &self,
         alias: &str,
@@ -538,20 +549,29 @@ impl Store {
         session_id: &str,
         model: Option<&str>,
         pid: u32,
+        endpoint: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE agents SET thread_id=?,session_id=?,model=?,pid=?,
-                state='idle',updated=? WHERE alias=?",
-            params![thread_id, session_id, model, pid as i64, now(), alias],
+                endpoint=?,state='idle',updated=? WHERE alias=?",
+            params![
+                thread_id,
+                session_id,
+                model,
+                pid as i64,
+                endpoint,
+                now(),
+                alias
+            ],
         )?;
         Self::event(
             &tx,
             alias,
             "ready",
             json!({"thread_id": thread_id, "session_id": session_id,
-                   "model": model, "pid": pid}),
+                   "model": model, "pid": pid, "endpoint": endpoint}),
         )?;
         tx.commit()?;
         Ok(())
@@ -566,11 +586,14 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_pid(&self, alias: &str, pid: Option<u32>) -> Result<()> {
+    /// Clear runtime ownership markers when the actor exits: the pid and
+    /// any attachable endpoint belong to the dead process, so leaving
+    /// them would let `agent attach` point at a stale address.
+    pub fn clear_runtime(&self, alias: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE agents SET pid=? WHERE alias=?",
-            params![pid.map(|p| p as i64), alias],
+            "UPDATE agents SET pid=NULL, endpoint=NULL WHERE alias=?",
+            [alias],
         )?;
         Ok(())
     }

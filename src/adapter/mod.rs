@@ -7,7 +7,9 @@
 
 pub mod codex;
 pub mod fake;
+pub mod link;
 pub mod stdio;
+pub mod ws;
 
 use serde_json::Value;
 
@@ -20,6 +22,8 @@ pub struct Identity {
     pub session_id: String,
     pub model: Option<String>,
     pub pid: u32,
+    /// Attachable endpoint (`ws://…`) for transports that support it.
+    pub endpoint: Option<String>,
 }
 
 /// A provider-initiated request (approval, user input). `id` is the raw
@@ -90,9 +94,15 @@ pub fn build(
                 "No managed adapter for provider '{other}' (implemented: codex)"
             ))),
         },
+        "managed-ws" => match agent.provider.as_str() {
+            "codex" => Ok(Box::new(codex::CodexAdapter::new_ws(hooks, log_path))),
+            other => Err(crate::error::Error::rejected(format!(
+                "No managed-ws adapter for provider '{other}' (implemented: codex)"
+            ))),
+        },
         "fake" => Ok(Box::new(fake::FakeAdapter::new(hooks))),
         other => Err(crate::error::Error::rejected(format!(
-            "Endpoint kind '{other}' is not implemented (implemented: managed, fake)"
+            "Endpoint kind '{other}' is not implemented (implemented: managed, managed-ws, fake)"
         ))),
     }
 }

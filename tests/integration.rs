@@ -606,6 +606,156 @@ struct MockCodex {
     pidfile: PathBuf,
 }
 
+// ---- mock Codex app-server over a real WebSocket (no model calls) ----
+
+/// A WebSocket JSON-RPC provider speaking the same app-server wire as
+/// MOCK_PY. Parses `--listen ws://host:port` from argv (appended by the
+/// transport), handshakes with stdlib sockets, and serves text frames.
+/// Turn text directives: `DIE` closes the connection after the ack,
+/// `NEED_INPUT:x` raises a server->client approval request that must be
+/// answered before the turn completes. `silent` mode applies only to
+/// non-seed turns so `open` can still finish its rollout seed.
+const MOCK_WS_PY: &str = r##"
+import base64, hashlib, json, os, socket, struct, sys, threading, time
+
+pidfile, mode = sys.argv[1], sys.argv[2]
+url = sys.argv[sys.argv.index("--listen") + 1]
+host, port = url.split("://", 1)[1].split(":")
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind((host, int(port)))
+srv.listen(4)
+with open(pidfile, "w") as f:
+    f.write(str(os.getpid()))
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+SEED = "Cadence endpoint initialization"
+
+def recv_exact(conn, n):
+    data = b""
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+def read_frame(conn):
+    hdr = recv_exact(conn, 2)
+    if hdr is None:
+        return None, None
+    opcode, flags = hdr[0] & 0x0F, hdr[1]
+    length = flags & 0x7F
+    if length == 126:
+        length = struct.unpack(">H", recv_exact(conn, 2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", recv_exact(conn, 8))[0]
+    mask = recv_exact(conn, 4) if flags & 0x80 else b""
+    payload = recv_exact(conn, length) if length else b""
+    if payload is None:
+        return None, None
+    if mask:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
+def send_frame(conn, opcode, payload):
+    n = len(payload)
+    if n < 126:
+        hdr = bytes([0x80 | opcode, n])
+    elif n < 65536:
+        hdr = bytes([0x80 | opcode, 126]) + struct.pack(">H", n)
+    else:
+        hdr = bytes([0x80 | opcode, 127]) + struct.pack(">Q", n)
+    conn.sendall(hdr + payload)
+
+def send_json(conn, msg):
+    send_frame(conn, 1, json.dumps(msg).encode())
+
+def complete(conn, turn, text):
+    send_json(conn, {"method": "turn/completed", "params": {"turn": {
+        "id": turn, "status": "completed", "items": [
+            {"id": "i1", "type": "agentMessage",
+             "text": text, "phase": "final_answer"}]}}})
+
+def handshake(conn):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return False
+        data += chunk
+    key = ""
+    for line in data.decode().split("\r\n"):
+        if line.lower().startswith("sec-websocket-key:"):
+            key = line.split(":", 1)[1].strip()
+    accept = base64.b64encode(
+        hashlib.sha1((key + GUID).encode()).digest()).decode()
+    conn.sendall((
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+    return True
+
+def handle(conn):
+    if not handshake(conn):
+        return
+    approval = None
+    while True:
+        op, payload = read_frame(conn)
+        if op is None or op == 8:
+            break
+        if op == 9:
+            send_frame(conn, 0xA, payload)
+            continue
+        if op != 1:
+            continue
+        try:
+            msg = json.loads(payload)
+        except Exception:
+            continue
+        mid, method = msg.get("id"), msg.get("method")
+        if method is None:
+            if mid == approval:
+                approval = None
+                complete(conn, "t-1", "MOCK_OK")
+            continue
+        if method == "initialize":
+            if mode == "slow-init":
+                time.sleep(30)
+            send_json(conn, {"id": mid, "result": {
+                "serverInfo": {"name": "mock-ws", "version": "0"}}})
+        elif method in ("thread/start", "thread/resume"):
+            send_json(conn, {"id": mid, "result": {
+                "thread": {"id": "th-1", "sessionId": "s-1"}}})
+        elif method == "turn/start":
+            text = ""
+            try:
+                text = msg["params"]["input"][0]["text"]
+            except Exception:
+                pass
+            send_json(conn, {"id": mid, "result": {"turn": {"id": "t-1"}}})
+            if text.startswith("DIE"):
+                conn.close()
+                return
+            if text.startswith(SEED):
+                complete(conn, "t-1", "READY")
+            elif mode == "silent":
+                pass
+            elif text.startswith("NEED_INPUT"):
+                approval = "srv-1"
+                send_json(conn, {"id": "srv-1",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"command": "x"}})
+            else:
+                complete(conn, "t-1", "MOCK_OK")
+        elif method == "turn/interrupt":
+            send_json(conn, {"id": mid, "result": {}})
+    conn.close()
+
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+"##;
+
 impl TestDaemon {
     /// Install a mock codex command for `mode`, returning its pidfile.
     fn mock_codex(&self, mode: &str) -> MockCodex {
@@ -628,12 +778,47 @@ impl TestDaemon {
         }
     }
 
+    /// Install a mock WebSocket app-server command for `mode`. `dir`
+    /// hosts the script + pidfile and must outlive every daemon that
+    /// will spawn it (restart tests use the seeded state dir).
+    fn mock_codex_ws_at(&self, dir: &Path, mode: &str) -> MockCodex {
+        let guard = ENV_LOCK.lock().unwrap();
+        let pidfile = dir.join(format!("mock-ws-{mode}.pid"));
+        let script = dir.join(format!("mock-ws-{mode}.py"));
+        std::fs::write(&script, MOCK_WS_PY).unwrap();
+        std::env::set_var(
+            "CADENCE_CODEX_WS_COMMAND",
+            format!(
+                "python3 {} {} {}",
+                script.display(),
+                pidfile.display(),
+                mode
+            ),
+        );
+        MockCodex {
+            _guard: guard,
+            pidfile,
+        }
+    }
+
+    fn mock_codex_ws(&self, mode: &str) -> MockCodex {
+        self.mock_codex_ws_at(self.dir.path(), mode)
+    }
+
     fn register_codex(&self, alias: &str) {
+        self.register_kind(alias, "managed");
+    }
+
+    fn register_codex_ws(&self, alias: &str) {
+        self.register_kind(alias, "managed-ws");
+    }
+
+    fn register_kind(&self, alias: &str, endpoint_kind: &str) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
         self.rpc(
             "agent_register",
             json!({"alias": alias, "provider": "codex",
-                   "endpoint_kind": "managed", "cwd": cwd}),
+                   "endpoint_kind": endpoint_kind, "cwd": cwd}),
         )
         .unwrap();
     }
@@ -642,6 +827,7 @@ impl TestDaemon {
 impl Drop for MockCodex {
     fn drop(&mut self) {
         std::env::remove_var("CADENCE_CODEX_COMMAND");
+        std::env::remove_var("CADENCE_CODEX_WS_COMMAND");
     }
 }
 
@@ -835,4 +1021,158 @@ fn stop_during_initialization_is_bounded() {
     // and no provider process is left behind.
     assert_eq!(stopped["state"], "attention");
     wait_pid_gone(&mock.pidfile, 10);
+}
+
+// ---- managed-ws: WebSocket app-server endpoint ----
+
+#[test]
+fn ws_turn_roundtrip_exposes_endpoint() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    let agent = d.wait_agent("w1", "idle", 15);
+    // The endpoint is discoverable for `agent attach`; loopback only.
+    let endpoint = agent["endpoint"].as_str().unwrap();
+    assert!(endpoint.starts_with("ws://127.0.0.1:"), "{endpoint}");
+    assert_eq!(agent["thread_id"], "th-1");
+    let reply = d
+        .rpc(
+            "agent_ask",
+            json!({"alias": "w1", "text": "hello", "message": "m1", "wait": 30}),
+        )
+        .unwrap();
+    assert_eq!(reply["state"], "completed");
+    assert!(reply["result"].to_string().contains("MOCK_OK"), "{reply}");
+    // The provider process stays alive while the agent is up.
+    assert!(pid_alive(&mock.pidfile));
+}
+
+#[test]
+fn ws_disconnect_fences_turn_unknown() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    let began = Instant::now();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "DIE now", "message": "m1"}),
+    )
+    .unwrap();
+    // Server closed the socket mid-turn: EOF must reach the wait fast.
+    d.wait_message("w1", "m1", &["unknown"], 20);
+    assert!(began.elapsed() < Duration::from_secs(20));
+    d.wait_agent("w1", "attention", 10);
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_stop_is_bounded_when_silent() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("silent");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["running"], 15);
+    let began = Instant::now();
+    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "ws stop was not bounded"
+    );
+    assert_eq!(stopped["state"], "attention");
+    d.wait_message("w1", "m1", &["unknown"], 10);
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_approval_is_brokered() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT:x", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let handle = requests["requests"][0]["request"].as_str().unwrap();
+    let answered = d
+        .rpc(
+            "agent_respond",
+            json!({"alias": "w1", "request": handle, "decision": "accept"}),
+        )
+        .unwrap();
+    assert_eq!(answered["state"], "answered");
+    d.wait_message("w1", "m1", &["completed"], 20);
+}
+
+#[test]
+fn ws_stop_during_init_is_bounded() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("slow-init");
+    d.register_codex_ws("w1");
+    // Wait until the provider accepted the WebSocket: the adapter is
+    // published and the 30s initialize RPC is in flight.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mock.pidfile.exists() {
+        assert!(Instant::now() < deadline, "provider never launched");
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(500)); // let connect+handshake land
+    let began = Instant::now();
+    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "ws init stop was not bounded: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(stopped["state"], "attention");
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_restart_resumes_thread_with_fresh_endpoint() {
+    // State dir outlives both daemon instances (d.state dies with d);
+    // the agent cwd must too, so both point at `seeded`.
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    let cwd = seeded.path().to_str().unwrap().to_string();
+    let mock;
+    let first_endpoint;
+    {
+        let d = TestDaemon::start_on(state.clone());
+        mock = d.mock_codex_ws_at(seeded.path(), "ok");
+        d.rpc(
+            "agent_register",
+            json!({"alias": "w1", "provider": "codex",
+                   "endpoint_kind": "managed-ws", "cwd": cwd}),
+        )
+        .unwrap();
+        let first = d.wait_agent("w1", "idle", 15);
+        first_endpoint = first["endpoint"].as_str().unwrap().to_string();
+    }
+    // Restart relaunches the enabled actor: a fresh app-server process,
+    // a fresh loopback port, and thread/resume on the saved thread.
+    let d = TestDaemon::start_on(state);
+    let resumed = d.wait_agent("w1", "idle", 15);
+    assert_eq!(resumed["thread_id"], "th-1");
+    let new_endpoint = resumed["endpoint"].as_str().unwrap();
+    assert!(new_endpoint.starts_with("ws://127.0.0.1:"));
+    assert_ne!(new_endpoint, first_endpoint, "endpoint was not refreshed");
+    // The resumed adapter still answers turns on the same thread.
+    let reply = d
+        .rpc(
+            "agent_ask",
+            json!({"alias": "w1", "text": "hi", "message": "m2", "wait": 30}),
+        )
+        .unwrap();
+    assert_eq!(reply["state"], "completed");
+    assert!(pid_alive(&mock.pidfile));
 }

@@ -16,6 +16,7 @@ pub const CAPABILITIES: &[&str] = &[
     "agent_registry",
     "durable_queue",
     "managed_codex_stdio",
+    "managed_codex_ws",
     "approval_brokering",
     "result_routing",
     "fake_provider_tests",
