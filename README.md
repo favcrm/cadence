@@ -11,6 +11,9 @@ acceptance-tested capability, not a promise of universal session attachment.
 
 See [the implementation plan](docs/IMPLEMENTATION-PLAN.md).
 
+Keep task checkouts under `.worktrees/`; see [workspace setup](docs/WORKSPACES.md)
+for creation, handover and cleanup instructions.
+
 ## Principles
 
 - Preserve native session identity and visible terminal conversations.
