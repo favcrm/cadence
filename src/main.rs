@@ -52,14 +52,16 @@ enum Commands {
     /// Launch a Devin official terminal as a managed agent (pty endpoint).
     /// `-r <session-slug>` resumes an existing Devin session, mirroring
     /// `devin -r`; without it a fresh session is launched and becomes
-    /// addressable by its discovered slug.
+    /// addressable by its discovered slug. Once the endpoint is open this
+    /// terminal attaches to the owned pane by default (`--detach` opts
+    /// out; a non-TTY or nested-tmux launch prints the command instead).
     Devin {
         /// Resume an existing Devin session by its native slug.
         #[arg(short = 'r', long)]
         resume: Option<String>,
-        /// Attach this terminal to the owned pane once the session is open.
+        /// Do not attach this terminal to the owned pane once open.
         #[arg(long)]
-        attach: bool,
+        detach: bool,
         /// Working directory for the session [default: current directory].
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -74,11 +76,13 @@ enum Commands {
         instructions_file: Option<PathBuf>,
     },
     /// Launch a Codex agent on a managed-ws endpoint, attachable by the
-    /// official Codex TUI via `codex resume --remote`.
+    /// official Codex TUI via `codex resume --remote`. This terminal
+    /// runs that attach once the endpoint is up by default (`--detach`
+    /// opts out; a non-TTY or nested-tmux launch prints the command).
     Codex {
-        /// Attach this terminal once the endpoint is up.
+        /// Do not attach this terminal once the endpoint is up.
         #[arg(long)]
-        attach: bool,
+        detach: bool,
         /// Working directory for the session [default: current directory].
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -457,7 +461,7 @@ fn run() -> Result<i32> {
         }
         Commands::Devin {
             resume,
-            attach,
+            detach,
             cwd,
             alias,
             role,
@@ -471,10 +475,10 @@ fn run() -> Result<i32> {
             alias,
             resume,
             instructions_file,
-            attach,
+            detach,
         ),
         Commands::Codex {
-            attach,
+            detach,
             cwd,
             alias,
             role,
@@ -488,7 +492,7 @@ fn run() -> Result<i32> {
             alias,
             None,
             instructions_file,
-            attach,
+            detach,
         ),
         Commands::Message { action } => {
             let (result, pending) = match action {
@@ -660,10 +664,11 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
 }
 
 /// `cadence devin [-r slug]` / `cadence codex`: register the provider's
-/// native-terminal endpoint, wait for it to open, then optionally attach.
-/// Re-running against an already-registered name resumes or reuses it.
-/// Once open, the agent answers to its alias and its provider-native id
-/// alike (e.g. `cadence agent show <devin-session-slug>`).
+/// native-terminal endpoint, wait for it to open, then attach this
+/// terminal by default. Re-running against an already-registered name
+/// resumes or reuses it. Once open, the agent answers to its alias and
+/// its provider-native id alike (e.g. `cadence agent show
+/// <devin-session-slug>`).
 #[allow(clippy::too_many_arguments)]
 fn provider_launch(
     state_dir: &Path,
@@ -674,7 +679,7 @@ fn provider_launch(
     alias: Option<String>,
     resume: Option<String>,
     instructions_file: Option<PathBuf>,
-    attach: bool,
+    detach: bool,
 ) -> Result<i32> {
     // `-r <slug>` first resolves the slug to an already-registered agent
     // (by alias or native session id) so re-running is a reopen, not a
@@ -761,10 +766,19 @@ fn provider_launch(
     if state == "starting" {
         eprintln!("still opening — watch `cadence agent show {alias}`");
     }
-    if attach {
+    // `--detach` opts out entirely; without a live endpoint there is
+    // nothing to attach or print beyond the summary's `next.attach`.
+    if detach || agent["endpoint"].is_null() {
+        return Ok(0);
+    }
+    // Attach is the default — exec it only where this terminal can:
+    // stdin must be a TTY and we must not sit inside tmux (a nested
+    // client cannot attach a foreign socket). Otherwise print the
+    // attach command exactly like `agent attach` without --run.
+    if atty_stdin() && std::env::var_os("TMUX").is_none() {
         return attach_agent(state_dir, &alias, true);
     }
-    Ok(0)
+    attach_agent(state_dir, &alias, false)
 }
 
 fn main() {
@@ -792,30 +806,42 @@ mod tests {
     fn devin_resume_parses_like_native() {
         let cli = Cli::try_parse_from(["cadence", "devin", "-r", "cookie-cesium"]).unwrap();
         match cli.command {
-            Commands::Devin { resume, attach, .. } => {
+            Commands::Devin { resume, detach, .. } => {
                 assert_eq!(resume.as_deref(), Some("cookie-cesium"));
-                assert!(!attach);
+                assert!(!detach);
             }
             _ => panic!("expected devin subcommand"),
         }
     }
 
     #[test]
-    fn devin_fresh_with_attach() {
-        let cli = Cli::try_parse_from(["cadence", "devin", "--attach"]).unwrap();
+    fn devin_detach_opts_out() {
+        let cli = Cli::try_parse_from(["cadence", "devin", "--detach"]).unwrap();
         assert!(matches!(
             cli.command,
             Commands::Devin {
                 resume: None,
-                attach: true,
+                detach: true,
                 ..
             }
         ));
     }
 
     #[test]
+    fn attach_flag_is_removed() {
+        assert!(Cli::try_parse_from(["cadence", "devin", "--attach"]).is_err());
+        assert!(Cli::try_parse_from(["cadence", "codex", "--attach"]).is_err());
+    }
+
+    #[test]
     fn codex_shortcut_parses() {
         let cli = Cli::try_parse_from(["cadence", "codex", "--cwd", "/tmp"]).unwrap();
-        assert!(matches!(cli.command, Commands::Codex { .. }));
+        assert!(matches!(cli.command, Commands::Codex { detach: false, .. }));
+    }
+
+    #[test]
+    fn codex_detach_parses() {
+        let cli = Cli::try_parse_from(["cadence", "codex", "--detach"]).unwrap();
+        assert!(matches!(cli.command, Commands::Codex { detach: true, .. }));
     }
 }
