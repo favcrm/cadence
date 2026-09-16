@@ -18,6 +18,10 @@ pub enum Error {
     /// The endpoint is not safe to submit to right now; the message
     /// returns to `queued` and is retried, never failed or pasted blind.
     GateRefused(String),
+    /// Deterministic rejection made *before* any bytes could reach the
+    /// provider — the message fails, but the endpoint is provably
+    /// untouched, so the actor must not fence or close it.
+    PreWrite(String),
 }
 
 impl Error {
@@ -26,6 +30,9 @@ impl Error {
     }
     pub fn gate(message: impl Into<String>) -> Self {
         Self::GateRefused(message.into())
+    }
+    pub fn pre_write(message: impl Into<String>) -> Self {
+        Self::PreWrite(message.into())
     }
     pub fn provider(message: impl Into<String>) -> Self {
         Self::Provider(message.into())
@@ -44,6 +51,9 @@ impl Error {
             Self::OutcomeUnknown(_) => "unknown",
             Self::Internal(_) => "internal",
             Self::GateRefused(_) => "gate",
+            // Wire-compatible with `rejected`: it is one — the variant
+            // only exists so the actor can match the pre-write proof.
+            Self::PreWrite(_) => "rejected",
         }
     }
 }
@@ -55,7 +65,8 @@ impl fmt::Display for Error {
             | Self::Provider(m)
             | Self::OutcomeUnknown(m)
             | Self::Internal(m)
-            | Self::GateRefused(m) => f.write_str(m),
+            | Self::GateRefused(m)
+            | Self::PreWrite(m) => f.write_str(m),
         }
     }
 }

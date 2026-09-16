@@ -417,6 +417,21 @@ impl Shared {
                         Err(Error::OutcomeUnknown(_)) => {
                             return self.unknown(alias, &message);
                         }
+                        // Deterministic pre-submission rejection: zero
+                        // bytes reached the provider, so nothing is
+                        // unknown — fail the message, keep the endpoint
+                        // live and keep draining the queue.
+                        Err(Error::PreWrite(reason)) => {
+                            self.store.finish(
+                                &message,
+                                "failed",
+                                &json!({"status": "failed", "text": "",
+                                        "error": reason}),
+                                Some(&reason),
+                            )?;
+                            gate_notice = None;
+                            self.wake();
+                        }
                         // A provider/adapter error is actor-fatal: record
                         // the failed attempt, then land in `attention`.
                         Err(error) => {
