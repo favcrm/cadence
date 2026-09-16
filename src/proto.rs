@@ -17,6 +17,7 @@ pub const CAPABILITIES: &[&str] = &[
     "durable_queue",
     "managed_codex_stdio",
     "managed_codex_ws",
+    "pty_devin_tmux",
     "approval_brokering",
     "result_routing",
     "fake_provider_tests",

@@ -282,9 +282,16 @@ impl Shared {
     /// outcomes, and stop cleanly on disable/shutdown.
     fn run_actor(self: &Arc<Self>, alias: &str, ctl: Arc<AgentCtl>) {
         let outcome = self.actor_inner(alias, &ctl);
-        // Cleanup always runs: close adapter, clear ctl, final state.
+        // Cleanup always runs: release the adapter, clear ctl, final
+        // state. On daemon shutdown we detach instead — endpoints like
+        // an owned tmux pane outlive the controller and are revalidated
+        // on the next open rather than destroyed mid-use.
         if let Some(adapter) = ctl.adapter.lock().unwrap().take() {
-            adapter.close();
+            if self.closing.load(Ordering::SeqCst) {
+                adapter.detach();
+            } else {
+                adapter.close();
+            }
         }
         {
             let mut pending = self.pending.lock().unwrap();
@@ -346,16 +353,9 @@ impl Shared {
         // Publish before `open` so stop/shutdown can force-close the
         // transport while initialization RPCs are still in flight.
         *ctl.adapter.lock().unwrap() = Some(Arc::clone(&adapter));
-        let opened = adapter.open(&agent).and_then(|identity| {
-            self.store.set_identity(
-                alias,
-                &identity.thread_id,
-                &identity.session_id,
-                identity.model.as_deref(),
-                identity.pid,
-                identity.endpoint.as_deref(),
-            )
-        });
+        let opened = adapter
+            .open(&agent)
+            .and_then(|identity| self.store.set_identity(alias, &identity));
         if let Err(error) = opened {
             // A half-open adapter may still own a provider process;
             // never leave it running past a failed initialization.
@@ -363,6 +363,7 @@ impl Shared {
             return Err(error);
         }
         self.wake();
+        let mut gate_notice: Option<String> = None;
         loop {
             if self.closing.load(Ordering::SeqCst) {
                 return Ok(());
@@ -371,6 +372,11 @@ impl Shared {
                 Take::Stop => return Ok(()),
                 Take::Empty => {
                     if adapter.disconnected() {
+                        // Submitted PTY messages may have reached the
+                        // provider; fence them rather than replay.
+                        let _ = self
+                            .store
+                            .orphan_running(alias, "endpoint lost after submission");
                         return Err(Error::unknown("Provider process disconnected while idle"));
                     }
                     ctl.wake.wait_until(Instant::now() + Duration::from_secs(5));
@@ -390,6 +396,23 @@ impl Shared {
                                 // post-submission, fence rather than replay.
                                 return self.unknown(alias, &message);
                             }
+                            gate_notice = None;
+                        }
+                        // The submission gate refused before any paste:
+                        // safe to retry — back to the queue with a
+                        // bounded wait, never a silent drop.
+                        Err(Error::GateRefused(reason)) => {
+                            let _ = self.store.requeue(&message.id);
+                            let _ = self.store.set_agent_state_if(alias, "idle", "busy");
+                            if gate_notice.as_deref() != Some(reason.as_str()) {
+                                let _ = self.store.event_public(
+                                    alias,
+                                    "gate_wait",
+                                    json!({"message": message.id, "reason": reason}),
+                                );
+                                gate_notice = Some(reason);
+                            }
+                            ctl.wake.wait_until(Instant::now() + Duration::from_secs(5));
                         }
                         Err(Error::OutcomeUnknown(_)) => {
                             return self.unknown(alias, &message);
@@ -403,6 +426,11 @@ impl Shared {
                                 &json!({"status": "failed", "text": "", "error": error.to_string()}),
                                 Some(&error.to_string()),
                             )?;
+                            // Other submitted PTY messages are now
+                            // orphaned by the dead endpoint.
+                            let _ = self
+                                .store
+                                .orphan_running(alias, "endpoint lost after submission");
                             self.wake();
                             return Err(error);
                         }
@@ -413,6 +441,14 @@ impl Shared {
     }
 
     fn complete(&self, message: &Message, result: TurnResult) -> Result<()> {
+        // PTY endpoints report "submitted": the paste reached the
+        // terminal, but only an explicit ack/result report may finish
+        // the message — it stays `running` meanwhile.
+        if result.status == "submitted" {
+            self.store.mark_submitted(message)?;
+            self.wake();
+            return Ok(());
+        }
         let status = match result.status.as_str() {
             "completed" | "failed" | "interrupted" => result.status.clone(),
             other => {
@@ -504,6 +540,9 @@ impl Shared {
                 Ok(json!({"requests": requests}))
             }
             "agent_respond" => self.rpc_respond(params),
+            "agent_ready" => self.rpc_ready(params),
+            "agent_capture" => self.rpc_capture(params),
+            "message_report" => self.rpc_message_report(params),
             "agent_stop" => self.rpc_stop(params),
             "agent_resume" => {
                 let alias = required_str(params, "alias")?;
@@ -530,6 +569,7 @@ impl Shared {
         let cwd = required_str(params, "cwd")?;
         let sandbox = optional_str(params, "sandbox").unwrap_or("read-only");
         let instructions = optional_str(params, "instructions");
+        let agent_params = optional_str(params, "params");
         let cwd = std::fs::canonicalize(cwd)
             .map_err(|_| Error::rejected("Working directory must exist"))?;
         self.store.register_agent(&crate::store::NewAgent {
@@ -540,6 +580,7 @@ impl Shared {
             cwd: &cwd.to_string_lossy(),
             sandbox,
             instructions,
+            params: agent_params,
         })?;
         self.launch_actor(alias)?;
         Ok(json!({"alias": alias, "state": "starting", "provider": provider}))
@@ -683,6 +724,110 @@ impl Shared {
             .event_public(alias, "input_answered", json!({"request": handle}));
         self.wake();
         Ok(json!({"state": "answered"}))
+    }
+
+    /// The live adapter for an alias, when an actor owns one.
+    fn adapter_for(&self, alias: &str) -> Result<Arc<dyn ProviderAdapter>> {
+        self.lifecycle
+            .lock()
+            .unwrap()
+            .agents
+            .get(alias)
+            .and_then(|ctl| ctl.adapter.lock().unwrap().clone())
+            .ok_or_else(|| Error::rejected("Agent has no live endpoint (not running?)"))
+    }
+
+    /// Operator readiness claim for gated endpoints (pty): asserts the
+    /// terminal was inspected and is idle with an empty input. Single
+    /// use, short TTL — see the adapter for semantics.
+    fn rpc_ready(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let alias = required_str(params, "alias")?;
+        self.adapter_for(alias)?.claim_ready()?;
+        let _ = self.store.event_public(alias, "ready_claimed", json!({}));
+        Ok(json!({"alias": alias, "state": "ready-claimed"}))
+    }
+
+    /// Screen contents of a PTY endpoint for operator inspection.
+    fn rpc_capture(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let alias = required_str(params, "alias")?;
+        let text = self.adapter_for(alias)?.capture()?;
+        Ok(json!({"alias": alias, "capture": text}))
+    }
+
+    /// Explicit ack/result report for a submitted PTY message. The
+    /// `token` is the `turn_id` minted at submission; it embeds the
+    /// endpoint generation, so a report aimed at a previous pane life
+    /// is rejected as stale. Callers are identified by possession of
+    /// the token, which is self-asserted — not an authentication.
+    fn rpc_message_report(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let id = required_str(params, "message")?;
+        let token = required_str(params, "token")?;
+        let kind = required_str(params, "kind")?;
+        let text = optional_str(params, "text");
+        let message = self
+            .store
+            .message(id)?
+            .ok_or_else(|| Error::rejected("Unknown message"))?;
+        let agent = self.store.agent(&message.alias)?;
+        if message.turn_id.as_deref() != Some(token) {
+            return Err(Error::rejected(
+                "Token does not match the message's submission token",
+            ));
+        }
+        let stale = match &agent.generation {
+            Some(gen) => !token.starts_with(&format!("pty-{gen}-")),
+            None => true,
+        };
+        if stale {
+            return Err(Error::rejected(
+                "Submission token belongs to a stale endpoint generation",
+            ));
+        }
+        match kind {
+            "ack" => {
+                self.store.mark_ack(&message, text)?;
+            }
+            "result" => {
+                let text = text.ok_or_else(|| Error::rejected("A result report requires text"))?;
+                if message.state == "running" {
+                    self.store.finish(
+                        &message,
+                        "completed",
+                        &json!({
+                            "status": "completed", "text": text,
+                            "turn_id": token, "via": "pty_report",
+                        }),
+                        None,
+                    )?;
+                } else if message.state == "completed" {
+                    // Idempotent retry vs conflicting duplicate.
+                    let same = message
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.get("text"))
+                        .and_then(Value::as_str)
+                        == Some(text);
+                    if !same {
+                        return Err(Error::rejected(
+                            "Message already completed with a different result",
+                        ));
+                    }
+                    return Ok(json!({"state": "completed", "duplicate": true}));
+                } else {
+                    return Err(Error::rejected(format!(
+                        "Message is not awaiting a report (state {})",
+                        message.state
+                    )));
+                }
+            }
+            other => {
+                return Err(Error::rejected(format!(
+                    "Report kind must be ack or result, not '{other}'"
+                )))
+            }
+        }
+        self.wake();
+        Ok(json!({"state": "reported", "kind": kind}))
     }
 
     fn rpc_stop(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -957,6 +1102,7 @@ mod tests {
                 cwd: dir.to_str().unwrap(),
                 sandbox: "read-only",
                 instructions: None,
+                params: None,
             })
             .unwrap();
     }

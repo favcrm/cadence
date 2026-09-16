@@ -69,6 +69,7 @@ impl ProviderAdapter for FakeAdapter {
             model: Some("fake-1".to_string()),
             pid: std::process::id(),
             endpoint: None,
+            generation: None,
         })
     }
 

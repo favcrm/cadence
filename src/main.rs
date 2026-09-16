@@ -85,7 +85,8 @@ enum AgentAction {
         #[arg(long)]
         provider: String,
         /// Endpoint kind: managed (stdio), managed-ws (official-TUI
-        /// attachable WebSocket app-server) or fake (test double).
+        /// attachable WebSocket app-server), pty (official TUI in an
+        /// owned tmux session; devin only) or fake (test double).
         #[arg(long, default_value = "managed")]
         endpoint: String,
         /// Working directory for the provider session.
@@ -100,6 +101,10 @@ enum AgentAction {
         /// File with reusable provider instructions.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
+        /// Endpoint option as key=value (pty: session=<native-id> to
+        /// resume an existing Devin session). Repeatable.
+        #[arg(long = "param")]
+        params: Vec<String>,
     },
     /// List registered agents.
     List,
@@ -124,14 +129,20 @@ enum AgentAction {
     Stop { alias: String },
     /// Resume a stopped agent on its saved native thread.
     Resume { alias: String },
-    /// Show or run the official `codex resume --remote` attach command
-    /// for a `managed-ws` agent's native thread.
+    /// Show or run the official attach command for an attachable
+    /// endpoint (managed-ws: `codex resume --remote`; pty: tmux attach).
     Attach {
         alias: String,
         /// Execute the attach in this terminal instead of printing it.
         #[arg(long)]
         run: bool,
     },
+    /// Claim a gated endpoint is ready for one submission (pty only).
+    /// Asserts the operator inspected the terminal: idle, empty input,
+    /// no permission prompt. Consumed by a single send, expires quickly.
+    Ready { alias: String },
+    /// Print the current terminal contents of a pty endpoint.
+    Capture { alias: String },
 }
 
 #[derive(Subcommand)]
@@ -162,6 +173,30 @@ enum MessageAction {
         /// Seconds to wait (max 600).
         #[arg(long, default_value_t = 120)]
         wait: u64,
+    },
+    /// Record an explicit acknowledgement for a submitted PTY message.
+    /// The token is the `turn_id` shown by `agent show`.
+    Ack {
+        /// Message id.
+        message: String,
+        /// Submission token (pty-<generation>-<uuid>).
+        #[arg(long)]
+        token: String,
+        /// Optional acknowledgement note.
+        #[arg(long)]
+        text: Option<String>,
+    },
+    /// Report the result of a submitted PTY message; completes it and
+    /// routes to `reply_to` when set.
+    Result {
+        /// Message id.
+        message: String,
+        /// Submission token (pty-<generation>-<uuid>).
+        #[arg(long)]
+        token: String,
+        /// Result text reported for the message.
+        #[arg(long)]
+        text: String,
     },
 }
 
@@ -297,11 +332,23 @@ fn run() -> Result<i32> {
                     role,
                     sandbox,
                     instructions_file,
+                    params,
                 } => {
                     let instructions = match instructions_file {
                         Some(path) => Some(std::fs::read_to_string(path)?),
                         None => None,
                     };
+                    let mut obj = serde_json::Map::new();
+                    for kv in &params {
+                        let (k, v) = kv
+                            .split_once('=')
+                            .ok_or_else(|| Error::rejected("--param entries must be key=value"))?;
+                        if k.is_empty() {
+                            return Err(Error::rejected("--param key must not be empty"));
+                        }
+                        obj.insert(k.to_string(), Value::String(v.to_string()));
+                    }
+                    let params_json = (!obj.is_empty()).then(|| Value::Object(obj).to_string());
                     client::rpc(
                         &state_dir,
                         "agent_register",
@@ -310,6 +357,7 @@ fn run() -> Result<i32> {
                             "endpoint_kind": endpoint, "cwd": cwd,
                             "role": role, "sandbox": sandbox,
                             "instructions": instructions,
+                            "params": params_json,
                         }),
                     )?
                 }
@@ -349,11 +397,10 @@ fn run() -> Result<i32> {
                     let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
                     let agent = &show["agent"];
                     let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
-                    if kind != "managed-ws" {
+                    if !matches!(kind, "managed-ws" | "pty") {
                         return Err(Error::rejected(format!(
-                            "Agent '{alias}' uses endpoint kind '{kind}'; official TUI \
-                             attach requires endpoint kind 'managed-ws' \
-                             (register with --endpoint managed-ws)"
+                            "Agent '{alias}' uses endpoint kind '{kind}'; attach requires \
+                             'managed-ws' or 'pty'"
                         )));
                     }
                     let state = agent["state"].as_str().unwrap_or_default();
@@ -364,13 +411,38 @@ fn run() -> Result<i32> {
                     }
                     let endpoint = agent["endpoint"].as_str().ok_or_else(|| {
                         Error::rejected(
-                            "No live endpoint — the agent's WebSocket app-server is not \
+                            "No live endpoint — the agent's provider endpoint is not \
                              running (start or resume the agent first)",
                         )
                     })?;
                     let thread = agent["thread_id"]
                         .as_str()
                         .ok_or_else(|| Error::rejected("Agent has no native thread yet"))?;
+                    if kind == "pty" {
+                        // tmux://<socket>/<session> — attach is a view of
+                        // the owned pane, not a takeover of anything else.
+                        let (socket, session) = endpoint
+                            .strip_prefix("tmux://")
+                            .and_then(|rest| rest.split_once('/'))
+                            .ok_or_else(|| Error::internal("malformed tmux endpoint"))?;
+                        if run {
+                            let status = Command::new("tmux")
+                                .args(["-L", socket, "attach-session", "-t", session])
+                                .status()?;
+                            return Ok(status.code().unwrap_or(1));
+                        }
+                        print_json(&json!({
+                            "alias": alias,
+                            "endpoint": endpoint,
+                            "thread_id": thread,
+                            "command": format!(
+                                "tmux -L {socket} attach-session -t {session}"
+                            ),
+                            "note": "Attach shows the live pane; terminal echo is not \
+                                     agent receipt — message state remains authoritative.",
+                        }));
+                        return Ok(0);
+                    }
                     if run {
                         let status = Command::new("codex")
                             .args(["resume", "--remote", endpoint, thread])
@@ -385,6 +457,17 @@ fn run() -> Result<i32> {
                         "note": "Attach shows the native thread; terminal echo is not \
                                  agent receipt — message state remains authoritative.",
                     })
+                }
+                AgentAction::Ready { alias } => {
+                    client::rpc(&state_dir, "agent_ready", json!({"alias": alias}))?
+                }
+                AgentAction::Capture { alias } => {
+                    let out = client::rpc(&state_dir, "agent_capture", json!({"alias": alias}))?;
+                    if let Some(text) = out["capture"].as_str() {
+                        println!("{text}");
+                        return Ok(0);
+                    }
+                    out
                 }
             };
             print_json(&result);
@@ -410,6 +493,32 @@ fn run() -> Result<i32> {
                         false,
                     )
                 }
+                MessageAction::Ack {
+                    message,
+                    token,
+                    text,
+                } => (
+                    client::rpc(
+                        &state_dir,
+                        "message_report",
+                        json!({"message": message, "token": token,
+                               "kind": "ack", "text": text}),
+                    )?,
+                    false,
+                ),
+                MessageAction::Result {
+                    message,
+                    token,
+                    text,
+                } => (
+                    client::rpc(
+                        &state_dir,
+                        "message_report",
+                        json!({"message": message, "token": token,
+                               "kind": "result", "text": text}),
+                    )?,
+                    false,
+                ),
                 MessageAction::Ask {
                     alias,
                     text,
