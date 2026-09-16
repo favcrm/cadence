@@ -236,6 +236,60 @@ fn result_routing_wakes_pm() {
 }
 
 #[test]
+fn upstream_param_defaults_reply_to() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register("other");
+    // A worker joined to a group carries params.upstream = <pm alias>.
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "params": "{\"upstream\":\"pm\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("other", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    // No explicit reply_to — the upstream wiring routes the result to pm.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "work", "message": "u1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "u1", &["completed"], 15);
+    let show = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    let routed = &show["messages"].as_array().unwrap()[0];
+    assert_eq!(routed["source"], "worker_result");
+    assert!(routed["body"].as_str().unwrap().contains("u1"));
+    let routed_id = routed["id"].as_str().unwrap().to_string();
+    d.wait_message("pm", &routed_id, &["completed"], 15);
+    // An explicit reply_to still wins over the upstream default.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "more work", "message": "u2",
+               "reply_to": "other"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "u2", &["completed"], 15);
+    let other = d.rpc("agent_show", json!({"alias": "other"})).unwrap();
+    assert!(other["messages"].as_array().unwrap().iter().any(|m| {
+        m["source"] == "worker_result" && m["body"].as_str().unwrap_or_default().contains("u2")
+    }));
+    // pm saw only the first routed delivery — u2 went to `other`.
+    let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    assert_eq!(
+        pm["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["source"] == "worker_result")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn approval_lifecycle() {
     let d = TestDaemon::start();
     d.register("w1");
