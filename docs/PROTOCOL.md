@@ -57,9 +57,11 @@ also covers provider initialization, since the adapter is published
 before `open`. A turn that was still in flight becomes `unknown` and the
 agent stays `attention` — a stop never masks a fence: on an agent already
 in `attention` it only disables and preserves the state and reason. While
-a stop is in flight the alias stays reserved, so `agent_resume` is
-`rejected` until the stop's final write is done — a stale stop cannot
-write over a new actor generation. Resume on a fenced agent returns
+a stop is in flight the alias stays reserved: `agent_resume` is
+`rejected` until the stop's final write is done, and a second
+`agent_stop` is `rejected` (`already stopping`) before any mutation —
+a stale stop cannot write over a new actor generation. A sequential
+stop after completion is idempotent. Resume on a fenced agent returns
 `attention` and does not re-enable.
 
 ## Agents

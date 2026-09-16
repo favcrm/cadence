@@ -97,19 +97,17 @@ impl Lifecycle {
     }
 }
 
-/// Drops the caller's stop reservation on scope exit; reservations left
-/// by a *different* in-flight stop are left alone.
+/// Drops the caller's stop reservation on scope exit. Only the stop
+/// that inserted the reservation ever holds this guard — overlapping
+/// stops are rejected before mutation.
 struct StopReservation<'a> {
     lifecycle: &'a Mutex<Lifecycle>,
     alias: &'a str,
-    owned: bool,
 }
 
 impl Drop for StopReservation<'_> {
     fn drop(&mut self) {
-        if self.owned {
-            self.lifecycle.lock().unwrap().stopping.remove(self.alias);
-        }
+        self.lifecycle.lock().unwrap().stopping.remove(self.alias);
     }
 }
 
@@ -646,17 +644,19 @@ impl Shared {
         // Reserve the alias for the whole stop — through the final state
         // write — so a resume cannot start a new actor in the gap where
         // the old actor already released ownership.
-        let (reserved, ctl) = {
+        let ctl = {
             let mut lc = self.lifecycle.lock().unwrap();
-            (
-                lc.stopping.insert(alias.to_string()),
-                lc.agents.get(alias).cloned(),
-            )
+            // A stop already in flight owns the alias through its final
+            // write; reject before any mutation rather than letting a
+            // second operation write stale state over a newer actor.
+            if !lc.stopping.insert(alias.to_string()) {
+                return Err(Error::rejected("Agent is already stopping"));
+            }
+            lc.agents.get(alias).cloned()
         };
         let _reservation = StopReservation {
             lifecycle: &self.lifecycle,
             alias,
-            owned: reserved,
         };
         self.store.set_enabled(alias, false)?;
         let _ = self.store.event_public(alias, "stop_requested", json!({}));
@@ -941,30 +941,33 @@ mod tests {
         }
     }
 
-    /// A second stop reservation must not release the first owner's.
+    /// While a stop reservation is in flight (its owner has not yet
+    /// finished the final state write), a second stop is rejected and
+    /// mutates nothing — so no stale stop can outlive the reservation
+    /// and write over a newer actor generation.
     #[test]
-    fn overlapping_stop_reservations_keep_ownership() {
+    fn overlapping_stop_is_rejected_without_mutation() {
         let (dir, shared) = shared();
         register(&shared, dir.path(), "w1");
-        {
-            let mut lc = shared.lifecycle.lock().unwrap();
-            assert!(lc.stopping.insert("w1".to_string()));
-            assert!(!lc.stopping.insert("w1".to_string()));
-        }
-        // The non-owner's guard releases nothing.
-        drop(StopReservation {
-            lifecycle: &shared.lifecycle,
-            alias: "w1",
-            owned: false,
-        });
-        assert!(shared.lifecycle.lock().unwrap().stopping.contains("w1"));
-        assert!(shared.launch_actor("w1").is_err());
-        // The owner's release frees the alias.
-        drop(StopReservation {
-            lifecycle: &shared.lifecycle,
-            alias: "w1",
-            owned: true,
-        });
-        assert!(!shared.lifecycle.lock().unwrap().stopping.contains("w1"));
+        shared
+            .lifecycle
+            .lock()
+            .unwrap()
+            .stopping
+            .insert("w1".to_string());
+        let before = shared.store.agent("w1").unwrap().state;
+        let err = shared.rpc_stop(&json!({"alias": "w1"})).unwrap_err();
+        assert!(err.to_string().contains("already stopping"));
+        // Zero mutations: agent still enabled and in its prior state.
+        let agent = shared.store.agent("w1").unwrap();
+        assert_eq!(agent.state, before);
+        assert!(agent.enabled);
+        // Once the owning stop finalizes and releases, a sequential
+        // stop proceeds — repeat stop stays idempotent.
+        shared.lifecycle.lock().unwrap().stopping.remove("w1");
+        let stopped = shared.rpc_stop(&json!({"alias": "w1"})).unwrap();
+        assert_eq!(stopped["state"], "stopped");
+        let again = shared.rpc_stop(&json!({"alias": "w1"})).unwrap();
+        assert_eq!(again["state"], "stopped");
     }
 }

@@ -793,10 +793,18 @@ fn concurrent_stops_are_idempotent() {
             client::rpc(&state, "agent_stop", json!({"alias": "w1"}))
         }));
     }
-    for racer in racers {
-        let result = racer.join().unwrap().unwrap();
-        assert_eq!(result["state"], "stopped");
-    }
+    // Overlapping stops: exactly one owns the reservation and mutates;
+    // the loser is rejected before touching any state.
+    let results: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+    let winners = results
+        .iter()
+        .filter(|r| matches!(r, Ok(v) if v["state"] == "stopped"))
+        .count();
+    let losers = results
+        .iter()
+        .filter(|r| matches!(r, Err(e) if e.to_string().contains("already stopping")))
+        .count();
+    assert_eq!((winners, losers), (1, 1), "{results:?}");
     d.wait_agent("w1", "stopped", 10);
     assert_eq!(d.message_state("w1", "m1"), "interrupted");
     // Ownership was fully released: a resume works on the first try.
