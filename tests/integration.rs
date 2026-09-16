@@ -183,6 +183,34 @@ fn fifo_queue_and_idempotent_send() {
 }
 
 #[test]
+fn agent_addressable_by_native_id() {
+    let d = TestDaemon::start();
+    d.register("w9");
+    d.wait_agent("w9", "idle", 10);
+    // The fake adapter publishes thread_id "fake-thread-w9" at open —
+    // every alias-taking verb must resolve it to the canonical alias,
+    // the same way a Devin session slug resolves.
+    let native = "fake-thread-w9";
+    let show = d.rpc("agent_show", json!({"alias": native})).unwrap();
+    assert_eq!(show["agent"]["alias"], "w9");
+    d.rpc(
+        "agent_send",
+        json!({"alias": native, "text": "task", "message": "m-native"}),
+    )
+    .unwrap();
+    let m = d.wait_message("w9", "m-native", &["completed"], 15);
+    assert_eq!(m["result"]["text"], "FAKE_REPLY: task");
+    let events = d.rpc("agent_events", json!({"alias": native})).unwrap();
+    assert!(!events["events"].as_array().unwrap().is_empty());
+    // An exact alias always wins over another agent's native id.
+    d.register(native);
+    d.wait_agent(native, "idle", 10);
+    let show = d.rpc("agent_show", json!({"alias": native})).unwrap();
+    assert_eq!(show["agent"]["alias"], native);
+    assert_eq!(show["agent"]["thread_id"], format!("fake-thread-{native}"));
+}
+
+#[test]
 fn result_routing_wakes_pm() {
     let d = TestDaemon::start();
     d.register("pm");

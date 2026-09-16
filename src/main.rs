@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use cadence_agent::client;
 use cadence_agent::error::{Error, Result};
@@ -48,9 +49,52 @@ enum Commands {
         #[command(subcommand)]
         action: MessageAction,
     },
+    /// Launch a Devin official terminal as a managed agent (pty endpoint).
+    /// `-r <session-slug>` resumes an existing Devin session, mirroring
+    /// `devin -r`; without it a fresh session is launched and becomes
+    /// addressable by its discovered slug.
+    Devin {
+        /// Resume an existing Devin session by its native slug.
+        #[arg(short = 'r', long)]
+        resume: Option<String>,
+        /// Attach this terminal to the owned pane once the session is open.
+        #[arg(long)]
+        attach: bool,
+        /// Working directory for the session [default: current directory].
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Routing alias [default: the resumed slug, else devin-<random>].
+        #[arg(long)]
+        alias: Option<String>,
+        /// pm or worker.
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// File with reusable provider instructions.
+        #[arg(long)]
+        instructions_file: Option<PathBuf>,
+    },
+    /// Launch a Codex agent on a managed-ws endpoint, attachable by the
+    /// official Codex TUI via `codex resume --remote`.
+    Codex {
+        /// Attach this terminal once the endpoint is up.
+        #[arg(long)]
+        attach: bool,
+        /// Working directory for the session [default: current directory].
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Routing alias [default: codex-<random>].
+        #[arg(long)]
+        alias: Option<String>,
+        /// pm or worker.
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// File with reusable provider instructions.
+        #[arg(long)]
+        instructions_file: Option<PathBuf>,
+    },
     /// Read the durable event log for an agent.
     Events {
-        /// Agent alias.
+        /// Agent alias or provider-native id (Devin slug, Codex thread).
         alias: String,
         /// Return events after this cursor.
         #[arg(long, default_value_t = 0)]
@@ -394,69 +438,7 @@ fn run() -> Result<i32> {
                     client::rpc(&state_dir, "agent_resume", json!({"alias": alias}))?
                 }
                 AgentAction::Attach { alias, run } => {
-                    let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
-                    let agent = &show["agent"];
-                    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
-                    if !matches!(kind, "managed-ws" | "pty") {
-                        return Err(Error::rejected(format!(
-                            "Agent '{alias}' uses endpoint kind '{kind}'; attach requires \
-                             'managed-ws' or 'pty'"
-                        )));
-                    }
-                    let state = agent["state"].as_str().unwrap_or_default();
-                    if matches!(state, "stopped" | "offline") {
-                        return Err(Error::rejected(format!(
-                            "Agent '{alias}' is {state} — resume it before attaching"
-                        )));
-                    }
-                    let endpoint = agent["endpoint"].as_str().ok_or_else(|| {
-                        Error::rejected(
-                            "No live endpoint — the agent's provider endpoint is not \
-                             running (start or resume the agent first)",
-                        )
-                    })?;
-                    let thread = agent["thread_id"]
-                        .as_str()
-                        .ok_or_else(|| Error::rejected("Agent has no native thread yet"))?;
-                    if kind == "pty" {
-                        // tmux://<socket>/<session> — attach is a view of
-                        // the owned pane, not a takeover of anything else.
-                        let (socket, session) = endpoint
-                            .strip_prefix("tmux://")
-                            .and_then(|rest| rest.split_once('/'))
-                            .ok_or_else(|| Error::internal("malformed tmux endpoint"))?;
-                        if run {
-                            let status = Command::new("tmux")
-                                .args(["-L", socket, "attach-session", "-t", session])
-                                .status()?;
-                            return Ok(status.code().unwrap_or(1));
-                        }
-                        print_json(&json!({
-                            "alias": alias,
-                            "endpoint": endpoint,
-                            "thread_id": thread,
-                            "command": format!(
-                                "tmux -L {socket} attach-session -t {session}"
-                            ),
-                            "note": "Attach shows the live pane; terminal echo is not \
-                                     agent receipt — message state remains authoritative.",
-                        }));
-                        return Ok(0);
-                    }
-                    if run {
-                        let status = Command::new("codex")
-                            .args(["resume", "--remote", endpoint, thread])
-                            .status()?;
-                        return Ok(status.code().unwrap_or(1));
-                    }
-                    json!({
-                        "alias": alias,
-                        "endpoint": endpoint,
-                        "thread_id": thread,
-                        "command": format!("codex resume --remote {endpoint} {thread}"),
-                        "note": "Attach shows the native thread; terminal echo is not \
-                                 agent receipt — message state remains authoritative.",
-                    })
+                    return attach_agent(&state_dir, &alias, run);
                 }
                 AgentAction::Ready { alias } => {
                     client::rpc(&state_dir, "agent_ready", json!({"alias": alias}))?
@@ -473,6 +455,41 @@ fn run() -> Result<i32> {
             print_json(&result);
             Ok(0)
         }
+        Commands::Devin {
+            resume,
+            attach,
+            cwd,
+            alias,
+            role,
+            instructions_file,
+        } => provider_launch(
+            &state_dir,
+            "devin",
+            "pty",
+            cwd,
+            &role,
+            alias,
+            resume,
+            instructions_file,
+            attach,
+        ),
+        Commands::Codex {
+            attach,
+            cwd,
+            alias,
+            role,
+            instructions_file,
+        } => provider_launch(
+            &state_dir,
+            "codex",
+            "managed-ws",
+            cwd,
+            &role,
+            alias,
+            None,
+            instructions_file,
+            attach,
+        ),
         Commands::Message { action } => {
             let (result, pending) = match action {
                 MessageAction::Send {
@@ -574,6 +591,182 @@ fn run() -> Result<i32> {
     }
 }
 
+/// Print or exec the native attach for an agent's live endpoint.
+/// `pty` attaches this terminal to the cadence-owned tmux pane;
+/// `managed-ws` shells out to `codex resume --remote`.
+fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
+    let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+    let agent = &show["agent"];
+    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
+    if !matches!(kind, "managed-ws" | "pty") {
+        return Err(Error::rejected(format!(
+            "Agent '{alias}' uses endpoint kind '{kind}'; attach requires \
+             'managed-ws' or 'pty'"
+        )));
+    }
+    let state = agent["state"].as_str().unwrap_or_default();
+    if matches!(state, "stopped" | "offline") {
+        return Err(Error::rejected(format!(
+            "Agent '{alias}' is {state} — resume it before attaching"
+        )));
+    }
+    let endpoint = agent["endpoint"].as_str().ok_or_else(|| {
+        Error::rejected(
+            "No live endpoint — the agent's provider endpoint is not \
+             running (start or resume the agent first)",
+        )
+    })?;
+    let thread = agent["thread_id"]
+        .as_str()
+        .ok_or_else(|| Error::rejected("Agent has no native thread yet"))?;
+    if kind == "pty" {
+        // tmux://<socket>/<session> — attach is a view of
+        // the owned pane, not a takeover of anything else.
+        let (socket, session) = endpoint
+            .strip_prefix("tmux://")
+            .and_then(|rest| rest.split_once('/'))
+            .ok_or_else(|| Error::internal("malformed tmux endpoint"))?;
+        if run {
+            let status = Command::new("tmux")
+                .args(["-L", socket, "attach-session", "-t", session])
+                .status()?;
+            return Ok(status.code().unwrap_or(1));
+        }
+        print_json(&json!({
+            "alias": alias,
+            "endpoint": endpoint,
+            "thread_id": thread,
+            "command": format!("tmux -L {socket} attach-session -t {session}"),
+            "note": "Attach shows the live pane; terminal echo is not \
+                     agent receipt — message state remains authoritative.",
+        }));
+        return Ok(0);
+    }
+    if run {
+        let status = Command::new("codex")
+            .args(["resume", "--remote", endpoint, thread])
+            .status()?;
+        return Ok(status.code().unwrap_or(1));
+    }
+    print_json(&json!({
+        "alias": alias,
+        "endpoint": endpoint,
+        "thread_id": thread,
+        "command": format!("codex resume --remote {endpoint} {thread}"),
+        "note": "Attach shows the native thread; terminal echo is not \
+                 agent receipt — message state remains authoritative.",
+    }));
+    Ok(0)
+}
+
+/// `cadence devin [-r slug]` / `cadence codex`: register the provider's
+/// native-terminal endpoint, wait for it to open, then optionally attach.
+/// Re-running against an already-registered name resumes or reuses it.
+/// Once open, the agent answers to its alias and its provider-native id
+/// alike (e.g. `cadence agent show <devin-session-slug>`).
+#[allow(clippy::too_many_arguments)]
+fn provider_launch(
+    state_dir: &Path,
+    provider: &str,
+    endpoint_kind: &str,
+    cwd: Option<PathBuf>,
+    role: &str,
+    alias: Option<String>,
+    resume: Option<String>,
+    instructions_file: Option<PathBuf>,
+    attach: bool,
+) -> Result<i32> {
+    // `-r <slug>` first resolves the slug to an already-registered agent
+    // (by alias or native session id) so re-running is a reopen, not a
+    // duplicate registration fighting over the same session lock.
+    let mut alias = alias.clone();
+    if alias.is_none() {
+        if let Some(name) = &resume {
+            if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": name})) {
+                let found = &show["agent"];
+                let known_provider = found["provider"].as_str().unwrap_or_default();
+                if known_provider != provider {
+                    return Err(Error::rejected(format!(
+                        "'{name}' is already registered as a {known_provider} agent \
+                         (alias '{}') — use `cadence agent attach {}`",
+                        found["alias"].as_str().unwrap_or_default(),
+                        found["alias"].as_str().unwrap_or_default(),
+                    )));
+                }
+                alias = found["alias"].as_str().map(str::to_string);
+            }
+        }
+    }
+    let alias = alias
+        .or_else(|| resume.clone())
+        .unwrap_or_else(|| format!("{provider}-{}", &Uuid::new_v4().simple().to_string()[..6]));
+    let cwd = match cwd {
+        Some(path) => path,
+        None => std::env::current_dir()?,
+    };
+    let instructions = instructions_file.map(std::fs::read_to_string).transpose()?;
+    let params = resume.map(|session| json!({"session": session}).to_string());
+    match client::rpc(
+        state_dir,
+        "agent_register",
+        json!({"alias": alias, "provider": provider,
+               "endpoint_kind": endpoint_kind, "cwd": cwd,
+               "role": role, "sandbox": "read-only",
+               "instructions": instructions, "params": params}),
+    ) {
+        Ok(_) => {}
+        Err(err) if err.to_string().contains("UNIQUE") => {
+            // Already registered — reopen rather than fail. A stopped
+            // agent is resumed; a live one is reused as-is.
+            let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+            let state = show["agent"]["state"].as_str().unwrap_or_default();
+            if matches!(state, "stopped" | "offline") {
+                client::rpc(state_dir, "agent_resume", json!({"alias": alias}))?;
+            }
+        }
+        Err(err) => return Err(err),
+    }
+    // The provider endpoint opens asynchronously (a pty open can wait on
+    // the native session lock) — poll until it is live or gives up.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let agent = loop {
+        let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+        let agent = show["agent"].clone();
+        let state = agent["state"].as_str().unwrap_or_default();
+        let open = agent["endpoint"].is_string();
+        if open || matches!(state, "stopped" | "offline" | "attention") {
+            break agent;
+        }
+        if Instant::now() >= deadline {
+            break agent;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let state = agent["state"].as_str().unwrap_or_default();
+    let native = agent["session_id"]
+        .as_str()
+        .or_else(|| agent["thread_id"].as_str());
+    print_json(&json!({
+        "alias": alias,
+        "provider": provider,
+        "state": state,
+        "session": native,
+        "endpoint": agent["endpoint"],
+        "next": {
+            "attach": format!("cadence agent attach {alias}"),
+            "ready": format!("cadence agent ready {alias}"),
+            "send": format!("cadence message send {alias} --text '…'"),
+        },
+    }));
+    if state == "starting" {
+        eprintln!("still opening — watch `cadence agent show {alias}`");
+    }
+    if attach {
+        return attach_agent(state_dir, &alias, true);
+    }
+    Ok(0)
+}
+
 fn main() {
     let code = match run() {
         Ok(code) => code,
@@ -589,4 +782,40 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn devin_resume_parses_like_native() {
+        let cli = Cli::try_parse_from(["cadence", "devin", "-r", "cookie-cesium"]).unwrap();
+        match cli.command {
+            Commands::Devin { resume, attach, .. } => {
+                assert_eq!(resume.as_deref(), Some("cookie-cesium"));
+                assert!(!attach);
+            }
+            _ => panic!("expected devin subcommand"),
+        }
+    }
+
+    #[test]
+    fn devin_fresh_with_attach() {
+        let cli = Cli::try_parse_from(["cadence", "devin", "--attach"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Devin {
+                resume: None,
+                attach: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn codex_shortcut_parses() {
+        let cli = Cli::try_parse_from(["cadence", "codex", "--cwd", "/tmp"]).unwrap();
+        assert!(matches!(cli.command, Commands::Codex { .. }));
+    }
 }

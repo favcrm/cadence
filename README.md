@@ -14,6 +14,23 @@ See [the implementation plan](docs/IMPLEMENTATION-PLAN.md).
 Keep task checkouts under `.worktrees/`; see [workspace setup](docs/WORKSPACES.md)
 for creation, handover and cleanup instructions.
 
+## Quick start
+
+```bash
+cadence daemon start            # detached controller (CADENCE_STATE_DIR sets the state dir)
+
+cadence devin                   # fresh Devin official TUI in an owned tmux pane
+cadence devin -r cookie-cesium  # resume an existing Devin session, like `devin -r`
+cadence codex --attach          # Codex managed-ws endpoint + `codex resume --remote`
+
+cadence agent ready <slug>      # operator claim: pane inspected, idle, empty input
+cadence message send <slug> --text "task"   # gated literal paste into the TUI
+cadence agent attach <slug>     # print the tmux attach command (--run to exec)
+```
+
+Everywhere a command takes an agent name, the provider-native session id
+(Devin slug, Codex thread) resolves to the registered alias.
+
 ## Principles
 
 - Preserve native session identity and visible terminal conversations.

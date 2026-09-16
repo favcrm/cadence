@@ -303,12 +303,35 @@ impl Store {
     }
 
     pub fn agent(&self, alias: &str) -> Result<Agent> {
+        self.agent_opt(alias)?
+            .ok_or_else(|| Error::rejected("Unknown managed agent"))
+    }
+
+    pub fn agent_opt(&self, alias: &str) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Error::rejected("Unknown managed agent"),
-                other => other.into(),
-            })
+        match conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent) {
+            Ok(agent) => Ok(Some(agent)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    /// Look an agent up by a provider-native identifier — `thread_id` or
+    /// `session_id` (e.g. a Devin session slug). Exact aliases always win;
+    /// callers should try [`Store::agent_opt`] first.
+    pub fn agent_by_native(&self, native: &str) -> Result<Option<Agent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT * FROM agents WHERE thread_id=?1 OR session_id=?1 LIMIT 2")?;
+        let rows = stmt
+            .query_map([native], row_agent)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.len() > 1 {
+            return Err(Error::rejected(
+                "Native session id matches more than one agent — use the alias",
+            ));
+        }
+        Ok(rows.into_iter().next())
     }
 
     pub fn agents(&self) -> Result<Vec<Agent>> {
