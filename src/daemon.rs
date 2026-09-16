@@ -62,6 +62,9 @@ impl Notify {
     }
 }
 
+/// Grace period for a cooperative stop before the transport is force-closed.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+
 struct PendingRequest {
     alias: String,
     id: Value,
@@ -107,23 +110,29 @@ impl Shared {
         self.changed.notify_all();
     }
 
-    /// Spawn the actor for `alias` unless it is already running or fenced
-    /// by an unknown outcome.
+    /// Spawn the actor for `alias` unless it is already owned (running or
+    /// stopping) or fenced by an unknown outcome.
     pub fn launch_actor(self: &Arc<Self>, alias: &str) -> Result<()> {
-        {
-            let agents = self.agents.lock().unwrap();
-            if let Some(ctl) = agents.get(alias) {
-                if ctl
-                    .thread
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|h| !h.is_finished())
-                {
-                    return Err(Error::rejected("Agent is still running or stopping"));
-                }
-            }
+        let mut agents = self.agents.lock().unwrap();
+        if agents.contains_key(alias) {
+            return Err(Error::rejected("Agent is still running or stopping"));
         }
+        self.start_actor_locked(&mut agents, alias, false)?;
+        Ok(())
+    }
+
+    /// Fence check, enable, state write, spawn and insert — all while the
+    /// agents map lock is held, so a concurrent stop/resume cannot
+    /// interleave. The map entry is the ownership record: it is inserted
+    /// before the actor becomes visible and removed only by the actor
+    /// itself after full termination, so a present entry always means
+    /// "still owned". Returns false when the alias is fenced.
+    fn start_actor_locked(
+        self: &Arc<Self>,
+        agents: &mut HashMap<String, Arc<AgentCtl>>,
+        alias: &str,
+        enable: bool,
+    ) -> Result<bool> {
         if self.store.has_unknown(alias)? {
             self.store.set_agent_state(
                 alias,
@@ -136,7 +145,10 @@ impl Shared {
                 json!({"reason": "uncertain_turn_preserved"}),
             );
             self.wake();
-            return Ok(());
+            return Ok(false);
+        }
+        if enable {
+            self.store.set_enabled(alias, true)?;
         }
         self.store.set_agent_state(alias, "starting", None)?;
         let ctl = Arc::new(AgentCtl {
@@ -149,8 +161,8 @@ impl Shared {
         let spawned = Arc::clone(&ctl);
         let handle = thread::spawn(move || shared.run_actor(&owned, spawned));
         *ctl.thread.lock().unwrap() = Some(handle);
-        self.agents.lock().unwrap().insert(alias.to_string(), ctl);
-        Ok(())
+        agents.insert(alias.to_string(), ctl);
+        Ok(true)
     }
 
     fn on_provider_event(&self, alias: &str, method: &str, params: Value) {
@@ -224,6 +236,13 @@ impl Shared {
                 let _ = self.store.set_agent_state(alias, state, None);
             }
         }
+        // Release the alias only after cleanup and the final state write:
+        // until this removal, lifecycle callers still see the agent owned.
+        let mut agents = self.agents.lock().unwrap();
+        if agents.get(alias).is_some_and(|c| Arc::ptr_eq(c, &ctl)) {
+            agents.remove(alias);
+        }
+        drop(agents);
         self.wake();
     }
 
@@ -244,14 +263,21 @@ impl Shared {
         };
         let adapter = adapter::build(&agent, hooks, &log_path)?;
         let adapter: Arc<dyn ProviderAdapter> = Arc::from(adapter);
-        let identity = adapter.open(&agent)?;
-        self.store.set_identity(
-            alias,
-            &identity.thread_id,
-            &identity.session_id,
-            identity.model.as_deref(),
-            identity.pid,
-        )?;
+        let opened = adapter.open(&agent).and_then(|identity| {
+            self.store.set_identity(
+                alias,
+                &identity.thread_id,
+                &identity.session_id,
+                identity.model.as_deref(),
+                identity.pid,
+            )
+        });
+        if let Err(error) = opened {
+            // A half-open adapter may still own a provider process;
+            // never leave it running past a failed initialization.
+            adapter.close();
+            return Err(error);
+        }
         *ctl.adapter.lock().unwrap() = Some(Arc::clone(&adapter));
         self.wake();
         loop {
@@ -274,7 +300,14 @@ impl Shared {
                         shared.wake();
                     });
                     match outcome {
-                        Ok(result) => self.complete(&message, result)?,
+                        Ok(result) => {
+                            if self.complete(&message, result).is_err() {
+                                // The provider reported an outcome we could
+                                // not persist or classify — ambiguous
+                                // post-submission, fence rather than replay.
+                                return self.unknown(alias, &message);
+                            }
+                        }
                         Err(Error::OutcomeUnknown(_)) => {
                             return self.unknown(alias, &message);
                         }
@@ -392,9 +425,15 @@ impl Shared {
             "agent_resume" => {
                 let alias = required_str(params, "alias")?;
                 self.store.agent(alias)?;
-                self.store.set_enabled(alias, true)?;
-                self.launch_actor(alias)?;
-                Ok(json!({"alias": alias, "state": "starting"}))
+                let mut agents = self.agents.lock().unwrap();
+                if agents.contains_key(alias) {
+                    return Err(Error::rejected("Agent is still running or stopping"));
+                }
+                // Enable only after the ownership/fence checks pass —
+                // a rejected resume must leave no side effects behind.
+                let started = self.start_actor_locked(&mut agents, alias, true)?;
+                let state = if started { "starting" } else { "attention" };
+                Ok(json!({"alias": alias, "state": state}))
             }
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
@@ -574,18 +613,48 @@ impl Shared {
         let _ = self.store.event_public(alias, "stop_requested", json!({}));
         let ctl = self.agents.lock().unwrap().get(alias).cloned();
         if let Some(ctl) = ctl {
+            self.stop_ctls(&[ctl]);
+        }
+        // The actor writes its own terminal state on exit; do not mask a
+        // fence it may have raised while finishing.
+        let agent = self.store.agent(alias)?;
+        let state = if agent.state == "attention" {
+            "attention"
+        } else {
+            self.store.set_agent_state(alias, "stopped", None)?;
+            "stopped"
+        };
+        self.wake();
+        Ok(json!({"alias": alias, "state": state}))
+    }
+
+    /// Interrupt every actor, wait one bounded grace, force-close the
+    /// stragglers, then join all threads. A forced close makes any
+    /// outstanding attempt `OutcomeUnknown` — fenced, never replayed.
+    fn stop_ctls(&self, ctls: &[Arc<AgentCtl>]) {
+        for ctl in ctls {
             if let Some(adapter) = ctl.adapter.lock().unwrap().clone() {
                 adapter.interrupt();
             }
             ctl.wake.notify_all();
-            let handle = ctl.thread.lock().unwrap().take();
-            if let Some(handle) = handle {
+        }
+        let deadline = Instant::now() + STOP_GRACE;
+        while ctls.iter().any(|c| !ctl_finished(c)) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        for ctl in ctls {
+            if !ctl_finished(ctl) {
+                if let Some(adapter) = ctl.adapter.lock().unwrap().clone() {
+                    adapter.close();
+                }
+                ctl.wake.notify_all();
+            }
+        }
+        for ctl in ctls {
+            if let Some(handle) = ctl.thread.lock().unwrap().take() {
                 let _ = handle.join();
             }
         }
-        self.store.set_agent_state(alias, "stopped", None)?;
-        self.wake();
-        Ok(json!({"alias": alias, "state": "stopped"}))
     }
 
     fn notify_agent(&self, alias: &str) {
@@ -594,22 +663,19 @@ impl Shared {
         }
     }
 
-    /// Cooperative shutdown: stop accepting, stop actors, close adapters.
+    /// Cooperative shutdown: bounded stop for every actor.
     fn shutdown(&self) {
-        for ctl in self.agents.lock().unwrap().values() {
-            if let Some(adapter) = ctl.adapter.lock().unwrap().clone() {
-                adapter.interrupt();
-            }
-            ctl.wake.notify_all();
-        }
-        let agents: Vec<Arc<AgentCtl>> = self.agents.lock().unwrap().values().cloned().collect();
-        for ctl in agents {
-            let handle = ctl.thread.lock().unwrap().take();
-            if let Some(handle) = handle {
-                let _ = handle.join();
-            }
-        }
+        let ctls: Vec<Arc<AgentCtl>> = self.agents.lock().unwrap().values().cloned().collect();
+        self.stop_ctls(&ctls);
     }
+}
+
+fn ctl_finished(ctl: &AgentCtl) -> bool {
+    ctl.thread
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_none_or(|h| h.is_finished())
 }
 
 fn is_terminal(state: &str) -> bool {
@@ -695,11 +761,32 @@ fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
     }
 }
 
+/// Exclusive lifetime ownership of the state directory. The lock file is
+/// held for the whole `serve` call; a second daemon fails here before it
+/// can touch the store, the socket, or any actor.
+fn acquire_singleton(state_dir: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(state_dir.join("cadence.lock"))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(Error::rejected(
+            "Another cadence daemon already owns this state directory",
+        ));
+    }
+    Ok(file)
+}
+
 /// Run the daemon in the foreground until `shutdown` or a signal.
 pub fn serve(state_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let _singleton = acquire_singleton(state_dir)?;
     let shared = Shared::new(state_dir)?;
     let socket_path = state_dir.join("cadence.sock");
     if socket_path.exists() {
+        // Safe while the singleton is held: no live owner can exist.
         std::fs::remove_file(&socket_path)?;
     }
     let listener = UnixListener::bind(&socket_path)?;

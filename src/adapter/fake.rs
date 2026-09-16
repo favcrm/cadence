@@ -7,15 +7,20 @@
 //!
 //! Prompt directives:
 //! - `NEED_INPUT:<detail>` — emit a provider approval request and block
-//!   until `agent respond` answers it; result echoes the decision.
+//!   until `agent respond` answers it, `interrupt` aborts it, or the
+//!   answer deadline passes.
+//! - `SLEEP:<secs>` — hold the turn; ignores `interrupt`, ends early only
+//!   when the transport is closed (mirrors a provider that ignores
+//!   cancellation but dies with its process).
 //! - `DISCONNECT` — sever the transport; the turn returns `OutcomeUnknown`.
 //! - `FAIL:<text>` — the provider reports a failed turn.
+//! - `BAD_STATUS` — return an unclassifiable completion status.
 //! - anything else — `FAKE_REPLY: <prompt>`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -25,9 +30,13 @@ use crate::store::Agent;
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Answer channel payload: `Some` is a provider response, `None` is an
+/// interrupt abort.
+type AnswerTx = mpsc::Sender<Option<Value>>;
+
 pub struct FakeAdapter {
     hooks: AdapterHooks,
-    pending: Mutex<HashMap<String, mpsc::Sender<Value>>>,
+    pending: Mutex<HashMap<String, AnswerTx>>,
     next_request: AtomicU64,
     next_turn: AtomicU64,
     disconnected: AtomicBool,
@@ -104,10 +113,52 @@ impl ProviderAdapter for FakeAdapter {
                     ));
                 }
             };
+            self.pending.lock().unwrap().remove(&request_id);
+            let Some(answer) = answer else {
+                // Interrupted while waiting for the decision.
+                return Ok(TurnResult {
+                    turn_id,
+                    status: "interrupted".to_string(),
+                    text: String::new(),
+                    stop_reason: Some("interrupted".to_string()),
+                    error: None,
+                });
+            };
             return Ok(TurnResult {
                 turn_id,
                 status: "completed".to_string(),
                 text: format!("FAKE_DECIDED:{answer}"),
+                stop_reason: None,
+                error: None,
+            });
+        }
+        if let Some(secs) = prompt
+            .strip_prefix("SLEEP:")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            // Ignores interrupt; ends early only when the transport dies.
+            let deadline = Instant::now() + Duration::from_secs(secs.min(300));
+            while Instant::now() < deadline {
+                if self.disconnected.load(Ordering::SeqCst) {
+                    return Err(Error::unknown(
+                        "Connection lost during turn; provider outcome is unknown",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            return Ok(TurnResult {
+                turn_id,
+                status: "completed".to_string(),
+                text: "FAKE_SLEPT".to_string(),
+                stop_reason: None,
+                error: None,
+            });
+        }
+        if prompt == "BAD_STATUS" {
+            return Ok(TurnResult {
+                turn_id,
+                status: "melted".to_string(),
+                text: String::new(),
                 stop_reason: None,
                 error: None,
             });
@@ -126,18 +177,27 @@ impl ProviderAdapter for FakeAdapter {
         let target = self.pending.lock().unwrap().remove(&id);
         match target {
             Some(tx) => {
-                let _ = tx.send(result);
+                let _ = tx.send(Some(result));
                 Ok(())
             }
             None => Err(Error::rejected("Request is no longer pending")),
         }
     }
 
-    fn interrupt(&self) {}
+    fn interrupt(&self) {
+        // Abort every outstanding provider request wait.
+        for (_, tx) in self.pending.lock().unwrap().drain() {
+            let _ = tx.send(None);
+        }
+    }
 
     fn disconnected(&self) -> bool {
         self.disconnected.load(Ordering::SeqCst)
     }
 
-    fn close(&self) {}
+    fn close(&self) {
+        // Mirror a dying provider: sever the transport and abort waits.
+        self.disconnected.store(true, Ordering::SeqCst);
+        self.interrupt();
+    }
 }

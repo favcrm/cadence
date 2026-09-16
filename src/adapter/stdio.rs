@@ -34,11 +34,13 @@ pub enum Incoming {
 }
 
 type MessageHandler = Box<dyn Fn(Incoming) + Send + Sync>;
+type DisconnectHook = Box<dyn Fn() + Send + Sync>;
 
 pub struct StdioAdapter {
     command: Vec<String>,
     env_scrub: Vec<String>,
     on_message: MessageHandler,
+    on_disconnect: DisconnectHook,
     inner: Mutex<Inner>,
     pending: Mutex<HashMap<u64, mpsc::Sender<Result<Value>>>>,
     next_id: AtomicU64,
@@ -51,11 +53,17 @@ struct Inner {
 }
 
 impl StdioAdapter {
-    pub fn new(command: &[&str], env_scrub: &[&str], on_message: MessageHandler) -> Arc<Self> {
+    pub fn new(
+        command: &[String],
+        env_scrub: &[&str],
+        on_message: MessageHandler,
+        on_disconnect: DisconnectHook,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            command: command.iter().map(|s| s.to_string()).collect(),
+            command: command.to_vec(),
             env_scrub: env_scrub.iter().map(|s| s.to_string()).collect(),
             on_message,
+            on_disconnect,
             inner: Mutex::new(Inner {
                 child: None,
                 stdin: None,
@@ -141,6 +149,9 @@ impl StdioAdapter {
         for (_, target) in self.pending.lock().unwrap().drain() {
             let _ = target.send(Err(Error::unknown("Provider process disconnected")));
         }
+        // Wake protocol-level waiters (e.g. a turn-completion wait) that
+        // do not sit on a pending RPC channel.
+        (self.on_disconnect)();
     }
 
     /// Write one outbound frame. A write failure means the request may or

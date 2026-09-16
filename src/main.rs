@@ -200,18 +200,27 @@ fn daemon_start(state_dir: &Path) -> Result<Value> {
             Ok(())
         });
     }
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
     // Wait until the socket answers or the child exits.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match client::rpc(state_dir, "health", json!({})) {
             Ok(health) => {
+                // If our child already exited, the socket belongs to a
+                // pre-existing daemon — report that honestly.
+                if child.try_wait().ok().flatten().is_some() {
+                    return Ok(json!({
+                        "state": "already_running",
+                        "socket": client::socket_path(state_dir),
+                        "health": health,
+                    }));
+                }
                 return Ok(json!({
                     "state": "started",
                     "pid": child.id(),
                     "socket": client::socket_path(state_dir),
                     "health": health,
-                }))
+                }));
             }
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(e),

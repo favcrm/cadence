@@ -27,6 +27,15 @@ prototype (`agent-harness-test/managed.py`, `service.py`,
   `agent register|list|show|requests|respond|stop|resume`,
   `message send|ask`, `events [--follow]`. Unimplemented verbs absent
   rather than stubbed.
+- Hardening (independent-review fixes): singleton `cadence.lock` flock
+  held for the daemon lifetime — a second `serve` fails before touching
+  store/socket; per-alias actor ownership through termination (map entry
+  removed only by the actor itself); bounded stop/shutdown (interrupt →
+  ~3s grace → force-close → in-flight attempt becomes `unknown`, fence
+  preserved); transport EOF wakes turn-completion waits; ambiguous
+  post-submission outcomes (uncorrelatable `turn/start`, unclassifiable
+  status) persist `unknown`; adapter init guarded so a failed `open` or
+  identity write never leaves a provider process behind.
 
 ## Deferred (documented, not claimed)
 

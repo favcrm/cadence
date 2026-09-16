@@ -21,6 +21,20 @@ use crate::store::Agent;
 
 const TURN_DEADLINE: Duration = Duration::from_secs(600);
 
+/// Provider command; `CADENCE_CODEX_COMMAND` overrides it (test/mock use).
+fn codex_command() -> Vec<String> {
+    if let Ok(cmd) = std::env::var("CADENCE_CODEX_COMMAND") {
+        let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+        if !parts.is_empty() {
+            return parts;
+        }
+    }
+    ["codex", "app-server", "--listen", "stdio://"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 pub struct CodexAdapter {
     stdio: Arc<StdioAdapter>,
     shared: Arc<Shared>,
@@ -50,14 +64,16 @@ impl CodexAdapter {
             active_turn: Mutex::new(None),
         });
         let routed = Arc::clone(&shared);
+        let disconnected = Arc::clone(&shared);
         let stdio = StdioAdapter::new(
-            &["codex", "app-server", "--listen", "stdio://"],
+            &codex_command(),
             &[
                 "CODEX_THREAD_ID",
                 "CODEX_SESSION_ID",
                 "CLAUDE_CODE_SESSION_ID",
             ],
             Box::new(move |incoming| routed.dispatch(incoming)),
+            Box::new(move || disconnected.on_disconnect()),
         );
         Self {
             stdio,
@@ -114,13 +130,23 @@ impl Shared {
     fn emit(&self, method: &str, params: &Value) {
         (self.hooks.on_event)(method, params.clone());
     }
+
+    /// Transport EOF: wake any turn-completion wait so it can re-check
+    /// `disconnected` instead of sleeping out the turn deadline. The
+    /// `completed` lock serializes against the waiter's check-then-sleep.
+    fn on_disconnect(&self) {
+        let _guard = self.completed.lock().unwrap();
+        self.turn_cv.notify_all();
+    }
 }
 
 impl ProviderAdapter for CodexAdapter {
     fn open(&self, agent: &Agent) -> Result<Identity> {
         self.stdio.launch(&agent.cwd, &self.log_path)?;
-        let pid = self.stdio.pid().unwrap_or(0);
-        let result = (|| -> Result<Value> {
+        // Everything after launch is guarded: any failure closes the
+        // transport so no owned provider process is left behind.
+        let opened = (|| -> Result<Identity> {
+            let pid = self.stdio.pid().unwrap_or(0);
             self.stdio.request(
                 "initialize",
                 json!({"clientInfo": {"name": "cadence-agent", "version": "0.1.0"}}),
@@ -143,34 +169,28 @@ impl ProviderAdapter for CodexAdapter {
             } else {
                 "thread/start"
             };
-            self.stdio.request(method, params)
+            let result = self.stdio.request(method, params)?;
+            let thread_id = result
+                .pointer("/thread/id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::provider("thread/start returned no thread id"))?
+                .to_string();
+            *self.shared.thread_id.lock().unwrap() = Some(thread_id.clone());
+            Ok(Identity {
+                session_id: result
+                    .pointer("/thread/sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&thread_id)
+                    .to_string(),
+                thread_id,
+                model: result
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                pid,
+            })
         })();
-        let result = match result {
-            Ok(r) => r,
-            Err(e) => {
-                self.stdio.close();
-                return Err(e);
-            }
-        };
-        let thread_id = result
-            .pointer("/thread/id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::provider("thread/start returned no thread id"))?
-            .to_string();
-        *self.shared.thread_id.lock().unwrap() = Some(thread_id.clone());
-        Ok(Identity {
-            session_id: result
-                .pointer("/thread/sessionId")
-                .and_then(Value::as_str)
-                .unwrap_or(&thread_id)
-                .to_string(),
-            thread_id,
-            model: result
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            pid,
-        })
+        opened.inspect_err(|_| self.stdio.close())
     }
 
     fn run_turn(
@@ -197,7 +217,10 @@ impl ProviderAdapter for CodexAdapter {
         let turn_id = result
             .pointer("/turn/id")
             .and_then(Value::as_str)
-            .ok_or_else(|| Error::provider("turn/start returned no turn id"))?
+            // The provider acknowledged the request but we cannot correlate
+            // a turn — execution may have started, so this is not a
+            // definitive failure.
+            .ok_or_else(|| Error::unknown("turn/start acknowledged but returned no turn id"))?
             .to_string();
         *self.shared.active_turn.lock().unwrap() = Some(turn_id.clone());
         on_started(&turn_id);

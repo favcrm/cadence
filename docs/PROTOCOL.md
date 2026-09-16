@@ -10,6 +10,12 @@ else `~/.local/state/cadence` (mode 0700). The daemon accepts only
 same-UID peers (`SO_PEERCRED`). This establishes same-user access; it is
 not a hostile same-user isolation boundary.
 
+One daemon owns a state directory: `serve` takes an exclusive `flock` on
+`<state_dir>/cadence.lock` before touching the store or socket and holds
+it for the process lifetime. A second start fails `rejected` without
+running recovery; `daemon start` reports `already_running` with the
+existing daemon's health.
+
 ## Frames
 
 Request: `{"method": "<name>", "params": {...}}`
@@ -30,7 +36,7 @@ Error kinds:
 | Method | Params | Result |
 |---|---|---|
 | `health` | — | `{state:"ready", protocol:1, capabilities:[...]}` |
-| `shutdown` | — | `{state:"stopping"}`; daemon closes actors then exits |
+| `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded) then exits |
 | `agent_register` | `alias, provider, cwd, endpoint_kind?, role?, sandbox?, instructions?` | `{alias,state:"starting",provider}` |
 | `agent_list` | — | `{agents:[Agent]}` |
 | `agent_show` | `alias` | `{agent, messages, event_cursor}` |
@@ -39,11 +45,18 @@ Error kinds:
 | `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
 | `agent_respond` | `alias, request, decision?|answers?` | `{state:"answered"}` |
-| `agent_stop` | `alias` | `{alias,state:"stopped"}` |
-| `agent_resume` | `alias` | `{alias,state:"starting"}` |
+| `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
+| `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
+
+`agent_stop` is bounded: it interrupts the provider, waits a short grace
+(~3s), then force-closes the transport and joins the actor. A turn that
+was still in flight becomes `unknown` and the agent stays `attention` —
+a stop never masks a fence. `agent_resume` is `rejected` while the actor
+is still owned (running or stopping) and has no side effects in that
+case; on a fenced agent it returns `attention` and does not re-enable.
 
 ## Agents
 
@@ -64,7 +77,11 @@ provider outcome needs human review; the actor will not relaunch itself.
 ## Messages
 
 States: `queued → submitting → running → completed | failed | interrupted
-| unknown`. `unknown` is durable and fences its actor.
+| unknown`. `unknown` is durable and fences its actor. Any ambiguous
+post-submission outcome lands there — transport loss mid-turn, a turn
+deadline, an acknowledged `turn/start` that cannot be correlated to a
+turn id, an unclassifiable completion status, or a forced close while a
+turn was in flight.
 
 Idempotency: a client-supplied `message` id makes retries of the *same
 envelope* (alias+body+reply_to+source) return `duplicate:true`. The same
