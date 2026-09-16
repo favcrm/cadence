@@ -41,27 +41,31 @@ prototype (`agent-harness-test/managed.py`, `service.py`,
   and failed initialization leaves no provider process behind.
 - M2a — `managed-ws` endpoint: owned `codex app-server --listen
   ws://127.0.0.1:<ephemeral>` (loopback only, own process group), the
-  same app-server JSON-RPC protocol over a blocking WebSocket with a
-  hand-rolled codec — ONE `Mutex<TcpStream>` serializes every outbound
-  frame (requests, pongs, close replies), so no two WebSocket state
-  machines write the same socket. Shared request/response correlation
-  extracted to `adapter/link.rs` so stdio and WS transports cannot
-  diverge. Connect, handshake, writes and close are all socket-timeout
-  bounded; the child is published before connecting so `stop` can kill
-  a provider stuck mid-handshake, and every post-spawn error path
-  cleans it up. Fresh threads get one minimal seed turn at open —
-  Codex persists a thread's rollout only after its first turn, which
-  is what `codex resume --remote` needs to attach. Agent record
-  carries `endpoint`; cleared on actor exit. `agent attach` prints (or
-  `--run` executes) `codex resume --remote <endpoint> <thread>`;
-  rejected for non-WS kinds, dead agents, or missing endpoint/thread.
-  External approval resolution: `serverRequest/resolved` drops the
-  matching pending handle and fences late `agent_respond` calls.
+  same app-server JSON-RPC protocol over a tungstenite WebSocket with a
+  single I/O owner — one thread owns the `WebSocket` and drains an
+  outbound channel between bounded reads, so requests, pongs and close
+  replies never interleave on the socket. Shared request/response
+  correlation extracted to `adapter/link.rs` so stdio and WS transports
+  cannot diverge. Connect/handshake/write/close are all bounded, with
+  the upgrade running in a helper thread joined by absolute deadline —
+  a drip-feeding or silent peer cannot stall startup. The child is
+  published before connecting so `stop` kills a provider stuck
+  mid-handshake; every post-spawn error path cleans it up. Fresh
+  threads get one minimal seed turn at open — Codex persists a
+  thread's rollout only after its first turn, which is what
+  `codex resume --remote` needs to attach. Agent record carries
+  `endpoint`; cleared on actor exit. `agent attach` prints (or `--run`
+  executes) `codex resume --remote <endpoint> <thread>`; rejected for
+  non-WS kinds, dead agents, or missing endpoint/thread. External
+  approval resolution: `serverRequest/resolved` drops the matching
+  pending handle; `agent_respond` claims handles atomically (validate
+  under lock, then send) so a late/concurrent respond is `rejected`
+  and `waiting_input` never regresses from a resolved/finished turn.
   Schema v1→v2 migration is a single transaction with a column-exists
   check, so an interrupted upgrade converges instead of wedging.
-  Live smoke verified: official TUI attached to the exact native
-  thread showed an externally submitted prompt and its separate
-  actual reply (`CADENCE_WS_SMOKE_42`).
+  Live smoke verified on the earlier transport revision: official TUI
+  attached to the exact native thread showed an externally submitted
+  prompt and its separate actual reply (`CADENCE_WS_SMOKE_42`).
 
 ## Deferred (documented, not claimed)
 

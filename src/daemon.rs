@@ -596,28 +596,22 @@ impl Shared {
         let decision = optional_str(params, "decision");
         // Explicit JSON null means "not provided".
         let answers = params.get("answers").filter(|a| !a.is_null()).cloned();
-        let pending = {
-            let map = self.pending.lock().unwrap();
-            map.get(handle).map(|req| {
-                (
-                    req.alias.clone(),
-                    req.id.clone(),
-                    req.method.clone(),
-                    req.params.clone(),
-                )
-            })
-        };
-        let Some((owner, request_id, method, request_params)) = pending else {
-            return Err(Error::rejected(
-                "Request is no longer pending for this agent",
-            ));
-        };
-        if owner != alias {
-            return Err(Error::rejected(
-                "Request is no longer pending for this agent",
-            ));
-        }
-        let response = match method.as_str() {
+        // Claim the handle atomically: whichever path removes it first
+        // — this respond or an external `serverRequest/resolved` — owns
+        // the answer, and every other path sees "no longer pending".
+        // Validation runs under the same lock so a malformed respond
+        // leaves the request pending instead of consuming it. No I/O
+        // happens while the lock is held.
+        let (request_id, response) = {
+            let mut map = self.pending.lock().unwrap();
+            let req = map
+                .get(handle)
+                .filter(|req| req.alias == alias)
+                .ok_or_else(|| Error::rejected("Request is no longer pending for this agent"))?;
+            let request_id = req.id.clone();
+            let method = req.method.clone();
+            let request_params = req.params.clone();
+            let response = match method.as_str() {
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                 match decision {
                     Some("accept") | Some("decline") if answers.is_none() => {
@@ -655,6 +649,9 @@ impl Shared {
             _ => return Err(Error::rejected(
                 "This request type is not supported; stop the agent or use the provider directly",
             )),
+            };
+            map.remove(handle);
+            (request_id, response)
         };
         let adapter = self
             .lifecycle
@@ -666,12 +663,16 @@ impl Shared {
         let adapter = adapter
             .ok_or_else(|| Error::internal("Agent adapter is not available for this request"))?;
         adapter.respond(&request_id, response)?;
-        let remaining = {
-            let mut pending = self.pending.lock().unwrap();
-            pending.remove(handle);
-            pending.values().any(|req| req.alias == alias)
-        };
-        if !remaining {
+        let remaining = self
+            .pending
+            .lock()
+            .unwrap()
+            .values()
+            .any(|req| req.alias == alias);
+        // Only relax waiting_input: a turn that meanwhile resolved or
+        // finished (idle/completed/attention/stopping) must not regress
+        // to busy.
+        if !remaining && self.store.agent(alias)?.state == "waiting_input" {
             self.store.set_agent_state(alias, "busy", None)?;
         }
         let _ = self

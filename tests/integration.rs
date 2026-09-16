@@ -612,14 +612,18 @@ struct MockCodex {
 /// MOCK_PY. Parses `--listen ws://host:port` from argv (appended by the
 /// transport), handshakes with stdlib sockets, and serves text frames.
 /// Turn text directives: `DIE` closes the TCP connection after the ack,
-/// `DIE2` sends a WS close frame instead, `NEED_INPUT:x` raises a
-/// server->client approval request that must be answered before the
-/// turn completes, `NEED_INPUT_EXT:x` raises one then resolves it
-/// externally via `serverRequest/resolved` once `<pidfile>.resolve`
-/// appears. Modes: `silent` never completes non-seed turns,
-/// `no-upgrade` accepts TCP but never answers the WS handshake,
-/// `ping-first` pings before the non-seed ack and records pong receipt
-/// in `<pidfile>.pong`.
+/// `DIE2` sends a WS close frame instead, `FRAG` delivers
+/// turn/completed as two continuations with an interleaved ping,
+/// `NEED_INPUT:x` raises a server->client approval request that must be
+/// answered before the turn completes, `NEED_INPUT_EXT:x` raises one
+/// then resolves it externally via `serverRequest/resolved` once
+/// `<pidfile>.resolve` appears. Modes: `silent` never completes
+/// non-seed turns, `no-upgrade` accepts TCP but never answers the WS
+/// handshake, `drip` feeds a valid 101 one byte/second,
+/// `bad-upgrade` answers 200 instead of 101, `ping-first` pings before
+/// the non-seed ack and records pong receipt in `<pidfile>.pong`.
+/// The handshake is strict: a Sec-WebSocket-Key that does not decode
+/// to exactly 16 bytes is refused with 400.
 const MOCK_WS_PY: &str = r##"
 import base64, hashlib, json, os, socket, struct, sys, threading, time
 
@@ -662,18 +666,33 @@ def read_frame(conn):
         payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
     return opcode, payload
 
-def send_frame(conn, opcode, payload):
+def send_frag(conn, fin, opcode, payload):
     n = len(payload)
     if n < 126:
-        hdr = bytes([0x80 | opcode, n])
+        hdr = bytes([(0x80 if fin else 0) | opcode, n])
     elif n < 65536:
-        hdr = bytes([0x80 | opcode, 126]) + struct.pack(">H", n)
+        hdr = bytes([(0x80 if fin else 0) | opcode, 126]) + struct.pack(">H", n)
     else:
-        hdr = bytes([0x80 | opcode, 127]) + struct.pack(">Q", n)
+        hdr = bytes([(0x80 if fin else 0) | opcode, 127]) + struct.pack(">Q", n)
     conn.sendall(hdr + payload)
+
+def send_frame(conn, opcode, payload):
+    send_frag(conn, True, opcode, payload)
 
 def send_json(conn, msg):
     send_frame(conn, 1, json.dumps(msg).encode())
+
+def send_fragmented_complete(conn, turn, text):
+    # One message split across two continuations with an interleaved
+    # ping: the client must reassemble it and answer the control frame.
+    body = json.dumps({"method": "turn/completed", "params": {"turn": {
+        "id": turn, "status": "completed", "items": [
+            {"id": "i1", "type": "agentMessage",
+             "text": text, "phase": "final_answer"}]}}}).encode()
+    half = len(body) // 2
+    send_frag(conn, False, 0x1, body[:half])
+    send_frame(conn, 0x9, b"mid-frag")
+    send_frag(conn, True, 0x0, body[half:])
 
 def complete(conn, turn, text):
     send_json(conn, {"method": "turn/completed", "params": {"turn": {
@@ -692,6 +711,15 @@ def handshake(conn):
     for line in data.decode().split("\r\n"):
         if line.lower().startswith("sec-websocket-key:"):
             key = line.split(":", 1)[1].strip()
+    # RFC 6455: the client nonce must decode to exactly 16 bytes.
+    # Refuse anything else, as a strict standards-compliant server does.
+    try:
+        valid = len(base64.b64decode(key)) == 16
+    except Exception:
+        valid = False
+    if not valid:
+        conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        return False
     accept = base64.b64encode(
         hashlib.sha1((key + GUID).encode()).digest()).decode()
     conn.sendall((
@@ -733,10 +761,46 @@ def external_resolve(conn):
         "params": {"requestId": "srv-1", "threadId": "th-1"}})
     complete(conn, "t-1", "MOCK_OK")
 
+def read_request(conn):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return None
+        data += chunk
+    key = ""
+    for line in data.decode().split("\r\n"):
+        if line.lower().startswith("sec-websocket-key:"):
+            key = line.split(":", 1)[1].strip()
+    return key
+
 def handle(conn):
     if mode == "no-upgrade":
         # Accept TCP, never answer the handshake. The client's bounded
         # handshake must give up and clean up the owned process.
+        time.sleep(3600)
+        return
+    if mode == "drip":
+        # Answer with a valid 101 one byte per second: only an absolute
+        # deadline bounds this — per-read timeouts never fire.
+        key = read_request(conn)
+        if key is None:
+            return
+        accept = base64.b64encode(
+            hashlib.sha1((key + GUID).encode()).digest()).decode()
+        response = ("HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode()
+        for byte in response:
+            conn.sendall(bytes([byte]))
+            time.sleep(1)
+        time.sleep(3600)
+        return
+    if mode == "bad-upgrade":
+        # Refuse the upgrade outright: HTTP 200, not 101.
+        if read_request(conn) is None:
+            return
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
         time.sleep(3600)
         return
     if not handshake(conn):
@@ -784,6 +848,9 @@ def handle(conn):
             if text.startswith("DIE"):
                 conn.close()
                 return
+            if text.startswith("FRAG"):
+                send_fragmented_complete(conn, "t-1", "MOCK_OK")
+                continue
             if text.startswith(SEED):
                 complete(conn, "t-1", "READY")
             elif mode == "silent":
@@ -1363,4 +1430,98 @@ fn ws_external_approval_resolution_drops_pending() {
     let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
     assert_eq!(requests["requests"].as_array().unwrap().len(), 0);
     d.wait_agent("w1", "idle", 10);
+}
+
+#[test]
+fn ws_drip_handshake_is_bounded() {
+    // The reviewer's drip probe: a peer feeding one header byte/second
+    // defeats per-read timeouts; only the absolute deadline bounds it.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("drip");
+    d.register_codex_ws("w1");
+    let began = Instant::now();
+    d.wait_agent("w1", "attention", 25);
+    assert!(
+        began.elapsed() < Duration::from_secs(25),
+        "drip handshake was not wall-clock bounded"
+    );
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_refused_upgrade_is_bounded() {
+    // A 200-instead-of-101 response must fail startup, not hang.
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("bad-upgrade");
+    d.register_codex_ws("w1");
+    let began = Instant::now();
+    d.wait_agent("w1", "attention", 25);
+    assert!(began.elapsed() < Duration::from_secs(25));
+    wait_pid_gone(&mock.pidfile, 10);
+}
+
+#[test]
+fn ws_fragmented_message_with_interleaved_ping() {
+    // turn/completed arrives as two continuations around a ping: the
+    // vetted codec must reassemble it and answer the control frame.
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    let reply = d
+        .rpc(
+            "agent_ask",
+            json!({"alias": "w1", "text": "FRAG me", "message": "m1", "wait": 30}),
+        )
+        .unwrap();
+    assert_eq!(reply["state"], "completed");
+    assert!(reply["result"].to_string().contains("MOCK_OK"), "{reply}");
+}
+
+#[test]
+fn ws_concurrent_respond_has_single_winner() {
+    // Two racing responds on one handle: the atomic claim gives exactly
+    // one winner; the loser is rejected before any provider write.
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex_ws("ok");
+    d.register_codex_ws("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT:x", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let handle = requests["requests"][0]["request"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut results = Vec::new();
+    thread::scope(|scope| {
+        let mut racers = Vec::new();
+        for _ in 0..2 {
+            let d = &d;
+            let handle = handle.clone();
+            racers.push(scope.spawn(move || {
+                d.rpc(
+                    "agent_respond",
+                    json!({"alias": "w1", "request": handle, "decision": "accept"}),
+                )
+            }));
+        }
+        for racer in racers {
+            results.push(racer.join().unwrap());
+        }
+    });
+    let winners = results
+        .iter()
+        .filter(|r| matches!(r, Ok(v) if v["state"] == "answered"))
+        .count();
+    let losers = results
+        .iter()
+        .filter(|r| matches!(r, Err(e) if e.to_string().contains("no longer pending")))
+        .count();
+    assert_eq!((winners, losers), (1, 1), "{results:?}");
+    d.wait_message("w1", "m1", &["completed"], 20);
 }

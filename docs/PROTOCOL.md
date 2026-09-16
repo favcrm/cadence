@@ -101,10 +101,14 @@ apply to TCP, and the port is discoverable via `ss`. The URL lives only
 in the private 0700 state dir, but treat every local process as able to
 connect. Do not expose `managed-ws` on multi-user hosts you distrust.
 
-Connect, handshake, writes, and close are all bounded: a provider that
-accepts TCP but never upgrades fails startup within the connect
-deadline and the owned child is killed — `stop` can interrupt setup
-because the child is published before the transport connects.
+The wire is tungstenite with a single I/O owner: only one thread ever
+touches the `WebSocket`, and outbound payloads (requests, pongs, close
+replies) travel over a channel it drains between bounded reads — no two
+writers ever share the socket. Connect, handshake, writes, and close
+are bounded: the upgrade runs against an absolute deadline (a
+drip-feeding or silent peer fails startup within the connect deadline)
+and the owned child is killed — `stop` can interrupt setup because the
+child is published before the transport connects.
 
 Approval requests remain brokered through `agent_respond`; an attached
 TUI may also see and answer them. The provider then emits
