@@ -66,11 +66,37 @@ prototype (`agent-harness-test/managed.py`, `service.py`,
   Live smoke verified on the earlier transport revision: official TUI
   attached to the exact native thread showed an externally submitted
   prompt and its separate actual reply (`CADENCE_WS_SMOKE_42`).
+- M2b — `pty` endpoint (provider `devin`): owned tmux session on a
+  private socket (`cadence-<state-hash>`) runs the official `devin`
+  TUI. Native session identity is proven via
+  `~/.local/share/devin/cli/session_locks/<id>.lock` — a `/proc` walk
+  requires a lock holder to descend from the pane pid at open, at every
+  send, and on reconnect; a foreign lock refuses takeover, a changed
+  owner fails closed. Restart reattaches a live pane owning the same
+  session or relaunches `devin -r <stored>` on a dead one. Submission
+  is gated: pane alive/unblocked/lock-owning plus a single-use,
+  short-TTL operator claim (`agent ready`); refuse → `queued` retry,
+  never blind paste. Delivery is literal (`load-buffer` +
+  `paste-buffer -p` + `Enter`, 1–4000 chars, no control characters, no
+  shell). A paste marks the message `running` with a
+  `pty-<generation>-<uuid>` token (`submitted` event); only explicit
+  `message ack` / `message result` reports complete it — wrong or
+  stale-generation tokens and conflicting duplicates are `rejected`.
+  `agent_respond` is `rejected` on pty (approvals stay in-terminal);
+  `agent capture` returns the pane; `agent attach` prints the tmux
+  attach command. Schema v2→v3 adds `agents.params` and
+  `agents.generation` atomically. `stop` kills the owned pane; daemon
+  shutdown detaches instead so the operator's terminal survives.
 
 ## Deferred (documented, not claimed)
 
-- Devin ACP adapter, PTY endpoint, Claude native inbox, Cursor —
+- Devin ACP adapter, Claude native inbox, Cursor —
   `endpoint_kind`s declared; `doctor` reports them not implemented.
+- Automatic TUI draft/permission-prompt detection — the `agent ready`
+  operator claim is the authoritative gate; screen scraping is not
+  claimed as reliable.
+- Registration of a pre-existing foreign pane (no kill authority) —
+  only launched, owned sessions are supported in M2b.
 - Job/task lifecycle, worktrees, revision-bound QA verdicts (M3).
 - Cooperative job API (legacy prototype path) — intentionally not ported.
 - systemd user unit, SSH-disconnect lifecycle testing.

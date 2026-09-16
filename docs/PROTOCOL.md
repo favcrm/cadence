@@ -45,6 +45,9 @@ Error kinds:
 | `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
 | `agent_respond` | `alias, request, decision?|answers?` | `{state:"answered"}` |
+| `agent_ready` | `alias` | `{state:"ready-claimed"}` — single-use readiness claim for `pty` |
+| `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
+| `message_report` | `message, token, kind: ack|result, text?` | `{state:"reported"}` — explicit PTY ack/result |
 | `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 
@@ -73,9 +76,68 @@ depend on it:
 |---|---|---|
 | `managed` | owned provider process (JSON-RPC stdio) | implemented: provider `codex` |
 | `managed-ws` | owned `codex app-server --listen ws://127.0.0.1:*`; official TUI attachable | implemented: provider `codex` |
+| `pty` | owned tmux pane running the official TUI; literal paste + explicit reports | implemented: provider `devin` |
 | `fake` | in-process test double | test fixture only |
-| `pty` | terminal paste/capture | declared, not implemented |
 | `native_inbox` | provider-native inbox | declared, not implemented |
+
+`agent_register` accepts `params` (JSON object) for endpoint options:
+pty uses `{"session": "<native-id>"}` to resume an existing Devin
+session instead of starting a fresh one.
+
+## pty endpoints (provider `devin`)
+
+Cadence launches `devin [-r <session>]` inside a detached tmux session
+on a private socket (`cadence-<state-hash>`), so every pane it can kill
+is one it spawned. The agent record keeps the fields separate: `alias`,
+`thread_id` = the native Devin session id, `endpoint` =
+`tmux://<socket>/<session>`, `pid` = pane process, `generation` = a uuid
+minted per `open`.
+
+**Ownership is proven, not assumed.** Devin flock's
+`~/.local/share/devin/cli/session_locks/<session>.lock`; Cadence walks
+`/proc` to require that a lock holder is a descendant of the pane pid —
+at open, at every send, and on reconnect. If the lock for a requested
+session is held by any other process, registration refuses (no
+takeover). On restart a live pane that still owns the recorded session
+is reattached; a dead pane is relaunched with `devin -r <stored>`. A
+pane owning a *different* session fails closed (`attention`).
+
+**Submission gates.** `run_turn` requires all of: pane alive,
+`pane_dead=0`, `pane_in_mode=0`, lock still owned, and a fresh
+unconsumed operator claim from `agent ready` (60s TTL, consumed
+atomically by exactly one send — at most one paste per claim). The
+claim is the authoritative gate: Cadence cannot reliably detect a typed
+draft or an on-screen permission prompt, so the claiming operator
+asserts the terminal is idle with an empty input — inspect with
+`agent capture` first. A refused send returns the message to `queued`
+(event `gate_wait`) and retries; it is never pasted blind and never
+dropped. Message text is a single line of 1–4000 chars with no control
+characters, delivered literally via `load-buffer` + `paste-buffer -p`
++ `Enter` — no shell interpretation.
+
+**Durable submission vs. receipt.** A successful paste marks the
+message `running` with `turn_id = pty-<generation>-<uuid>` and emits
+`submitted`. Terminal echo proves visibility only; the message completes
+only through an explicit `message_report` (`message ack` keeps it
+`running`; `message result` finishes it `completed` and routes
+`reply_to`). The token must equal the recorded `turn_id` and belong to
+the agent's current generation — a report against a previous pane life
+is `rejected` as stale; a conflicting result for a completed message is
+`rejected`; an identical retry is idempotent. Reporting identifies the
+caller by possession of the token — self-asserted, not authenticated.
+
+A pane that dies after a possible paste leaves submitted messages
+`unknown` (fence, never replay); a pane that dies before the paste
+fails the message. `agent_respond` is `rejected` for pty — Devin
+permission prompts are answered in the terminal, and a visible prompt
+is one of the things the ready claim asserts absent. `agent_stop`
+kills the owned pane; daemon shutdown detaches instead, so a restart
+reattaches rather than destroying a terminal the operator may be using.
+
+Trust boundary: the tmux socket lives under the private state dir name
+scheme but tmux sockets are reachable by the same user; the report
+route is token-possession only. Peer result text is recorded data,
+not authorization for anything.
 
 `managed-ws` runs the same app-server protocol as `managed`, over a
 loopback WebSocket instead of stdio. The agent record exposes `endpoint`
@@ -144,8 +206,8 @@ no-op) and carries no `reply_to`, so routing cannot loop.
 `agent_events` pages the durable log: `{seq, alias, kind, payload, at}`.
 Kinds: `registered, queued, submitting, turn_started, turn_finished,
 provider_event, input_required, input_answered, input_resolved,
-result_routed, ready, attention, stop_requested`. `wait>0` long-polls
-up to 30s.
+result_routed, ready, ready_claimed, gate_wait, submitted, acknowledged,
+attention, stop_requested`. `wait>0` long-polls up to 30s.
 
 ## Approvals
 

@@ -15,11 +15,17 @@ pub enum Error {
     Provider(String),
     OutcomeUnknown(String),
     Internal(String),
+    /// The endpoint is not safe to submit to right now; the message
+    /// returns to `queued` and is retried, never failed or pasted blind.
+    GateRefused(String),
 }
 
 impl Error {
     pub fn rejected(message: impl Into<String>) -> Self {
         Self::Rejected(message.into())
+    }
+    pub fn gate(message: impl Into<String>) -> Self {
+        Self::GateRefused(message.into())
     }
     pub fn provider(message: impl Into<String>) -> Self {
         Self::Provider(message.into())
@@ -37,6 +43,7 @@ impl Error {
             Self::Provider(_) => "provider",
             Self::OutcomeUnknown(_) => "unknown",
             Self::Internal(_) => "internal",
+            Self::GateRefused(_) => "gate",
         }
     }
 }
@@ -44,9 +51,11 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Rejected(m) | Self::Provider(m) | Self::OutcomeUnknown(m) | Self::Internal(m) => {
-                f.write_str(m)
-            }
+            Self::Rejected(m)
+            | Self::Provider(m)
+            | Self::OutcomeUnknown(m)
+            | Self::Internal(m)
+            | Self::GateRefused(m) => f.write_str(m),
         }
     }
 }

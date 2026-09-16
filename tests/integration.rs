@@ -266,6 +266,7 @@ fn restart_fences_unknown_inflight() {
                 cwd: &cwd,
                 sandbox: "read-only",
                 instructions: None,
+                params: None,
             })
             .unwrap();
         store.enqueue("w1", "work", None, "m1", "user").unwrap();
@@ -1585,4 +1586,609 @@ fn ws_second_pending_request_keeps_waiting() {
     assert_eq!(answered["state"], "answered");
     d.wait_message("w1", "m1", &["completed"], 20);
     d.wait_agent("w1", "idle", 10);
+}
+
+// ---- mock Devin TUI over a mock tmux (no model calls) ----
+
+/// Fake `tmux` speaking just enough of the CLI for the pty adapter.
+/// `tmux -L <sock> <cmd> <args>`; per-socket state lives under
+/// `<mockdir>/tmux-state/<sock>/`. `new-session` really spawns the pane
+/// command (`bash -c`) in its own process group so pane_pid and the
+/// /proc lock-descendant checks exercise real ownership logic.
+const MOCK_TMUX_PY: &str = r##"#!/usr/bin/env python3
+import os, signal, subprocess, sys
+
+args = sys.argv[1:]
+if args[0] == "-L":
+    sock = args[1]; args = args[2:]
+state = os.path.join(os.environ["MOCK_TMUX_STATE"], sock)
+os.makedirs(state, exist_ok=True)
+
+def sess_path(name, ext):
+    return os.path.join(state, name + "." + ext)
+
+def sess_pid(name):
+    try:
+        pid = int(open(sess_path(name, "pid")).read().strip())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+def die(msg, code=1):
+    sys.stderr.write(msg + "\n"); sys.exit(code)
+
+cmd, rest = args[0], args[1:]
+if cmd == "new-session":
+    name = rest[rest.index("-s") + 1]
+    cwd = rest[rest.index("-c") + 1] if "-c" in rest else os.getcwd()
+    pane_cmd = rest[-1]
+    pane = os.path.join(state, name)
+    env = dict(os.environ, FAKE_PANE=pane)
+    # Detach the pane's stdio to a file — the adapter's Command::output
+    # would otherwise wait on pipes the long-lived pane inherited.
+    log = open(sess_path(name, "log"), "ab")
+    proc = subprocess.Popen(["bash", "-c", pane_cmd], cwd=cwd, env=env,
+                            stdin=subprocess.DEVNULL, stdout=log,
+                            stderr=log, start_new_session=True)
+    open(sess_path(name, "pid"), "w").write(str(proc.pid))
+    open(sess_path(name, "screen"), "a").close()
+    sys.exit(0)
+if cmd == "has-session":
+    name = rest[rest.index("-t") + 1]
+    sys.exit(0 if sess_pid(name) else 1)
+if cmd == "display-message":
+    name = rest[rest.index("-t") + 1]
+    fmt = rest[-1]
+    pid = sess_pid(name)
+    if fmt == "#{pane_pid}":
+        # A dead pane keeps its pid (tmux keeps dead panes); emulate.
+        try: print(int(open(sess_path(name, "pid")).read().strip()))
+        except Exception: die("no such session")
+    elif fmt == "#{pane_dead}":
+        print("0" if pid else "1")
+    elif fmt == "#{pane_in_mode}":
+        try: print(open(sess_path(name, "mode")).read().strip() or "0")
+        except FileNotFoundError: print("0")
+    else: die("unknown format " + fmt)
+    sys.exit(0)
+if cmd == "capture-pane":
+    name = rest[rest.index("-t") + 1]
+    out = ""
+    try: out += open(sess_path(name, "screen")).read()
+    except FileNotFoundError: die("no such session")
+    try: out += open(sess_path(name, "input")).read()
+    except FileNotFoundError: pass
+    sys.stdout.write(out); sys.exit(0)
+if cmd == "load-buffer":
+    open(os.path.join(state, "buffer"), "w").write(open(rest[-1]).read())
+    sys.exit(0)
+if cmd == "paste-buffer":
+    name = rest[rest.index("-t") + 1]
+    with open(sess_path(name, "input"), "a") as f:
+        f.write(open(os.path.join(state, "buffer")).read())
+    sys.exit(0)
+if cmd == "send-keys":
+    name = rest[rest.index("-t") + 1]
+    key = rest[-1]
+    with open(sess_path(name, "input"), "a") as f:
+        f.write("<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
+    sys.exit(0)
+if cmd == "kill-session":
+    name = rest[rest.index("-t") + 1]
+    pid = sess_pid(name)
+    if pid:
+        try: os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+    sys.exit(0)
+die("unhandled tmux cmd " + cmd)
+"##;
+
+/// Fake `devin` TUI: takes the real session lock (`flock`, visible via
+/// /proc/fd to the adapter's ownership scan), mirrors the pane input
+/// file, and answers an `<ENTER>`-terminated paste by writing the
+/// submitted line and a `MOCK_REPLY` to the screen file.
+/// `$FAKE_PANE` (set by the mock tmux) points at the session state.
+const MOCK_DEVIN_PY: &str = r#"
+import fcntl, os, sys, time
+
+locks = sys.argv[1]
+sid = sys.argv[sys.argv.index("-r") + 1] if "-r" in sys.argv else \
+    "mock-session-%d" % os.getpid()
+os.makedirs(locks, exist_ok=True)
+lf = open(os.path.join(locks, sid + ".lock"), "a")
+try:
+    fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("session_locked: %s" % sid); sys.exit(1)
+open(os.environ["FAKE_PANE"] + ".sid", "w").write(sid)
+with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+    f.write("Mock Devin TUI [%s]\n" % sid)
+while True:
+    inp = os.environ["FAKE_PANE"] + ".input"
+    try:
+        data = open(inp).read()
+    except FileNotFoundError:
+        data = ""
+    if "<ENTER>" in data:
+        text, rest = data.split("<ENTER>", 1)
+        open(inp, "w").write(rest)
+        if text.strip():
+            with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+                f.write("> %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()))
+    if "<KEY:C-c>" in data:
+        open(inp, "w").write("")
+        with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+            f.write("^C interrupt\n")
+    time.sleep(0.05)
+"#;
+
+struct MockDevin {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    dir: PathBuf,
+    locks: PathBuf,
+}
+
+/// Install the mock tmux/devin pair. Set the env overrides BEFORE a
+/// daemon starts so its auto-relaunch sees them.
+fn install_mock_devin(dir: &Path) -> MockDevin {
+    let guard = ENV_LOCK.lock().unwrap();
+    let locks = dir.join("devin-locks");
+    let tmux_state = dir.join("tmux-state");
+    std::fs::create_dir_all(&locks).unwrap();
+    std::fs::create_dir_all(&tmux_state).unwrap();
+    let tmux = dir.join("tmux");
+    let devin_py = dir.join("mock-devin.py");
+    std::fs::write(&tmux, MOCK_TMUX_PY).unwrap();
+    std::fs::write(&devin_py, MOCK_DEVIN_PY).unwrap();
+    // The adapter execs the tmux binary directly (no shell), so the
+    // mock must be executable.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
+    std::env::set_var("CADENCE_TMUX_COMMAND", &tmux);
+    std::env::set_var(
+        "CADENCE_DEVIN_COMMAND",
+        format!("python3 {} {}", devin_py.display(), locks.display()),
+    );
+    std::env::set_var("CADENCE_DEVIN_LOCKS", &locks);
+    MockDevin {
+        _guard: guard,
+        dir: dir.to_path_buf(),
+        locks,
+    }
+}
+
+impl TestDaemon {
+    /// Install the mock tmux/devin pair for `dir` (which must outlive
+    /// every daemon that will launch panes) and return their paths.
+    fn mock_devin_at(&self, dir: &Path) -> MockDevin {
+        install_mock_devin(dir)
+    }
+
+    fn mock_devin(&self) -> MockDevin {
+        self.mock_devin_at(self.dir.path())
+    }
+
+    fn register_devin(&self, alias: &str, session: Option<&str>) {
+        let cwd = self.dir.path().to_str().unwrap().to_string();
+        let params = session.map(|s| json!({"session": s}).to_string());
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "devin",
+                   "endpoint_kind": "pty", "cwd": cwd, "params": params}),
+        )
+        .unwrap();
+    }
+
+    /// The tmux-side state dir for a given agent session name.
+    fn pane_file(&self, mock: &MockDevin, alias: &str, ext: &str) -> PathBuf {
+        // The adapter derives its socket name from the state dir.
+        mock.dir
+            .join("tmux-state")
+            .join(socket_for(&self.state))
+            .join(format!("{alias}.{ext}"))
+    }
+}
+
+impl Drop for MockDevin {
+    fn drop(&mut self) {
+        // Panes legitimately outlive a daemon (shutdown detaches), so
+        // clean any survivors ourselves by their recorded pane pids.
+        if let Ok(socks) = std::fs::read_dir(self.dir.join("tmux-state")) {
+            for sock in socks.flatten() {
+                if let Ok(files) = std::fs::read_dir(sock.path()) {
+                    for f in files.flatten() {
+                        if f.file_name().to_string_lossy().ends_with(".pid") {
+                            if let Ok(pid) = std::fs::read_to_string(f.path())
+                                .unwrap_or_default()
+                                .trim()
+                                .parse::<i32>()
+                            {
+                                unsafe { libc::killpg(pid, libc::SIGKILL) };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::env::remove_var("CADENCE_TMUX_COMMAND");
+        std::env::remove_var("CADENCE_DEVIN_COMMAND");
+        std::env::remove_var("CADENCE_DEVIN_LOCKS");
+        std::env::remove_var("MOCK_TMUX_STATE");
+    }
+}
+
+/// Mirror of the adapter's `cadence-<fnv64(state_dir)>` socket name.
+fn socket_for(state_dir: &Path) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in state_dir.to_string_lossy().as_bytes() {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x100000001b3);
+    }
+    format!("cadence-{h:016x}")
+}
+
+fn pty_token(d: &TestDaemon, alias: &str, id: &str) -> String {
+    let m = d.wait_message(alias, id, &["running"], 20);
+    m["turn_id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn pty_send_pastes_literal_and_completes_via_report() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    let agent = d.wait_agent("dv1", "idle", 20);
+    assert_eq!(agent["endpoint_kind"], "pty");
+    assert!(
+        agent["endpoint"]
+            .as_str()
+            .unwrap()
+            .starts_with("tmux://cadence-"),
+        "{}",
+        agent
+    );
+    assert!(
+        agent["thread_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("mock-session-"),
+        "native session discovered from the lock: {}",
+        agent
+    );
+    let gen = agent["generation"].as_str().unwrap().to_string();
+    assert!(!gen.is_empty());
+
+    // A queued message without a readiness claim must not be pasted.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "first task", "message": "m1"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(d.message_state("dv1", "m1"), "queued");
+
+    // Operator claim: the head of the FIFO queue (m1) is pasted.
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    let token1 = pty_token(&d, "dv1", "m1");
+    assert!(token1.starts_with(&format!("pty-{gen}-")), "{token1}");
+
+    // Literal text with shell metacharacters is pasted verbatim into
+    // the pane input — one paste per claim, so m2 needs a new one.
+    let tricky = "quote ' $HOME `id` ; rm -rf / & | <tag> \"double\"";
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": tricky, "message": "m2"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(d.message_state("dv1", "m2"), "queued");
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    let token = pty_token(&d, "dv1", "m2");
+    assert!(token.starts_with(&format!("pty-{gen}-")), "{token}");
+
+    // The mock TUI consumed the paste + Enter and replied on screen;
+    // capture shows the verbatim submitted line and the separate reply.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let cap = loop {
+        let out = d.rpc("agent_capture", json!({"alias": "dv1"})).unwrap()["capture"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        if out.contains(&format!("MOCK_REPLY: {tricky}")) {
+            break out;
+        }
+        assert!(Instant::now() < deadline, "no reply on screen: {out}");
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert!(cap.contains(&format!("> {tricky}")));
+
+    // Still `running` — the screen reply does not finish the message;
+    // only an explicit report does.
+    assert_eq!(d.message_state("dv1", "m2"), "running");
+
+    // Wrong token rejected; correct token completes and preserves text.
+    let bad = d.rpc(
+        "message_report",
+        json!({"message": "m2", "token": "pty-wrong", "kind": "result",
+               "text": "nope"}),
+    );
+    assert!(bad.is_err());
+    d.rpc(
+        "message_report",
+        json!({"message": "m2", "token": token, "kind": "result",
+               "text": "done: MOCK_REPLY observed"}),
+    )
+    .unwrap();
+    let m = d.wait_message("dv1", "m2", &["completed"], 10);
+    assert_eq!(m["result"]["via"], "pty_report");
+    d.wait_agent("dv1", "idle", 10);
+}
+
+#[test]
+fn pty_claim_is_single_use_and_expires() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "one", "message": "m1"}),
+    )
+    .unwrap();
+    pty_token(&d, "dv1", "m1");
+    // The claim was consumed: a second send queues, it does not paste.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "two", "message": "m2"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(d.message_state("dv1", "m2"), "queued");
+    let input = std::fs::read_to_string(d.pane_file(&_mock, "dv1", "input")).unwrap_or_default();
+    assert!(!input.contains("two"), "second send pasted without a claim");
+}
+
+#[test]
+fn pty_ack_then_result_and_duplicate_rules() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "work", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "m1");
+
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "ack",
+               "text": "seen"}),
+    )
+    .unwrap();
+    assert_eq!(d.message_state("dv1", "m1"), "running");
+    let m = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "m1")
+        .unwrap()
+        .clone();
+    assert_eq!(m["result"]["ack"]["text"], "seen");
+
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result",
+               "text": "final"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m1", &["completed"], 10);
+    // Idempotent retry of the same result is fine...
+    let dup = d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result",
+               "text": "final"}),
+    );
+    assert!(dup.is_ok(), "{dup:?}");
+    // ...but a conflicting result for a finished message is rejected.
+    assert!(d
+        .rpc(
+            "message_report",
+            json!({"message": "m1", "token": token, "kind": "result",
+                   "text": "DIFFERENT"}),
+        )
+        .is_err());
+    // And ack after completion is rejected too.
+    assert!(d
+        .rpc(
+            "message_report",
+            json!({"message": "m1", "token": token, "kind": "ack"}),
+        )
+        .is_err());
+}
+
+#[test]
+fn pty_stale_generation_report_rejected() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    let old_token = pty_token(&d, "dv1", "m1");
+
+    // New endpoint life: stop + resume mints a fresh generation even
+    // though the relaunched pane owns the same native session.
+    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.wait_agent("dv1", "stopped", 15);
+    // m1 is still `running` (submitted before the stop); the report
+    // carrying the old-generation token must be rejected.
+    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    let agent = d.wait_agent("dv1", "idle", 20);
+    assert!(!agent["generation"].as_str().unwrap().is_empty());
+    let stale = d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": old_token, "kind": "result",
+               "text": "late"}),
+    );
+    assert!(
+        stale.is_err(),
+        "stale-generation report accepted: {stale:?}"
+    );
+}
+
+#[test]
+fn pty_locked_session_refuses_takeover() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    // A foreign process holds the session lock — simulating another TUI.
+    let lock = mock.locks.join("held-session.lock");
+    let mut holder = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import fcntl,sys,time; f=open(sys.argv[1],'a'); \
+             fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB); time.sleep(30)",
+            lock.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    d.register_devin("dv1", Some("held-session"));
+    let agent = d.wait_agent("dv1", "attention", 20);
+    assert!(
+        agent["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("locked by another terminal"),
+        "{}",
+        agent
+    );
+    holder.kill().unwrap();
+    let _ = holder.wait();
+}
+
+#[test]
+fn pty_dead_pane_fences_submitted_and_stops_actor() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    pty_token(&d, "dv1", "m1");
+
+    // Kill the pane's whole process group: the submitted message can no
+    // longer be confirmed — it must go `unknown`, never silently replay.
+    let pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    unsafe { libc::killpg(pid, libc::SIGKILL) };
+    let agent = d.wait_agent("dv1", "attention", 20);
+    assert!(
+        agent["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("disconnected")
+            || agent["error"].as_str().unwrap_or("").contains("lock"),
+        "{}",
+        agent
+    );
+    d.wait_message("dv1", "m1", &["unknown"], 15);
+}
+
+#[test]
+fn pty_restart_reattaches_same_native_session() {
+    let dir = TempDir::new().unwrap();
+    let seeded = dir.path().join("state");
+    std::fs::create_dir_all(&seeded).unwrap();
+    let fixtures = TempDir::new().unwrap();
+    {
+        let _mock = install_mock_devin(fixtures.path());
+        let d = TestDaemon::start_on(seeded.clone());
+        d.register_devin("dv1", None);
+        let agent = d.wait_agent("dv1", "idle", 20);
+        let native = agent["thread_id"].as_str().unwrap().to_string();
+        let pane_pid = agent["pid"].as_i64().unwrap();
+        // Daemon restart: the mock tmux server (fixture dir) outlives it,
+        // so the pane is still alive and must be reattached, not relaunched.
+        drop(d);
+        let d2 = TestDaemon::start_on(seeded.clone());
+        let agent2 = d2.wait_agent("dv1", "idle", 25);
+        assert_eq!(agent2["thread_id"].as_str().unwrap(), native);
+        assert_eq!(agent2["pid"].as_i64().unwrap(), pane_pid);
+    }
+}
+
+#[test]
+fn pty_stop_kills_only_owned_session() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    let pidfile = d.pane_file(&mock, "dv1", "pid");
+    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.wait_agent("dv1", "stopped", 15);
+    wait_pid_gone(&pidfile, 10);
+}
+
+#[test]
+fn pty_respond_rejected_and_mode_blocks_send() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    // No approval channel exists for pty.
+    assert!(d
+        .rpc(
+            "agent_respond",
+            json!({"alias": "dv1", "request": "r1", "decision": "accept"}),
+        )
+        .is_err());
+    // pane_in_mode != 0 (copy mode etc.) keeps the message queued even
+    // with a fresh claim.
+    std::fs::write(d.pane_file(&mock, "dv1", "mode"), "1").unwrap();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "x", "message": "m1"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(d.message_state("dv1", "m1"), "queued");
+    std::fs::remove_file(d.pane_file(&mock, "dv1", "mode")).unwrap();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    pty_token(&d, "dv1", "m1");
+}
+
+#[test]
+fn pty_send_rejects_control_chars() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "line1\nline2", "message": "m1"}),
+    )
+    .unwrap();
+    // The newline is rejected by the adapter's literal-content rule —
+    // the message fails without ever touching the pane.
+    d.wait_message("dv1", "m1", &["failed"], 15);
+    let input = std::fs::read_to_string(d.pane_file(&_mock, "dv1", "input")).unwrap_or_default();
+    assert!(!input.contains("line1"));
 }

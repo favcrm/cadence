@@ -46,19 +46,23 @@ pub fn run(state_dir: &Path) -> Result<Value> {
     checks["devin"] = command_version("devin", &["--version"]);
     checks["tmux"] = command_version("tmux", &["-V"]);
     let codex_ok = checks["codex"]["present"].as_bool().unwrap_or(false);
+    let devin_ok = checks["devin"]["present"].as_bool().unwrap_or(false);
+    let tmux_ok = checks["tmux"]["present"].as_bool().unwrap_or(false);
     Ok(json!({
         "state_dir": state_dir,
         "checks": checks,
         "capabilities": {
             "managed_codex_stdio": codex_ok,
+            "managed_codex_ws": codex_ok,
+            "pty_devin_tmux": devin_ok && tmux_ok,
             "managed_devin_acp": false,
-            "pty_endpoint": false,
             "native_inbox_endpoint": false,
             "fake_provider_tests": true,
         },
         "notes": [
-            "Devin, Claude and Cursor endpoints are declared but not implemented in this milestone",
-            "PTY submission cannot establish provider receipt; do not treat it as delivered",
+            "pty devin endpoint requires devin + tmux; submission is gated on an explicit operator ready claim",
+            "PTY submission cannot establish provider receipt; only an explicit message ack/result report completes it",
+            "Devin ACP, Claude and Cursor endpoints remain unimplemented",
             "fake endpoint_kind is a test fixture, not a provider",
         ],
     }))
