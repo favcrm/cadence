@@ -1,0 +1,119 @@
+# Cadence wire protocol — v1
+
+The control API is newline-delimited JSON over a Unix-domain socket at
+`<state_dir>/cadence.sock`. Each line is one request; the daemon answers
+with one line per request on the same connection. Multiple requests may
+share a connection.
+
+State directory: `$CADENCE_STATE_DIR`, else `$XDG_STATE_HOME/cadence`,
+else `~/.local/state/cadence` (mode 0700). The daemon accepts only
+same-UID peers (`SO_PEERCRED`). This establishes same-user access; it is
+not a hostile same-user isolation boundary.
+
+One daemon owns a state directory: `serve` takes an exclusive `flock` on
+`<state_dir>/cadence.lock` before touching the store or socket and holds
+it for the process lifetime. A second start fails `rejected` without
+running recovery; `daemon start` reports `already_running` with the
+existing daemon's health.
+
+## Frames
+
+Request: `{"method": "<name>", "params": {...}}`
+
+Response: `{"ok": true, "result": {...}}` or
+`{"ok": false, "error": {"kind": "rejected|provider|unknown|internal", "message": "..."}}`
+
+Error kinds:
+
+- `rejected` — invalid or disallowed request; nothing was attempted.
+- `provider` — the provider explicitly rejected the request.
+- `unknown` — transport failed after the request may have reached the
+  provider. The attempt is preserved for review; never retried blindly.
+- `internal` — local runtime failure (I/O, storage, protocol).
+
+## Methods
+
+| Method | Params | Result |
+|---|---|---|
+| `health` | — | `{state:"ready", protocol:1, capabilities:[...]}` |
+| `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded) then exits |
+| `agent_register` | `alias, provider, cwd, endpoint_kind?, role?, sandbox?, instructions?` | `{alias,state:"starting",provider}` |
+| `agent_list` | — | `{agents:[Agent]}` |
+| `agent_show` | `alias` | `{agent, messages, event_cursor}` |
+| `agent_send` | `alias, text, message?, reply_to?` | `{message,state,duplicate}` |
+| `agent_ask` | `alias, text, message?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
+| `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
+| `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
+| `agent_respond` | `alias, request, decision?|answers?` | `{state:"answered"}` |
+| `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
+| `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
+
+`alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
+`text`: 1–48000 chars. `reply_to` may not equal `alias`.
+
+`agent_stop` is bounded: it interrupts the provider, waits a short grace
+(~3s), then force-closes the transport and joins the actor — the bound
+also covers provider initialization, since the adapter is published
+before `open`. A turn that was still in flight becomes `unknown` and the
+agent stays `attention` — a stop never masks a fence: on an agent already
+in `attention` it only disables and preserves the state and reason. While
+a stop is in flight the alias stays reserved: `agent_resume` is
+`rejected` until the stop's final write is done, and a second
+`agent_stop` is `rejected` (`already stopping`) before any mutation —
+a stale stop cannot write over a new actor generation. A sequential
+stop after completion is idempotent. Resume on a fenced agent returns
+`attention` and does not re-enable.
+
+## Agents
+
+`endpoint_kind` selects the delivery mechanism; reachable message states
+depend on it:
+
+| endpoint_kind | delivery | status |
+|---|---|---|
+| `managed` | owned provider process (JSON-RPC stdio) | implemented: provider `codex` |
+| `fake` | in-process test double | test fixture only |
+| `pty` | terminal paste/capture | declared, not implemented |
+| `native_inbox` | provider-native inbox | declared, not implemented |
+
+Agent states: `starting → idle ⇄ busy → waiting_input →` and terminal-ish
+`attention | stopping → stopped | offline`. `attention` means an uncertain
+provider outcome needs human review; the actor will not relaunch itself.
+
+## Messages
+
+States: `queued → submitting → running → completed | failed | interrupted
+| unknown`. `unknown` is durable and fences its actor. Any ambiguous
+post-submission outcome lands there — transport loss mid-turn, a turn
+deadline, an acknowledged `turn/start` that cannot be correlated to a
+turn id, an unclassifiable completion status, or a forced close while a
+turn was in flight.
+
+Idempotency: a client-supplied `message` id makes retries of the *same
+envelope* (alias+body+reply_to+source) return `duplicate:true`. The same
+id with different content is a `rejected` conflict.
+
+Result routing: when a message has `reply_to`, finishing it enqueues a
+`worker_result` message to that agent in the SAME transaction. The routed
+id is `uuid5("cadence-result:" + message_id)` (deterministic; resend is a
+no-op) and carries no `reply_to`, so routing cannot loop.
+
+## Events
+
+`agent_events` pages the durable log: `{seq, alias, kind, payload, at}`.
+Kinds: `registered, queued, submitting, turn_started, turn_finished,
+provider_event, input_required, input_answered, result_routed, ready,
+attention, stop_requested`. `wait>0` long-polls up to 30s.
+
+## Approvals
+
+Provider-initiated requests (e.g. `item/commandExecution/requestApproval`,
+`item/tool/requestUserInput`, `session/request_permission`) pause the
+agent at `waiting_input` and appear in `agent_requests`. `agent_respond`
+answers them per type; nothing is auto-accepted.
+
+## Recovery
+
+On daemon start: messages in `submitting`/`running` become `unknown` and
+their agents `offline`/`attention`. Enabled agents relaunch *unless*
+fenced by an `unknown` attempt — those stay `attention` for review.
