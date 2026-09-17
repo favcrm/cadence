@@ -88,6 +88,11 @@ enum Commands {
         /// Skip the briefing file and AGENTS.md block entirely.
         #[arg(long)]
         no_bootstrap: bool,
+        /// Opt into verified auto-ready: the daemon probes the pane and
+        /// self-claims the ready gate when the TUI is visibly idle
+        /// (a human `agent ready` still wins).
+        #[arg(long)]
+        auto_ready: bool,
     },
     /// Launch a Codex agent on a managed-ws endpoint, attachable by the
     /// official Codex TUI via `codex resume --remote`. This terminal
@@ -183,6 +188,10 @@ enum Commands {
         /// Do not enqueue the join bootstrap briefing message.
         #[arg(long)]
         no_bootstrap: bool,
+        /// Opt the worker into verified auto-ready (pty providers only):
+        /// the daemon probes the pane and self-claims when visibly idle.
+        #[arg(long)]
+        auto_ready: bool,
     },
     /// Attach this terminal to a live agent's native endpoint. `name`
     /// may be an alias, a provider-native id, or a provider name when
@@ -221,9 +230,28 @@ enum Commands {
     },
     /// Inside a cadence-owned pane: print this agent's alias, its
     /// running message id and the report token for it. Errors when
-    /// `CADENCE_ALIAS` is absent (not a cadence pane).
+    /// `CADENCE_ALIAS` is absent (not a cadence pane). For an inbox
+    /// alias (set by hand in an outside terminal) it prints the queued
+    /// inbound count instead.
     #[command(name = "self")]
     SelfInfo,
+    /// Drain an inbox agent's durable queue: one JSON object per
+    /// message, oldest first, each marked completed `via=inbox_read`.
+    /// `--follow` blocks on the daemon for new arrivals — a waiting
+    /// consumer needs no polling loop.
+    Inbox {
+        /// Inbox agent alias or provider-native id.
+        alias: String,
+        /// Only consume messages after this sequence cursor.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        /// Seconds to wait for new messages per request (0-30).
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+        /// Keep draining new arrivals until interrupted.
+        #[arg(long)]
+        follow: bool,
+    },
     /// Install or inspect the `cadence` agent skill under
     /// `~/.agents/skills/cadence` with symlinks into the `.claude`,
     /// `.cursor` and `.copilot` skill dirs.
@@ -277,9 +305,6 @@ enum AgentAction {
         /// owned tmux session; devin only) or fake (test double).
         #[arg(long, default_value = "managed")]
         endpoint: String,
-        /// Working directory for the provider session.
-        #[arg(long)]
-        cwd: PathBuf,
         /// pm or worker.
         #[arg(long, default_value = "worker")]
         role: String,
@@ -293,6 +318,11 @@ enum AgentAction {
         /// resume an existing Devin session). Repeatable.
         #[arg(long = "param")]
         params: Vec<String>,
+        /// Working directory for the provider session [default: current
+        /// directory]. Meaningless for `--provider inbox` — a mailbox
+        /// has no working directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
     },
     /// List registered agents. Inside a cadence pane (`CADENCE_ALIAS`
     /// resolves to a registered agent) the output is scoped to the
@@ -344,9 +374,22 @@ enum AgentAction {
     /// Claim a gated endpoint is ready for one submission (pty only).
     /// Asserts the operator inspected the terminal: idle, empty input,
     /// no permission prompt. Consumed by a single send, expires quickly.
+    /// Claims stack — N claims release N queued messages.
     Ready { alias: String },
     /// Print the current terminal contents of a pty endpoint.
     Capture { alias: String },
+    /// Reduce a pty pane to gate facts: `{idle, reason, input_nonempty,
+    /// prompt_visible, busy_marker, approval_menu}` — the same probe the
+    /// verified auto-ready mode runs before self-claiming.
+    Probe { alias: String },
+    /// Merge `key=value` pairs into an agent's endpoint params — e.g.
+    /// `agent set <alias> auto_ready=verified` opts a live agent into
+    /// daemon-verified readiness.
+    Set {
+        alias: String,
+        /// key=value pairs; a bare `key` (no `=`) removes it.
+        pairs: Vec<String>,
+    },
     /// Remove a dead agent's registry row — and with it the message and
     /// event history. Refuses while an endpoint is live (`agent stop`
     /// first) or the actor still owns the alias.
@@ -480,11 +523,13 @@ fn send_message(
     let body = read_body(text, file)?;
     // --ready IS the operator's explicit claim — the human typing it
     // asserts the pane is idle with an empty input. Skipped silently on
-    // endpoints where readiness claims don't exist.
+    // endpoints where readiness claims don't exist. The claim is
+    // attributed to CADENCE_ALIAS when sent from inside a pane.
     if ready {
         let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
         if show["agent"]["endpoint_kind"].as_str() == Some("pty") {
-            client::rpc(state_dir, "agent_ready", json!({"alias": alias}))?;
+            let by = std::env::var("CADENCE_ALIAS").ok();
+            client::rpc(state_dir, "agent_ready", json!({"alias": alias, "by": by}))?;
         }
     }
     Ok((
@@ -707,6 +752,11 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
     // Live = a live actor (idle/running/waiting_input/starting) or a
     // live endpoint address — fake/managed actors never expose one, so
     // endpoint alone cannot detect "already up".
+    // A mailbox has nothing to resume — its queue survives regardless.
+    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
+    if kind == "inbox" {
+        return json!({"alias": alias, "resumed": false, "skipped": "mailbox"});
+    }
     let live = agent["endpoint"].is_string()
         || matches!(
             agent["state"].as_str(),
@@ -715,7 +765,6 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
     if live {
         return json!({"alias": alias, "resumed": false, "skipped": "live"});
     }
-    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
     let attachable = matches!(kind, "pty" | "managed-ws");
     if let Err(e) = client::rpc(state_dir, "agent_resume", json!({"alias": alias})) {
         return json!({"alias": alias, "resumed": false, "error": e.to_string()});
@@ -844,8 +893,19 @@ fn stop_group(state_dir: &Path, group: &str) -> Result<i32> {
     let mut order = group_members(state_dir, &pm_alias)?;
     order.push(pm_alias);
     let mut stopped = vec![];
+    let mut skipped = vec![];
     let mut failed = vec![];
     for alias in &order {
+        // A mailbox is never "stopped" — it has no actor and its queue
+        // is the point. Removing it is the only lifecycle action.
+        let is_inbox = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
+            .map(|s| s["agent"]["endpoint_kind"].as_str() == Some("inbox"))
+            .unwrap_or(false);
+        if is_inbox {
+            eprintln!("stop {alias}: skipped (inbox — durable mailbox)");
+            skipped.push(json!({"alias": alias}));
+            continue;
+        }
         match client::rpc(state_dir, "agent_stop", json!({"alias": alias})) {
             Ok(r) => {
                 eprintln!("stop {alias}: {}", r["state"].as_str().unwrap_or("ok"));
@@ -857,7 +917,7 @@ fn stop_group(state_dir: &Path, group: &str) -> Result<i32> {
             }
         }
     }
-    print_json(&json!({"stopped": stopped, "failed": failed}));
+    print_json(&json!({"stopped": stopped, "skipped": skipped, "failed": failed}));
     Ok(0)
 }
 
@@ -957,6 +1017,19 @@ fn run() -> Result<i32> {
                         obj.insert(k.to_string(), Value::String(v.to_string()));
                     }
                     let params_json = (!obj.is_empty()).then(|| Value::Object(obj).to_string());
+                    // `--provider inbox` is the mailbox registration —
+                    // the endpoint kind follows the provider, and no
+                    // working directory is involved.
+                    let inbox = provider == "inbox";
+                    let endpoint = if inbox && endpoint == "managed" {
+                        "inbox".to_string()
+                    } else {
+                        endpoint
+                    };
+                    let cwd = match cwd {
+                        Some(c) => c,
+                        None => std::env::current_dir()?,
+                    };
                     client::rpc(
                         &state_dir,
                         "agent_register",
@@ -1005,7 +1078,36 @@ fn run() -> Result<i32> {
                     return attach_agent(&state_dir, &alias, run);
                 }
                 AgentAction::Ready { alias } => {
-                    client::rpc(&state_dir, "agent_ready", json!({"alias": alias}))?
+                    // The claimer identity is recorded for audit —
+                    // CADENCE_ALIAS when the claim came from a pane.
+                    let by = std::env::var("CADENCE_ALIAS").ok();
+                    client::rpc(&state_dir, "agent_ready", json!({"alias": alias, "by": by}))?
+                }
+                AgentAction::Probe { alias } => {
+                    client::rpc(&state_dir, "agent_probe", json!({"alias": alias}))?
+                }
+                AgentAction::Set { alias, pairs } => {
+                    let mut patch = serde_json::Map::new();
+                    for kv in &pairs {
+                        match kv.split_once('=') {
+                            Some((k, v)) => {
+                                patch.insert(k.to_string(), Value::String(v.to_string()))
+                            }
+                            // A bare key deletes it from params.
+                            None => patch.insert(kv.clone(), Value::Null),
+                        };
+                    }
+                    if patch.is_empty() {
+                        return Err(Error::rejected(
+                            "agent set needs key=value pairs — e.g. \
+                             `cadence agent set <alias> auto_ready=verified`",
+                        ));
+                    }
+                    client::rpc(
+                        &state_dir,
+                        "agent_set",
+                        json!({"alias": alias, "patch": patch}),
+                    )?
                 }
                 AgentAction::Capture { alias } => {
                     let out = client::rpc(&state_dir, "agent_capture", json!({"alias": alias}))?;
@@ -1042,6 +1144,7 @@ fn run() -> Result<i32> {
             worktree,
             bootstrap,
             no_bootstrap,
+            auto_ready,
         } => provider_launch(
             &state_dir,
             "devin",
@@ -1055,6 +1158,7 @@ fn run() -> Result<i32> {
             None,
             worktree.as_deref(),
             BriefMode::standalone(no_bootstrap, bootstrap),
+            auto_ready,
         ),
         Commands::Codex {
             detach,
@@ -1078,6 +1182,7 @@ fn run() -> Result<i32> {
             None,
             worktree.as_deref(),
             BriefMode::standalone(no_bootstrap, bootstrap),
+            false,
         ),
         Commands::Join {
             group,
@@ -1090,6 +1195,7 @@ fn run() -> Result<i32> {
             instructions_file,
             worktree,
             no_bootstrap,
+            auto_ready,
         } => join_group(
             &state_dir,
             &group,
@@ -1102,6 +1208,7 @@ fn run() -> Result<i32> {
             instructions_file,
             worktree,
             no_bootstrap,
+            auto_ready,
         ),
         Commands::Attach { name, print } => attach_command(&state_dir, name, print),
         Commands::Resume { group, all, detach } => resume_command(&state_dir, group, all, detach),
@@ -1126,6 +1233,16 @@ fn run() -> Result<i32> {
                 Error::rejected("CADENCE_ALIAS is not set — not inside a cadence-owned pane")
             })?;
             let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
+            // A mailbox has no running turn — report the inbound
+            // backlog a consumer would drain instead.
+            if show["agent"]["endpoint_kind"].as_str() == Some("inbox") {
+                print_json(&json!({
+                    "alias": show["agent"]["alias"],
+                    "endpoint_kind": "inbox",
+                    "queued": show["queued"],
+                }));
+                return Ok(0);
+            }
             let running = show["messages"]
                 .as_array()
                 .map(|ms| {
@@ -1136,6 +1253,36 @@ fn run() -> Result<i32> {
                 })
                 .unwrap_or_default();
             print_json(&json!({"alias": alias, "running": running}));
+            Ok(0)
+        }
+        Commands::Inbox {
+            alias,
+            after,
+            wait,
+            follow,
+        } => {
+            // One JSON object per drained message, oldest first. Each
+            // line already completed `via=inbox_read` server-side —
+            // printed output is proof of consumption, never re-read.
+            let mut cursor = after;
+            loop {
+                let page = client::rpc(
+                    &state_dir,
+                    "agent_inbox",
+                    json!({"alias": alias, "after": cursor,
+                           "wait": if follow { 25 } else { wait }}),
+                )?;
+                let messages = page["messages"].as_array().cloned().unwrap_or_default();
+                for m in &messages {
+                    println!("{}", serde_json::to_string(m).unwrap_or_default());
+                }
+                cursor = page["cursor"].as_i64().unwrap_or(cursor);
+                if !follow {
+                    // An empty drain prints nothing — drained output is
+                    // the complete record of what was consumed.
+                    break;
+                }
+            }
             Ok(0)
         }
         Commands::Skill { action } => {
@@ -1199,7 +1346,12 @@ fn run() -> Result<i32> {
                     if ready {
                         let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
                         if show["agent"]["endpoint_kind"].as_str() == Some("pty") {
-                            client::rpc(&state_dir, "agent_ready", json!({"alias": alias}))?;
+                            let by = std::env::var("CADENCE_ALIAS").ok();
+                            client::rpc(
+                                &state_dir,
+                                "agent_ready",
+                                json!({"alias": alias, "by": by}),
+                            )?;
                         }
                     }
                     let result = client::rpc(
@@ -1339,6 +1491,7 @@ fn provider_launch(
     upstream: Option<String>,
     worktree: Option<&str>,
     briefing: BriefMode,
+    auto_ready: bool,
 ) -> Result<i32> {
     // `-r <slug>` first resolves the slug to an already-registered agent
     // (by alias or native session id) so re-running is a reopen, not a
@@ -1381,6 +1534,12 @@ fn provider_launch(
         Some(name) => create_worktree(&cwd, name)?,
         None => cwd,
     };
+    if auto_ready && endpoint_kind != "pty" {
+        return Err(Error::rejected(
+            "--auto-ready only applies to pty (devin) endpoints — a screen \
+             probe exists only there",
+        ));
+    }
     let instructions = instructions_file.map(std::fs::read_to_string).transpose()?;
     let mut params_obj = serde_json::Map::new();
     if let Some(session) = &resume {
@@ -1388,6 +1547,12 @@ fn provider_launch(
     }
     if let Some(upstream) = &upstream {
         params_obj.insert("upstream".to_string(), Value::String(upstream.clone()));
+    }
+    if auto_ready {
+        params_obj.insert(
+            "auto_ready".to_string(),
+            Value::String("verified".to_string()),
+        );
     }
     let params = (!params_obj.is_empty()).then(|| Value::Object(params_obj).to_string());
     // Reopening an already-registered name keeps its stored params — a
@@ -1428,13 +1593,18 @@ fn provider_launch(
     }
     // The provider endpoint opens asynchronously (a pty open can wait on
     // the native session lock) — poll until it is live or gives up.
+    // Kinds with no attachable endpoint are done once the actor is back.
+    let attachable = matches!(endpoint_kind, "pty" | "managed-ws");
     let deadline = Instant::now() + Duration::from_secs(45);
     let agent = loop {
         let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
         let agent = show["agent"].clone();
         let state = agent["state"].as_str().unwrap_or_default();
         let open = agent["endpoint"].is_string();
-        if open || matches!(state, "stopped" | "offline" | "attention") {
+        if open
+            || matches!(state, "stopped" | "offline" | "attention")
+            || (!attachable && matches!(state, "idle" | "running"))
+        {
             break agent;
         }
         if Instant::now() >= deadline {
@@ -1502,6 +1672,7 @@ fn join_group(
     instructions_file: Option<PathBuf>,
     worktree: Option<String>,
     no_bootstrap: bool,
+    auto_ready: bool,
 ) -> Result<i32> {
     let endpoint_kind = match provider {
         "devin" => "pty",
@@ -1550,6 +1721,7 @@ fn join_group(
         } else {
             BriefMode::FilesAndMessage
         },
+        auto_ready,
     )
 }
 
@@ -1668,6 +1840,13 @@ const AGENTS_END: &str = "<!-- cadence:end -->";
 /// usual unknown-name rejection.
 fn brief_agent(state_dir: &Path, alias: &str, enqueue: bool) -> Result<PathBuf> {
     let agent = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?["agent"].clone();
+    // A mailbox consumes no briefing — nothing runs in it.
+    if agent["endpoint_kind"].as_str() == Some("inbox") {
+        return Err(Error::rejected(format!(
+            "Agent '{alias}' is an inbox — nothing to brief; \
+             `cadence inbox {alias}` drains its queue"
+        )));
+    }
     // The group root is the upstream PM when wired, else the agent
     // itself — briefing files always land in the root's `.cadence/`.
     let upstream = agent["params"]["upstream"].as_str();

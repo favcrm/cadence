@@ -109,6 +109,75 @@ remove-and-rejoin path (`agent remove` + `join -r`) — because resume on
 a mismatched pane can never converge, and guessing would take over a
 session that isn't ours.
 
+## The ready claim needed a machine-checked form
+
+**What happened.** `agent ready` is a human assertion — "I looked, the
+pane is idle". A QA audit of a real dispatch found the failure mode:
+an agent pastes `--ready` blind because inspecting first is a separate
+`agent capture` call nobody is forced to make. Worse, a busy Devin pane
+*accepts* pasted input into a staged queue, so a "sent" message can sit
+unexecuted while the sender believes it is `running` — bytes were
+delivered, the work never started.
+
+**What landed.** `auto_ready=verified` (params, or `--auto-ready` on
+launch, or `agent set <alias> auto_ready=verified` live) makes the
+daemon earn the claim itself: before every paste it probes the pane —
+prompt glyph present, input empty, no busy markers, no approval menu —
+and only then mints a single-use claim. Approval menus get priority
+over prompt shape because their `❭` option marker mimics the idle
+prompt, and busy/menu markers are matched only in the bottom status
+region — the transcript above can legitimately print the same strings
+(including this repository's own source quoting them) without the pane
+being busy. The region is anchored at the last *non-blank* row:
+`capture-pane` pads the capture to pane height, and on a fresh session
+with a tall pane the literal bottom rows are all blank — the first cut
+of region-scoping anchored at the last row and read a thinking pane as
+idle (caught in review, reproduced live: 89 captured rows, 67 trailing
+blanks). The `Guide Devin while it works` input watermark is itself a
+busy signal independent of the region maths. `agent probe <alias>`
+exposes the same analyzer read-only.
+Every claim consumption writes a `claim_used` audit event naming the
+claimer. The gate is still a gate; it just no longer trusts a human to
+have looked.
+
+**What the first review round added.** The post-paste check is
+*differential*: the screen is captured before the paste and the
+body's normalized tail slice must occur *more often* afterwards —
+every routed `worker_result` opens with the same sentence, so a plain
+`contains` would pass a swallowed re-delivery on the strength of the
+earlier one still on screen. And rendered ≠ submitted: the input line
+must be empty again after `Enter`, because a paste can stage into the
+draft while the keystroke is swallowed; a held draft is `NotRendered`,
+left untouched for a human. On a render miss a routed notification is
+requeued (bounded) then *parked* — `failed` with `via=pty_render_miss`
+and a `delivery_parked` event — while a task message still goes
+`unknown` and fences the actor: a possibly-executed task is never
+replayed, but a notification must never kill the recipient's pane.
+`agent set` narrowed to an allowlist (`auto_ready` only) after review
+found the merge-into-params shape could silently rewrite `upstream`
+result routing and `session` bindings on a live agent.
+
+## Some consumers are not agents
+
+**What happened.** The QA-audit loop needed somewhere for verdicts to
+land that was not another LLM session — a place a script could read.
+The only delivery targets were live actors; there was no durable,
+readable queue, so reviewers were simulated with workers or notes on
+disk, and "did the verdict arrive" meant polling `agent show`.
+
+**What landed.** `provider=inbox` / `endpoint_kind=inbox`: a
+registered agent that is a pure mailbox — `inbox://<alias>` endpoint,
+state `idle`, no actor, no briefing, no pane. Messages sent to it (or
+routed via `reply_to`, including as a group root collecting worker
+results) stay `queued` durably. `cadence inbox <alias>` drains them
+over the daemon socket — `--wait`/`--follow` block on the daemon's
+change signal rather than polling — and each consumed message
+completes `via=inbox_read`. A drained message with `reply_to` routes
+its result in the same transaction, so a consumer's answer can still
+wake the waiting actor. Lifecycle verbs refuse the things a mailbox
+cannot do (`resume`, `stop` are rejected; `remove` deletes the
+mailbox outright).
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not
