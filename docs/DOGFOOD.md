@@ -125,13 +125,30 @@ daemon earn the claim itself: before every paste it probes the pane —
 prompt glyph present, input empty, no busy markers, no approval menu —
 and only then mints a single-use claim. Approval menus get priority
 over prompt shape because their `❭` option marker mimics the idle
-prompt. `agent probe <alias>` exposes the same analyzer read-only.
-After `Enter`, the paste must visibly render before `submitted` is
-reported: a missed render requeues routed notifications with a bound,
-but a task message goes `unknown` and fences the actor — a possibly-
-executed task is never replayed. Every claim consumption writes a
-`claim_used` audit event naming the claimer. The gate is still a gate;
-it just no longer trusts a human to have looked.
+prompt, and busy/menu markers are matched only in the bottom status
+region — the transcript above can legitimately print the same strings
+(including this repository's own source quoting them) without the pane
+being busy. `agent probe <alias>` exposes the same analyzer read-only.
+Every claim consumption writes a `claim_used` audit event naming the
+claimer. The gate is still a gate; it just no longer trusts a human to
+have looked.
+
+**What the first review round added.** The post-paste check is
+*differential*: the screen is captured before the paste and the
+body's normalized tail slice must occur *more often* afterwards —
+every routed `worker_result` opens with the same sentence, so a plain
+`contains` would pass a swallowed re-delivery on the strength of the
+earlier one still on screen. And rendered ≠ submitted: the input line
+must be empty again after `Enter`, because a paste can stage into the
+draft while the keystroke is swallowed; a held draft is `NotRendered`,
+left untouched for a human. On a render miss a routed notification is
+requeued (bounded) then *parked* — `failed` with `via=pty_render_miss`
+and a `delivery_parked` event — while a task message still goes
+`unknown` and fences the actor: a possibly-executed task is never
+replayed, but a notification must never kill the recipient's pane.
+`agent set` narrowed to an allowlist (`auto_ready` only) after review
+found the merge-into-params shape could silently rewrite `upstream`
+result routing and `session` bindings on a live agent.
 
 ## Some consumers are not agents
 

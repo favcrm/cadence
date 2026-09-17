@@ -19,11 +19,13 @@
 //!
 //! Text is delivered literally through a tmux buffer (`load-buffer` +
 //! bracketed `paste-buffer -p` + `Enter`); no shell interpolation and no
-//! control characters. After Enter, the body prefix must render on the
-//! visible screen within [`RENDER_DEADLINE`] — a busy TUI drops a
-//! bracketed paste silently, so bytes-sent is not delivery evidence. A
-//! provable miss is `NotRendered`; the daemon requeues informational
-//! deliveries and fences task messages as `unknown`.
+//! control characters. After Enter, a differential render check must see
+//! this paste's text newly on the visible screen *and* the input line
+//! empty again within [`RENDER_DEADLINE`] — a busy TUI drops a bracketed
+//! paste silently, so bytes-sent is not delivery evidence. A miss inside
+//! the bound is `NotRendered` — evidence, not proof, which is why the
+//! daemon parks exhausted informational deliveries and fences task
+//! messages as `unknown` rather than failing them.
 //!
 //! Terminal echo proves *rendering*, never model receipt. A pasted
 //! message stays `running` under its `pty-<generation>-<uuid>` token
@@ -57,7 +59,19 @@ const OPEN_DEADLINE: Duration = Duration::from_secs(30);
 /// Pause between bracketed paste and Enter so the TUI consumes it.
 const PASTE_SETTLE: Duration = Duration::from_millis(300);
 /// Bounded post-paste wait for the body to render in the transcript.
-const RENDER_DEADLINE: Duration = Duration::from_millis(1500);
+/// A miss inside the bound is *evidence* of a dropped paste, not proof
+/// — a saturated host renders late — which is why a task message lands
+/// `unknown` (uncertainty discipline) rather than `failed`.
+const RENDER_DEADLINE: Duration = Duration::from_secs(4);
+/// How much of the screen bottom counts as the status region: input
+/// line, divider, status bar and a menu tall enough for Devin's
+/// approval select. Busy/approval markers only match inside it — the
+/// transcript above can legitimately show these strings as text.
+const STATUS_LINES: usize = 14;
+/// Slice of the pasted body used for the differential render check.
+/// The tail is what stays visible: a long input scrolls horizontally
+/// to the cursor, and a wrapped transcript ends with it.
+const PROBE_SLICE: usize = 64;
 /// Stacked operator claims retained for the queue (oldest dropped past
 /// this); each claim releases exactly one gated message.
 const CLAIM_CAPACITY: usize = 16;
@@ -72,6 +86,11 @@ mod devin_screen {
     pub const PROMPT: &str = "❭";
     /// The input line's placeholder text — presence means EMPTY input.
     pub const PLACEHOLDER: &str = "Ask Devin to build features";
+    /// The input line's watermark while a turn runs — also EMPTY input.
+    /// A submitted body echoes into the transcript and the input gets
+    /// this placeholder; reading it as a staged draft would misjudge a
+    /// healthy turn as unsubmitted (observed live with a ~3.6KB body).
+    pub const BUSY_PLACEHOLDER: &str = "Guide Devin while it works";
     /// On-screen markers while a turn is running.
     pub const BUSY: &[&str] = &[
         "(esc again to interrupt)",
@@ -80,11 +99,16 @@ mod devin_screen {
         "Guide Devin while it works",
         "Press Ctrl+O to view the full thinking trace",
     ];
-    /// An open select/permission menu — the hint-bar fragment plus the
-    /// option labels only a menu renders.
+    /// An open select/permission menu — the hint-bar fragments plus the
+    /// option labels only a menu renders. `↑↓ select · ↵ confirm ·
+    /// esc cancel` is the verbatim approval footer; `↓↑ to select` is
+    /// the same control on the directory-trust prompt.
     pub const APPROVAL: &[&str] = &[
         "(Approve",
         " to select",
+        "↑↓ select",
+        "↵ confirm",
+        "esc cancel",
         "Yes, switch to bypass mode",
         "No, keep",
     ];
@@ -96,13 +120,25 @@ mod devin_screen {
 /// Reduce a captured Devin screen to gate facts. The last `❭` line is
 /// the input line; text after it that is not the placeholder is a
 /// staged draft. Menus and busy markers win over prompt parsing — a
-/// `❭` leads the first approval option too.
+/// `❭` leads the first approval option too — and both are only read
+/// in the bottom status region: the transcript above can legitimately
+/// print these same strings (source text, docs) without the pane being
+/// busy at all.
 pub fn analyze_devin(screen: &str) -> Probe {
-    let approval_menu = devin_screen::APPROVAL.iter().any(|m| screen.contains(m));
+    let tail: String = screen
+        .lines()
+        .rev()
+        .take(STATUS_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let approval_menu = devin_screen::APPROVAL.iter().any(|m| tail.contains(m));
     let busy_marker = devin_screen::BUSY
         .iter()
         .chain(devin_screen::QUEUED.iter())
-        .any(|m| screen.contains(m));
+        .any(|m| tail.contains(m));
     let prompt_line = screen
         .lines()
         .rev()
@@ -116,7 +152,9 @@ pub fn analyze_devin(screen: &str) -> Probe {
                 .to_string()
         })
         .unwrap_or_default();
-    let input_nonempty = !draft.is_empty() && !draft.starts_with(devin_screen::PLACEHOLDER);
+    let input_nonempty = !draft.is_empty()
+        && !draft.starts_with(devin_screen::PLACEHOLDER)
+        && !draft.starts_with(devin_screen::BUSY_PLACEHOLDER);
     let (idle, reason) = if approval_menu {
         (false, "approval menu is open")
     } else if busy_marker {
@@ -190,6 +228,18 @@ fn short_hash(text: &str) -> String {
 
 fn shlex_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Strip all whitespace so a body wrapped/indented by the TUI still
+/// matches its source text contiguously.
+fn normalize_screen(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The last `n` characters of `text` (by char, not byte).
+fn tail_chars(text: &str, n: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    chars.iter().skip(chars.len().saturating_sub(n)).collect()
 }
 
 fn resolve_on_path(bin: &str) -> Result<String> {
@@ -616,6 +666,21 @@ impl ProviderAdapter for DevinPtyAdapter {
         };
         let session = self.session();
 
+        // The render check is *differential*: "this paste added text",
+        // not "the text is somewhere on screen". Capture before the
+        // paste so an identical earlier body (a repeated routed
+        // notification, a re-sent task) cannot pass for this one.
+        let before = self.capture_visible()?;
+        // The probe slice is the body's normalized tail — the end is
+        // what stays visible on a horizontally-scrolled input line and
+        // what a wrapped transcript renders last. Whitespace is stripped
+        // on both sides so TUI line wrapping/indentation cannot hide a
+        // match. For routed `worker_result` bodies the tail covers the
+        // unique worker turn_id; for repeated plain text the
+        // occurrence-count delta is still differential.
+        let slice = normalize_screen(&tail_chars(prompt, PROBE_SLICE));
+        let before_count = normalize_screen(&before).matches(&slice).count();
+
         // Literal delivery: content travels in a tmux buffer file, never
         // through argv or a shell — quoting cannot corrupt or inject it.
         let mut tmp = tempfile::NamedTempFile::new()?;
@@ -640,23 +705,29 @@ impl ProviderAdapter for DevinPtyAdapter {
         }
         drop(tmp);
 
-        // Post-paste verification: the body prefix must appear on the
-        // visible screen within a short bound. A busy TUI swallows a
-        // bracketed paste without rendering it (delivery loss) — bytes
-        // sent is not evidence. `NotRendered` is a *provable* miss, so
-        // the daemon can requeue informational deliveries safely and
-        // keeps task messages under the uncertainty discipline.
-        let prefix: String = prompt.chars().take(32).collect();
+        // Post-paste verification, bounded by RENDER_DEADLINE: the
+        // slice's occurrence count must increase AND the input line must
+        // be empty again — text rendered but still sitting in the input
+        // means Enter never submitted (a staged draft is not a turn).
+        // A miss inside the bound is evidence of a dropped paste, never
+        // proof; the daemon decides per message kind what a miss means.
         let deadline = Instant::now() + RENDER_DEADLINE;
+        let mut rendered = false;
         loop {
             let screen = self.capture_visible()?;
-            if screen.contains(&prefix) {
-                break;
+            if normalize_screen(&screen).matches(&slice).count() > before_count {
+                rendered = true;
+                if !analyze_devin(&screen).input_nonempty {
+                    break;
+                }
             }
             if Instant::now() >= deadline {
-                return Err(Error::not_rendered(
-                    "pasted text never rendered in the pane — the TUI dropped it",
-                ));
+                return Err(Error::not_rendered(if rendered {
+                    "paste rendered in the input line but was never submitted — \
+                     Enter not observed; the draft is left untouched"
+                } else {
+                    "pasted text never rendered in the pane — the TUI dropped it"
+                }));
             }
             std::thread::sleep(Duration::from_millis(150));
         }
@@ -743,7 +814,7 @@ impl ProviderAdapter for DevinPtyAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::analyze_devin;
+    use super::{analyze_devin, normalize_screen, tail_chars, STATUS_LINES};
 
     /// Real idle screen captured from a live Devin pane.
     const IDLE: &str = "\
@@ -751,15 +822,20 @@ mod tests {
 ──────────────────────────────────────────────────────────────────
 SWE-2 Max                                          Context: 43k / 262k";
 
-    /// Real approval menu captured from a live Devin pane.
+    /// Real approval menu captured verbatim from a live Devin pane
+    /// (v3000.10.31): option list plus the `↑↓ select · ↵ confirm ·
+    /// esc cancel` footer.
     const APPROVAL: &str = "\
 Allow this tool call?
 ❭ 1 Yes  (Approve once)
-· 2 Yes, allow edits in /tmp
-· 3 Yes, always allow edits in /tmp
-· 4 Yes, switch to bypass mode
-· 5 No
-↑↓ to select · ↵ confirm · esc cancel";
+· 2 Yes, allow `env` commands
+· 3 Yes, always allow `env` commands in `cadence-smoke-repo`
+· 4 Yes, always allow `env` commands in all projects
+· 5 Yes, switch to bypass mode
+· 6 Edit command
+· 7 Describe change to command
+· 8 No
+↑↓ select · ↵ confirm · esc cancel";
 
     #[test]
     fn idle_prompt_is_pasteable() {
@@ -794,6 +870,25 @@ Allow this tool call?
     }
 
     #[test]
+    fn busy_watermark_is_empty_input_not_a_draft() {
+        // Observed live (F7): after a ~3.6KB body submits, the text
+        // echoes into the transcript and the input line shows the busy
+        // watermark `❭ Guide Devin while it works` — an EMPTY input,
+        // not a staged draft. Reading it as a draft made the render
+        // check miss a healthy turn and fence a working pane.
+        let busy = "\
+Sentence 37 of the long-body observation fills the input line. TAILMARKER-9Z7X-END
+⠸  Thinking · 0s (esc twice to interrupt)
+──────────────────────────────────────────────────────────────────
+❭ Guide Devin while it works
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                      Alt+Enter for multiline prompts";
+        let p = analyze_devin(busy);
+        assert!(!p.idle && p.busy_marker, "{}", p.reason);
+        assert!(!p.input_nonempty, "busy watermark must read as empty");
+    }
+
+    #[test]
     fn staged_tui_queue_is_busy_not_idle() {
         // A26 sibling: the TUI shows queued input while busy — adding
         // more to it is still unsafe.
@@ -819,5 +914,50 @@ Allow this tool call?
         let p = analyze_devin("compiling…\nsome output without a prompt");
         assert!(!p.idle && !p.prompt_visible);
         assert_eq!(p.reason, "no prompt line visible");
+    }
+
+    #[test]
+    fn markers_in_transcript_do_not_count_as_busy() {
+        // The transcript may legitimately print the marker strings
+        // (this repo's own source does). Only the bottom status region
+        // is authoritative — a marker scrolled above it must not stall
+        // an idle pane.
+        let mut screen = String::new();
+        for marker in [
+            "(esc twice to interrupt)",
+            "Guide Devin while it works",
+            "↑↓ select · ↵ confirm · esc cancel",
+            "Press Enter to send queued messages",
+        ] {
+            screen.push_str(&format!("transcript line: {marker}\n"));
+        }
+        for i in 0..STATUS_LINES {
+            screen.push_str(&format!("ordinary output row {i}\n"));
+        }
+        screen.push_str(IDLE);
+        let p = analyze_devin(&screen);
+        assert!(p.idle, "{} / {}", p.idle, p.reason);
+        assert!(!p.busy_marker && !p.approval_menu);
+    }
+
+    #[test]
+    fn markers_in_status_region_still_block() {
+        // Same strings inside the bottom region DO mean busy — the
+        // region is the TUI's live status/menu area.
+        let screen = format!("{IDLE}\n⠀⠇ Thinking · 30s (esc twice to interrupt)");
+        let p = analyze_devin(&screen);
+        assert!(!p.idle && p.busy_marker);
+    }
+
+    #[test]
+    fn normalize_and_tail_helpers() {
+        assert_eq!(normalize_screen("a b\n  c"), "abc");
+        assert_eq!(tail_chars("abcdef", 3), "def");
+        assert_eq!(tail_chars("ab", 9), "ab");
+        // A wrapped body still matches its own tail slice.
+        let body = "alpha beta gamma delta omega";
+        let rendered = "alpha beta\n    gamma delta\n    omega";
+        let slice = normalize_screen(&tail_chars(body, 12));
+        assert!(normalize_screen(rendered).contains(&slice));
     }
 }

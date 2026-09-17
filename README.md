@@ -59,9 +59,9 @@ cadence agent resume <slug>     # reopen a stopped agent, then attach
                                 #   --detach opts out, non-TTY prints)
 cadence agent ready <slug>      # operator claim: pane inspected, idle, empty input
 cadence agent probe <slug>      # analyze the pane without claiming (pty)
-cadence agent set <slug> k=v    # merge params into a live agent
-                                #  (auto_ready=verified opts the pane into
-                                #   daemon-verified claims — no --ready needed)
+cadence agent set <slug> k=v    # merge an allowlisted param (auto_ready)
+                                #  into a live agent — auto_ready=verified opts
+                                #  the pane into daemon-verified claims
 cadence agent attach <slug>     # print the tmux attach command (--run to exec)
 
 cadence agent register obs --provider inbox   # durable mailbox, no process

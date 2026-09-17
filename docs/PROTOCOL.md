@@ -48,7 +48,7 @@ Error kinds:
 | `agent_ready` | `alias, by?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
-| `agent_set` | `alias, patch` | merges params into the live agent; `{state:"updated"}` |
+| `agent_set` | `alias, patch` | merges an allowlisted param into the live agent — today only `auto_ready` (`"verified"` or null-removal, pty only); `{state:"updated"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?` | `{state:"reported"}` — explicit PTY ack/result |
 | `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
@@ -198,38 +198,51 @@ TTL) or, under `auto_ready=verified`, a daemon-minted claim. Claims
 are single-use (consumed atomically by exactly one send), FIFO, and
 capped; every consumption emits a `claim_used` event recording the
 message id and the claimer (`agent ready <alias>` records
-`CADENCE_ALIAS` when set, else `"operator"`; auto-claims record
-`"auto:verified"`).
+`CADENCE_ALIAS` when set, else `"operator"`; daemon-minted claims
+record `"daemon"` on the `ready_claimed` event itself).
 
 With `auto_ready=verified` the daemon mints a claim only after a pane
 probe verifies idle: the screen must show the `❭` prompt with an empty
 input line, and none of the observed busy signatures (`esc to
 interrupt` hints, the guide/steer bar, queued-message footers) or an
 approval menu — an approval screen's `❭` option marker can mimic a
-prompt, so menu detection wins over prompt shape. `agent probe
-<alias>` runs the same analyzer on demand (`{idle, reason,
-prompt_visible, input_nonempty, busy_marker, approval_menu}`) without
-claiming. A refused send returns the message to `queued` (event
-`gate_wait`) and retries; it is never pasted blind and never dropped.
-Message text is a single line of 1–4000 chars with no control
-characters, delivered literally via `load-buffer` + `paste-buffer -p`
-+ `Enter` — no shell interpretation.
+prompt, so menu detection wins over prompt shape. Busy and menu
+markers are matched only in the bottom status region (the last ~14
+lines around the prompt) — the transcript above can legitimately print
+the same strings without the pane being busy. `agent probe <alias>`
+runs the same analyzer on demand (`{idle, reason, prompt_visible,
+input_nonempty, busy_marker, approval_menu}`) without claiming. A
+refused send returns the message to `queued` (event `gate_wait`) and
+retries; it is never pasted blind and never dropped. Message text is a
+single line of 1–4000 chars with no control characters, delivered
+literally via `load-buffer` + `paste-buffer -p` + `Enter` — no shell
+interpretation.
 
-**Durable submission vs. receipt.** Paste alone is not proof: after
-`Enter` the adapter captures the pane and requires a prefix of the
-submitted body to be visible before reporting `submitted`. When that
-render check fails (`NotRendered`) a routed `worker_result`
-notification is requeued with a bounded retry count; any other message
-goes `unknown` and fences the actor — a possibly-pasted task is never
-replayed blind. Once the render check passes the message is `running`
-with `turn_id = pty-<generation>-<uuid>` and completes only through an
-explicit `message_report` (`message ack` keeps it `running`; `message
-result` finishes it `completed` and routes `reply_to`). The token must
-equal the recorded `turn_id` and belong to the agent's current
-generation — a report against a previous pane life is `rejected` as
-stale; a conflicting result for a completed message is `rejected`; an
-identical retry is idempotent. Reporting identifies the caller by
-possession of the token — self-asserted, not authenticated.
+**Durable submission vs. receipt.** Paste alone is not proof: the
+render check is *differential* — the pane is captured before the paste,
+and afterwards the occurrence count of the body's normalized tail slice
+(whitespace-stripped on both sides, so TUI line wrapping cannot hide a
+match) must *increase*. An identical earlier notification already on
+screen therefore cannot pass for a dropped re-delivery. And rendered is
+not submitted: the input line must also be empty again after `Enter` —
+a staged draft left in the input means the keystroke was swallowed.
+Missing the deadline is `NotRendered` — *evidence* of a dropped or
+unsubmitted paste, not proof, since a saturated host can render late.
+On that evidence a routed `worker_result` notification is requeued
+(bounded, then the delivery is `failed` with `via=pty_render_miss` and
+a `delivery_parked` event — a notification must never fence the
+recipient or kill its pane; the worker's result stays durable on the
+worker's own message). Any other message goes `unknown` and fences the
+actor — a possibly-pasted task is never replayed blind. Once the check
+passes the message is `running` with `turn_id =
+pty-<generation>-<uuid>` and completes only through an explicit
+`message_report` (`message ack` keeps it `running`; `message result`
+finishes it `completed` and routes `reply_to`). The token must equal
+the recorded `turn_id` and belong to the agent's current generation — a
+report against a previous pane life is `rejected` as stale; a
+conflicting result for a completed message is `rejected`; an identical
+retry is idempotent. Reporting identifies the caller by possession of
+the token — self-asserted, not authenticated.
 
 A pane that dies after a possible paste leaves submitted messages
 `unknown` (fence, never replay); a pane that dies before the paste
@@ -396,8 +409,9 @@ endpoint kinds without a readiness gate. `message ask` accepts
 Kinds: `registered, queued, submitting, turn_started, turn_finished,
 provider_event, input_required, input_answered, input_resolved,
 result_routed, ready, ready_claimed, claim_used, gate_wait, submitted,
-acknowledged, paste_not_rendered, inbox_read, params_updated,
-attention, stop_requested`. `wait>0` long-polls up to 30s.
+acknowledged, paste_not_rendered, delivery_parked, inbox_read,
+params_updated, attention, stop_requested`. `wait>0` long-polls up to
+30s.
 
 ## Approvals
 

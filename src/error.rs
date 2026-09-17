@@ -22,9 +22,10 @@ pub enum Error {
     /// provider — the message fails, but the endpoint is provably
     /// untouched, so the actor must not fence or close it.
     PreWrite(String),
-    /// The paste was accepted by the terminal path but never rendered —
-    /// provably not delivered (pty post-paste screen check). The actor
-    /// decides: routed notifications requeue, task messages go
+    /// The paste was accepted by the terminal path but did not render
+    /// within the deadline — evidence of a dropped or unsubmitted paste,
+    /// not proof (pty post-paste screen check). The actor decides:
+    /// routed notifications requeue bounded then park; task messages go
     /// `unknown` under the usual uncertainty discipline.
     NotRendered(String),
 }

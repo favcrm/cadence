@@ -419,21 +419,27 @@ impl Shared {
                             gate_waits = 0;
                             unrendered = 0;
                         }
-                        // The paste provably never rendered: the pane
-                        // accepted the write path but dropped the input.
-                        // Routed notifications are informational —
-                        // requeue for at-least-once delivery, bounded.
-                        // Operator task messages keep the uncertainty
+                        // The paste did not render within the deadline:
+                        // evidence of a dropped or unsubmitted delivery.
+                        // Routed notifications are informational — requeue
+                        // for at-least-once delivery, bounded; on exhaustion
+                        // the delivery is *parked*, not fenced: a
+                        // notification must never kill the recipient's pane
+                        // and in-flight work. The worker's result stays
+                        // durable on the worker's own message, so nothing
+                        // is lost. Task messages keep the uncertainty
                         // discipline: `unknown` + fence, never a blind
                         // replay.
                         Err(Error::NotRendered(reason)) => {
-                            let retry = message.source == "worker_result" && unrendered < 3;
                             unrendered += 1;
+                            let routed = message.source == "worker_result";
+                            let retry = routed && unrendered <= 3;
                             let _ = self.store.event_public(
                                 alias,
                                 "paste_not_rendered",
                                 json!({"message": message.id,
                                        "reason": reason,
+                                       "attempt": unrendered,
                                        "retry": retry}),
                             );
                             if retry {
@@ -441,6 +447,25 @@ impl Shared {
                                 let _ = self.store.set_agent_state_if(alias, "idle", "busy");
                                 gate_notice = None;
                                 ctl.wake.wait_until(Instant::now() + Duration::from_secs(5));
+                            } else if routed {
+                                let _ = self.store.event_public(
+                                    alias,
+                                    "delivery_parked",
+                                    json!({"message": message.id,
+                                           "reason": reason,
+                                           "attempts": unrendered}),
+                                );
+                                self.store.finish(
+                                    &message,
+                                    "failed",
+                                    &json!({"status": "failed",
+                                            "via": "pty_render_miss",
+                                            "error": reason}),
+                                    Some(&reason),
+                                )?;
+                                let _ = self.store.set_agent_state_if(alias, "idle", "busy");
+                                unrendered = 0;
+                                self.wake();
                             } else {
                                 return self.unknown(alias, &message);
                             }
@@ -983,8 +1008,35 @@ impl Shared {
             .filter(|p| p.is_object())
             .cloned()
             .ok_or_else(|| Error::rejected("Missing 'patch' object"))?;
-        for key in patch.as_object().unwrap().keys() {
+        // Live-mutable params are an explicit allowlist — arbitrary keys
+        // like `upstream` or `session` would silently rewire routing and
+        // session binding, so they are rejected rather than merged.
+        let agent = self.store.agent(&alias)?;
+        for (key, value) in patch.as_object().unwrap() {
             proto::param_key(key)?;
+            match key.as_str() {
+                "auto_ready" => {
+                    if agent.endpoint_kind != "pty" {
+                        return Err(Error::rejected(
+                            "'auto_ready' only applies to pty endpoints — \
+                             a screen probe exists only there",
+                        ));
+                    }
+                    if !(value.is_null() || value.as_str() == Some("verified")) {
+                        return Err(Error::rejected(
+                            "'auto_ready' accepts \"verified\" or a bare key \
+                             (removal) — no other value is implemented",
+                        ));
+                    }
+                }
+                other => {
+                    return Err(Error::rejected(format!(
+                        "'{other}' is not live-settable — allowed keys: auto_ready \
+                         (pty only). Recreate the agent to change wiring params \
+                         like upstream or session"
+                    )));
+                }
+            }
         }
         self.store.set_params(&alias, &patch)?;
         // Push the merged params into the live adapter so cached

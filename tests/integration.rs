@@ -1744,7 +1744,10 @@ if cmd == "capture-pane":
     out = ""
     try: out += open(sess_path(name, "screen")).read()
     except FileNotFoundError: die("no such session")
-    try: out += open(sess_path(name, "input")).read()
+    # The input line renders like the real TUI: `❭ ` + staged draft.
+    try:
+        staged = open(sess_path(name, "input")).read()
+        if staged: out += "❭ " + staged + "\n"
     except FileNotFoundError: pass
     # Test-controlled extra screen content — a file the test writes to
     # make the pane look busy, approval-blocked, etc.
@@ -1819,10 +1822,15 @@ while True:
         data = ""
     if "<ENTER>" in data:
         text, rest = data.split("<ENTER>", 1)
-        open(inp, "w").write(rest)
-        if text.strip():
-            with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
-                f.write("> %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()))
+        if os.path.exists(os.environ["FAKE_PANE"] + ".hold-enter"):
+            # Enter swallowed: the marker is consumed but the draft
+            # stays staged in the input line, unsubmitted.
+            open(inp, "w").write(text + rest)
+        else:
+            open(inp, "w").write(rest)
+            if text.strip():
+                with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+                    f.write("> %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()))
     if "<KEY:C-c>" in data:
         open(inp, "w").write("")
         with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
@@ -3042,9 +3050,31 @@ fn daemon_run_refreshes_skill_on_start() {
         .join(".claude/skills/cadence")
         .symlink_metadata()
         .is_ok());
-    // Cleanly stop the daemon we spawned.
-    let _ = cadence_at(home.path(), &state, &["daemon", "stop"]);
-    let _ = child.wait();
+    // Cleanly stop the daemon we spawned. The skill file lands before
+    // `serve()` binds the socket, so the first `daemon stop` can race
+    // the listener — retry briefly, and bound the exit wait so a wedged
+    // daemon fails the test instead of hanging it.
+    let stop_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let out = cadence_at(home.path(), &state, &["daemon", "stop"]);
+        if out.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < stop_deadline,
+            "daemon stop never succeeded: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let wait_deadline = Instant::now() + Duration::from_secs(15);
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < wait_deadline,
+            "daemon run never exited after daemon stop"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// `agent list` inside a cadence pane scopes to the caller's group.
@@ -4160,7 +4190,126 @@ fn pty_unrendered_task_fences_unknown() {
 }
 
 #[test]
-fn pty_unrendered_worker_result_requeues_then_fences() {
+fn pty_render_check_is_differential_not_contains() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    // An identical body already rendered once — the screen provably
+    // contains the text before the second paste.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "identical notification body",
+               "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "m1", &["running"], 20);
+    // Now the pane drops the paste: the body is already on screen, so a
+    // `contains` check would pass — the differential check must not.
+    std::fs::write(d.pane_file(&mock, "dv", "swallow"), "1").unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "identical notification body",
+               "message": "m2"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "m2", &["unknown"], 25);
+    let e = d.wait_event("dv", "paste_not_rendered", 5);
+    assert_eq!(e["payload"]["message"], "m2", "{e}");
+}
+
+#[test]
+fn pty_rendered_but_not_submitted_is_not_running() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    // The TUI renders the paste but swallows Enter — the body sits in
+    // the input line as a staged draft. That is not a submission.
+    std::fs::write(d.pane_file(&mock, "dv", "hold-enter"), "1").unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "staged but unsent", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "m1", &["unknown"], 25);
+    d.wait_agent("dv", "attention", 15);
+    let e = d.wait_event("dv", "paste_not_rendered", 5);
+    assert!(
+        e["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("never submitted"),
+        "{e}"
+    );
+    // The draft was left untouched — no blind second Enter.
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap();
+    assert!(input.contains("staged but unsent"), "{input}");
+}
+
+#[test]
+fn agent_set_rejects_non_allowlisted_params() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.register("fk");
+    d.wait_agent("dv", "idle", 20);
+    d.wait_agent("fk", "idle", 10);
+    // Wiring keys are not live-settable.
+    let e = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "dv", "patch": {"upstream": "x"}}),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("auto_ready"), "{e}");
+    let e = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "dv", "patch": {"session": "other"}}),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("auto_ready"), "{e}");
+    // Only "verified" (or removal) is a valid value.
+    let e = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "dv", "patch": {"auto_ready": "bogus"}}),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("verified"), "{e}");
+    // auto_ready only exists on pty endpoints.
+    let e = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "fk", "patch": {"auto_ready": "verified"}}),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("pty"), "{e}");
+    // The allowed operations still work on a live pty agent.
+    d.rpc(
+        "agent_set",
+        json!({"alias": "dv", "patch": {"auto_ready": "verified"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"]["params"]["auto_ready"],
+        "verified"
+    );
+    d.rpc(
+        "agent_set",
+        json!({"alias": "dv", "patch": {"auto_ready": null}}),
+    )
+    .unwrap();
+    assert!(
+        d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"]["params"]
+            .get("auto_ready")
+            .is_none()
+    );
+}
+
+#[test]
+fn pty_unrendered_worker_result_requeues_then_parks() {
     let d = TestDaemon::start();
     let mock = d.mock_devin();
     d.register_devin_opts("pm", json!({"auto_ready": "verified"}));
@@ -4186,16 +4335,47 @@ fn pty_unrendered_worker_result_requeues_then_fences() {
         .unwrap()
         .to_string();
     // At-least-once: bounded requeues with paste_not_rendered evidence,
-    // then the same fence a task message would get.
-    d.wait_message("pm", &routed_id, &["unknown"], 60);
-    d.wait_agent("pm", "attention", 15);
+    // then the delivery is PARKED — a notification must never fence the
+    // recipient or kill its pane.
+    d.wait_message("pm", &routed_id, &["failed"], 90);
+    let parked = d
+        .events("pm")
+        .into_iter()
+        .find(|e| e["kind"].as_str() == Some("delivery_parked"))
+        .expect("no delivery_parked event");
+    assert_eq!(parked["payload"]["message"], routed_id);
+    assert_eq!(parked["payload"]["attempts"], 4, "{parked}");
     let misses: Vec<Value> = d
         .events("pm")
         .into_iter()
         .filter(|e| e["kind"].as_str() == Some("paste_not_rendered"))
         .collect();
-    assert!(misses.len() >= 2, "expected requeue evidence: {:?}", misses);
-    assert!(misses.iter().any(|e| e["payload"]["retry"] == true));
+    assert_eq!(misses.len(), 4, "{:?}", misses);
+    assert!(misses.iter().take(3).all(|e| e["payload"]["retry"] == true));
+    let show = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    let msg = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == routed_id)
+        .unwrap();
+    assert_eq!(msg["result"]["via"], "pty_render_miss", "{msg}");
+    // The PM stays alive and idle — the pane is still owned, and the
+    // next message still delivers once the pane renders again.
+    d.wait_agent("pm", "idle", 15);
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "pm"})).unwrap()["agent"]["dead"],
+        false
+    );
+    std::fs::remove_file(d.pane_file(&mock, "pm", "swallow")).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "pm", "text": "still alive", "message": "after"}),
+    )
+    .unwrap();
+    // Delivered = render-verified `running` (a task then awaits an
+    // explicit report, so the agent correctly stays busy on it).
+    d.wait_message("pm", "after", &["running"], 20);
 }
 
 #[test]
