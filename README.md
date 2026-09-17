@@ -75,6 +75,22 @@ cadence inbox obs [--wait 30]   # drain it: one JSON object per message,
                                 #  each completed via=inbox_read (empty = silent)
 ```
 
+The **board** tracks issues as folders of Markdown files under `~/pm`
+(`CADENCE_PM_DIR` overrides) — a private git repo outside every project
+repo. `cadence issue` is the only writer (each write is one git commit);
+`cadence ui` serves a read-only board + JSON API on loopback, reached at
+`http://cadence.localhost:18000` through the dev gateway. See
+[docs/BOARD.md](docs/BOARD.md).
+
+```bash
+cadence issue init                 # first run creates ~/pm
+cadence issue new "title"          # project resolves from the cwd repo
+cadence issue ls --ready           # leaves with no unfinished blockers
+cadence issue show CAD-16
+cadence issue lint                 # dangling/cyclic links, depth, sizes
+cadence ui run                     # 127.0.0.1:3010 — SPA + GET-only API
+```
+
 The hot path is verb-first — `devin`, `codex`, `join`, `attach`, `send`,
 `resume`, `stop`, `inbox` — while `agent`, `message` and `daemon` hold
 the admin subcommands (register/list/show/ready/capture/probe/set/
