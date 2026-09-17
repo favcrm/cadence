@@ -128,7 +128,14 @@ over prompt shape because their `❭` option marker mimics the idle
 prompt, and busy/menu markers are matched only in the bottom status
 region — the transcript above can legitimately print the same strings
 (including this repository's own source quoting them) without the pane
-being busy. `agent probe <alias>` exposes the same analyzer read-only.
+being busy. The region is anchored at the last *non-blank* row:
+`capture-pane` pads the capture to pane height, and on a fresh session
+with a tall pane the literal bottom rows are all blank — the first cut
+of region-scoping anchored at the last row and read a thinking pane as
+idle (caught in review, reproduced live: 89 captured rows, 67 trailing
+blanks). The `Guide Devin while it works` input watermark is itself a
+busy signal independent of the region maths. `agent probe <alias>`
+exposes the same analyzer read-only.
 Every claim consumption writes a `claim_used` audit event naming the
 claimer. The gate is still a gate; it just no longer trusts a human to
 have looked.

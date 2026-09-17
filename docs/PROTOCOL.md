@@ -207,9 +207,12 @@ input line, and none of the observed busy signatures (`esc to
 interrupt` hints, the guide/steer bar, queued-message footers) or an
 approval menu — an approval screen's `❭` option marker can mimic a
 prompt, so menu detection wins over prompt shape. Busy and menu
-markers are matched only in the bottom status region (the last ~14
-lines around the prompt) — the transcript above can legitimately print
-the same strings without the pane being busy. `agent probe <alias>`
+markers are matched only in the status region (the ~14 lines ending at
+the last non-blank row — `capture-pane` pads short content with blank
+rows, so the region is not the pane's literal bottom) — the transcript
+above can legitimately print the same strings without the pane being
+busy, and the `Guide Devin while it works` input watermark is itself a
+busy signal even outside the region. `agent probe <alias>`
 runs the same analyzer on demand (`{idle, reason, prompt_visible,
 input_nonempty, busy_marker, approval_menu}`) without claiming. A
 refused send returns the message to `queued` (event `gate_wait`) and

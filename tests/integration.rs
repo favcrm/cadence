@@ -4134,6 +4134,44 @@ fn pty_auto_ready_waits_on_busy_pane_then_delivers() {
 }
 
 #[test]
+fn pty_probe_busy_markers_survive_trailing_blank_rows() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    // capture-pane pads to pane height: a young session on a tall pane
+    // leaves blank rows below the content. The probe must anchor the
+    // status region at the last non-blank row or a busy pane reads
+    // idle and the daemon pastes into it.
+    std::fs::write(
+        d.pane_file(&mock, "dv", "tui-state"),
+        "⠸ Thinking · 12s (esc twice to interrupt)\n".to_string() + &"\n".repeat(30),
+    )
+    .unwrap();
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["idle"], false, "{probe}");
+    assert_eq!(probe["busy_marker"], true, "{probe}");
+    // And the gate refuses to paste into it.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "do not paste", "message": "m1"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("dv", "gate_wait", 10);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("busy"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("dv", "m1"), "queued");
+    assert!(std::fs::read_to_string(d.pane_file(&mock, "dv", "input"))
+        .unwrap_or_default()
+        .is_empty());
+}
+
+#[test]
 fn pty_ready_claims_stack_fifo_with_claimer() {
     let d = TestDaemon::start();
     let _mock = d.mock_devin();

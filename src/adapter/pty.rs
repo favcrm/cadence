@@ -123,9 +123,12 @@ mod devin_screen {
 /// `❭` leads the first approval option too — and both are only read
 /// in the bottom status region: the transcript above can legitimately
 /// print these same strings (source text, docs) without the pane being
-/// busy at all.
+/// busy at all. The region is anchored at the last NON-BLANK row —
+/// `capture-pane` pads the capture to pane height, so a young session
+/// on a tall pane has blank rows below the real content.
 pub fn analyze_devin(screen: &str) -> Probe {
-    let tail: String = screen
+    let content = screen.trim_end();
+    let tail: String = content
         .lines()
         .rev()
         .take(STATUS_LINES)
@@ -135,7 +138,7 @@ pub fn analyze_devin(screen: &str) -> Probe {
         .collect::<Vec<_>>()
         .join("\n");
     let approval_menu = devin_screen::APPROVAL.iter().any(|m| tail.contains(m));
-    let busy_marker = devin_screen::BUSY
+    let region_busy = devin_screen::BUSY
         .iter()
         .chain(devin_screen::QUEUED.iter())
         .any(|m| tail.contains(m));
@@ -155,9 +158,17 @@ pub fn analyze_devin(screen: &str) -> Probe {
     let input_nonempty = !draft.is_empty()
         && !draft.starts_with(devin_screen::PLACEHOLDER)
         && !draft.starts_with(devin_screen::BUSY_PLACEHOLDER);
+    // Defence in depth: the busy watermark in the input line is itself
+    // a busy signal, checked before the region markers so the reason
+    // stays precise — and so the verdict survives even if the line ever
+    // falls outside the status window.
+    let watermark_busy = draft.starts_with(devin_screen::BUSY_PLACEHOLDER);
+    let busy_marker = region_busy || watermark_busy;
     let (idle, reason) = if approval_menu {
         (false, "approval menu is open")
-    } else if busy_marker {
+    } else if watermark_busy {
+        (false, "tui is busy (guide watermark in the input line)")
+    } else if region_busy {
         (false, "tui is busy (interrupt marker on screen)")
     } else if !prompt_visible {
         (false, "no prompt line visible")
@@ -935,9 +946,16 @@ SWE-2 Max                                      Alt+Enter for multiline prompts";
             screen.push_str(&format!("ordinary output row {i}\n"));
         }
         screen.push_str(IDLE);
-        let p = analyze_devin(&screen);
-        assert!(p.idle, "{} / {}", p.idle, p.reason);
-        assert!(!p.busy_marker && !p.approval_menu);
+        // Same verdict with and without capture-pane's blank padding.
+        for blanks in [
+            "",
+            "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+        ] {
+            let padded = format!("{screen}{blanks}");
+            let p = analyze_devin(&padded);
+            assert!(p.idle, "{} / {}", p.idle, p.reason);
+            assert!(!p.busy_marker && !p.approval_menu);
+        }
     }
 
     #[test]
@@ -947,6 +965,48 @@ SWE-2 Max                                      Alt+Enter for multiline prompts";
         let screen = format!("{IDLE}\n⠀⠇ Thinking · 30s (esc twice to interrupt)");
         let p = analyze_devin(&screen);
         assert!(!p.idle && p.busy_marker);
+    }
+
+    #[test]
+    fn trailing_blank_rows_do_not_hide_busy() {
+        // capture-pane pads to pane height: a young session on a tall
+        // pane leaves blank rows below the real content. The status
+        // region must anchor at the last non-blank row — otherwise a
+        // busy pane reads idle and the daemon pastes into it.
+        let busy = "\
+⠸  Thinking · 12s (esc twice to interrupt)
+──────────────────────────────────────────────────────────────────
+❭ Guide Devin while it works
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                      Alt+Enter for multiline prompts";
+        let screen = format!("{busy}{}", "\n".repeat(30));
+        let p = analyze_devin(&screen);
+        assert!(!p.idle, "busy pane with trailing blanks read idle");
+        assert!(p.busy_marker, "{:?}", p);
+    }
+
+    #[test]
+    fn trailing_blank_rows_do_not_hide_approval() {
+        let screen = format!("{APPROVAL}{}", "\n".repeat(30));
+        let p = analyze_devin(&screen);
+        assert!(!p.idle && p.approval_menu, "{:?}", p);
+        assert_eq!(p.reason, "approval menu is open");
+    }
+
+    #[test]
+    fn busy_watermark_alone_is_not_idle() {
+        // Defence in depth: the guide watermark in the input line is a
+        // busy signal even when no other marker survives the region
+        // maths (e.g. the banner scrolled just above the window).
+        let screen = "\
+some transcript output
+❭ Guide Devin while it works
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                      Alt+Enter for multiline prompts";
+        let p = analyze_devin(screen);
+        assert!(!p.idle && p.busy_marker);
+        assert_eq!(p.reason, "tui is busy (guide watermark in the input line)");
+        assert!(!p.input_nonempty);
     }
 
     #[test]
