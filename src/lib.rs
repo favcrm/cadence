@@ -8,8 +8,10 @@ pub mod client;
 pub mod daemon;
 pub mod doctor;
 pub mod error;
+pub mod issue;
 pub mod proto;
 pub mod skill;
 pub mod store;
+pub mod ui;
 
 pub use error::{Error, Result};

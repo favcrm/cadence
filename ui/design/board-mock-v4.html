@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cadence board — plan + mock (v4, issues)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+if(document.visibilityState==='visible'&&!matchMedia('(prefers-reduced-motion: reduce)').matches)document.documentElement.classList.add('anim');
+tailwind.config={theme:{extend:{
+ fontFamily:{sans:['"IBM Plex Sans"','sans-serif'],mono:['"IBM Plex Mono"','monospace']},
+ colors:{ink:{950:'#070708',900:'#0b0b0c',875:'#0e0e10',850:'#141518',800:'#191a1e',700:'#222428',600:'#2e3136',500:'#858c96',400:'#9ba1a9',300:'#c3c8ce',200:'#e7e9ec',100:'#f6f7f8'},
+  accent:'#2dd4bf',ok:'#4ade80',fail:'#f87171',warn:'#fbbf24',info:'#60a5fa'},
+ fontSize:{micro:'.6875rem',label:'.75rem',table:'.78125rem',secondary:'.8125rem',body:'.875rem',cardtitle:'.9375rem',section:'1.125rem',drawer:'1.25rem'}
+}}}
+</script>
+<style>
+  :root{color-scheme:dark}
+  body{background:#070708;color:#c3c8ce;font-family:"IBM Plex Sans",sans-serif;font-size:.875rem;line-height:1.4;font-synthesis:none;text-rendering:optimizeLegibility}
+  .num{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums lining-nums}
+  .kicker{font:400 .75rem "IBM Plex Mono",monospace;color:#858c96;text-transform:lowercase}
+  .slabel{font:500 .6875rem "IBM Plex Mono",monospace;letter-spacing:.08em;text-transform:uppercase;color:#858c96}
+  .card{border:1px solid #222428;background:#141518;border-radius:.5rem;transition:border-color .15s ease,background-color .15s ease}
+  .tcard{cursor:pointer}.tcard:focus-visible{outline:none;border-color:#2dd4bf;box-shadow:0 0 0 3px rgba(45,212,191,.1)}.tcard:hover{border-color:#2e3136;background:#191a1e}
+  .tcard.dragging{opacity:.35}
+  .col.over{box-shadow:inset 0 0 0 1px rgba(45,212,191,.55)}
+  .navlink{display:flex;min-height:38px;align-items:center;gap:11px;padding:0 11px;border-radius:4px;color:#9ba1a9;font-size:13px;transition:background-color .16s ease,color .16s ease}
+  .navlink:hover{background:#191a1e;color:#f6f7f8}
+  .navlink[aria-current=page]{background:color-mix(in srgb,#2dd4bf 13%,#0e0e10);color:#2dd4bf}
+  .proj{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;width:100%;padding:7px 10px;border-radius:4px;color:#9ba1a9;font-size:12px;text-align:left}
+  .proj:hover,.proj.on{background:#191a1e;color:#f6f7f8}.proj.on{box-shadow:inset 2px 0 #2dd4bf}
+  .field{height:2.25rem;border:1px solid #3a3d43;border-radius:.25rem;background:#0b0b0c;color:#f6f7f8;padding:0 .85rem;font-size:.8125rem}
+  .field:hover{border-color:#50545c}.field:focus{outline:none;border-color:#2dd4bf;box-shadow:0 0 0 3px rgba(45,212,191,.1)}
+  .chip{display:inline-flex;align-items:center;gap:.3rem;border-radius:.25rem;padding:.05rem .4rem;font:500 .6875rem "IBM Plex Mono",monospace}
+  .anim .reveal{animation:reveal .45s cubic-bezier(.2,.8,.2,1) both}
+  @keyframes reveal{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .drawer{transition:transform .22s cubic-bezier(.2,.8,.2,1)}
+  .closebtn svg{transition:transform .18s cubic-bezier(.2,.8,.2,1)}.closebtn:hover svg{transform:rotate(90deg)}
+  .closebtn:hover{border-color:#2dd4bf;color:#2dd4bf}
+  a.lnk,button.lnk{color:#2dd4bf}a.lnk:hover,button.lnk:hover{text-decoration:underline}
+  pre{white-space:pre-wrap}
+  .md code{font:500 .75rem 'IBM Plex Mono',monospace;background:#191a1e;border-radius:.25rem;padding:.05rem .3rem;color:#e7e9ec}
+  @media (prefers-reduced-motion:reduce){.reveal,.drawer{animation:none;transition:none}}
+  ::-webkit-scrollbar{height:10px;width:10px}::-webkit-scrollbar-thumb{background:#222428;border-radius:6px}
+</style>
+</head>
+<body>
+<div class="grid lg:grid-cols-[208px_minmax(0,1fr)] min-h-screen bg-ink-900">
+
+<!-- SIDEBAR -->
+<aside class="hidden lg:flex sticky top-0 h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[22px] pb-4 overflow-y-auto">
+  <div class="px-[7px] pb-[23px]">
+    <span class="inline-flex items-center gap-2 text-ink-100 text-[17px] font-semibold tracking-[-.035em]">
+      <svg width="25" height="25" viewBox="0 0 25 25" fill="none"><rect x=".5" y=".5" width="24" height="24" rx="5" stroke="#2e3136"/><path d="M6 16.5V8.5M10.3 16.5v-5M14.6 16.5V6.5M18.9 16.5v-3.4" stroke="#e7e9ec" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <span>cadence<span class="text-ink-400 font-normal"> board</span></span></span>
+  </div>
+  <nav class="grid gap-[3px]">
+    <a href="#" data-tab="board" class="navlink tab" aria-current="page"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="1.5" y="2" width="3.6" height="12" rx="1"/><rect x="6.2" y="2" width="3.6" height="8" rx="1"/><rect x="10.9" y="2" width="3.6" height="10" rx="1"/></svg>Board</a>
+    <a href="#" data-tab="plan" class="navlink tab"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 1.8h6l3 3v9.4h-9z"/><path d="M5.8 7.5h4.4M5.8 10h4.4"/></svg>Plan</a>
+    <span class="navlink opacity-45 cursor-not-allowed" title="iteration 4"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="3.5" cy="8" r="1.7"/><circle cx="12.5" cy="3.5" r="1.7"/><circle cx="12.5" cy="12.5" r="1.7"/><path d="M5 7.2l6-3M5 8.8l6 3"/></svg>Loops <span class="ml-auto num text-[10px] text-ink-500">I4</span></span>
+    <span class="navlink opacity-45 cursor-not-allowed" title="iteration 3"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3" width="12" height="8.5" rx="1.2"/><path d="M5.5 14h5"/></svg>Agents <span class="ml-auto num text-[10px] text-ink-500">I3</span></span>
+  </nav>
+  <div class="slabel flex justify-between mx-[11px] mt-[22px] mb-[7px]"><span>Projects</span><span class="text-[10px]">~/pm</span></div>
+  <div id="projects" class="grid gap-[2px]"></div>
+  <div class="mt-auto pt-4 border-t border-ink-700 mx-1 text-ink-500 text-label leading-relaxed">
+    <div class="slabel mb-1">session</div>
+    no auth · loopback only<br><span class="num text-micro">cadence.localhost:18000</span>
+  </div>
+</aside>
+
+<div class="min-w-0 flex flex-col">
+<!-- TOPBAR -->
+<header class="sticky top-0 z-10 h-[2.85rem] flex items-center gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
+  <div class="num text-label text-ink-500"><span class="text-ink-300">cadence</span> / <span id="crumb" class="text-ink-100">board</span></div>
+  <div class="lg:hidden flex gap-1 ml-2"><a href="#" data-tab="board" class="tab chip bg-ink-800 text-ink-200">board</a><a href="#" data-tab="plan" class="tab chip bg-ink-800 text-ink-200">plan</a></div>
+  <div class="ml-auto flex items-center gap-2">
+    <span class="chip bg-warn/10 text-warn">MOCK SESSION</span>
+    <span class="hidden sm:inline-flex chip bg-ink-800 text-ink-400">v4 · issues</span>
+  </div>
+</header>
+
+<!-- BOARD -->
+<main id="tab-board" class="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
+  <div class="flex flex-wrap items-center gap-x-3 gap-y-1 mb-5 reveal">
+    <span class="chip bg-warn/10 text-warn">REFERENCE DATA · NOT LIVE</span>
+    <span class="text-secondary text-ink-400">Cards and agent states are fixtures taken from the 17 Sep cadence backlog. Moves do not persist.</span>
+  </div>
+
+  <div class="flex flex-wrap items-end gap-x-3 gap-y-3 mb-4 reveal" style="animation-delay:40ms">
+    <h1 class="text-section font-semibold text-ink-100 leading-tight" id="board-title">All projects</h1>
+    <span class="kicker" id="board-count"></span>
+    <input id="q" class="field ml-auto w-full sm:w-64" placeholder="Filter issues by id, title or owner">
+  </div>
+
+  <!-- runtime strip -->
+  <section class="card mb-4 px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-2 reveal" style="animation-delay:80ms" aria-label="Runtime">
+    <div class="flex items-center gap-x-5 gap-y-1 flex-wrap">
+      <span class="flex items-baseline gap-1.5"><span class="slabel">running</span><span class="num text-secondary text-ink-100">1</span></span>
+      <span class="flex items-baseline gap-1.5"><span class="slabel">queued</span><span class="num text-secondary text-ink-100">0</span></span>
+      <span class="flex items-baseline gap-1.5"><span class="slabel">fenced</span><span class="num text-secondary text-ok">0</span></span>
+      <span class="flex items-baseline gap-1.5"><span class="slabel">parked</span><span class="num text-secondary text-ink-100">0</span></span>
+    </div>
+    <span class="hidden md:block w-px h-4 bg-ink-700"></span>
+    <div class="flex items-center gap-2 min-w-0 flex-wrap" title="read from the daemon socket"><span class="slabel">agents</span><div id="agents" class="flex flex-wrap gap-1.5"></div></div>
+  </section>
+
+  <div id="cols" class="grid grid-flow-col auto-cols-[minmax(232px,1fr)] lg:auto-cols-[minmax(0,1fr)] gap-3 overflow-x-auto lg:overflow-visible pb-2"></div>
+
+  <footer class="mt-8 pt-4 border-t border-ink-700 text-label text-ink-500 num">source: ~/pm issue folders · /var/www/agent-notes chains · cadence daemon socket — mock fixtures, not live. Drag a card to see the request the real app would send.</footer>
+</main>
+
+<!-- PLAN (document page: narrative column + context rail) -->
+<main id="tab-plan" class="hidden px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
+  <div class="grid xl:grid-cols-3 gap-x-8 gap-y-10">
+  <div class="xl:col-span-2 space-y-16 max-w-[62rem]">
+
+    <section class="reveal">
+      <div class="flex items-baseline gap-3 mb-4"><h2 class="text-section font-semibold text-ink-100">Files are the truth</h2><span class="kicker">the board is a view</span></div>
+      <p class="text-body leading-[1.55] max-w-[68ch]">An internal tracker for one host and one operator. One folder per issue in a private directory outside every repo. The agent-notes chain keeps holding evidence. Cadence keeps holding runtime state. The board reads all three and writes only issue folders.</p>
+      <div class="grid sm:grid-cols-3 gap-4 mt-4">
+        <div class="card p-5"><div class="slabel">intent</div><div class="num text-secondary text-ink-100 mt-2">~/pm/&lt;project&gt;/&lt;ID&gt;/</div><p class="text-secondary text-ink-400 mt-2">Backlog, priority, links, comments, artifacts.</p></div>
+        <div class="card p-5"><div class="slabel">evidence</div><div class="num text-secondary text-ink-100 mt-2">/var/www/agent-notes</div><p class="text-secondary text-ink-400 mt-2">Kickoff, QA and verdict notes, joined by loop id.</p></div>
+        <div class="card p-5"><div class="slabel">runtime</div><div class="num text-secondary text-ink-100 mt-2">cadence daemon</div><p class="text-secondary text-ink-400 mt-2">Agents, messages, fences and events.</p></div>
+      </div>
+      <p class="text-secondary text-ink-500 mt-3">Not goals: multi-host sync, human team workflows, claims or heartbeats in the tracker, anything written into a project repo.</p>
+    </section>
+
+    <section class="reveal" style="animation-delay:60ms">
+      <div class="flex items-baseline gap-3 mb-4"><h2 class="text-section font-semibold text-ink-100">Issue folder</h2><span class="kicker">one folder per issue, path never changes</span></div>
+      <div class="grid gap-5">
+        <pre class="num text-label leading-relaxed rounded-lg border border-ink-700 bg-ink-900 p-4 text-ink-300 !whitespace-pre overflow-x-auto">~/pm/                           <span class="text-ink-500">private git repo, never pushed anywhere public</span>
+├── pm.yaml                     <span class="text-ink-500">schema version, statuses, link types, artifact size cap</span>
+├── README.md                   <span class="text-ink-500">the rules, for agents and humans</span>
+├── .index/                     <span class="text-ink-500">generated cache, disposable, gitignored</span>
+├── cadence/
+│   ├── project.yaml            <span class="text-ink-500">key, prefix: CAD, repos, components</span>
+│   ├── CAD-16/
+│   │   ├── issue.md            <span class="text-ink-500">frontmatter, intent, acceptance checkboxes</span>
+│   │   ├── comments/
+│   │   │   └── 20260917T172400Z-fable-cc.md
+│   │   └── artifacts/
+│   │       └── scratch-smoke.txt
+│   └── CAD-17/issue.md
+├── sportslog/project.yaml      <span class="text-ink-500">prefix: SPL, components: app api admin web</span>
+└── ops/project.yaml            <span class="text-ink-500">prefix: OPS, work with no repo</span></pre>
+        <ul class="grid sm:grid-cols-2 gap-x-8 gap-y-3 text-secondary leading-[1.5]">
+          <li><span class="text-ink-100 font-medium">Paths encode nothing that changes.</span> Folder name is the id only. No title slug, no status folder, no nesting under a parent.</li>
+          <li><span class="text-ink-100 font-medium">Store only what cannot be derived.</span> Inverse links, readiness, counts, artifact list, activity and sessions are computed.</li>
+          <li><span class="text-ink-100 font-medium">Six statuses.</span> <span class="num">backlog ready doing review done dropped</span>. Issues are never deleted, only dropped.</li>
+          <li><span class="text-ink-100 font-medium">Links, one direction only.</span> <span class="num">blocked_by parent relates duplicate_of</span>. Only blocked_by affects readiness.</li>
+          <li><span class="text-ink-100 font-medium">Sub-issues are full issues.</span> Own id from the same sequence, own folder, a <span class="num">parent</span> field. Two levels only. A parent with children is a container and its status rolls up.</li>
+          <li><span class="text-ink-100 font-medium">Sub-issue or checkbox.</span> If it can be assigned, blocked or reviewed separately, it is a sub-issue. Otherwise a Markdown checkbox.</li>
+          <li><span class="text-ink-100 font-medium">Artifacts are refs or files.</span> Refs point at PRs, commits, notes, previews. Files live in <span class="num">artifacts/</span> under a 1 MB cap. The listing is the manifest.</li>
+          <li><span class="text-ink-100 font-medium">One file per comment.</span> Created exclusively, named by UTC time and author. Append-only, sanitized Markdown, no threading.</li>
+          <li><span class="text-ink-100 font-medium">Writes.</span> <span class="num">issue.md</span> edits take a lock and an atomic rename. Comments and artifacts are create-only. Every write is a git commit made by the tool.</li>
+          <li><span class="text-ink-100 font-medium">Lint as a pre-commit hook.</span> Schema, dangling and cyclic links, id and folder mismatch, depth, oversize artifacts.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="reveal" style="animation-delay:90ms">
+      <div class="flex items-baseline gap-3 mb-4"><h2 class="text-section font-semibold text-ink-100">Projects</h2><span class="kicker">a named entity, not a cwd</span></div>
+      <div class="grid md:grid-cols-2 gap-5">
+        <pre class="num text-label leading-relaxed rounded-lg border border-ink-700 bg-ink-900 p-4 text-ink-300 !whitespace-pre overflow-x-auto"><span class="text-ink-500"># ~/pm/cadence/project.yaml</span>
+key: cadence
+prefix: CAD
+repos:
+  - path: ~/Project/cadence
+    remote: github.com/favcrm/cadence
+components: [adapter, daemon, cli, ui]
+default_owner: cookie-cesium</pre>
+        <div class="text-secondary leading-[1.5]"><p class="text-ink-100 font-medium mb-2">How the CLI picks a project</p>
+          <ol class="space-y-1.5 list-decimal pl-5"><li><span class="num">--project</span> or <span class="num">CADENCE_PROJECT</span> wins.</li><li>The git common dir of the cwd, so any worktree maps to its main checkout, matched by remote URL.</li><li>Then matched by path.</li><li>No match fails closed. An agent never files into the wrong board.</li></ol>
+          <p class="text-ink-500 mt-3">Worktrees, monorepo sub-apps and an agent launched from another repo all break a one-to-one cwd mapping. Sub-apps are a <span class="num">component</span> label.</p></div>
+      </div>
+    </section>
+
+    <section class="reveal" style="animation-delay:100ms">
+      <div class="flex items-baseline gap-3 mb-4"><h2 class="text-section font-semibold text-ink-100">Issues and M3 jobs</h2><span class="kicker">intent versus execution</span></div>
+      <div class="grid sm:grid-cols-2 gap-4">
+        <div class="card p-5"><div class="slabel mb-2">issue · files in ~/pm</div><p class="text-secondary text-ink-300 leading-[1.5]">What should happen and why. Backlog, priority, links, discussion, artifacts. Lives with or without the daemon.</p></div>
+        <div class="card p-5"><div class="slabel mb-2">job · daemon tables, M3</div><p class="text-secondary text-ink-300 leading-[1.5]">One execution of a leaf issue: dispatched, running, review, verified. Assignee, worktree, verdict bound to a commit.</p></div>
+      </div>
+      <ul class="mt-4 space-y-2 text-secondary leading-[1.5] max-w-[72ch]">
+        <li><span class="text-ink-100 font-medium">One leaf issue, one job, usually one PR.</span> Jobs carry an <span class="num">issue_id</span>. The issue never stores job or session ids.</li>
+        <li><span class="text-ink-100 font-medium">Status source.</span> With M3: the job state. Before M3: the latest agent-note whose header carries <span class="num">Issue: CAD-16</span>. Otherwise the file field.</li>
+        <li><span class="text-ink-100 font-medium">Sessions are a live view.</span> Agents, provider sessions and messages come from the daemon through the message-to-task column M3 adds.</li>
+      </ul>
+    </section>
+
+    <section class="reveal" style="animation-delay:120ms">
+      <div class="flex items-baseline gap-3 mb-4"><h2 class="text-section font-semibold text-ink-100">Architecture</h2><span class="kicker">one binary, three sources</span></div>
+      <div class="card p-5 overflow-x-auto"><div class="min-w-[620px]">
+        <div class="grid grid-cols-[1fr_auto_1fr_auto_1fr] items-stretch gap-3 num text-label">
+          <div class="rounded border border-ink-700 bg-ink-900 p-3"><div class="text-ink-100">browser</div><div class="text-ink-500 mt-1">Vite · React · Tailwind SPA</div></div><div class="self-center text-ink-500">→</div>
+          <div class="rounded border border-ink-700 bg-ink-900 p-3"><div class="text-ink-100">dev gateway nginx</div><div class="text-ink-500 mt-1">cadence.localhost:18000</div></div><div class="self-center text-ink-500">→</div>
+          <div class="rounded border border-ink-600 bg-ink-800 p-3"><div class="text-ink-100">cadence ui · 127.0.0.1</div><div class="text-ink-500 mt-1">serves dist + /api</div></div>
+        </div>
+        <div class="grid grid-cols-3 gap-3 mt-3 num text-label">
+          <div class="rounded border border-dashed border-ink-700 p-3"><span class="text-ink-500">reads and writes</span><div class="text-ink-100 mt-1">~/pm</div></div>
+          <div class="rounded border border-dashed border-ink-700 p-3"><span class="text-ink-500">reads only</span><div class="text-ink-100 mt-1">agent-notes</div></div>
+          <div class="rounded border border-dashed border-ink-700 p-3"><span class="text-ink-500">reads only</span><div class="text-ink-100 mt-1">daemon socket</div></div>
+        </div></div></div>
+      <ul class="mt-4 space-y-2 text-secondary leading-[1.5] max-w-[72ch]">
+        <li><span class="text-ink-100 font-medium">Frontend.</span> <span class="num">cadence/ui/</span>: Vite, React, TypeScript, Tailwind 4, pnpm. Dev uses the Vite proxy to the API.</li>
+        <li><span class="text-ink-100 font-medium">Backend.</span> A <span class="num">cadence ui</span> subcommand in the existing Rust binary. It already owns the store and socket. The built SPA is embedded behind a cargo feature so CI without Node still builds.</li>
+        <li><span class="text-ink-100 font-medium">Live updates.</span> One server-sent events stream: a file watcher on <span class="num">~/pm</span> and the notes directory, plus the daemon change signal.</li>
+        <li><span class="text-ink-100 font-medium">CLI parity.</span> <span class="num">cadence issue new | ls --ready | show | set | link | comment | attach | lint</span> uses the same writer, so agents never need HTTP.</li>
+      </ul>
+    </section>
+
+    <section class="reveal" style="animation-delay:180ms">
+      <div class="flex items-baseline gap-3 mb-4"><h2 class="text-section font-semibold text-ink-100">Design system</h2><span class="kicker">shared with agentic-alpha</span></div>
+      <p class="text-body leading-[1.55] max-w-[68ch]">The UI adopts the sister project's <span class="num text-secondary">DESIGN.md</span> as written. This page is built to it.</p>
+      <div class="grid sm:grid-cols-2 gap-4 mt-4">
+        <div class="card p-5"><div class="slabel mb-2">taken as-is</div><ul class="space-y-1.5 text-secondary">
+          <li><span class="num">tokens.css</span> copied verbatim: graphite ink ramp, type scale, field and motion tokens.</li>
+          <li>IBM Plex Sans for prose, Plex Mono with tabular figures for ids, counts and times. No third family.</li>
+          <li>One surface (<span class="num">.card</span>), one border colour, tint chips without borders.</li>
+          <li>Teal accent on interactive elements only.</li>
+          <li>Sidebar plus slim topbar. Detail in an overlay drawer: header, body, sticky footer.</li></ul></div>
+        <div class="card p-5"><div class="slabel mb-2">mapped for cadence</div>
+          <div class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 text-secondary items-center">
+            <span class="chip bg-ok/10 text-ok">ok</span><span>done, healthy, nothing fenced</span>
+            <span class="chip bg-fail/10 text-fail">fail</span><span>fenced, unknown, failed delivery</span>
+            <span class="chip bg-warn/10 text-warn">warn</span><span>blocked, in review, top priority, mock notices</span>
+            <span class="chip bg-info/10 text-info">info</span><span>derived from notes, agent busy, kickoff notes</span>
+          </div>
+          <p class="text-label text-ink-500 mt-3">Board is treated as a Registry page: full-width content plus overlay drawer, no persistent rail. Plan is a Document page, so it may carry this context rail.</p></div>
+      </div>
+    </section>
+
+    <section class="reveal" style="animation-delay:240ms">
+      <div class="flex items-baseline gap-3 mb-4"><h2 class="text-section font-semibold text-ink-100">API surface</h2><span class="kicker">and what it must never grow</span></div>
+      <div class="border border-ink-700 bg-ink-875 overflow-x-auto"><table class="w-full text-table min-w-[560px]">
+        <thead><tr class="slabel text-left border-b border-ink-700"><th class="px-3.5 py-2.5 font-medium">method</th><th class="px-3.5 py-2.5 font-medium">path</th><th class="px-3.5 py-2.5 font-medium">purpose</th><th class="px-3.5 py-2.5 font-medium text-right">iteration</th></tr></thead>
+        <tbody class="divide-y divide-ink-700/80" id="api"></tbody></table></div>
+      <div class="card p-5 mt-4 border-warn/30"><div class="flex items-center gap-2 mb-2"><span class="chip bg-warn/10 text-warn">no auth at this stage</span><span class="kicker">by decision</span></div>
+        <p class="text-secondary leading-[1.55] max-w-[76ch]">Containment is the defence: bind 127.0.0.1 by default, no CORS, reachable only through the gateway vhost and your SSH forward. That holds only while the API stays this small. <span class="text-ink-100">Never add</span> arbitrary file read, command execution, git or PR actions, or agent dispatch without a token. Those endpoints are why the Beads UI needed patching.</p></div>
+    </section>
+
+    <section class="reveal" style="animation-delay:300ms">
+      <div class="flex items-baseline gap-3 mb-4"><h2 class="text-section font-semibold text-ink-100">Housekeeping</h2><span class="kicker">before the first commit</span></div>
+      <ul class="space-y-2 text-secondary leading-[1.5] max-w-[72ch]">
+        <li>Stop <span class="num">beads-ui</span>, restore the gateway config backup, uninstall <span class="num">bd</span>.</li>
+        <li>Close notes loop <span class="num">3036d</span> with a verdict marked dropped.</li>
+        <li>Seed <span class="num">~/pm/cadence</span> from the two verdict backlogs. The cards in this mock are that seed.</li>
+        <li>Give every agent session its own mailbox name. Two sessions share <span class="num">fable-cc</span> today.</li>
+      </ul>
+    </section>
+    <footer class="pt-4 border-t border-ink-700 text-label text-ink-500 num">plan v4 · 17 Sep 2026 · design per ~/Project/agentic-alpha/DESIGN.md · nothing built or dispatched yet</footer>
+  </div>
+
+  <!-- context rail (document pages only) -->
+  <aside class="space-y-4 xl:sticky xl:top-[4rem] self-start">
+    <div class="card"><div class="px-4 py-3 border-b border-ink-700 flex items-baseline gap-2"><h3 class="text-cardtitle font-semibold text-ink-100">Iterations</h3><span class="kicker">one screen each</span></div>
+      <ol class="divide-y divide-ink-700/80" id="iters"></ol></div>
+    <div class="card p-4"><div class="slabel mb-2">decisions to confirm</div><ul class="space-y-2 text-secondary">
+      <li>Backend in the cadence Rust binary, not a Node server. <span class="text-ink-500">Assumed.</span></li>
+      <li>Tracker directory at <span class="num">~/pm</span>, outside the cadence repo. <span class="text-ink-500">Assumed.</span></li>
+      <li>Derived status overrides the file field. <span class="text-ink-500">Assumed.</span></li>
+      <li class="text-ok">Board item is called an issue. Confirmed.</li></ul></div>
+    <div class="card p-4"><div class="slabel mb-2">guardrails</div><ul class="space-y-2 text-secondary">
+      <li><span class="text-ink-100">Stay small.</span> Needing rich queries, several human users or multi-host sync means adopt a real tracker.</li>
+      <li><span class="text-ink-100">One write path.</span> Agents write notes and use the CLI for issue folders.</li>
+      <li><span class="text-ink-100">The UI is optional.</span> Files and CLI work with the process down.</li></ul></div>
+  </aside>
+  </div>
+</main>
+</div></div>
+
+<!-- DRAWER -->
+<div id="scrim" class="hidden fixed inset-0 bg-ink-950/70 z-20"></div>
+<aside id="drawer" class="drawer fixed top-0 right-0 h-full w-full sm:w-[34rem] bg-ink-875 border-l border-ink-700 z-30 translate-x-full flex flex-col" aria-label="Task detail"></aside>
+<div id="toast" class="hidden fixed bottom-5 left-1/2 -translate-x-1/2 z-40 card px-4 py-2.5 num text-label text-ink-200 shadow-2xl shadow-black/60"></div>
+
+<script>
+const COLS=[['backlog','Backlog'],['ready','Ready'],['doing','Doing',3],['review','Review'],['done','Done']];
+const PROJECTS=[{k:'all',n:'All projects'},{k:'cadence',n:'cadence',p:'CAD'},{k:'sportslog',n:'sportslog',p:'SPL'},{k:'ops',n:'ops',p:'OPS'}];
+const T=[
+ {id:'CAD-30',p:'cadence',s:'doing',pr:'P1',t:'claude provider',container:1,deps:[]},
+ {id:'CAD-16',p:'cadence',s:'doing',pr:'P1',t:'claude provider: managed stream-json endpoint',o:'cookie-cesium',busy:1,parent:'CAD-30',comp:'adapter',deps:['CAD-12','CAD-14'],relates:['CAD-18'],derived:1,nc:3,
+  checks:[1,4],refs:[['pr','PR #16','https://github.com/favcrm/cadence/pull/16'],['note','kickoff · claude-managed'],['note','review kickoff · PR 16']],files:[['turn1.jsonl','1.2 KB'],['denied.jsonl','2.9 KB'],['scratch-smoke.txt','4.1 KB']],
+  chain:[['kickoff','16:01','cadence-claude-managed'],['qa','17:15','claude-managed qa · PR #16 @ 0653fd6'],['kickoff','17:26','review: 1 blocking, 4 smaller']],
+  comments:[['cookie-cesium','16:48','Observed on the real CLI: <code>system/init</code> only arrives with the first turn, so the session check moved into <code>run_turn</code>.'],
+            ['fable-cc','17:24','Review: the 600 s turn deadline is fixed. A real implementation turn runs far longer, so this fences healthy work. Details in the review kickoff.'],
+            ['operator','17:31','Agreed. Activity-based liveness, default 15 min idle.']]},
+ {id:'CAD-17',p:'cadence',s:'backlog',pr:'P1',t:'claude provider: pty TUI endpoint with Stop-hook reporting',parent:'CAD-30',deps:['CAD-16'],blocked:1,nc:1},
+ {id:'CAD-19',p:'cadence',s:'backlog',pr:'P2',t:'Broker approvals via the permission prompt tool',parent:'CAD-30',deps:['CAD-16'],blocked:1},
+ {id:'CAD-22',p:'cadence',s:'doing',pr:'P2',t:'Internal board: issue folders + cadence ui',o:'operator',deps:[],nc:2,files:[['board-mock-v4.html','38 KB']],refs:[['preview','plan + mock','/20260917-164658/cadence-board-plan/']]},
+ {id:'CAD-18',p:'cadence',s:'ready',pr:'P1',t:'devin --bypass, or an allowlist written into the worktree',deps:[]},
+ {id:'CAD-20',p:'cadence',s:'ready',pr:'P1',t:'Launch must not write into the cwd repo (N8)',deps:[]},
+ {id:'CAD-21',p:'cadence',s:'ready',pr:'P2',t:'Settle agent unfence default: resume or stay stopped',deps:['CAD-14']},
+ {id:'CAD-26',p:'cadence',s:'ready',pr:'P1',t:'M3a: jobs, tasks and verdicts in the daemon',deps:['CAD-16'],relates:['CAD-22'],nc:1},
+ {id:'CAD-23',p:'cadence',s:'backlog',pr:'P2',t:'message result text truncated on long single lines',deps:[]},
+ {id:'CAD-24',p:'cadence',s:'backlog',pr:'P3',t:'dead flag is misleading for non-pty kinds (N5)',deps:[]},
+ {id:'CAD-25',p:'cadence',s:'backlog',pr:'P3',t:'Cancel or requeue a queued message (G4)',deps:[]},
+ {id:'CAD-14',p:'cadence',s:'done',pr:'P0',t:'Fence recovery: reconcile, unfence, restart skips fenced',o:'cookie-cesium',prn:15,derived:1,deps:['CAD-12'],nc:2,refs:[['pr','PR #15','https://github.com/favcrm/cadence/pull/15'],['commit','cb3e9cc']],
+  chain:[['kickoff','12:19','cadence-fence-recovery'],['qa','15:00','fence-recovery qa'],['kickoff','15:05','review: 1 blocking, 2 should-fix'],['qa','15:33','fixes qa'],['verdict','15:41','pass']]},
+ {id:'CAD-12',p:'cadence',s:'done',pr:'P0',t:'Inbox endpoint + verified auto-ready for pty',o:'cookie-cesium',prn:14,derived:1,deps:['CAD-9'],nc:4,refs:[['pr','PR #14','https://github.com/favcrm/cadence/pull/14'],['commit','804c821']],
+  chain:[['kickoff','05:55','cadence-inbox-autoready'],['qa','08:14','inbox-autoready qa'],['kickoff','08:27','review round 1'],['qa','09:59','fixes qa'],['kickoff','10:05','probe regression'],['qa','10:19','probe-fix qa'],['verdict','10:24','pass']]},
+ {id:'CAD-9',p:'cadence',s:'done',pr:'P1',t:'Independent QA audit of main @ e663778',o:'qa-audit-319f2',derived:1,deps:[],chain:[['kickoff','03:22','cadence-qa-audit-v2'],['verdict','04:57','ship with known defects']]},
+ {id:'CAD-11',p:'cadence',s:'review',pr:'P1',t:'M3 jobs and tasks design',o:'devin-056801',derived:1,deps:[],files:[['cadence-JOBS.md','31 KB']],chain:[['kickoff','02:07','m-m3-design-2'],['qa','12:15','design result routed to PM']]},
+ {id:'SPL-4',p:'sportslog',s:'review',pr:'P1',t:'Friend add lands in Friends, leaves Matching, keeps the room',o:'devin',comp:'app',derived:1,deps:[],chain:[['kickoff','06:46','friend-add-lands-in-friends'],['qa','07:26','128/128 matching tests, not pushed']]},
+ {id:'SPL-5',p:'sportslog',s:'backlog',pr:'P2',t:'Re-match path for friends whose match expired',comp:'app',deps:['SPL-4'],blocked:1},
+ {id:'SPL-2',p:'sportslog',s:'ready',pr:'P2',t:'Prod D1 migrations 0019 and 0020',comp:'api',deps:[]},
+ {id:'OPS-3',p:'ops',s:'ready',pr:'P2',t:'Gateway vhost for cadence.localhost',deps:[],relates:['CAD-22']},
+];
+const AGENTS=[{a:'cookie-cesium',st:'busy',on:'CAD-16'},{a:'devin-056801',st:'idle'},{a:'qa-audit-319f2',st:'stopped'},{a:'iridescent-zone',st:'idle'},{a:'devin-32ca9f',st:'idle'}];
+const API=[['GET','/api/projects','folders, prefixes, counts',1],['GET','/api/issues?project=','parsed frontmatter, derived status, counts',1],['GET','/api/issues/:id','issue body, links both ways, refs, file list, activity',1],['GET','/api/agents','agent list, running and unknown counts',1],['GET','/api/stream','server-sent change events',3],['POST','/api/issues','create an issue folder',2],['PATCH','/api/issues/:id','status, priority, owner, links only',2],['POST','/api/issues/:id/comments','add one comment file',2],['POST','/api/issues/:id/artifacts','upload under the size cap',2],['GET','/api/issues/:id/artifacts/:name','basename only, inside that folder, active types as download',2]];
+const ITERS=[['I1','~2 d','Read-only board','Issue folders, parser, lint, cadence issue CLI for all writes, cadence ui with the four GET routes, board plus drawer, seed ~/pm, gateway vhost.'],['I2','~1.5 d','Write path','Drag to change status, quick-add, comment, attach, edit links. Derived cards refuse manual moves. Constrained artifact read.'],['I3','~1 d','Agents','Event stream, busy marker on the active card, fence and parked-delivery alerts with the recovery command.'],['I4','~1 d','Loops','A notes chain as a timeline: kickoff, QA, review rounds, verdict, PR and head SHA.'],['later','token','Dispatch from a card','First feature that acts rather than views. Waits for auth.']];
+const PCH={P0:'bg-warn/10 text-warn',P1:'bg-ink-800 text-ink-200',P2:'bg-ink-800 text-ink-400',P3:'bg-ink-800 text-ink-500'};
+const SDOT={busy:'bg-info',idle:'bg-ok',stopped:'bg-ink-600',attention:'bg-fail'};
+const CDOT={backlog:'bg-ink-600',ready:'bg-ink-400',doing:'bg-info',review:'bg-warn',done:'bg-ok'};
+const NCH={kickoff:'bg-info/10 text-info',qa:'bg-warn/10 text-warn',verdict:'bg-ok/10 text-ok'};
+let proj='all',q=''; const $=s=>document.querySelector(s);
+const visible=()=>T.filter(t=>!t.container&&(proj==='all'||t.p===proj)&&(!q||(t.id+t.t+(t.o||'')).toLowerCase().includes(q)));
+
+function render(){
+  $('#projects').innerHTML=PROJECTS.map(p=>{const L=T.filter(t=>!t.container); const n=p.k==='all'?L.length:L.filter(t=>t.p===p.k).length;
+    return `<button data-p="${p.k}" class="proj ${proj===p.k?'on':''}"><span class="truncate">${p.n}</span><span class="num text-micro text-ink-500">${p.p?p.p+' ':''}${n}</span></button>`}).join('');
+  const v=visible(); $('#board-title').textContent=PROJECTS.find(p=>p.k===proj).n;
+  $('#board-count').textContent=`${v.length} issues · ${v.filter(t=>t.blocked).length} blocked · ${v.filter(t=>t.derived).length} derived`;
+  $('#cols').innerHTML=COLS.map(([k,name,wip],ci)=>{const cs=v.filter(t=>t.s===k);
+    return `<section class="col rounded-lg border border-ink-700 bg-ink-875 min-h-[26rem] flex flex-col reveal" style="animation-delay:${120+ci*45}ms" data-col="${k}">
+      <header class="lg:sticky lg:top-[2.85rem] z-[5] flex items-center gap-2 px-3.5 h-10 border-b border-ink-700 shrink-0 bg-ink-875 rounded-t-lg"><i class="w-1.5 h-1.5 rounded-full ${CDOT[k]}"></i><h2 class="text-secondary font-semibold text-ink-100">${name}</h2><span class="kicker num">${cs.length}${wip?' of '+wip+' wip':''}</span></header>
+      <div class="p-2.5 space-y-2.5 flex-1">${cs.map(card).join('')||'<p class="kicker px-1 py-2">empty</p>'}</div></section>`}).join('');
+  const act=AGENTS.filter(x=>x.st==='busy'||x.st==='attention'), cnt=st=>AGENTS.filter(x=>x.st===st).length;
+  $('#agents').innerHTML=act.map(x=>`<span class="chip bg-ink-800 !py-[.15rem] text-ink-300"><i class="w-1.5 h-1.5 rounded-full ${SDOT[x.st]}"></i>${x.a}<span class="text-ink-500">${x.st}</span>${x.on?`<button class="lnk" data-open="${x.on}">${x.on}</button>`:''}</span>`).join('')
+    +['idle','stopped'].filter(cnt).map(st=>`<span class="chip bg-ink-800 !py-[.15rem] text-ink-400" title="${AGENTS.filter(x=>x.st===st).map(x=>x.a).join(', ')}"><i class="w-1.5 h-1.5 rounded-full ${SDOT[st]}"></i><span class="num text-ink-200">${cnt(st)}</span>${st}</span>`).join('');
+  $('#api').innerHTML=API.map(r=>`<tr class="hover:bg-ink-850"><td class="px-3.5 py-2.5 num text-ink-400">${r[0]}</td><td class="px-3.5 py-2.5 num text-ink-100">${r[1]}</td><td class="px-3.5 py-2.5 text-ink-300">${r[2]}</td><td class="px-3.5 py-2.5 num text-right text-ink-400">I${r[3]}</td></tr>`).join('');
+  $('#iters').innerHTML=ITERS.map(i=>`<li class="px-4 py-3"><div class="flex items-baseline gap-2"><span class="num text-label text-ink-100 w-9">${i[0]}</span><span class="text-secondary text-ink-100 font-medium">${i[2]}</span><span class="ml-auto kicker num">${i[1]}</span></div><p class="text-label text-ink-400 mt-1 pl-11 leading-[1.5]">${i[3]}</p></li>`).join('');
+}
+function card(t){
+  const na=(t.files||[]).length+(t.refs||[]).length;
+  const meta=[t.o?`<span class="inline-flex items-center gap-1.5 text-ink-400">${t.busy?'<i class="w-1.5 h-1.5 rounded-full bg-info"></i>':''}${t.o}</span>`:'',t.prn?`<span>PR #${t.prn}</span>`:'',
+    t.checks?`<span title="checklist">${t.checks[0]}/${t.checks[1]} done</span>`:'',t.nc?`<span title="comments">${t.nc} cmt</span>`:'',na?`<span title="artifacts">${na} art</span>`:''].filter(Boolean).join('');
+  const deps=t.deps&&t.deps.length?`<div class="mt-1.5 num text-micro ${t.blocked?'text-warn/80':'text-ink-500'}">${t.blocked?'waits on':'after'} ${t.deps.join(' · ')}</div>`:'';
+  return `<article draggable="true" tabindex="0" role="button" aria-label="${t.id} ${t.t}" data-id="${t.id}" class="card tcard p-3 ${t.s==='done'?'opacity-70':''}">
+  <div class="flex items-center gap-1.5 flex-wrap"><span class="num text-label text-ink-100 font-medium">${t.id}</span><span class="chip ${PCH[t.pr]}">${t.pr}</span>
+   ${t.derived?'<span class="chip bg-info/10 text-info" title="status derived, not set by hand">derived</span>':''}${t.comp?`<span class="chip bg-ink-800 text-ink-500">${t.comp}</span>`:''}${t.blocked?'<span class="chip bg-warn/10 text-warn ml-auto">blocked</span>':''}</div>
+  <h3 class="mt-2 text-secondary text-ink-200 leading-[1.45]">${t.t}</h3>
+  ${t.parent?`<div class="mt-1.5 num text-micro text-ink-500">in ${t.parent} · ${T.find(x=>x.id===t.parent).t}</div>`:''}
+  ${meta?`<div class="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 num text-micro text-ink-500">${meta}</div>`:''}${deps}</article>`}
+
+function openDrawer(id){const t=T.find(x=>x.id===id); if(!t)return;
+  const blocks=T.filter(x=>(x.deps||[]).includes(t.id)), kids=T.filter(x=>x.parent===t.id);
+  const fm=`<span class="text-ink-500">---</span>\nid: ${t.id}\ntitle: ${t.t}\nstatus: ${t.s}${t.derived||t.container?'   <span class="text-ink-500"># '+(t.container?'roll-up of children':'derived')+'</span>':''}\npriority: ${t.pr}${t.o?'\nowner: '+t.o:''}${t.comp?'\ncomponent: '+t.comp:''}${t.parent?'\nparent: '+t.parent:''}${(t.deps||[]).length?'\nblocked_by: ['+t.deps.join(', ')+']':''}${(t.relates||[]).length?'\nrelates: ['+t.relates.join(', ')+']':''}${(t.refs||[]).filter(r=>r[2]).map((r,i)=>(i?'':'\nrefs:')+'\n  - {kind: '+r[0]+', '+(r[0]==='preview'?'path':'url')+': '+r[2]+'}').join('')}\n<span class="text-ink-500">---</span>${t.checks?'\n- [x] observe and pin stream-json fixtures\n- [ ] activity-based turn liveness\n- [ ] env scrub by rule\n- [ ] re-review and verdict':''}`;
+  const row=(x,label)=>`<li class="flex items-center gap-2.5 px-3 py-2.5"><span class="chip bg-ink-800 text-ink-400 w-[5.4rem] justify-center shrink-0 whitespace-nowrap">${label}</span><button data-open="${x.id}" class="lnk num text-label shrink-0 whitespace-nowrap">${x.id}</button><span class="text-secondary text-ink-400 truncate min-w-0">${x.t}</span><span class="chip ml-auto shrink-0 ${x.s==='done'?'bg-ok/10 text-ok':'bg-ink-800 text-ink-400'}">${x.s}</span></li>`;
+  const get=i=>T.find(y=>y.id===i);
+  const links=[...(t.parent?[row(get(t.parent),'parent')]:[]),...kids.map(x=>row(x,'child')),...(t.deps||[]).map(i=>row(get(i),'blocked by')),...blocks.map(x=>row(x,'blocks')),...(t.relates||[]).map(i=>row(get(i),'relates'))];
+  const act=[...(t.chain||[]).map(c=>({at:c[1],h:`<span class="chip ${NCH[c[0]]}">${c[0]}</span><span class="num text-micro text-ink-500">${c[1]} UTC · agent-notes</span>`,b:`<div class="text-secondary text-ink-300 mt-1">${c[2]}</div>`})),
+    ...(t.comments||[]).map(c=>({at:c[1],h:`<span class="chip bg-ink-800 text-ink-200">${c[0]}</span><span class="num text-micro text-ink-500">${c[1]} UTC · comment</span>`,b:`<div class="md text-secondary text-ink-300 mt-1 leading-[1.5]">${c[2]}</div>`}))].sort((x,y)=>x.at.localeCompare(y.at));
+  const last=t.chain&&t.chain[t.chain.length-1];
+  $('#drawer').innerHTML=`
+   <header class="px-5 pt-4 pb-4 border-b border-ink-700 flex items-start gap-3 shrink-0"><div class="min-w-0"><div class="num text-label text-ink-500">${t.id} · ${t.p}${t.comp?' / '+t.comp:''} · ${t.s}${t.blocked?' · blocked':''}${t.container?' · container':''}</div>
+     <h2 class="text-drawer font-semibold text-ink-100 leading-tight mt-1">${t.t}</h2></div>
+     <button id="close" aria-label="Close" class="closebtn ml-auto shrink-0 w-8 h-8 grid place-items-center rounded border border-ink-600 text-ink-300 bg-ink-850"><svg width="12" height="12" viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.5" fill="none" style="pointer-events:none"><path d="M2 2l8 8M10 2l-8 8"/></svg></button></header>
+   <div class="flex-1 overflow-y-auto px-5 py-5 space-y-6">
+    <section><div class="flex items-baseline gap-2 mb-2"><h3 class="text-cardtitle font-semibold text-ink-100">Issue file</h3><span class="kicker">the source of truth</span></div>
+      <div class="num text-micro text-ink-400 mb-2 break-all">~/pm/${t.p}/${t.id}/issue.md</div>
+      <pre class="num text-label leading-relaxed rounded-lg border border-ink-700 bg-ink-900 p-4 text-ink-300 !whitespace-pre overflow-x-auto">${fm}</pre></section>
+    <section><div class="flex items-baseline gap-2 mb-2"><h3 class="text-cardtitle font-semibold text-ink-100">Links</h3><span class="kicker num">${links.length} · inverses are computed</span></div>
+      ${links.length?`<ul class="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">${links.join('')}</ul>`:'<p class="text-secondary text-ink-500">None.</p>'}</section>
+    <section><div class="flex items-baseline gap-2 mb-2"><h3 class="text-cardtitle font-semibold text-ink-100">Artifacts</h3><span class="kicker num">${(t.refs||[]).length} refs · ${(t.files||[]).length} files</span></div>
+      ${(t.refs||[]).length?`<div class="flex flex-wrap gap-1.5 mb-2">${t.refs.map(r=>`<span class="chip bg-ink-800 text-ink-300 !py-[.2rem]"><span class="text-ink-500">${r[0]}</span><button class="lnk">${r[1]}</button></span>`).join('')}</div>`:''}
+      ${(t.files||[]).length?`<ul class="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">${t.files.map(f=>`<li class="flex items-center gap-3 px-3 py-2"><span class="num text-label text-ink-200">artifacts/${f[0]}</span><span class="num text-micro text-ink-500 ml-auto">${f[1]}</span></li>`).join('')}</ul>`:''}
+      ${!(t.refs||[]).length&&!(t.files||[]).length?'<p class="text-secondary text-ink-500">None.</p>':''}</section>
+    <section><div class="flex items-baseline gap-2 mb-2"><h3 class="text-cardtitle font-semibold text-ink-100">Activity</h3><span class="kicker">notes, comments &amp; file history, merged</span></div>
+      ${act.length?`<ol class="relative ml-1 border-l border-ink-700 space-y-3.5">${act.map(e=>`<li class="pl-4 relative"><i class="absolute -left-[3.5px] top-[7px] w-1.5 h-1.5 rounded-full bg-ink-500"></i><div class="flex items-center gap-2">${e.h}</div>${e.b}</li>`).join('')}</ol>`:'<p class="text-secondary text-ink-500">Nothing yet.</p>'}
+      ${last?`<p class="text-label text-ink-500 mt-3 leading-[1.5]">Latest tagged note is a ${last[0]}, so the board shows <span class="text-ink-200">${t.s}</span>. Once M3 ships, status comes from the job state instead.</p>`:''}
+      ${t.container?'<p class="text-label text-ink-500 mt-3 leading-[1.5]">A container is never dispatched. Its status rolls up from its children.</p>':''}</section>
+    <section><div class="flex items-baseline gap-2 mb-2"><h3 class="text-cardtitle font-semibold text-ink-100">Sessions</h3><span class="kicker">derived from the daemon</span></div>
+      ${t.busy?`<ul class="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850"><li class="flex items-center gap-2.5 px-3 py-2.5"><i class="w-1.5 h-1.5 rounded-full bg-info"></i><span class="num text-label text-ink-200">cookie-cesium</span><span class="num text-micro text-ink-500">devin · m-pr16-review · running</span><span class="num text-micro text-ink-500 ml-auto">devin -r cookie-cesium</span></li></ul>`:'<p class="text-secondary text-ink-500">No live session. The issue file never stores sessions.</p>'}</section>
+   </div>
+   <footer class="shrink-0 border-t border-ink-700 px-5 py-3 flex items-center gap-3 bg-ink-875"><span class="text-label text-ink-500 leading-[1.4]">Read-only in iteration 1. Comment, attach and edit arrive in I2. Dispatch waits for a token.</span>
+     <div class="ml-auto flex gap-2 shrink-0"><button disabled class="h-9 px-3 rounded border border-ink-600 text-secondary text-ink-300 opacity-45 cursor-not-allowed">Comment</button><button disabled class="h-9 px-3 rounded bg-accent text-ink-950 text-secondary font-medium opacity-40 cursor-not-allowed">Kick off</button></div></footer>`;
+  $('#drawer').classList.remove('translate-x-full'); $('#scrim').classList.remove('hidden')}
+function closeDrawer(){$('#drawer').classList.add('translate-x-full'); $('#scrim').classList.add('hidden')}
+function toast(m){const e=$('#toast'); e.textContent=m; e.classList.remove('hidden'); clearTimeout(toast.t); toast.t=setTimeout(()=>e.classList.add('hidden'),3400)}
+document.addEventListener('click',e=>{
+  const tab=e.target.closest('.tab'); if(tab){e.preventDefault(); const k=tab.dataset.tab; document.querySelectorAll('.navlink.tab').forEach(b=>b.dataset.tab===k?b.setAttribute('aria-current','page'):b.removeAttribute('aria-current'));
+    $('#tab-board').classList.toggle('hidden',k!=='board'); $('#tab-plan').classList.toggle('hidden',k!=='plan'); $('#crumb').textContent=k; window.scrollTo(0,0); return}
+  const p=e.target.closest('[data-p]'); if(p){proj=p.dataset.p; render(); return}
+  const o=e.target.closest('[data-open]'); if(o){openDrawer(o.dataset.open); return}
+  if(e.target.closest('#close')||e.target.id==='scrim'){closeDrawer(); return}
+  const c=e.target.closest('.tcard'); if(c) openDrawer(c.dataset.id)});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDrawer(); if((e.key==='Enter'||e.key===' ')&&e.target.classList&&e.target.classList.contains('tcard')){e.preventDefault(); openDrawer(e.target.dataset.id)}});
+$('#q').addEventListener('input',e=>{q=e.target.value.toLowerCase(); render()});
+let drag=null;
+document.addEventListener('dragstart',e=>{const c=e.target.closest('.tcard'); if(c){drag=c.dataset.id; c.classList.add('dragging')}});
+document.addEventListener('dragend',()=>{drag=null; document.querySelectorAll('.over,.dragging').forEach(x=>x.classList.remove('over','dragging'))});
+document.addEventListener('dragover',e=>{const col=e.target.closest('.col'); if(col&&drag){e.preventDefault(); document.querySelectorAll('.over').forEach(x=>x.classList.remove('over')); col.classList.add('over')}});
+document.addEventListener('drop',e=>{const col=e.target.closest('.col'); if(!col||!drag)return; e.preventDefault(); const t=T.find(x=>x.id===drag);
+  if(t.derived) toast(`${t.id} has a derived status. Manual move refused.`);
+  else if(t.blocked&&col.dataset.col!=='backlog') toast(`${t.id} waits on ${t.deps.join(', ')}. Finish those first.`);
+  else {t.s=col.dataset.col; toast(`PATCH /api/issues/${t.id}  {"status":"${t.s}"}  · mock, not persisted`)} render()});
+render();
+</script>
+</body>
+</html>

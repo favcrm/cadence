@@ -350,6 +350,17 @@ enum Commands {
         #[arg(long)]
         follow: bool,
     },
+    /// The issue board: folders under the PM dir (`~/pm` or
+    /// `CADENCE_PM_DIR`); this CLI is the only writer.
+    Issue {
+        #[command(subcommand)]
+        action: cadence_agent::issue::cli::IssueAction,
+    },
+    /// The read-only board UI + JSON API on loopback.
+    Ui {
+        #[command(subcommand)]
+        action: cadence_agent::ui::UiAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1682,6 +1693,8 @@ fn run() -> Result<i32> {
                 }
             }
         }
+        Commands::Issue { action } => cadence_agent::issue::cli::run(&action),
+        Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
     }
 }
 
