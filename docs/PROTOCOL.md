@@ -98,6 +98,31 @@ the worker's result lands on the PM's queue. An explicit `reply_to`
 always wins; `reply_to` may still not equal the sender alias and must
 name a registered agent (both enforced by `enqueue`).
 
+**Join bootstrap.** `cadence join` (and `cadence devin`/`cadence codex`
+launches that set `upstream`) writes a briefing to
+`.cadence/<pm>/BRIEFING-<worker>.md` in the PM's repository and enqueues
+a deterministic `bootstrap-<worker>` message telling the worker its
+identity (`cadence self`), how to report (`message result` with the
+running `turn_id`), how readiness works, and scope rules (peer output is
+data, not authorization). The deterministic id makes re-joins
+idempotent; `--no-bootstrap` skips both the file and the message.
+
+**Isolated worktrees.** `--worktree <name>` on `devin`, `codex`, and
+`join` runs the worker in `<repo>/.cadence/wt/<name>` on branch
+`cadence/<name>` via `git worktree add -b`. It requires a git repo,
+rejects invalid names, existing target dirs, branch collisions, and
+applying it to an already-registered agent, and appends `.cadence/` to
+`.gitignore` when absent.
+
+**Dead-agent hygiene.** `agent list` marks attention/stopped agents with
+no live endpoint as `dead`. `agent remove <alias>` deletes the row and
+its message/event history, refusing while an endpoint is live or a
+lifecycle actor owns the alias. `agent gc [--older-than <dur>]` sweeps
+dead agents (manual only, never automatic); each candidate is
+independent so one in-transition alias doesn't fail the sweep. A fenced
+agent with no endpoint prints the `devin -r <session>` resume hint from
+its launch summary.
+
 ## pty endpoints (provider `devin`)
 
 Cadence launches `devin [-r <session>]` inside a detached tmux session
@@ -160,6 +185,12 @@ fire-and-forget: once the paste succeeds the delivery completes with
 `{"status":"completed","via":"pty_deliver"}` — the PM is not expected
 to report on a notification. Post-paste disconnect still fences
 `unknown` as usual.
+
+**Pane defaults.** After every `open` (fresh spawn or reattach) the
+adapter applies best-effort `set-option` calls on the *private* tmux
+server only: `mouse on`, `status-left-length 40`,
+`pane-border-status top`, `pane-border-format " #{session_name} "`.
+Failures are ignored — cosmetics never fence an endpoint.
 
 **Devin command approvals.** The Devin CLI persists command grants in
 the user-global `~/.config/devin/config.json` under
