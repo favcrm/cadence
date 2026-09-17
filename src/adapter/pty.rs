@@ -411,6 +411,20 @@ impl ProviderAdapter for DevinPtyAdapter {
             (native, pane_pid)
         };
 
+        // Pane defaults for cadence-owned sessions, scoped to this
+        // private tmux server — `-g`/`-gw` here never touch the user's
+        // own tmux. Best effort: a cosmetic failure must not fence a
+        // working endpoint.
+        let _ = self.tmux_ok(&["set-option", "-g", "mouse", "on"]);
+        let _ = self.tmux_ok(&["set-option", "-g", "status-left-length", "40"]);
+        let _ = self.tmux_ok(&["set-option", "-gw", "pane-border-status", "top"]);
+        let _ = self.tmux_ok(&[
+            "set-option",
+            "-gw",
+            "pane-border-format",
+            " #{session_name} ",
+        ]);
+
         let endpoint = format!("tmux://{}/{session}", self.socket);
         {
             let mut s = self.state.lock().unwrap();

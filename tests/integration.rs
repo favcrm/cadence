@@ -1761,6 +1761,11 @@ if cmd == "send-keys":
     with open(sess_path(name, "input"), "a") as f:
         f.write("<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
     sys.exit(0)
+if cmd == "set-option":
+    # Record option writes so tests can assert pane defaults.
+    with open(os.path.join(state, "setopt.log"), "a") as f:
+        f.write(" ".join(rest) + "\n")
+    sys.exit(0)
 if cmd == "kill-session":
     name = rest[rest.index("-t") + 1]
     pid = sess_pid(name)
@@ -2483,4 +2488,401 @@ fn message_send_ready_claims_then_sends() {
         String::from_utf8_lossy(&out.stderr)
     );
     d.wait_message("w1", "m10", &["completed"], 15);
+}
+
+/// `git init` + one empty commit so `worktree add -b` has a HEAD.
+fn git_repo(path: &Path) {
+    std::fs::create_dir_all(path).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+    }
+}
+
+#[test]
+fn pty_pane_gets_default_options() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    // Pane defaults are scoped to the private -L socket's server.
+    let path = d.pane_file(&mock, "setopt", "log");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let log = loop {
+        if let Ok(log) = std::fs::read_to_string(&path) {
+            if log.contains("pane-border-format") {
+                break log;
+            }
+        }
+        assert!(Instant::now() < deadline, "no set-option calls recorded");
+        thread::sleep(Duration::from_millis(50));
+    };
+    for want in [
+        "-g mouse on",
+        "-g status-left-length 40",
+        "-gw pane-border-status top",
+        "-gw pane-border-format  #{session_name} ",
+    ] {
+        assert!(log.contains(want), "missing `{want}` in:\n{log}");
+    }
+}
+
+#[test]
+fn join_bootstrap_briefs_and_queues() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    // The PM's cwd is a git repo so the briefing exercises .gitignore.
+    let pm_repo = d.dir.path().join("pmrepo");
+    git_repo(&pm_repo);
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": pm_repo}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 10);
+
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["join", "pm", "devin", "--alias", "w-join", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("w-join", "idle", 20);
+
+    // Briefing persisted under the PM's .cadence/<pm>/ and the repo's
+    // .gitignore covers .cadence/.
+    let briefing = pm_repo
+        .join(".cadence")
+        .join("pm")
+        .join("BRIEFING-w-join.md");
+    let text = std::fs::read_to_string(&briefing).unwrap();
+    assert!(text.contains("w-join") && text.contains("pm"), "{text}");
+    let gitignore = std::fs::read_to_string(pm_repo.join(".gitignore")).unwrap();
+    assert!(
+        gitignore.lines().any(|l| l.trim() == ".cadence/"),
+        "{gitignore}"
+    );
+
+    // The durable bootstrap message sits queued behind the ready gate —
+    // no bypass — and its body is one pty-safe line naming alias, PM
+    // and the briefing path.
+    let m = d.wait_message("w-join", "bootstrap-w-join", &["queued", "submitting"], 15);
+    assert_eq!(m["source"], "bootstrap");
+    let body = m["body"].as_str().unwrap();
+    assert!(!body.chars().any(|c| (c as u32) < 32 || c as u32 == 127));
+    for want in ["w-join", "pm", briefing.to_str().unwrap(), "cadence self"] {
+        assert!(body.contains(want), "bootstrap body missing {want}: {body}");
+    }
+    thread::sleep(Duration::from_millis(400));
+    let mid = d.message_state("w-join", "bootstrap-w-join");
+    assert!(matches!(mid.as_str(), "queued" | "submitting"), "{mid}");
+    // A claim releases it — gated like any send, never bypassed.
+    d.rpc("agent_ready", json!({"alias": "w-join"})).unwrap();
+    pty_token(&d, "w-join", "bootstrap-w-join");
+
+    // --no-bootstrap: no message, no briefing file.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "join",
+            "pm",
+            "devin",
+            "--alias",
+            "w-nb",
+            "--detach",
+            "--no-bootstrap",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("w-nb", "idle", 20);
+    let show = d.rpc("agent_show", json!({"alias": "w-nb"})).unwrap();
+    assert!(
+        !show["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["source"] == "bootstrap"),
+        "{}",
+        show["messages"]
+    );
+    assert!(!pm_repo.join(".cadence/pm/BRIEFING-w-nb.md").exists());
+}
+
+#[test]
+fn join_bootstrap_runs_on_fake_worker() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["join", "pm", "fake", "--alias", "w-fake", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("w-fake", "idle", 15);
+    // No gate on a fake endpoint — the bootstrap completes its turn.
+    let m = d.wait_message("w-fake", "bootstrap-w-fake", &["completed"], 15);
+    assert_eq!(m["source"], "bootstrap");
+    // The briefing still lands in the PM's .cadence/ (PM cwd = tempdir).
+    assert!(d.dir.path().join(".cadence/pm/BRIEFING-w-fake.md").exists());
+}
+
+#[test]
+fn devin_worktree_isolates_checkout() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    let repo = d.dir.path().join("repo");
+    git_repo(&repo);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "devin",
+            "--worktree",
+            "feat-a",
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--alias",
+            "w-wt",
+            "--detach",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let agent = d.wait_agent("w-wt", "idle", 20);
+    let wt = repo.join(".cadence").join("wt").join("feat-a");
+    assert_eq!(agent["cwd"].as_str().unwrap(), wt.to_str().unwrap());
+    // Branch created, .cadence/ ignored.
+    let branches = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "--list", "cadence/feat-a"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&branches.stdout).contains("cadence/feat-a"));
+    let gitignore = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
+    assert!(gitignore.lines().any(|l| l.trim() == ".cadence/"));
+
+    // Same alias + --worktree: clean refusal before touching anything.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "devin",
+            "--worktree",
+            "feat-b",
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--alias",
+            "w-wt",
+            "--detach",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already registered"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Occupied worktree dir with a fresh alias: reuse hint.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "devin",
+            "--worktree",
+            "feat-a",
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--alias",
+            "w-wt2",
+            "--detach",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already exists"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Not a git repository: clean rejection, nothing created.
+    let plain = d.dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "devin",
+            "--worktree",
+            "x",
+            "--cwd",
+            plain.to_str().unwrap(),
+            "--alias",
+            "w-ng",
+            "--detach",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("git repository"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn agent_remove_and_gc_sweep() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.register("w-old");
+    d.register("w-recent");
+    d.wait_agent("dv1", "idle", 20);
+    d.wait_agent("w-old", "idle", 10);
+    d.wait_agent("w-recent", "idle", 10);
+
+    // Refused while the endpoint is live — suggests agent stop.
+    let err = d.rpc("agent_remove", json!({"alias": "dv1"})).unwrap_err();
+    assert!(err.to_string().contains("agent stop"), "{err}");
+
+    // Fake agents have no endpoint but are actor-owned while running.
+    let err = d
+        .rpc("agent_remove", json!({"alias": "w-old"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("agent stop"), "{err}");
+
+    // Stopped agents are dead: endpoint NULL shows in `agent list`.
+    d.rpc("agent_stop", json!({"alias": "w-old"})).unwrap();
+    d.rpc("agent_stop", json!({"alias": "w-recent"})).unwrap();
+    d.wait_agent("w-old", "stopped", 15);
+    d.wait_agent("w-recent", "stopped", 15);
+    let list = d.rpc("agent_list", json!({})).unwrap();
+    let w_old = list["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "w-old")
+        .unwrap();
+    assert_eq!(w_old["dead"], true, "{w_old}");
+    assert!(w_old["endpoint"].is_null());
+    let live = list["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "dv1")
+        .unwrap();
+    assert_eq!(live["dead"], false, "{live}");
+
+    // Explicit remove drops the row and its history.
+    d.rpc("agent_remove", json!({"alias": "w-old"})).unwrap();
+    assert!(d.rpc("agent_show", json!({"alias": "w-old"})).is_err());
+
+    // gc --older-than filters by `updated` age: both were just stopped.
+    let swept = d.rpc("agent_gc", json!({"older_than": 3600.0})).unwrap();
+    assert_eq!(swept["removed"].as_array().unwrap().len(), 0);
+    // Default sweep removes every dead stopped/attention agent.
+    let swept = d.rpc("agent_gc", json!({})).unwrap();
+    let removed: Vec<&str> = swept["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(removed, vec!["w-recent"], "{swept}");
+    // The live pty agent was untouched.
+    d.rpc("agent_show", json!({"alias": "dv1"})).unwrap();
+}
+
+#[test]
+fn fenced_agent_resume_hint() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let native = agent["thread_id"].as_str().unwrap().to_string();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    pty_token(&d, "dv1", "m1");
+    // Fence it: pane dies with a submitted message in flight.
+    let pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    unsafe { libc::killpg(pid, libc::SIGKILL) };
+    let agent = d.wait_agent("dv1", "attention", 20);
+    assert!(agent["endpoint"].is_null());
+
+    // `devin -r <slug>` on the fenced agent must not print attach/ready
+    // steps — the useful next command is `agent resume`.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["devin", "-r", &native, "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["state"], "attention", "{v}");
+    assert_eq!(
+        v["next"]["resume"].as_str().unwrap_or_default(),
+        "cadence agent resume dv1",
+        "{v}"
+    );
+    assert!(v["next"]["attach"].is_null(), "{v}");
 }
