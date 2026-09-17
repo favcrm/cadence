@@ -539,7 +539,7 @@ fn reconcile_interrupted_clears_fence_and_preserves_history() {
 }
 
 #[test]
-fn reconcile_completed_routes_reply_to_interrupted_routes_nothing() {
+fn reconcile_completed_routes_result_interrupted_routes_notice() {
     let d = TestDaemon::start();
     d.register("pm");
     d.register("w1");
@@ -562,37 +562,98 @@ fn reconcile_completed_routes_reply_to_interrupted_routes_nothing() {
     .unwrap();
     d.wait_message("w1", "x1", &["unknown"], 15);
     d.wait_message("w2", "x2", &["unknown"], 15);
-    // completed → the reconciled result routes to pm exactly once.
+    // Each fence routed pm ONE informational notice — plainly not a
+    // result, no reply_to (no loops), deterministic ids distinct from
+    // the result slot a reconcile may still fill.
+    let show = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    let pm_msgs = show["messages"].as_array().unwrap();
+    let notices: Vec<&Value> = pm_msgs
+        .iter()
+        .filter(|m| m["source"] == "worker_notice")
+        .collect();
+    assert_eq!(notices.len(), 2, "one notice per fence: {show}");
+    assert!(pm_msgs.iter().all(|m| m["source"] != "worker_result"));
+    let x1_notice = notices
+        .iter()
+        .find(|m| m["body"].as_str().unwrap().contains("\"x1\""))
+        .expect("x1 fence notice");
+    let body = x1_notice["body"].as_str().unwrap();
+    assert!(body.contains("unknown"), "{body}");
+    assert!(body.contains("fenced"), "{body}");
+    assert!(body.contains("reconcile"), "{body}");
+    assert!(body.contains("not a result"), "{body}");
+    assert!(x1_notice["reply_to"].is_null());
+    // completed → the reconciled result routes to pm exactly once,
+    // under the `cadence-result:` id the notice never touched.
     d.rpc(
         "message_reconcile",
         json!({"message": "x1", "status": "completed",
                "note": "pane showed the answer"}),
     )
     .unwrap();
-    // interrupted → nothing routed — nothing was ever reported.
+    // interrupted → one more notice (the operator closed the turn),
+    // still no result.
     d.rpc(
         "message_reconcile",
         json!({"message": "x2", "status": "interrupted"}),
     )
     .unwrap();
     let show = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
-    let routed: Vec<&Value> = show["messages"]
-        .as_array()
-        .unwrap()
+    let pm_msgs = show["messages"].as_array().unwrap();
+    let results: Vec<&Value> = pm_msgs
         .iter()
         .filter(|m| m["source"] == "worker_result")
         .collect();
-    assert_eq!(routed.len(), 1, "exactly one routed result: {show}");
-    assert!(routed[0]["body"].as_str().unwrap().contains("\"x1\""));
-    assert!(routed[0]["body"]
+    assert_eq!(results.len(), 1, "exactly one routed result: {show}");
+    assert!(results[0]["body"].as_str().unwrap().contains("\"x1\""));
+    assert!(results[0]["body"]
         .as_str()
         .unwrap()
         .contains("operator_reconcile"));
-    // x2 produced no delivery; its routed-routing event is absent.
-    let w2_events = event_kinds(&d, "w2");
-    assert!(!w2_events.iter().any(|k| k == "result_routed"));
+    let notices: Vec<&Value> = pm_msgs
+        .iter()
+        .filter(|m| m["source"] == "worker_notice")
+        .collect();
+    assert_eq!(
+        notices.len(),
+        3,
+        "fence notices + interrupted notice: {show}"
+    );
+    let interrupted = notices
+        .iter()
+        .find(|m| {
+            let b = m["body"].as_str().unwrap();
+            b.contains("\"x2\"") && b.contains("interrupted")
+        })
+        .expect("x2 interrupted notice");
+    assert!(
+        interrupted["body"]
+            .as_str()
+            .unwrap()
+            .contains("operator closed"),
+        "{}",
+        interrupted["body"]
+    );
+    // All four deliveries carry distinct deterministic ids — no
+    // primary-key collision in any ordering.
+    let ids: Vec<&str> = pm_msgs
+        .iter()
+        .filter(|m| m["source"] != "user")
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(ids.len(), 4);
+    assert_eq!(unique.len(), 4, "colliding delivery ids: {ids:?}");
+    // Event trail: w1 routed notice + result; w2 routed two notices.
     let w1_events = event_kinds(&d, "w1");
+    assert!(w1_events.iter().any(|k| k == "notice_routed"));
     assert!(w1_events.iter().any(|k| k == "result_routed"));
+    let w2_events = event_kinds(&d, "w2");
+    assert_eq!(
+        w2_events.iter().filter(|k| *k == "notice_routed").count(),
+        2
+    );
+    assert!(!w2_events.iter().any(|k| k == "result_routed"));
 }
 
 #[test]
@@ -763,6 +824,158 @@ fn daemon_restart_skips_fenced_and_relaunches_healthy() {
     d.rpc("agent_resume", json!({"alias": "fenced"})).unwrap();
     d.wait_agent("fenced", "idle", 15);
     d.wait_message("fenced", "m2", &["completed"], 15);
+}
+
+#[test]
+fn restart_preserves_attention_fence_without_unknowns() {
+    // Seed: an agent fenced for a session-mismatch — `attention` state,
+    // recorded error, stored thread — with NO unknown messages.
+    // recover() must not rewrite the fence to `offline` before the
+    // serve loop reads it.
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        for alias in ["mismatch", "healthy"] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: "fake",
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params: None,
+                })
+                .unwrap();
+        }
+        store
+            .set_identity(
+                "mismatch",
+                &cadence_agent::adapter::Identity {
+                    thread_id: "th-mismatch".into(),
+                    session_id: "s-mismatch".into(),
+                    model: None,
+                    pid: 1,
+                    endpoint: None,
+                    generation: None,
+                },
+            )
+            .unwrap();
+        store
+            .set_agent_state(
+                "mismatch",
+                "attention",
+                Some("pane owns session 'other', expected 's-mismatch'"),
+            )
+            .unwrap();
+        store.set_agent_state("healthy", "idle", None).unwrap();
+    }
+    let d = TestDaemon::start_on(state);
+    // Healthy relaunched; the fenced agent kept its fence AND its
+    // original error — recover cleared only the dead runtime fields.
+    d.wait_agent("healthy", "idle", 15);
+    let agent = d.wait_agent("mismatch", "attention", 15);
+    assert!(agent["endpoint"].is_null());
+    assert!(
+        agent["error"]
+            .as_str()
+            .unwrap()
+            .contains("owns session 'other'"),
+        "fence error must survive restart verbatim: {}",
+        agent["error"]
+    );
+    let kinds = event_kinds(&d, "mismatch");
+    assert!(
+        kinds.iter().any(|k| k == "relaunch_skipped"),
+        "events: {kinds:?}"
+    );
+    // No actor ever spawned for it: a queued task is never taken.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "mismatch", "text": "later", "message": "m2"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(d.message_state("mismatch", "m2"), "queued");
+    // `resume --all` agrees with startup: reported under `fenced` with
+    // the remove-and-rejoin hint — never attempted.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["resume", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let fenced = v["fenced"].as_array().unwrap();
+    let entry = fenced
+        .iter()
+        .find(|r| r["alias"] == "mismatch")
+        .expect("mismatch listed under fenced");
+    assert_eq!(entry["state"], "attention");
+    assert!(
+        entry["hint"]
+            .as_str()
+            .unwrap()
+            .contains("cadence agent remove mismatch"),
+        "{entry}"
+    );
+    assert!(v["resumed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["alias"] != "mismatch"));
+    assert_eq!(d.message_state("mismatch", "m2"), "queued");
+}
+
+#[test]
+fn unfenced_agent_stays_stopped_across_restart() {
+    let mut d = TestDaemon::start();
+    d.register("w1");
+    d.register("w2");
+    d.wait_agent("w1", "idle", 10);
+    d.wait_agent("w2", "idle", 10);
+    fence_agent(&d, "w1", "x1");
+    // Unfence without resume: the reconcile leaves the agent in the
+    // same condition as an operator stop — stopped AND disabled.
+    d.rpc(
+        "agent_unfence",
+        json!({"alias": "w1", "status": "interrupted"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("w1", "stopped", 10);
+    assert_eq!(agent["enabled"], false);
+    // Daemon restart: a stopped, disabled member is not relaunched.
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("w2", "idle", 15);
+    thread::sleep(Duration::from_secs(1));
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["state"], "stopped");
+    assert_eq!(agent["enabled"], false);
+    assert!(agent["endpoint"].is_null());
+    // No actor spawned: a queued message is never taken.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "later", "message": "x2"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(d.message_state("w1", "x2"), "queued");
+    // The operator's explicit resume still works — the normal path.
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 15);
+    d.wait_message("w1", "x2", &["completed"], 15);
 }
 
 #[test]

@@ -167,6 +167,15 @@ impl Agent {
 }
 
 impl Message {
+    /// A daemon-routed delivery to a `reply_to` target — a worker's
+    /// result (`worker_result`) or an informational fence/closure
+    /// notice (`worker_notice`). Routed copies carry no `reply_to`,
+    /// are fire-and-forget on the recipient, and must never fence or
+    /// become the recipient's own turn result.
+    pub fn is_routed(&self) -> bool {
+        matches!(self.source.as_str(), "worker_result" | "worker_notice")
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "seq": self.seq, "id": self.id, "alias": self.alias,
@@ -283,10 +292,22 @@ impl Store {
              WHERE state IN ('submitting','running')",
             [],
         )?;
+        // An `attention` row is a fence, not a liveness state — keep the
+        // state and its recorded error intact (they are the operator's
+        // recovery context) and clear only the dead runtime fields.
+        // Rewriting it to `offline` here would hide the fence from the
+        // serve loop's relaunch skip and retry a provider session the
+        // operator has not cleared.
+        conn.execute(
+            "UPDATE agents SET pid=NULL, endpoint=NULL, generation=NULL
+             WHERE state='attention' AND endpoint_kind != 'inbox'",
+            [],
+        )?;
         conn.execute(
             "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL,
                 generation=NULL
-             WHERE state != 'stopped' AND endpoint_kind != 'inbox'",
+             WHERE state NOT IN ('stopped','attention')
+               AND endpoint_kind != 'inbox'",
             [],
         )?;
         Ok(())
@@ -652,11 +673,15 @@ impl Store {
             "turn_finished",
             json!({"message": message.id, "result": result}),
         )?;
-        // `unknown` routes nothing — the outcome was never learned, so
-        // a result notification would be fabricated. The replier gets
-        // the operator's verdict later via `message reconcile`
-        // (completed/failed) or nothing (interrupted).
-        if status != "unknown" {
+        // `unknown` must not route a result — the outcome was never
+        // learned, so a result notification would be fabricated. The
+        // replier still hears that the worker fenced: a one-shot notice
+        // with its own deterministic id, leaving the `cadence-result:`
+        // slot free for the operator's later verdict (completed/failed)
+        // or the interrupted notice.
+        if status == "unknown" {
+            self.route_notice(&tx, message, "unknown", result)?;
+        } else {
             self.route_result(&tx, message, result)?;
         }
         tx.commit()?;
@@ -707,6 +732,67 @@ impl Store {
         Ok(())
     }
 
+    /// An informational notice to `reply_to` — plainly not a result.
+    /// Sent once when a turn goes `unknown` (worker fenced, operator
+    /// reconcile pending) and once when the operator reconciles as
+    /// `interrupted`. Its deterministic id lives in the
+    /// `cadence-notice:` namespace, disjoint from `cadence-result:`,
+    /// so it can never collide with the real verdict a later reconcile
+    /// may route.
+    fn route_notice(
+        &self,
+        tx: &Connection,
+        message: &Message,
+        kind: &str,
+        result: &Value,
+    ) -> Result<()> {
+        let Some(target) = &message.reply_to else {
+            return Ok(());
+        };
+        let delivery = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("cadence-notice:{kind}:{}", message.id).as_bytes(),
+        )
+        .simple()
+        .to_string();
+        let payload = json!({
+            "message": message.id, "notice": kind,
+            "result": result, "worker": message.alias,
+        });
+        let prompt = match kind {
+            "interrupted" => format!(
+                "An operator closed a managed worker's turn as interrupted — the outcome was \
+                 never learned. This is an informational notice, not a result; do not treat it \
+                 as worker output. {payload}"
+            ),
+            _ => format!(
+                "A managed worker's turn outcome is unknown — the worker is fenced and an \
+                 operator reconcile is pending. This is an informational notice, not a result; \
+                 do not treat it as worker output. {payload}"
+            ),
+        };
+        self.agent_in(tx, target)?;
+        tx.execute(
+            "INSERT INTO messages(id,alias,body,reply_to,source,created)
+             VALUES(?,?,?,NULL,'worker_notice',?)",
+            params![delivery, target, prompt, now()],
+        )?;
+        Self::event(
+            tx,
+            &message.alias,
+            "notice_routed",
+            json!({"message": message.id, "recipient": target,
+                   "delivery": delivery, "notice": kind}),
+        )?;
+        Self::event(
+            tx,
+            target,
+            "queued",
+            json!({"message": delivery, "source": "worker_notice"}),
+        )?;
+        Ok(())
+    }
+
     /// True when the alias has an `unknown` in-flight attempt that must be
     /// reconciled before it may run again.
     pub fn has_unknown(&self, alias: &str) -> Result<bool> {
@@ -741,10 +827,14 @@ impl Store {
     /// with result `{status, via: "operator_reconcile", note}`; a
     /// `reconciled` event records message id, status, note and the
     /// caller. `completed`/`failed` route `reply_to` exactly like a
-    /// normal finish (deterministic delivery id — exactly once);
-    /// `interrupted` routes nothing — nothing was reported. When the
-    /// agent's last `unknown` reconciles, the fence lifts
-    /// `attention` → `stopped`; it is never auto-started.
+    /// normal finish (deterministic `cadence-result:` id — exactly
+    /// once); `interrupted` routes one `cadence-notice:` instead — the
+    /// replier learns the operator closed the turn, but nothing is
+    /// reported as worker output. When the agent's last `unknown`
+    /// reconciles, the fence lifts `attention` → `stopped` with
+    /// `enabled=0` — the same condition as an operator stop, so a
+    /// later daemon restart leaves it stopped rather than relaunching
+    /// it.
     pub fn reconcile(
         &self,
         message_id: &str,
@@ -794,10 +884,13 @@ impl Store {
         )?;
         if matches!(status, "completed" | "failed") {
             self.route_result(&tx, &message, &result)?;
+        } else {
+            self.route_notice(&tx, &message, "interrupted", &result)?;
         }
         // The fence lifts when the last unknown reconciles — attention
-        // drops to stopped, never auto-started; `agent resume` is the
-        // operator's next move.
+        // drops to stopped and disabled, the same condition as an
+        // operator stop: a restart must not relaunch a worker the
+        // operator never resumed. `agent resume` is the next move.
         let remaining: i64 = tx.query_row(
             "SELECT COUNT(*) FROM messages WHERE alias=? AND state='unknown'",
             [&message.alias],
@@ -805,7 +898,7 @@ impl Store {
         )?;
         if remaining == 0 {
             tx.execute(
-                "UPDATE agents SET state='stopped',updated=? \
+                "UPDATE agents SET state='stopped',enabled=0,updated=? \
                  WHERE alias=? AND state='attention'",
                 params![now(), message.alias],
             )?;

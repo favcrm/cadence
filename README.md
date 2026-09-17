@@ -62,7 +62,7 @@ cadence agent unfence <slug>    # reconcile every unknown fencing the agent,
                                 #  --status completed|failed records a verdict)
 cadence message reconcile <id> --status interrupted [--note "why"]
                                 # operator exit from `unknown`: completed/failed
-                                #  route reply_to; interrupted routes nothing
+                                #  route reply_to; interrupted routes a notice
 cadence agent ready <slug>      # operator claim: pane inspected, idle, empty input
 cadence agent probe <slug>      # analyze the pane without claiming (pty)
 cadence agent set <slug> k=v    # merge an allowlisted param (auto_ready)

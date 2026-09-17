@@ -51,7 +51,7 @@ Error kinds:
 | `agent_set` | `alias, patch` | merges an allowlisted param into the live agent — today only `auto_ready` (`"verified"` or null-removal, pty only); `{state:"updated"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?` | `{state:"reported"}` — explicit PTY ack/result |
-| `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to`; `interrupted` routes nothing |
+| `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice |
 | `agent_unfence` | `alias, status?, note?, by?` | reconciles every `unknown` on the agent (default `interrupted`); `{alias, reconciled:[id], state}` |
 | `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
@@ -154,8 +154,9 @@ already live (endpoint set or an actor-alive state) are skipped, and
 each member gets a bounded ~15s endpoint wait rather than hanging on a
 broken session. Per-member status lines go to stderr and the summary
 JSON reports `resumed` / `skipped` / `fenced` / `failed` separately; a
-member fenced by an unreconciled `unknown` is listed under `fenced`
-with the `agent unfence` + `agent resume` commands and never attempted,
+fenced member — an unreconciled `unknown` or any `attention` state —
+is listed under `fenced` with the reconcile or remove-and-rejoin hint
+and never attempted,
 and a member whose provider opened a different native session is
 reported `unrecoverable` with an explicit `agent remove` + `join -r`
 hint. Once
@@ -406,12 +407,18 @@ it. One transaction moves the message to the chosen terminal state with
 result `{status, via:"operator_reconcile", note}` and emits a
 `reconciled` event carrying the message id, status, note and caller
 (`CADENCE_ALIAS`, else `"operator"`). `completed`/`failed` route
-`reply_to` exactly like a normal finish (same deterministic delivery id
-— exactly once); `interrupted` routes nothing — nothing was ever
-reported. An `unknown` finish itself routes nothing either: the
-replier hears the operator's verdict, not a fabricated result. When the
-agent's last `unknown` reconciles, the fence lifts `attention →
-stopped` — never auto-started; `agent resume` is the next move.
+`reply_to` exactly like a normal finish (same deterministic
+`cadence-result:` delivery id — exactly once); `interrupted` routes a
+`worker_notice` instead — the replier learns the operator closed the
+turn, but nothing is reported as worker output. An `unknown` finish
+routes no result either — the outcome was never learned — but the
+replier does hear about the fence: one `worker_notice` ("outcome
+unknown, worker fenced, operator reconcile pending") under its own
+`cadence-notice:` id, disjoint from the result slot a reconcile may
+still fill. When the agent's last `unknown` reconciles, the fence lifts
+`attention → stopped` with `enabled=0` — the same condition as an
+operator stop, so a later restart leaves it stopped rather than
+relaunching it; `agent resume` re-enables it.
 `agent_unfence` is the bulk form: every `unknown` on the agent in one
 call, printing each id; `cadence agent unfence <alias>` then resumes
 unless `--no-resume`.
@@ -428,6 +435,14 @@ no-op) and carries no `reply_to`, so routing cannot loop. A routed
 paste is submitted the delivery itself completes — the receiving PM is
 not expected to report a result on a notification.
 
+Notices share the same mechanism with a distinct namespace and source:
+`worker_notice`, `uuid5("cadence-notice:<kind>:" + message_id)`, no
+`reply_to`, fire-and-forget. The body is plainly worded as an
+informational notice — never a result — so the recipient cannot mistake
+it for worker output. Exactly one is routed when a turn goes `unknown`
+(worker fenced, reconcile pending) and one when the operator reconciles
+`interrupted`.
+
 CLI surface: `cadence send` is the verb form of `message send`
 (identical path, same `--text/--file/--message/--reply-to/--ready`).
 `--ready` on `send` and `ask` is the operator's explicit gate claim for
@@ -440,7 +455,8 @@ endpoint kinds without a readiness gate. `message ask` accepts
 `agent_events` pages the durable log: `{seq, alias, kind, payload, at}`.
 Kinds: `registered, queued, submitting, turn_started, turn_finished,
 provider_event, input_required, input_answered, input_resolved,
-result_routed, ready, ready_claimed, claim_used, gate_wait, submitted,
+result_routed, notice_routed, ready, ready_claimed, claim_used,
+gate_wait, submitted,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
 params_updated, reconciled, relaunch_skipped, attention,
 stop_requested`. `wait>0` long-polls up to 30s.
@@ -459,12 +475,17 @@ The agent stays `waiting_input` while other requests remain pending.
 ## Recovery
 
 On daemon start: messages in `submitting`/`running` become `unknown`.
-Enabled agents relaunch *unless* fenced — state `attention` or an
-unreconciled `unknown`. A fenced agent is skipped before any actor or
-provider spawn: its state is restored to `attention` with the reconcile
-hint, a `relaunch_skipped` event records the reason, and the sweep
+`attention` fences survive the restart intact — recovery clears the
+dead pid/endpoint/generation but keeps the state and its recorded
+error verbatim, so the serve loop still sees the fence. Enabled agents
+relaunch *unless* fenced — state `attention` or an unreconciled
+`unknown`. A fenced agent is skipped before any actor or provider
+spawn: a `relaunch_skipped` event records the reason and the sweep
 continues with healthy agents. Recovery is `cadence agent unfence
 <alias> --status interrupted` then `cadence agent resume <alias>`; a
+reconciled agent lands `stopped` and disabled — the same condition as
+an operator stop — so the next restart leaves it stopped rather than
+relaunching it. A
 pty pane that survived the restart is re-adopted by `open` — the
 reattach path verifies the pane still owns the stored native session
 lock, so resume converges on the same Devin session rather than a fresh

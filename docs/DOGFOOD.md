@@ -193,8 +193,8 @@ failed [--note]` — an operator statement, no turn token (the token is
 stale by definition), refused for any other state with the state named.
 One transaction records `{status, via:"operator_reconcile", note}`,
 emits `reconciled` with the caller, routes `reply_to` for
-completed/failed (deterministic delivery id — exactly once) and nothing
-for interrupted; the last unknown on an agent lifts the fence to
+completed/failed (deterministic delivery id — exactly once); the last
+unknown on an agent lifts the fence to
 `stopped`, never auto-started. `agent unfence <alias>` is the bulk form
 and resumes unless `--no-resume`. Daemon start now skips fenced agents
 before any spawn (`relaunch_skipped` event) and keeps launching healthy
@@ -202,8 +202,21 @@ ones; `resume --all` lists them under `fenced` with the hint instead of
 attempting them. Every fenced surface — launch `next`, resume
 rejection, `devin -r`, `agent show` error — names unfence first, and
 session-mismatch hints now say each retried resume mints a new provider
-session. And because the fence path no longer routes `reply_to`, a
-reconciled `completed` is the replier's first and only notification.
+session.
+
+**What the second review round fixed.** Three gaps. First, `recover`
+still rewrote `attention` rows to `offline` before the serve loop read
+them — the startup skip was dead code for every non-unknown fence; now
+recovery preserves the fence and its error verbatim, clearing only the
+dead runtime fields. Second, an `unknown` finish routed nothing at all,
+so a fenced worker's PM was never told — now the fence routes one
+`worker_notice` ("outcome unknown, worker fenced, reconcile pending")
+under a `cadence-notice:` id disjoint from the `cadence-result:` slot,
+and `reconcile --status interrupted` routes a closure notice the same
+way; notices are plainly not results and carry no `reply_to`. Third, a
+reconciled agent stayed `enabled`, so the next restart relaunched it —
+the fence lift now lands `stopped` with `enabled=0`, identical to an
+operator stop.
 
 ## The general lesson
 

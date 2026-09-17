@@ -849,6 +849,27 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
                                        `cadence agent unfence {alias} --status interrupted`, \
                                        then `cadence agent resume {alias}`")});
     }
+    // Any other `attention` fence gates resume exactly the way it gates
+    // startup relaunch — the recorded cause is the operator's context;
+    // a session-mismatch can never converge (each retried resume mints
+    // a new provider session), anything else may retry once cleared.
+    if agent["state"].as_str() == Some("attention") {
+        let error = agent["error"].as_str().unwrap_or_default().to_string();
+        let hint = if session_mismatch(&error) {
+            format!(
+                "unrecoverable — `cadence agent remove {alias}` then rejoin with \
+                     `cadence join <pm> <provider> -r <session>`; each retried resume \
+                     mints a new provider session"
+            )
+        } else {
+            format!(
+                "fenced (attention) — `cadence agent show {alias}` records the \
+                     cause; retry `cadence agent resume {alias}` once it is cleared"
+            )
+        };
+        return json!({"alias": alias, "resumed": false, "fenced": true,
+                      "state": "attention", "error": error, "hint": hint});
+    }
     let attachable = matches!(kind, "pty" | "managed-ws");
     if let Err(e) = client::rpc(state_dir, "agent_resume", json!({"alias": alias})) {
         return json!({"alias": alias, "resumed": false, "error": e.to_string()});

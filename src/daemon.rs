@@ -445,7 +445,7 @@ impl Shared {
                         // replay.
                         Err(Error::NotRendered(reason)) => {
                             unrendered += 1;
-                            let routed = message.source == "worker_result";
+                            let routed = message.is_routed();
                             let retry = routed && unrendered <= 3;
                             let _ = self.store.event_public(
                                 alias,
@@ -554,7 +554,7 @@ impl Shared {
             self.store.mark_submitted(message)?;
             // A routed notification's delivery IS its completion — the
             // receiving PM is not expected to report a result on it.
-            if message.source == "worker_result" {
+            if message.is_routed() {
                 self.store.finish(
                     message,
                     "completed",
