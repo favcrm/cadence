@@ -65,6 +65,10 @@ so do not report on them — they carry no `turn_id` for you.
 
 ```bash
 cadence join <your-alias> devin                     # worker into your group
+cadence join <your-alias> claude                    # headless claude worker —
+                                                    #  its turn's result text
+                                                    #  IS the report (no
+                                                    #  `message result` needed)
 cadence join <your-alias> devin --worktree feat-a   # isolated checkout
                                                     #  (.cadence/wt/feat-a)
 cadence agent ready <worker>                        # gate one paste

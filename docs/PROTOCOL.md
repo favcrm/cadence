@@ -89,7 +89,7 @@ depend on it:
 
 | endpoint_kind | delivery | status |
 |---|---|---|
-| `managed` | owned provider process (JSON-RPC stdio) | implemented: provider `codex` |
+| `managed` | owned provider process — JSON-RPC stdio (`codex`) or newline-delimited stream-json (`claude`) | implemented: providers `codex`, `claude` |
 | `managed-ws` | owned `codex app-server --listen ws://127.0.0.1:*`; official TUI attachable | implemented: provider `codex` |
 | `pty` | owned tmux pane running the official TUI; literal paste + explicit reports | implemented: provider `devin` |
 | `inbox` | durable mailbox — no actor; messages queue until `agent_inbox` drains them | implemented: provider `inbox` |
@@ -111,7 +111,15 @@ the worker's result lands on the PM's queue. An explicit `reply_to`
 always wins; `reply_to` may still not equal the sender alias and must
 name a registered agent (both enforced by `enqueue`).
 
-**Briefings.** Every launch path (`devin`, `codex`, `join`) writes
+For provider `claude`, `params` holds the launch options the adapter
+replays verbatim on every resume: `{"model": "<cli model>",
+"permission_mode": "<claude mode>"}` (default `manual`;
+`--bypass` stores `bypassPermissions`), `{"allowed_tools": ["<pat>",
+…]}` — appended to the `Bash(cadence *)` baseline the CLI tool needs
+to self-report — and the turn-liveness knobs `{"turn_idle_secs": N}`
+(default 900) plus `{"turn_max_secs": N}` (optional absolute cap).
+
+**Briefings.** Every launch path (`devin`, `codex`, `claude`, `join`) writes
 `.cadence/<root>/BRIEFING-<alias>.md` — the group root's `.cadence/`
 dir in the root's cwd (the PM's repo for a joined worker, the agent's
 own for a standalone launch). The file carries identity (alias, native
@@ -306,6 +314,74 @@ TUI attaches to the same native thread with:
 ```
 codex resume --remote <endpoint> <thread_id>
 ```
+
+## managed claude endpoints (provider `claude`)
+
+`cadence claude` and `cadence join <pm> claude` run one long-lived
+headless process per agent:
+
+```
+claude -p --input-format stream-json --output-format stream-json --verbose
+         (--session-id <uuid> | --resume <uuid>) [--model <m>]
+         --permission-mode <mode> --allowedTools <pat> …
+```
+
+The wire is newline-delimited typed events, not JSON-RPC — there are no
+request ids. Each durable message is written as one
+`{"type":"user","message":…}` line; the next `result` event completes
+it. Turns are serialized by the actor, so correlation is "the first
+result after the send". The result's `result` field is the report text
+— a managed claude turn completes the message itself, no
+`cadence message result` call exists. Turn ids mint as
+`claude-<generation>-<uuid4>`.
+
+Result mapping: `subtype:"success"` + `is_error:false` → `completed`
+(`stop_reason` preserved); `is_error:true` or `subtype:"error_*"` →
+`failed` (a definitive answer — the `errors[]` text is kept);
+`subtype:"interrupted"` → `interrupted`; a process exit or EOF before
+any `result` → `unknown` + fence, recoverable via `agent unfence` +
+`agent resume` which relaunches with `--resume <stored session>`.
+`permission_denials` on a result do NOT fail the turn — they are
+recorded as a `permission_denied` event and the agent is expected to
+work around them.
+
+Turn liveness is **activity-based, never wall-clock**: every parsed
+stdout event (`assistant`, `user`, `system`, `stream_event`, `result`)
+resets the clock. A turn is `unknown` only after `turn_idle_secs` of
+silence (default 900 — a healthy multi-hour turn is fine) or after the
+optional `turn_max_secs` absolute cap, which fences even a chatty turn.
+The fence records the provider's own reason (`No provider event for
+900s`, `Turn exceeded turn_max_secs`, EOF, …) so reconcile knows why.
+Each `assistant` tool_use block also lands as a compact `tool_use`
+event — the tool name only — so `events --follow` shows progress on a
+long turn.
+
+The child's environment is scrubbed **by rule**: `CLAUDECODE` and every
+inherited `CLAUDE_*`, `CODEX_*`, `CADENCE_*` name is removed — a name
+list would keep missing new leak variables (`CLAUDE_CODE_SUBAGENT_MODEL`,
+`CLAUDE_EFFORT`, `CLAUDE_PID`, …). The keep-list is operator-set
+configuration: `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN`.
+`ANTHROPIC_*` auth/proxy variables are never touched; `CADENCE_ALIAS`
+and `CADENCE_STATE_DIR` are re-injected per agent.
+
+Session identity: a fresh open mints `--session-id <uuid>`; reopening
+uses `--resume <thread_id>`. Every `system/init` event is checked — a
+reported `session_id` different from the opened one means another
+Claude process owns the session and the agent fences `attention` with
+session-mismatch wording (remove + rejoin mints fresh).
+
+Interrupt is SIGINT to the provider's own process group; the adapter
+waits a bounded 60s grace for the interrupted `result`, then fails
+closed `unknown`. `close` ends stdin first (clean EOF exit) before the
+TERM→KILL fallback. There is no attachable surface — `agent attach`
+prints an explanation naming `cadence events --follow` and manual
+`claude --resume` after `agent stop`. Phase A brokers no provider
+requests: `agent respond` is `rejected` naming the real opt-ups —
+relaunch or rejoin with `--permission-mode <mode>` / `--allow "<pat>"`
+/ `--bypass`, and watch `permission_denied` events. Provider stderr
+lands in `providers/<alias>.provider.log` and
+each `result` emits a `claude_result` event carrying
+`total_cost_usd`/`num_turns`/`session_id` for audit.
 
 ## inbox endpoints (provider `inbox`)
 
