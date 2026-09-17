@@ -17,6 +17,27 @@ export default function App() {
   const [openId, setOpenId] = useState<string | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
 
+  // Selection lives in the URL (`?project=cadence&issue=CAD-16`) so a
+  // refresh or a pasted link restores the same view.
+  useEffect(() => {
+    const read = () => {
+      const q = new URLSearchParams(location.search);
+      setProject(q.get("project") ?? "all");
+      setOpenId(q.get("issue"));
+    };
+    read();
+    addEventListener("popstate", read);
+    return () => removeEventListener("popstate", read);
+  }, []);
+
+  useEffect(() => {
+    const q = new URLSearchParams();
+    if (project !== "all") q.set("project", project);
+    if (openId) q.set("issue", openId);
+    const s = q.toString();
+    history.replaceState(null, "", location.pathname + (s ? `?${s}` : ""));
+  }, [project, openId]);
+
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
     api

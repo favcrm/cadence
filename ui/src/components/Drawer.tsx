@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { fmtBytes, fmtTime } from "../fmt";
+import Md from "./Md";
 import type { AgentsPayload, IssueDetail, LinkRef } from "../types";
 
 const NOTE_CHIP: Record<string, string> = {
@@ -305,7 +306,7 @@ export default function Drawer({ id, agents, onClose, onOpen }: Props) {
                         <div className="text-secondary text-ink-300 mt-1 leading-[1.5]">
                           {e.kind === "note" && (e.title ?? e.name)}
                           {e.kind === "comment" && (
-                            <span className="whitespace-pre-wrap">{e.body}</span>
+                            <Md text={e.body ?? ""} onOpen={onOpen} />
                           )}
                           {e.kind === "commit" && e.subject}
                         </div>
