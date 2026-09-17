@@ -38,9 +38,9 @@ Error kinds:
 | `health` | — | `{state:"ready", protocol:1, capabilities:[...]}` |
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded) then exits |
 | `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?` | `{alias,state:"starting"|"idle",provider}` |
-| `agent_list` | — | `{agents:[Agent]}` |
+| `agent_list` | — | `{agents:[Agent+tasks]}` — `tasks` names the alias's non-terminal task assignments |
 | `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown}` — `unknown` counts unreconciled unknowns fencing the agent |
-| `agent_send` | `alias, text, message?, reply_to?, source?` | `{message,state,duplicate}` |
+| `agent_send` | `alias, text, message?, reply_to?, source?, task?` | `{message,state,duplicate}` — `task` attaches the delivery to a task for indexing |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
@@ -50,8 +50,23 @@ Error kinds:
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
 | `agent_set` | `alias, patch` | merges an allowlisted param into the live agent — today only `auto_ready` (`"verified"` or null-removal, pty only); `{state:"updated"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
-| `message_report` | `message, token, kind: ack|result, text?` | `{state:"reported"}` — explicit PTY ack/result |
-| `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice |
+| `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit PTY ack/result; `sha` names the produced commit for task-attached kickoffs |
+| `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?, sha?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice. A `sha` on `completed` binds like a worker `--sha` |
+| `job_new` | `pm, spec, spec_sha256, job?, title?, issue?, repo?, base_ref?, max_revisions?, task_title?` | `{job, duplicate}` — bookkeeping only; creates the `open` job + default `<job>-t1` draft task |
+| `job_list` | `state?, all?` | `{jobs:[Job+task counts]}` |
+| `job_show` | `job` | `{job:{...,tasks:[Task+kickoff+attention+latest_verdict]}}` — lazily flags drift |
+| `job_events` | `job, after?, limit?` | `{events:[Event], cursor}` — the `job_id`-scoped view |
+| `task_new` | `job, task?, title?, assignee?, spec?, acceptance?, worktree?, branch?, base_sha?` | `{task}` — draft task in an open job |
+| `task_show` | `task` | `{task:{...,messages,verdicts}}` |
+| `task_dispatch` | `task, to?, message?, by?` | `{task, message, duplicate, queued_behind_dead}` — enqueues the kickoff at a new revision, or returns the live kickoff (`duplicate:true`) |
+| `task_verdict` | `task, sha, verdict: pass|revise|blocked, reviewer?, pane?, evidence?, message?, revision?` | `{task, verdict}` — binds `sha == head_sha` on `state=review` |
+| `task_accept` | `task, merged_sha?, by?` | `{task}` — `verified → done` |
+| `task_sha` | `task, sha, by?` | `{task}` — repairs a NULL `head_sha` on a `review` task |
+| `task_fail` | `task, reason, by?` | `{task}` — mark unrecoverable |
+| `task_reopen` | `task, pane?` | `{task}` — `blocked|verified|failed → draft`, `revision` resets |
+| `task_cancel` | `task, by?` | `{task}` — cancels the task; a `queued`/`submitting` kickoff cancels in the same tx, a `running` one completes on its own |
+| `job_cancel` | `job, by?` | `{job}` — cancels the job + every non-terminal task |
+| `job_close` | `job, by?` | `{job}` — legal only when every task is `done` |
 | `agent_unfence` | `alias, status?, note?, by?` | reconciles every `unknown` on the agent (default `interrupted`); `{alias, reconciled:[id], state}` |
 | `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
@@ -519,6 +534,16 @@ it for worker output. Exactly one is routed when a turn goes `unknown`
 (worker fenced, reconcile pending) and one when the operator reconciles
 `interrupted`.
 
+Job notifications are the third routed source: `job_event`,
+`uuid5("cadence-job:<task>:r<rev>:<state>:<dedupe>")`, `reply_to` NULL,
+`task_id` set for indexing, fire-and-forget — the same bounded
+render-miss retry and park-instead-of-fence behaviour, so a job
+notification can never fence a PM pane. One is enqueued per verdict
+transition (`verified`/`revising`/`blocked`) and on `task_done`; a
+removed PM simply gets no copy. `Message::is_routed()` is exactly
+`worker_result | worker_notice | job_event` — those sources cannot be
+forged through `agent_send` (the `identifier` charset has no `_`).
+
 CLI surface: `cadence send` is the verb form of `message send`
 (identical path, same `--text/--file/--message/--reply-to/--ready`).
 `--ready` on `send` and `ask` is the operator's explicit gate claim for
@@ -536,6 +561,38 @@ gate_wait, submitted,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
 params_updated, reconciled, relaunch_skipped, attention,
 stop_requested`. `wait>0` long-polls up to 30s.
+
+Job operations emit the same rows with `job_id`/`task_id` set —
+`job_created, task_created, task_dispatched, task_running,
+task_reported, verdict_recorded, task_revising, task_blocked,
+task_reopened, task_failed, task_cancelled, task_sha_recorded,
+task_done, job_closed, job_cancelled` — and `job_events` pages them
+across aliases (`{job, after?, limit?}` → `{events, cursor}`).
+
+## Jobs and tasks
+
+Full semantics live in `docs/JOBS.md`. The wire contract in brief:
+
+- `messages.task_id` attaches a delivery to a task (kickoff, `--task`
+  follow-up, or `job_event` notification); `events.job_id`/`task_id`
+  scope the job event view. Old rows read NULL — unattached.
+- Task states: `draft → dispatched → running → review →
+  verified|revising|blocked → done`, plus `failed`/`cancelled`;
+  `job task reopen` returns `blocked|verified|failed` to `draft`.
+- Only `source='job_dispatch'` messages drive task state — a dispatch's
+  kickoff completing moves the task to `review` with `head_sha` from
+  `result.sha`, else the last `SHA: <40-hex>` line of the result text,
+  else NULL. Attachments for indexing never move state.
+- `task_verdict` requires `state='review'`, `sha == head_sha` (NULL
+  head_sha rejects naming `job task sha`), optional `--revision` equal
+  to the current one, `reviewer != assignee`, and pane rules: inside a
+  cadence pane the reviewer is the pane alias (`--reviewer` and
+  `operator` refused); outside, `--reviewer` is required.
+- `task_dispatch` legal from `draft|revising`, from
+  `dispatched|running` once the live kickoff is terminal (new revision;
+  a reconcile to `completed` takes the normal completion edge), and
+  from `blocked` only with a `--to` reassign. A live kickoff returns
+  `duplicate:true` with the live message id.
 
 ## Approvals
 

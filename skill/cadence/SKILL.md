@@ -12,13 +12,14 @@ your pane environment has `CADENCE_ALIAS` and `CADENCE_STATE_DIR` set.
 ## Who am I
 
 ```bash
-cadence self          # → {"alias": "...", "running": [{"id": msg, "turn_id": token}]}
+cadence self          # → {"alias": "...", "running": [{"id": msg, "turn_id": token, "task": task-or-null}]}
 ```
 
 `cadence self` is the source of truth for your alias and your **running**
 message ids + turn tokens. Do not parse `agent show` to guess them.
 (On an `inbox` agent — a durable mailbox with no actor — it instead
-answers `{"queued": N}`.)
+answers `{"queued": N}`.) Each running entry's `task` field names the job
+task the message carries — `null` for unattached deliveries.
 
 ## Reporting on a task
 
@@ -26,10 +27,17 @@ Every dispatched message expects a correlated report. When done:
 
 ```bash
 cadence message result <msg-id> --token <turn_id> --text "summary of outcome"
+# a job kickoff additionally wants the commit you produced:
+cadence message result <msg-id> --token <turn_id> --text "summary" --sha "$(git rev-parse HEAD)"
 ```
 
 Get `<msg-id>` and `<turn_id>` from `cadence self`. Report every running
 message — an unreported message stays `running` forever and blocks review.
+Never report a SHA you have not committed — a `job verdict` binds QA to
+exactly that commit. Managed endpoints (codex/claude) never run
+`message result`: their kickoff instead asks the final answer to end with
+a last line `SHA: <40-hex>` — the daemon reads the last such line as the
+reported revision.
 
 ## Peers and your group
 
@@ -89,6 +97,26 @@ cadence send obs --text "note"                      #   — or route a reply_to 
 cadence inbox obs --wait 30                         # drain; each completes
                                                     #  via=inbox_read
 ```
+
+Job work (the work axis over messages — see docs/JOBS.md):
+
+```bash
+cadence job new --pm <you> --spec spec.md --issue CAD-31
+cadence job task add <job> --task <job>-fix --assignee <w> --accept "tests pass"
+cadence job dispatch <task>              # kickoff → worker (revision 1)
+cadence job show <job>                   # task states + kickoff + drift flags
+cadence job events <job> --follow        # scoped event view
+cadence job verdict <task> --sha <40-hex> --revise   # reviewer pane = reviewer;
+                                                     #  sha must equal head_sha
+cadence job dispatch <task>              # revising → next revision
+cadence job verdict <task> --sha <sha> --pass
+cadence job accept <task>                # verified → done
+cadence job task reopen <task>           # blocked/verified/failed → draft
+cadence send <w> --task <task> --text "follow-up"   # attach, no state drive
+```
+
+Routed `job_event` notifications are informational like `worker_result` —
+they complete on delivery and carry no turn for you.
 
 Fresh joins get a `bootstrap-<alias>` kickoff plus the briefing file;
 `join --no-bootstrap` skips both. An inbox is the right `reply_to`/

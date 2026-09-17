@@ -87,26 +87,38 @@ fn http(port: u16, method: &str, path: &str, host: &str) -> (u16, String) {
 }
 
 /// Spawn `ui::serve` on a free port and wait for health. The caller owns
-/// the TempDirs keeping the pm/state dirs alive.
+/// the TempDirs keeping the pm/state dirs alive. `free_port` is a
+/// bind-release race — a parallel test may grab the port first, so a
+/// failed start retries on a fresh port.
 fn start_ui(pm_dir: PathBuf, state_dir: PathBuf) -> u16 {
-    let port = free_port();
-    thread::spawn(move || {
-        let _ = ui::serve(&state_dir, &pm_dir, "127.0.0.1", port, None, &[]);
-    });
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let overall = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
-            let probe = format!("GET /api/health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
-            let _ = s.write_all(probe.as_bytes());
-            let mut buf = String::new();
-            if s.read_to_string(&mut buf).is_ok() && buf.contains("200") {
-                break;
+        let port = free_port();
+        let (sd, pd) = (state_dir.clone(), pm_dir.clone());
+        thread::spawn(move || {
+            let _ = ui::serve(&sd, &pd, "127.0.0.1", port, None, &[]);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Host carries the port, so a stolen port's foreign server
+        // rejects this probe (its allowlist names ITS port) — 200
+        // only ever comes from OUR server.
+        loop {
+            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let probe = format!("GET /api/health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+                let _ = s.write_all(probe.as_bytes());
+                let mut buf = String::new();
+                if s.read_to_string(&mut buf).is_ok() && buf.contains("200") {
+                    return port;
+                }
             }
+            if Instant::now() >= deadline {
+                break; // port was likely stolen — retry on another
+            }
+            assert!(Instant::now() < overall, "ui server did not start");
+            thread::sleep(Duration::from_millis(50));
         }
-        assert!(Instant::now() < deadline, "ui server did not start");
-        thread::sleep(Duration::from_millis(50));
     }
-    port
 }
 
 fn seed(pm: &Path, state: &Path) {

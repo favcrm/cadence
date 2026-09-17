@@ -102,6 +102,39 @@ cadence issue lint                 # dangling/cyclic links, depth, sizes
 cadence ui run                     # 127.0.0.1:3010 — SPA + GET-only API
 ```
 
+A **job** is a PM-scoped unit of work: `job new` binds an existing PM +
+spec file, `job dispatch` sends a task's kickoff to a group worker, and
+`job verdict` binds QA to the exact reported commit. Messages stay the
+delivery axis — the job layer tracks the work axis on top. See
+[docs/JOBS.md](docs/JOBS.md).
+
+```bash
+cadence job new --pm pm --spec spec.md --issue CAD-26
+                                # open job + default <job>-t1 draft task
+cadence job task add j1 --task j1-fix --assignee w1 \
+        --worktree .cadence/wt/fix --accept "tests pass"
+cadence job dispatch j1-fix     # kickoff → w1; revision 1
+cadence job show j1             # tasks + live kickoff state + drift flags
+cadence job verdict j1-fix --sha <40-hex> --revise --reviewer rev
+                                # sha must equal the reported head_sha;
+                                #  revise at the cap blocks instead
+cadence job dispatch j1-fix     # revision 2 — fresh kickoff id
+cadence job verdict j1-fix --sha <40-hex> --pass --reviewer rev
+cadence job accept j1-fix --merged-sha <sha>
+                                # verified → done; PM notified via job_event
+cadence job cancel j1           # cancels non-terminal tasks; queued
+                                #  kickoffs cancel, running ones finish —
+                                #  agents are never stopped by a job
+```
+
+Workers on pty report with `message result <id> --token <t> --sha "$(git
+rev-parse HEAD)"`; managed endpoints (codex/claude) never call
+`message result` — their kickoff asks for a last line `SHA: <40-hex>`
+instead, and `job task sha` repairs a missing one. A verdict on a NULL
+SHA is rejected. Inside a cadence pane the reviewer is the pane alias;
+outside, `--reviewer` is required (`operator` is the human's id), and
+the reviewer is never the assignee.
+
 The hot path is verb-first — `devin`, `codex`, `join`, `attach`, `send`,
 `resume`, `stop`, `inbox` — while `agent`, `message` and `daemon` hold
 the admin subcommands (register/list/show/ready/capture/probe/set/

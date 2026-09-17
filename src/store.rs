@@ -40,6 +40,9 @@ pub struct Message {
     pub turn_id: Option<String>,
     pub result: Option<Value>,
     pub error: Option<String>,
+    /// The task this delivery carries (a dispatch kickoff or a
+    /// `--task` follow-up). NULL = unattached delivery.
+    pub task_id: Option<String>,
     pub created: f64,
     pub started: Option<f64>,
     pub completed: Option<f64>,
@@ -75,7 +78,73 @@ pub struct Event {
     pub alias: String,
     pub kind: String,
     pub payload: Value,
+    /// Job/task the event was caused by, when it was a job operation.
+    /// `job events` is one indexed query across alias rows.
+    pub job_id: Option<String>,
+    pub task_id: Option<String>,
     pub at: f64,
+}
+
+/// A job: the rollup container binding a spec, a PM (group root) and a
+/// set of tasks. `state`: `draft|open|done|failed|cancelled`.
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub id: String,
+    pub title: Option<String>,
+    pub spec_path: String,
+    pub spec_sha256: Option<String>,
+    pub pm_alias: String,
+    /// Board issue (`<PREFIX>-<n>`), grammar-validated only — the
+    /// daemon never reads the board filesystem.
+    pub issue_id: Option<String>,
+    pub repo: Option<String>,
+    pub base_ref: Option<String>,
+    pub state: String,
+    pub max_revisions: i64,
+    pub error: Option<String>,
+    pub created: f64,
+    pub updated: f64,
+}
+
+/// A task: the dispatch/QA unit inside a job. `revision` counts
+/// attempts; each attempt is one kickoff message (`dispatch_message`).
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: String,
+    pub job_id: String,
+    pub title: Option<String>,
+    pub role: String,
+    pub assignee: Option<String>,
+    pub spec_path: Option<String>,
+    pub acceptance: Option<String>,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+    pub base_sha: Option<String>,
+    /// The worker's reported commit for the current revision — the
+    /// only SHA a verdict may name. NULL until reported.
+    pub head_sha: Option<String>,
+    pub state: String,
+    pub revision: i64,
+    pub dispatch_message: Option<String>,
+    pub error: Option<String>,
+    pub created: f64,
+    pub updated: f64,
+}
+
+/// A verdict: the QA record bound to one exact `(task, revision, sha)`.
+/// Rows are append-only — re-dispatch starts a new revision and old
+/// verdicts remain as the audit trail.
+#[derive(Debug, Clone)]
+pub struct Verdict {
+    pub seq: i64,
+    pub task_id: String,
+    pub revision: i64,
+    pub sha: String,
+    pub verdict: String,
+    pub reviewer: String,
+    pub evidence: Option<Value>,
+    pub message: Option<String>,
+    pub created: f64,
 }
 
 /// Result of [`Store::take_queued`].
@@ -118,9 +187,78 @@ fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         turn_id: row.get("turn_id")?,
         result: result.and_then(|r| serde_json::from_str(&r).ok()),
         error: row.get("error")?,
+        task_id: row.get("task_id")?,
         created: row.get("created")?,
         started: row.get("started")?,
         completed: row.get("completed")?,
+    })
+}
+
+fn row_job(row: &rusqlite::Row) -> rusqlite::Result<Job> {
+    Ok(Job {
+        id: row.get("id")?,
+        title: row.get("title")?,
+        spec_path: row.get("spec_path")?,
+        spec_sha256: row.get("spec_sha256")?,
+        pm_alias: row.get("pm_alias")?,
+        issue_id: row.get("issue_id")?,
+        repo: row.get("repo")?,
+        base_ref: row.get("base_ref")?,
+        state: row.get("state")?,
+        max_revisions: row.get("max_revisions")?,
+        error: row.get("error")?,
+        created: row.get("created")?,
+        updated: row.get("updated")?,
+    })
+}
+
+fn row_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: row.get("id")?,
+        job_id: row.get("job_id")?,
+        title: row.get("title")?,
+        role: row.get("role")?,
+        assignee: row.get("assignee")?,
+        spec_path: row.get("spec_path")?,
+        acceptance: row.get("acceptance")?,
+        worktree: row.get("worktree")?,
+        branch: row.get("branch")?,
+        base_sha: row.get("base_sha")?,
+        head_sha: row.get("head_sha")?,
+        state: row.get("state")?,
+        revision: row.get("revision")?,
+        dispatch_message: row.get("dispatch_message")?,
+        error: row.get("error")?,
+        created: row.get("created")?,
+        updated: row.get("updated")?,
+    })
+}
+
+fn row_verdict(row: &rusqlite::Row) -> rusqlite::Result<Verdict> {
+    let evidence: Option<String> = row.get("evidence")?;
+    Ok(Verdict {
+        seq: row.get("seq")?,
+        task_id: row.get("task_id")?,
+        revision: row.get("revision")?,
+        sha: row.get("sha")?,
+        verdict: row.get("verdict")?,
+        reviewer: row.get("reviewer")?,
+        evidence: evidence.and_then(|e| serde_json::from_str(&e).ok()),
+        message: row.get("message")?,
+        created: row.get("created")?,
+    })
+}
+
+fn row_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
+    let payload: String = row.get("payload")?;
+    Ok(Event {
+        seq: row.get("seq")?,
+        alias: row.get("alias")?,
+        kind: row.get("kind")?,
+        payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+        job_id: row.get("job_id")?,
+        task_id: row.get("task_id")?,
+        at: row.get("at")?,
     })
 }
 
@@ -168,12 +306,16 @@ impl Agent {
 
 impl Message {
     /// A daemon-routed delivery to a `reply_to` target — a worker's
-    /// result (`worker_result`) or an informational fence/closure
-    /// notice (`worker_notice`). Routed copies carry no `reply_to`,
-    /// are fire-and-forget on the recipient, and must never fence or
-    /// become the recipient's own turn result.
+    /// result (`worker_result`), an informational fence/closure
+    /// notice (`worker_notice`), or a job notification (`job_event`).
+    /// Routed copies carry no `reply_to`, are fire-and-forget on the
+    /// recipient, and must never fence or become the recipient's own
+    /// turn result.
     pub fn is_routed(&self) -> bool {
-        matches!(self.source.as_str(), "worker_result" | "worker_notice")
+        matches!(
+            self.source.as_str(),
+            "worker_result" | "worker_notice" | "job_event"
+        )
     }
 
     pub fn to_json(&self) -> Value {
@@ -182,6 +324,7 @@ impl Message {
             "body": self.body, "reply_to": self.reply_to, "source": self.source,
             "state": self.state, "turn_id": self.turn_id,
             "result": self.result, "error": self.error,
+            "task_id": self.task_id,
             "created": self.created, "started": self.started,
             "completed": self.completed,
         })
@@ -192,7 +335,46 @@ impl Event {
     pub fn to_json(&self) -> Value {
         json!({
             "seq": self.seq, "alias": self.alias, "kind": self.kind,
-            "payload": self.payload, "at": self.at,
+            "payload": self.payload, "job_id": self.job_id,
+            "task_id": self.task_id, "at": self.at,
+        })
+    }
+}
+
+impl Job {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id, "title": self.title, "spec_path": self.spec_path,
+            "spec_sha256": self.spec_sha256, "pm": self.pm_alias,
+            "issue": self.issue_id, "repo": self.repo, "base_ref": self.base_ref,
+            "state": self.state, "max_revisions": self.max_revisions,
+            "error": self.error, "created": self.created, "updated": self.updated,
+        })
+    }
+}
+
+impl Task {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "id": self.id, "job": self.job_id, "title": self.title,
+            "role": self.role, "assignee": self.assignee,
+            "spec_path": self.spec_path, "acceptance": self.acceptance,
+            "worktree": self.worktree, "branch": self.branch,
+            "base_sha": self.base_sha, "head_sha": self.head_sha,
+            "state": self.state, "revision": self.revision,
+            "dispatch_message": self.dispatch_message, "error": self.error,
+            "created": self.created, "updated": self.updated,
+        })
+    }
+}
+
+impl Verdict {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "seq": self.seq, "task": self.task_id, "revision": self.revision,
+            "sha": self.sha, "verdict": self.verdict,
+            "reviewer": self.reviewer, "evidence": self.evidence,
+            "message": self.message, "created": self.created,
         })
     }
 }
@@ -273,6 +455,84 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=3", [])?;
             tx.commit()?;
         }
+        if version < 4 {
+            // v4: the work axis. `jobs`/`tasks`/`verdicts` tables plus
+            // attachment columns on `messages` (`task_id`) and `events`
+            // (`job_id`/`task_id`). One transaction, existence checks
+            // before each ALTER, `IF NOT EXISTS` on the new objects —
+            // a half-applied v4 converges on reopen like v2/v3. Old
+            // messages simply read task_id NULL (unattached delivery).
+            let msg_cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(messages)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let event_cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(events)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS jobs(
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    spec_path TEXT NOT NULL,
+                    spec_sha256 TEXT,
+                    pm_alias TEXT NOT NULL,
+                    issue_id TEXT,
+                    repo TEXT,
+                    base_ref TEXT,
+                    state TEXT NOT NULL,
+                    max_revisions INTEGER NOT NULL DEFAULT 2,
+                    error TEXT,
+                    created REAL NOT NULL, updated REAL NOT NULL);
+                 CREATE TABLE IF NOT EXISTS tasks(
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL REFERENCES jobs(id),
+                    title TEXT,
+                    role TEXT NOT NULL DEFAULT 'implementer',
+                    assignee TEXT,
+                    spec_path TEXT,
+                    acceptance TEXT,
+                    worktree TEXT,
+                    branch TEXT,
+                    base_sha TEXT,
+                    head_sha TEXT,
+                    state TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    dispatch_message TEXT,
+                    error TEXT,
+                    created REAL NOT NULL, updated REAL NOT NULL);
+                 CREATE INDEX IF NOT EXISTS tasks_job ON tasks(job_id, state);
+                 CREATE TABLE IF NOT EXISTS verdicts(
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    revision INTEGER NOT NULL,
+                    sha TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    reviewer TEXT NOT NULL,
+                    evidence TEXT,
+                    message TEXT,
+                    created REAL NOT NULL);
+                 CREATE INDEX IF NOT EXISTS verdicts_task ON verdicts(task_id, revision);",
+            )?;
+            if !msg_cols.iter().any(|c| c == "task_id") {
+                tx.execute_batch("ALTER TABLE messages ADD COLUMN task_id TEXT")?;
+            }
+            if !event_cols.iter().any(|c| c == "job_id") {
+                tx.execute_batch("ALTER TABLE events ADD COLUMN job_id TEXT")?;
+            }
+            if !event_cols.iter().any(|c| c == "task_id") {
+                tx.execute_batch("ALTER TABLE events ADD COLUMN task_id TEXT")?;
+            }
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS msg_task ON messages(task_id);
+                 CREATE INDEX IF NOT EXISTS events_job ON events(job_id, seq);
+                 UPDATE schema_version SET version=4;",
+            )?;
+            tx.commit()?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -314,9 +574,24 @@ impl Store {
     }
 
     fn event(conn: &Connection, alias: &str, kind: &str, payload: Value) -> Result<()> {
+        Self::event_scoped(conn, alias, kind, payload, None, None)
+    }
+
+    /// Event insert that additionally records the job/task the event
+    /// was caused by — the `job events` view is one indexed query
+    /// across these rows.
+    fn event_scoped(
+        conn: &Connection,
+        alias: &str,
+        kind: &str,
+        payload: Value,
+        job_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Result<()> {
         conn.execute(
-            "INSERT INTO events(alias,kind,payload,at) VALUES(?,?,?,?)",
-            params![alias, kind, payload.to_string(), now()],
+            "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
+             VALUES(?,?,?,?,?,?)",
+            params![alias, kind, payload.to_string(), job_id, task_id, now()],
         )?;
         Ok(())
     }
@@ -451,26 +726,63 @@ impl Store {
         id: &str,
         source: &str,
     ) -> Result<(bool, String)> {
+        self.enqueue_task(alias, body, reply_to, id, source, None)
+    }
+
+    /// `enqueue` with an optional task attachment (`send --task`,
+    /// dispatch kickoffs). The task must exist; the message carries
+    /// `task_id` so the daemon can drive task edges off its state.
+    pub fn enqueue_task(
+        &self,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+    ) -> Result<(bool, String)> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let out = self.enqueue_tx(&tx, alias, body, reply_to, id, source, task_id)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Transactional enqueue — validation, idempotent dedupe, insert,
+    /// `queued` event — usable inside a caller's `BEGIN IMMEDIATE`.
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_tx(
+        &self,
+        tx: &Connection,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+    ) -> Result<(bool, String)> {
         if body.is_empty() || body.len() > 48_000 {
             return Err(Error::rejected("Prompt must contain 1-48000 characters"));
         }
         identifier(id, "Message id")?;
-        let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
-        self.agent_in(&tx, alias)?;
+        self.agent_in(tx, alias)?;
         if let Some(target) = reply_to {
-            self.agent_in(&tx, target)?;
+            self.agent_in(tx, target)?;
             if target == alias {
                 return Err(Error::rejected(
                     "An agent cannot automatically reply to itself",
                 ));
             }
         }
-        if let Some(old) = self.message_in(&tx, id)? {
+        if let Some(task) = task_id {
+            self.task_in(tx, task)?;
+        }
+        if let Some(old) = self.message_in(tx, id)? {
             let same = old.alias == alias
                 && old.body == body
                 && old.reply_to.as_deref() == reply_to
-                && old.source == source;
+                && old.source == source
+                && old.task_id.as_deref() == task_id;
             if !same {
                 return Err(Error::rejected(
                     "Message id was already used with different content",
@@ -479,17 +791,18 @@ impl Store {
             return Ok((true, old.state));
         }
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,created)
-             VALUES(?,?,?,?,?,?)",
-            params![id, alias, body, reply_to, source, now()],
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
+             VALUES(?,?,?,?,?,?,?)",
+            params![id, alias, body, reply_to, source, task_id, now()],
         )?;
-        Self::event(
-            &tx,
+        Self::event_scoped(
+            tx,
             alias,
             "queued",
             json!({"message": id, "source": source, "reply_to": reply_to}),
+            None,
+            task_id,
         )?;
-        tx.commit()?;
         Ok((false, "queued".to_string()))
     }
 
@@ -561,6 +874,10 @@ impl Store {
             "turn_started",
             json!({"message": message_id, "turn_id": turn_id}),
         )?;
+        // Task edge: a task-attached kickoff observed running moves the
+        // task dispatched → running (guarded — cancelled/advanced tasks
+        // are untouched).
+        self.task_on_running(&tx, message_id, &alias)?;
         tx.commit()?;
         Ok(())
     }
@@ -684,6 +1001,12 @@ impl Store {
         } else {
             self.route_result(&tx, message, result)?;
         }
+        // Task edge: normal completion of a task-attached kickoff moves
+        // the task to review and binds head_sha to the reported commit.
+        // Any other terminal leaves the task flagged where it stands.
+        if status == "completed" {
+            self.task_on_completed(&tx, message, result)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -703,6 +1026,10 @@ impl Store {
         .to_string();
         let payload = json!({
             "worker": message.alias, "message": message.id, "result": result,
+            // Self-describing for the PM: which task this reports on and
+            // the commit the worker claims (NULL when unreported).
+            "task": message.task_id,
+            "sha": result.get("sha"),
         });
         // Single line: the routed body may be delivered to a pty
         // endpoint, which rejects control characters. Compact JSON
@@ -713,9 +1040,9 @@ impl Store {
             + &payload.to_string();
         self.agent_in(tx, target)?;
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,created)
-             VALUES(?,?,?,NULL,'worker_result',?)",
-            params![delivery, target, prompt, now()],
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
+             VALUES(?,?,?,NULL,'worker_result',?,?)",
+            params![delivery, target, prompt, message.task_id, now()],
         )?;
         Self::event(
             tx,
@@ -773,9 +1100,9 @@ impl Store {
         };
         self.agent_in(tx, target)?;
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,created)
-             VALUES(?,?,?,NULL,'worker_notice',?)",
-            params![delivery, target, prompt, now()],
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
+             VALUES(?,?,?,NULL,'worker_notice',?,?)",
+            params![delivery, target, prompt, message.task_id, now()],
         )?;
         Self::event(
             tx,
@@ -841,12 +1168,14 @@ impl Store {
         status: &str,
         note: Option<&str>,
         by: &str,
+        sha: Option<&str>,
     ) -> Result<Message> {
         if !matches!(status, "interrupted" | "completed" | "failed") {
             return Err(Error::rejected(format!(
                 "reconcile status must be interrupted|completed|failed, not '{status}'"
             )));
         }
+        let sha = sha.map(check_commit_sha).transpose()?;
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         let message = self
@@ -863,6 +1192,7 @@ impl Store {
             "status": status,
             "via": "operator_reconcile",
             "note": note,
+            "sha": sha,
         });
         // The state guard in the UPDATE is the atomic fence against a
         // concurrent transition between the check and the write.
@@ -886,6 +1216,12 @@ impl Store {
             self.route_result(&tx, &message, &result)?;
         } else {
             self.route_notice(&tx, &message, "interrupted", &result)?;
+        }
+        // An operator reconcile to `completed` behaves like a normal
+        // completion for the task — same SHA rules: an explicit `sha`
+        // field on the result, else a `SHA:` line in the note, else NULL.
+        if status == "completed" {
+            self.task_on_completed(&tx, &message, &result)?;
         }
         // The fence lifts when the last unknown reconciles — attention
         // drops to stopped and disabled, the same condition as an
@@ -1125,19 +1461,22 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         self.agent_in(&conn, alias)?;
         let mut stmt = conn.prepare(
-            "SELECT seq,alias,kind,payload,at FROM events
+            "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
              WHERE alias=? AND seq>? ORDER BY seq LIMIT ?",
         )?;
-        let rows = stmt.query_map(params![alias, after, limit], |row| {
-            let payload: String = row.get("payload")?;
-            Ok(Event {
-                seq: row.get("seq")?,
-                alias: row.get("alias")?,
-                kind: row.get("kind")?,
-                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
-                at: row.get("at")?,
-            })
-        })?;
+        let rows = stmt.query_map(params![alias, after, limit], row_event)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The `job events` view: every scoped event for the job across
+    /// alias rows, ordered. One indexed query — no separate stream.
+    pub fn job_events(&self, job_id: &str, after: i64, limit: i64) -> Result<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
+             WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![job_id, after, limit], row_event)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1164,12 +1503,1157 @@ impl Store {
         )?;
         Ok(cursor)
     }
+
+    // ---- Jobs, tasks, verdicts (the work axis) ----
+
+    fn job_in(&self, conn: &Connection, id: &str) -> Result<Job> {
+        conn.query_row("SELECT * FROM jobs WHERE id=?", [id], row_job)
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::rejected(format!("No such job '{id}'"))
+                }
+                other => other.into(),
+            })
+    }
+
+    fn task_in(&self, conn: &Connection, id: &str) -> Result<Task> {
+        conn.query_row("SELECT * FROM tasks WHERE id=?", [id], row_task)
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::rejected(format!("No such task '{id}'"))
+                }
+                other => other.into(),
+            })
+    }
+
+    fn agent_opt_in(&self, conn: &Connection, alias: &str) -> Result<Option<Agent>> {
+        match conn.query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent) {
+            Ok(a) => Ok(Some(a)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn job(&self, id: &str) -> Result<Job> {
+        let conn = self.conn.lock().unwrap();
+        self.job_in(&conn, id)
+    }
+
+    pub fn task(&self, id: &str) -> Result<Task> {
+        let conn = self.conn.lock().unwrap();
+        self.task_in(&conn, id)
+    }
+
+    pub fn task_opt(&self, id: &str) -> Result<Option<Task>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row("SELECT * FROM tasks WHERE id=?", [id], row_task) {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Jobs for `job list` — non-terminal by default, `all` includes
+    /// done/cancelled/failed; `state` filters exactly.
+    pub fn jobs(&self, state: Option<&str>, all: bool) -> Result<Vec<Job>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if state.is_some() {
+            "SELECT * FROM jobs WHERE state=? ORDER BY created"
+        } else if all {
+            "SELECT * FROM jobs ORDER BY created"
+        } else {
+            "SELECT * FROM jobs WHERE state NOT IN ('done','cancelled','failed')
+             ORDER BY created"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = if let Some(s) = state {
+            stmt.query_map([s], row_job)?
+        } else {
+            stmt.query_map([], row_job)?
+        };
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn tasks_for_job(&self, job_id: &str) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM tasks WHERE job_id=? ORDER BY created")?;
+        let rows = stmt.query_map([job_id], row_task)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// An alias's non-terminal task assignments — derived, never stored.
+    pub fn tasks_for_assignee(&self, alias: &str) -> Result<Vec<Task>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM tasks WHERE assignee=?
+             AND state NOT IN ('verified','done','cancelled','failed')
+             ORDER BY updated",
+        )?;
+        let rows = stmt.query_map([alias], row_task)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn verdicts_for_task(&self, task_id: &str) -> Result<Vec<Verdict>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT * FROM verdicts WHERE task_id=? ORDER BY revision, seq")?;
+        let rows = stmt.query_map([task_id], row_verdict)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every message attached to a task (kickoffs + `--task` sends),
+    /// oldest first — `job task show`'s delivery view.
+    pub fn messages_for_task(&self, task_id: &str) -> Result<Vec<Message>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM messages WHERE task_id=? ORDER BY seq")?;
+        let rows = stmt.query_map([task_id], row_message)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// `job new`: bookkeeping, not spawning. One transaction writes the
+    /// job (`open`) plus its default task `<job>-t1` covering the spec.
+    /// Idempotent on the client key: same id + same spec hash +
+    /// same PM + same issue → `duplicate:true`; any difference →
+    /// `rejected`, the same rule `enqueue` uses for message ids.
+    /// One leaf issue maps to at most one non-terminal job.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_job(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        spec_path: &str,
+        spec_sha256: &str,
+        pm_alias: &str,
+        issue_id: Option<&str>,
+        repo: Option<&str>,
+        base_ref: Option<&str>,
+        max_revisions: i64,
+        task_title: Option<&str>,
+    ) -> Result<(bool, Job)> {
+        identifier(id, "Job id")?;
+        if let Some(issue) = issue_id {
+            crate::issue::model::check_id(issue)?;
+        }
+        if max_revisions < 0 {
+            return Err(Error::rejected("--max-revisions must be >= 0"));
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        self.agent_in(&tx, pm_alias)?;
+        if let Ok(existing) = self.job_in(&tx, id) {
+            let same = existing.pm_alias == pm_alias
+                && existing.spec_path == spec_path
+                && existing.spec_sha256.as_deref() == Some(spec_sha256)
+                && existing.issue_id.as_deref() == issue_id;
+            if !same {
+                return Err(Error::rejected(
+                    "Job id was already used with different content",
+                ));
+            }
+            return Ok((true, existing));
+        }
+        if let Some(issue) = issue_id {
+            let holder: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM jobs WHERE issue_id=?
+                     AND state NOT IN ('done','cancelled','failed')",
+                    [issue],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(holder) = holder {
+                return Err(Error::rejected(format!(
+                    "Issue {issue} already maps to job '{holder}' — \
+                     one leaf issue maps to one job"
+                )));
+            }
+        }
+        let t = now();
+        tx.execute(
+            "INSERT INTO jobs(id,title,spec_path,spec_sha256,pm_alias,issue_id,
+             repo,base_ref,state,max_revisions,created,updated)
+             VALUES(?,?,?,?,?,?,?,?,'open',?,?,?)",
+            params![
+                id,
+                title,
+                spec_path,
+                spec_sha256,
+                pm_alias,
+                issue_id,
+                repo,
+                base_ref,
+                max_revisions,
+                t,
+                t
+            ],
+        )?;
+        Self::event_scoped(
+            &tx,
+            pm_alias,
+            "job_created",
+            json!({"job": id, "spec": spec_path, "issue": issue_id}),
+            Some(id),
+            None,
+        )?;
+        let task_id = format!("{id}-t1");
+        tx.execute(
+            "INSERT INTO tasks(id,job_id,title,state,created,updated)
+             VALUES(?,?,?,'draft',?,?)",
+            params![task_id, id, task_title.or(title), t, t],
+        )?;
+        Self::event_scoped(
+            &tx,
+            pm_alias,
+            "task_created",
+            json!({"task": task_id, "job": id}),
+            Some(id),
+            Some(&task_id),
+        )?;
+        tx.commit()?;
+        Ok((false, self.job_in(&conn, id)?))
+    }
+
+    /// `job task add`: a draft task in an open job. `--assignee` is
+    /// validated against the job's group immediately — eligible workers
+    /// are the PM itself or agents whose `params.upstream` names it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_task(
+        &self,
+        job_id: &str,
+        id: &str,
+        title: Option<&str>,
+        assignee: Option<&str>,
+        spec_path: Option<&str>,
+        acceptance: Option<&str>,
+        worktree: Option<&str>,
+        branch: Option<&str>,
+        base_sha: Option<&str>,
+    ) -> Result<Task> {
+        identifier(id, "Task id")?;
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let job = self.job_in(&tx, job_id)?;
+        if job.state != "open" {
+            return Err(Error::rejected(format!(
+                "Job '{job_id}' is '{}' — tasks can only be added to an open job",
+                job.state
+            )));
+        }
+        if self.task_opt_in(&tx, id)? {
+            return Err(Error::rejected(format!(
+                "Task id '{id}' is already used — task ids are global"
+            )));
+        }
+        if let Some(w) = assignee {
+            let worker = self.agent_in(&tx, w)?;
+            self.check_group_member(&job, &worker)?;
+        }
+        let t = now();
+        tx.execute(
+            "INSERT INTO tasks(id,job_id,title,assignee,spec_path,acceptance,
+             worktree,branch,base_sha,state,created,updated)
+             VALUES(?,?,?,?,?,?,?,?,?,'draft',?,?)",
+            params![
+                id, job_id, title, assignee, spec_path, acceptance, worktree, branch, base_sha, t,
+                t
+            ],
+        )?;
+        Self::event_scoped(
+            &tx,
+            &job.pm_alias,
+            "task_created",
+            json!({"task": id, "job": job_id, "assignee": assignee}),
+            Some(job_id),
+            Some(id),
+        )?;
+        tx.commit()?;
+        self.task_in(&conn, id)
+    }
+
+    fn task_opt_in(&self, conn: &Connection, id: &str) -> Result<bool> {
+        Ok(conn
+            .query_row("SELECT 1 FROM tasks WHERE id=?", [id], |_| Ok(()))
+            .is_ok())
+    }
+
+    /// Eligible workers for a job: the PM itself or a group member
+    /// (`params.upstream == pm`). Dispatch can never bind outside the
+    /// job's group — routed results land on the PM via that same wire.
+    fn check_group_member(&self, job: &Job, worker: &Agent) -> Result<()> {
+        let member = worker.alias == job.pm_alias
+            || worker
+                .params
+                .as_ref()
+                .and_then(|p| p.get("upstream"))
+                .and_then(Value::as_str)
+                == Some(job.pm_alias.as_str());
+        if !member {
+            return Err(Error::rejected(format!(
+                "'{}' is not in job '{}'s group — join it first: \
+                 `cadence join {} <provider>`",
+                worker.alias, job.id, job.pm_alias
+            )));
+        }
+        Ok(())
+    }
+
+    /// `job dispatch`: one transaction — task `dispatched` at a new (or
+    /// retried) revision, the kickoff message enqueued, events scoped.
+    ///
+    /// Dispatch is legal from `draft`, `revising`, and — once the live
+    /// kickoff is terminal for any reason other than normal completion
+    /// — `dispatched`/`running`. A live kickoff makes re-dispatch an
+    /// idempotent retry of the SAME revision (deterministic
+    /// `cadence-dispatch:<task>:r<n>` id → `duplicate`, never a second
+    /// paste). `blocked` requires `job task reopen`, unless `--to`
+    /// reassigns — a new assignee is a fresh QA chain. `verified`,
+    /// `done`, `failed`, `cancelled` reject.
+    ///
+    /// Returns `(task, kickoff_message_id, duplicate, queued_behind_dead)`.
+    pub fn dispatch_task(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+    ) -> Result<(Task, String, bool, bool)> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let task = self.task_in(&tx, task_id)?;
+        let job = self.job_in(&tx, &task.job_id)?;
+        if job.state != "open" {
+            return Err(Error::rejected(format!(
+                "Job '{}' is '{}' — dispatch needs an open job",
+                job.id, job.state
+            )));
+        }
+        let assignee = to.or(task.assignee.as_deref()).ok_or_else(|| {
+            Error::rejected(format!(
+                "Task '{task_id}' has no assignee — \
+                 `cadence job dispatch {task_id} --to <worker>`"
+            ))
+        })?;
+        let worker = self.agent_in(&tx, assignee)?;
+        self.check_group_member(&job, &worker)?;
+
+        // Same-revision retry vs new revision.
+        let mut revision = task.revision;
+        match task.state.as_str() {
+            "draft" | "revising" => revision += 1,
+            "dispatched" | "running" => {
+                let live_id = task
+                    .dispatch_message
+                    .as_deref()
+                    .and_then(|m| self.message_in(&tx, m).ok().flatten())
+                    .filter(|m| !is_terminal(&m.state))
+                    .map(|m| m.id);
+                if let Some(live_id) = live_id {
+                    // Kickoff still in flight — a second dispatch is a
+                    // retry of this revision, not a new attempt: the
+                    // live kickoff id IS the dedupe key. Reassigning
+                    // under a live kickoff is refused — the pane may
+                    // already hold the paste.
+                    if to.is_some() && to != task.assignee.as_deref() {
+                        return Err(Error::rejected(format!(
+                            "Task '{task_id}' has a live kickoff — reassign \
+                             after it finishes or is reconciled"
+                        )));
+                    }
+                    tx.commit()?;
+                    return Ok((task, live_id, true, false));
+                }
+                revision += 1;
+            }
+            "blocked" => {
+                if to.is_some() && to != task.assignee.as_deref() {
+                    revision += 1;
+                } else {
+                    return Err(Error::rejected(format!(
+                        "Task '{task_id}' is blocked — `cadence job task reopen \
+                         {task_id}` re-scopes it, or `job dispatch {task_id} \
+                         --to <worker>` reassigns"
+                    )));
+                }
+            }
+            state => {
+                return Err(Error::rejected(format!(
+                    "Task '{task_id}' is '{state}' — dispatch is legal from \
+                     draft, revising, or after the live kickoff ended"
+                )))
+            }
+        }
+
+        // Deterministic kickoff id for a fresh mint: (task, revision,
+        // attempt). Live-kickoff retries never reach here — they return
+        // the live id above — so this only needs uniqueness across
+        // re-scopes: `job task reopen` resets revision to 0, and
+        // `attempt` (kickoffs already written) keeps the id fresh.
+        let attempt: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE task_id=? AND source='job_dispatch'",
+            [task_id],
+            |r| r.get(0),
+        )?;
+        let kickoff = message_id.map(str::to_string).unwrap_or_else(|| {
+            Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("cadence-dispatch:{task_id}:r{revision}:a{attempt}").as_bytes(),
+            )
+            .simple()
+            .to_string()
+        });
+        let body = kickoff_body(&job, &task, revision, &kickoff, &worker);
+        // PM self-task: the PM's own turn IS the report path — a
+        // reply_to to itself would fail enqueue's self-reply rule.
+        let reply_to = (assignee != job.pm_alias).then_some(job.pm_alias.as_str());
+        let (duplicate, _state) = self.enqueue_tx(
+            &tx,
+            assignee,
+            &body,
+            reply_to,
+            &kickoff,
+            "job_dispatch",
+            Some(task_id),
+        )?;
+        if duplicate {
+            return Ok((task, kickoff, true, false));
+        }
+        tx.execute(
+            "UPDATE tasks SET state='dispatched',revision=?,assignee=?,
+             dispatch_message=?,head_sha=NULL,error=NULL,updated=?
+             WHERE id=?",
+            params![revision, assignee, kickoff, now(), task_id],
+        )?;
+        Self::event_scoped(
+            &tx,
+            &job.pm_alias,
+            "task_dispatched",
+            json!({"task": task_id, "job": job.id, "assignee": assignee,
+                   "revision": revision, "message": kickoff, "by": by}),
+            Some(&job.id),
+            Some(task_id),
+        )?;
+        tx.commit()?;
+        let behind_dead = worker.endpoint.is_none() && worker.endpoint_kind != "inbox";
+        Ok((self.task_in(&conn, task_id)?, kickoff, false, behind_dead))
+    }
+
+    /// `job verdict`: validate + record + transition + notify in one
+    /// transaction. The verdict names the exact reported commit —
+    /// `sha == tasks.head_sha` and `state == 'review'` or it is
+    /// rejected. `revise` past `max_revisions` records the verdict and
+    /// escalates to `blocked` instead of looping.
+    ///
+    /// `reviewer` is resolved by the RPC layer (pane alias inside a
+    /// cadence pane, `--reviewer` outside it); `pane` records whether a
+    /// pane alias was present. Reviewer independence is enforced here:
+    /// reviewer == assignee is rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_verdict(
+        &self,
+        task_id: &str,
+        sha: &str,
+        verdict: &str,
+        reviewer: &str,
+        pane: Option<&str>,
+        evidence: Option<&str>,
+        message: Option<&str>,
+        expect_revision: Option<i64>,
+    ) -> Result<(Task, Verdict)> {
+        if !matches!(verdict, "pass" | "revise" | "blocked") {
+            return Err(Error::rejected(format!(
+                "Verdict must be pass|revise|blocked, not '{verdict}'"
+            )));
+        }
+        let sha = check_commit_sha(sha)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let task = self.task_in(&tx, task_id)?;
+        let job = self.job_in(&tx, &task.job_id)?;
+        if task.state != "review" {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is '{}', not 'review' — a verdict lands \
+                 only on a reported revision",
+                task.state
+            )));
+        }
+        if let Some(r) = expect_revision {
+            if r != task.revision {
+                return Err(Error::rejected(format!(
+                    "Verdict names revision {r} but task '{task_id}' is at \
+                     revision {} — stale verdict",
+                    task.revision
+                )));
+            }
+        }
+        let head = task.head_sha.clone().ok_or_else(|| {
+            Error::rejected(format!(
+                "Task '{task_id}' reported no SHA — record it first with \
+                 `cadence job task sha {task_id} <sha>`"
+            ))
+        })?;
+        if sha != head {
+            return Err(Error::rejected(format!(
+                "Verdict SHA {sha} does not match the task's reported \
+                 head_sha {head} — verify the exact reported commit"
+            )));
+        }
+        if task.assignee.as_deref() == Some(reviewer) {
+            return Err(Error::rejected(format!(
+                "Reviewer '{reviewer}' is the task's assignee — a worker \
+                 cannot verdict its own revision"
+            )));
+        }
+        let evidence_json: Option<String> = evidence.map(|e| {
+            serde_json::from_str::<Value>(e)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| json!({"text": e}).to_string())
+        });
+        tx.execute(
+            "INSERT INTO verdicts(task_id,revision,sha,verdict,reviewer,evidence,
+             message,created) VALUES(?,?,?,?,?,?,?,?)",
+            params![
+                task_id,
+                task.revision,
+                sha,
+                verdict,
+                reviewer,
+                evidence_json,
+                message,
+                now()
+            ],
+        )?;
+        let seq = tx.last_insert_rowid();
+        let next = match verdict {
+            "pass" => "verified",
+            "revise" if task.revision < job.max_revisions => "revising",
+            _ => "blocked",
+        };
+        let error = match (verdict, next) {
+            ("revise", "blocked") => Some("revision cap reached".to_string()),
+            ("blocked", _) => Some("verdict: blocked".to_string()),
+            _ => None,
+        };
+        tx.execute(
+            "UPDATE tasks SET state=?,error=?,updated=? WHERE id=?",
+            params![next, error, now(), task_id],
+        )?;
+        Self::event_scoped(
+            &tx,
+            &job.pm_alias,
+            "verdict_recorded",
+            json!({"task": task_id, "job": job.id, "revision": task.revision,
+                   "sha": sha, "verdict": verdict, "reviewer": reviewer,
+                   "pane": pane, "state": next}),
+            Some(&job.id),
+            Some(task_id),
+        )?;
+        if next != "verified" {
+            Self::event_scoped(
+                &tx,
+                &job.pm_alias,
+                if next == "blocked" {
+                    "task_blocked"
+                } else {
+                    "task_revising"
+                },
+                json!({"task": task_id, "revision": task.revision,
+                       "verdict": verdict}),
+                Some(&job.id),
+                Some(task_id),
+            )?;
+        }
+        let note = match next {
+            "verified" => format!(
+                "verdict pass on task {task_id} r{} — verified (sha {sha}, \
+                 reviewer {reviewer}). Accept: `cadence job accept {task_id}`.",
+                task.revision
+            ),
+            "revising" => format!(
+                "verdict revise on task {task_id} r{} — re-dispatch: \
+                 `cadence job dispatch {task_id}`.",
+                task.revision
+            ),
+            _ => format!(
+                "task {task_id} blocked at r{} (verdict {verdict}, \
+                 reviewer {reviewer}) — `cadence job task reopen {task_id}` \
+                 re-scopes it.",
+                task.revision
+            ),
+        };
+        self.route_job_event(&tx, &job, &task, next, &format!("verdict:{seq}"), &note)?;
+        tx.commit()?;
+        let verdict_row = self.verdict_in(&conn, seq)?;
+        Ok((self.task_in(&conn, task_id)?, verdict_row))
+    }
+
+    /// `job accept`: verified → done, the acceptance edge. `--merged-sha`
+    /// is recorded as evidence on the event/notification — cadence never
+    /// runs git merges itself.
+    pub fn accept_task(&self, task_id: &str, merged_sha: Option<&str>, by: &str) -> Result<Task> {
+        if let Some(s) = merged_sha {
+            check_commit_sha(s)?;
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let task = self.task_in(&tx, task_id)?;
+        let job = self.job_in(&tx, &task.job_id)?;
+        if task.state != "verified" {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is '{}', not 'verified' — \
+                 `cadence job verdict {task_id} --sha <sha> --pass` first",
+                task.state
+            )));
+        }
+        tx.execute(
+            "UPDATE tasks SET state='done',updated=? WHERE id=?",
+            params![now(), task_id],
+        )?;
+        Self::event_scoped(
+            &tx,
+            &job.pm_alias,
+            "task_done",
+            json!({"task": task_id, "job": job.id, "revision": task.revision,
+                   "merged_sha": merged_sha, "by": by}),
+            Some(&job.id),
+            Some(task_id),
+        )?;
+        self.route_job_event(
+            &tx,
+            &job,
+            &task,
+            "done",
+            "accept",
+            &format!(
+                "task {task_id} done at r{} — job '{}'.",
+                task.revision, job.id
+            ),
+        )?;
+        tx.commit()?;
+        self.task_in(&conn, task_id)
+    }
+
+    /// `job task reopen`: blocked/verified/failed → draft, revision
+    /// resets to 0 — a re-scope, not a continuation. Operator intent.
+    pub fn reopen_task(&self, task_id: &str, by: &str) -> Result<Task> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let task = self.task_in(&tx, task_id)?;
+        if !matches!(task.state.as_str(), "blocked" | "verified" | "failed") {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is '{}' — reopen is legal from \
+                 blocked, verified or failed",
+                task.state
+            )));
+        }
+        tx.execute(
+            "UPDATE tasks SET state='draft',revision=0,head_sha=NULL,
+             error=NULL,updated=? WHERE id=?",
+            params![now(), task_id],
+        )?;
+        Self::event_scoped(
+            &tx,
+            &self.job_in(&tx, &task.job_id)?.pm_alias,
+            "task_reopened",
+            json!({"task": task_id, "by": by}),
+            Some(&task.job_id),
+            Some(task_id),
+        )?;
+        tx.commit()?;
+        self.task_in(&conn, task_id)
+    }
+
+    /// `job task fail`: PM marks a task unrecoverable. Terminal.
+    pub fn fail_task(&self, task_id: &str, reason: &str, by: &str) -> Result<Task> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let task = self.task_in(&tx, task_id)?;
+        if is_task_terminal(&task.state) {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is already '{}'",
+                task.state
+            )));
+        }
+        tx.execute(
+            "UPDATE tasks SET state='failed',error=?,updated=? WHERE id=?",
+            params![reason, now(), task_id],
+        )?;
+        Self::event_scoped(
+            &tx,
+            &self.job_in(&tx, &task.job_id)?.pm_alias,
+            "task_failed",
+            json!({"task": task_id, "reason": reason, "by": by}),
+            Some(&task.job_id),
+            Some(task_id),
+        )?;
+        tx.commit()?;
+        self.task_in(&conn, task_id)
+    }
+
+    /// `job task cancel`: task → cancelled; its kickoff is cancelled in
+    /// the same transaction when still `queued`/`submitting` — a
+    /// `running` kickoff cannot be unpasted and finishes on its own.
+    /// Agents are never stopped by a job.
+    pub fn cancel_task(&self, task_id: &str, by: &str) -> Result<Task> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let task = self.task_in(&tx, task_id)?;
+        if is_task_terminal(&task.state) {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is already '{}'",
+                task.state
+            )));
+        }
+        self.cancel_task_tx(&tx, &task, by)?;
+        tx.commit()?;
+        self.task_in(&conn, task_id)
+    }
+
+    fn cancel_task_tx(&self, tx: &Connection, task: &Task, by: &str) -> Result<()> {
+        if let Some(kickoff) = &task.dispatch_message {
+            tx.execute(
+                "UPDATE messages SET state='cancelled',completed=?
+                 WHERE id=? AND state IN ('queued','submitting')",
+                params![now(), kickoff],
+            )?;
+        }
+        tx.execute(
+            "UPDATE tasks SET state='cancelled',updated=? WHERE id=?",
+            params![now(), task.id],
+        )?;
+        Self::event_scoped(
+            tx,
+            &self.job_in(tx, &task.job_id)?.pm_alias,
+            "task_cancelled",
+            json!({"task": task.id, "by": by}),
+            Some(&task.job_id),
+            Some(&task.id),
+        )?;
+        Ok(())
+    }
+
+    /// `job cancel`: job → cancelled, every non-terminal task cancelled
+    /// in one transaction (queued kickoffs included). Running kickoffs
+    /// are left alone — agents are never stopped by a job.
+    pub fn cancel_job(&self, job_id: &str, by: &str) -> Result<Job> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let job = self.job_in(&tx, job_id)?;
+        if matches!(job.state.as_str(), "done" | "cancelled" | "failed") {
+            return Err(Error::rejected(format!(
+                "Job '{job_id}' is already '{}'",
+                job.state
+            )));
+        }
+        let tasks: Vec<Task> = {
+            let mut stmt = tx.prepare(
+                "SELECT * FROM tasks WHERE job_id=? AND state NOT IN
+                 ('verified','done','cancelled','failed')",
+            )?;
+            let rows = stmt.query_map([job_id], row_task)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for task in &tasks {
+            self.cancel_task_tx(&tx, task, by)?;
+        }
+        tx.execute(
+            "UPDATE jobs SET state='cancelled',updated=? WHERE id=?",
+            params![now(), job_id],
+        )?;
+        Self::event_scoped(
+            &tx,
+            &job.pm_alias,
+            "job_cancelled",
+            json!({"job": job_id, "tasks": tasks.len(), "by": by}),
+            Some(job_id),
+            None,
+        )?;
+        tx.commit()?;
+        self.job_in(&conn, job_id)
+    }
+
+    /// `job close`: legal only when every task is `done`.
+    pub fn close_job(&self, job_id: &str, by: &str) -> Result<Job> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let job = self.job_in(&tx, job_id)?;
+        if job.state != "open" {
+            return Err(Error::rejected(format!(
+                "Job '{job_id}' is '{}' — only an open job closes",
+                job.state
+            )));
+        }
+        let open: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM tasks WHERE job_id=? AND state != 'done'")?;
+            let rows = stmt.query_map([job_id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !open.is_empty() {
+            return Err(Error::rejected(format!(
+                "Job '{job_id}' has tasks not done: {} — \
+                 `cadence job cancel {job_id}` abandons the job instead",
+                open.join(", ")
+            )));
+        }
+        tx.execute(
+            "UPDATE jobs SET state='done',updated=? WHERE id=?",
+            params![now(), job_id],
+        )?;
+        Self::event_scoped(
+            &tx,
+            &job.pm_alias,
+            "job_closed",
+            json!({"job": job_id, "by": by}),
+            Some(job_id),
+            None,
+        )?;
+        tx.commit()?;
+        self.job_in(&conn, job_id)
+    }
+
+    /// `job task sha`: record the reported commit manually — the repair
+    /// path when a kickoff completed without `SHA:` or `--sha`. Never
+    /// infers: the caller names the SHA explicitly. Recording is an
+    /// event; overwriting a different SHA is rejected.
+    pub fn set_task_sha(&self, task_id: &str, sha: &str, by: &str) -> Result<Task> {
+        let sha = check_commit_sha(sha)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let task = self.task_in(&tx, task_id)?;
+        if task.state != "review" {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is '{}' — `job task sha` repairs a \
+                 reported revision awaiting verdict",
+                task.state
+            )));
+        }
+        if let Some(head) = &task.head_sha {
+            if *head == sha {
+                return Ok(task);
+            }
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' already reports head_sha {head} — \
+                 SHA is bound at report time, not edited"
+            )));
+        }
+        tx.execute(
+            "UPDATE tasks SET head_sha=?,updated=? WHERE id=?",
+            params![sha, now(), task_id],
+        )?;
+        Self::event_scoped(
+            &tx,
+            &self.job_in(&tx, &task.job_id)?.pm_alias,
+            "task_sha_recorded",
+            json!({"task": task_id, "sha": sha, "by": by}),
+            Some(&task.job_id),
+            Some(task_id),
+        )?;
+        tx.commit()?;
+        self.task_in(&conn, task_id)
+    }
+
+    /// Routed job notification to the PM — `source='job_event'` so it
+    /// gets the same fire-and-forget delivery as `worker_result`:
+    /// render-miss retries, park-instead-of-fence, never a turn of the
+    /// PM's own. Deterministic id dedupes a retried write. A removed
+    /// PM simply gets no copy — the event row already records it.
+    /// `new_state` is the task state the notification announces — the
+    /// caller's UPDATE already landed, so the in-memory `task.state`
+    /// is stale by the time this runs. `dedupe` names the triggering
+    /// transition (e.g. `verdict:42`) so each distinct event notifies
+    /// once while a retried write is a no-op.
+    fn route_job_event(
+        &self,
+        tx: &Connection,
+        job: &Job,
+        task: &Task,
+        new_state: &str,
+        dedupe: &str,
+        note: &str,
+    ) -> Result<()> {
+        if self.agent_opt_in(tx, &job.pm_alias)?.is_none() {
+            return Ok(());
+        }
+        let delivery = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!(
+                "cadence-job:{}:r{}:{}:{}",
+                task.id, task.revision, new_state, dedupe
+            )
+            .as_bytes(),
+        )
+        .simple()
+        .to_string();
+        if self.message_in(tx, &delivery)?.is_some() {
+            return Ok(());
+        }
+        let payload = json!({"job": job.id, "task": task.id,
+                             "revision": task.revision, "state": new_state});
+        let body = format!("Cadence job {}: {note} {payload}", job.id);
+        tx.execute(
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
+             VALUES(?,?,?,NULL,'job_event',?,?)",
+            params![delivery, job.pm_alias, body, task.id, now()],
+        )?;
+        Self::event_scoped(
+            tx,
+            &job.pm_alias,
+            "queued",
+            json!({"message": delivery, "source": "job_event"}),
+            Some(&job.id),
+            Some(&task.id),
+        )?;
+        Ok(())
+    }
+
+    /// Task edge for `mark_running`: a task-attached kickoff observed
+    /// `running` moves its task `dispatched → running`. Only
+    /// `job_dispatch` messages are kickoffs — `--task` follow-ups and
+    /// `job_event` notifications attach `task_id` for indexing but
+    /// never drive state. Guarded on the stored state so a cancelled
+    /// or already-advanced task is untouched.
+    fn task_on_running(&self, tx: &Connection, message_id: &str, alias: &str) -> Result<()> {
+        let (task_id, source): (Option<String>, String) = tx.query_row(
+            "SELECT task_id,source FROM messages WHERE id=?",
+            [message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if source != "job_dispatch" {
+            return Ok(());
+        }
+        let Some(task_id) = task_id else {
+            return Ok(());
+        };
+        let Ok(task) = self.task_in(tx, &task_id) else {
+            return Ok(());
+        };
+        if task.state != "dispatched" {
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE tasks SET state='running',updated=? WHERE id=? AND state='dispatched'",
+            params![now(), task.id],
+        )?;
+        Self::event_scoped(
+            tx,
+            alias,
+            "task_running",
+            json!({"task": task.id, "job": task.job_id,
+                   "revision": task.revision, "message": message_id}),
+            Some(&task.job_id),
+            Some(&task.id),
+        )?;
+        Ok(())
+    }
+
+    /// Task edge for `finish`/`reconcile` on a task-attached kickoff:
+    /// normal completion moves the task to `review` with `head_sha`
+    /// bound to the reported commit — explicit `result.sha` first, else
+    /// the last `SHA: <hex>` line of the result text (managed endpoints
+    /// never call `message result`). A completion with no SHA still
+    /// reaches `review` with NULL; `job task sha` repairs it. Any
+    /// non-completion terminal leaves the task where it is — `job show`
+    /// reports the drift and `job dispatch` starts the next revision.
+    fn task_on_completed(&self, tx: &Connection, message: &Message, result: &Value) -> Result<()> {
+        // Only a dispatch kickoff carries the work axis: `--task`
+        // follow-ups and `job_event` notifications attach `task_id`
+        // for indexing but completing them must not move the task.
+        if message.source != "job_dispatch" {
+            return Ok(());
+        }
+        let Some(task_id) = message.task_id.as_deref() else {
+            return Ok(());
+        };
+        let Ok(task) = self.task_in(tx, task_id) else {
+            return Ok(());
+        };
+        if !matches!(task.state.as_str(), "dispatched" | "running") {
+            return Ok(());
+        }
+        let sha = result
+            .get("sha")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                ["text", "note"].iter().find_map(|field| {
+                    result
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .and_then(last_sha_line)
+                })
+            });
+        tx.execute(
+            "UPDATE tasks SET state='review',head_sha=?,updated=?
+             WHERE id=? AND state IN ('dispatched','running')",
+            params![sha, now(), task_id],
+        )?;
+        Self::event_scoped(
+            tx,
+            &message.alias,
+            "task_reported",
+            json!({"task": task_id, "job": task.job_id,
+                   "revision": task.revision, "message": message.id,
+                   "sha": sha}),
+            Some(&task.job_id),
+            Some(task_id),
+        )?;
+        Ok(())
+    }
+
+    fn verdict_in(&self, conn: &Connection, seq: i64) -> Result<Verdict> {
+        conn.query_row("SELECT * FROM verdicts WHERE seq=?", [seq], row_verdict)
+            .map_err(Into::into)
+    }
+}
+
+/// Terminal task states — verdicts/acceptance/cancellation are closed
+/// to these. `verified` sits between review and done (accept pending).
+fn is_task_terminal(state: &str) -> bool {
+    matches!(state, "verified" | "done" | "cancelled" | "failed")
+}
+
+/// Terminal message states — same set `daemon::is_terminal` uses;
+/// duplicated here so store code doesn't reach into the daemon module.
+fn is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "completed" | "failed" | "interrupted" | "unknown" | "cancelled"
+    )
+}
+
+/// A reported commit must be an explicit hex object id — 40 hex
+/// (SHA-1) or 64 (SHA-256 repos). Never inferred, never partial.
+pub fn check_commit_sha(sha: &str) -> Result<String> {
+    let ok = matches!(sha.len(), 40 | 64) && sha.chars().all(|c| c.is_ascii_hexdigit());
+    if ok {
+        Ok(sha.to_ascii_lowercase())
+    } else {
+        Err(Error::rejected(format!(
+            "'{sha}' is not a commit SHA — expected 40 or 64 hex characters"
+        )))
+    }
+}
+
+/// The `SHA: <hex>` convention for managed endpoints (A3): the last
+/// matching line of a result text is the reported commit. Managed
+/// `codex`/`claude`/`fake` turns complete from final text and never
+/// call `message result --sha`, so the kickoff asks the agent to end
+/// its answer with this line. The LAST line wins — a worker discussing
+/// SHAs mid-answer cannot shadow the trailer it ends with.
+fn last_sha_line(text: &str) -> Option<String> {
+    text.lines().rev().find_map(|line| {
+        let hex = line
+            .trim()
+            .strip_prefix("SHA:")
+            .or_else(|| line.trim().strip_prefix("sha:"))?
+            .trim();
+        check_commit_sha(hex).ok()
+    })
+}
+
+/// The dispatch body — one line, control-char free, ≤4000 chars (the
+/// pty constraint that already shapes bootstrap messages). Pointer-first:
+/// the spec path, scope claim and acceptance reference, then the exact
+/// report contract. Managed endpoints never run `message result`, so
+/// they get the `SHA:`-trailer convention instead of `--sha`.
+fn kickoff_body(
+    job: &Job,
+    task: &Task,
+    revision: i64,
+    message_id: &str,
+    assignee: &Agent,
+) -> String {
+    let spec = task.spec_path.as_deref().unwrap_or(&job.spec_path);
+    let clean = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect()
+    };
+    let mut scope = String::new();
+    if let Some(w) = &task.worktree {
+        scope += &format!(" worktree {},", clean(w));
+    }
+    if let Some(b) = &task.branch {
+        scope += &format!(" branch {},", clean(b));
+    }
+    if let Some(s) = &task.base_sha {
+        scope += &format!(" base {},", clean(s));
+    }
+    if !scope.is_empty() {
+        scope.pop(); // trailing comma
+        scope = format!(" Scope:{}.", scope);
+    }
+    let acceptance = task
+        .acceptance
+        .as_deref()
+        .map(|a| format!(" Acceptance: {}.", clean(a)))
+        .unwrap_or_default();
+    let issue = job
+        .issue_id
+        .as_deref()
+        .map(|i| {
+            format!(
+                " This job tracks issue {i} — if you write an agent-note, \
+                 put the header line `Issue: {i}` in it."
+            )
+        })
+        .unwrap_or_default();
+    let managed = matches!(
+        assignee.endpoint_kind.as_str(),
+        "managed" | "managed-ws" | "fake"
+    );
+    let report = if managed {
+        " Report when done: end your final answer with a one-line \
+         summary followed by a last line `SHA: <40-hex>` naming the \
+         commit you produced — the daemon reads that line as the \
+         reported revision."
+            .to_string()
+    } else {
+        format!(
+            " Report when done: `cadence message result {message_id} \
+             --token <turn_id> --text '<summary>' --sha \"$(git rev-parse \
+             HEAD)\"` — `cadence self` shows the turn_id."
+        )
+    };
+    let body = format!(
+        "Cadence task {} (job {}, revision {}): implement per spec at \
+         {}.{}{}{}{} Do not report a SHA you have not committed.",
+        task.id,
+        job.id,
+        revision,
+        clean(spec),
+        scope,
+        acceptance,
+        issue,
+        report
+    );
+    // The pty body ceiling is 4000 chars; truncate the free-form middle
+    // (acceptance) rather than the contract tail. The suffix and the
+    // report contract must fit inside the ceiling too.
+    if body.len() > 4000 {
+        let suffix = "… (truncated — full criteria in the spec file).";
+        let room = 4000usize.saturating_sub(suffix.len() + report.len());
+        // Byte budget, not char count — spec text may be multibyte.
+        let mut cut = String::new();
+        for c in body.chars() {
+            if cut.len() + c.len_utf8() > room {
+                break;
+            }
+            cut.push(c);
+        }
+        cut += suffix;
+        cut += &report;
+        return cut;
+    }
+    body
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    const SHA40_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA40_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
@@ -1353,7 +2837,313 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         Store::open(&db).unwrap();
+    }
+
+    /// A seeded v3 database: one agent, one unattached message, one
+    /// event — the "copy of the live database" shape A7 names.
+    fn v3_db(dir: &TempDir) -> std::path::PathBuf {
+        let db = dir.path().join("t.sqlite3");
+        let cwd = dir.path().join("w");
+        std::fs::create_dir(&cwd).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &cwd);
+            s.enqueue("a1", "old work", None, "m1", "user").unwrap();
+        }
+        // Downgrade to a genuine v3: drop the v4 objects + columns.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE verdicts; DROP TABLE tasks; DROP TABLE jobs;
+             DROP INDEX msg_task; DROP INDEX events_job;
+             ALTER TABLE messages DROP COLUMN task_id;
+             ALTER TABLE events DROP COLUMN job_id;
+             ALTER TABLE events DROP COLUMN task_id;
+             UPDATE schema_version SET version=3;",
+        )
+        .unwrap();
+        drop(conn);
+        db
+    }
+
+    #[test]
+    fn migration_v3_to_v4_converges_and_preserves_rows() {
+        let dir = TempDir::new().unwrap();
+        let db = v3_db(&dir);
+        {
+            let s = Store::open(&db).unwrap();
+            // Old rows read cleanly: the pre-v4 message is unattached.
+            let m = s.message("m1").unwrap().unwrap();
+            assert_eq!(m.task_id, None);
+            assert_eq!(m.body, "old work");
+            // The new tables exist and take writes.
+            s.create_job(
+                "j1",
+                None,
+                "/s.md",
+                &"0".repeat(64),
+                "a1",
+                Some("CAD-1"),
+                None,
+                None,
+                2,
+                None,
+            )
+            .unwrap();
+            let v: i64 = s
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, 4);
+        }
+        // Half-applied: v4 objects present but version rolled back —
+        // reopening must converge, not fail on duplicates.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("UPDATE schema_version SET version=3", [])
+            .unwrap();
+        drop(conn);
+        {
+            let s = Store::open(&db).unwrap();
+            assert_eq!(s.job("j1").unwrap().id, "j1");
+            assert_eq!(s.message("m1").unwrap().unwrap().task_id, None);
+        }
+        // Deeper partial state: a new column exists while another was
+        // dropped and version is still 3 — the per-column checks heal it.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE events DROP COLUMN task_id;
+             UPDATE schema_version SET version=3;",
+        )
+        .unwrap();
+        drop(conn);
+        {
+            let s = Store::open(&db).unwrap();
+            // Scoped events work again → the column was re-added.
+            s.create_task("j1", "j1-t9", None, None, None, None, None, None, None)
+                .unwrap();
+            let evs = s.job_events("j1", 0, 50).unwrap();
+            assert!(evs.iter().any(|e| e.task_id.as_deref() == Some("j1-t9")));
+            let v: i64 = s
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, 4);
+        }
+    }
+
+    /// One helper: a pm + group worker + open job + task, dispatched.
+    fn seeded_task(s: &Store, cwd: &Path) -> String {
+        reg(s, "pm", cwd);
+        s.register_agent(&NewAgent {
+            alias: "w1",
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&json!({"upstream": "pm"}).to_string()),
+        })
+        .unwrap();
+        s.create_job(
+            "j1",
+            None,
+            "/s.md",
+            &"0".repeat(64),
+            "pm",
+            None,
+            None,
+            None,
+            2,
+            None,
+        )
+        .unwrap();
+        s.create_task("j1", "t1", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (t, kickoff, dup, _) = s.dispatch_task("t1", None, None, "test").unwrap();
+        assert!(!dup && t.state == "dispatched");
+        kickoff
+    }
+
+    fn run_kickoff(s: &Store, kickoff: &str) -> Message {
+        match s.take_queued("w1").unwrap() {
+            Take::Message(m) => assert_eq!(m.id, kickoff),
+            _ => panic!("expected kickoff"),
+        }
+        s.mark_running(kickoff, "fake-1-x").unwrap();
+        s.message(kickoff).unwrap().unwrap()
+    }
+
+    #[test]
+    fn finish_sha_binds_review_and_verdict() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        let m = run_kickoff(&s, &kickoff);
+        assert_eq!(s.task("t1").unwrap().state, "running");
+        // The `message result --sha` path: explicit result.sha wins.
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "text": "done", "sha": SHA40_A}),
+            None,
+        )
+        .unwrap();
+        let t = s.task("t1").unwrap();
+        assert_eq!(t.state, "review");
+        assert_eq!(t.head_sha.as_deref(), Some(SHA40_A));
+        // verdict binding: wrong sha rejected, right sha passes.
+        assert!(s
+            .record_verdict("t1", SHA40_B, "pass", "rev", None, None, None, None)
+            .is_err());
+        let (t, v) = s
+            .record_verdict("t1", SHA40_A, "pass", "rev", None, None, None, None)
+            .unwrap();
+        assert_eq!(t.state, "verified");
+        assert_eq!(v.revision, 1);
+    }
+
+    #[test]
+    fn finish_sha_trailer_and_missing_sha_repair() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        let m = run_kickoff(&s, &kickoff);
+        // Managed path: no result.sha — the LAST `SHA: <hex>` line wins.
+        let text = format!("summary\nSHA: {SHA40_B}\nmore text\nSHA: {SHA40_A}");
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "text": text}),
+            None,
+        )
+        .unwrap();
+        let t = s.task("t1").unwrap();
+        assert_eq!(t.head_sha.as_deref(), Some(SHA40_A), "{t:?}");
+
+        // Second task: no sha anywhere → review with NULL, task sha repairs.
+        s.create_task("j1", "t2", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, kick2, ..) = s.dispatch_task("t2", None, None, "test").unwrap();
+        let m2 = run_kickoff(&s, &kick2);
+        s.finish(
+            &m2,
+            "completed",
+            &json!({"status": "completed", "text": "no sha"}),
+            None,
+        )
+        .unwrap();
+        let t2 = s.task("t2").unwrap();
+        assert_eq!(t2.state, "review");
+        assert_eq!(t2.head_sha, None);
+        assert!(s
+            .record_verdict("t2", SHA40_A, "pass", "rev", None, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("job task sha"));
+        s.set_task_sha("t2", SHA40_A, "op").unwrap();
+        s.record_verdict("t2", SHA40_A, "pass", "rev", None, None, None, None)
+            .unwrap();
+        assert_eq!(s.task("t2").unwrap().state, "verified");
+    }
+
+    #[test]
+    fn reconcile_completed_behaves_like_finish() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        let m = run_kickoff(&s, &kickoff);
+        // Fence it, then operator-reconcile to completed with --sha.
+        s.finish(&m, "unknown", &json!({"status": "unknown"}), Some("lost"))
+            .unwrap();
+        assert_eq!(s.task("t1").unwrap().state, "running"); // untouched
+        s.reconcile(
+            &kickoff,
+            "completed",
+            Some("verified by hand"),
+            "operator",
+            Some(SHA40_A),
+        )
+        .unwrap();
+        let t = s.task("t1").unwrap();
+        assert_eq!(t.state, "review");
+        assert_eq!(t.head_sha.as_deref(), Some(SHA40_A));
+    }
+
+    #[test]
+    fn interrupted_and_failed_kickoffs_legalize_redispatch() {
+        for status in ["interrupted", "failed"] {
+            let (dir, s) = store();
+            let cwd = dir.path().join("w");
+            let kickoff = seeded_task(&s, &cwd);
+            let m = run_kickoff(&s, &kickoff);
+            s.finish(&m, status, &json!({"status": status}), Some("x"))
+                .unwrap();
+            // Task untouched (still running), dispatch starts r2.
+            assert_eq!(s.task("t1").unwrap().state, "running", "{status}");
+            let (t, k2, dup, _) = s.dispatch_task("t1", None, None, "test").unwrap();
+            assert!(!dup, "{status}");
+            assert_eq!(t.revision, 2, "{status}");
+            assert_ne!(k2, kickoff);
+            // Old rows preserved: r1 kickoff + events intact.
+            assert!(s.message(&kickoff).unwrap().is_some());
+            let evs = s.job_events("j1", 0, 50).unwrap();
+            assert!(evs.iter().filter(|e| e.kind == "task_dispatched").count() >= 2);
+        }
+    }
+
+    #[test]
+    fn verdict_revision_and_reviewer_guards() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        let m = run_kickoff(&s, &kickoff);
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "sha": SHA40_A}),
+            None,
+        )
+        .unwrap();
+        // Stale revision.
+        assert!(s
+            .record_verdict("t1", SHA40_A, "pass", "rev", None, None, None, Some(9))
+            .unwrap_err()
+            .to_string()
+            .contains("stale"));
+        // Reviewer == assignee.
+        assert!(s
+            .record_verdict("t1", SHA40_A, "pass", "w1", None, None, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("assignee"));
+        // Verdicts are append-only across revisions: revise then pass.
+        s.record_verdict("t1", SHA40_A, "revise", "rev", None, None, None, None)
+            .unwrap();
+        assert_eq!(s.task("t1").unwrap().state, "revising");
+        let (_, k2, ..) = s.dispatch_task("t1", None, None, "test").unwrap();
+        let m2 = run_kickoff(&s, &k2);
+        s.finish(
+            &m2,
+            "completed",
+            &json!({"status": "completed", "sha": SHA40_B}),
+            None,
+        )
+        .unwrap();
+        // The r1 sha is stale for r2.
+        assert!(s
+            .record_verdict("t1", SHA40_A, "pass", "rev", None, None, None, None)
+            .is_err());
+        s.record_verdict("t1", SHA40_B, "pass", "rev", None, None, None, None)
+            .unwrap();
+        let vs = s.verdicts_for_task("t1").unwrap();
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[0].revision, 1);
+        assert_eq!(vs[1].revision, 2);
     }
 }

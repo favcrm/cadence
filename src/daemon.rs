@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::adapter::{self, AdapterHooks, ProviderAdapter, ProviderRequest, TurnResult};
 use crate::error::{Error, Result};
 use crate::proto;
-use crate::store::{Agent, Message, Store, Take};
+use crate::store::{self, Message, Store, Take};
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
 pub struct Notify {
@@ -640,9 +640,23 @@ impl Shared {
                 Ok(json!({"state": "stopping"}))
             }
             "agent_register" => self.rpc_register(params),
-            "agent_list" => Ok(json!({
-                "agents": self.store.agents()?.iter().map(Agent::to_json).collect::<Vec<_>>()
-            })),
+            "agent_list" => {
+                let mut agents = Vec::new();
+                for agent in self.store.agents()? {
+                    let mut j = agent.to_json();
+                    // The alias's current non-terminal task assignments —
+                    // derived from tasks.assignee, never stored.
+                    let tasks: Vec<String> = self
+                        .store
+                        .tasks_for_assignee(&agent.alias)?
+                        .iter()
+                        .map(|t| t.id.clone())
+                        .collect();
+                    j["tasks"] = json!(tasks);
+                    agents.push(j);
+                }
+                Ok(json!({"agents": agents}))
+            }
             "agent_show" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
@@ -686,6 +700,21 @@ impl Shared {
             "agent_inbox" => self.rpc_inbox(params),
             "message_report" => self.rpc_message_report(params),
             "message_reconcile" => self.rpc_reconcile(params),
+            "job_new" => self.rpc_job_new(params),
+            "job_list" => self.rpc_job_list(params),
+            "job_show" => self.rpc_job_show(params),
+            "job_events" => self.rpc_job_events(params),
+            "job_cancel" => self.rpc_job_cancel(params),
+            "job_close" => self.rpc_job_close(params),
+            "task_new" => self.rpc_task_new(params),
+            "task_show" => self.rpc_task_show(params),
+            "task_dispatch" => self.rpc_task_dispatch(params),
+            "task_verdict" => self.rpc_task_verdict(params),
+            "task_accept" => self.rpc_task_accept(params),
+            "task_sha" => self.rpc_task_sha(params),
+            "task_fail" => self.rpc_task_fail(params),
+            "task_reopen" => self.rpc_task_reopen(params),
+            "task_cancel" => self.rpc_task_cancel(params),
             "agent_unfence" => self.rpc_unfence(params),
             "agent_stop" => self.rpc_stop(params),
             "agent_remove" => {
@@ -846,9 +875,12 @@ impl Shared {
         // internal routing contract cannot be forged through agent_send.
         let source = optional_str(params, "source").unwrap_or("user");
         proto::identifier(source, "Message source")?;
+        // `send --task` attaches the delivery to a task — ad-hoc
+        // PM↔worker follow-up inside a job's delivery record.
+        let task = optional_str(params, "task");
         let (duplicate, state) =
             self.store
-                .enqueue(&alias, text, reply_to.as_deref(), &message, source)?;
+                .enqueue_task(&alias, text, reply_to.as_deref(), &message, source, task)?;
         self.notify_agent(&alias);
         self.wake();
         Ok(json!({"message": message, "state": state, "duplicate": duplicate}))
@@ -1176,6 +1208,11 @@ impl Shared {
             }
             "result" => {
                 let text = text.ok_or_else(|| Error::rejected("A result report requires text"))?;
+                // `--sha` binds the report to an exact commit — the
+                // verdict protocol requires it on task-attached work.
+                let sha = optional_str(params, "sha")
+                    .map(store::check_commit_sha)
+                    .transpose()?;
                 if message.state == "running" {
                     self.store.finish(
                         &message,
@@ -1183,6 +1220,7 @@ impl Shared {
                         &json!({
                             "status": "completed", "text": text,
                             "turn_id": token, "via": "pty_report",
+                            "sha": sha,
                         }),
                         None,
                     )?;
@@ -1226,7 +1264,10 @@ impl Shared {
         let status = required_str(params, "status")?;
         let note = optional_str(params, "note");
         let by = optional_str(params, "by").unwrap_or("operator");
-        let message = self.store.reconcile(message_id, status, note, by)?;
+        // An operator-stated SHA on a `completed` reconcile is bound
+        // like a worker's `--sha` — explicit, never inferred.
+        let sha = optional_str(params, "sha");
+        let message = self.store.reconcile(message_id, status, note, by, sha)?;
         self.wake();
         Ok(json!({"state": "reconciled", "message": message.to_json()}))
     }
@@ -1250,12 +1291,377 @@ impl Shared {
         }
         let mut reconciled = Vec::new();
         for id in &ids {
-            self.store.reconcile(id, status, note, by)?;
+            self.store.reconcile(id, status, note, by, None)?;
             reconciled.push(id.clone());
         }
         let state = self.store.agent(&alias)?.state;
         self.wake();
         Ok(json!({"alias": alias, "reconciled": reconciled, "state": state}))
+    }
+
+    // ---- Jobs: the work axis (docs/JOBS.md) ----
+
+    /// `job new` — bookkeeping, not spawning. Requires a registered PM
+    /// (an inbox alias is a legitimate PM — notifications drain through
+    /// `cadence inbox`) and a readable spec the caller already hashed.
+    fn rpc_job_new(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let pm = self.resolve_alias(required_str(params, "pm")?)?;
+        let spec = required_str(params, "spec")?;
+        let spec_sha256 = required_str(params, "spec_sha256")?;
+        let id = optional_str(params, "job")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("job-{}", &Uuid::new_v4().simple().to_string()[..8]));
+        let (duplicate, job) = self.store.create_job(
+            &id,
+            optional_str(params, "title"),
+            spec,
+            spec_sha256,
+            &pm,
+            optional_str(params, "issue"),
+            optional_str(params, "repo"),
+            optional_str(params, "base_ref"),
+            optional_i64(params, "max_revisions").unwrap_or(2),
+            optional_str(params, "task_title"),
+        )?;
+        self.wake();
+        Ok(json!({"job": job.to_json(), "duplicate": duplicate}))
+    }
+
+    fn rpc_job_list(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let jobs = self.store.jobs(
+            optional_str(params, "state"),
+            params.get("all").and_then(Value::as_bool).unwrap_or(false),
+        )?;
+        let mut out = Vec::new();
+        for job in jobs {
+            let mut j = job.to_json();
+            let mut counts: std::collections::BTreeMap<String, i64> =
+                std::collections::BTreeMap::new();
+            for task in self.store.tasks_for_job(&job.id)? {
+                *counts.entry(task.state.clone()).or_insert(0) += 1;
+            }
+            j["tasks"] = json!(counts);
+            out.push(j);
+        }
+        Ok(json!({"jobs": out}))
+    }
+
+    /// `job show` — job + tasks with live kickoff state, latest verdict
+    /// and lazily-computed drift. No startup reconciliation runs: the
+    /// read side flags a task whose kickoff ended without completing,
+    /// a dead assignee, a missing SHA, or a spec that drifted since
+    /// `job new` hashed it.
+    fn rpc_job_show(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let id = required_str(params, "job")?;
+        let job = self.store.job(id)?;
+        let mut jj = job.to_json();
+        if let Some(sha) = &job.spec_sha256 {
+            match sha256_file(std::path::Path::new(&job.spec_path)) {
+                Some(now) if now != *sha => {
+                    jj["attention"] = json!(
+                        "spec changed since `job new` — \
+                        re-create the job if the drift is real work"
+                    );
+                }
+                None => {
+                    jj["attention"] = json!(format!("spec {} is unreadable", job.spec_path));
+                }
+                _ => {}
+            }
+        }
+        let mut tasks = Vec::new();
+        for task in self.store.tasks_for_job(id)? {
+            tasks.push(self.task_json(&task)?);
+        }
+        jj["tasks"] = json!(tasks);
+        Ok(json!({"job": jj}))
+    }
+
+    /// One task rendered for show/list: the row plus live kickoff
+    /// state, drift flags and the latest verdict.
+    fn task_json(self: &Arc<Self>, task: &store::Task) -> Result<Value> {
+        let mut j = task.to_json();
+        if let Some(mid) = &task.dispatch_message {
+            match self.store.message(mid)? {
+                Some(m) => {
+                    j["kickoff"] = json!({"id": m.id, "state": m.state, "turn_id": m.turn_id});
+                    if matches!(task.state.as_str(), "dispatched" | "running")
+                        && is_terminal(&m.state)
+                        && m.state != "completed"
+                    {
+                        let assignee = task.assignee.as_deref().unwrap_or("?");
+                        j["attention"] = if m.state == "unknown" {
+                            json!(format!(
+                                "kickoff {mid} went unknown — the worker is fenced. \
+                                 `cadence agent unfence {assignee} --status interrupted`, \
+                                 `cadence agent resume {assignee}`, then `cadence job \
+                                 dispatch {}` starts the next revision",
+                                task.id
+                            ))
+                        } else {
+                            json!(format!(
+                                "kickoff {mid} ended '{}' — `cadence job dispatch {}` \
+                                 starts revision {}",
+                                m.state,
+                                task.id,
+                                task.revision + 1
+                            ))
+                        };
+                    }
+                }
+                None => {
+                    j["attention"] = json!(format!(
+                        "dispatch message {mid} is gone — history is incomplete"
+                    ));
+                }
+            }
+        }
+        if let Some(assignee) = &task.assignee {
+            if let Ok(agent) = self.store.agent(assignee) {
+                if agent.endpoint.is_none()
+                    && agent.endpoint_kind != "inbox"
+                    && !is_task_terminal(&task.state)
+                {
+                    j["assignee_dead"] = json!(format!(
+                        "assignee {assignee} has no live endpoint — \
+                         `cadence job dispatch {} --to <worker>` reassigns",
+                        task.id
+                    ));
+                }
+            }
+        }
+        if task.state == "review" && task.head_sha.is_none() {
+            j["attention"] = json!(format!(
+                "kickoff reported no SHA — `cadence job task sha {} <sha>` \
+                 records it before a verdict can land",
+                task.id
+            ));
+        }
+        if let Some(v) = self.store.verdicts_for_task(&task.id)?.last() {
+            j["latest_verdict"] = v.to_json();
+        }
+        Ok(j)
+    }
+
+    fn rpc_task_show(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let task = self.store.task(required_str(params, "task")?)?;
+        let mut out = self.task_json(&task)?;
+        out["messages"] = json!(self
+            .store
+            .messages_for_task(&task.id)?
+            .iter()
+            .map(Message::to_json)
+            .collect::<Vec<_>>());
+        out["verdicts"] = json!(self
+            .store
+            .verdicts_for_task(&task.id)?
+            .iter()
+            .map(store::Verdict::to_json)
+            .collect::<Vec<_>>());
+        Ok(json!({"task": out}))
+    }
+
+    fn rpc_job_events(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let job = self.store.job(required_str(params, "job")?)?;
+        let after = params.get("after").and_then(Value::as_i64).unwrap_or(0);
+        if after < 0 {
+            return Err(Error::rejected("Event cursor must be nonnegative"));
+        }
+        let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
+        let deadline = Instant::now() + Duration::from_secs(wait);
+        loop {
+            let events = self.store.job_events(&job.id, after, 200)?;
+            if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
+                return Ok(json!({
+                    "events": events.iter().map(store::Event::to_json).collect::<Vec<_>>(),
+                    "cursor": events.last().map(|e| e.seq).unwrap_or(after),
+                }));
+            }
+            if Instant::now() >= deadline {
+                return Ok(json!({"events": [], "cursor": after}));
+            }
+            let step = deadline.min(Instant::now() + Duration::from_secs(1));
+            self.changed.wait_until(step);
+        }
+    }
+
+    fn rpc_task_new(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let job = self.store.job(required_str(params, "job")?)?;
+        let id = match optional_str(params, "task") {
+            Some(id) => id.to_string(),
+            None => {
+                // Default `<job>-t<n>` — first free index keeps ids
+                // readable and collision-free.
+                let existing = self.store.tasks_for_job(&job.id)?;
+                let mut n = existing.len() + 1;
+                loop {
+                    let candidate = format!("{}-t{n}", job.id);
+                    if self.store.task_opt(&candidate)?.is_none() {
+                        break candidate;
+                    }
+                    n += 1;
+                }
+            }
+        };
+        let assignee = optional_str(params, "assignee")
+            .map(|a| self.resolve_alias(a))
+            .transpose()?;
+        let task = self.store.create_task(
+            &job.id,
+            &id,
+            optional_str(params, "title"),
+            assignee.as_deref(),
+            optional_str(params, "spec"),
+            optional_str(params, "acceptance"),
+            optional_str(params, "worktree"),
+            optional_str(params, "branch"),
+            optional_str(params, "base_sha"),
+        )?;
+        self.wake();
+        Ok(json!({"task": task.to_json()}))
+    }
+
+    /// `job dispatch` — bookkeeping plus the kickoff enqueue in one
+    /// store transaction. Does not bypass the ready gate: `--ready` is
+    /// claimed client-side exactly like `send --ready`.
+    fn rpc_task_dispatch(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let to = optional_str(params, "to")
+            .map(|a| self.resolve_alias(a))
+            .transpose()?;
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let (task, message, duplicate, behind_dead) = self.store.dispatch_task(
+            required_str(params, "task")?,
+            to.as_deref(),
+            optional_str(params, "message"),
+            by,
+        )?;
+        if let Some(assignee) = &task.assignee {
+            self.notify_agent(assignee);
+        }
+        self.wake();
+        Ok(json!({"task": task.to_json(), "message": message,
+                  "duplicate": duplicate, "queued_behind_dead": behind_dead}))
+    }
+
+    /// `job verdict` — reviewer identity is self-asserted on this
+    /// same-host socket: inside a cadence pane the reviewer IS
+    /// `CADENCE_ALIAS` (`--reviewer` and `operator` are refused there);
+    /// outside, `--reviewer` is required. The store binds the verdict
+    /// to `head_sha` + current revision.
+    fn rpc_task_verdict(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let task_id = required_str(params, "task")?;
+        let sha = required_str(params, "sha")?;
+        let verdict = required_str(params, "verdict")?;
+        let pane = optional_str(params, "pane");
+        let claimed = optional_str(params, "reviewer");
+        let reviewer = match pane {
+            Some(alias) => {
+                if claimed.is_some() {
+                    return Err(Error::rejected(
+                        "--reviewer cannot be asserted inside a cadence pane — \
+                         the pane alias is the reviewer",
+                    ));
+                }
+                if alias == "operator" {
+                    return Err(Error::rejected(
+                        "'operator' cannot be claimed inside a cadence pane — \
+                         verdicts from the human run outside panes",
+                    ));
+                }
+                alias.to_string()
+            }
+            None => claimed.map(str::to_string).ok_or_else(|| {
+                Error::rejected("Outside a cadence pane, --reviewer <alias|operator> is required")
+            })?,
+        };
+        let (task, v) = self.store.record_verdict(
+            task_id,
+            sha,
+            verdict,
+            &reviewer,
+            pane,
+            optional_str(params, "evidence"),
+            optional_str(params, "message"),
+            optional_i64(params, "revision"),
+        )?;
+        let job = self.store.job(&task.job_id)?;
+        self.notify_agent(&job.pm_alias);
+        self.wake();
+        Ok(json!({"task": task.to_json(), "verdict": v.to_json()}))
+    }
+
+    fn rpc_task_accept(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let task = self.store.accept_task(
+            required_str(params, "task")?,
+            optional_str(params, "merged_sha"),
+            by,
+        )?;
+        let job = self.store.job(&task.job_id)?;
+        self.notify_agent(&job.pm_alias);
+        self.wake();
+        Ok(json!({"task": task.to_json()}))
+    }
+
+    /// `job task sha` — the repair path for a `review` task whose
+    /// kickoff reported no SHA (A3): the PM/operator records it
+    /// explicitly; never inferred.
+    fn rpc_task_sha(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let task = self.store.set_task_sha(
+            required_str(params, "task")?,
+            required_str(params, "sha")?,
+            by,
+        )?;
+        self.wake();
+        Ok(json!({"task": task.to_json()}))
+    }
+
+    fn rpc_task_fail(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let task = self.store.fail_task(
+            required_str(params, "task")?,
+            required_str(params, "reason")?,
+            by,
+        )?;
+        self.wake();
+        Ok(json!({"task": task.to_json()}))
+    }
+
+    /// `job task reopen` — operator only: a pane alias means an agent
+    /// is asking, and re-scoping blocked work is the human's call.
+    fn rpc_task_reopen(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        if optional_str(params, "pane").is_some() {
+            return Err(Error::rejected(
+                "job task reopen is an operator action — run it outside a cadence pane",
+            ));
+        }
+        let task = self
+            .store
+            .reopen_task(required_str(params, "task")?, "operator")?;
+        self.wake();
+        Ok(json!({"task": task.to_json()}))
+    }
+
+    fn rpc_task_cancel(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let task = self.store.cancel_task(required_str(params, "task")?, by)?;
+        self.wake();
+        Ok(json!({"task": task.to_json()}))
+    }
+
+    fn rpc_job_cancel(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let job = self.store.cancel_job(required_str(params, "job")?, by)?;
+        self.wake();
+        Ok(json!({"job": job.to_json()}))
+    }
+
+    fn rpc_job_close(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let job = self.store.close_job(required_str(params, "job")?, by)?;
+        self.wake();
+        Ok(json!({"job": job.to_json()}))
     }
 
     fn rpc_stop(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -1394,6 +1800,19 @@ fn is_terminal(state: &str) -> bool {
         state,
         "completed" | "failed" | "interrupted" | "unknown" | "cancelled"
     )
+}
+
+fn is_task_terminal(state: &str) -> bool {
+    matches!(state, "verified" | "done" | "cancelled" | "failed")
+}
+
+/// Content hash for spec-drift detection — the same value the CLI
+/// computes at `job new`. Returns None when the file is unreadable
+/// (the show path surfaces that as its own flag).
+fn sha256_file(path: &std::path::Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    Some(format!("{:x}", Sha256::digest(&bytes)))
 }
 
 fn required_str<'a>(params: &'a Value, field: &str) -> Result<&'a str> {

@@ -15,6 +15,9 @@
 //! - `DISCONNECT` — sever the transport; the turn returns `OutcomeUnknown`.
 //! - `FAIL:<text>` — the provider reports a failed turn.
 //! - `BAD_STATUS` — return an unclassifiable completion status.
+//! - `REPORT_SHA:<hex>` anywhere in the prompt — reply echoes the
+//!   prompt then ends with a `SHA: <hex>` trailer line, the managed-
+//!   endpoint reporting convention (`message result` is never called).
 //! - anything else — `FAKE_REPLY: <prompt>`.
 
 use std::collections::HashMap;
@@ -165,10 +168,15 @@ impl ProviderAdapter for FakeAdapter {
                 error: None,
             });
         }
+        let mut text = format!("FAKE_REPLY: {prompt}");
+        if let Some(rest) = prompt.split("REPORT_SHA:").nth(1) {
+            let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            text += &format!("\nSHA: {hex}");
+        }
         Ok(TurnResult {
             turn_id,
             status: "completed".to_string(),
-            text: format!("FAKE_REPLY: {prompt}"),
+            text,
             stop_reason: Some("end_turn".to_string()),
             error: None,
         })
