@@ -9,7 +9,9 @@ Devin workers on one host, including terminals accessed over SSH.
 **Development stage:** implementation in progress. Provider support is an
 acceptance-tested capability, not a promise of universal session attachment.
 
-See [the implementation plan](docs/IMPLEMENTATION-PLAN.md).
+See [the implementation plan](docs/IMPLEMENTATION-PLAN.md) and the
+[dogfooding retrospective](docs/DOGFOOD.md) for what running Cadence on
+itself taught us.
 
 Keep task checkouts under `.worktrees/`; see [workspace setup](docs/WORKSPACES.md)
 for creation, handover and cleanup instructions.
@@ -18,12 +20,16 @@ for creation, handover and cleanup instructions.
 
 ```bash
 cadence daemon start            # detached controller (CADENCE_STATE_DIR sets the state dir)
+cadence skill install           # install the `cadence` agent skill into
+                                #  ~/.agents/skills + .claude/.cursor/.copilot
+                                #  symlinks (daemon start re-syncs stale copies)
 
 cadence devin                   # fresh Devin TUI in an owned tmux pane, then attach
 cadence devin -r cookie-cesium  # resume an existing Devin session, like `devin -r`
 cadence codex                   # Codex managed-ws endpoint, then `codex resume --remote`
                                 # (--detach opts out; non-TTY or inside tmux prints
-                                #  the attach command instead of exec'ing it)
+                                #  the attach command instead of exec'ing it;
+                                #  --worktree <name> isolates it like join's)
 
 cadence join <pm-slug> devin    # spawn a worker wired to a group: results route to the PM
                                 #  (--worktree <name> isolates it in .cadence/wt/<name>
@@ -31,21 +37,54 @@ cadence join <pm-slug> devin    # spawn a worker wired to a group: results route
                                 #   briefing file + kickoff message)
 cadence attach [name]           # attach this terminal (alias, native id, or unambiguous
                                 #  provider name); no name lists live attachable agents
+                                #  grouped by PM; non-TTY/in-tmux prints the command
+cadence send <slug> --text "t"  # durable message (verb form of `message send`;
+                                #  --ready fuses the operator's gate claim for pty)
+
+cadence resume <group>          # PM-first group resume: the PM, then every
+                                #  member whose upstream is the PM (live ones
+                                #  skipped, per-member status), then attach
+cadence resume --all            # sweep every registered agent with a resumable
+                                #  thread/session and no live endpoint
+cadence daemon start --resume   # run the same sweep once the daemon is up
+cadence stop <group>            # stop PM + members (registered + resumable still)
 
 cadence agent remove <slug>     # delete a dead agent + its history
 cadence agent gc --older-than 1d  # sweep dead agents (never automatic)
+cadence agent bootstrap <slug>  # write + enqueue the briefing for an
+                                #  already-live agent (launched pre-briefing)
 
+cadence agent resume <slug>     # reopen a stopped agent, then attach
+                                #  (waits for the endpoint, ~30s bound;
+                                #   --detach opts out, non-TTY prints)
 cadence agent ready <slug>      # operator claim: pane inspected, idle, empty input
-cadence message send <slug> --text "task"   # gated literal paste into the TUI
 cadence agent attach <slug>     # print the tmux attach command (--run to exec)
 ```
+
+The hot path is verb-first — `devin`, `codex`, `join`, `attach`, `send`,
+`resume`, `stop` — while `agent`, `message` and `daemon` hold the admin
+subcommands (register/list/show/ready/capture/remove/gc/bootstrap,
+send/ask/ack/result, start/run/status/stop). Everywhere a command takes
+an agent name, an alias or a provider-native session id resolves the
+same way.
 
 A **group** is a PM agent plus its workers; the PM's slug is the group
 handle. Workers join with `params.upstream` set to the PM's alias, which
 makes their result reports route back to the PM's queue by default.
+Inside a cadence pane `cadence agent list` shows just the caller's group
+(the root row carries `"group_root": true`); `--all` shows every agent.
 
-Everywhere a command takes an agent name, the provider-native session id
-(Devin slug, Codex thread) resolves to the registered alias.
+Every launch writes `.cadence/<group-root>/BRIEFING-<alias>.md` (identity,
+protocol quickref, roster) plus an idempotent `<!-- cadence:* -->` block
+in the repo's `AGENTS.md`; joins also enqueue a `bootstrap-<alias>`
+message. `--bootstrap` adds the message to standalone launches;
+`--no-bootstrap` skips all of it.
+
+Owned panes set `mouse on` + `set-clipboard on` (OSC52) on the private
+tmux server. When a provider TUI captures the mouse, **Shift+drag**
+still selects terminal-natively; `Ctrl-b [` enters copy mode as a
+fallback. OSC52 reaches the system clipboard only on terminals that
+support it.
 
 ## Principles
 

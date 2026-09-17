@@ -416,6 +416,7 @@ impl ProviderAdapter for DevinPtyAdapter {
         // own tmux. Best effort: a cosmetic failure must not fence a
         // working endpoint.
         let _ = self.tmux_ok(&["set-option", "-g", "mouse", "on"]);
+        let _ = self.tmux_ok(&["set-option", "-g", "set-clipboard", "on"]);
         let _ = self.tmux_ok(&["set-option", "-g", "status-left-length", "40"]);
         let _ = self.tmux_ok(&["set-option", "-gw", "pane-border-status", "top"]);
         let _ = self.tmux_ok(&[

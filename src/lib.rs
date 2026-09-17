@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod error;
 pub mod proto;
+pub mod skill;
 pub mod store;
 
 pub use error::{Error, Result};
