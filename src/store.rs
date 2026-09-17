@@ -159,6 +159,9 @@ impl Agent {
             "enabled": self.enabled, "error": self.error,
             "endpoint": self.endpoint, "params": self.params,
             "generation": self.generation,
+            // Dead = no live endpoint address: the row cannot be
+            // attached or submitted to until it opens again.
+            "dead": self.endpoint.is_none(),
         })
     }
 }
@@ -772,6 +775,50 @@ impl Store {
             [alias],
         )?;
         Ok(())
+    }
+
+    /// Explicit removal of a dead agent: the registry row plus its whole
+    /// message/event history drop in one transaction. A live endpoint
+    /// refuses — `agent stop` first — as does any state that could still
+    /// own or start a turn. Callers must hold the lifecycle check (the
+    /// daemon rejects removal of an owned alias before reaching here).
+    pub fn remove_agent(&self, alias: &str) -> Result<Agent> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let agent = self.agent_in(&tx, alias)?;
+        if agent.endpoint.is_some() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' still has a live endpoint — \
+                 run `cadence agent stop {alias}` first"
+            )));
+        }
+        if !matches!(agent.state.as_str(), "stopped" | "attention" | "offline") {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is {} — only stopped, attention or offline \
+                 agents without an endpoint can be removed",
+                agent.state
+            )));
+        }
+        tx.execute("DELETE FROM messages WHERE alias=?", [alias])?;
+        tx.execute("DELETE FROM events WHERE alias=?", [alias])?;
+        tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
+        tx.commit()?;
+        Ok(agent)
+    }
+
+    /// Agents eligible for an explicit `agent gc` sweep: dead endpoint
+    /// and a terminal lifecycle state, optionally limited to rows not
+    /// updated within `older_than` seconds. Sweeping is always an
+    /// explicit command — nothing calls this on a timer.
+    pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
+        let cutoff = older_than.map(|age| now() - age).unwrap_or(f64::MAX);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM agents WHERE endpoint IS NULL
+             AND state IN ('attention','stopped') AND updated < ?",
+        )?;
+        let rows = stmt.query_map(params![cutoff], row_agent)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Event log page for the `events` API; cursor is the last seq seen.

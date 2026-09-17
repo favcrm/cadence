@@ -570,6 +570,50 @@ impl Shared {
             "agent_capture" => self.rpc_capture(params),
             "message_report" => self.rpc_message_report(params),
             "agent_stop" => self.rpc_stop(params),
+            "agent_remove" => {
+                let alias = self.resolve_alias(required_str(params, "alias")?)?;
+                let agent = self.store.agent(&alias)?;
+                // A live endpoint means an actor is serving it — the
+                // operator must stop it first. Endpoint is checked
+                // before ownership so the error suggests the remedy.
+                if agent.endpoint.is_some() {
+                    return Err(Error::rejected(format!(
+                        "Agent '{alias}' still has a live endpoint — \
+                         run `cadence agent stop {alias}` first"
+                    )));
+                }
+                {
+                    let lc = self.lifecycle.lock().unwrap();
+                    if lc.owned(&alias) {
+                        return Err(Error::rejected(format!(
+                            "Agent '{alias}' is still owned by a live actor — \
+                             run `cadence agent stop {alias}` first"
+                        )));
+                    }
+                    // Re-checks endpoint/state inside its transaction.
+                    self.store.remove_agent(&alias)?;
+                }
+                self.wake();
+                Ok(json!({"alias": alias, "state": "removed"}))
+            }
+            "agent_gc" => {
+                let older_than = params.get("older_than").and_then(Value::as_f64);
+                let candidates = self.store.gc_candidates(older_than)?;
+                let mut removed = Vec::new();
+                {
+                    let lc = self.lifecycle.lock().unwrap();
+                    for agent in candidates {
+                        // Skip an alias owned mid-transition rather than
+                        // failing the whole sweep.
+                        if !lc.owned(&agent.alias) && self.store.remove_agent(&agent.alias).is_ok()
+                        {
+                            removed.push(agent.alias);
+                        }
+                    }
+                }
+                self.wake();
+                Ok(json!({"removed": removed}))
+            }
             "agent_resume" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 self.store.agent(&alias)?;
@@ -624,9 +668,15 @@ impl Shared {
         let message = optional_str(params, "message")
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        // Caller-supplied provenance (`bootstrap` from join, etc.).
+        // Identifier-charset only — internal sources like
+        // `worker_result` contain characters this rejects, so the
+        // internal routing contract cannot be forged through agent_send.
+        let source = optional_str(params, "source").unwrap_or("user");
+        proto::identifier(source, "Message source")?;
         let (duplicate, state) =
             self.store
-                .enqueue(&alias, text, reply_to.as_deref(), &message, "user")?;
+                .enqueue(&alias, text, reply_to.as_deref(), &message, source)?;
         self.notify_agent(&alias);
         self.wake();
         Ok(json!({"message": message, "state": state, "duplicate": duplicate}))

@@ -26,8 +26,14 @@ cadence codex                   # Codex managed-ws endpoint, then `codex resume 
                                 #  the attach command instead of exec'ing it)
 
 cadence join <pm-slug> devin    # spawn a worker wired to a group: results route to the PM
+                                #  (--worktree <name> isolates it in .cadence/wt/<name>
+                                #   on branch cadence/<name>; --no-bootstrap skips the
+                                #   briefing file + kickoff message)
 cadence attach [name]           # attach this terminal (alias, native id, or unambiguous
                                 #  provider name); no name lists live attachable agents
+
+cadence agent remove <slug>     # delete a dead agent + its history
+cadence agent gc --older-than 1d  # sweep dead agents (never automatic)
 
 cadence agent ready <slug>      # operator claim: pane inspected, idle, empty input
 cadence message send <slug> --text "task"   # gated literal paste into the TUI
