@@ -19,6 +19,7 @@ pub const CAPABILITIES: &[&str] = &[
     "managed_codex_ws",
     "pty_devin_tmux",
     "pty_verified_autoready",
+    "operator_reconcile",
     "inbox_endpoint",
     "approval_brokering",
     "result_routing",

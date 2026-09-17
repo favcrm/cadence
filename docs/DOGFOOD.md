@@ -178,6 +178,46 @@ wake the waiting actor. Lifecycle verbs refuse the things a mailbox
 cannot do (`resume`, `stop` are rejected; `remove` deletes the
 mailbox outright).
 
+## A fence had no exit that kept history
+
+**What happened.** A provider outcome that cannot be proven lands a
+message in `unknown` and fences the agent — correct, and never replayed.
+But there was no way out that preserved the record: the only recovery
+was `agent remove`, which deletes the agent's message and event history.
+Worse, a daemon restart *retried* fenced agents — `recover` marked them
+`offline`, the relaunch loop re-armed them into `attention`, and every
+recovery hint said only "resume", which the fence itself rejects.
+
+**What landed.** `message reconcile <id> --status interrupted|completed|
+failed [--note]` — an operator statement, no turn token (the token is
+stale by definition), refused for any other state with the state named.
+One transaction records `{status, via:"operator_reconcile", note}`,
+emits `reconciled` with the caller, routes `reply_to` for
+completed/failed (deterministic delivery id — exactly once); the last
+unknown on an agent lifts the fence to
+`stopped`, never auto-started. `agent unfence <alias>` is the bulk form
+and resumes unless `--no-resume`. Daemon start now skips fenced agents
+before any spawn (`relaunch_skipped` event) and keeps launching healthy
+ones; `resume --all` lists them under `fenced` with the hint instead of
+attempting them. Every fenced surface — launch `next`, resume
+rejection, `devin -r`, `agent show` error — names unfence first, and
+session-mismatch hints now say each retried resume mints a new provider
+session.
+
+**What the second review round fixed.** Three gaps. First, `recover`
+still rewrote `attention` rows to `offline` before the serve loop read
+them — the startup skip was dead code for every non-unknown fence; now
+recovery preserves the fence and its error verbatim, clearing only the
+dead runtime fields. Second, an `unknown` finish routed nothing at all,
+so a fenced worker's PM was never told — now the fence routes one
+`worker_notice` ("outcome unknown, worker fenced, reconcile pending")
+under a `cadence-notice:` id disjoint from the `cadence-result:` slot,
+and `reconcile --status interrupted` routes a closure notice the same
+way; notices are plainly not results and carry no `reply_to`. Third, a
+reconciled agent stayed `enabled`, so the next restart relaunched it —
+the fence lift now lands `stopped` with `enabled=0`, identical to an
+operator stop.
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not
