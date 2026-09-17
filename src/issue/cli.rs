@@ -221,6 +221,7 @@ pub fn run(action: &IssueAction) -> Result<i32> {
                 owner.as_deref(),
                 component.as_deref(),
                 id.as_deref(),
+                "",
             )?;
             print_json(&out);
             Ok(0)
@@ -274,17 +275,17 @@ pub fn run(action: &IssueAction) -> Result<i32> {
         }
         IssueAction::Set { id, pairs } => {
             let pm = open_pm()?;
-            print_json(&write::set_fields(&pm, id, pairs)?);
+            print_json(&write::set_fields(&pm, id, pairs, "")?);
             Ok(0)
         }
         IssueAction::Link { id, kind, target } => {
             let pm = open_pm()?;
-            print_json(&write::link(&pm, id, kind, target, false)?);
+            print_json(&write::link(&pm, id, kind, target, false, None, "")?);
             Ok(0)
         }
         IssueAction::Unlink { id, kind, target } => {
             let pm = open_pm()?;
-            print_json(&write::link(&pm, id, kind, target, true)?);
+            print_json(&write::link(&pm, id, kind, target, true, None, "")?);
             Ok(0)
         }
         IssueAction::Ref {
@@ -294,7 +295,15 @@ pub fn run(action: &IssueAction) -> Result<i32> {
             label,
         } => {
             let pm = open_pm()?;
-            print_json(&write::add_ref(&pm, id, kind, target, label.as_deref())?);
+            print_json(&write::add_ref(
+                &pm,
+                id,
+                kind,
+                target,
+                label.as_deref(),
+                None,
+                "",
+            )?);
             Ok(0)
         }
         IssueAction::Comment {
@@ -323,6 +332,8 @@ pub fn run(action: &IssueAction) -> Result<i32> {
                 &body,
                 author.as_deref(),
                 kind.as_deref(),
+                None,
+                "",
             )?);
             Ok(0)
         }

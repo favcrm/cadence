@@ -1,7 +1,8 @@
 # Cadence board
 
 An internal project tracker: one folder per issue in a private directory,
-a `cadence issue` CLI as the only writer, and a read-only `cadence ui`
+one writer implementation (`src/issue/write.rs`) shared by the
+`cadence issue` CLI and the board's HTTP write API, and `cadence ui`
 serving a board + JSON API on loopback.
 
 - **Tracker dir:** `~/pm` (or `CADENCE_PM_DIR`). A private git repo —
@@ -116,36 +117,93 @@ cadence ui stop
 assets/index.js, assets/index.css, and the latin woff2 files — Vite
 emits fixed names) so `--dist` is unnecessary.
 
-### API (GET/HEAD only)
+### API — reads
 
 | Route | Returns |
 |---|---|
 | `GET /api/health` | `ok`, `pm_dir`, `pm_present`, counts, `daemon`, `embedded` |
 | `GET /api/projects` | folders, prefixes, components, repos, issue counts |
-| `GET /api/issues?project=` | card views: derived status, readiness, counts |
+| `GET /api/issues?project=` | card views: derived status, readiness, counts, `rev` |
 | `GET /api/issues/:id` | the drawer payload: frontmatter, body, links both ways, refs, files, comments, notes chain, merged activity |
 | `GET /api/issues/:id/file` | raw `issue.md`, `text/markdown` |
 | `GET /api/issues/:id/activity` | the merged activity stream only |
+| `GET /api/issues/:id/artifacts/:name` | one artifact file — inline for a small safe list (`text/plain` for md/txt/logs/code, images), **`Content-Disposition: attachment` for everything else, always for html/svg/xml/js/pdf**. Every artifact response carries `Content-Security-Policy: sandbox; default-src 'none'` and `Cache-Control: no-store`; names must satisfy the write grammar (no `/`, no leading dot); symlinks → `404` |
 | `GET /api/agents` | worker agent rows + running/queued/fenced/parked totals; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down |
+
+### API — writes
+
+Every write goes through `issue::write` — the same functions the CLI
+runs — so the API is a second front door, not a second writer. Each
+successful call is exactly one git commit whose subject carries the
+actor: `CAD-16: set status=review (operator (ui))`.
+
+| Route | Body | Returns |
+|---|---|---|
+| `POST /api/issues` | `{project, title, priority?, owner?, component?, parent?, blocked_by?}` | `201` |
+| `PATCH /api/issues/:id` | `{status?, priority?, owner?, component?, title?, body?, if_rev?}` — `""` clears owner/component; `body` replaces the markdown only | `200` |
+| `POST /api/issues/:id/links` | `{type: blocked_by\|relates\|parent\|duplicate_of, target, if_rev?}` | `200` |
+| `DELETE /api/issues/:id/links` | same shape | `200` |
+| `POST /api/issues/:id/refs` | `{kind, url\|path, label?, if_rev?}` — exactly one of url/path | `200` |
+| `POST /api/issues/:id/comments` | `{body, if_rev?}` — author `operator`, kind `ui`, markdown stored verbatim | `200` |
+| `POST /api/issues/:id/artifacts?name=<base>` | raw bytes, create-only | `200` |
+
+Success bodies are `{issue, card, warnings}` — the fresh payloads, so
+the UI needs no second fetch. `warnings` notes a `ready`/`doing`/`review`
+status that still has open blockers (usable, just flagged). Conflicts
+are `409` with `conflict: if_rev | status_derived | exists` plus the
+current card; a `notes`- or `rollup`-derived status refuses `status`
+writes with the reason. `if_rev` is the `rev` field — a hash of
+`issue.md` — for optimistic concurrency; a stale one returns `409` and
+the current rev. Unknown JSON fields are rejected
+(`deny_unknown_fields`); JSON bodies cap at 256 KiB, artifact uploads at
+`artifact_max_bytes` (1 MiB) enforced while reading — the body is never
+fully buffered first.
 
 ### Security posture
 
-No auth in I1 — containment is the defence:
+No auth — **containment is the whole defence**, so the write path adds
+four cross-site guards, each checked in order before any body is read
+or any writer runs, and each refusal names its check in `403` JSON:
 
-- loopback bind only (`127.0.0.1`), no CORS headers
-- `Host` allowlist: `cadence.localhost[:18000]`, the bind address forms,
-  plus `--allow-host` extras → `421` otherwise
-- `POST`/`PUT`/`DELETE`/… → `405`; `HEAD` allowed
-- issue ids must match `<PREFIX>-<n>` before any filesystem use → `400`
+1. **Route + method.** Writes are `POST`/`PATCH`/`DELETE` on known
+   shapes only; a known shape with the wrong method is `405`, anything
+   else `404`.
+2. **Exact content type.** JSON routes require exactly
+   `application/json`; the artifact route requires exactly
+   `application/octet-stream`. A cross-site HTML form can only send
+   "simple" types (`text/plain`, `x-www-form-urlencoded`, `multipart`)
+   — all refused here.
+3. **`X-Cadence-Board: 1`.** A custom header a cross-site request
+   cannot send without a CORS preflight — and this server never
+   answers a preflight: `OPTIONS` is `405` and no response ever carries
+   `Access-Control-*`.
+4. **Origin / fetch metadata.** If `Origin` is present it must be one
+   of the allowlisted board origins (the `Host` allowlist over http);
+   if `Sec-Fetch-Site` is present it must be `same-origin`.
+
+Then the I1 containment still holds:
+
+- loopback bind only (`127.0.0.1`); `Host` allowlist → `421`
+- issue ids must match `<PREFIX>-<n>` before any filesystem use → `400`;
+  artifact names match the same `[A-Za-z0-9._-]` basename grammar
 - static paths canonicalize inside `--dist` → traversal `400`
 - symlinks are never followed: a linked project/issue folder, `issue.md`,
-  comment or artifact is invisible to reads, an error in `lint`, and
-  refused by writes
+  comment, artifact file or `artifacts/` dir is invisible to reads, an
+  error in `lint`, and refused by writes
 - every response carries `X-Content-Type-Options: nosniff` and
-  `Referrer-Policy: no-referrer`; HTML also gets a `default-src 'self'`
-  CSP; `HEAD` returns the same headers as `GET`, minus the body
+  `Referrer-Policy: no-referrer`; HTML gets `default-src 'self'` CSP;
+  artifact bodies get `sandbox; default-src 'none'` and only the safe
+  allowlist renders inline — html/svg/xml/js/pdf always download
+- artifact reads serve regular files only, never follow `..`, and a
+  symlinked artifact is `404`
 - no arbitrary file read, no command execution, no git/PR/dispatch
   endpoints — that list must not grow without auth
+
+The honest limit: anyone who can open `http://127.0.0.1:3010` from this
+machine — a local process, or a browser tab on an allowed origin — can
+write the tracker. That is the threat model: a private repo on a
+single-operator host, loopback plus the guards above. Auth is deferred
+to I3+.
 
 ## Frontend
 
@@ -161,8 +219,11 @@ pnpm typecheck   # tsc --noEmit
 pnpm build       # → ui/dist (committed; --features ui embeds it)
 ```
 
-The original mock is `ui/design/board-mock-v4.html`. Cards are not
-draggable in I1 — the write path is I2.
+The original mock is `ui/design/board-mock-v4.html`. In I2 cards drag
+between columns (derived/container cards don't — the reason shows on
+hover), the drawer edits fields/body/links/refs, comments and attaches
+artifacts, and backlog has quick-add. There is no event stream — the
+board re-fetches on window focus and every 30 s while visible.
 
 ## Seeding
 

@@ -88,9 +88,13 @@ cadence inbox obs [--wait 30]   # drain it: one JSON object per message,
 
 The **board** tracks issues as folders of Markdown files under `~/pm`
 (`CADENCE_PM_DIR` overrides) — a private git repo outside every project
-repo. `cadence issue` is the only writer (each write is one git commit);
-`cadence ui` serves a read-only board + JSON API on loopback, reached at
-`http://cadence.localhost:18000` through the dev gateway. See
+repo. There is exactly one writer implementation (`src/issue/write.rs`);
+the `cadence issue` CLI and the board's HTTP write API both drive it, so
+every write is one git commit (`operator (ui)` for API writes). The HTTP
+write path carries no auth — loopback + `Host` allowlist + four
+cross-site guards (exact content type, `X-Cadence-Board` marker,
+Origin/Sec-Fetch-Site) are the whole boundary; artifacts always serve
+sandboxed, and html/svg download rather than render. See
 [docs/BOARD.md](docs/BOARD.md).
 
 ```bash
@@ -99,7 +103,7 @@ cadence issue new "title"          # project resolves from the cwd repo
 cadence issue ls --ready           # leaves with no unfinished blockers
 cadence issue show CAD-16
 cadence issue lint                 # dangling/cyclic links, depth, sizes
-cadence ui run                     # 127.0.0.1:3010 — SPA + GET-only API
+cadence ui run                     # 127.0.0.1:3010 — SPA + read/write API
 ```
 
 The hot path is verb-first — `devin`, `codex`, `join`, `attach`, `send`,

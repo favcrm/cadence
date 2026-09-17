@@ -1,11 +1,15 @@
-//! `cadence ui` — the read-only board: a small synchronous HTTP server
+//! `cadence ui` — the board: a small synchronous HTTP server
 //! (tiny_http, no async runtime — the daemon is plain threads too)
-//! serving the built SPA plus a five-route JSON API on loopback.
+//! serving the built SPA plus a JSON API on loopback.
 //!
-//! No auth in I1 — containment is the defence: loopback bind, no CORS
-//! headers, a Host allowlist against DNS rebinding, GET/HEAD only, id
-//! grammar checked before any path is touched, and no file reads
-//! outside the PM dir or `--dist`.
+//! No auth, by decision — containment is the defence: loopback bind, no
+//! CORS headers, a Host allowlist against DNS rebinding, id grammar
+//! checked before any path is touched, and no file reads outside the PM
+//! dir or `--dist`. Writes are I2: POST/PATCH/DELETE routes must pass
+//! four cross-site guards (known write route, exact JSON/octet-stream
+//! content type, `X-Cadence-Board: 1`, same-origin Origin/Sec-Fetch-Site)
+//! before any work is done, then go through `issue::write` — the same
+//! writer the CLI uses — so CLI and API cannot disagree.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -15,12 +19,13 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use clap::Subcommand;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::client;
 use crate::error::{Error, Result};
-use crate::issue::{board, model, project, Pm};
+use crate::issue::{board, model, project, write as issue_write, Pm};
 
 #[derive(Subcommand)]
 pub enum UiAction {
@@ -325,6 +330,536 @@ fn agents_payload(state_dir: &Path, known_ids: &std::collections::HashSet<String
     json!({"daemon": "reachable", "agents": out, "totals": totals})
 }
 
+// ---------- write path (I2) ----------
+
+/// JSON write bodies are small — fields, links, a comment, a body
+/// replace. Artifact bytes go through the octet-stream route, capped at
+/// `artifact_max_bytes` while reading.
+const JSON_CAP: u64 = 256 * 1024;
+
+/// The actor the write API commits as — visible in `git log` subjects.
+const UI_ACTOR: &str = "operator (ui)";
+
+type HttpResp = Response<std::io::Cursor<Vec<u8>>>;
+
+fn header_value(request: &Request, name: &'static str) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+fn guard_fail(check: &str, msg: &str) -> HttpResp {
+    let body =
+        serde_json::to_vec_pretty(&json!({"error": msg, "check": check})).unwrap_or_default();
+    let mut resp = Response::from_data(body).with_status_code(StatusCode(403));
+    resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+    resp
+}
+
+/// Allowed write origins: the allowlisted hosts over http. A same-origin
+/// browser page sends `Origin: http://<host>` — anything else, or a
+/// cross-site `Sec-Fetch-Site`, is not our board.
+fn origin_allowed(origin: &str, port: u16, hosts: &[String]) -> bool {
+    let origin = origin.trim().to_ascii_lowercase();
+    let mut allowed = vec![
+        "http://cadence.localhost".to_string(),
+        "http://cadence.localhost:18000".to_string(),
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+        format!("http://[::1]:{port}"),
+    ];
+    allowed.extend(
+        hosts
+            .iter()
+            .map(|h| format!("http://{}", h.trim().to_ascii_lowercase())),
+    );
+    allowed.contains(&origin)
+}
+
+/// The three header guards every write request must pass, checked
+/// before any work: exact content type (never a "simple" form type), the
+/// custom `X-Cadence-Board: 1` marker, and same-origin Origin /
+/// Sec-Fetch-Site when the browser sends them. A cross-site page cannot
+/// satisfy any of the three without a preflight this server never
+/// answers (OPTIONS is 405; no `Access-Control-*` header is ever sent).
+fn write_guard(
+    request: &Request,
+    want_ct: &str,
+    port: u16,
+    hosts: &[String],
+) -> std::result::Result<(), HttpResp> {
+    let ct = header_value(request, "Content-Type").unwrap_or_default();
+    if ct.trim() != want_ct {
+        return Err(guard_fail(
+            "content_type",
+            &format!("content-type must be exactly '{want_ct}'"),
+        ));
+    }
+    if header_value(request, "X-Cadence-Board").as_deref() != Some("1") {
+        return Err(guard_fail("x_cadence_board", "missing X-Cadence-Board: 1"));
+    }
+    if let Some(origin) = header_value(request, "Origin") {
+        if !origin_allowed(&origin, port, hosts) {
+            return Err(guard_fail(
+                "origin",
+                &format!("origin '{origin}' is not a board origin"),
+            ));
+        }
+    }
+    if let Some(sfs) = header_value(request, "Sec-Fetch-Site") {
+        if !sfs.eq_ignore_ascii_case("same-origin") {
+            return Err(guard_fail(
+                "sec_fetch_site",
+                &format!("sec-fetch-site '{sfs}' must be 'same-origin'"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read a request body, stopping at `cap + 1` — an oversized upload is
+/// refused without ever buffering it whole.
+fn read_body(request: &mut Request, cap: u64) -> std::result::Result<Vec<u8>, HttpResp> {
+    let mut buf = Vec::new();
+    let mut limited = request.as_reader().take(cap + 1);
+    if let Err(e) = limited.read_to_end(&mut buf) {
+        return Err(err_response(400, &format!("body read failed: {e}")));
+    }
+    if buf.len() as u64 > cap {
+        return Err(err_response(
+            413,
+            &format!("body is over the {cap}-byte cap"),
+        ));
+    }
+    Ok(buf)
+}
+
+fn parse_json<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> std::result::Result<T, HttpResp> {
+    serde_json::from_slice(bytes).map_err(|e| err_response(400, &format!("bad request json: {e}")))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewIssueReq {
+    project: String,
+    title: String,
+    priority: Option<String>,
+    owner: Option<String>,
+    component: Option<String>,
+    parent: Option<String>,
+    blocked_by: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchReq {
+    status: Option<String>,
+    priority: Option<String>,
+    /// `""` clears owner.
+    owner: Option<String>,
+    /// `""` clears component.
+    component: Option<String>,
+    title: Option<String>,
+    body: Option<String>,
+    if_rev: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinkReq {
+    #[serde(rename = "type")]
+    kind: String,
+    target: String,
+    if_rev: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefReq {
+    kind: String,
+    url: Option<String>,
+    path: Option<String>,
+    label: Option<String>,
+    if_rev: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommentReq {
+    body: String,
+    if_rev: Option<String>,
+}
+
+/// A write op's outcome → HTTP response. Conflicts are 409 with the
+/// reason; success re-reads the issue and returns the fresh card and
+/// detail payloads so the UI needs no second fetch.
+fn write_reply(pm: &Pm, id: &str, out: Value, created: bool) -> HttpResp {
+    if out.get("conflict").is_some() {
+        let mut body = out.clone();
+        let msg = match out["conflict"].as_str() {
+            Some("if_rev") => "if_rev does not match issue.md — re-read and retry".to_string(),
+            Some("status_derived") => out["reason"]
+                .as_str()
+                .unwrap_or("status is derived")
+                .to_string(),
+            Some("exists") => format!(
+                "artifact '{}' already exists",
+                out["artifact"].as_str().unwrap_or_default()
+            ),
+            _ => "conflict".to_string(),
+        };
+        body["error"] = json!(msg);
+        // The fresh card lets the caller resync on the spot.
+        if let Ok((card, _)) = issue_payloads(pm, id) {
+            body["card"] = card;
+        }
+        let bytes = serde_json::to_vec_pretty(&body).unwrap_or_default();
+        let mut resp = Response::from_data(bytes).with_status_code(StatusCode(409));
+        resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+        return resp;
+    }
+    match issue_payloads(pm, id) {
+        Ok((card, detail)) => {
+            let warnings = out.get("warnings").cloned().unwrap_or(json!([]));
+            let body = serde_json::to_vec_pretty(&json!({
+                "issue": detail, "card": card, "warnings": warnings,
+            }))
+            .unwrap_or_default();
+            let mut resp = Response::from_data(body).with_status_code(StatusCode(if created {
+                201
+            } else {
+                200
+            }));
+            resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            resp
+        }
+        Err(e) => err_response(500, &format!("write committed but reload failed: {e}")),
+    }
+}
+
+/// Fresh card + detail payloads for one id after a write.
+fn issue_payloads(pm: &Pm, id: &str) -> Result<(Value, Value)> {
+    let issues = board::load_all(&pm.dir, None)?;
+    let views = board::views(&pm.config.notes_dir(), issues);
+    let by_id: std::collections::HashMap<String, &board::View> = views
+        .iter()
+        .map(|v| (v.issue.front.id.clone(), v))
+        .collect();
+    let view = by_id
+        .get(id)
+        .ok_or_else(|| Error::rejected(format!("unknown issue '{id}'")))?;
+    Ok((
+        board::card_json(view),
+        board::detail_json(&pm.dir, view, &by_id),
+    ))
+}
+
+/// Map a writer error to an HTTP status: unknown ids are 404, rejections
+/// are 400, internals are 500.
+fn write_err(e: &Error) -> HttpResp {
+    match e {
+        Error::Rejected(m) if m.starts_with("Unknown issue") => err_response(404, m),
+        Error::Rejected(m) => err_response(400, m),
+        other => err_response(500, &other.to_string()),
+    }
+}
+
+/// Dispatch POST/PATCH/DELETE on the write routes. Every route passes
+/// `write_guard` before reading a body or touching the PM dir, and every
+/// op goes through `issue::write` — one write path for CLI and API.
+#[allow(clippy::too_many_arguments)]
+fn write_route(
+    mut request: Request,
+    method: &Method,
+    path: &str,
+    query: &dyn Fn(&str) -> Option<String>,
+    pm_dir: &Path,
+    port: u16,
+    hosts: &[String],
+    send: &dyn Fn(Request, HttpResp),
+) {
+    let Some(rest) = path.strip_prefix("/api/issues") else {
+        send(request, err_response(404, "no such write route"));
+        return;
+    };
+    let (id, sub) = if rest.is_empty() {
+        (None, None)
+    } else if let Some(tail) = rest.strip_prefix('/') {
+        let mut segs = tail.splitn(2, '/');
+        (Some(segs.next().unwrap_or_default()), segs.next())
+    } else {
+        send(request, err_response(404, "no such write route"));
+        return;
+    };
+    // Route shape → expected method. A known shape with the wrong
+    // method is 405; an unknown shape is 404.
+    let known_sub = matches!(sub, Some("links" | "refs" | "comments" | "artifacts"));
+    let shape_ok = matches!(
+        (id.is_some(), sub, method),
+        (false, None, &Method::Post)
+            | (true, None, &Method::Patch)
+            | (true, Some("links"), &Method::Post | &Method::Delete)
+            | (true, Some("refs" | "comments" | "artifacts"), &Method::Post)
+    );
+    if !shape_ok {
+        let code = if id.is_none() && sub.is_none() || known_sub || (id.is_some() && sub.is_none())
+        {
+            405
+        } else {
+            404
+        };
+        send(request, err_response(code, "no such write route"));
+        return;
+    }
+    let want_ct = if sub == Some("artifacts") {
+        "application/octet-stream"
+    } else {
+        "application/json"
+    };
+    if let Err(resp) = write_guard(&request, want_ct, port, hosts) {
+        send(request, resp);
+        return;
+    }
+    let pm = match Pm::at(pm_dir) {
+        Ok(pm) => pm,
+        Err(e) => {
+            send(request, err_response(503, &e.to_string()));
+            return;
+        }
+    };
+
+    if id.is_none() {
+        // POST /api/issues — create.
+        let bytes = match read_body(&mut request, JSON_CAP) {
+            Ok(b) => b,
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        };
+        let req: NewIssueReq = match parse_json(&bytes) {
+            Ok(r) => r,
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        };
+        let blocked_by = req.blocked_by.unwrap_or_default();
+        match issue_write::new_issue(
+            &pm,
+            &pm.dir,
+            Some(&req.project),
+            &req.title,
+            req.priority.as_deref(),
+            req.parent.as_deref(),
+            &blocked_by,
+            req.owner.as_deref(),
+            req.component.as_deref(),
+            None,
+            UI_ACTOR,
+        ) {
+            Ok(out) => {
+                let new_id = out["id"].as_str().unwrap_or_default().to_string();
+                send(request, write_reply(&pm, &new_id, out, true));
+            }
+            Err(e) => send(request, write_err(&e)),
+        }
+        return;
+    }
+
+    let id_raw = id.unwrap_or_default();
+    let Ok(id) = model::check_id(id_raw) else {
+        send(request, err_response(400, "bad issue id"));
+        return;
+    };
+    if sub == Some("artifacts") {
+        // POST /api/issues/:id/artifacts?name=<basename> — raw bytes.
+        let name = query("name").unwrap_or_default();
+        if !model::valid_artifact_name(&name) {
+            send(
+                request,
+                err_response(
+                    400,
+                    "bad artifact name — [A-Za-z0-9._-]{1,120}, no leading dot",
+                ),
+            );
+            return;
+        }
+        let cap = pm.config.artifact_max_bytes;
+        let bytes = match read_body(&mut request, cap) {
+            Ok(b) => b,
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        };
+        match issue_write::attach_bytes(&pm, &id, &name, &bytes, false, UI_ACTOR) {
+            Ok(out) => send(request, write_reply(&pm, &id, out, false)),
+            Err(e) => send(request, write_err(&e)),
+        }
+        return;
+    }
+
+    let bytes = match read_body(&mut request, JSON_CAP) {
+        Ok(b) => b,
+        Err(resp) => {
+            send(request, resp);
+            return;
+        }
+    };
+    let out = match (sub, method) {
+        (None, &Method::Patch) => match parse_json::<PatchReq>(&bytes) {
+            Ok(req) => issue_write::patch_issue(
+                &pm,
+                &id,
+                &issue_write::IssuePatch {
+                    status: req.status,
+                    priority: req.priority,
+                    owner: req.owner,
+                    component: req.component,
+                    title: req.title,
+                    body: req.body,
+                },
+                req.if_rev.as_deref(),
+                UI_ACTOR,
+            ),
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        },
+        (Some("links"), m) => match parse_json::<LinkReq>(&bytes) {
+            Ok(req) => issue_write::link(
+                &pm,
+                &id,
+                &req.kind,
+                &req.target,
+                m == &Method::Delete,
+                req.if_rev.as_deref(),
+                UI_ACTOR,
+            ),
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        },
+        (Some("refs"), _) => match parse_json::<RefReq>(&bytes) {
+            Ok(req) => {
+                let target = match (req.url, req.path) {
+                    (Some(u), None) | (None, Some(u)) => u,
+                    _ => {
+                        send(
+                            request,
+                            err_response(400, "send exactly one of url or path"),
+                        );
+                        return;
+                    }
+                };
+                issue_write::add_ref(
+                    &pm,
+                    &id,
+                    &req.kind,
+                    &target,
+                    req.label.as_deref(),
+                    req.if_rev.as_deref(),
+                    UI_ACTOR,
+                )
+            }
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        },
+        (Some("comments"), _) => match parse_json::<CommentReq>(&bytes) {
+            Ok(req) => issue_write::add_comment(
+                &pm,
+                &id,
+                &req.body,
+                Some("operator"),
+                Some("ui"),
+                req.if_rev.as_deref(),
+                UI_ACTOR,
+            ),
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        },
+        _ => unreachable!("shape_ok gated"),
+    };
+    match out {
+        Ok(out) => send(request, write_reply(&pm, &id, out, false)),
+        Err(e) => send(request, write_err(&e)),
+    }
+}
+
+/// `GET /api/issues/:id/artifacts/:name` — the constrained read. The
+/// name must satisfy the write grammar, resolve to a real regular file
+/// inside that issue's `artifacts/` (symlinks refused), and is served
+/// inline only for a small allowlist; everything else — and always html,
+/// svg, xml, js, pdf — downloads as an octet-stream attachment so a
+/// rendered report can never drive the write API.
+fn artifact_response(view: &board::View, name: &str) -> HttpResp {
+    if !model::valid_artifact_name(name) {
+        return err_response(400, "bad artifact name");
+    }
+    let dir = view.issue.dir.join("artifacts");
+    let path = dir.join(name);
+    if !board::is_real_dir(&dir) || !board::is_real_file(&path) {
+        return err_response(404, "no such artifact");
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return err_response(500, "artifact read failed");
+    };
+    let ext = name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let (mime, inline) = match ext.as_str() {
+        "txt" | "md" | "log" | "json" | "jsonl" | "yaml" | "yml" | "toml" | "rs" | "ts" | "tsx"
+        | "css" | "diff" | "patch" => ("text/plain; charset=utf-8", true),
+        "png" => ("image/png", true),
+        "jpg" | "jpeg" => ("image/jpeg", true),
+        "gif" => ("image/gif", true),
+        "webp" => ("image/webp", true),
+        _ => ("application/octet-stream", false),
+    };
+    let mut resp = Response::from_data(bytes);
+    resp.add_header(Header::from_bytes("Content-Type", mime).unwrap());
+    resp.add_header(
+        Header::from_bytes("Content-Security-Policy", "sandbox; default-src 'none'").unwrap(),
+    );
+    resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+    if !inline {
+        resp.add_header(
+            Header::from_bytes(
+                "Content-Disposition",
+                format!("attachment; filename=\"{name}\""),
+            )
+            .unwrap(),
+        );
+    }
+    resp
+}
+
+fn send(request: Request, mut resp: HttpResp, head_only: bool) {
+    add_security_headers(&mut resp);
+    if head_only {
+        // tiny_http does not strip bodies on HEAD — answer with the
+        // same headers as GET, minus the body.
+        let mut bare = Response::empty(resp.status_code());
+        for h in resp.headers() {
+            bare.add_header(h.clone());
+        }
+        let _ = request.respond(bare);
+    } else {
+        let _ = request.respond(resp);
+    }
+}
+
 fn handle(
     request: Request,
     state_dir: &Path,
@@ -333,12 +868,11 @@ fn handle(
     dist: Option<&Path>,
     hosts: &[String],
 ) {
-    let head_only = request.method() == &Method::Head;
-    if request.method() != &Method::Get && request.method() != &Method::Head {
-        let _ = request.respond(err_response(
-            405,
-            "method not allowed — the board is read-only",
-        ));
+    let method = request.method().clone();
+    let head_only = method == Method::Head;
+    let is_write = matches!(method, Method::Post | Method::Patch | Method::Delete);
+    if !matches!(method, Method::Get | Method::Head) && !is_write {
+        let _ = request.respond(err_response(405, "method not allowed"));
         return;
     }
     let host = request
@@ -372,20 +906,12 @@ fn handle(
         })
     };
 
-    let send = |req: Request, mut resp: Response<std::io::Cursor<Vec<u8>>>| {
-        add_security_headers(&mut resp);
-        if head_only {
-            // tiny_http does not strip bodies on HEAD — answer with the
-            // same headers as GET, minus the body.
-            let mut bare = Response::empty(resp.status_code());
-            for h in resp.headers() {
-                bare.add_header(h.clone());
-            }
-            let _ = req.respond(bare);
-        } else {
-            let _ = req.respond(resp);
-        }
-    };
+    let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
+
+    if is_write {
+        write_route(request, &method, &path, &query, pm_dir, port, hosts, &send);
+        return;
+    }
 
     match path.as_str() {
         "/api/health" => {
@@ -464,13 +990,15 @@ fn handle(
             send(request, json_response(agents_payload(state_dir, &known)));
         }
         _ => {
-            // `/api/issues/<ID>[/file|/activity]` — id grammar checked
-            // before the id is ever used as a path component.
+            // `/api/issues/<ID>[/file|/activity|/artifacts/<name>]` — id
+            // grammar checked before the id is ever a path component.
             if let Some(tail) = path.strip_prefix("/api/issues/") {
                 let mut segs = tail.splitn(2, '/');
                 let id_raw = segs.next().unwrap_or_default();
                 let sub = segs.next();
-                if sub.is_some_and(|s| !matches!(s, "file" | "activity")) {
+                if sub.is_some_and(|s| {
+                    !matches!(s, "file" | "activity") && !s.starts_with("artifacts/")
+                }) {
                     send(request, err_response(404, "no such route"));
                     return;
                 }
@@ -519,6 +1047,10 @@ fn handle(
                                     "activity": board::activity_json(&pm.dir, view),
                                 })),
                             ),
+                            Some(s) if s.starts_with("artifacts/") => {
+                                let name = s.strip_prefix("artifacts/").unwrap_or_default();
+                                send(request, artifact_response(view, name));
+                            }
                             Some(_) => unreachable!(),
                         }
                     }
