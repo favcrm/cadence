@@ -616,10 +616,26 @@ impl Shared {
             }
             "agent_resume" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
-                self.store.agent(&alias)?;
+                let agent = self.store.agent(&alias)?;
                 let mut lc = self.lifecycle.lock().unwrap();
                 if lc.owned(&alias) {
-                    return Err(Error::rejected("Agent is still running or stopping"));
+                    // Distinguish the two owned cases for the operator:
+                    // a live actor means "attach" (fake/managed actors
+                    // may carry no endpoint address, so state is the
+                    // signal), a starting/stopping one means "retry".
+                    let live = agent.endpoint.is_some()
+                        || matches!(agent.state.as_str(), "idle" | "running" | "waiting_input");
+                    return if live {
+                        Err(Error::rejected(format!(
+                            "Agent '{alias}' is already live — attach with \
+                             `cadence attach {alias}`"
+                        )))
+                    } else {
+                        Err(Error::rejected(format!(
+                            "Agent '{alias}' is still starting or stopping — \
+                             retry shortly"
+                        )))
+                    };
                 }
                 // Enable only after the ownership/fence checks pass —
                 // a rejected resume must leave no side effects behind.

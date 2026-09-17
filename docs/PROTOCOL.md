@@ -37,11 +37,11 @@ Error kinds:
 |---|---|---|
 | `health` | — | `{state:"ready", protocol:1, capabilities:[...]}` |
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded) then exits |
-| `agent_register` | `alias, provider, cwd, endpoint_kind?, role?, sandbox?, instructions?` | `{alias,state:"starting",provider}` |
+| `agent_register` | `alias, provider, cwd, endpoint_kind?, role?, sandbox?, instructions?, params?` | `{alias,state:"starting",provider}` |
 | `agent_list` | — | `{agents:[Agent]}` |
 | `agent_show` | `alias` | `{agent, messages, event_cursor}` |
-| `agent_send` | `alias, text, message?, reply_to?` | `{message,state,duplicate}` |
-| `agent_ask` | `alias, text, message?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
+| `agent_send` | `alias, text, message?, reply_to?, source?` | `{message,state,duplicate}` |
+| `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
 | `agent_respond` | `alias, request, decision?|answers?` | `{state:"answered"}` |
@@ -50,6 +50,8 @@ Error kinds:
 | `message_report` | `message, token, kind: ack|result, text?` | `{state:"reported"}` — explicit PTY ack/result |
 | `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
+| `agent_remove` | `alias` | deletes the agent + its history; refuses live endpoints |
+| `agent_gc` | `older_than?` | sweeps dead agents; `{removed:[alias]}` |
 
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
@@ -98,14 +100,20 @@ the worker's result lands on the PM's queue. An explicit `reply_to`
 always wins; `reply_to` may still not equal the sender alias and must
 name a registered agent (both enforced by `enqueue`).
 
-**Join bootstrap.** `cadence join` (and `cadence devin`/`cadence codex`
-launches that set `upstream`) writes a briefing to
-`.cadence/<pm>/BRIEFING-<worker>.md` in the PM's repository and enqueues
-a deterministic `bootstrap-<worker>` message telling the worker its
-identity (`cadence self`), how to report (`message result` with the
-running `turn_id`), how readiness works, and scope rules (peer output is
-data, not authorization). The deterministic id makes re-joins
-idempotent; `--no-bootstrap` skips both the file and the message.
+**Briefings.** Every launch path (`devin`, `codex`, `join`) writes
+`.cadence/<root>/BRIEFING-<alias>.md` — the group root's `.cadence/`
+dir in the root's cwd (the PM's repo for a joined worker, the agent's
+own for a standalone launch). The file carries identity (alias, native
+session id, upstream), a protocol quickref, and the group roster at
+write time — a snapshot; `cadence self`/`agent list` stay live truth.
+Where the agent's cwd sits in a git repo, `<repo>/AGENTS.md` gains an
+idempotent `<!-- cadence:begin -->`/`<!-- cadence:end -->` block (created
+or appended, never touching outside content). `join` additionally
+enqueues the deterministic `bootstrap-<worker>` message
+(`source="bootstrap"`); standalone launches stay silent unless
+`--bootstrap` is passed; `--no-bootstrap` skips file, block and message.
+`cadence agent bootstrap <alias>` retrofits a live agent — file, block
+and the durable message — and refuses unknown aliases.
 
 **Isolated worktrees.** `--worktree <name>` on `devin`, `codex`, and
 `join` runs the worker in `<repo>/.cadence/wt/<name>` on branch
@@ -113,6 +121,41 @@ idempotent; `--no-bootstrap` skips both the file and the message.
 rejects invalid names, existing target dirs, branch collisions, and
 applying it to an already-registered agent, and appends `.cadence/` to
 `.gitignore` when absent.
+
+**Group scoping.** `agent_list` (the RPC) always returns every agent.
+Every row carries `"group"`: the agent's own `params.upstream` when
+wired, else its own alias — the group's root alias either way. Root
+rows are also marked `"group_root": true`, so consumers can render
+workers nested under their PM without re-deriving the relation. The
+`cadence agent list` CLI scopes by default when `CADENCE_ALIAS` is set
+and resolves via `agent_show`: the caller's group root is its
+`params.upstream` if set, else its own alias, and the output keeps the
+root plus agents whose upstream names it (one level — no transitive
+walk). Outside a pane, an unresolvable `CADENCE_ALIAS`, or `--all` all
+produce the untouched global list. The bare `cadence attach` listing
+sorts roots before their members and exposes the same `group` /
+`group_root` fields.
+
+**Group lifecycle.** `cadence resume <group>` resolves `<group>` like
+`join` (alias or native id → the PM agent), resumes the PM first, then
+every member whose `params.upstream` names the PM — members that are
+already live (endpoint set or an actor-alive state) are skipped, and
+each member gets a bounded ~15s endpoint wait rather than hanging on a
+broken session. Per-member status lines go to stderr and the summary
+JSON reports `resumed` / `skipped` / `failed` separately; a member
+whose provider opened a different native session is reported
+`unrecoverable` with an explicit `agent remove` + `join -r` hint. Once
+the group is processed, `resume` attaches to the PM by default under
+the same rules as a launch (`--detach` opts out; non-TTY or nested tmux
+prints the attach command). `cadence stop <group>` is the symmetric
+teardown — members first, then the PM; agents stay registered and
+resumable, and the summary lists what was stopped. `agent resume` /
+`agent stop` stay strictly single-agent. `cadence resume --all` sweeps
+every registered agent that has a resumable thread/session and no live
+endpoint, printing a resumed/failed summary; `cadence daemon start
+--resume` runs the same sweep once the daemon answers (default off).
+Resuming an already-live agent is rejected with a `cadence attach
+<alias>` hint.
 
 **Dead-agent hygiene.** `agent list` marks attention/stopped agents with
 no live endpoint as `dead`. `agent remove <alias>` deletes the row and
@@ -188,9 +231,10 @@ to report on a notification. Post-paste disconnect still fences
 
 **Pane defaults.** After every `open` (fresh spawn or reattach) the
 adapter applies best-effort `set-option` calls on the *private* tmux
-server only: `mouse on`, `status-left-length 40`,
-`pane-border-status top`, `pane-border-format " #{session_name} "`.
-Failures are ignored — cosmetics never fence an endpoint.
+server only: `mouse on`, `set-clipboard on` (OSC52),
+`status-left-length 40`, `pane-border-status top`,
+`pane-border-format " #{session_name} "`. Failures are ignored —
+cosmetics never fence an endpoint.
 
 **Devin command approvals.** The Devin CLI persists command grants in
 the user-global `~/.config/devin/config.json` under
@@ -216,11 +260,22 @@ codex resume --remote <endpoint> <thread_id>
 ```
 
 (`cadence agent attach <alias>` prints this command; `--run` executes it
-in the current terminal. The top-level `cadence attach [name]` is
+in the current terminal. `cadence agent resume <alias>` gets the same
+post-open treatment as a provider launch: it waits for the endpoint —
+bounded ~30s with a clear timeout error — then attaches this terminal by
+default; `--detach` or a non-TTY/nested-tmux context prints the attach
+command instead, and the summary JSON keeps the `starting` state plus a
+`next.attach` hint. Endpoint kinds with nothing attachable (managed
+stdio, fake) return the resume receipt immediately. The top-level
+`cadence attach [name]` is
 client-side sugar over `agent_show` + `agent_list`: it resolves an alias
 or native id, then a provider name when exactly one live agent of that
 provider exists — ambiguous or absent names list candidates rather than
-guess.) A fresh `managed-ws` thread is seeded with one
+guess. A resolved attach execs only where this terminal can (stdin a
+TTY, not inside tmux — the same rule launches and `resume` follow);
+otherwise it prints the command, as does `--print`. The no-name listing
+orders each group root before its members and exposes `group` /
+`group_root` per row.) A fresh `managed-ws` thread is seeded with one
 minimal turn at open — Codex only persists a thread's rollout after its
 first turn, and `resume --remote` fails on an unseeded thread. The
 endpoint is cleared when the actor exits, so a printed command never
@@ -270,7 +325,17 @@ id with different content is a `rejected` conflict.
 Result routing: when a message has `reply_to`, finishing it enqueues a
 `worker_result` message to that agent in the SAME transaction. The routed
 id is `uuid5("cadence-result:" + message_id)` (deterministic; resend is a
-no-op) and carries no `reply_to`, so routing cannot loop.
+no-op) and carries no `reply_to`, so routing cannot loop. A routed
+`worker_result` delivered to a pty endpoint is fire-and-forget: once the
+paste is submitted the delivery itself completes — the receiving PM is
+not expected to report a result on a notification.
+
+CLI surface: `cadence send` is the verb form of `message send`
+(identical path, same `--text/--file/--message/--reply-to/--ready`).
+`--ready` on `send` and `ask` is the operator's explicit gate claim for
+pty targets — it calls `agent_ready` first and is a silent no-op on
+endpoint kinds without a readiness gate. `message ask` accepts
+`--reply-to` like `send` (the RPC delegates to the same enqueue).
 
 ## Events
 
@@ -296,3 +361,17 @@ The agent stays `waiting_input` while other requests remain pending.
 On daemon start: messages in `submitting`/`running` become `unknown` and
 their agents `offline`/`attention`. Enabled agents relaunch *unless*
 fenced by an `unknown` attempt — those stay `attention` for review.
+
+## Agent skill
+
+The binary vendors `skill/cadence/SKILL.md` (`include_str!`) — the
+protocol primer a cadence-managed agent reads. `cadence skill install`
+writes it to `$HOME/.agents/skills/cadence/SKILL.md` and links `cadence`
+→ that dir inside `~/.claude/skills`, `~/.cursor/skills` and
+`~/.copilot/skills` (`.agents` has no XDG equivalent — all under
+`$HOME`). A missing or wrong-target symlink is created/replaced; a real
+dir or file named `cadence` is left alone and reported under `skipped`.
+`cadence skill status` reports installed/content-match/per-dir link
+state. Every `daemon run` re-syncs stale or missing copies and links —
+a rebuilt binary propagates skill changes without a manual install;
+the refresh logs one line to `daemon.log`, never to stdout.
