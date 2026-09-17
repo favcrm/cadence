@@ -56,7 +56,7 @@ pub fn run(state_dir: &Path) -> Result<Value> {
             "managed_codex_ws": codex_ok,
             "pty_devin_tmux": devin_ok && tmux_ok,
             "managed_devin_acp": false,
-            "native_inbox_endpoint": false,
+            "native_inbox_endpoint": true,
             "fake_provider_tests": true,
         },
         "notes": [

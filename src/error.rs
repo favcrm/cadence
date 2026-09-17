@@ -22,6 +22,12 @@ pub enum Error {
     /// provider — the message fails, but the endpoint is provably
     /// untouched, so the actor must not fence or close it.
     PreWrite(String),
+    /// The paste was accepted by the terminal path but did not render
+    /// within the deadline — evidence of a dropped or unsubmitted paste,
+    /// not proof (pty post-paste screen check). The actor decides:
+    /// routed notifications requeue bounded then park; task messages go
+    /// `unknown` under the usual uncertainty discipline.
+    NotRendered(String),
 }
 
 impl Error {
@@ -43,6 +49,9 @@ impl Error {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
+    pub fn not_rendered(message: impl Into<String>) -> Self {
+        Self::NotRendered(message.into())
+    }
     /// Stable wire kind for [`crate::proto`].
     pub fn kind(&self) -> &'static str {
         match self {
@@ -54,6 +63,9 @@ impl Error {
             // Wire-compatible with `rejected`: it is one — the variant
             // only exists so the actor can match the pre-write proof.
             Self::PreWrite(_) => "rejected",
+            // Internal to the actor loop — never a wire answer: the
+            // daemon classifies it into requeue or `unknown` first.
+            Self::NotRendered(_) => "not_rendered",
         }
     }
 }
@@ -66,7 +78,8 @@ impl fmt::Display for Error {
             | Self::OutcomeUnknown(m)
             | Self::Internal(m)
             | Self::GateRefused(m)
-            | Self::PreWrite(m) => f.write_str(m),
+            | Self::PreWrite(m)
+            | Self::NotRendered(m) => f.write_str(m),
         }
     }
 }

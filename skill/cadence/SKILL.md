@@ -17,6 +17,8 @@ cadence self          # → {"alias": "...", "running": [{"id": msg, "turn_id": 
 
 `cadence self` is the source of truth for your alias and your **running**
 message ids + turn tokens. Do not parse `agent show` to guess them.
+(On an `inbox` agent — a durable mailbox with no actor — it instead
+answers `{"queued": N}`.)
 
 ## Reporting on a task
 
@@ -64,6 +66,9 @@ cadence join <your-alias> devin --worktree feat-a   # isolated checkout
                                                     #  (.cadence/wt/feat-a)
 cadence agent ready <worker>                        # gate one paste
 cadence send <worker> --ready --text "task"         # claim + send fused
+cadence agent probe <worker>                        # is the pane idle? (pty)
+cadence agent set <worker> auto_ready=verified      # daemon verifies idle
+                                                    #  itself before pasting
 cadence message ask <worker> --text "q" --wait 60   # send + wait for done
 cadence events <worker> --follow                    # watch results land
 cadence attach [name]                               # open a live terminal
@@ -72,7 +77,13 @@ cadence resume --all                                # sweep all resumable dead a
 cadence stop <group>                                # stop PM + members (still resumable)
 cadence agent remove <alias>                        # delete a dead agent
 cadence agent gc --older-than 1d                    # sweep dead agents
+cadence agent register obs --provider inbox         # a durable mailbox, no process
+cadence send obs --text "note"                      #   — or route a reply_to to it
+cadence inbox obs --wait 30                         # drain; each completes
+                                                    #  via=inbox_read
 ```
 
 Fresh joins get a `bootstrap-<alias>` kickoff plus the briefing file;
-`join --no-bootstrap` skips both.
+`join --no-bootstrap` skips both. An inbox is the right `reply_to`/
+group root when results should accumulate for a non-agent consumer —
+the queue is durable and `inbox --wait` blocks instead of polling.

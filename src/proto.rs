@@ -18,6 +18,8 @@ pub const CAPABILITIES: &[&str] = &[
     "managed_codex_stdio",
     "managed_codex_ws",
     "pty_devin_tmux",
+    "pty_verified_autoready",
+    "inbox_endpoint",
     "approval_brokering",
     "result_routing",
     "fake_provider_tests",
@@ -55,6 +57,25 @@ pub fn unwrap(frame: Value) -> Result<Value> {
 
 pub fn request(method: &str, params: Value) -> Value {
     json!({"method": method, "params": params})
+}
+
+/// Validate a params key: `[a-z0-9_-]` like identifiers plus
+/// underscores (`auto_ready`, `reply_to`). Keys are never used in
+/// filenames, so the wider charset is safe.
+pub fn param_key(value: &str) -> Result<String> {
+    let valid = !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        && value.chars().next().is_some_and(|c| c != '-' && c != '_');
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err(Error::rejected(
+            "Params key must be 1-64 lowercase letters, digits, hyphens or underscores and not start with '-' or '_'",
+        ))
+    }
 }
 
 /// Validate an agent/message identifier: 1-64 chars of `[a-z0-9-]`,

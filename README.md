@@ -58,15 +58,28 @@ cadence agent resume <slug>     # reopen a stopped agent, then attach
                                 #  (waits for the endpoint, ~30s bound;
                                 #   --detach opts out, non-TTY prints)
 cadence agent ready <slug>      # operator claim: pane inspected, idle, empty input
+cadence agent probe <slug>      # analyze the pane without claiming (pty)
+cadence agent set <slug> k=v    # merge an allowlisted param (auto_ready)
+                                #  into a live agent — auto_ready=verified opts
+                                #  the pane into daemon-verified claims
 cadence agent attach <slug>     # print the tmux attach command (--run to exec)
+
+cadence agent register obs --provider inbox   # durable mailbox, no process
+cadence inbox obs [--wait 30]   # drain it: one JSON object per message,
+                                #  each completed via=inbox_read (empty = silent)
 ```
 
 The hot path is verb-first — `devin`, `codex`, `join`, `attach`, `send`,
-`resume`, `stop` — while `agent`, `message` and `daemon` hold the admin
-subcommands (register/list/show/ready/capture/remove/gc/bootstrap,
-send/ask/ack/result, start/run/status/stop). Everywhere a command takes
-an agent name, an alias or a provider-native session id resolves the
-same way.
+`resume`, `stop`, `inbox` — while `agent`, `message` and `daemon` hold
+the admin subcommands (register/list/show/ready/capture/probe/set/
+remove/gc/bootstrap, send/ask/ack/result, start/run/status/stop).
+Everywhere a command takes an agent name, an alias or a provider-native
+session id resolves the same way.
+
+An **inbox** agent is a durable mailbox endpoint: registerable as a
+group root or a `reply_to` target, queueing messages in SQLite until
+`cadence inbox` drains them over the daemon socket — no actor, no
+polling loop, and the backlog survives restarts.
 
 A **group** is a PM agent plus its workers; the PM's slug is the group
 handle. Workers join with `params.upstream` set to the PM's alias, which
