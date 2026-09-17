@@ -2537,6 +2537,7 @@ fn pty_pane_gets_default_options() {
     };
     for want in [
         "-g mouse on",
+        "-g set-clipboard on",
         "-g status-left-length 40",
         "-gw pane-border-status top",
         "-gw pane-border-format  #{session_name} ",
@@ -2885,4 +2886,839 @@ fn fenced_agent_resume_hint() {
         "{v}"
     );
     assert!(v["next"]["attach"].is_null(), "{v}");
+}
+
+/// Spawn the real `cadence` binary under a scratch HOME (skill install
+/// targets `$HOME` directly — no daemon involved).
+fn cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state)
+        .args(args)
+        .env("HOME", home)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn skill_install_links_and_is_idempotent() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+
+    let out = cadence_at(home.path(), state.path(), &["skill", "install"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let file = home.path().join(".agents/skills/cadence/SKILL.md");
+    assert_eq!(v["installed"].as_str().unwrap(), file.to_str().unwrap());
+    assert_eq!(v["linked"].as_array().unwrap().len(), 3);
+    assert!(v["skipped"].as_array().unwrap().is_empty());
+    // The installed file is byte-identical to the vendored copy.
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        cadence_agent::skill::SKILL_MD
+    );
+    for parent in [".claude/skills", ".cursor/skills", ".copilot/skills"] {
+        let link = home.path().join(parent).join("cadence");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            home.path().join(".agents/skills/cadence"),
+            "{parent}"
+        );
+    }
+
+    // Second run: same result, links re-verified not duplicated.
+    let out = cadence_at(home.path(), state.path(), &["skill", "install"]);
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["linked"].as_array().unwrap().len(), 0, "{v}");
+    let status: Value =
+        serde_json::from_slice(&cadence_at(home.path(), state.path(), &["skill", "status"]).stdout)
+            .unwrap();
+    assert_eq!(status["installed"], true);
+    assert_eq!(status["content_match"], true);
+    assert_eq!(status["links"]["claude"], "ok");
+    assert_eq!(status["links"]["cursor"], "ok");
+    assert_eq!(status["links"]["copilot"], "ok");
+}
+
+#[test]
+fn skill_install_never_clobbers_real_entries() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    // A real directory sitting where the claude symlink would go.
+    let foreign = home.path().join(".claude/skills/cadence");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::write(foreign.join("KEEP"), "mine").unwrap();
+
+    let out = cadence_at(home.path(), state.path(), &["skill", "install"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["linked"].as_array().unwrap().len(), 2, "{v}");
+    assert_eq!(v["skipped"].as_array().unwrap().len(), 1);
+    // Untouched — still a real dir with its contents.
+    assert!(foreign.is_dir() && !foreign.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(
+        std::fs::read_to_string(foreign.join("KEEP")).unwrap(),
+        "mine"
+    );
+    let status: Value =
+        serde_json::from_slice(&cadence_at(home.path(), state.path(), &["skill", "status"]).stdout)
+            .unwrap();
+    assert_eq!(status["links"]["claude"], "foreign");
+}
+
+#[test]
+fn skill_install_overwrites_stale_content() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    cadence_at(home.path(), state.path(), &["skill", "install"]);
+    let file = home.path().join(".agents/skills/cadence/SKILL.md");
+    std::fs::write(&file, "STALE").unwrap();
+    let status: Value =
+        serde_json::from_slice(&cadence_at(home.path(), state.path(), &["skill", "status"]).stdout)
+            .unwrap();
+    assert_eq!(status["content_match"], false);
+
+    cadence_at(home.path(), state.path(), &["skill", "install"]);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        cadence_agent::skill::SKILL_MD
+    );
+}
+
+#[test]
+fn daemon_run_refreshes_skill_on_start() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap().path().join("state");
+    // Seed a stale copy so the refresh (not just install) is exercised.
+    let file = home.path().join(".agents/skills/cadence/SKILL.md");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "STALE").unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["daemon", "run"])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read_to_string(&file)
+        .map(|s| s.as_str() == "STALE")
+        .unwrap_or(true)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        cadence_agent::skill::SKILL_MD,
+        "daemon start must refresh stale skill content"
+    );
+    // Missing links get created too.
+    assert!(home
+        .path()
+        .join(".claude/skills/cadence")
+        .symlink_metadata()
+        .is_ok());
+    // Cleanly stop the daemon we spawned.
+    let _ = cadence_at(home.path(), &state, &["daemon", "stop"]);
+    let _ = child.wait();
+}
+
+/// `agent list` inside a cadence pane scopes to the caller's group.
+#[test]
+fn agent_list_scopes_to_callers_group() {
+    let d = TestDaemon::start();
+    d.register("pm1");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "params": "{\"upstream\":\"pm1\"}"}),
+    )
+    .unwrap();
+    d.register("other");
+    d.wait_agent("pm1", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    d.wait_agent("other", "idle", 10);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let list = |env_alias: Option<&str>, extra: &[&str]| -> Value {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("--state-dir")
+            .arg(&d.state)
+            .args(["agent", "list"])
+            .args(extra)
+            .env_remove("CADENCE_ALIAS");
+        if let Some(a) = env_alias {
+            cmd.env("CADENCE_ALIAS", a);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let aliases = |v: &Value| -> Vec<String> {
+        let mut names: Vec<String> = v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["alias"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+
+    // Worker inside a pane: sees its group — root + itself.
+    let v = list(Some("w1"), &[]);
+    assert_eq!(aliases(&v), vec!["pm1", "w1"], "{v}");
+    let root = v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "pm1")
+        .unwrap();
+    assert_eq!(root["group_root"], true, "{v}");
+    let worker = v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "w1")
+        .unwrap();
+    assert!(worker["group_root"].is_null(), "{v}");
+
+    // The PM itself has no upstream — it IS its group root.
+    let v = list(Some("pm1"), &[]);
+    assert_eq!(aliases(&v), vec!["pm1", "w1"], "{v}");
+
+    // Unresolvable alias and no env both fall back to global — and
+    // every row still carries its group wiring: "group" names the root
+    // (upstream when wired, else the row's own alias) and roots are
+    // marked, so consumers can render the tree from global output too.
+    let v = list(Some("nobody"), &[]);
+    assert_eq!(aliases(&v), vec!["other", "pm1", "w1"], "{v}");
+    let v = list(None, &[]);
+    assert_eq!(aliases(&v), vec!["other", "pm1", "w1"], "{v}");
+    for a in v["agents"].as_array().unwrap() {
+        match a["alias"].as_str().unwrap() {
+            "pm1" | "other" => {
+                assert_eq!(a["group"], a["alias"], "{a}");
+                assert_eq!(a["group_root"], true, "{a}");
+            }
+            "w1" => {
+                assert_eq!(a["group"], "pm1", "{a}");
+                assert!(a["group_root"].is_null(), "{a}");
+            }
+            other => panic!("unexpected agent {other}"),
+        }
+    }
+
+    // --all forces global from inside a pane.
+    let v = list(Some("w1"), &["--all"]);
+    assert_eq!(aliases(&v), vec!["other", "pm1", "w1"], "{v}");
+}
+
+/// Every launch path writes the briefing + AGENTS.md block; standalone
+/// launches stay silent (no message) unless --bootstrap is passed.
+#[test]
+fn standalone_launch_writes_briefing_and_agents_block() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    let repo = d.dir.path().join("srepo");
+    git_repo(&repo);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["devin", "--alias", "solo", "--detach", "--cwd"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("solo", "idle", 20);
+
+    // Standalone root = itself: briefing in its own .cadence/<alias>/.
+    let text = std::fs::read_to_string(repo.join(".cadence/solo/BRIEFING-solo.md")).unwrap();
+    assert!(text.contains("none — you are a group root"), "{text}");
+    assert!(text.contains("cadence self"), "{text}");
+    // AGENTS.md carries the marker block; .gitignore covers .cadence/.
+    let agents = std::fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+    assert!(agents.contains("<!-- cadence:begin -->"), "{agents}");
+    let gitignore = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
+    assert!(gitignore.lines().any(|l| l.trim() == ".cadence/"));
+    // Silent by default — no bootstrap message was enqueued.
+    let show = d.rpc("agent_show", json!({"alias": "solo"})).unwrap();
+    assert!(!show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["source"] == "bootstrap"));
+
+    // --bootstrap on a standalone launch enqueues the durable kickoff.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["devin", "--alias", "wb", "--bootstrap", "--detach", "--cwd"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("wb", "idle", 20);
+    let m = d.wait_message("wb", "bootstrap-wb", &["queued", "submitting"], 15);
+    assert_eq!(m["source"], "bootstrap");
+
+    // --no-bootstrap writes nothing at all.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "devin",
+            "--alias",
+            "nb",
+            "--no-bootstrap",
+            "--detach",
+            "--cwd",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("nb", "idle", 20);
+    assert!(!repo.join(".cadence/nb/BRIEFING-nb.md").exists());
+    let show = d.rpc("agent_show", json!({"alias": "nb"})).unwrap();
+    assert!(!show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["source"] == "bootstrap"));
+}
+
+/// `agent bootstrap` retrofits a live agent launched before briefings:
+/// writes the file (to its upstream's group dir when wired) and enqueues
+/// the durable message; unknown aliases are refused.
+#[test]
+fn agent_bootstrap_retrofits_live_agent() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "params": "{\"upstream\":\"pm\"}"}),
+    )
+    .unwrap();
+    d.register("solo");
+    d.wait_agent("w1", "idle", 10);
+    d.wait_agent("solo", "idle", 10);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+
+    // Wired worker: briefing lands under the PM's .cadence/<pm>/ and the
+    // message enqueues (fake endpoint — it completes its turn).
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "bootstrap", "w1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["message"], "bootstrap-w1");
+    let m = d.wait_message("w1", "bootstrap-w1", &["completed"], 15);
+    assert_eq!(m["source"], "bootstrap");
+    let briefing = d.dir.path().join(".cadence/pm/BRIEFING-w1.md");
+    let text = std::fs::read_to_string(&briefing).unwrap();
+    assert!(text.contains("`pm` — reported results route"), "{text}");
+
+    // Standalone agent briefs into its own .cadence/<self>/.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "bootstrap", "solo"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(d.dir.path().join(".cadence/solo/BRIEFING-solo.md").exists());
+    d.wait_message("solo", "bootstrap-solo", &["completed"], 15);
+
+    // Unknown alias is refused, nothing is written.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "bootstrap", "ghost"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+/// `agent resume` waits for the endpoint and attaches like a provider
+/// launch: JSON state + attach hint, --detach opts out, non-TTY prints
+/// the attach command rather than exec'ing it.
+#[test]
+fn agent_resume_waits_and_attaches_like_launch() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.wait_agent("dv1", "stopped", 15);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+
+    // --detach: JSON with the attach hint, no attach attempt.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "resume", "dv1", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["alias"], "dv1");
+    assert!(v["endpoint"].is_string(), "{v}");
+    assert_eq!(
+        v["next"]["attach"].as_str().unwrap(),
+        "cadence agent attach dv1"
+    );
+    d.wait_agent("dv1", "idle", 20);
+
+    // Default (non-TTY test env): after the summary, the attach command
+    // is printed — same JSON shape `agent attach` produces.
+    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.wait_agent("dv1", "stopped", 15);
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "resume", "dv1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("tmux -L"), "{text}");
+    assert!(text.contains("attach-session"), "{text}");
+    d.wait_agent("dv1", "idle", 20);
+
+    // A kind with no attachable endpoint returns the receipt
+    // immediately — no 30s wait.
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+    let started = Instant::now();
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "resume", "w1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "fake resume must not wait"
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["state"], "starting", "{v}");
+    d.wait_agent("w1", "idle", 10);
+}
+
+/// `cadence resume <group>` resumes PM-first then upstream members only,
+/// skips live agents, and reports per-member outcomes.
+#[test]
+fn group_resume_orders_pm_first_and_skips_live() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    for (alias, params) in [
+        ("w1", Some("{\"upstream\":\"pm\"}")),
+        ("w2", Some("{\"upstream\":\"pm\"}")),
+        ("other", None),
+    ] {
+        let mut req = json!({"alias": alias, "provider": "fake",
+                             "endpoint_kind": "fake", "cwd": cwd});
+        if let Some(p) = params {
+            req["params"] = json!(p);
+        }
+        d.rpc("agent_register", req).unwrap();
+    }
+    for a in ["pm", "w1", "w2", "other"] {
+        d.wait_agent(a, "idle", 10);
+    }
+    // pm + w1 down; w2 stays live (skip case); other is ungrouped.
+    d.rpc("agent_stop", json!({"alias": "pm"})).unwrap();
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("pm", "stopped", 15);
+    d.wait_agent("w1", "stopped", 15);
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["resume", "pm", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let resumed: Vec<&str> = v["resumed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["alias"].as_str().unwrap())
+        .collect();
+    // PM first, then members — and only the ones that were down.
+    assert_eq!(resumed, vec!["pm", "w1"], "{v}");
+    let skipped: Vec<&str> = v["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["alias"].as_str().unwrap())
+        .collect();
+    assert_eq!(skipped, vec!["w2"], "{v}");
+    assert!(v["failed"].as_array().unwrap().is_empty(), "{v}");
+    // The ungrouped agent was never touched.
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "other"})).unwrap()["agent"]["state"],
+        "idle"
+    );
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+}
+
+/// `cadence resume --all` sweeps every resumable agent; `daemon start
+/// --resume` runs the same sweep once the daemon answers.
+#[test]
+fn resume_all_and_daemon_start_resume_sweep() {
+    let d = TestDaemon::start();
+    d.register("a1");
+    d.register("a2");
+    d.wait_agent("a1", "idle", 10);
+    d.wait_agent("a2", "idle", 10);
+    d.rpc("agent_stop", json!({"alias": "a1"})).unwrap();
+    d.wait_agent("a1", "stopped", 15);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["resume", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let resumed: Vec<&str> = v["resumed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["alias"].as_str().unwrap())
+        .collect();
+    // a2 is live — not a sweep target at all; a1 resumes.
+    assert_eq!(resumed, vec!["a1"], "{v}");
+    d.wait_agent("a1", "idle", 10);
+
+    // `daemon start --resume` against a second, stopped-forever state
+    // dir would need a fresh daemon — instead verify the flag parses
+    // and reaches the sweep against the LIVE daemon: agents with no
+    // thread/session or a live endpoint are ignored, so the sweep is a
+    // no-op here.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["daemon", "start", "--resume"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["state"], "already_running", "{v}");
+    assert!(v["resume"]["resumed"].as_array().unwrap().is_empty(), "{v}");
+}
+
+/// `cadence stop <group>` tears down members + PM; agents stay
+/// registered and resumable.
+#[test]
+fn group_stop_tears_down_members_and_pm() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "params": "{\"upstream\":\"pm\"}"}),
+    )
+    .unwrap();
+    d.register("other");
+    for a in ["pm", "w1", "other"] {
+        d.wait_agent(a, "idle", 10);
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["stop", "pm"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let stopped: Vec<&str> = v["stopped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["alias"].as_str().unwrap())
+        .collect();
+    assert_eq!(stopped, vec!["w1", "pm"], "{v}");
+    d.wait_agent("pm", "stopped", 15);
+    d.wait_agent("w1", "stopped", 15);
+    // Untouched outsider; members remain registered.
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "other"})).unwrap()["agent"]["state"],
+        "idle"
+    );
+    assert!(d.rpc("agent_show", json!({"alias": "w1"})).is_ok());
+}
+
+/// Error hints: resuming a live agent suggests attach; an
+/// unrecoverable session mismatch in the sweep gets the
+/// remove-and-rejoin hint.
+#[test]
+fn resume_error_hints() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    // Live agent resume → daemon rejection naming `cadence attach`.
+    let err = d
+        .rpc("agent_resume", json!({"alias": "w1"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("cadence attach w1"), "{err}");
+}
+
+/// A member whose pane bound a different native session is reported
+/// unrecoverable with the remove-and-rejoin hint — the rest of the
+/// group still resumes.
+#[test]
+fn group_resume_reports_unrecoverable_session_mismatch() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("pm", None);
+    // Member pinned to a specific native session.
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w-bad", "provider": "devin", "endpoint_kind": "pty",
+               "cwd": cwd,
+               "params": "{\"upstream\":\"pm\",\"session\":\"want-x\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 15);
+    d.wait_agent("w-bad", "idle", 15);
+    d.rpc("agent_stop", json!({"alias": "w-bad"})).unwrap();
+    d.wait_agent("w-bad", "stopped", 15);
+
+    // Before the group resume, plant a rogue pane under the member's
+    // session name that holds a DIFFERENT native lock — the reattach
+    // path must fail closed with the session-mismatch error.
+    let sock = socket_for(&d.state);
+    let devin_py = mock.dir.join("mock-devin.py");
+    let st = std::process::Command::new(mock.dir.join("tmux"))
+        .args(["-L", &sock, "new-session", "-d", "-s", "w-bad", "-c", &cwd])
+        .arg(format!(
+            "python3 {} {} -r other-y",
+            devin_py.display(),
+            mock.locks.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    // Wait until the rogue pane actually holds its lock.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !mock.locks.join("other-y.lock").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rogue pane never took its lock"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["resume", "pm", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let failed = v["failed"].as_array().unwrap();
+    let bad = failed
+        .iter()
+        .find(|r| r["alias"] == "w-bad")
+        .unwrap_or_else(|| panic!("w-bad missing from failed: {v}"));
+    assert_eq!(bad["unrecoverable"], true, "{bad}");
+    let hint = bad["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("cadence agent remove w-bad"), "{hint}");
+    assert!(hint.contains("cadence join"), "{hint}");
+    assert!(
+        bad["error"].as_str().unwrap_or("").contains("owns session"),
+        "{bad}"
+    );
+    // The PM was already live — skipped, not failed; the mismatch is
+    // strictly per-member.
+    assert!(
+        v["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["alias"] == "pm"),
+        "{v}"
+    );
+}
+
+/// Bare `cadence attach` orders roots before their members and marks
+/// each row with its group, so a worker is identifiable under its PM.
+#[test]
+fn attach_listing_groups_workers_under_pm() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("pm", None);
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "devin", "endpoint_kind": "pty",
+               "cwd": cwd, "params": "{\"upstream\":\"pm\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 15);
+    d.wait_agent("w1", "idle", 15);
+    // A second, unrelated root sorts by its own group.
+    d.register_devin("zz-solo", None);
+    d.wait_agent("zz-solo", "idle", 15);
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .arg("attach")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["attachable"].as_array().unwrap();
+    let aliases: Vec<&str> = rows.iter().map(|r| r["alias"].as_str().unwrap()).collect();
+    // pm's group first, pm before its member; the unrelated root last.
+    assert_eq!(aliases, vec!["pm", "w1", "zz-solo"], "{v}");
+    assert_eq!(rows[0]["group"], "pm");
+    assert_eq!(rows[0]["group_root"], true);
+    assert_eq!(rows[1]["group"], "pm");
+    assert_eq!(rows[1]["group_root"], false);
+    assert_eq!(rows[2]["group_root"], true);
+
+    // A named attach in a non-TTY context prints the command rather
+    // than exec'ing it — the same rule launches and resume follow.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["attach", "pm"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["alias"], "pm");
+    assert!(
+        v["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("attach-session"),
+        "{v}"
+    );
+}
+
+/// `cadence send` is the verb alias for `message send` — same durable
+/// enqueue, same fields.
+#[test]
+fn send_verb_matches_message_send() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["send", "w1", "--text", "do thing", "--message", "m-verb"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["message"], "m-verb", "{v}");
+    // Fake endpoints complete turns in-line — the message lands.
+    d.wait_message("w1", "m-verb", &["completed"], 15);
 }
