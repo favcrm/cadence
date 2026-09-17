@@ -1,6 +1,8 @@
 /target/
 /.worktrees/
 .state/
+/ui/node_modules/
+/ui/dist/
 .env
 *.log
 __pycache__/
