@@ -25,9 +25,43 @@ use crate::error::{Error, Result};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 
+/// Environment scrubbing applied to the child at launch. `names` are
+/// removed verbatim; every inherited variable whose name starts with a
+/// `prefixes` entry is removed unless it appears in `keep` — the
+/// keep-list is operator-set configuration that must survive (e.g.
+/// `CLAUDE_CONFIG_DIR`). Prefix scrubbing enumerates the daemon's own
+/// environment at spawn, so new leak names are caught by rule rather
+/// than by list.
+pub struct EnvScrub {
+    names: Vec<String>,
+    prefixes: Vec<String>,
+    keep: Vec<String>,
+}
+
+impl EnvScrub {
+    /// Exact-name scrubbing (the codex transport's list).
+    pub fn names(names: &[&str]) -> Self {
+        Self {
+            names: names.iter().map(|s| s.to_string()).collect(),
+            prefixes: Vec::new(),
+            keep: Vec::new(),
+        }
+    }
+
+    /// Prefix scrubbing: every inherited `PREFIX*` is removed except the
+    /// `keep` names, which the operator sets on purpose.
+    pub fn prefixes(prefixes: &[&str], keep: &[&str]) -> Self {
+        Self {
+            names: Vec::new(),
+            prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
+            keep: keep.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
 pub struct StdioAdapter {
     command: Vec<String>,
-    env_scrub: Vec<String>,
+    env_scrub: EnvScrub,
     on_message: MessageHandler,
     on_disconnect: DisconnectHook,
     inner: Mutex<Inner>,
@@ -45,7 +79,7 @@ struct Inner {
 impl StdioAdapter {
     pub fn new(
         command: &[String],
-        env_scrub: &[&str],
+        env_scrub: EnvScrub,
         on_message: MessageHandler,
         on_disconnect: DisconnectHook,
     ) -> Arc<Self> {
@@ -57,7 +91,7 @@ impl StdioAdapter {
     /// `params` is the whole event object. Used by Claude `stream-json`.
     pub fn new_lines(
         command: &[String],
-        env_scrub: &[&str],
+        env_scrub: EnvScrub,
         on_message: MessageHandler,
         on_disconnect: DisconnectHook,
     ) -> Arc<Self> {
@@ -66,14 +100,14 @@ impl StdioAdapter {
 
     fn with_mode(
         command: &[String],
-        env_scrub: &[&str],
+        env_scrub: EnvScrub,
         on_message: MessageHandler,
         on_disconnect: DisconnectHook,
         raw_lines: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             command: command.to_vec(),
-            env_scrub: env_scrub.iter().map(|s| s.to_string()).collect(),
+            env_scrub,
             on_message,
             on_disconnect,
             inner: Mutex::new(Inner {
@@ -108,8 +142,24 @@ impl StdioAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log));
-        for name in &self.env_scrub {
+        for name in &self.env_scrub.names {
             command.env_remove(name);
+        }
+        if !self.env_scrub.prefixes.is_empty() {
+            for (key, _) in std::env::vars_os() {
+                let Some(key) = key.to_str() else { continue };
+                if self.env_scrub.keep.iter().any(|k| k == key) {
+                    continue;
+                }
+                if self
+                    .env_scrub
+                    .prefixes
+                    .iter()
+                    .any(|p| key.starts_with(p.as_str()))
+                {
+                    command.env_remove(key);
+                }
+            }
         }
         for (key, value) in env {
             command.env(key, value);
@@ -181,17 +231,20 @@ impl StdioAdapter {
         (self.on_disconnect)();
     }
 
-    /// Write one outbound frame. A write failure means the request may or
-    /// may not have reached the provider — `OutcomeUnknown`, not a retry.
+    /// Write one outbound frame. When the transport is already
+    /// disconnected or stdin is already gone, provably no bytes left —
+    /// a provider error, not `OutcomeUnknown`. Only a failed
+    /// `write_all`/`flush` is genuinely uncertain: the request may or
+    /// may not have reached the provider.
     pub fn send(&self, message: Value) -> Result<()> {
         if self.disconnected.load(Ordering::SeqCst) {
-            return Err(Error::unknown("Provider connection is closed"));
+            return Err(Error::provider("Provider connection is closed"));
         }
         let mut inner = self.inner.lock().unwrap();
         let stdin = inner
             .stdin
             .as_mut()
-            .ok_or_else(|| Error::unknown("Provider connection is closed"))?;
+            .ok_or_else(|| Error::provider("Provider connection is closed"))?;
         let mut payload = message.to_string();
         payload.push('\n');
         stdin

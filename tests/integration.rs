@@ -438,7 +438,11 @@ fn unknown_outcome_never_replays() {
     )
     .unwrap();
     let m = d.wait_message("w1", "x1", &["unknown"], 15);
-    assert!(m["error"].as_str().unwrap().contains("uncertain"));
+    // The fence carries the provider's own reason, not a generic label.
+    assert!(
+        m["error"].as_str().unwrap().contains("Connection lost"),
+        "{m}"
+    );
     d.wait_agent("w1", "attention", 10);
     // Subsequent messages stay queued — no automatic replay or relaunch.
     d.rpc(
@@ -1770,7 +1774,7 @@ fn malformed_turn_start_is_unknown_not_failed() {
     // Acknowledged but uncorrelatable: the provider may have started work,
     // so the attempt is fenced unknown — not a definitive failure.
     let m1 = d.wait_message("w1", "m1", &["unknown"], 20);
-    assert!(m1["error"].as_str().unwrap().contains("uncertain"));
+    assert!(m1["error"].as_str().unwrap().contains("no turn id"), "{m1}");
     d.wait_agent("w1", "attention", 10);
     d.rpc(
         "agent_send",
@@ -5125,11 +5129,19 @@ fn agent_set_opts_live_agent_into_auto_ready() {
 ///   await-interrupt  — no result until SIGINT, then an interrupted one
 ///   replay           — replays $MOCK_CLAUDE_FIXTURE events verbatim,
 ///                      rewriting session_id fields to the argv id
+///   heartbeat        — activity every ~0.3s for ~3.6s, then success —
+///                      a turn longer than a short idle window
+///   silent           — init, then nothing; stays alive (idle fence)
+///   chatty           — activity every ~0.3s forever, never a result
+///                      (absolute-cap fence)
+///   tooluse          — one assistant tool_use block, then success
 const MOCK_CLAUDE_PY: &str = r#"
-import json, os, signal, sys
+import json, os, signal, sys, time
 
 pidfile = sys.argv[1]
-mode = os.environ.get("CADENCE_CLAUDE_MODE", "ok")
+# Mode travels in the pidfile basename — the daemon scrubs CADENCE_*
+# from the child env, so an env var would never arrive.
+mode = os.path.basename(pidfile).removeprefix("claude-").removesuffix(".pid")
 argv = sys.argv[2:]
 sid = ""
 for i, a in enumerate(argv):
@@ -5140,10 +5152,8 @@ with open(pidfile, "w") as f:
 with open(pidfile + ".argv", "w") as f:
     f.write("\n".join(sys.argv))
 with open(pidfile + ".env", "w") as f:
-    f.write("CADENCE_ALIAS=%s\nCADENCE_STATE_DIR=%s\nCLAUDE_CODE_SESSION_ID=%s\n" % (
-        os.environ.get("CADENCE_ALIAS", ""),
-        os.environ.get("CADENCE_STATE_DIR", ""),
-        os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
+    for k in sorted(os.environ):
+        f.write("%s=%s\n" % (k, os.environ[k]))
 
 count = [0]
 
@@ -5212,6 +5222,29 @@ for line in sys.stdin:
           "session_id": sid})
     if mode_now == "await-interrupt":
         continue  # the SIGINT handler emits the result
+    if mode_now == "silent":
+        while True:
+            time.sleep(5)  # alive but eventless — the idle fence path
+    if mode_now == "chatty":
+        while True:
+            emit({"type": "assistant",
+                  "message": {"role": "assistant",
+                              "content": [{"type": "text", "text": "."}]},
+                  "session_id": sid})
+            time.sleep(0.3)
+    if mode_now == "heartbeat":
+        for _ in range(12):
+            emit({"type": "assistant",
+                  "message": {"role": "assistant",
+                              "content": [{"type": "text", "text": "."}]},
+                  "session_id": sid})
+            time.sleep(0.3)
+    if mode_now == "tooluse":
+        emit({"type": "assistant",
+              "message": {"role": "assistant",
+                          "content": [{"type": "tool_use", "name": "Bash",
+                                       "input": {"command": "true"}}]},
+              "session_id": sid})
     if mode_now == "fail":
         result(subtype="error_during_execution", is_error=True,
                errors=["mock exploded"], stop_reason="error")
@@ -5254,8 +5287,6 @@ impl TestDaemon {
             "CADENCE_CLAUDE_COMMAND",
             format!("python3 {} {}", script.display(), pidfile.display()),
         );
-        // Mode travels in the env so appended CLI flags stay realistic.
-        std::env::set_var("CADENCE_CLAUDE_MODE", mode);
         if let Some(f) = fixture {
             std::env::set_var("MOCK_CLAUDE_FIXTURE", f);
         }
@@ -5274,7 +5305,6 @@ impl TestDaemon {
             "CADENCE_CLAUDE_COMMAND",
             format!("python3 {} {}", script.display(), pidfile.display()),
         );
-        std::env::set_var("CADENCE_CLAUDE_MODE", mode);
         MockClaude {
             _guard: None,
             pidfile,
@@ -5520,19 +5550,64 @@ fn claude_denials_complete_with_event() {
 #[test]
 fn claude_env_injected_and_scrubbed() {
     let d = TestDaemon::start();
-    // A parent conversation's identity must never leak into the child.
-    std::env::set_var("CLAUDE_CODE_SESSION_ID", "stale-parent-sid");
+    // Scrub by rule: every CLAUDE_*/CLAUDECODE/CODEX_*/CADENCE_* name a
+    // parent session (or a test override) could leak is removed — except
+    // the documented keep-list. ANTHROPIC_* auth is never touched.
+    for (k, v) in [
+        ("CLAUDECODE", "1"),
+        ("CLAUDE_CODE_EXECPATH", "/usr/bin/claude"),
+        ("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet"),
+        ("CLAUDE_EFFORT", "high"),
+        ("CLAUDE_PID", "4242"),
+        ("CLAUDE_CODE_SESSION_ID", "stale-parent-sid"),
+        ("CODEX_THREAD_ID", "stale-thread"),
+        // keep-list: operator-set on purpose, must survive
+        ("CLAUDE_CONFIG_DIR", "/tmp/claude-cfg"),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "tok-keep"),
+        ("ANTHROPIC_API_KEY", "sk-keep"),
+    ] {
+        std::env::set_var(k, v);
+    }
     let mock = d.mock_claude("ok", None);
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
-    std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+    for k in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_EFFORT",
+        "CLAUDE_PID",
+        "CLAUDE_CODE_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ] {
+        std::env::remove_var(k);
+    }
     let env = std::fs::read_to_string(mock.pidfile.with_extension("pid.env")).unwrap_or_default();
-    assert!(env.contains("CADENCE_ALIAS=w1"), "{env}");
+    assert!(env.contains("CADENCE_ALIAS=w1\n"), "{env}");
     assert!(
-        env.contains(&format!("CADENCE_STATE_DIR={}", d.state.display())),
+        env.contains(&format!("CADENCE_STATE_DIR={}\n", d.state.display())),
         "{env}"
     );
-    assert!(env.contains("CLAUDE_CODE_SESSION_ID=\n"), "{env}");
+    for leaked in [
+        "CLAUDECODE=",
+        "CLAUDE_CODE_EXECPATH=",
+        "CLAUDE_CODE_SUBAGENT_MODEL=",
+        "CLAUDE_EFFORT=",
+        "CLAUDE_PID=",
+        "CLAUDE_CODE_SESSION_ID=",
+        "CODEX_THREAD_ID=",
+        "CADENCE_CLAUDE_COMMAND=",
+        "CADENCE_CLAUDE_MODE=",
+    ] {
+        assert!(!env.contains(leaked), "{leaked} leaked into child:\n{env}");
+    }
+    // The keep-list and auth variables survive untouched.
+    assert!(env.contains("CLAUDE_CONFIG_DIR=/tmp/claude-cfg\n"), "{env}");
+    assert!(env.contains("CLAUDE_CODE_OAUTH_TOKEN=tok-keep\n"), "{env}");
+    assert!(env.contains("ANTHROPIC_API_KEY=sk-keep\n"), "{env}");
 }
 
 #[test]
@@ -5543,7 +5618,9 @@ fn claude_params_replayed_on_resume() {
         "w1",
         json!({"permission_mode": "acceptEdits",
                "allowed_tools": ["Bash(git *)", "Read"],
-               "model": "haiku"}),
+               "model": "haiku",
+               "turn_idle_secs": 5,
+               "turn_max_secs": 3600}),
     );
     d.wait_agent("w1", "idle", 15);
     let argv_file = mock.pidfile.with_extension("pid.argv");
@@ -5568,6 +5645,10 @@ fn claude_params_replayed_on_resume() {
     assert!(argv2.contains("--permission-mode\nacceptEdits"), "{argv2}");
     assert!(argv2.contains("--allowedTools\nBash(git *)"), "{argv2}");
     assert!(argv2.contains("--model\nhaiku"), "{argv2}");
+    // The turn-liveness params persist on the agent row across resume.
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["params"]["turn_idle_secs"], 5, "{agent}");
+    assert_eq!(agent["params"]["turn_max_secs"], 3600, "{agent}");
 }
 
 #[test]
@@ -5630,5 +5711,96 @@ fn claude_respond_is_rejected_naming_opt_ups() {
         )
         .unwrap_err()
         .to_string();
-    assert!(err.contains("permission-prompt-tool"), "{err}");
+    // The hint names real cadence opt-ups, not flags that don't exist.
+    assert!(err.contains("--permission-mode"), "{err}");
+    assert!(err.contains("--allow"), "{err}");
+    assert!(err.contains("--bypass"), "{err}");
+    assert!(err.contains("permission_denied"), "{err}");
+}
+
+#[test]
+fn claude_tool_use_events_recorded() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("tooluse", None);
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["completed"], 20);
+    // Lifecycle envelope: the tool name lands as a compact event —
+    // no arguments, no transcript text.
+    let ev = d.wait_event("w1", "tool_use", 10);
+    assert_eq!(ev["payload"]["tool"], "Bash", "{ev}");
+    assert!(ev["payload"].get("input").is_none(), "{ev}");
+    assert!(ev["payload"].get("command").is_none(), "{ev}");
+}
+
+#[test]
+fn claude_idle_window_counts_activity() {
+    let d = TestDaemon::start();
+    // heartbeat: an event every ~0.3s for ~3.6s — longer than the 2s
+    // idle window, but never silent — must complete, not fence.
+    let _mock = d.mock_claude("heartbeat", None);
+    d.register_claude("w1", json!({"turn_idle_secs": 2}));
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("w1", "m1", &["completed"], 30);
+    assert!(
+        m1["result"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("MOCK_OK"),
+        "{m1}"
+    );
+}
+
+#[test]
+fn claude_silent_turn_fences_unknown() {
+    let d = TestDaemon::start();
+    // silent: alive but eventless — the idle window declares unknown.
+    let _mock = d.mock_claude("silent", None);
+    d.register_claude("w1", json!({"turn_idle_secs": 2}));
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("w1", "m1", &["unknown"], 30);
+    assert!(
+        m1["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("No provider event"),
+        "{m1}"
+    );
+    d.wait_agent("w1", "attention", 15);
+}
+
+#[test]
+fn claude_max_turn_fences_chatty() {
+    let d = TestDaemon::start();
+    // chatty: activity every ~0.3s forever — the absolute cap still
+    // fences it (idle window alone never fires on a chatty turn).
+    let _mock = d.mock_claude("chatty", None);
+    d.register_claude("w1", json!({"turn_idle_secs": 30, "turn_max_secs": 2}));
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("w1", "m1", &["unknown"], 30);
+    assert!(
+        m1["error"].as_str().unwrap_or("").contains("turn_max_secs"),
+        "{m1}"
+    );
+    d.wait_agent("w1", "attention", 15);
 }

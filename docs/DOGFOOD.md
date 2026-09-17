@@ -244,6 +244,19 @@ claude has no token flow: the turn's `result` text IS the report.
 design (lazy init, denial semantics, EOF-as-shutdown) came from
 fixtures, not docs.
 
+**Review round.** Independent review caught what the happy path hid:
+a fixed 600s turn deadline would have fenced every healthy hour-long
+PM turn — liveness is now activity-based (`turn_idle_secs` bounds
+silence, `turn_max_secs` caps absolutely) and the fence records the
+provider's own reason, so reconcile knows *why*. Environment scrubbing
+moved from a name list to a prefix rule — a list keeps missing new
+leak vars (`CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_EFFORT`, `CLAUDE_PID`)
+— with an explicit keep-list for operator-set config. `send` on a
+provably-dead transport is a provider error, not `unknown` — nothing
+was written, so nothing is uncertain. And `assistant` events now emit
+compact `tool_use` lifecycle events (name only) so `events --follow`
+shows a long turn working.
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not

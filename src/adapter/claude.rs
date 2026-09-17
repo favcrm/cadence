@@ -20,6 +20,13 @@
 //!   another process owns the expected session — the agent fences.
 //! - Interrupt is SIGINT to the child's own process group; a bounded
 //!   grace waits for the interrupted result, then fails closed.
+//! - Turn liveness is activity, not wall clock: any stdout event resets
+//!   the clock, and a turn fences `unknown` only after
+//!   `params.turn_idle_secs` of silence (default 900) or the optional
+//!   `params.turn_max_secs` absolute cap — a healthy multi-hour turn is
+//!   never fenced for being long.
+//! - One `tool_use` lifecycle event per assistant tool call (name only)
+//!   keeps `events --follow` meaningful without proxying the transcript.
 //! - No approval brokering in phase A: `--permission-mode` (default
 //!   `manual`) and `--allowedTools` (always `Bash(cadence *)` plus
 //!   `params.allowed_tools`) are fixed at launch and replayed on resume.
@@ -36,31 +43,36 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::link::Incoming;
-use super::stdio::StdioAdapter;
+use super::stdio::{EnvScrub, StdioAdapter};
 use super::{AdapterHooks, Identity, ProviderAdapter, TurnResult};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
-const TURN_DEADLINE: Duration = Duration::from_secs(600);
+/// Default inactivity window: a turn is `unknown` only after no stdout
+/// event for this long — never on a wall-clock deadline. Overridable via
+/// `params.turn_idle_secs` (`--turn-idle-secs`); `params.turn_max_secs`
+/// (`--turn-max-secs`) adds an optional absolute cap.
+const DEFAULT_TURN_IDLE: Duration = Duration::from_secs(900);
 /// After SIGINT the provider is expected to emit a final `result` —
 /// a bounded grace keeps a hung interrupt from parking the actor.
 const INTERRUPT_GRACE: Duration = Duration::from_secs(60);
 
-/// Identity variables a child must never inherit from a parent
-/// conversation (Claude session markers, foreign providers, and the
-/// Cadence identity re-injected per-agent at launch).
-const ENV_SCRUB: &[&str] = &[
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CODEX_THREAD_ID",
-    "CODEX_SESSION_ID",
-    "CADENCE_ALIAS",
-    "CADENCE_STATE_DIR",
-];
+/// Scrubbed by rule, not by name list — a list keeps missing new leak
+/// variables (`CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_EFFORT`,
+/// `CLAUDE_PID`, …). `CLAUDECODE` and every inherited `CLAUDE_*`,
+/// `CODEX_*`, `CADENCE_*` name is removed except the keep-list —
+/// configuration an operator sets on purpose: `CLAUDE_CONFIG_DIR`
+/// (config location) and `CLAUDE_CODE_OAUTH_TOKEN` (CI auth injection).
+/// `ANTHROPIC_*` auth/proxy variables are never touched. `CADENCE_*` is
+/// scrubbed then the real pair (`CADENCE_ALIAS`, `CADENCE_STATE_DIR`) is
+/// re-injected per agent — test overrides like `CADENCE_CLAUDE_COMMAND`
+/// never reach the child.
+fn claude_env_scrub() -> EnvScrub {
+    EnvScrub::prefixes(
+        &["CLAUDE_", "CLAUDECODE", "CODEX_", "CADENCE_"],
+        &["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"],
+    )
+}
 
 /// Provider binary; `CADENCE_CLAUDE_COMMAND` overrides it (test/mock).
 /// Stream-json flags are appended after this prefix so a mock sees the
@@ -143,6 +155,16 @@ struct Shared {
     generation: Mutex<String>,
     /// Set by `interrupt()` — the next result's grace deadline.
     interrupt_at: Mutex<Option<Instant>>,
+    /// Last provider stdout event — the turn liveness clock. Stamped in
+    /// `dispatch`, so every parsed line (assistant, user, system,
+    /// stream_event, result) counts as activity.
+    last_activity: Mutex<Instant>,
+    /// Inactivity window before a turn is `unknown`
+    /// (`params.turn_idle_secs`, default 900 s). Set at `open`.
+    idle_window: Mutex<Duration>,
+    /// Optional absolute turn cap (`params.turn_max_secs`, default
+    /// none). Set at `open`.
+    max_turn: Mutex<Option<Duration>>,
     dead: AtomicBool,
 }
 
@@ -156,6 +178,9 @@ impl ClaudeAdapter {
             session_mismatch: Mutex::new(None),
             generation: Mutex::new(String::new()),
             interrupt_at: Mutex::new(None),
+            last_activity: Mutex::new(Instant::now()),
+            idle_window: Mutex::new(DEFAULT_TURN_IDLE),
+            max_turn: Mutex::new(None),
             dead: AtomicBool::new(false),
         });
         let routed = Arc::clone(&shared);
@@ -163,7 +188,7 @@ impl ClaudeAdapter {
         Self {
             transport: RwLock::new(StdioAdapter::new_lines(
                 &claude_command(),
-                ENV_SCRUB,
+                claude_env_scrub(),
                 Box::new(move |incoming| routed.dispatch(incoming)),
                 Box::new(move || disconnected.on_disconnect()),
             )),
@@ -184,7 +209,7 @@ impl ClaudeAdapter {
         let disconnected = Arc::clone(&self.shared);
         StdioAdapter::new_lines(
             command,
-            ENV_SCRUB,
+            claude_env_scrub(),
             Box::new(move |incoming| routed.dispatch(incoming)),
             Box::new(move || disconnected.on_disconnect()),
         )
@@ -197,16 +222,40 @@ impl Shared {
             // stream-json has no server→client requests.
             return;
         };
+        // Any parsed stdout event is proof of life — the turn liveness
+        // clock is activity, not wall clock.
+        *self.last_activity.lock().unwrap() = Instant::now();
         match method.as_str() {
             "system" if params.get("subtype").and_then(Value::as_str) == Some("init") => {
                 self.on_init(&params);
             }
+            "assistant" => self.on_assistant(&params),
             "result" => {
                 self.results.lock().unwrap().push_back(params.clone());
                 self.result_cv.notify_all();
                 self.emit_result_meta(&params);
             }
             _ => {}
+        }
+    }
+
+    /// One compact lifecycle event per tool use — name only, never
+    /// arguments or text — so `cadence events --follow` shows progress
+    /// on a long turn without proxying the transcript.
+    fn on_assistant(&self, event: &Value) {
+        let Some(content) = event
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                if let Some(name) = block.get("name").and_then(Value::as_str) {
+                    self.emit("cadence/tool_use", &json!({"tool": name}));
+                }
+            }
         }
     }
 
@@ -285,6 +334,17 @@ impl ProviderAdapter for ClaudeAdapter {
                 self.state_dir.to_string_lossy().to_string(),
             ),
         ];
+        let params = agent.params.clone().unwrap_or(Value::Null);
+        let idle_secs = params
+            .get("turn_idle_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_TURN_IDLE.as_secs());
+        *self.shared.idle_window.lock().unwrap() = Duration::from_secs(idle_secs.max(1));
+        *self.shared.max_turn.lock().unwrap() = params
+            .get("turn_max_secs")
+            .and_then(Value::as_u64)
+            .map(|s| Duration::from_secs(s.max(1)));
+        *self.shared.last_activity.lock().unwrap() = Instant::now();
         let transport = self.transport_for(&command);
         let pid = transport.launch(&agent.cwd, &self.log_path, &env)?;
         *self.transport.write().unwrap() = transport;
@@ -323,7 +383,14 @@ impl ProviderAdapter for ClaudeAdapter {
             "message": {"role": "user", "content": prompt},
         }))?;
         on_started(&turn_id);
-        let deadline = Instant::now() + TURN_DEADLINE;
+        // The liveness clock is provider activity, not wall clock: a
+        // turn that keeps emitting events is alive no matter how long it
+        // runs. `turn_idle_secs` bounds silence; `turn_max_secs`, when
+        // set, is an absolute cap even on a chatty turn.
+        let start = Instant::now();
+        *self.shared.last_activity.lock().unwrap() = start;
+        let idle_window = *self.shared.idle_window.lock().unwrap();
+        let max_turn = *self.shared.max_turn.lock().unwrap();
         let result = {
             let mut queue = self.shared.results.lock().unwrap();
             loop {
@@ -338,6 +405,22 @@ impl ProviderAdapter for ClaudeAdapter {
                         "Claude process exited before a result; outcome is unknown",
                     ));
                 }
+                let now = Instant::now();
+                let last = *self.shared.last_activity.lock().unwrap();
+                let idle_left = (last + idle_window).saturating_duration_since(now);
+                if idle_left.is_zero() {
+                    return Err(Error::unknown(format!(
+                        "No provider event for {}s; outcome is unknown",
+                        idle_window.as_secs()
+                    )));
+                }
+                let max_left = max_turn.map(|cap| (start + cap).saturating_duration_since(now));
+                if matches!(max_left, Some(d) if d.is_zero()) {
+                    return Err(Error::unknown(format!(
+                        "Turn exceeded turn_max_secs ({}s); provider outcome needs review",
+                        max_turn.unwrap_or_default().as_secs()
+                    )));
+                }
                 let interrupt_deadline = self
                     .shared
                     .interrupt_at
@@ -345,21 +428,18 @@ impl ProviderAdapter for ClaudeAdapter {
                     .unwrap()
                     .map(|at| at + INTERRUPT_GRACE);
                 if let Some(at) = interrupt_deadline {
-                    if Instant::now() >= at {
+                    if now >= at {
                         return Err(Error::unknown(
                             "No result after interrupt; provider outcome is unknown",
                         ));
                     }
                 }
-                let remaining = deadline.saturating_duration_since(Instant::now()).min(
-                    interrupt_deadline
-                        .map(|at| at.saturating_duration_since(Instant::now()))
-                        .unwrap_or(TURN_DEADLINE),
-                );
-                if remaining.is_zero() {
-                    return Err(Error::unknown(
-                        "Turn deadline reached; provider outcome needs review",
-                    ));
+                let mut remaining = idle_left;
+                if let Some(d) = max_left {
+                    remaining = remaining.min(d);
+                }
+                if let Some(at) = interrupt_deadline {
+                    remaining = remaining.min(at.saturating_duration_since(now));
                 }
                 let (guard, _) = self
                     .shared
@@ -430,9 +510,11 @@ impl ProviderAdapter for ClaudeAdapter {
     /// stream-json brokers no provider→client requests in phase A.
     fn respond(&self, _request_id: &Value, _result: Value) -> Result<()> {
         Err(Error::rejected(
-            "managed claude endpoints broker no requests — approval flow \
-             opt-ups: --permission-prompt-tool, --include-hook-events, \
-             or an MCP approval tool",
+            "managed claude endpoints broker no requests — widen \
+             permissions by relaunching or rejoining with \
+             `--permission-mode <mode>` or `--allow \"<pattern>\"` \
+             (or `--bypass`); denials are recorded as permission_denied \
+             events on the agent",
         ))
     }
 

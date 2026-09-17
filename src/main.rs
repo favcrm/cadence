@@ -156,6 +156,15 @@ enum Commands {
         /// Shortcut for --permission-mode bypassPermissions.
         #[arg(long, conflicts_with = "permission_mode")]
         bypass: bool,
+        /// Seconds without any provider event before a turn is declared
+        /// unknown [default: 900]. Liveness is activity-based — a turn
+        /// that keeps emitting events runs as long as it needs.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn_idle_secs: Option<u64>,
+        /// Optional absolute turn cap in seconds — fences even a chatty
+        /// turn. Unset by default.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn_max_secs: Option<u64>,
         /// File with reusable provider instructions.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
@@ -253,6 +262,13 @@ enum Commands {
         /// Claude shortcut for --permission-mode bypassPermissions.
         #[arg(long, conflicts_with = "permission_mode")]
         bypass: bool,
+        /// Seconds without any provider event before a claude turn is
+        /// declared unknown [default: 900].
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn_idle_secs: Option<u64>,
+        /// Optional absolute turn cap in seconds for provider `claude`.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn_max_secs: Option<u64>,
     },
     /// Attach this terminal to a live agent's native endpoint. `name`
     /// may be an alias, a provider-native id, or a provider name when
@@ -1392,6 +1408,8 @@ fn run() -> Result<i32> {
             permission_mode,
             allow,
             bypass,
+            turn_idle_secs,
+            turn_max_secs,
             instructions_file,
             worktree,
             bootstrap,
@@ -1416,6 +1434,8 @@ fn run() -> Result<i32> {
                 permission_mode,
                 allow,
                 bypass,
+                turn_idle_secs,
+                turn_max_secs,
             },
         ),
         Commands::Join {
@@ -1434,6 +1454,8 @@ fn run() -> Result<i32> {
             permission_mode,
             allow,
             bypass,
+            turn_idle_secs,
+            turn_max_secs,
         } => join_group(
             &state_dir,
             &group,
@@ -1452,6 +1474,8 @@ fn run() -> Result<i32> {
                 permission_mode,
                 allow,
                 bypass,
+                turn_idle_secs,
+                turn_max_secs,
             },
         ),
         Commands::Attach { name, print } => attach_command(&state_dir, name, print),
@@ -1768,6 +1792,11 @@ struct ClaudeOpts {
     permission_mode: Option<String>,
     allow: Vec<String>,
     bypass: bool,
+    /// `params.turn_idle_secs` — inactivity window before a turn is
+    /// `unknown` (activity-based liveness; default 900).
+    turn_idle_secs: Option<u64>,
+    /// `params.turn_max_secs` — optional absolute turn cap.
+    turn_max_secs: Option<u64>,
 }
 
 /// `cadence devin [-r slug]` / `cadence codex` / `cadence claude`:
@@ -1862,6 +1891,12 @@ fn provider_launch(
         }
         if !claude.allow.is_empty() {
             params_obj.insert("allowed_tools".to_string(), json!(claude.allow));
+        }
+        if let Some(secs) = claude.turn_idle_secs {
+            params_obj.insert("turn_idle_secs".to_string(), json!(secs));
+        }
+        if let Some(secs) = claude.turn_max_secs {
+            params_obj.insert("turn_max_secs".to_string(), json!(secs));
         }
     }
     if auto_ready {

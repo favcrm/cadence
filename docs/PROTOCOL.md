@@ -114,9 +114,10 @@ name a registered agent (both enforced by `enqueue`).
 For provider `claude`, `params` holds the launch options the adapter
 replays verbatim on every resume: `{"model": "<cli model>",
 "permission_mode": "<claude mode>"}` (default `manual`;
-`--bypass` stores `bypassPermissions`) and `{"allowed_tools": ["<pat>",
+`--bypass` stores `bypassPermissions`), `{"allowed_tools": ["<pat>",
 …]}` — appended to the `Bash(cadence *)` baseline the CLI tool needs
-to self-report.
+to self-report — and the turn-liveness knobs `{"turn_idle_secs": N}`
+(default 900) plus `{"turn_max_secs": N}` (optional absolute cap).
 
 **Briefings.** Every launch path (`devin`, `codex`, `claude`, `join`) writes
 `.cadence/<root>/BRIEFING-<alias>.md` — the group root's `.cadence/`
@@ -344,6 +345,25 @@ any `result` → `unknown` + fence, recoverable via `agent unfence` +
 recorded as a `permission_denied` event and the agent is expected to
 work around them.
 
+Turn liveness is **activity-based, never wall-clock**: every parsed
+stdout event (`assistant`, `user`, `system`, `stream_event`, `result`)
+resets the clock. A turn is `unknown` only after `turn_idle_secs` of
+silence (default 900 — a healthy multi-hour turn is fine) or after the
+optional `turn_max_secs` absolute cap, which fences even a chatty turn.
+The fence records the provider's own reason (`No provider event for
+900s`, `Turn exceeded turn_max_secs`, EOF, …) so reconcile knows why.
+Each `assistant` tool_use block also lands as a compact `tool_use`
+event — the tool name only — so `events --follow` shows progress on a
+long turn.
+
+The child's environment is scrubbed **by rule**: `CLAUDECODE` and every
+inherited `CLAUDE_*`, `CODEX_*`, `CADENCE_*` name is removed — a name
+list would keep missing new leak variables (`CLAUDE_CODE_SUBAGENT_MODEL`,
+`CLAUDE_EFFORT`, `CLAUDE_PID`, …). The keep-list is operator-set
+configuration: `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN`.
+`ANTHROPIC_*` auth/proxy variables are never touched; `CADENCE_ALIAS`
+and `CADENCE_STATE_DIR` are re-injected per agent.
+
 Session identity: a fresh open mints `--session-id <uuid>`; reopening
 uses `--resume <thread_id>`. Every `system/init` event is checked — a
 reported `session_id` different from the opened one means another
@@ -356,9 +376,10 @@ closed `unknown`. `close` ends stdin first (clean EOF exit) before the
 TERM→KILL fallback. There is no attachable surface — `agent attach`
 prints an explanation naming `cadence events --follow` and manual
 `claude --resume` after `agent stop`. Phase A brokers no provider
-requests: `agent respond` is `rejected` naming the opt-ups
-(`--permission-prompt-tool`, `--include-hook-events`, MCP approval
-tool). Provider stderr lands in `providers/<alias>.provider.log` and
+requests: `agent respond` is `rejected` naming the real opt-ups —
+relaunch or rejoin with `--permission-mode <mode>` / `--allow "<pat>"`
+/ `--bypass`, and watch `permission_denied` events. Provider stderr
+lands in `providers/<alias>.provider.log` and
 each `result` emits a `claude_result` event carrying
 `total_cost_usd`/`num_turns`/`session_id` for audit.
 

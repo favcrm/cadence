@@ -35,12 +35,17 @@ cadence claude                  # headless managed Claude (stream-json) — each
                                 #  (--model/--permission-mode/--allow/--bypass are
                                 #  stored and replayed on resume; no attach —
                                 #  `cadence events --follow` observes)
+                                #  --turn-idle-secs <n> bounds silence before a
+                                #  turn fences unknown (default 900; liveness is
+                                #  activity-based) — --turn-max-secs <n> adds an
+                                #  absolute cap
 
 cadence join <pm-slug> devin    # spawn a worker wired to a group: results route to the PM
                                 #  (providers: devin, codex, claude, fake)
                                 #  (--worktree <name> isolates it in .cadence/wt/<name>
                                 #   on branch cadence/<name>; --no-bootstrap skips the
-                                #   briefing file + kickoff message)
+                                #   briefing file + kickoff message — note a bootstrap
+                                #   on provider claude spends one real model turn)
 cadence attach [name]           # attach this terminal (alias, native id, or unambiguous
                                 #  provider name); no name lists live attachable agents
                                 #  grouped by PM; non-TTY/in-tmux prints the command

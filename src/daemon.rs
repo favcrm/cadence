@@ -422,11 +422,15 @@ impl Shared {
                     });
                     match outcome {
                         Ok(result) => {
-                            if self.complete(&message, result).is_err() {
+                            if let Err(error) = self.complete(&message, result) {
                                 // The provider reported an outcome we could
                                 // not persist or classify — ambiguous
                                 // post-submission, fence rather than replay.
-                                return self.unknown(alias, &message);
+                                return self.unknown(
+                                    alias,
+                                    &message,
+                                    &format!("reported outcome could not be applied: {error}"),
+                                );
                             }
                             gate_notice = None;
                             gate_waits = 0;
@@ -480,7 +484,11 @@ impl Shared {
                                 unrendered = 0;
                                 self.wake();
                             } else {
-                                return self.unknown(alias, &message);
+                                return self.unknown(
+                                    alias,
+                                    &message,
+                                    "submission accepted but never rendered on the endpoint",
+                                );
                             }
                         }
                         // The submission gate refused before any paste:
@@ -505,8 +513,8 @@ impl Shared {
                             unrendered = 0;
                             ctl.wake.wait_until(Instant::now() + wait);
                         }
-                        Err(Error::OutcomeUnknown(_)) => {
-                            return self.unknown(alias, &message);
+                        Err(Error::OutcomeUnknown(error)) => {
+                            return self.unknown(alias, &message, &error);
                         }
                         // Deterministic pre-submission rejection: zero
                         // bytes reached the provider, so nothing is
@@ -591,26 +599,28 @@ impl Shared {
     }
 
     /// An `OutcomeUnknown` never becomes a retry: mark the attempt and
-    /// fence the actor for review.
-    fn unknown(&self, alias: &str, message: &Message) -> Result<()> {
+    /// fence the actor for review. `reason` is the provider's own account
+    /// of the uncertainty (idle window, EOF, cap exceeded, …) — the
+    /// operator needs it to reconcile.
+    fn unknown(&self, alias: &str, message: &Message, reason: &str) -> Result<()> {
         self.store.finish(
             message,
             "unknown",
-            &json!({"status": "unknown", "text": "", "error": "provider outcome uncertain"}),
-            Some("provider outcome uncertain"),
+            &json!({"status": "unknown", "text": "", "error": reason}),
+            Some(reason),
         )?;
         self.store.set_agent_state(
             alias,
             "attention",
             Some(&format!(
-                "Uncertain provider outcome requires review — reconcile: \
+                "{reason} — reconcile: \
                  `cadence agent unfence {alias} --status interrupted`, then \
                  `cadence agent resume {alias}`"
             )),
         )?;
         let _ = self
             .store
-            .event_public(alias, "attention", json!({"reason": "uncertain_turn"}));
+            .event_public(alias, "attention", json!({"reason": reason}));
         self.wake();
         Err(Error::unknown("Uncertain provider outcome requires review"))
     }
@@ -891,12 +901,15 @@ impl Shared {
     fn rpc_respond(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         // Managed Claude brokers no provider requests in phase A — the
-        // rejection names the opt-ups rather than hunting the pending map.
+        // rejection names the real opt-ups rather than hunting the
+        // pending map.
         if self.store.agent(&alias)?.provider == "claude" {
             return Err(Error::rejected(
-                "managed claude endpoints broker no requests — approval flow \
-                 opt-ups: --permission-prompt-tool, --include-hook-events, \
-                 or an MCP approval tool",
+                "managed claude endpoints broker no requests — widen \
+                 permissions by relaunching or rejoining with \
+                 `--permission-mode <mode>` or `--allow \"<pattern>\"` \
+                 (or `--bypass`); denials are recorded as \
+                 permission_denied events on the agent",
             ));
         }
         let handle = required_str(params, "request")?;
