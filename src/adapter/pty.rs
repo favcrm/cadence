@@ -10,14 +10,22 @@
 //!
 //! Submission is gated, never blind: every `run_turn` re-verifies the pane
 //! is alive, unblocked (`pane_in_mode == 0`) and still lock-owning, and
-//! consumes an explicit operator readiness claim (`agent ready`, valid
-//! [`READY_TTL`], single-use). The claim asserts what heuristics cannot
-//! prove — idle input, no draft, no permission prompt on screen. Text is
-//! delivered literally through a tmux buffer (`load-buffer` + bracketed
-//! `paste-buffer -p` + `Enter`); no shell interpolation and no control
-//! characters. At most one paste is attempted per claim.
+//! consumes a readiness claim. Claims are single-use, time-boxed
+//! ([`READY_TTL`]) and stack FIFO — N claims release N queued sends, each
+//! attributed to its claimer for the audit record. Agents opted into
+//! `params.auto_ready = "verified"` let the daemon mint the claim itself
+//! after a screen probe ([`analyze_devin`]) proves the pane idle; a human
+//! `agent ready` still wins whenever both exist.
 //!
-//! Terminal echo proves *submission*, never model receipt. A pasted
+//! Text is delivered literally through a tmux buffer (`load-buffer` +
+//! bracketed `paste-buffer -p` + `Enter`); no shell interpolation and no
+//! control characters. After Enter, the body prefix must render on the
+//! visible screen within [`RENDER_DEADLINE`] — a busy TUI drops a
+//! bracketed paste silently, so bytes-sent is not delivery evidence. A
+//! provable miss is `NotRendered`; the daemon requeues informational
+//! deliveries and fences task messages as `unknown`.
+//!
+//! Terminal echo proves *rendering*, never model receipt. A pasted
 //! message stays `running` under its `pty-<generation>-<uuid>` token
 //! until an explicit `message ack` / `message result` report completes
 //! it; tokens from a previous endpoint generation are rejected. If the
@@ -30,6 +38,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -39,7 +48,7 @@ use uuid::Uuid;
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
-use super::{AdapterHooks, Identity, ProviderAdapter, TurnResult};
+use super::{AdapterHooks, Identity, Probe, ProviderAdapter, TurnResult};
 
 /// How long an operator readiness claim stays valid for one send.
 const READY_TTL: Duration = Duration::from_secs(60);
@@ -47,7 +56,95 @@ const READY_TTL: Duration = Duration::from_secs(60);
 const OPEN_DEADLINE: Duration = Duration::from_secs(30);
 /// Pause between bracketed paste and Enter so the TUI consumes it.
 const PASTE_SETTLE: Duration = Duration::from_millis(300);
+/// Bounded post-paste wait for the body to render in the transcript.
+const RENDER_DEADLINE: Duration = Duration::from_millis(1500);
+/// Stacked operator claims retained for the queue (oldest dropped past
+/// this); each claim releases exactly one gated message.
+const CLAIM_CAPACITY: usize = 16;
 const BUFFER: &str = "cadence-msg";
+
+/// Devin TUI screen signatures — THE one place they live. A provider
+/// TUI update means editing this table, never the gate logic. Every
+/// string is verbatim from the shipped binary or a live pane capture.
+mod devin_screen {
+    /// Glyph leading the input line (also the first option of an open
+    /// approval menu — approval is checked before input parsing).
+    pub const PROMPT: &str = "❭";
+    /// The input line's placeholder text — presence means EMPTY input.
+    pub const PLACEHOLDER: &str = "Ask Devin to build features";
+    /// On-screen markers while a turn is running.
+    pub const BUSY: &[&str] = &[
+        "(esc again to interrupt)",
+        "(esc twice to interrupt)",
+        "Cancel agent (esc twice)",
+        "Guide Devin while it works",
+        "Press Ctrl+O to view the full thinking trace",
+    ];
+    /// An open select/permission menu — the hint-bar fragment plus the
+    /// option labels only a menu renders.
+    pub const APPROVAL: &[&str] = &[
+        "(Approve",
+        " to select",
+        "Yes, switch to bypass mode",
+        "No, keep",
+    ];
+    /// TUI-side staged queue while busy (A26 sibling: text was staged,
+    /// not dropped — still not safe to add to).
+    pub const QUEUED: &[&str] = &["Press Enter to send queued messages"];
+}
+
+/// Reduce a captured Devin screen to gate facts. The last `❭` line is
+/// the input line; text after it that is not the placeholder is a
+/// staged draft. Menus and busy markers win over prompt parsing — a
+/// `❭` leads the first approval option too.
+pub fn analyze_devin(screen: &str) -> Probe {
+    let approval_menu = devin_screen::APPROVAL.iter().any(|m| screen.contains(m));
+    let busy_marker = devin_screen::BUSY
+        .iter()
+        .chain(devin_screen::QUEUED.iter())
+        .any(|m| screen.contains(m));
+    let prompt_line = screen
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with(devin_screen::PROMPT));
+    let prompt_visible = prompt_line.is_some();
+    let draft = prompt_line
+        .map(|l| {
+            l.trim_start()
+                .trim_start_matches(devin_screen::PROMPT)
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let input_nonempty = !draft.is_empty() && !draft.starts_with(devin_screen::PLACEHOLDER);
+    let (idle, reason) = if approval_menu {
+        (false, "approval menu is open")
+    } else if busy_marker {
+        (false, "tui is busy (interrupt marker on screen)")
+    } else if !prompt_visible {
+        (false, "no prompt line visible")
+    } else if input_nonempty {
+        (false, "unsubmitted text in the input line")
+    } else {
+        (true, "idle")
+    };
+    Probe {
+        idle,
+        reason: reason.to_string(),
+        input_nonempty,
+        prompt_visible,
+        busy_marker,
+        approval_menu,
+    }
+}
+
+/// One operator readiness claim: single-use, time-boxed, attributed to
+/// the claimer when known (the pane's `CADENCE_ALIAS` is passed through
+/// `agent ready`). Claims stack FIFO — N claims release N sends.
+struct Claim {
+    at: Instant,
+    by: Option<String>,
+}
 
 struct PtyState {
     /// tmux session name (the agent alias).
@@ -58,12 +155,11 @@ struct PtyState {
     pane_pid: u32,
     /// Endpoint generation minted per `open`; embedded in tokens.
     generation: String,
-    /// Single-use operator readiness claim.
-    claim: Option<Instant>,
+    /// Single-use operator readiness claims, oldest first.
+    claims: std::collections::VecDeque<Claim>,
 }
 
 pub struct DevinPtyAdapter {
-    #[allow(dead_code)]
     hooks: AdapterHooks,
     state: Mutex<PtyState>,
     socket: String,
@@ -77,6 +173,10 @@ pub struct DevinPtyAdapter {
     cwd: String,
     /// Cadence state dir, exported into the pane for `cadence self`.
     state_dir: PathBuf,
+    /// `params.auto_ready == "verified"`: the daemon probes the pane
+    /// itself instead of requiring a human `agent ready` claim.
+    /// Mutable — `agent set` refreshes it on the live adapter.
+    auto_ready: AtomicBool,
 }
 
 fn short_hash(text: &str) -> String {
@@ -130,7 +230,7 @@ impl DevinPtyAdapter {
                 native_session: String::new(),
                 pane_pid: 0,
                 generation: String::new(),
-                claim: None,
+                claims: std::collections::VecDeque::new(),
             }),
             socket: format!("cadence-{}", short_hash(&state_dir.to_string_lossy())),
             locks_dir,
@@ -148,6 +248,14 @@ impl DevinPtyAdapter {
             desired_session,
             cwd: agent.cwd.clone(),
             state_dir,
+            auto_ready: AtomicBool::new(
+                agent
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("auto_ready"))
+                    .and_then(|v| v.as_str())
+                    == Some("verified"),
+            ),
         })
     }
 
@@ -282,9 +390,12 @@ impl DevinPtyAdapter {
     }
 
     /// Gate evaluation before any paste: the pane must be live, not in a
-    /// tmux mode, and still the lock owner — else the endpoint is dead;
-    /// a fresh unconsumed operator claim is required — else requeue.
-    fn check_gate(&self) -> Result<()> {
+    /// tmux mode, and still the lock owner — else the endpoint is dead.
+    /// Then readiness: a fresh unconsumed operator claim always wins;
+    /// without one, `auto_ready=verified` agents get a daemon-run screen
+    /// probe (idle pane → self-claim, recorded as a `ready_claimed`
+    /// event by `"daemon"`); anything else requeues for a retry.
+    fn check_gate(&self, message_id: &str) -> Result<()> {
         let (session, native) = self.session_and_native();
         if !self.has_session(&session) {
             return Err(Error::provider("tmux session is gone"));
@@ -296,17 +407,52 @@ impl DevinPtyAdapter {
         if self.pane_value(&session, "#{pane_in_mode}")? != "0" {
             return Err(Error::gate("pane is in a tmux mode (copy/view)"));
         }
-        let mut state = self.state.lock().unwrap();
-        match state.claim {
-            Some(at) if at.elapsed() <= READY_TTL => {
-                state.claim = None; // consumed: at most one paste per claim
-                Ok(())
+        let claimed = {
+            // Claims stack FIFO: drop expired heads, consume the oldest
+            // fresh one — one paste per claim, always.
+            let mut state = self.state.lock().unwrap();
+            while let Some(front) = state.claims.front() {
+                if front.at.elapsed() > READY_TTL {
+                    state.claims.pop_front();
+                } else {
+                    break;
+                }
             }
-            _ => Err(Error::gate(
+            state.claims.pop_front()
+        };
+        if let Some(claim) = claimed {
+            // Which claim released this send is audit-relevant (G5):
+            // the claimer is recorded at consumption, not just claim.
+            (self.hooks.on_event)(
+                "cadence/claim_used",
+                serde_json::json!({
+                    "message": message_id,
+                    "by": claim.by.unwrap_or_else(|| "operator".to_string()),
+                }),
+            );
+            return Ok(());
+        }
+        if !self.auto_ready.load(AtomicOrdering::SeqCst) {
+            return Err(Error::gate(
                 "no fresh `agent ready` claim — an operator must verify the \
                  terminal is idle with an empty input before submission",
-            )),
+            ));
         }
+        let probe = self.probe()?;
+        if probe.idle {
+            (self.hooks.on_event)(
+                "cadence/ready_claimed",
+                serde_json::json!({"by": "daemon", "probe": probe.to_json()}),
+            );
+            return Ok(());
+        }
+        Err(Error::gate(format!("tui not idle: {}", probe.reason)))
+    }
+
+    /// Visible screen only (no scrollback) — what the TUI shows now.
+    fn capture_visible(&self) -> Result<String> {
+        let session = self.session();
+        self.tmux_ok(&["capture-pane", "-p", "-t", &session])
     }
 }
 
@@ -432,7 +578,7 @@ impl ProviderAdapter for DevinPtyAdapter {
             s.native_session = native.clone();
             s.pane_pid = pane_pid;
             s.generation = generation.clone();
-            s.claim = None; // a new endpoint can never inherit a claim
+            s.claims.clear(); // a new endpoint can never inherit claims
         }
         Ok(Identity {
             thread_id: native.clone(),
@@ -447,7 +593,7 @@ impl ProviderAdapter for DevinPtyAdapter {
     fn run_turn(
         &self,
         prompt: &str,
-        _client_message_id: &str,
+        client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         // Literal-only content: pasted verbatim, so reject anything the
@@ -462,7 +608,7 @@ impl ProviderAdapter for DevinPtyAdapter {
                 "PTY messages must be a single line without control characters",
             ));
         }
-        self.check_gate()?;
+        self.check_gate(client_message_id)?;
 
         let token = {
             let s = self.state.lock().unwrap();
@@ -493,6 +639,27 @@ impl ProviderAdapter for DevinPtyAdapter {
             ));
         }
         drop(tmp);
+
+        // Post-paste verification: the body prefix must appear on the
+        // visible screen within a short bound. A busy TUI swallows a
+        // bracketed paste without rendering it (delivery loss) — bytes
+        // sent is not evidence. `NotRendered` is a *provable* miss, so
+        // the daemon can requeue informational deliveries safely and
+        // keeps task messages under the uncertainty discipline.
+        let prefix: String = prompt.chars().take(32).collect();
+        let deadline = Instant::now() + RENDER_DEADLINE;
+        loop {
+            let screen = self.capture_visible()?;
+            if screen.contains(&prefix) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::not_rendered(
+                    "pasted text never rendered in the pane — the TUI dropped it",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
 
         on_started(&token);
         Ok(TurnResult {
@@ -540,18 +707,117 @@ impl ProviderAdapter for DevinPtyAdapter {
     /// to the operator's screen and survives for reattach on restart.
     fn detach(&self) {}
 
-    fn claim_ready(&self) -> Result<()> {
+    fn claim_ready(&self, by: Option<String>) -> Result<()> {
         let (session, native) = self.session_and_native();
         if !self.has_session(&session) {
             return Err(Error::provider("cannot claim readiness: pane is gone"));
         }
         self.verify_ownership(&session, &native)?;
-        self.state.lock().unwrap().claim = Some(Instant::now());
+        let mut state = self.state.lock().unwrap();
+        if state.claims.len() >= CLAIM_CAPACITY {
+            state.claims.pop_front();
+        }
+        state.claims.push_back(Claim {
+            at: Instant::now(),
+            by,
+        });
         Ok(())
     }
 
     fn capture(&self) -> Result<String> {
         let session = self.session();
         self.tmux_ok(&["capture-pane", "-p", "-t", &session, "-S", "-120"])
+    }
+
+    fn probe(&self) -> Result<Probe> {
+        Ok(analyze_devin(&self.capture_visible()?))
+    }
+
+    fn update_params(&self, params: &Value) {
+        self.auto_ready.store(
+            params.get("auto_ready").and_then(|v| v.as_str()) == Some("verified"),
+            AtomicOrdering::SeqCst,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::analyze_devin;
+
+    /// Real idle screen captured from a live Devin pane.
+    const IDLE: &str = "\
+❭ Ask Devin to build features, fix bugs, or work on your code
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                          Context: 43k / 262k";
+
+    /// Real approval menu captured from a live Devin pane.
+    const APPROVAL: &str = "\
+Allow this tool call?
+❭ 1 Yes  (Approve once)
+· 2 Yes, allow edits in /tmp
+· 3 Yes, always allow edits in /tmp
+· 4 Yes, switch to bypass mode
+· 5 No
+↑↓ to select · ↵ confirm · esc cancel";
+
+    #[test]
+    fn idle_prompt_is_pasteable() {
+        let p = analyze_devin(IDLE);
+        assert!(p.idle, "{} / {}", p.idle, p.reason);
+        assert!(p.prompt_visible && !p.input_nonempty);
+        assert!(!p.busy_marker && !p.approval_menu);
+    }
+
+    #[test]
+    fn approval_menu_wins_over_prompt_shape() {
+        // The menu's first option also leads with `❭` — menu detection
+        // must outrank prompt parsing or it reads as a draft.
+        let p = analyze_devin(APPROVAL);
+        assert!(!p.idle);
+        assert!(p.approval_menu);
+        assert_eq!(p.reason, "approval menu is open");
+    }
+
+    #[test]
+    fn busy_markers_block_even_with_prompt() {
+        for marker in [
+            "(esc twice to interrupt)",
+            "Cancel agent (esc twice)",
+            "Guide Devin while it works",
+            "Press Ctrl+O to view the full thinking trace",
+        ] {
+            let screen = format!("{IDLE}\nWorking on it {marker}");
+            let p = analyze_devin(&screen);
+            assert!(!p.idle && p.busy_marker, "{marker}: {}", p.reason);
+        }
+    }
+
+    #[test]
+    fn staged_tui_queue_is_busy_not_idle() {
+        // A26 sibling: the TUI shows queued input while busy — adding
+        // more to it is still unsafe.
+        let screen = format!("{IDLE}\nPress Enter to send queued messages now");
+        let p = analyze_devin(&screen);
+        assert!(!p.idle && p.busy_marker);
+    }
+
+    #[test]
+    fn typed_draft_is_not_idle() {
+        let screen = IDLE.replacen(
+            "Ask Devin to build features, fix bugs, or work on your code",
+            "half-typed human draft",
+            1,
+        );
+        let p = analyze_devin(&screen);
+        assert!(!p.idle && p.input_nonempty);
+        assert_eq!(p.reason, "unsubmitted text in the input line");
+    }
+
+    #[test]
+    fn no_prompt_line_is_not_idle() {
+        let p = analyze_devin("compiling…\nsome output without a prompt");
+        assert!(!p.idle && !p.prompt_visible);
+        assert_eq!(p.reason, "no prompt line visible");
     }
 }

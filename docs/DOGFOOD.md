@@ -109,6 +109,51 @@ remove-and-rejoin path (`agent remove` + `join -r`) — because resume on
 a mismatched pane can never converge, and guessing would take over a
 session that isn't ours.
 
+## The ready claim needed a machine-checked form
+
+**What happened.** `agent ready` is a human assertion — "I looked, the
+pane is idle". A QA audit of a real dispatch found the failure mode:
+an agent pastes `--ready` blind because inspecting first is a separate
+`agent capture` call nobody is forced to make. Worse, a busy Devin pane
+*accepts* pasted input into a staged queue, so a "sent" message can sit
+unexecuted while the sender believes it is `running` — bytes were
+delivered, the work never started.
+
+**What landed.** `auto_ready=verified` (params, or `--auto-ready` on
+launch, or `agent set <alias> auto_ready=verified` live) makes the
+daemon earn the claim itself: before every paste it probes the pane —
+prompt glyph present, input empty, no busy markers, no approval menu —
+and only then mints a single-use claim. Approval menus get priority
+over prompt shape because their `❭` option marker mimics the idle
+prompt. `agent probe <alias>` exposes the same analyzer read-only.
+After `Enter`, the paste must visibly render before `submitted` is
+reported: a missed render requeues routed notifications with a bound,
+but a task message goes `unknown` and fences the actor — a possibly-
+executed task is never replayed. Every claim consumption writes a
+`claim_used` audit event naming the claimer. The gate is still a gate;
+it just no longer trusts a human to have looked.
+
+## Some consumers are not agents
+
+**What happened.** The QA-audit loop needed somewhere for verdicts to
+land that was not another LLM session — a place a script could read.
+The only delivery targets were live actors; there was no durable,
+readable queue, so reviewers were simulated with workers or notes on
+disk, and "did the verdict arrive" meant polling `agent show`.
+
+**What landed.** `provider=inbox` / `endpoint_kind=inbox`: a
+registered agent that is a pure mailbox — `inbox://<alias>` endpoint,
+state `idle`, no actor, no briefing, no pane. Messages sent to it (or
+routed via `reply_to`, including as a group root collecting worker
+results) stay `queued` durably. `cadence inbox <alias>` drains them
+over the daemon socket — `--wait`/`--follow` block on the daemon's
+change signal rather than polling — and each consumed message
+completes `via=inbox_read`. A drained message with `reply_to` routes
+its result in the same transaction, so a consumer's answer can still
+wake the waiting actor. Lifecycle verbs refuse the things a mailbox
+cannot do (`resume`, `stop` are rejected; `remove` deletes the
+mailbox outright).
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not

@@ -119,6 +119,7 @@ pub struct Shared {
     lifecycle: Mutex<Lifecycle>,
     closing: AtomicBool,
     provider_log_dir: PathBuf,
+    state_dir: PathBuf,
 }
 
 impl Shared {
@@ -133,6 +134,7 @@ impl Shared {
             lifecycle: Mutex::new(Lifecycle::default()),
             closing: AtomicBool::new(false),
             provider_log_dir,
+            state_dir: state_dir.to_path_buf(),
         }))
     }
 
@@ -163,6 +165,12 @@ impl Shared {
         alias: &str,
         enable: bool,
     ) -> Result<bool> {
+        // A mailbox never gets an actor — regardless of who asked.
+        if self.store.agent(alias)?.endpoint_kind == "inbox" {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is an inbox — it has no actor to start"
+            )));
+        }
         if self.store.has_unknown(alias)? {
             self.store.set_agent_state(
                 alias,
@@ -196,6 +204,13 @@ impl Shared {
     }
 
     fn on_provider_event(&self, alias: &str, method: &str, params: Value) {
+        // `cadence/<kind>` is the adapter's own bookkeeping channel —
+        // recorded verbatim, not provider traffic.
+        if let Some(kind) = method.strip_prefix("cadence/") {
+            let _ = self.store.event_public(alias, kind, params);
+            self.wake();
+            return;
+        }
         // Token streams and tool details stay in the provider transcript;
         // we record the lifecycle envelope only.
         let _ = self.store.event_public(
@@ -364,6 +379,10 @@ impl Shared {
         }
         self.wake();
         let mut gate_notice: Option<String> = None;
+        let mut gate_waits: u32 = 0;
+        // Proven paste misses per message — a TUI that looks idle but
+        // keeps dropping pastes must not be re-fed forever.
+        let mut unrendered: u32 = 0;
         loop {
             if self.closing.load(Ordering::SeqCst) {
                 return Ok(());
@@ -397,10 +416,38 @@ impl Shared {
                                 return self.unknown(alias, &message);
                             }
                             gate_notice = None;
+                            gate_waits = 0;
+                            unrendered = 0;
+                        }
+                        // The paste provably never rendered: the pane
+                        // accepted the write path but dropped the input.
+                        // Routed notifications are informational —
+                        // requeue for at-least-once delivery, bounded.
+                        // Operator task messages keep the uncertainty
+                        // discipline: `unknown` + fence, never a blind
+                        // replay.
+                        Err(Error::NotRendered(reason)) => {
+                            let retry = message.source == "worker_result" && unrendered < 3;
+                            unrendered += 1;
+                            let _ = self.store.event_public(
+                                alias,
+                                "paste_not_rendered",
+                                json!({"message": message.id,
+                                       "reason": reason,
+                                       "retry": retry}),
+                            );
+                            if retry {
+                                let _ = self.store.requeue(&message.id);
+                                let _ = self.store.set_agent_state_if(alias, "idle", "busy");
+                                gate_notice = None;
+                                ctl.wake.wait_until(Instant::now() + Duration::from_secs(5));
+                            } else {
+                                return self.unknown(alias, &message);
+                            }
                         }
                         // The submission gate refused before any paste:
                         // safe to retry — back to the queue with a
-                        // bounded wait, never a silent drop.
+                        // bounded backoff, never a silent drop.
                         Err(Error::GateRefused(reason)) => {
                             let _ = self.store.requeue(&message.id);
                             let _ = self.store.set_agent_state_if(alias, "idle", "busy");
@@ -412,7 +459,13 @@ impl Shared {
                                 );
                                 gate_notice = Some(reason);
                             }
-                            ctl.wake.wait_until(Instant::now() + Duration::from_secs(5));
+                            // 5s → 10 → 20 → 30s cap: claims and inbox
+                            // arrivals wake the wait early, so the poll
+                            // is only the fallback for a busy pane.
+                            let wait = Duration::from_secs((5u64 << gate_waits.min(3)).min(30));
+                            gate_waits = gate_waits.saturating_add(1);
+                            unrendered = 0;
+                            ctl.wake.wait_until(Instant::now() + wait);
                         }
                         Err(Error::OutcomeUnknown(_)) => {
                             return self.unknown(alias, &message);
@@ -546,6 +599,10 @@ impl Shared {
                     "agent": agent.to_json(),
                     "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
                     "event_cursor": self.store.event_cursor(&alias)?,
+                    // Inbound backlog — what `cadence inbox` would drain
+                    // for a mailbox, what the actor will still take for
+                    // a live endpoint.
+                    "queued": self.store.queued_count(&alias)?,
                 }))
             }
             "agent_send" => self.rpc_send(params),
@@ -568,6 +625,9 @@ impl Shared {
             "agent_respond" => self.rpc_respond(params),
             "agent_ready" => self.rpc_ready(params),
             "agent_capture" => self.rpc_capture(params),
+            "agent_probe" => self.rpc_probe(params),
+            "agent_set" => self.rpc_set(params),
+            "agent_inbox" => self.rpc_inbox(params),
             "message_report" => self.rpc_message_report(params),
             "agent_stop" => self.rpc_stop(params),
             "agent_remove" => {
@@ -576,7 +636,9 @@ impl Shared {
                 // A live endpoint means an actor is serving it — the
                 // operator must stop it first. Endpoint is checked
                 // before ownership so the error suggests the remedy.
-                if agent.endpoint.is_some() {
+                // Inbox pseudo-endpoints are permanent mailboxes, not
+                // processes — removal is the only lifecycle they have.
+                if agent.endpoint.is_some() && agent.endpoint_kind != "inbox" {
                     return Err(Error::rejected(format!(
                         "Agent '{alias}' still has a live endpoint — \
                          run `cadence agent stop {alias}` first"
@@ -617,6 +679,12 @@ impl Shared {
             "agent_resume" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
+                if agent.endpoint_kind == "inbox" {
+                    return Err(Error::rejected(format!(
+                        "Agent '{alias}' is an inbox — nothing to resume; \
+                         `cadence inbox {alias}` drains it"
+                    )));
+                }
                 let mut lc = self.lifecycle.lock().unwrap();
                 if lc.owned(&alias) {
                     // Distinguish the two owned cases for the operator:
@@ -652,12 +720,23 @@ impl Shared {
         let provider = required_str(params, "provider")?;
         let endpoint = optional_str(params, "endpoint_kind").unwrap_or("managed");
         let role = optional_str(params, "role").unwrap_or("worker");
-        let cwd = required_str(params, "cwd")?;
+        let cwd = optional_str(params, "cwd");
         let sandbox = optional_str(params, "sandbox").unwrap_or("read-only");
         let instructions = optional_str(params, "instructions");
         let agent_params = optional_str(params, "params");
-        let cwd = std::fs::canonicalize(cwd)
-            .map_err(|_| Error::rejected("Working directory must exist"))?;
+        if (endpoint == "inbox") != (provider == "inbox") {
+            return Err(Error::rejected(
+                "Provider 'inbox' and endpoint kind 'inbox' must be used together",
+            ));
+        }
+        // A mailbox never runs a process — its cwd is bookkeeping only,
+        // so direct socket callers may omit it (the CLI defaults cwd).
+        let cwd = match (cwd, endpoint) {
+            (Some(cwd), _) => std::fs::canonicalize(cwd)
+                .map_err(|_| Error::rejected("Working directory must exist"))?,
+            (None, "inbox") => self.state_dir.clone(),
+            (None, _) => return Err(Error::rejected("Missing 'cwd'")),
+        };
         self.store.register_agent(&crate::store::NewAgent {
             alias,
             provider,
@@ -668,6 +747,14 @@ impl Shared {
             instructions,
             params: agent_params,
         })?;
+        // A mailbox has no actor — it is `idle` with its pseudo-endpoint
+        // from registration and simply accrues queued messages.
+        if endpoint == "inbox" {
+            return Ok(json!({
+                "alias": alias, "state": "idle", "provider": provider,
+                "endpoint": format!("inbox://{alias}"),
+            }));
+        }
         self.launch_actor(alias)?;
         Ok(json!({"alias": alias, "state": "starting", "provider": provider}))
     }
@@ -831,16 +918,42 @@ impl Shared {
             .agents
             .get(alias)
             .and_then(|ctl| ctl.adapter.lock().unwrap().clone())
-            .ok_or_else(|| Error::rejected("Agent has no live endpoint (not running?)"))
+            .ok_or_else(|| {
+                // A mailbox never has an adapter — name its real verb.
+                if self
+                    .store
+                    .agent(alias)
+                    .map(|a| a.endpoint_kind == "inbox")
+                    .unwrap_or(false)
+                {
+                    Error::rejected(format!(
+                        "Agent '{alias}' is an inbox — no live endpoint; \
+                         `cadence inbox {alias}` drains the queue"
+                    ))
+                } else {
+                    Error::rejected("Agent has no live endpoint (not running?)")
+                }
+            })
     }
 
     /// Operator readiness claim for gated endpoints (pty): asserts the
     /// terminal was inspected and is idle with an empty input. Single
-    /// use, short TTL — see the adapter for semantics.
+    /// use, short TTL — see the adapter for semantics. `by` carries the
+    /// claimer's `CADENCE_ALIAS` when the call came from inside a pane —
+    /// recorded for audit (G5 policy stays open; the record exists).
     fn rpc_ready(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        self.adapter_for(&alias)?.claim_ready()?;
-        let _ = self.store.event_public(&alias, "ready_claimed", json!({}));
+        let by = optional_str(params, "by").map(str::to_string);
+        self.adapter_for(&alias)?.claim_ready(by.clone())?;
+        let _ = self.store.event_public(
+            &alias,
+            "ready_claimed",
+            json!({"by": by.unwrap_or_else(|| "operator".to_string())}),
+        );
+        // Wake the actor's gate wait — a claim should release the head
+        // message immediately, not on the next poll tick.
+        self.notify_agent(&alias);
+        self.wake();
         Ok(json!({"alias": alias, "state": "ready-claimed"}))
     }
 
@@ -849,6 +962,75 @@ impl Shared {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = self.adapter_for(&alias)?.capture()?;
         Ok(json!({"alias": alias, "capture": text}))
+    }
+
+    /// Screen probe for a PTY endpoint — the same reduction the
+    /// verified auto-claim gate uses.
+    fn rpc_probe(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let probe = self.adapter_for(&alias)?.probe()?;
+        let mut out = probe.to_json();
+        out["alias"] = json!(alias);
+        Ok(out)
+    }
+
+    /// Merge key=value pairs into an agent's stored params — how an
+    /// existing agent opts into `auto_ready=verified` post-launch.
+    fn rpc_set(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let patch = params
+            .get("patch")
+            .filter(|p| p.is_object())
+            .cloned()
+            .ok_or_else(|| Error::rejected("Missing 'patch' object"))?;
+        for key in patch.as_object().unwrap().keys() {
+            proto::param_key(key)?;
+        }
+        self.store.set_params(&alias, &patch)?;
+        // Push the merged params into the live adapter so cached
+        // endpoint options (auto_ready) take effect without a restart.
+        if let Ok(adapter) = self.adapter_for(&alias) {
+            if let Some(params) = self.store.agent(&alias)?.params {
+                adapter.update_params(&params);
+            }
+        }
+        // Wake a gate wait — new params may be exactly what it needs.
+        self.notify_agent(&alias);
+        self.wake();
+        Ok(json!({"alias": alias, "state": "updated"}))
+    }
+
+    /// Drain an inbox agent's durable queue — messages complete
+    /// `via=inbox_read` as they are returned. `wait` long-polls on the
+    /// daemon's change signal, the same mechanism `events` uses.
+    fn rpc_inbox(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let after = optional_i64(params, "after").unwrap_or(0);
+        let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
+        let deadline = Instant::now() + Duration::from_secs(wait);
+        loop {
+            let messages = self.store.inbox_drain(&alias, after)?;
+            if !messages.is_empty() || self.closing.load(Ordering::SeqCst) {
+                // Consuming a message with a return address routed its
+                // result — the target actor must not wait out its poll.
+                for m in &messages {
+                    if let Some(target) = &m.reply_to {
+                        self.notify_agent(target);
+                    }
+                }
+                self.wake();
+                let cursor = messages.last().map(|m| m.seq).unwrap_or(after);
+                return Ok(json!({
+                    "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
+                    "cursor": cursor,
+                }));
+            }
+            if Instant::now() >= deadline {
+                return Ok(json!({"messages": [], "cursor": after}));
+            }
+            let step = deadline.min(Instant::now() + Duration::from_secs(1));
+            self.changed.wait_until(step);
+        }
     }
 
     /// Explicit ack/result report for a submitted PTY message. The
@@ -929,7 +1111,13 @@ impl Shared {
 
     fn rpc_stop(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        self.store.agent(&alias)?;
+        let agent = self.store.agent(&alias)?;
+        if agent.endpoint_kind == "inbox" {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is an inbox — no actor to stop; \
+                 `cadence agent remove {alias}` deletes the mailbox"
+            )));
+        }
         // Reserve the alias for the whole stop — through the final state
         // write — so a resume cannot start a new actor in the gap where
         // the old actor already released ownership.
@@ -1166,8 +1354,10 @@ pub fn serve(state_dir: &Path) -> Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
     // Relaunch enabled actors; fenced ones land in `attention` instead.
+    // Inbox rows are durable mailboxes — enabled or not, they own no
+    // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {
-        if agent.enabled {
+        if agent.enabled && agent.endpoint_kind != "inbox" {
             shared.launch_actor(&agent.alias)?;
         }
     }

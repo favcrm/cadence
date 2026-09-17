@@ -1746,14 +1746,21 @@ if cmd == "capture-pane":
     except FileNotFoundError: die("no such session")
     try: out += open(sess_path(name, "input")).read()
     except FileNotFoundError: pass
+    # Test-controlled extra screen content — a file the test writes to
+    # make the pane look busy, approval-blocked, etc.
+    try: out += open(sess_path(name, "tui-state")).read()
+    except FileNotFoundError: pass
     sys.stdout.write(out); sys.exit(0)
 if cmd == "load-buffer":
     open(os.path.join(state, "buffer"), "w").write(open(rest[-1]).read())
     sys.exit(0)
 if cmd == "paste-buffer":
     name = rest[rest.index("-t") + 1]
-    with open(sess_path(name, "input"), "a") as f:
-        f.write(open(os.path.join(state, "buffer")).read())
+    # A `.swallow` file models a busy TUI dropping the bracketed paste:
+    # the write path "works" but the text never reaches the screen.
+    if not os.path.exists(sess_path(name, "swallow")):
+        with open(sess_path(name, "input"), "a") as f:
+            f.write(open(os.path.join(state, "buffer")).read())
     sys.exit(0)
 if cmd == "send-keys":
     name = rest[rest.index("-t") + 1]
@@ -1801,6 +1808,9 @@ open(os.environ["FAKE_PANE"] + ".env", "w").write(
         os.environ.get("CADENCE_STATE_DIR", "")))
 with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
     f.write("Mock Devin TUI [%s]\n" % sid)
+    # An idle input line — the same shape the real TUI shows so the
+    # screen probe recognizes an empty prompt.
+    f.write("❭ Ask Devin to build features, fix bugs, or work on your code\n")
 while True:
     inp = os.environ["FAKE_PANE"] + ".input"
     try:
@@ -3721,4 +3731,494 @@ fn send_verb_matches_message_send() {
     assert_eq!(v["message"], "m-verb", "{v}");
     // Fake endpoints complete turns in-line — the message lands.
     d.wait_message("w1", "m-verb", &["completed"], 15);
+}
+
+// ==== inbox endpoint kind ====
+
+impl TestDaemon {
+    /// Register a mailbox: provider+kind `inbox`, durable pseudo-endpoint,
+    /// no actor.
+    fn register_inbox(&self, alias: &str) {
+        let cwd = self.dir.path().to_str().unwrap().to_string();
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "inbox",
+                   "endpoint_kind": "inbox", "cwd": cwd}),
+        )
+        .unwrap();
+    }
+
+    /// Register a pty devin agent with arbitrary endpoint params.
+    fn register_devin_opts(&self, alias: &str, params: Value) {
+        let cwd = self.dir.path().to_str().unwrap().to_string();
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "devin",
+                   "endpoint_kind": "pty", "cwd": cwd,
+                   "params": params.to_string()}),
+        )
+        .unwrap();
+    }
+
+    /// All recorded events for an alias.
+    fn events(&self, alias: &str) -> Vec<Value> {
+        self.rpc("agent_events", json!({"alias": alias})).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    /// Poll until an event of `kind` exists (bounded).
+    fn wait_event(&self, alias: &str, kind: &str, secs: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(e) = self
+                .events(alias)
+                .into_iter()
+                .find(|e| e["kind"].as_str() == Some(kind))
+            {
+                return e;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent {alias} never emitted {kind}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[test]
+fn inbox_registers_as_durable_mailbox() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    let agent = &show["agent"];
+    assert_eq!(agent["endpoint_kind"], "inbox");
+    assert_eq!(agent["provider"], "inbox");
+    assert_eq!(agent["endpoint"], "inbox://obs");
+    assert_eq!(agent["dead"], false, "{agent}");
+    assert_eq!(agent["state"], "idle");
+    assert_eq!(show["queued"], 0);
+    // Registration wrote no briefing files in its cwd.
+    assert!(!d.dir.path().join(".cadence").exists());
+
+    // A mailbox never runs a process, so socket callers may omit cwd;
+    // a process endpoint still requires it.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "obs2", "provider": "inbox", "endpoint_kind": "inbox"}),
+    )
+    .unwrap();
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "obs2"})).unwrap()["agent"]["endpoint"],
+        "inbox://obs2"
+    );
+    assert!(d
+        .rpc(
+            "agent_register",
+            json!({"alias": "w9", "provider": "fake", "endpoint_kind": "fake"}),
+        )
+        .is_err());
+}
+
+#[test]
+fn inbox_drains_messages_once() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    for (id, text) in [("n1", "note one"), ("n2", "note two")] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "obs", "text": text, "message": id}),
+        )
+        .unwrap();
+    }
+    // Backlog is visible before draining.
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "obs"})).unwrap()["queued"],
+        2
+    );
+    let page = d.rpc("agent_inbox", json!({"alias": "obs"})).unwrap();
+    let msgs = page["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "{page}");
+    assert_eq!(msgs[0]["id"], "n1");
+    assert_eq!(msgs[1]["id"], "n2");
+    assert_eq!(page["cursor"], msgs[1]["seq"]);
+    // Consumption completed each message via=inbox_read.
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    for m in show["messages"].as_array().unwrap() {
+        assert_eq!(m["state"], "completed", "{m}");
+        assert_eq!(m["result"]["via"], "inbox_read", "{m}");
+    }
+    // A second drain returns nothing.
+    let page2 = d.rpc("agent_inbox", json!({"alias": "obs"})).unwrap();
+    assert!(page2["messages"].as_array().unwrap().is_empty());
+    // Draining a non-inbox agent is a clean rejection.
+    d.register("w1");
+    assert!(d.rpc("agent_inbox", json!({"alias": "w1"})).is_err());
+}
+
+#[test]
+fn inbox_wait_blocks_until_arrival() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    let state = d.state.clone();
+    let sender = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        client::rpc(
+            &state,
+            "agent_send",
+            json!({"alias": "obs", "text": "late note", "message": "n1"}),
+        )
+        .unwrap();
+    });
+    let started = Instant::now();
+    // A consumer can block on the daemon — no polling loop needed.
+    let page = d
+        .rpc("agent_inbox", json!({"alias": "obs", "wait": 10}))
+        .unwrap();
+    sender.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let msgs = page["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0]["id"], "n1");
+}
+
+#[test]
+fn inbox_group_root_collects_worker_results() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    // `cadence join obs fake` wires exactly this: worker params.upstream
+    // = the inbox alias. Register the equivalent directly.
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "params": json!({"upstream": "obs"}).to_string()}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "idle", 10);
+    // The worker's send defaults reply_to=obs (its upstream) — the
+    // completed result routes into the mailbox, not a pane.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "do work", "message": "j1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "j1", &["completed"], 15);
+    let page = d.rpc("agent_inbox", json!({"alias": "obs"})).unwrap();
+    let msgs = page["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "{page}");
+    assert_eq!(msgs[0]["source"], "worker_result");
+    assert!(msgs[0]["body"].as_str().unwrap().contains("j1"));
+    assert!(msgs[0]["body"].as_str().unwrap().contains("w1"));
+    // Consuming it does not re-route — routed copies carry no reply_to.
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(
+        show["messages"].as_array().unwrap().len(),
+        1,
+        "no echo back to the worker"
+    );
+}
+
+#[test]
+fn inbox_collects_direct_send_with_reply_to() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_inbox("obs");
+    d.register_devin("sender", None);
+    d.wait_agent("sender", "idle", 20);
+    // Direct send on a pty agent with --reply-to obs: the reported
+    // result routes into the mailbox.
+    d.rpc("agent_ready", json!({"alias": "sender"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "sender", "text": "task", "message": "t1",
+               "reply_to": "obs"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "sender", "t1");
+    d.rpc(
+        "message_report",
+        json!({"message": "t1", "token": token, "kind": "result",
+               "text": "did the thing"}),
+    )
+    .unwrap();
+    let page = d.rpc("agent_inbox", json!({"alias": "obs"})).unwrap();
+    let msgs = page["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "{page}");
+    assert_eq!(msgs[0]["source"], "worker_result");
+    assert!(msgs[0]["body"].as_str().unwrap().contains("did the thing"));
+}
+
+#[test]
+fn inbox_lifecycle_guards() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    for method in ["agent_resume", "agent_stop"] {
+        let err = d
+            .rpc(method, json!({"alias": "obs"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inbox"), "{method}: {err}");
+    }
+    for method in ["agent_probe", "agent_capture", "agent_ready"] {
+        let err = d
+            .rpc(method, json!({"alias": "obs"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inbox"), "{method}: {err}");
+    }
+    // Removal works directly — a mailbox is never "live".
+    d.rpc("agent_remove", json!({"alias": "obs"})).unwrap();
+    assert!(d.rpc("agent_show", json!({"alias": "obs"})).is_err());
+}
+
+#[test]
+fn cli_inbox_drains_and_self_reports_backlog() {
+    let d = TestDaemon::start();
+    d.register_inbox("obs");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "obs", "text": "hello inbox", "message": "n1"}),
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+
+    // `cadence self` inside a hand-exported inbox alias reports the
+    // queued count, not a running turn.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .arg("self")
+        .env("CADENCE_ALIAS", "obs")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["alias"], "obs");
+    assert_eq!(v["endpoint_kind"], "inbox");
+    assert_eq!(v["queued"], 1, "{v}");
+
+    // `cadence inbox obs` prints one JSON object per message.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["inbox", "obs"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "{stdout}");
+    assert_eq!(lines[0]["id"], "n1");
+    assert_eq!(lines[0]["body"], "hello inbox");
+
+    // Second call prints nothing at all.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["inbox", "obs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+}
+
+// ==== verified auto-ready (pty) ====
+
+#[test]
+fn pty_auto_ready_self_claims_when_idle() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    // No human claim — the daemon probes the pane, sees the idle
+    // prompt, and self-claims.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "auto ready task", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "m1", &["running"], 20);
+    let claim = d.wait_event("dv", "ready_claimed", 5);
+    assert_eq!(claim["payload"]["by"], "daemon", "{claim}");
+    assert_eq!(claim["payload"]["probe"]["idle"], true, "{claim}");
+    // The pane really received the text.
+    let screen = std::fs::read_to_string(d.pane_file(&mock, "dv", "screen")).unwrap_or_default()
+        + &std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
+    assert!(screen.contains("auto ready task"), "{screen}");
+}
+
+#[test]
+fn pty_auto_ready_waits_on_busy_pane_then_delivers() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    // The TUI shows a working state — the probe must refuse the paste.
+    std::fs::write(
+        d.pane_file(&mock, "dv", "tui-state"),
+        "(esc twice to interrupt)\n",
+    )
+    .unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "wait for idle", "message": "m1"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("dv", "gate_wait", 10);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("busy"),
+        "{wait}"
+    );
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(d.message_state("dv", "m1"), "queued");
+    // Nothing was pasted while the pane looked busy.
+    assert!(std::fs::read_to_string(d.pane_file(&mock, "dv", "input"))
+        .unwrap_or_default()
+        .is_empty());
+    // Probe RPC exposes the same verdict the gate used.
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["idle"], false);
+    assert_eq!(probe["busy_marker"], true, "{probe}");
+    // Pane goes idle — the bounded backoff retries and delivers.
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    d.wait_message("dv", "m1", &["running"], 20);
+    let claim = d.wait_event("dv", "ready_claimed", 5);
+    assert_eq!(claim["payload"]["by"], "daemon");
+}
+
+#[test]
+fn pty_ready_claims_stack_fifo_with_claimer() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.wait_agent("dv", "idle", 20);
+    // Two claims land before either send — the queue stacks them FIFO
+    // instead of overwriting (N6). Each releases exactly one message.
+    d.rpc("agent_ready", json!({"alias": "dv", "by": "alice"}))
+        .unwrap();
+    d.rpc("agent_ready", json!({"alias": "dv", "by": "bob"}))
+        .unwrap();
+    for id in ["m1", "m2"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "dv", "text": format!("task {id}"), "message": id}),
+        )
+        .unwrap();
+    }
+    d.wait_message("dv", "m1", &["running"], 15);
+    d.wait_message("dv", "m2", &["running"], 15);
+    let used: Vec<Value> = d
+        .events("dv")
+        .into_iter()
+        .filter(|e| e["kind"].as_str() == Some("claim_used"))
+        .collect();
+    assert_eq!(used.len(), 2, "{:?}", d.events("dv"));
+    // FIFO: m1 consumed alice's claim, m2 consumed bob's.
+    assert_eq!(used[0]["payload"]["message"], "m1");
+    assert_eq!(used[0]["payload"]["by"], "alice");
+    assert_eq!(used[1]["payload"]["message"], "m2");
+    assert_eq!(used[1]["payload"]["by"], "bob");
+}
+
+#[test]
+fn pty_unrendered_task_fences_unknown() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    // The pane drops the paste entirely (TUI swallowed the input).
+    std::fs::write(d.pane_file(&mock, "dv", "swallow"), "1").unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "task that vanishes", "message": "m1"}),
+    )
+    .unwrap();
+    // A provable paste miss on a task message: unknown + attention —
+    // never a blind replay.
+    d.wait_message("dv", "m1", &["unknown"], 20);
+    d.wait_agent("dv", "attention", 15);
+    let e = d.wait_event("dv", "paste_not_rendered", 5);
+    assert_eq!(e["payload"]["message"], "m1");
+    assert_eq!(e["payload"]["retry"], false, "{e}");
+}
+
+#[test]
+fn pty_unrendered_worker_result_requeues_then_fences() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("pm", json!({"auto_ready": "verified"}));
+    d.wait_agent("pm", "idle", 20);
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    // Pane swallows before the routed notification lands.
+    std::fs::write(d.pane_file(&mock, "pm", "swallow"), "1").unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "work", "message": "j1",
+               "reply_to": "pm"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "j1", &["completed"], 15);
+    let routed_id = d.rpc("agent_show", json!({"alias": "pm"})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["source"] == "worker_result")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // At-least-once: bounded requeues with paste_not_rendered evidence,
+    // then the same fence a task message would get.
+    d.wait_message("pm", &routed_id, &["unknown"], 60);
+    d.wait_agent("pm", "attention", 15);
+    let misses: Vec<Value> = d
+        .events("pm")
+        .into_iter()
+        .filter(|e| e["kind"].as_str() == Some("paste_not_rendered"))
+        .collect();
+    assert!(misses.len() >= 2, "expected requeue evidence: {:?}", misses);
+    assert!(misses.iter().any(|e| e["payload"]["retry"] == true));
+}
+
+#[test]
+fn agent_set_opts_live_agent_into_auto_ready() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.wait_agent("dv", "idle", 20);
+    // Without opt-in the queue still waits on a human claim.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "gated", "message": "m1"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(d.message_state("dv", "m1"), "queued");
+    // Retrofit via agent_set — the running actor reads params per send.
+    d.rpc(
+        "agent_set",
+        json!({"alias": "dv", "patch": {"auto_ready": "verified"}}),
+    )
+    .unwrap();
+    d.wait_message("dv", "m1", &["running"], 20);
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap();
+    assert_eq!(show["agent"]["params"]["auto_ready"], "verified");
 }

@@ -49,7 +49,39 @@ pub struct TurnResult {
     pub error: Option<String>,
 }
 
-/// Notification sink: `(method, params)` for lifecycle events.
+/// Screen-probe verdict for terminal endpoints: what the pane shows
+/// right now, reduced to the facts the gate needs. `reason` names the
+/// first condition that makes the pane not-idle (or "idle").
+#[derive(Debug, Clone)]
+pub struct Probe {
+    pub idle: bool,
+    pub reason: String,
+    /// Text staged in the input line (typed but not submitted).
+    pub input_nonempty: bool,
+    /// An empty `❭`-style prompt line is visible.
+    pub prompt_visible: bool,
+    /// A working/spinner marker is on screen.
+    pub busy_marker: bool,
+    /// A provider approval/permission menu is on screen.
+    pub approval_menu: bool,
+}
+
+impl Probe {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "idle": self.idle,
+            "reason": self.reason,
+            "input_nonempty": self.input_nonempty,
+            "prompt_visible": self.prompt_visible,
+            "busy_marker": self.busy_marker,
+            "approval_menu": self.approval_menu,
+        })
+    }
+}
+
+/// Notification sink: `(method, params)` for lifecycle events. Methods
+/// prefixed `cadence/` are recorded verbatim as event kinds — the
+/// adapter's own bookkeeping channel, not provider traffic.
 pub type EventHook = Box<dyn Fn(&str, Value) + Send + Sync>;
 /// Request sink: provider-initiated requests needing a user decision.
 pub type RequestHook = Box<dyn Fn(ProviderRequest) + Send + Sync>;
@@ -89,8 +121,10 @@ pub trait ProviderAdapter: Send + Sync {
         self.close();
     }
     /// Record an operator readiness claim (pty-style gated endpoints
-    /// only); the next send consumes it atomically.
-    fn claim_ready(&self) -> Result<()> {
+    /// only); `by` names the claimer (the caller's `CADENCE_ALIAS` when
+    /// set) for the audit record. Claims stack FIFO — each is consumed
+    /// by exactly one send.
+    fn claim_ready(&self, _by: Option<String>) -> Result<()> {
         Err(crate::error::Error::rejected(
             "this endpoint kind has no readiness gate",
         ))
@@ -101,6 +135,16 @@ pub trait ProviderAdapter: Send + Sync {
             "this endpoint kind has no capturable screen",
         ))
     }
+    /// Inspect the screen and reduce it to gate facts (pty only).
+    fn probe(&self) -> Result<Probe> {
+        Err(crate::error::Error::rejected(
+            "this endpoint kind has no screen probe",
+        ))
+    }
+    /// A merged params patch landed in the store — live adapters that
+    /// cache endpoint options (pty's `auto_ready`) refresh here. Stored
+    /// params remain authoritative for the next `open` regardless.
+    fn update_params(&self, _params: &Value) {}
 }
 
 /// Build the adapter for an agent's `provider`/`endpoint_kind`.

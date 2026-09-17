@@ -37,16 +37,19 @@ Error kinds:
 |---|---|---|
 | `health` | — | `{state:"ready", protocol:1, capabilities:[...]}` |
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded) then exits |
-| `agent_register` | `alias, provider, cwd, endpoint_kind?, role?, sandbox?, instructions?, params?` | `{alias,state:"starting",provider}` |
+| `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?` | `{alias,state:"starting"|"idle",provider}` |
 | `agent_list` | — | `{agents:[Agent]}` |
-| `agent_show` | `alias` | `{agent, messages, event_cursor}` |
+| `agent_show` | `alias` | `{agent, messages, event_cursor, queued}` |
 | `agent_send` | `alias, text, message?, reply_to?, source?` | `{message,state,duplicate}` |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
 | `agent_respond` | `alias, request, decision?|answers?` | `{state:"answered"}` |
-| `agent_ready` | `alias` | `{state:"ready-claimed"}` — single-use readiness claim for `pty` |
+| `agent_ready` | `alias, by?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
+| `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
+| `agent_set` | `alias, patch` | merges params into the live agent; `{state:"updated"}` |
+| `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?` | `{state:"reported"}` — explicit PTY ack/result |
 | `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
@@ -85,12 +88,16 @@ depend on it:
 | `managed` | owned provider process (JSON-RPC stdio) | implemented: provider `codex` |
 | `managed-ws` | owned `codex app-server --listen ws://127.0.0.1:*`; official TUI attachable | implemented: provider `codex` |
 | `pty` | owned tmux pane running the official TUI; literal paste + explicit reports | implemented: provider `devin` |
+| `inbox` | durable mailbox — no actor; messages queue until `agent_inbox` drains them | implemented: provider `inbox` |
 | `fake` | in-process test double | test fixture only |
-| `native_inbox` | provider-native inbox | declared, not implemented |
 
 `agent_register` accepts `params` (JSON object) for endpoint options:
 pty uses `{"session": "<native-id>"}` to resume an existing Devin
-session instead of starting a fresh one.
+session instead of starting a fresh one, and `{"auto_ready":
+"verified"}` opts into daemon-side verified claims (see the pty
+section). Provider `inbox` requires endpoint kind `inbox` and vice
+versa — mixed pairs are rejected — and its `cwd` may be omitted (a
+mailbox runs no process; the state dir is recorded instead).
 
 `params` also carries wiring metadata: `{"upstream": "<pm-alias>"}`
 marks the agent as a worker joined to a group (`cadence join` sets it).
@@ -186,27 +193,43 @@ pane owning a *different* session fails closed (`attention`).
 
 **Submission gates.** `run_turn` requires all of: pane alive,
 `pane_dead=0`, `pane_in_mode=0`, lock still owned, and a fresh
-unconsumed operator claim from `agent ready` (60s TTL, consumed
-atomically by exactly one send — at most one paste per claim). The
-claim is the authoritative gate: Cadence cannot reliably detect a typed
-draft or an on-screen permission prompt, so the claiming operator
-asserts the terminal is idle with an empty input — inspect with
-`agent capture` first. A refused send returns the message to `queued`
-(event `gate_wait`) and retries; it is never pasted blind and never
-dropped. Message text is a single line of 1–4000 chars with no control
+unconsumed claim — either an operator claim from `agent ready` (60s
+TTL) or, under `auto_ready=verified`, a daemon-minted claim. Claims
+are single-use (consumed atomically by exactly one send), FIFO, and
+capped; every consumption emits a `claim_used` event recording the
+message id and the claimer (`agent ready <alias>` records
+`CADENCE_ALIAS` when set, else `"operator"`; auto-claims record
+`"auto:verified"`).
+
+With `auto_ready=verified` the daemon mints a claim only after a pane
+probe verifies idle: the screen must show the `❭` prompt with an empty
+input line, and none of the observed busy signatures (`esc to
+interrupt` hints, the guide/steer bar, queued-message footers) or an
+approval menu — an approval screen's `❭` option marker can mimic a
+prompt, so menu detection wins over prompt shape. `agent probe
+<alias>` runs the same analyzer on demand (`{idle, reason,
+prompt_visible, input_nonempty, busy_marker, approval_menu}`) without
+claiming. A refused send returns the message to `queued` (event
+`gate_wait`) and retries; it is never pasted blind and never dropped.
+Message text is a single line of 1–4000 chars with no control
 characters, delivered literally via `load-buffer` + `paste-buffer -p`
 + `Enter` — no shell interpretation.
 
-**Durable submission vs. receipt.** A successful paste marks the
-message `running` with `turn_id = pty-<generation>-<uuid>` and emits
-`submitted`. Terminal echo proves visibility only; the message completes
-only through an explicit `message_report` (`message ack` keeps it
-`running`; `message result` finishes it `completed` and routes
-`reply_to`). The token must equal the recorded `turn_id` and belong to
-the agent's current generation — a report against a previous pane life
-is `rejected` as stale; a conflicting result for a completed message is
-`rejected`; an identical retry is idempotent. Reporting identifies the
-caller by possession of the token — self-asserted, not authenticated.
+**Durable submission vs. receipt.** Paste alone is not proof: after
+`Enter` the adapter captures the pane and requires a prefix of the
+submitted body to be visible before reporting `submitted`. When that
+render check fails (`NotRendered`) a routed `worker_result`
+notification is requeued with a bounded retry count; any other message
+goes `unknown` and fences the actor — a possibly-pasted task is never
+replayed blind. Once the render check passes the message is `running`
+with `turn_id = pty-<generation>-<uuid>` and completes only through an
+explicit `message_report` (`message ack` keeps it `running`; `message
+result` finishes it `completed` and routes `reply_to`). The token must
+equal the recorded `turn_id` and belong to the agent's current
+generation — a report against a previous pane life is `rejected` as
+stale; a conflicting result for a completed message is `rejected`; an
+identical retry is idempotent. Reporting identifies the caller by
+possession of the token — self-asserted, not authenticated.
 
 A pane that dies after a possible paste leaves submitted messages
 `unknown` (fence, never replay); a pane that dies before the paste
@@ -258,6 +281,36 @@ TUI attaches to the same native thread with:
 ```
 codex resume --remote <endpoint> <thread_id>
 ```
+
+## inbox endpoints (provider `inbox`)
+
+An inbox is a durable mailbox, not a process: `agent_register` with
+`provider=inbox, endpoint_kind=inbox` creates an `idle` agent with the
+pseudo-endpoint `inbox://<alias>` and no actor. Registration writes no
+briefing and `cwd` may be omitted. Everything else about the agent
+model still applies — it can be a group root (`agent list` renders
+workers under it) or a routed `reply_to` target.
+
+`agent_send`/`agent_ask` enqueue into the mailbox exactly like any
+agent; the messages stay `queued` in SQLite — they survive daemon
+restarts and accrue while nothing reads them. `agent_inbox` drains:
+every `queued` message with `seq > after` is completed in one
+transaction with result `{"status":"completed","via":"inbox_read"}`,
+emits `inbox_read`, and any `reply_to` on a consumed message routes
+its result in the same transaction (a drained `reply_to` therefore
+lands on the replier's queue and wakes its actor). `wait>0`
+long-polls on the daemon's change signal up to 30s, so a consumer
+blocks on the socket instead of polling — `cadence inbox <alias>
+[--after N] [--wait S]` prints one JSON object per consumed message
+and nothing on an empty drain. `agent_show` reports the backlog as
+`queued`; `cadence self` on an inbox answers that count rather than a
+running turn.
+
+Lifecycle: a mailbox is always `idle`, so `agent_resume` is rejected
+(there is nothing to resume), `agent_stop` is rejected (there is
+nothing to interrupt), and `agent_remove` deletes the mailbox and its
+history outright — there is no live endpoint to refuse on. Daemon
+startup and `resume --all` skip inbox rows.
 
 (`cadence agent attach <alias>` prints this command; `--run` executes it
 in the current terminal. `cadence agent resume <alias>` gets the same
@@ -342,7 +395,8 @@ endpoint kinds without a readiness gate. `message ask` accepts
 `agent_events` pages the durable log: `{seq, alias, kind, payload, at}`.
 Kinds: `registered, queued, submitting, turn_started, turn_finished,
 provider_event, input_required, input_answered, input_resolved,
-result_routed, ready, ready_claimed, gate_wait, submitted, acknowledged,
+result_routed, ready, ready_claimed, claim_used, gate_wait, submitted,
+acknowledged, paste_not_rendered, inbox_read, params_updated,
 attention, stop_requested`. `wait>0` long-polls up to 30s.
 
 ## Approvals
