@@ -6607,7 +6607,7 @@ fn task_attached_send_and_self() {
         .unwrap()
         .clone();
     let w1 = list.iter().find(|a| a["alias"] == "w1").unwrap();
-    assert_eq!(w1["task"], json!(["j1-t2"]), "{w1}");
+    assert_eq!(w1["tasks"], json!(["j1-t2"]), "{w1}");
 }
 
 #[test]
