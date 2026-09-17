@@ -175,11 +175,7 @@ impl Shared {
             self.store.set_agent_state(
                 alias,
                 "attention",
-                Some(&format!(
-                    "Uncertain provider outcome requires review — reconcile: \
-                     `cadence agent unfence {alias} --status interrupted`, then \
-                     `cadence agent resume {alias}`"
-                )),
+                Some(&self.uncertain_fence_text(alias)),
             )?;
             let _ = self.store.event_public(
                 alias,
@@ -596,6 +592,26 @@ impl Shared {
         )?;
         self.wake();
         Ok(())
+    }
+
+    /// The attention text for an unknown-outcome fence — keeps the
+    /// provider's own reason when `unknown()` already recorded it
+    /// (everything before the `— reconcile:` tail), so a re-stamp on
+    /// relaunch-skip doesn't erase the detail the operator needs.
+    fn uncertain_fence_text(&self, alias: &str) -> String {
+        let detail = self
+            .store
+            .agent(alias)
+            .ok()
+            .and_then(|a| a.error)
+            .and_then(|e| e.split(" — reconcile:").next().map(str::to_string))
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| "Uncertain provider outcome requires review".to_string());
+        format!(
+            "{detail} — reconcile: \
+             `cadence agent unfence {alias} --status interrupted`, then \
+             `cadence agent resume {alias}`"
+        )
     }
 
     /// An `OutcomeUnknown` never becomes a retry: mark the attempt and
@@ -1939,12 +1955,7 @@ pub fn serve(state_dir: &Path) -> Result<()> {
             let (reason, error) = if unknown {
                 (
                     "unknown messages await reconcile",
-                    format!(
-                        "Uncertain provider outcome requires review — reconcile: \
-                         `cadence agent unfence {} --status interrupted`, then \
-                         `cadence agent resume {}`",
-                        agent.alias, agent.alias
-                    ),
+                    shared.uncertain_fence_text(&agent.alias),
                 )
             } else {
                 // Other fences (session mismatch, failed open) keep

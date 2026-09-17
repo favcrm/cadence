@@ -1713,6 +1713,25 @@ fn wait_pid_gone(path: &Path, secs: u64) {
     }
 }
 
+/// Poll a file until its content contains `needle` — a mock provider's
+/// dump files appear after the actor reports idle, and a relaunch
+/// rewrites them, so a single read races both ways.
+fn wait_file_contains(path: &Path, needle: &str, secs: u64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let body = std::fs::read_to_string(path).unwrap_or_default();
+        if body.contains(needle) {
+            return body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "file {} never contained '{needle}'",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn transport_eof_fences_turn_quickly() {
     let d = TestDaemon::start();
@@ -1808,18 +1827,32 @@ fn stop_on_fenced_agent_preserves_attention() {
     .unwrap();
     let fenced = d.wait_agent("w1", "attention", 10);
     let reason = fenced["error"].clone();
-    assert!(reason.as_str().unwrap().contains("Uncertain"));
+    // The fence error is either the provider's own account ("Connection
+    // lost during turn…") or the generic "Uncertain provider outcome"
+    // rewrite a later relaunch-skip stamps — both name the reconcile
+    // path; which one is observed is timing.
+    assert!(reason.as_str().unwrap().contains("reconcile"), "{reason}");
     // Stop only disables: the fence state and its reason stay visible.
     let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     assert_eq!(stopped["state"], "attention");
     let agent = d.wait_agent("w1", "attention", 10);
     assert_eq!(agent["enabled"], false);
-    assert_eq!(agent["error"], reason);
+    // The relaunch-skip may restate the error between reads — assert
+    // the fence is still named, not byte-equality with the snapshot.
+    assert!(
+        agent["error"].as_str().unwrap().contains("reconcile"),
+        "{}",
+        agent["error"]
+    );
     // Repeated stop is idempotent and still does not mask the fence.
     let again = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     assert_eq!(again["state"], "attention");
     let agent = d.wait_agent("w1", "attention", 5);
-    assert_eq!(agent["error"], reason);
+    assert!(
+        agent["error"].as_str().unwrap().contains("reconcile"),
+        "{}",
+        agent["error"]
+    );
     assert_eq!(d.message_state("w1", "m1"), "unknown");
     // Resume is rejected until the operator reconciles — the fence is
     // not masked by either verb.
@@ -5475,7 +5508,7 @@ fn claude_death_mid_turn_unknown_then_unfence_resume() {
     // Resume relaunched on the SAME session id via --resume.
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(agent["session_id"].as_str().unwrap(), sid);
-    let argv = std::fs::read_to_string(mock.pidfile.with_extension("pid.argv")).unwrap_or_default();
+    let argv = wait_file_contains(&mock.pidfile.with_extension("pid.argv"), "--resume", 10);
     assert!(argv.contains(&format!("--resume\n{sid}")), "{argv}");
     // And the resumed process takes a real turn.
     d.rpc(
@@ -5593,22 +5626,11 @@ fn claude_env_injected_and_scrubbed() {
     }
     // The mock writes its env dump at process start — poll for it;
     // `idle` only means the actor's transport opened.
-    let env_path = mock.pidfile.with_extension("pid.env");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let env = loop {
-        if let Ok(env) = std::fs::read_to_string(&env_path) {
-            if env.contains("CADENCE_ALIAS=w1\n") {
-                break env;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "mock never wrote its env file at {}",
-            env_path.display()
-        );
-        thread::sleep(Duration::from_millis(50));
-    };
-    assert!(env.contains("CADENCE_ALIAS=w1\n"), "{env}");
+    let env = wait_file_contains(
+        &mock.pidfile.with_extension("pid.env"),
+        "CADENCE_ALIAS=w1\n",
+        10,
+    );
     assert!(
         env.contains(&format!("CADENCE_STATE_DIR={}\n", d.state.display())),
         "{env}"
@@ -5645,9 +5667,10 @@ fn claude_params_replayed_on_resume() {
                "turn_max_secs": 3600}),
     );
     d.wait_agent("w1", "idle", 15);
+    // `idle` means the actor's transport opened — the mock may not have
+    // written its argv dump yet under load; poll for it.
     let argv_file = mock.pidfile.with_extension("pid.argv");
-    let argv1 = std::fs::read_to_string(&argv_file).unwrap_or_default();
-    assert!(argv1.contains("--session-id"), "{argv1}");
+    let argv1 = wait_file_contains(&argv_file, "--session-id", 10);
     assert!(argv1.contains("--permission-mode\nacceptEdits"), "{argv1}");
     assert!(argv1.contains("--allowedTools\nBash(cadence *)"), "{argv1}");
     assert!(argv1.contains("--allowedTools\nBash(git *)"), "{argv1}");
@@ -5660,7 +5683,10 @@ fn claude_params_replayed_on_resume() {
     d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
     d.wait_agent("w1", "idle", 15);
-    let argv2 = std::fs::read_to_string(&argv_file).unwrap_or_default();
+    // Same spawn/write gap as the first read — and the file still holds
+    // the first launch's argv until the resumed mock rewrites it, so
+    // poll for the resume-shaped content, not just non-empty.
+    let argv2 = wait_file_contains(&argv_file, "--resume", 10);
     // Resume replays the same permission/model params verbatim and
     // resumes the stored session — it never mints a fresh one.
     assert!(argv2.contains(&format!("--resume\n{sid}")), "{argv2}");
