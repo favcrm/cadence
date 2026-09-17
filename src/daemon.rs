@@ -890,6 +890,15 @@ impl Shared {
 
     fn rpc_respond(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // Managed Claude brokers no provider requests in phase A — the
+        // rejection names the opt-ups rather than hunting the pending map.
+        if self.store.agent(&alias)?.provider == "claude" {
+            return Err(Error::rejected(
+                "managed claude endpoints broker no requests — approval flow \
+                 opt-ups: --permission-prompt-tool, --include-hook-events, \
+                 or an MCP approval tool",
+            ));
+        }
         let handle = required_str(params, "request")?;
         let decision = optional_str(params, "decision");
         // Explicit JSON null means "not provided".

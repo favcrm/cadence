@@ -218,6 +218,32 @@ reconciled agent stayed `enabled`, so the next restart relaunched it —
 the fence lift now lands `stopped` with `enabled=0`, identical to an
 operator stop.
 
+## Managed claude: a wire that isn't JSON-RPC
+
+**What happened.** The third provider landed: `claude` on the `managed`
+endpoint kind — one long-lived headless `claude -p --input-format
+stream-json` process per agent, driven by newline-delimited typed
+events instead of JSON-RPC. The phase-B0 observation pass mattered
+more than the code: `system/init` does not arrive at spawn but with
+the first turn, so session-id verification lives inside `run_turn`
+rather than `open`; a `result` with `permission_denials` is still
+`success`/`is_error:false` — denials are a policy fact, not a failure;
+and `--verbose` is load-bearing (without it stream-json output refuses
+to start). A real interactive session also produced a surprise: the
+`!` shell escape executes immediately without a permission check, so
+"watch the approval menu" is not a reliable denial probe.
+
+**What it taught.** The fail-closed rule transferred cleanly: death
+before a `result` is `unknown` + fence, `agent unfence` + `resume`
+relaunches with `--resume <session>`, and a `system/init` session-id
+mismatch means another process owns the session — `attention`, not a
+retry. The briefing gained a provider-conditional line because managed
+claude has no token flow: the turn's `result` text IS the report.
+
+**Rule that fell out:** observe the real provider first — half the
+design (lazy init, denial semantics, EOF-as-shutdown) came from
+fixtures, not docs.
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not

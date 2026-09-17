@@ -75,7 +75,7 @@ impl Transport {
     fn launch(&self, cwd: &str, log: &Path) -> Result<Launched> {
         match self {
             Transport::Stdio(adapter) => Ok(Launched {
-                pid: adapter.launch(cwd, log)?,
+                pid: adapter.launch(cwd, log, &[])?,
                 endpoint: None,
             }),
             Transport::Ws(adapter) => {

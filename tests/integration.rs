@@ -1619,7 +1619,7 @@ while True:
 impl TestDaemon {
     /// Install a mock codex command for `mode`, returning its pidfile.
     fn mock_codex(&self, mode: &str) -> MockCodex {
-        let guard = ENV_LOCK.lock().unwrap();
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pidfile = self.dir.path().join(format!("mock-{mode}.pid"));
         let script = self.dir.path().join(format!("mock-{mode}.py"));
         std::fs::write(&script, MOCK_PY).unwrap();
@@ -1642,7 +1642,7 @@ impl TestDaemon {
     /// hosts the script + pidfile and must outlive every daemon that
     /// will spawn it (restart tests use the seeded state dir).
     fn mock_codex_ws_at(&self, dir: &Path, mode: &str) -> MockCodex {
-        let guard = ENV_LOCK.lock().unwrap();
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pidfile = dir.join(format!("mock-ws-{mode}.pid"));
         let script = dir.join(format!("mock-ws-{mode}.py"));
         std::fs::write(&script, MOCK_WS_PY).unwrap();
@@ -2495,7 +2495,7 @@ struct MockDevin {
 /// Install the mock tmux/devin pair. Set the env overrides BEFORE a
 /// daemon starts so its auto-relaunch sees them.
 fn install_mock_devin(dir: &Path) -> MockDevin {
-    let guard = ENV_LOCK.lock().unwrap();
+    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let locks = dir.join("devin-locks");
     let tmux_state = dir.join("tmux-state");
     std::fs::create_dir_all(&locks).unwrap();
@@ -5103,4 +5103,532 @@ fn agent_set_opts_live_agent_into_auto_ready() {
     d.wait_message("dv", "m1", &["running"], 20);
     let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap();
     assert_eq!(show["agent"]["params"]["auto_ready"], "verified");
+}
+
+// ==== managed claude (stream-json) endpoint ====
+
+/// A mock Claude stream-json provider over real stdio — speaks the
+/// observed wire: per user line it emits `system/init`, an `assistant`
+/// event, then one `result`. argv is `<script> <pidfile> <mode>` then
+/// the real CLI flags appended by the adapter (`--session-id|--resume`,
+/// `--permission-mode`, `--allowedTools`, `--model`) — recorded to
+/// `<pidfile>.argv` for launch-shape assertions. The pane env lands in
+/// `<pidfile>.env` for scrub/injection checks.
+///
+/// Modes:
+///   ok               — result success, text `MOCK_OK:<prompt>`
+///   fail             — result error_during_execution, is_error, errors[]
+///   deny             — result success carrying a non-empty
+///                      permission_denials array
+///   die              — exits on the first user message (mid-turn death)
+///   bad-session      — init reports a session id that is not argv's
+///   await-interrupt  — no result until SIGINT, then an interrupted one
+///   replay           — replays $MOCK_CLAUDE_FIXTURE events verbatim,
+///                      rewriting session_id fields to the argv id
+const MOCK_CLAUDE_PY: &str = r#"
+import json, os, signal, sys
+
+pidfile = sys.argv[1]
+mode = os.environ.get("CADENCE_CLAUDE_MODE", "ok")
+argv = sys.argv[2:]
+sid = ""
+for i, a in enumerate(argv):
+    if a in ("--session-id", "--resume") and i + 1 < len(argv):
+        sid = argv[i + 1]
+with open(pidfile, "w") as f:
+    f.write(str(os.getpid()))
+with open(pidfile + ".argv", "w") as f:
+    f.write("\n".join(sys.argv))
+with open(pidfile + ".env", "w") as f:
+    f.write("CADENCE_ALIAS=%s\nCADENCE_STATE_DIR=%s\nCLAUDE_CODE_SESSION_ID=%s\n" % (
+        os.environ.get("CADENCE_ALIAS", ""),
+        os.environ.get("CADENCE_STATE_DIR", ""),
+        os.environ.get("CLAUDE_CODE_SESSION_ID", "")))
+
+count = [0]
+
+def emit(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+def result(**kw):
+    count[0] += 1
+    base = {"type": "result", "session_id": sid, "num_turns": 1,
+            "total_cost_usd": 0.001, "result_index": count[0] - 1}
+    base.update(kw)
+    emit(base)
+
+def init():
+    # bad-session reports a session the process was NOT opened with.
+    reported = "00000000-foreign-session" if current_mode() == "bad-session" else sid
+    emit({"type": "system", "subtype": "init", "session_id": reported,
+          "model": "mock-claude", "tools": []})
+
+def on_sigint(signum, frame):
+    init()
+    result(subtype="interrupted", is_error=False, result="INTERRUPTED",
+           stop_reason="interrupted")
+
+signal.signal(signal.SIGINT, on_sigint)
+
+fixture = os.environ.get("MOCK_CLAUDE_FIXTURE")
+fixture_lines = open(fixture).read().splitlines() if fixture else []
+
+def current_mode():
+    # <pidfile>.mode overrides the env mode per message — lets a test
+    # switch a resumed provider from "die" to "ok".
+    try:
+        return open(pidfile + ".mode").read().strip()
+    except FileNotFoundError:
+        return mode
+
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if msg.get("type") != "user":
+        continue
+    mode_now = current_mode()
+    content = msg["message"]["content"]
+    text = content if isinstance(content, str) else \
+        " ".join(b.get("text", "") for b in content)
+    if mode_now == "die":
+        os._exit(0)
+    if mode_now == "replay":
+        for raw in fixture_lines:
+            try:
+                ev = json.loads(raw)
+            except Exception:
+                continue
+            if "session_id" in ev:
+                ev["session_id"] = sid
+            emit(ev)
+        continue
+    init()
+    emit({"type": "assistant",
+          "message": {"role": "assistant",
+                      "content": [{"type": "text", "text": "working"}]},
+          "session_id": sid})
+    if mode_now == "await-interrupt":
+        continue  # the SIGINT handler emits the result
+    if mode_now == "fail":
+        result(subtype="error_during_execution", is_error=True,
+               errors=["mock exploded"], stop_reason="error")
+        continue
+    denials = []
+    if mode_now == "deny":
+        denials = [{"tool_name": "Bash", "tool_use_id": "tu_1",
+                    "tool_input": {"command": "touch /tmp/x"}}]
+    result(subtype="success", is_error=False, result="MOCK_OK:" + text,
+           stop_reason="end_turn", permission_denials=denials)
+"#;
+
+struct MockClaude {
+    /// Held when the claude mock installed ENV_LOCK itself; `None` when
+    /// another mock (devin) already holds it — the guard is shared.
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+    pidfile: PathBuf,
+}
+
+impl TestDaemon {
+    /// Install a mock claude command for `mode` (optionally replaying
+    /// `fixture`), returning its pidfile path.
+    fn mock_claude(&self, mode: &str, fixture: Option<&Path>) -> MockClaude {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.install_mock_claude(mode, fixture, guard)
+    }
+
+    /// Install without taking ENV_LOCK — for tests that already hold it
+    /// via another provider mock (one guard serializes the whole test).
+    fn install_mock_claude(
+        &self,
+        mode: &str,
+        fixture: Option<&Path>,
+        guard: std::sync::MutexGuard<'static, ()>,
+    ) -> MockClaude {
+        let pidfile = self.dir.path().join(format!("claude-{mode}.pid"));
+        let script = self.dir.path().join(format!("claude-{mode}.py"));
+        std::fs::write(&script, MOCK_CLAUDE_PY).unwrap();
+        std::env::set_var(
+            "CADENCE_CLAUDE_COMMAND",
+            format!("python3 {} {}", script.display(), pidfile.display()),
+        );
+        // Mode travels in the env so appended CLI flags stay realistic.
+        std::env::set_var("CADENCE_CLAUDE_MODE", mode);
+        if let Some(f) = fixture {
+            std::env::set_var("MOCK_CLAUDE_FIXTURE", f);
+        }
+        MockClaude {
+            _guard: Some(guard),
+            pidfile,
+        }
+    }
+
+    /// Same, when the caller already holds ENV_LOCK (MockDevin).
+    fn mock_claude_locked(&self, mode: &str) -> MockClaude {
+        let pidfile = self.dir.path().join(format!("claude-{mode}.pid"));
+        let script = self.dir.path().join(format!("claude-{mode}.py"));
+        std::fs::write(&script, MOCK_CLAUDE_PY).unwrap();
+        std::env::set_var(
+            "CADENCE_CLAUDE_COMMAND",
+            format!("python3 {} {}", script.display(), pidfile.display()),
+        );
+        std::env::set_var("CADENCE_CLAUDE_MODE", mode);
+        MockClaude {
+            _guard: None,
+            pidfile,
+        }
+    }
+
+    fn register_claude(&self, alias: &str, params: Value) {
+        let cwd = self.dir.path().to_str().unwrap().to_string();
+        let params = (!params.is_null()).then(|| params.to_string());
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "claude",
+                   "endpoint_kind": "managed", "cwd": cwd,
+                   "params": params}),
+        )
+        .unwrap();
+    }
+}
+
+impl Drop for MockClaude {
+    fn drop(&mut self) {
+        std::env::remove_var("CADENCE_CLAUDE_COMMAND");
+        std::env::remove_var("CADENCE_CLAUDE_MODE");
+        std::env::remove_var("MOCK_CLAUDE_FIXTURE");
+    }
+}
+
+#[test]
+fn claude_turn_completes_and_routes_to_inbox_pm() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    d.register_inbox("pm");
+    d.register_claude("w1", json!({"upstream": "pm"}));
+    d.wait_agent("w1", "idle", 15);
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    // A fresh open mints the session id that --session-id carries.
+    let sid = show["agent"]["session_id"].as_str().unwrap().to_string();
+    assert_eq!(sid.len(), 36, "{sid}");
+    assert_eq!(show["agent"]["endpoint_kind"], "managed");
+    assert!(show["agent"]["endpoint"].is_null(), "{show}");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "Reply with exactly: PONG", "message": "m1"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("w1", "m1", &["completed"], 20);
+    assert_eq!(
+        m1["result"]["text"], "MOCK_OK:Reply with exactly: PONG",
+        "{m1}"
+    );
+    assert_eq!(
+        m1["result"]["turn_id"].as_str().unwrap()[..6].to_string(),
+        "claude"
+    );
+    // The upstream PM receives the routed worker_result.
+    let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    let routed = pm["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["source"].as_str() == Some("worker_result"))
+        .cloned();
+    let routed = routed.unwrap_or_else(|| panic!("no routed result on pm: {pm}"));
+    assert!(
+        routed["body"].as_str().unwrap().contains("MOCK_OK"),
+        "{routed}"
+    );
+}
+
+#[test]
+fn claude_result_routes_to_pty_pm() {
+    let d = TestDaemon::start();
+    // MockDevin holds ENV_LOCK for the whole test — the claude mock
+    // installs under it without re-locking.
+    let pm_mock = d.mock_devin();
+    let _worker_mock = d.mock_claude_locked("ok");
+    d.register_devin("pm", None);
+    d.wait_agent("pm", "idle", 20);
+    d.register_claude("w1", json!({"upstream": "pm"}));
+    d.wait_agent("w1", "idle", 15);
+    // Claim the pty gate so the routed result may be pasted.
+    d.rpc("agent_ready", json!({"alias": "pm"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["completed"], 20);
+    // The routed copy on the PM pane completes on delivery (is_routed).
+    let routed = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+            if let Some(m) = pm["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["source"].as_str() == Some("worker_result"))
+            {
+                break m.clone();
+            }
+            assert!(Instant::now() < deadline, "no routed result on pm: {pm}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    d.wait_message("pm", routed["id"].as_str().unwrap(), &["completed"], 20);
+    let screen = std::fs::read_to_string(d.pane_file(&pm_mock, "pm", "screen")).unwrap_or_default();
+    assert!(screen.contains("MOCK_OK"), "{screen}");
+}
+
+#[test]
+fn claude_failed_result_fails_message() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("fail", None);
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    // A clean provider-side error result is a definitive answer —
+    // failed, never unknown.
+    let m1 = d.wait_message("w1", "m1", &["failed"], 20);
+    assert!(
+        m1["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("mock exploded"),
+        "{m1}"
+    );
+    // The endpoint survives a failed turn — next message still works.
+    d.wait_agent("w1", "idle", 10);
+}
+
+#[test]
+fn claude_death_mid_turn_unknown_then_unfence_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude("die", None);
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    let sid = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    // EOF before any result event — outcome unknowable, fail closed.
+    d.wait_message("w1", "m1", &["unknown"], 20);
+    d.wait_agent("w1", "attention", 10);
+    // The same mock command relaunches; flip it to "ok" for the resume.
+    std::fs::write(mock.pidfile.with_extension("pid.mode"), "ok").unwrap();
+    let unfenced = d
+        .rpc(
+            "agent_unfence",
+            json!({"alias": "w1", "status": "interrupted"}),
+        )
+        .unwrap();
+    // Reconcile leaves the agent stopped; resume is the explicit step.
+    assert_eq!(unfenced["state"], "stopped", "{unfenced}");
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 15);
+    // Resume relaunched on the SAME session id via --resume.
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["session_id"].as_str().unwrap(), sid);
+    let argv = std::fs::read_to_string(mock.pidfile.with_extension("pid.argv")).unwrap_or_default();
+    assert!(argv.contains(&format!("--resume\n{sid}")), "{argv}");
+    // And the resumed process takes a real turn.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "again", "message": "m2"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m2", &["completed"], 20);
+}
+
+#[test]
+fn claude_session_mismatch_fences_attention() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("bad-session", None);
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    // init reported a foreign session — the turn fails and the agent
+    // fences with session-mismatch wording.
+    d.wait_agent("w1", "attention", 20);
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    let err = agent["error"].as_str().unwrap_or_default();
+    assert!(err.contains("owns session"), "{err}");
+    d.wait_message("w1", "m1", &["failed"], 10);
+}
+
+#[test]
+fn claude_interrupt_yields_interrupted() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("await-interrupt", None);
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["running"], 15);
+    // Stop interrupts first: the mock emits an interrupted result, so
+    // the message lands `interrupted` — never fenced unknown.
+    let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert_eq!(stopped["state"], "stopped");
+    d.wait_message("w1", "m1", &["interrupted"], 10);
+}
+
+#[test]
+fn claude_denials_complete_with_event() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("deny", None);
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    // permission_denials is not a failure — the turn still completes,
+    // and the denial is recorded as an auditable event.
+    d.wait_message("w1", "m1", &["completed"], 20);
+    let denied = d.wait_event("w1", "permission_denied", 10);
+    assert_eq!(
+        denied["payload"]["denials"][0]["tool_name"].as_str(),
+        Some("Bash"),
+        "{denied}"
+    );
+    // Result metadata is recorded too (cost accounting source).
+    d.wait_event("w1", "claude_result", 5);
+}
+
+#[test]
+fn claude_env_injected_and_scrubbed() {
+    let d = TestDaemon::start();
+    // A parent conversation's identity must never leak into the child.
+    std::env::set_var("CLAUDE_CODE_SESSION_ID", "stale-parent-sid");
+    let mock = d.mock_claude("ok", None);
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+    let env = std::fs::read_to_string(mock.pidfile.with_extension("pid.env")).unwrap_or_default();
+    assert!(env.contains("CADENCE_ALIAS=w1"), "{env}");
+    assert!(
+        env.contains(&format!("CADENCE_STATE_DIR={}", d.state.display())),
+        "{env}"
+    );
+    assert!(env.contains("CLAUDE_CODE_SESSION_ID=\n"), "{env}");
+}
+
+#[test]
+fn claude_params_replayed_on_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude("ok", None);
+    d.register_claude(
+        "w1",
+        json!({"permission_mode": "acceptEdits",
+               "allowed_tools": ["Bash(git *)", "Read"],
+               "model": "haiku"}),
+    );
+    d.wait_agent("w1", "idle", 15);
+    let argv_file = mock.pidfile.with_extension("pid.argv");
+    let argv1 = std::fs::read_to_string(&argv_file).unwrap_or_default();
+    assert!(argv1.contains("--session-id"), "{argv1}");
+    assert!(argv1.contains("--permission-mode\nacceptEdits"), "{argv1}");
+    assert!(argv1.contains("--allowedTools\nBash(cadence *)"), "{argv1}");
+    assert!(argv1.contains("--allowedTools\nBash(git *)"), "{argv1}");
+    assert!(argv1.contains("--allowedTools\nRead"), "{argv1}");
+    assert!(argv1.contains("--model\nhaiku"), "{argv1}");
+    let sid = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 15);
+    let argv2 = std::fs::read_to_string(&argv_file).unwrap_or_default();
+    // Resume replays the same permission/model params verbatim and
+    // resumes the stored session — it never mints a fresh one.
+    assert!(argv2.contains(&format!("--resume\n{sid}")), "{argv2}");
+    assert!(argv2.contains("--permission-mode\nacceptEdits"), "{argv2}");
+    assert!(argv2.contains("--allowedTools\nBash(git *)"), "{argv2}");
+    assert!(argv2.contains("--model\nhaiku"), "{argv2}");
+}
+
+#[test]
+fn claude_replay_fixture_turn() {
+    let d = TestDaemon::start();
+    // Replay a real captured stream: init + assistant + success result.
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude/turn1.jsonl");
+    let _mock = d.mock_claude("replay", Some(&fixture));
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("w1", "m1", &["completed"], 20);
+    assert_eq!(m1["result"]["text"], "PONG", "{m1}");
+    // The real capture carries a cost figure — recorded as an event.
+    let ev = d.wait_event("w1", "claude_result", 10);
+    assert!(
+        ev["payload"]["total_cost_usd"].as_f64().unwrap() > 0.0,
+        "{ev}"
+    );
+}
+
+#[test]
+fn claude_replay_failed_fixture() {
+    let d = TestDaemon::start();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude/fail-session.jsonl");
+    let _mock = d.mock_claude("replay", Some(&fixture));
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("w1", "m1", &["failed"], 20);
+    assert!(
+        m1["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("No conversation found"),
+        "{m1}"
+    );
+}
+
+#[test]
+fn claude_respond_is_rejected_naming_opt_ups() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    let err = d
+        .rpc(
+            "agent_respond",
+            json!({"alias": "w1", "request": "req-1", "decision": "accept"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("permission-prompt-tool"), "{err}");
 }

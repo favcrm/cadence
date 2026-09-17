@@ -43,9 +43,11 @@ pub fn run(state_dir: &Path) -> Result<Value> {
     let _ = std::fs::remove_file(probe.with_extension("sqlite3-shm"));
     checks["storage"] = storage;
     checks["codex"] = command_version("codex", &["--version"]);
+    checks["claude"] = command_version("claude", &["--version"]);
     checks["devin"] = command_version("devin", &["--version"]);
     checks["tmux"] = command_version("tmux", &["-V"]);
     let codex_ok = checks["codex"]["present"].as_bool().unwrap_or(false);
+    let claude_ok = checks["claude"]["present"].as_bool().unwrap_or(false);
     let devin_ok = checks["devin"]["present"].as_bool().unwrap_or(false);
     let tmux_ok = checks["tmux"]["present"].as_bool().unwrap_or(false);
     Ok(json!({
@@ -54,6 +56,7 @@ pub fn run(state_dir: &Path) -> Result<Value> {
         "capabilities": {
             "managed_codex_stdio": codex_ok,
             "managed_codex_ws": codex_ok,
+            "managed_claude_stream": claude_ok,
             "pty_devin_tmux": devin_ok && tmux_ok,
             "managed_devin_acp": false,
             "native_inbox_endpoint": true,
@@ -62,7 +65,8 @@ pub fn run(state_dir: &Path) -> Result<Value> {
         "notes": [
             "pty devin endpoint requires devin + tmux; submission is gated on an explicit operator ready claim",
             "PTY submission cannot establish provider receipt; only an explicit message ack/result report completes it",
-            "Devin ACP, Claude and Cursor endpoints remain unimplemented",
+            "managed claude runs headless stream-json; the turn's result text is the report — no message result needed",
+            "Devin ACP and Cursor endpoints remain unimplemented",
             "fake endpoint_kind is a test fixture, not a provider",
         ],
     }))
