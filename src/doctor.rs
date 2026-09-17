@@ -63,6 +63,7 @@ pub fn run(state_dir: &Path) -> Result<Value> {
                 "projects": projects,
                 "issues": issues,
                 "lint_ok": lint["ok"],
+                "lint_warnings": lint["warnings"].as_array().map(|w| w.len()).unwrap_or(0),
             })
         }
         Err(_) => json!({

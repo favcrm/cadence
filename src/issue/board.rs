@@ -54,13 +54,35 @@ pub struct View {
     pub checks_total: u64,
 }
 
+/// `lstat`-style truth: a real directory, never a symlink. PM folders
+/// must be actual folders — a link could point outside the PM dir.
+pub fn is_real_dir(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|m| m.is_dir() && !m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// `lstat`-style truth: a real file, never a symlink.
+pub fn is_real_file(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|m| m.is_file() && !m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 fn read_comments(dir: &Path) -> Vec<Comment> {
     let mut out = Vec::new();
     let comments_dir = dir.join("comments");
+    if !is_real_dir(&comments_dir) {
+        return out;
+    }
     let Ok(entries) = std::fs::read_dir(&comments_dir) else {
         return out;
     };
     for entry in entries.flatten() {
+        // file_type() does not follow links — a symlink is not a file.
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.ends_with(".md") {
             continue;
@@ -88,14 +110,20 @@ fn read_comments(dir: &Path) -> Vec<Comment> {
 fn read_artifacts(dir: &Path) -> Vec<(String, u64)> {
     let mut out = Vec::new();
     let artifacts = dir.join("artifacts");
+    if !is_real_dir(&artifacts) {
+        return out;
+    }
     let Ok(entries) = std::fs::read_dir(&artifacts) else {
         return out;
     };
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
+        let Ok(is_file) = entry.file_type().map(|t| t.is_file()) else {
             continue;
         };
-        if meta.is_file() {
+        if !is_file {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
             out.push((entry.file_name().to_string_lossy().to_string(), meta.len()));
         }
     }
@@ -107,6 +135,12 @@ pub fn load_issue(pm_dir: &Path, project_key: &str, id: &str) -> Result<Issue> {
     model::check_id(id)?;
     let dir = pm_dir.join(project_key).join(id);
     let file = dir.join("issue.md");
+    if !is_real_dir(&dir) || !is_real_file(&file) {
+        return Err(Error::rejected(format!(
+            "Unknown issue '{id}' — no {}/issue.md under project '{project_key}'",
+            dir.display()
+        )));
+    }
     let text = std::fs::read_to_string(&file).map_err(|_| {
         Error::rejected(format!(
             "Unknown issue '{id}' — no {}/issue.md under project '{project_key}'",
@@ -131,7 +165,7 @@ pub fn find_issue(pm_dir: &Path, id: &str) -> Result<Issue> {
     model::check_id(id)?;
     for project in project::list(pm_dir)? {
         let dir = pm_dir.join(&project.key).join(id);
-        if dir.join("issue.md").is_file() {
+        if is_real_dir(&dir) && is_real_file(&dir.join("issue.md")) {
             return load_issue(pm_dir, &project.key, id);
         }
     }
@@ -152,12 +186,17 @@ pub fn load_all(pm_dir: &Path, project_key: Option<&str>) -> Result<Vec<Issue>> 
             }
         }
         let dir = pm_dir.join(&project.key);
+        if !is_real_dir(&dir) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let id = entry.file_name().to_string_lossy().to_string();
-            if !model::valid_id(&id) || !entry.path().is_dir() {
+            // file_type() is lstat-style: a symlinked folder is skipped.
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !model::valid_id(&id) || !is_dir {
                 continue;
             }
             if let Ok(issue) = load_issue(pm_dir, &project.key, &id) {

@@ -108,12 +108,12 @@ export default function App() {
             )}
             <button
               onClick={refresh}
-              className="chip bg-ink-800 text-ink-400 hover:text-ink-100 transition-colors"
+              className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
               title="no live updates in I1 — click to re-read the folders"
             >
               refresh
             </button>
-            <span className="hidden sm:inline-flex chip bg-accent/10 text-accent">
+            <span className="hidden sm:inline-flex chip bg-ink-800 text-ink-400">
               read-only
             </span>
           </div>
@@ -147,6 +147,7 @@ export default function App() {
         <Drawer
           id={openId}
           agents={agents}
+          pmDir={health?.pm_dir}
           onClose={() => setOpenId(null)}
           onOpen={openIssue}
         />

@@ -65,21 +65,27 @@ pub fn render(front: &impl serde::Serialize, body: &str) -> Result<String> {
     Ok(format!("---\n{yaml}---\n\n{body}"))
 }
 
-/// Markdown acceptance checkboxes in a body: `(done, total)`.
+/// Markdown acceptance checkboxes in a body: `(done, total)`. A
+/// checkbox with no text (`- [ ]`) is a template stub, not an item.
 pub fn checkbox_progress(body: &str) -> (u64, u64) {
     let mut done = 0u64;
     let mut total = 0u64;
     for line in body.lines() {
         let t = line.trim_start();
         if let Some(rest) = t.strip_prefix("- [") {
-            match rest.as_bytes().first() {
-                Some(b'x') | Some(b'X') if rest.as_bytes().get(1) == Some(&b']') => {
-                    done += 1;
-                    total += 1;
-                }
-                Some(b' ') if rest.as_bytes().get(1) == Some(&b']') => total += 1,
-                _ => {}
+            let marked = match rest.as_bytes().first() {
+                Some(b'x') | Some(b'X') if rest.as_bytes().get(1) == Some(&b']') => Some(true),
+                Some(b' ') if rest.as_bytes().get(1) == Some(&b']') => Some(false),
+                _ => None,
+            };
+            let Some(marked) = marked else {
+                continue;
+            };
+            if rest[2..].trim().is_empty() {
+                continue;
             }
+            total += 1;
+            done += marked as u64;
         }
     }
     (done, total)
@@ -115,5 +121,8 @@ mod tests {
         assert_eq!(checkbox_progress(&body), (1, 2));
         assert_eq!(checkbox_progress("none"), (0, 0));
         assert_eq!(checkbox_progress("- [X] caps\n- [] no\n"), (1, 1));
+        // A bare `- [ ]` is a template stub — no text, not an item.
+        assert_eq!(checkbox_progress("- [ ] \n- [ ]\n"), (0, 0));
+        assert_eq!(checkbox_progress("- [ ] real\n- [ ]\n"), (0, 1));
     }
 }

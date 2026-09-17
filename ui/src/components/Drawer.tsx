@@ -13,8 +13,17 @@ const NOTE_CHIP: Record<string, string> = {
 interface Props {
   id: string;
   agents: AgentsPayload | null;
+  pmDir?: string;
   onClose: () => void;
   onOpen: (id: string) => void;
+}
+
+/// `/home/ubuntu/pm/cadence/CAD-16/issue.md` → `~/pm/cadence/CAD-16/issue.md`
+function relPath(path: string, pmDir?: string): string {
+  if (pmDir && path.startsWith(pmDir + "/")) {
+    return `~/pm/${path.slice(pmDir.length + 1)}`;
+  }
+  return path;
 }
 
 function LinkRow({
@@ -61,7 +70,7 @@ function LinkRow({
   );
 }
 
-export default function Drawer({ id, agents, onClose, onOpen }: Props) {
+export default function Drawer({ id, agents, pmDir, onClose, onOpen }: Props) {
   const [detail, setDetail] = useState<IssueDetail | null>(null);
   const [file, setFile] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -165,7 +174,7 @@ export default function Drawer({ id, agents, onClose, onOpen }: Props) {
                   <span className="kicker">the source of truth</span>
                 </div>
                 <div className="num text-micro text-ink-400 mb-2 break-all">
-                  {detail.path}
+                  {relPath(detail.path, pmDir)}
                 </div>
                 <pre className="num text-label leading-relaxed rounded-lg border border-ink-700 bg-ink-900 p-4 text-ink-300 !whitespace-pre overflow-x-auto">
                   {file ?? detail.body}

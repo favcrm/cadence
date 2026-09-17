@@ -49,12 +49,13 @@ say "pm dir: $PM_DIR (binary: $BIN)"
 
 # ---- cadence: done history first (link targets), then the backlog ----
 "$BIN" issue new "Independent QA audit of main @ e663778" --id CAD-9 --priority P1 --owner qa-audit-319f2
-"$BIN" issue new "Inbox endpoint + verified auto-ready for pty" --id CAD-12 --priority P0 --blocked-by CAD-9
-"$BIN" issue new "Fence recovery: reconcile, unfence, restart skips fenced" --id CAD-14 --priority P0 --blocked-by CAD-12
+"$BIN" issue new "Inbox endpoint + verified auto-ready for pty" --id CAD-12 --priority P0 --blocked-by CAD-9 --owner cookie-cesium
+"$BIN" issue new "Fence recovery: reconcile, unfence, restart skips fenced" --id CAD-14 --priority P0 --blocked-by CAD-12 --owner cookie-cesium
 "$BIN" issue new "claude provider" --id CAD-30 --priority P1
 "$BIN" issue new "M3 jobs and tasks design" --id CAD-11 --priority P1 --owner devin-056801
 "$BIN" issue new "claude provider: managed stream-json endpoint" --id CAD-16 --priority P1 \
-  --parent CAD-30 --component adapter --blocked-by CAD-12 --blocked-by CAD-14
+  --parent CAD-30 --component adapter --blocked-by CAD-12 --blocked-by CAD-14 \
+  --owner cookie-cesium
 "$BIN" issue new "claude provider: pty TUI endpoint with Stop-hook reporting" --id CAD-17 \
   --priority P1 --parent CAD-30 --blocked-by CAD-16
 "$BIN" issue new "devin --bypass, or an allowlist written into the worktree" --id CAD-18 --priority P1
@@ -96,7 +97,8 @@ say "pm dir: $PM_DIR (binary: $BIN)"
 "$BIN" issue set CAD-18 status=ready
 "$BIN" issue set CAD-20 status=ready
 "$BIN" issue set CAD-21 status=ready
-"$BIN" issue set CAD-26 status=ready
+# CAD-26 stays backlog: blocked_by CAD-16 (doing) — ready+open-blocker
+# was a seed mistake; lint now warns on it.
 "$BIN" issue set SPL-2 status=ready
 "$BIN" issue set SPL-4 status=review
 "$BIN" issue set OPS-3 status=ready

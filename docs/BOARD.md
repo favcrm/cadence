@@ -22,8 +22,10 @@ serving a board + JSON API on loopback.
 ├── README.md               # the rules, for agents and humans
 ├── cadence/
 │   ├── project.yaml        # key, prefix: CAD, repos, components, default_owner
+│   │                       #   (dispatch hint only — never stamped on new issues)
 │   ├── CAD-16/
-│   │   ├── issue.md        # YAML frontmatter + body + ## Acceptance checkboxes
+│   │   ├── issue.md        # YAML frontmatter + body; ## Acceptance checkboxes
+│   │                       #   (a bare `- [ ]` is a stub and does not count)
 │   │   ├── comments/
 │   │   │   └── 20260917T172400Z-fable-cc.md   # one file per comment, create-only
 │   │   └── artifacts/      # files under artifact_max_bytes (1 MiB)
@@ -85,13 +87,20 @@ cadence issue unlink CAD-16 blocked_by CAD-12
 cadence issue ref CAD-16 pr https://… --label "PR #16"
 cadence issue comment CAD-16 -m "text" --author me
 cadence issue attach CAD-16 ./shot.png      # copies into artifacts/, 1 MiB cap
-cadence issue lint                          # schema, links, depth, sizes → exit !=0
+cadence issue lint                          # schema, links, depth, sizes, symlinks
+                                            # → exit !=0 on errors; warnings
+                                            #   (e.g. ready/doing/review with an
+                                            #   open blocked_by) never fail it
+cadence issue set CAD-16 owner=             # empty value clears the field
 ```
 
 Every write is exactly one git commit in the PM repo, made under a lock
 file (`~/pm/.lock`) with atomic `issue.md` replacement. Writes validate
 what lint would catch: dangling links, `blocked_by`/parent cycles,
 depth > 2, oversize artifacts, unknown components/statuses/priorities.
+Symlinks inside the tracker are never followed — a linked folder or
+`issue.md` is invisible to reads, an error in lint, and refused by
+writes.
 
 ## `cadence ui` — the reader
 
@@ -103,9 +112,9 @@ cadence ui stop
 ```
 
 `run`/`start` take `--dist <dir>` to serve an unpacked SPA. Built with
-`--features ui`, the binary embeds `ui/dist` (three files: index.html,
-assets/index.js, assets/index.css — Vite emits fixed names and inlines
-fonts) so `--dist` is unnecessary.
+`--features ui`, the binary embeds `ui/dist` (index.html,
+assets/index.js, assets/index.css, and the latin woff2 files — Vite
+emits fixed names) so `--dist` is unnecessary.
 
 ### API (GET/HEAD only)
 
@@ -117,7 +126,7 @@ fonts) so `--dist` is unnecessary.
 | `GET /api/issues/:id` | the drawer payload: frontmatter, body, links both ways, refs, files, comments, notes chain, merged activity |
 | `GET /api/issues/:id/file` | raw `issue.md`, `text/markdown` |
 | `GET /api/issues/:id/activity` | the merged activity stream only |
-| `GET /api/agents` | agent rows + running/queued/fenced/parked totals; `daemon:"unreachable"` when the socket is down |
+| `GET /api/agents` | worker agent rows + running/queued/fenced/parked totals; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down |
 
 ### Security posture
 
@@ -129,6 +138,12 @@ No auth in I1 — containment is the defence:
 - `POST`/`PUT`/`DELETE`/… → `405`; `HEAD` allowed
 - issue ids must match `<PREFIX>-<n>` before any filesystem use → `400`
 - static paths canonicalize inside `--dist` → traversal `400`
+- symlinks are never followed: a linked project/issue folder, `issue.md`,
+  comment or artifact is invisible to reads, an error in `lint`, and
+  refused by writes
+- every response carries `X-Content-Type-Options: nosniff` and
+  `Referrer-Policy: no-referrer`; HTML also gets a `default-src 'self'`
+  CSP; `HEAD` returns the same headers as `GET`, minus the body
 - no arbitrary file read, no command execution, no git/PR/dispatch
   endpoints — that list must not grow without auth
 

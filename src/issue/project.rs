@@ -110,8 +110,11 @@ pub fn list(pm_dir: &Path) -> Result<Vec<Project>> {
         return Ok(projects);
     };
     for entry in entries.flatten() {
+        // lstat-style: a symlinked project dir or project.yaml is not
+        // a project — links could point outside the PM dir.
+        let dir_ok = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let file = entry.path().join("project.yaml");
-        if file.is_file() {
+        if dir_ok && crate::issue::board::is_real_file(&file) {
             projects.push(load(&file)?);
         }
     }

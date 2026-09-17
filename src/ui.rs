@@ -111,10 +111,29 @@ fn json_response(value: Value) -> Response<std::io::Cursor<Vec<u8>>> {
 }
 
 fn err_response(code: u16, message: &str) -> Response<std::io::Cursor<Vec<u8>>> {
-    let mut resp = Response::from_string(format!("{{\"error\": \"{message}\"}}\n"))
-        .with_status_code(StatusCode(code));
+    let body = serde_json::to_vec_pretty(&json!({"error": message})).unwrap_or_default();
+    let mut resp = Response::from_data(body).with_status_code(StatusCode(code));
     resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
     resp
+}
+
+/// Defence in depth on an unauthenticated loopback origin that renders
+/// agent-written Markdown.
+const CSP: &str = "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
+
+/// Every response gets nosniff + no-referrer; HTML additionally gets
+/// the CSP. Returns whether the response is HTML.
+fn add_security_headers(resp: &mut Response<std::io::Cursor<Vec<u8>>>) -> bool {
+    let is_html = resp
+        .headers()
+        .iter()
+        .any(|h| h.field.equiv("Content-Type") && h.value.as_str().starts_with("text/html"));
+    resp.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
+    resp.add_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
+    if is_html {
+        resp.add_header(Header::from_bytes("Content-Security-Policy", CSP).unwrap());
+    }
+    is_html
 }
 
 /// Percent-decode a URL path/query component (UTF-8, `+` untouched in
@@ -179,7 +198,9 @@ fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Vec<u8>)> {
             "/" | "/index.html" => Some(embedded::INDEX.as_bytes()),
             "/assets/index.js" => Some(embedded::JS.as_bytes()),
             "/assets/index.css" => Some(embedded::CSS.as_bytes()),
-            _ => None,
+            _ => path
+                .strip_prefix("/assets/")
+                .and_then(|name| embedded::ASSETS.get(name).copied()),
         };
         return bytes.map(|b| (path.to_string(), b.to_vec()));
     }
@@ -189,9 +210,43 @@ fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Vec<u8>)> {
 
 #[cfg(feature = "ui")]
 mod embedded {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
     pub const INDEX: &str = include_str!("../ui/dist/index.html");
     pub const JS: &str = include_str!("../ui/dist/assets/index.js");
     pub const CSS: &str = include_str!("../ui/dist/assets/index.css");
+
+    /// The latin woff2 files the CSS references (woff fallbacks are not
+    /// embedded — every supported browser takes woff2 first).
+    pub static ASSETS: LazyLock<HashMap<&'static str, &'static [u8]>> = LazyLock::new(|| {
+        HashMap::from([
+            (
+                "ibm-plex-sans-latin-400-normal.woff2",
+                include_bytes!("../ui/dist/assets/ibm-plex-sans-latin-400-normal.woff2") as &[u8],
+            ),
+            (
+                "ibm-plex-sans-latin-500-normal.woff2",
+                include_bytes!("../ui/dist/assets/ibm-plex-sans-latin-500-normal.woff2") as &[u8],
+            ),
+            (
+                "ibm-plex-sans-latin-600-normal.woff2",
+                include_bytes!("../ui/dist/assets/ibm-plex-sans-latin-600-normal.woff2") as &[u8],
+            ),
+            (
+                "ibm-plex-mono-latin-400-normal.woff2",
+                include_bytes!("../ui/dist/assets/ibm-plex-mono-latin-400-normal.woff2") as &[u8],
+            ),
+            (
+                "ibm-plex-mono-latin-500-normal.woff2",
+                include_bytes!("../ui/dist/assets/ibm-plex-mono-latin-500-normal.woff2") as &[u8],
+            ),
+            (
+                "ibm-plex-mono-latin-600-normal.woff2",
+                include_bytes!("../ui/dist/assets/ibm-plex-mono-latin-600-normal.woff2") as &[u8],
+            ),
+        ])
+    });
 }
 
 /// What the board needs from the daemon — agent rows plus the per-agent
@@ -206,8 +261,15 @@ fn agents_payload(state_dir: &Path, known_ids: &std::collections::HashSet<String
     };
     let agents = list["agents"].as_array().cloned().unwrap_or_default();
     let mut out = Vec::new();
-    let mut totals = json!({"running": 0, "queued": 0, "fenced": 0, "parked": 0});
+    let mut inboxes = 0i64;
+    let mut totals = json!({"running": 0, "queued": 0, "fenced": 0, "parked": 0, "inboxes": 0});
     for agent in &agents {
+        // Mailboxes are not workers — report them as their own count
+        // instead of padding idle/stopped.
+        if agent["endpoint_kind"].as_str() == Some("inbox") {
+            inboxes += 1;
+            continue;
+        }
         let alias = agent["alias"].as_str().unwrap_or_default();
         let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}));
         let (mut running, mut parked) = (0i64, 0i64);
@@ -259,6 +321,7 @@ fn agents_payload(state_dir: &Path, known_ids: &std::collections::HashSet<String
             "on": on,
         }));
     }
+    totals["inboxes"] = json!(inboxes);
     json!({"daemon": "reachable", "agents": out, "totals": totals})
 }
 
@@ -309,11 +372,16 @@ fn handle(
         })
     };
 
-    let send = |req: Request, resp: Response<std::io::Cursor<Vec<u8>>>| {
+    let send = |req: Request, mut resp: Response<std::io::Cursor<Vec<u8>>>| {
+        add_security_headers(&mut resp);
         if head_only {
             // tiny_http does not strip bodies on HEAD — answer with the
-            // status line only.
-            let _ = req.respond(Response::empty(resp.status_code()));
+            // same headers as GET, minus the body.
+            let mut bare = Response::empty(resp.status_code());
+            for h in resp.headers() {
+                bare.add_header(h.clone());
+            }
+            let _ = req.respond(bare);
         } else {
             let _ = req.respond(resp);
         }

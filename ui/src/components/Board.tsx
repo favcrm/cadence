@@ -146,6 +146,17 @@ export default function Board({
               {totals?.parked ?? "—"}
             </span>
           </span>
+          {(totals?.inboxes ?? 0) > 0 && (
+            <span
+              className="flex items-baseline gap-1.5"
+              title="inbox endpoints are mailboxes, not workers"
+            >
+              <span className="slabel">inboxes</span>
+              <span className="num text-secondary text-ink-400">
+                {totals?.inboxes}
+              </span>
+            </span>
+          )}
         </div>
         <span className="hidden md:block w-px h-4 bg-ink-700" />
         <div

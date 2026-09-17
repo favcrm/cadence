@@ -94,7 +94,13 @@ export interface Agent {
 export interface AgentsPayload {
   daemon: "reachable" | "unreachable";
   agents: Agent[];
-  totals: { running: number; queued: number; fenced: number; parked: number } | null;
+  totals: {
+    running: number;
+    queued: number;
+    fenced: number;
+    parked: number;
+    inboxes: number;
+  } | null;
 }
 
 export interface Health {

@@ -54,12 +54,14 @@ fn create_exclusive(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
 }
 
 /// Locate an issue folder by id. The id's prefix must match the
-/// project's prefix — ids cannot smuggle across projects.
+/// project's prefix — ids cannot smuggle across projects. Symlinks are
+/// never followed: a linked folder or issue.md does not exist as far
+/// as the writer is concerned.
 fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
     model::check_id(id)?;
     for project in project::list(&pm.dir)? {
         let dir = pm.dir.join(&project.key).join(id);
-        if dir.join("issue.md").is_file() {
+        if board::is_real_dir(&dir) && board::is_real_file(&dir.join("issue.md")) {
             return Ok((project, dir));
         }
     }
@@ -139,6 +141,11 @@ pub fn project_add(
         default_owner: owner.map(str::to_string),
     };
     let dir = pm.dir.join(key);
+    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{key}/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
     std::fs::create_dir_all(&dir)?;
     let yaml = serde_yaml::to_string(&project)
         .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
@@ -216,15 +223,15 @@ pub fn new_issue(
     }
     let mut front = Front::new(&id, title, &time::iso(time::now_epoch()));
     front.priority = priority.to_string();
-    front.owner = owner
-        .map(str::to_string)
-        .or_else(|| project.default_owner.clone());
+    // Owner is intent — `default_owner` stays a project.yaml hint for
+    // later dispatch; it is never stamped onto new issues.
+    front.owner = owner.map(str::to_string);
     front.component = component.map(str::to_string);
     front.blocked_by = blocked_by.to_vec();
     for dep in &front.blocked_by {
         model::check_id(dep)?;
     }
-    let body = format!("{title}\n\n## Acceptance\n\n- [ ] \n");
+    let body = format!("{title}\n\n## Acceptance\n\n");
     if let Some(parent) = parent {
         front.parent = Some(model::check_id(parent)?);
     }
@@ -497,6 +504,11 @@ pub fn add_comment(
     }
     let _lock = pm.lock()?;
     let comments = dir.join("comments");
+    if comments.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{id}: comments/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
     std::fs::create_dir_all(&comments)?;
     let epoch = time::now_epoch();
     let front = crate::issue::model::CommentFront {
@@ -543,6 +555,11 @@ pub fn attach(pm: &Pm, id: &str, file: &Path) -> Result<Value> {
     let bytes = std::fs::read(file)?;
     let _lock = pm.lock()?;
     let artifacts = dir.join("artifacts");
+    if artifacts.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{id}: artifacts/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
     std::fs::create_dir_all(&artifacts)?;
     let path = create_exclusive(&artifacts, &name, &bytes)?;
     pm.commit(&format!("{id}: attach {name}"))?;

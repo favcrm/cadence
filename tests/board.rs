@@ -65,7 +65,7 @@ fn free_port() -> u16 {
 
 /// Minimal blocking HTTP/1.0 client — enough for assertions without a
 /// client dependency.
-fn http(port: u16, method: &str, path: &str, host: &str) -> (u16, String) {
+fn http_full(port: u16, method: &str, path: &str, host: &str) -> (u16, String, String) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     write!(s, "{method} {path} HTTP/1.0\r\nHost: {host}\r\n\r\n").unwrap();
     let mut buf = String::new();
@@ -75,7 +75,14 @@ fn http(port: u16, method: &str, path: &str, host: &str) -> (u16, String) {
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
-    let body = buf.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    let mut parts = buf.splitn(2, "\r\n\r\n");
+    let headers = parts.next().unwrap_or("").to_string();
+    let body = parts.next().unwrap_or("").to_string();
+    (status, headers, body)
+}
+
+fn http(port: u16, method: &str, path: &str, host: &str) -> (u16, String) {
+    let (status, _, body) = http_full(port, method, path, host);
     (status, body)
 }
 
@@ -245,6 +252,69 @@ fn issue_cli_end_to_end() {
     let (ok, lint) = cli(pm.path(), state.path(), &["issue", "lint"]);
     assert!(ok);
     assert_eq!(lint["ok"], true);
+
+    // status=ready while a blocker is open → warning, not an error.
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "set", "CAD-3", "status=ready"]
+        )
+        .0
+    );
+    let (ok, lint) = cli(pm.path(), state.path(), &["issue", "lint"]);
+    assert!(ok);
+    assert_eq!(lint["ok"], true);
+    assert!(lint["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("CAD-3")));
+}
+
+#[test]
+fn symlinks_are_never_followed() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+
+    // CAD-2/issue.md → symlink to a file outside the PM dir.
+    let outside = TempDir::new().unwrap();
+    let loot = outside.path().join("loot.md");
+    std::fs::write(
+        &loot,
+        "---\nid: CAD-2\ntitle: escaped\nstatus: done\npriority: P0\ncreated: 2026-01-01T00:00:00Z\n---\n\noutside\n",
+    )
+    .unwrap();
+    let issue_md = pm.path().join("cadence/CAD-2/issue.md");
+    std::fs::remove_file(&issue_md).unwrap();
+    std::os::unix::fs::symlink(&loot, &issue_md).unwrap();
+
+    // The loader and the writer both pretend the issue is absent.
+    assert!(board::load_all(pm.path(), None)
+        .unwrap()
+        .iter()
+        .all(|i| i.front.id != "CAD-2"));
+    let (ok, err) = cli(pm.path(), state.path(), &["issue", "show", "CAD-2"]);
+    assert!(!ok && err["error"].as_str().unwrap().contains("Unknown"));
+
+    // lint names the link instead of following it.
+    let (ok, lint) = cli(pm.path(), state.path(), &["issue", "lint"]);
+    assert!(!ok);
+    let errors = lint["errors"].as_array().unwrap();
+    assert!(errors
+        .iter()
+        .any(|e| e.as_str().unwrap().contains("symlink")));
+
+    // A symlinked whole issue folder disappears the same way.
+    let dir = pm.path().join("cadence/CAD-3");
+    let real = pm.path().join("cadence/CAD-3-real");
+    std::fs::rename(&dir, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &dir).unwrap();
+    assert!(board::load_all(pm.path(), None)
+        .unwrap()
+        .iter()
+        .all(|i| i.front.id != "CAD-3"));
 }
 
 #[test]
@@ -306,6 +376,22 @@ fn ui_routes_and_rejections() {
     assert_eq!(code, 404);
     let (code, _) = http(port, "GET", "/api/nope", &ok_host);
     assert_eq!(code, 404);
+
+    // Security headers ride every response; HEAD mirrors GET's headers
+    // without the body. (No dist was passed, so `/` is the 503 path —
+    // headers still apply.)
+    let (code, headers, _) = http_full(port, "GET", "/api/health", &ok_host);
+    assert_eq!(code, 200);
+    let headers = headers.to_lowercase();
+    assert!(headers.contains("x-content-type-options: nosniff"));
+    assert!(headers.contains("referrer-policy: no-referrer"));
+    assert!(!headers.contains("content-security-policy")); // JSON, not HTML
+    let (code, headers, body) = http_full(port, "HEAD", "/api/health", &ok_host);
+    assert_eq!(code, 200);
+    assert!(body.is_empty());
+    assert!(headers
+        .to_lowercase()
+        .contains("x-content-type-options: nosniff"));
 }
 
 #[test]

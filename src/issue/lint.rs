@@ -11,17 +11,37 @@ use crate::issue::{model, parse, project, Pm};
 
 struct Lint {
     errors: Vec<String>,
+    warnings: Vec<String>,
 }
 
 impl Lint {
     fn err(&mut self, msg: impl Into<String>) {
         self.errors.push(msg.into());
     }
+    fn warn(&mut self, msg: impl Into<String>) {
+        self.warnings.push(msg.into());
+    }
 }
 
 pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
-    let mut lint = Lint { errors: vec![] };
+    let mut lint = Lint {
+        errors: vec![],
+        warnings: vec![],
+    };
     let projects = project::list(&pm.dir)?;
+    // project::list skips symlinked dirs — flag them here instead of
+    // letting them disappear silently.
+    if let Ok(entries) = std::fs::read_dir(&pm.dir) {
+        for entry in entries.flatten() {
+            let ft = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
+            if ft {
+                lint.err(format!(
+                    "{}: symlinked entry — the board never follows links",
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
     let mut fronts: HashMap<String, (String, model::Front, String)> = HashMap::new();
     for project in &projects {
         if let Some(only) = only_project {
@@ -36,13 +56,52 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let path = entry.path();
-            if !path.is_dir() || name.starts_with('.') {
+            // DirEntry::file_type is lstat-style — a symlink is not a dir.
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                lint.err(format!(
+                    "{}/{name}: symlinked issue folder — the board never follows links",
+                    project.key
+                ));
+                continue;
+            }
+            if !ft.is_dir() || name.starts_with('.') {
                 continue;
             }
             let file = path.join("issue.md");
+            if file.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                lint.err(format!(
+                    "{}/{name}: issue.md is a symlink — the board never follows links",
+                    project.key
+                ));
+                continue;
+            }
             if !file.is_file() {
                 lint.err(format!("{}/{}: no issue.md", project.key, name));
                 continue;
+            }
+            for sub in ["comments", "artifacts"] {
+                let sub_dir = path.join(sub);
+                if sub_dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                    lint.err(format!(
+                        "{}/{name}: {sub}/ is a symlink — the board never follows links",
+                        project.key
+                    ));
+                    continue;
+                }
+                if let Ok(files) = std::fs::read_dir(&sub_dir) {
+                    for f in files.flatten() {
+                        if f.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+                            lint.err(format!(
+                                "{}/{name}: {sub}/{} is a symlink",
+                                project.key,
+                                f.file_name().to_string_lossy()
+                            ));
+                        }
+                    }
+                }
             }
             let text = std::fs::read_to_string(&file).unwrap_or_default();
             match parse::parse_issue(&text) {
@@ -137,6 +196,33 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
         }
     }
 
+    // Contradiction warning: status claims progress while a blocker is
+    // still open. File status is what lint audits — derivation is a
+    // runtime concern.
+    for (_, front, _) in fronts.values() {
+        if matches!(front.status.as_str(), "ready" | "doing" | "review") {
+            let open: Vec<&str> = front
+                .blocked_by
+                .iter()
+                .filter(|dep| {
+                    fronts
+                        .get(dep.as_str())
+                        .map(|(_, f, _)| !matches!(f.status.as_str(), "done" | "dropped"))
+                        .unwrap_or(false)
+                })
+                .map(String::as_str)
+                .collect();
+            if !open.is_empty() {
+                lint.warn(format!(
+                    "{}: status '{}' but blocked_by {} still open",
+                    front.id,
+                    front.status,
+                    open.join(", ")
+                ));
+            }
+        }
+    }
+
     // Depth ≤ 2 and parent acyclicity.
     for (id, (_, front, _)) in &fronts {
         let mut depth = 1;
@@ -181,10 +267,10 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
         }
     }
 
-    let errors = lint.errors;
     Ok(json!({
-        "ok": errors.is_empty(),
-        "errors": errors,
+        "ok": lint.errors.is_empty(),
+        "errors": lint.errors,
+        "warnings": lint.warnings,
         "projects": projects.len(),
         "issues": fronts.len(),
     }))
