@@ -351,6 +351,22 @@ enum AgentAction {
         #[arg(long)]
         answers_file: Option<PathBuf>,
     },
+    /// Reconcile every `unknown` message fencing the agent, then resume
+    /// it (`--no-resume` leaves it stopped). Same reconcile rules and
+    /// events as `message reconcile`; history is never discarded.
+    Unfence {
+        alias: String,
+        /// Terminal state recorded for each reconciled message
+        /// [default: interrupted].
+        #[arg(long, value_enum, default_value_t = ReconcileStatus::Interrupted)]
+        status: ReconcileStatus,
+        /// Single-line note recorded with each reconcile event.
+        #[arg(long)]
+        note: Option<String>,
+        /// Reconcile without restarting the agent.
+        #[arg(long)]
+        no_resume: bool,
+    },
     /// Stop the agent's actor (queued messages are retained).
     Stop { alias: String },
     /// Resume a stopped agent on its saved native thread. Like a
@@ -484,6 +500,43 @@ enum MessageAction {
         #[arg(long)]
         text: String,
     },
+    /// Operator reconcile of an `unknown` message — the exit that keeps
+    /// history. No turn token: `unknown` means the submission token is
+    /// stale by definition. `interrupted` records that the outcome was
+    /// never learned and routes nothing; `completed`/`failed` route
+    /// `reply_to` exactly like a normal finish. Refused for any other
+    /// current state.
+    Reconcile {
+        /// Message id (must currently be `unknown`).
+        message: String,
+        /// Terminal state to record: interrupted|completed|failed.
+        #[arg(long, value_enum)]
+        status: ReconcileStatus,
+        /// Single-line note recorded with the reconcile event.
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
+/// Terminal state an operator reconcile may record.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ReconcileStatus {
+    /// The outcome was never learned — move on; never auto-replayed.
+    Interrupted,
+    /// The turn is confirmed finished; `reply_to` routes its result.
+    Completed,
+    /// The turn is confirmed failed; `reply_to` routes its result.
+    Failed,
+}
+
+impl ReconcileStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Interrupted => "interrupted",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 fn read_body(text: Option<String>, file: Option<PathBuf>) -> Result<String> {
@@ -666,12 +719,12 @@ fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Result<i32> {
     }
     // Poll until the endpoint is live or the actor gives up.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let agent = loop {
+    let (agent, unknown) = loop {
         let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
         let agent = show["agent"].clone();
         let state = agent["state"].as_str().unwrap_or_default();
         if agent["endpoint"].is_string() || matches!(state, "stopped" | "offline" | "attention") {
-            break agent;
+            break (agent, show["unknown"].as_i64().unwrap_or(0));
         }
         if Instant::now() >= deadline {
             return Err(Error::rejected(format!(
@@ -682,10 +735,10 @@ fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Result<i32> {
         std::thread::sleep(Duration::from_millis(250));
     };
     let state = agent["state"].as_str().unwrap_or_default();
-    // A fenced agent (attention, no endpoint) needs another resume —
-    // anything else gets the attach hint.
+    // A fenced agent (attention, no endpoint) gets the recovery hint —
+    // unreconciled unknowns reconcile first — anything else attaches.
     let next = if state == "attention" && agent["endpoint"].is_null() {
-        json!({"resume": format!("cadence agent resume {alias}")})
+        fenced_next(alias, agent["error"].as_str().unwrap_or_default(), unknown)
     } else {
         json!({"attach": format!("cadence agent attach {alias}")})
     };
@@ -739,14 +792,36 @@ fn session_mismatch(error: &str) -> bool {
     error.contains("owns session") || error.contains("acquired session")
 }
 
+/// `next` hint for a fenced agent (`attention`, no endpoint). An
+/// unreconciled `unknown` must be reconciled first — `agent unfence`,
+/// then `agent resume`; a session-mismatch can never converge — remove
+/// and rejoin (each retried resume mints a fresh provider session);
+/// anything else retries `agent resume`.
+fn fenced_next(alias: &str, error: &str, unknown: i64) -> Value {
+    if session_mismatch(error) {
+        json!({
+            "remove": format!("cadence agent remove {alias}"),
+            "rejoin": "cadence join <pm> <provider> -r <session>",
+            "note": "retrying resume mints a new provider session each time",
+        })
+    } else if unknown > 0 {
+        json!({
+            "unfence": format!("cadence agent unfence {alias} --status interrupted"),
+            "resume": format!("cadence agent resume {alias}"),
+        })
+    } else {
+        json!({"resume": format!("cadence agent resume {alias}")})
+    }
+}
+
 /// Resume one registered agent, waiting — bounded — for the endpoint
 /// when the kind has one. Live agents are skipped; terminal-state or
 /// RPC failures land in the per-member `error`. The unrecoverable case
 /// (the pane adopted a different native session) gets an explicit
 /// remove-and-rejoin hint.
 fn resume_one(state_dir: &Path, alias: &str) -> Value {
-    let agent = match client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
-        Ok(show) => show["agent"].clone(),
+    let (agent, unknown) = match client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+        Ok(show) => (show["agent"].clone(), show["unknown"].as_i64().unwrap_or(0)),
         Err(e) => return json!({"alias": alias, "resumed": false, "error": e.to_string()}),
     };
     // Live = a live actor (idle/running/waiting_input/starting) or a
@@ -764,6 +839,15 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
         );
     if live {
         return json!({"alias": alias, "resumed": false, "skipped": "live"});
+    }
+    // Fenced by an unreconciled `unknown` — never attempted; the sweep
+    // reports it under `fenced` with the reconcile-first commands.
+    if unknown > 0 {
+        return json!({"alias": alias, "resumed": false, "fenced": true,
+                      "state": agent["state"],
+                      "hint": format!("fenced by an unreconciled unknown message — \
+                                       `cadence agent unfence {alias} --status interrupted`, \
+                                       then `cadence agent resume {alias}`")});
     }
     let attachable = matches!(kind, "pty" | "managed-ws");
     if let Err(e) = client::rpc(state_dir, "agent_resume", json!({"alias": alias})) {
@@ -793,7 +877,8 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
                 // can never converge; rebuild the member instead.
                 out["hint"] = json!(format!(
                     "unrecoverable — `cadence agent remove {alias}` then \
-                     rejoin with `cadence join <pm> <provider> -r <session>`"
+                     rejoin with `cadence join <pm> <provider> -r <session>`; \
+                     retrying resume mints a new provider session each time"
                 ));
                 out["unrecoverable"] = json!(true);
             }
@@ -808,9 +893,11 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
 }
 
 /// Resume a list of aliases in order, printing a per-member status line
-/// and returning the `{resumed, skipped, failed}` summary.
+/// and returning the `{resumed, skipped, fenced, failed}` summary.
+/// Fenced members are never attempted — they land in `fenced` with the
+/// reconcile-first hint.
 fn resume_sweep(state_dir: &Path, aliases: &[String]) -> Value {
-    let (mut resumed, mut skipped, mut failed) = (vec![], vec![], vec![]);
+    let (mut resumed, mut skipped, mut fenced, mut failed) = (vec![], vec![], vec![], vec![]);
     for alias in aliases {
         let r = resume_one(state_dir, alias);
         if r["resumed"].as_bool() == Some(true) {
@@ -822,13 +909,22 @@ fn resume_sweep(state_dir: &Path, aliases: &[String]) -> Value {
                 r["skipped"].as_str().unwrap_or("")
             );
             skipped.push(r);
+        } else if r["fenced"].as_bool() == Some(true) {
+            eprintln!(
+                "resume {alias}: FENCED — {}",
+                r["hint"]
+                    .as_str()
+                    .unwrap_or("reconcile its unknown messages")
+            );
+            fenced.push(r);
         } else {
             let reason = r["error"].as_str().unwrap_or("unknown");
             eprintln!("resume {alias}: FAILED — {reason}");
             failed.push(r);
         }
     }
-    json!({"resumed": resumed, "skipped": skipped, "failed": failed})
+    json!({"resumed": resumed, "skipped": skipped,
+           "fenced": fenced, "failed": failed})
 }
 
 /// `cadence resume <group>` / `cadence resume --all`.
@@ -1067,6 +1163,26 @@ fn run() -> Result<i32> {
                         json!({"alias": alias, "request": request,
                                "decision": decision, "answers": answers}),
                     )?
+                }
+                AgentAction::Unfence {
+                    alias,
+                    status,
+                    note,
+                    no_resume,
+                } => {
+                    let result = client::rpc(
+                        &state_dir,
+                        "agent_unfence",
+                        json!({"alias": alias, "status": status.as_str(),
+                               "note": note,
+                               "by": std::env::var("CADENCE_ALIAS")
+                                   .unwrap_or_else(|_| "operator".into())}),
+                    )?;
+                    print_json(&result);
+                    if no_resume {
+                        return Ok(0);
+                    }
+                    return resume_agent(&state_dir, &alias, false);
                 }
                 AgentAction::Stop { alias } => {
                     client::rpc(&state_dir, "agent_stop", json!({"alias": alias}))?
@@ -1332,6 +1448,21 @@ fn run() -> Result<i32> {
                     )?,
                     false,
                 ),
+                MessageAction::Reconcile {
+                    message,
+                    status,
+                    note,
+                } => (
+                    client::rpc(
+                        &state_dir,
+                        "message_reconcile",
+                        json!({"message": message, "status": status.as_str(),
+                               "note": note,
+                               "by": std::env::var("CADENCE_ALIAS")
+                                   .unwrap_or_else(|_| "operator".into())}),
+                    )?,
+                    false,
+                ),
                 MessageAction::Ask {
                     alias,
                     text,
@@ -1423,10 +1554,20 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
         )));
     }
     let endpoint = agent["endpoint"].as_str().ok_or_else(|| {
-        Error::rejected(format!(
-            "Agent '{alias}' has no live endpoint — resume it with \
-             `cadence agent resume {alias}`"
-        ))
+        // An unreconciled `unknown` fences the agent — reconcile first,
+        // resume second; anything else just needs the resume.
+        if show["unknown"].as_i64().unwrap_or(0) > 0 {
+            Error::rejected(format!(
+                "Agent '{alias}' is fenced by an unreconciled unknown message — \
+                 `cadence agent unfence {alias} --status interrupted`, then \
+                 `cadence agent resume {alias}`"
+            ))
+        } else {
+            Error::rejected(format!(
+                "Agent '{alias}' has no live endpoint — resume it with \
+                 `cadence agent resume {alias}`"
+            ))
+        }
     })?;
     let thread = agent["thread_id"]
         .as_str()
@@ -1596,7 +1737,7 @@ fn provider_launch(
     // Kinds with no attachable endpoint are done once the actor is back.
     let attachable = matches!(endpoint_kind, "pty" | "managed-ws");
     let deadline = Instant::now() + Duration::from_secs(45);
-    let agent = loop {
+    let (agent, unknown) = loop {
         let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
         let agent = show["agent"].clone();
         let state = agent["state"].as_str().unwrap_or_default();
@@ -1605,10 +1746,10 @@ fn provider_launch(
             || matches!(state, "stopped" | "offline" | "attention")
             || (!attachable && matches!(state, "idle" | "running"))
         {
-            break agent;
+            break (agent, show["unknown"].as_i64().unwrap_or(0));
         }
         if Instant::now() >= deadline {
-            break agent;
+            break (agent, show["unknown"].as_i64().unwrap_or(0));
         }
         std::thread::sleep(Duration::from_millis(250));
     };
@@ -1617,10 +1758,10 @@ fn provider_launch(
         .as_str()
         .or_else(|| agent["thread_id"].as_str());
     // A fenced agent (attention, no endpoint) cannot attach — the
-    // useful next step is an explicit resume, not the usual trio.
+    // useful next step is its recovery hint, not the usual trio.
     let fenced = state == "attention" && agent["endpoint"].is_null();
     let next = if fenced {
-        json!({"resume": format!("cadence agent resume {alias}")})
+        fenced_next(&alias, agent["error"].as_str().unwrap_or_default(), unknown)
     } else {
         json!({
             "attach": format!("cadence agent attach {alias}"),

@@ -175,7 +175,11 @@ impl Shared {
             self.store.set_agent_state(
                 alias,
                 "attention",
-                Some("Uncertain provider outcome requires review"),
+                Some(&format!(
+                    "Uncertain provider outcome requires review — reconcile: \
+                     `cadence agent unfence {alias} --status interrupted`, then \
+                     `cadence agent resume {alias}`"
+                )),
             )?;
             let _ = self.store.event_public(
                 alias,
@@ -316,14 +320,23 @@ impl Shared {
         let _ = self.store.clear_runtime(alias);
         match outcome {
             Err(ref error) => {
+                // When unreconciled unknowns outlive the actor, the
+                // recorded reason names the reconcile-first recovery —
+                // resume alone is rejected while the fence stands.
+                let reason = if self.store.has_unknown(alias).unwrap_or(false) {
+                    format!(
+                        "{error} — reconcile: `cadence agent unfence {alias} \
+                         --status interrupted`, then `cadence agent resume {alias}`"
+                    )
+                } else {
+                    error.to_string()
+                };
                 let _ = self
                     .store
-                    .set_agent_state(alias, "attention", Some(&error.to_string()));
-                let _ = self.store.event_public(
-                    alias,
-                    "attention",
-                    json!({"reason": error.to_string()}),
-                );
+                    .set_agent_state(alias, "attention", Some(&reason));
+                let _ = self
+                    .store
+                    .event_public(alias, "attention", json!({"reason": reason}));
             }
             Ok(()) => {
                 let agent = self.store.agent(alias);
@@ -589,7 +602,11 @@ impl Shared {
         self.store.set_agent_state(
             alias,
             "attention",
-            Some("Uncertain provider outcome requires review"),
+            Some(&format!(
+                "Uncertain provider outcome requires review — reconcile: \
+                 `cadence agent unfence {alias} --status interrupted`, then \
+                 `cadence agent resume {alias}`"
+            )),
         )?;
         let _ = self
             .store
@@ -628,6 +645,10 @@ impl Shared {
                     // for a mailbox, what the actor will still take for
                     // a live endpoint.
                     "queued": self.store.queued_count(&alias)?,
+                    // Unreconciled `unknown` count — nonzero means the
+                    // agent is fenced and `message reconcile` /
+                    // `agent unfence` is the only exit.
+                    "unknown": self.store.unknown_messages(&alias)?.len(),
                 }))
             }
             "agent_send" => self.rpc_send(params),
@@ -654,6 +675,8 @@ impl Shared {
             "agent_set" => self.rpc_set(params),
             "agent_inbox" => self.rpc_inbox(params),
             "message_report" => self.rpc_message_report(params),
+            "message_reconcile" => self.rpc_reconcile(params),
+            "agent_unfence" => self.rpc_unfence(params),
             "agent_stop" => self.rpc_stop(params),
             "agent_remove" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -729,6 +752,17 @@ impl Shared {
                              retry shortly"
                         )))
                     };
+                }
+                // An unreconciled `unknown` fences the agent — the exit
+                // is an explicit operator reconcile, not another resume
+                // (which would fail closed anyway inside start_actor).
+                if self.store.has_unknown(&alias)? {
+                    return Err(Error::rejected(format!(
+                        "Agent '{alias}' is fenced by an unreconciled unknown \
+                         message — reconcile it first: `cadence agent unfence \
+                         {alias} --status interrupted`, then `cadence agent \
+                         resume {alias}`"
+                    )));
                 }
                 // Enable only after the ownership/fence checks pass —
                 // a rejected resume must leave no side effects behind.
@@ -1161,6 +1195,47 @@ impl Shared {
         Ok(json!({"state": "reported", "kind": kind}))
     }
 
+    /// Operator reconcile of an `unknown` message — no turn token, the
+    /// token is stale by definition when a message is `unknown`. The
+    /// store transaction enforces unknown-only; `completed`/`failed`
+    /// route `reply_to`, `interrupted` routes nothing.
+    fn rpc_reconcile(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let message_id = required_str(params, "message")?;
+        let status = required_str(params, "status")?;
+        let note = optional_str(params, "note");
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let message = self.store.reconcile(message_id, status, note, by)?;
+        self.wake();
+        Ok(json!({"state": "reconciled", "message": message.to_json()}))
+    }
+
+    /// Convenience wrapper: reconcile every `unknown` message fencing
+    /// the agent in one call. Returns each reconciled id; the agent
+    /// lands `stopped` (never auto-started) when the last one clears.
+    fn rpc_unfence(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let status = required_str(params, "status")?;
+        let note = optional_str(params, "note");
+        let by = optional_str(params, "by").unwrap_or("operator");
+        // Resolve the agent before any reconcile so a bad alias fails
+        // without side effects.
+        let _ = self.store.agent(&alias)?;
+        let ids = self.store.unknown_messages(&alias)?;
+        if ids.is_empty() {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' has no unknown messages to reconcile"
+            )));
+        }
+        let mut reconciled = Vec::new();
+        for id in &ids {
+            self.store.reconcile(id, status, note, by)?;
+            reconciled.push(id.clone());
+        }
+        let state = self.store.agent(&alias)?.state;
+        self.wake();
+        Ok(json!({"alias": alias, "reconciled": reconciled, "state": state}))
+    }
+
     fn rpc_stop(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let agent = self.store.agent(&alias)?;
@@ -1409,9 +1484,47 @@ pub fn serve(state_dir: &Path) -> Result<()> {
     // Inbox rows are durable mailboxes — enabled or not, they own no
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {
-        if agent.enabled && agent.endpoint_kind != "inbox" {
-            shared.launch_actor(&agent.alias)?;
+        if !agent.enabled || agent.endpoint_kind == "inbox" {
+            continue;
         }
+        // A fenced agent stays registered but must never churn on a
+        // daemon restart — no actor, no provider process. `attention`
+        // or an unreconciled `unknown` both mean the operator must
+        // reconcile before it runs again. The fenced state and its
+        // recovery hint are preserved/restored, then `relaunch_skipped`
+        // is emitted instead of a launch.
+        let unknown = shared.store.has_unknown(&agent.alias)?;
+        if agent.state == "attention" || unknown {
+            let (reason, error) = if unknown {
+                (
+                    "unknown messages await reconcile",
+                    format!(
+                        "Uncertain provider outcome requires review — reconcile: \
+                         `cadence agent unfence {} --status interrupted`, then \
+                         `cadence agent resume {}`",
+                        agent.alias, agent.alias
+                    ),
+                )
+            } else {
+                // Other fences (session mismatch, failed open) keep
+                // their recorded error verbatim.
+                (
+                    "agent is in attention",
+                    agent.error.clone().unwrap_or_default(),
+                )
+            };
+            shared
+                .store
+                .set_agent_state(&agent.alias, "attention", Some(&error))?;
+            eprintln!("start: skipping fenced agent '{}' ({reason})", agent.alias);
+            let _ = shared.store.event_public(
+                &agent.alias,
+                "relaunch_skipped",
+                json!({"reason": reason}),
+            );
+            continue;
+        }
+        shared.launch_actor(&agent.alias)?;
     }
     // Signal-driven shutdown: set the same flag as the rpc.
     {

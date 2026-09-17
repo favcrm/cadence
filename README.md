@@ -57,6 +57,12 @@ cadence agent bootstrap <slug>  # write + enqueue the briefing for an
 cadence agent resume <slug>     # reopen a stopped agent, then attach
                                 #  (waits for the endpoint, ~30s bound;
                                 #   --detach opts out, non-TTY prints)
+cadence agent unfence <slug>    # reconcile every unknown fencing the agent,
+                                #  then resume (--no-resume leaves it stopped;
+                                #  --status completed|failed records a verdict)
+cadence message reconcile <id> --status interrupted [--note "why"]
+                                # operator exit from `unknown`: completed/failed
+                                #  route reply_to; interrupted routes nothing
 cadence agent ready <slug>      # operator claim: pane inspected, idle, empty input
 cadence agent probe <slug>      # analyze the pane without claiming (pty)
 cadence agent set <slug> k=v    # merge an allowlisted param (auto_ready)
@@ -72,7 +78,8 @@ cadence inbox obs [--wait 30]   # drain it: one JSON object per message,
 The hot path is verb-first — `devin`, `codex`, `join`, `attach`, `send`,
 `resume`, `stop`, `inbox` — while `agent`, `message` and `daemon` hold
 the admin subcommands (register/list/show/ready/capture/probe/set/
-remove/gc/bootstrap, send/ask/ack/result, start/run/status/stop).
+remove/gc/bootstrap/unfence, send/ask/ack/result/reconcile,
+start/run/status/stop).
 Everywhere a command takes an agent name, an alias or a provider-native
 session id resolves the same way.
 

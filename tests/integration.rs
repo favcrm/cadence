@@ -457,6 +457,438 @@ fn unknown_outcome_never_replays() {
     assert_eq!(x2["state"], "queued");
 }
 
+// ---- fence recovery: operator reconcile + agent unfence ----
+
+/// The DISCONNECT keyword makes the fake provider drop mid-turn — the
+/// message lands `unknown` and fences the agent.
+fn fence_agent(d: &TestDaemon, alias: &str, id: &str) {
+    d.rpc(
+        "agent_send",
+        json!({"alias": alias, "text": "DISCONNECT", "message": id}),
+    )
+    .unwrap();
+    d.wait_message(alias, id, &["unknown"], 15);
+    d.wait_agent(alias, "attention", 10);
+}
+
+fn event_kinds(d: &TestDaemon, alias: &str) -> Vec<String> {
+    d.rpc("agent_events", json!({"alias": alias})).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn reconcile_interrupted_clears_fence_and_preserves_history() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    fence_agent(&d, "w1", "x1");
+    // Work queued behind the fence stays queued.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "after", "message": "x2"}),
+    )
+    .unwrap();
+    // A bare resume is rejected, naming the reconcile-first path.
+    let err = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cadence agent unfence w1 --status interrupted"),
+        "{err}"
+    );
+    // The operator's verdict: interrupted, with a note and caller.
+    let r = d
+        .rpc(
+            "message_reconcile",
+            json!({"message": "x1", "status": "interrupted",
+                   "note": "pane lost mid-turn", "by": "cookie-cesium"}),
+        )
+        .unwrap();
+    assert_eq!(r["state"], "reconciled");
+    assert_eq!(r["message"]["state"], "interrupted");
+    assert_eq!(r["message"]["result"]["via"], "operator_reconcile");
+    assert_eq!(r["message"]["result"]["note"], "pane lost mid-turn");
+    // The last unknown reconciled → attention drops to stopped, and the
+    // agent is NOT auto-started.
+    let agent = d.wait_agent("w1", "stopped", 10);
+    assert!(agent["endpoint"].is_null());
+    // The reconciled event carries id, status, note and caller.
+    let events = d.rpc("agent_events", json!({"alias": "w1"})).unwrap()["events"].clone();
+    let rec = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "reconciled")
+        .expect("reconciled event");
+    assert_eq!(rec["payload"]["message"], "x1");
+    assert_eq!(rec["payload"]["status"], "interrupted");
+    assert_eq!(rec["payload"]["note"], "pane lost mid-turn");
+    assert_eq!(rec["payload"]["by"], "cookie-cesium");
+    // History is intact: x1 still listed (interrupted), x2 still queued.
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["unknown"], 0);
+    assert_eq!(d.message_state("w1", "x1"), "interrupted");
+    assert_eq!(d.message_state("w1", "x2"), "queued");
+    // The normal resume path works again and drains the backlog.
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 15);
+    d.wait_message("w1", "x2", &["completed"], 15);
+}
+
+#[test]
+fn reconcile_completed_routes_reply_to_interrupted_routes_nothing() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register("w1");
+    d.register("w2");
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    d.wait_agent("w2", "idle", 10);
+    // Both fence on an unknown outcome; both were reply_to wired to pm.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "DISCONNECT", "message": "x1",
+               "reply_to": "pm"}),
+    )
+    .unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w2", "text": "DISCONNECT", "message": "x2",
+               "reply_to": "pm"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "x1", &["unknown"], 15);
+    d.wait_message("w2", "x2", &["unknown"], 15);
+    // completed → the reconciled result routes to pm exactly once.
+    d.rpc(
+        "message_reconcile",
+        json!({"message": "x1", "status": "completed",
+               "note": "pane showed the answer"}),
+    )
+    .unwrap();
+    // interrupted → nothing routed — nothing was ever reported.
+    d.rpc(
+        "message_reconcile",
+        json!({"message": "x2", "status": "interrupted"}),
+    )
+    .unwrap();
+    let show = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    let routed: Vec<&Value> = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["source"] == "worker_result")
+        .collect();
+    assert_eq!(routed.len(), 1, "exactly one routed result: {show}");
+    assert!(routed[0]["body"].as_str().unwrap().contains("\"x1\""));
+    assert!(routed[0]["body"]
+        .as_str()
+        .unwrap()
+        .contains("operator_reconcile"));
+    // x2 produced no delivery; its routed-routing event is absent.
+    let w2_events = event_kinds(&d, "w2");
+    assert!(!w2_events.iter().any(|k| k == "result_routed"));
+    let w1_events = event_kinds(&d, "w1");
+    assert!(w1_events.iter().any(|k| k == "result_routed"));
+}
+
+#[test]
+fn reconcile_rejects_non_unknown_and_repeats() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    // completed → rejected, naming the state.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "done", "message": "c1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "c1", &["completed"], 15);
+    let err = d
+        .rpc(
+            "message_reconcile",
+            json!({"message": "c1", "status": "interrupted"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("'completed'"), "{err}");
+    // running → rejected, naming the state.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT:hold", "message": "r1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "r1", &["running"], 15);
+    let err = d
+        .rpc(
+            "message_reconcile",
+            json!({"message": "r1", "status": "interrupted"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("'running'"), "{err}");
+    // queued → rejected, naming the state (w1 is busy holding r1).
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "next", "message": "q2"}),
+    )
+    .unwrap();
+    assert_eq!(d.message_state("w1", "q2"), "queued");
+    let err = d
+        .rpc(
+            "message_reconcile",
+            json!({"message": "q2", "status": "interrupted"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("'queued'"), "{err}");
+    // A real fence on a second agent: reconcile once, then a second
+    // reconcile rejects — the message is no longer unknown.
+    d.register("w2");
+    d.wait_agent("w2", "idle", 10);
+    fence_agent(&d, "w2", "x9");
+    d.rpc(
+        "message_reconcile",
+        json!({"message": "x9", "status": "failed"}),
+    )
+    .unwrap();
+    let err = d
+        .rpc(
+            "message_reconcile",
+            json!({"message": "x9", "status": "failed"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("'failed'"), "{err}");
+    // An invalid status is rejected before any state check.
+    let err = d
+        .rpc(
+            "message_reconcile",
+            json!({"message": "x9", "status": "bogus"}),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("interrupted|completed|failed"),
+        "{err}"
+    );
+}
+
+#[test]
+fn agent_unfence_reconciles_all_then_resume_works() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    fence_agent(&d, "w1", "x1");
+    // An agent with no unknowns refuses cleanly.
+    d.register("w2");
+    d.wait_agent("w2", "idle", 10);
+    let err = d
+        .rpc(
+            "agent_unfence",
+            json!({"alias": "w2", "status": "interrupted"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("no unknown"), "{err}");
+    // Unfence reconciles each unknown and lands the agent stopped.
+    let r = d
+        .rpc(
+            "agent_unfence",
+            json!({"alias": "w1", "status": "interrupted",
+                   "note": "bulk"}),
+        )
+        .unwrap();
+    assert_eq!(r["reconciled"], json!(["x1"]));
+    assert_eq!(r["state"], "stopped");
+    assert_eq!(d.message_state("w1", "x1"), "interrupted");
+    // Resume now works through the normal path.
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 15);
+}
+
+#[test]
+fn daemon_restart_skips_fenced_and_relaunches_healthy() {
+    // Seed: one agent mid-flight (crash → unknown fence) + one healthy.
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        for alias in ["fenced", "healthy"] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: "fake",
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params: None,
+                })
+                .unwrap();
+        }
+        store.set_agent_state("fenced", "idle", None).unwrap();
+        store.set_agent_state("healthy", "idle", None).unwrap();
+        store.enqueue("fenced", "work", None, "m1", "user").unwrap();
+        match store.take_queued("fenced").unwrap() {
+            Take::Message(m) => assert_eq!(m.id, "m1"),
+            _ => panic!("expected a message"),
+        }
+        // Store dropped mid-flight — the crash this daemon recovers.
+    }
+    let d = TestDaemon::start_on(state);
+    // Healthy relaunched; the fenced one was skipped, still attention.
+    d.wait_agent("healthy", "idle", 15);
+    let agent = d.wait_agent("fenced", "attention", 15);
+    assert!(agent["endpoint"].is_null());
+    // relaunch_skipped was emitted — no actor was spawned for it, so a
+    // queued task is never taken.
+    let kinds = event_kinds(&d, "fenced");
+    assert!(
+        kinds.iter().any(|k| k == "relaunch_skipped"),
+        "events: {kinds:?}"
+    );
+    d.rpc(
+        "agent_send",
+        json!({"alias": "fenced", "text": "later", "message": "m2"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(d.message_state("fenced", "m2"), "queued");
+    // Unfence + resume still recovers it through the normal path.
+    d.rpc(
+        "agent_unfence",
+        json!({"alias": "fenced", "status": "interrupted"}),
+    )
+    .unwrap();
+    d.rpc("agent_resume", json!({"alias": "fenced"})).unwrap();
+    d.wait_agent("fenced", "idle", 15);
+    d.wait_message("fenced", "m2", &["completed"], 15);
+}
+
+#[test]
+fn resume_all_lists_fenced_without_attempting() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.register("w2");
+    d.wait_agent("w1", "idle", 10);
+    d.wait_agent("w2", "idle", 10);
+    fence_agent(&d, "w1", "x1");
+    // w2 is a resumable member: stored thread, no live endpoint.
+    d.rpc("agent_stop", json!({"alias": "w2"})).unwrap();
+    d.wait_agent("w2", "stopped", 10);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["resume", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // The fenced member is reported under `fenced` with the reconcile
+    // hint — never attempted.
+    let fenced = v["fenced"].as_array().unwrap();
+    let w1 = fenced
+        .iter()
+        .find(|r| r["alias"] == "w1")
+        .expect("w1 listed under fenced");
+    assert!(
+        w1["hint"]
+            .as_str()
+            .unwrap()
+            .contains("cadence agent unfence w1 --status interrupted"),
+        "{w1}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("FENCED"), "{stderr}");
+    // Still fenced: the message is untouched, the agent never launched.
+    assert_eq!(d.message_state("w1", "x1"), "unknown");
+    d.wait_agent("w1", "attention", 5);
+    // The healthy member resumed normally through the same sweep.
+    assert!(v["resumed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["alias"] == "w2"));
+    d.wait_agent("w2", "idle", 15);
+}
+
+/// G2: a pty pane that survives a daemon restart mid-turn is re-adopted
+/// by the normal resume path after the operator unfences — the adapter
+/// reattaches to the surviving tmux session and verifies the pane's
+/// native-session lock against the stored thread_id.
+#[test]
+fn pty_restart_fence_unfence_resume_readopts_pane() {
+    let mut d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let native = agent["thread_id"].as_str().unwrap().to_string();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    pty_token(&d, "dv1", "m1");
+    let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // Daemon dies mid-turn — the tmux pane survives (detached).
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    // Leak d's TempDir — it owns both the state dir and the mock's pane
+    // state, which must outlive the second daemon. forget() also keeps
+    // Drop from shutting the new daemon's socket.
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    // Recover fenced the in-flight turn; the restart skipped relaunch.
+    let agent = d.wait_agent("dv1", "attention", 15);
+    assert!(agent["endpoint"].is_null());
+    assert!(event_kinds(&d, "dv1")
+        .iter()
+        .any(|k| k == "relaunch_skipped"));
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    // The pane itself is still alive.
+    let pid_now: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(pid_now, pane_pid);
+    // Unfence → stopped, then resume adopts the surviving pane.
+    d.rpc(
+        "agent_unfence",
+        json!({"alias": "dv1", "status": "interrupted"}),
+    )
+    .unwrap();
+    d.wait_agent("dv1", "stopped", 10);
+    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    let agent = d.wait_agent("dv1", "idle", 20);
+    // Same pane pid + same native session = adopted, not respawned.
+    let pid_after: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(pid_after, pane_pid, "pane was not re-adopted");
+    assert_eq!(agent["thread_id"].as_str().unwrap(), native);
+    // New work flows over the adopted pane.
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "again", "message": "m2"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m2", &["running"], 20);
+}
+
 #[test]
 fn cli_doctor_smoke() {
     let dir = TempDir::new().unwrap();
@@ -546,9 +978,10 @@ fn resume_rejected_while_actor_stopping() {
     let agent = d.wait_agent("w1", "attention", 10);
     assert_eq!(agent["enabled"], false);
     d.wait_message("w1", "m1", &["unknown"], 10);
-    // A later resume hits the fence, not a relaunch, and stays disabled.
-    let fenced = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
-    assert_eq!(fenced["state"], "attention");
+    // A later resume is rejected by the fence, naming the reconcile
+    // path — it is not a relaunch and stays disabled.
+    let fenced = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap_err();
+    assert!(fenced.to_string().contains("agent unfence"), "{fenced}");
     let agent = d
         .rpc("agent_show", json!({"alias": "w1"}))
         .unwrap()
@@ -1171,8 +1604,10 @@ fn stop_on_fenced_agent_preserves_attention() {
     let agent = d.wait_agent("w1", "attention", 5);
     assert_eq!(agent["error"], reason);
     assert_eq!(d.message_state("w1", "m1"), "unknown");
-    let fenced = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
-    assert_eq!(fenced["state"], "attention");
+    // Resume is rejected until the operator reconciles — the fence is
+    // not masked by either verb.
+    let fenced = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap_err();
+    assert!(fenced.to_string().contains("agent unfence"), "{fenced}");
 }
 
 #[test]
@@ -2884,7 +3319,8 @@ fn fenced_agent_resume_hint() {
     assert!(agent["endpoint"].is_null());
 
     // `devin -r <slug>` on the fenced agent must not print attach/ready
-    // steps — the useful next command is `agent resume`.
+    // steps — the useful next commands are `agent unfence` then
+    // `agent resume`.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .arg("--state-dir")
         .arg(&d.state)
@@ -2899,11 +3335,26 @@ fn fenced_agent_resume_hint() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["state"], "attention", "{v}");
     assert_eq!(
+        v["next"]["unfence"].as_str().unwrap_or_default(),
+        "cadence agent unfence dv1 --status interrupted",
+        "{v}"
+    );
+    assert_eq!(
         v["next"]["resume"].as_str().unwrap_or_default(),
         "cadence agent resume dv1",
         "{v}"
     );
     assert!(v["next"]["attach"].is_null(), "{v}");
+    // `agent show`'s error text names the same reconcile-first path.
+    let agent = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["agent"].clone();
+    assert!(
+        agent["error"]
+            .as_str()
+            .unwrap()
+            .contains("agent unfence dv1 --status interrupted"),
+        "{}",
+        agent["error"]
+    );
 }
 
 /// Spawn the real `cadence` binary under a scratch HOME (skill install

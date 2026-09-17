@@ -39,7 +39,7 @@ Error kinds:
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded) then exits |
 | `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?` | `{alias,state:"starting"|"idle",provider}` |
 | `agent_list` | — | `{agents:[Agent]}` |
-| `agent_show` | `alias` | `{agent, messages, event_cursor, queued}` |
+| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown}` — `unknown` counts unreconciled unknowns fencing the agent |
 | `agent_send` | `alias, text, message?, reply_to?, source?` | `{message,state,duplicate}` |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
@@ -51,6 +51,8 @@ Error kinds:
 | `agent_set` | `alias, patch` | merges an allowlisted param into the live agent — today only `auto_ready` (`"verified"` or null-removal, pty only); `{state:"updated"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?` | `{state:"reported"}` — explicit PTY ack/result |
+| `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to`; `interrupted` routes nothing |
+| `agent_unfence` | `alias, status?, note?, by?` | reconciles every `unknown` on the agent (default `interrupted`); `{alias, reconciled:[id], state}` |
 | `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 | `agent_remove` | `alias` | deletes the agent + its history; refuses live endpoints |
@@ -75,8 +77,10 @@ a stop is in flight the alias stays reserved: `agent_resume` is
 `rejected` until the stop's final write is done, and a second
 `agent_stop` is `rejected` (`already stopping`) before any mutation —
 a stale stop cannot write over a new actor generation. A sequential
-stop after completion is idempotent. Resume on a fenced agent returns
-`attention` and does not re-enable.
+stop after completion is idempotent. Resume on an unknown-fenced agent
+is `rejected`, naming `cadence agent unfence <alias> --status
+interrupted` then `cadence agent resume <alias>` — the fence is only
+lifted by an explicit operator reconcile.
 
 ## Agents
 
@@ -149,9 +153,12 @@ every member whose `params.upstream` names the PM — members that are
 already live (endpoint set or an actor-alive state) are skipped, and
 each member gets a bounded ~15s endpoint wait rather than hanging on a
 broken session. Per-member status lines go to stderr and the summary
-JSON reports `resumed` / `skipped` / `failed` separately; a member
-whose provider opened a different native session is reported
-`unrecoverable` with an explicit `agent remove` + `join -r` hint. Once
+JSON reports `resumed` / `skipped` / `fenced` / `failed` separately; a
+member fenced by an unreconciled `unknown` is listed under `fenced`
+with the `agent unfence` + `agent resume` commands and never attempted,
+and a member whose provider opened a different native session is
+reported `unrecoverable` with an explicit `agent remove` + `join -r`
+hint. Once
 the group is processed, `resume` attaches to the PM by default under
 the same rules as a launch (`--detach` opts out; non-TTY or nested tmux
 prints the attach command). `cadence stop <group>` is the symmetric
@@ -159,7 +166,8 @@ teardown — members first, then the PM; agents stay registered and
 resumable, and the summary lists what was stopped. `agent resume` /
 `agent stop` stay strictly single-agent. `cadence resume --all` sweeps
 every registered agent that has a resumable thread/session and no live
-endpoint, printing a resumed/failed summary; `cadence daemon start
+endpoint, printing the same resumed/skipped/fenced/failed summary;
+`cadence daemon start
 --resume` runs the same sweep once the daemon answers (default off).
 Resuming an already-live agent is rejected with a `cadence attach
 <alias>` hint.
@@ -385,7 +393,28 @@ States: `queued → submitting → running → completed | failed | interrupted
 post-submission outcome lands there — transport loss mid-turn, a turn
 deadline, an acknowledged `turn/start` that cannot be correlated to a
 turn id, an unclassifiable completion status, or a forced close while a
-turn was in flight.
+turn was in flight. `interrupted` is terminal for "the outcome was
+never learned and the operator moved on" — written by a reconcile, or
+by a provider that reports an interrupted turn; it is never replayed.
+
+**Fencing and reconcile.** An `unknown` message fences its agent
+(`attention`, no relaunch, queued work waits). The only exit that keeps
+history is `message_reconcile` — an operator statement requiring no
+turn token (the token is stale by definition when a message is
+`unknown`), refused for every other current state with an error naming
+it. One transaction moves the message to the chosen terminal state with
+result `{status, via:"operator_reconcile", note}` and emits a
+`reconciled` event carrying the message id, status, note and caller
+(`CADENCE_ALIAS`, else `"operator"`). `completed`/`failed` route
+`reply_to` exactly like a normal finish (same deterministic delivery id
+— exactly once); `interrupted` routes nothing — nothing was ever
+reported. An `unknown` finish itself routes nothing either: the
+replier hears the operator's verdict, not a fabricated result. When the
+agent's last `unknown` reconciles, the fence lifts `attention →
+stopped` — never auto-started; `agent resume` is the next move.
+`agent_unfence` is the bulk form: every `unknown` on the agent in one
+call, printing each id; `cadence agent unfence <alias>` then resumes
+unless `--no-resume`.
 
 Idempotency: a client-supplied `message` id makes retries of the *same
 envelope* (alias+body+reply_to+source) return `duplicate:true`. The same
@@ -413,8 +442,8 @@ Kinds: `registered, queued, submitting, turn_started, turn_finished,
 provider_event, input_required, input_answered, input_resolved,
 result_routed, ready, ready_claimed, claim_used, gate_wait, submitted,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
-params_updated, attention, stop_requested`. `wait>0` long-polls up to
-30s.
+params_updated, reconciled, relaunch_skipped, attention,
+stop_requested`. `wait>0` long-polls up to 30s.
 
 ## Approvals
 
@@ -429,9 +458,19 @@ The agent stays `waiting_input` while other requests remain pending.
 
 ## Recovery
 
-On daemon start: messages in `submitting`/`running` become `unknown` and
-their agents `offline`/`attention`. Enabled agents relaunch *unless*
-fenced by an `unknown` attempt — those stay `attention` for review.
+On daemon start: messages in `submitting`/`running` become `unknown`.
+Enabled agents relaunch *unless* fenced — state `attention` or an
+unreconciled `unknown`. A fenced agent is skipped before any actor or
+provider spawn: its state is restored to `attention` with the reconcile
+hint, a `relaunch_skipped` event records the reason, and the sweep
+continues with healthy agents. Recovery is `cadence agent unfence
+<alias> --status interrupted` then `cadence agent resume <alias>`; a
+pty pane that survived the restart is re-adopted by `open` — the
+reattach path verifies the pane still owns the stored native session
+lock, so resume converges on the same Devin session rather than a fresh
+one. A pane that adopted a *different* session fails closed and the
+hint is `agent remove` + `join -r` — retrying resume mints a new
+provider session each time.
 
 ## Agent skill
 

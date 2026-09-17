@@ -652,7 +652,13 @@ impl Store {
             "turn_finished",
             json!({"message": message.id, "result": result}),
         )?;
-        self.route_result(&tx, message, result)?;
+        // `unknown` routes nothing — the outcome was never learned, so
+        // a result notification would be fabricated. The replier gets
+        // the operator's verdict later via `message reconcile`
+        // (completed/failed) or nothing (interrupted).
+        if status != "unknown" {
+            self.route_result(&tx, message, result)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -711,6 +717,103 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// Ids of the alias's `unknown` messages, oldest first — what
+    /// `agent unfence` reconciles in one call.
+    pub fn unknown_messages(&self, alias: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id FROM messages WHERE alias=? AND state='unknown' ORDER BY seq")?;
+        let ids = stmt
+            .query_map([alias], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
+    /// Operator reconcile — the only exit from `unknown` that keeps the
+    /// agent's history. No turn token: `unknown` means the submission
+    /// token is stale by definition, so this is an operator statement
+    /// ("I reviewed it; this is the terminal truth"), refused for every
+    /// other state with an error naming that state.
+    ///
+    /// One transaction: the message takes the chosen terminal state
+    /// with result `{status, via: "operator_reconcile", note}`; a
+    /// `reconciled` event records message id, status, note and the
+    /// caller. `completed`/`failed` route `reply_to` exactly like a
+    /// normal finish (deterministic delivery id — exactly once);
+    /// `interrupted` routes nothing — nothing was reported. When the
+    /// agent's last `unknown` reconciles, the fence lifts
+    /// `attention` → `stopped`; it is never auto-started.
+    pub fn reconcile(
+        &self,
+        message_id: &str,
+        status: &str,
+        note: Option<&str>,
+        by: &str,
+    ) -> Result<Message> {
+        if !matches!(status, "interrupted" | "completed" | "failed") {
+            return Err(Error::rejected(format!(
+                "reconcile status must be interrupted|completed|failed, not '{status}'"
+            )));
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let message = self
+            .message_in(&tx, message_id)?
+            .ok_or_else(|| Error::rejected(format!("No such message '{message_id}'")))?;
+        if message.state != "unknown" {
+            return Err(Error::rejected(format!(
+                "Message '{message_id}' is '{}', not unknown — only an unknown \
+                 message can be reconciled",
+                message.state
+            )));
+        }
+        let result = json!({
+            "status": status,
+            "via": "operator_reconcile",
+            "note": note,
+        });
+        // The state guard in the UPDATE is the atomic fence against a
+        // concurrent transition between the check and the write.
+        let n = tx.execute(
+            "UPDATE messages SET state=?,result=?,completed=? WHERE id=? AND state='unknown'",
+            params![status, result.to_string(), now(), message_id],
+        )?;
+        if n == 0 {
+            return Err(Error::rejected(format!(
+                "Message '{message_id}' left unknown state before the reconcile committed"
+            )));
+        }
+        Self::event(
+            &tx,
+            &message.alias,
+            "reconciled",
+            json!({"message": message_id, "status": status,
+                   "note": note, "by": by}),
+        )?;
+        if matches!(status, "completed" | "failed") {
+            self.route_result(&tx, &message, &result)?;
+        }
+        // The fence lifts when the last unknown reconciles — attention
+        // drops to stopped, never auto-started; `agent resume` is the
+        // operator's next move.
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE alias=? AND state='unknown'",
+            [&message.alias],
+            |r| r.get(0),
+        )?;
+        if remaining == 0 {
+            tx.execute(
+                "UPDATE agents SET state='stopped',updated=? \
+                 WHERE alias=? AND state='attention'",
+                params![now(), message.alias],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
+        self.message(message_id)?
+            .ok_or_else(|| Error::internal("reconciled message vanished"))
     }
 
     /// Conditional transition: `to` applies only while the agent is in
