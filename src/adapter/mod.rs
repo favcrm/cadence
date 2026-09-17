@@ -5,6 +5,7 @@
 //! `OutcomeUnknown` transport failures; the daemon preserves the latter for
 //! review rather than replaying potentially executed work.
 
+pub mod claude;
 pub mod codex;
 pub mod fake;
 pub mod link;
@@ -158,8 +159,9 @@ pub fn build(
     match agent.endpoint_kind.as_str() {
         "managed" => match agent.provider.as_str() {
             "codex" => Ok(Box::new(codex::CodexAdapter::new(hooks, log_path))),
+            "claude" => Ok(Box::new(claude::ClaudeAdapter::new(hooks, log_path))),
             other => Err(crate::error::Error::rejected(format!(
-                "No managed adapter for provider '{other}' (implemented: codex)"
+                "No managed adapter for provider '{other}' (implemented: codex, claude)"
             ))),
         },
         "managed-ws" => match agent.provider.as_str() {

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use super::link::Incoming;
-use super::stdio::StdioAdapter;
+use super::stdio::{EnvScrub, StdioAdapter};
 use super::ws::WsAdapter;
 use super::{AdapterHooks, Identity, ProviderAdapter, ProviderRequest, TurnResult};
 use crate::error::{Error, Result};
@@ -75,7 +75,7 @@ impl Transport {
     fn launch(&self, cwd: &str, log: &Path) -> Result<Launched> {
         match self {
             Transport::Stdio(adapter) => Ok(Launched {
-                pid: adapter.launch(cwd, log)?,
+                pid: adapter.launch(cwd, log, &[])?,
                 endpoint: None,
             }),
             Transport::Ws(adapter) => {
@@ -180,7 +180,7 @@ impl CodexAdapter {
         } else {
             Transport::Stdio(StdioAdapter::new(
                 command,
-                ENV_SCRUB,
+                EnvScrub::names(ENV_SCRUB),
                 Box::new(move |incoming| routed.dispatch(incoming)),
                 Box::new(move || disconnected.on_disconnect()),
             ))

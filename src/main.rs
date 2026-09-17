@@ -128,6 +128,63 @@ enum Commands {
         #[arg(long)]
         no_bootstrap: bool,
     },
+    /// Launch a Claude agent on a managed stream-json endpoint — one
+    /// long-lived headless `claude -p` process per agent; each durable
+    /// message is one turn on its stdin and the turn's `result` event
+    /// completes the message. No attachable surface: watch
+    /// `cadence events --follow` instead.
+    Claude {
+        /// Working directory for the session [default: current directory].
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Routing alias [default: claude-<random>].
+        #[arg(long)]
+        alias: Option<String>,
+        /// pm or worker.
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// Model flag passed to the CLI (e.g. sonnet, haiku).
+        #[arg(long)]
+        model: Option<String>,
+        /// Claude permission mode [default: manual]. Replayed on resume.
+        #[arg(long)]
+        permission_mode: Option<String>,
+        /// Extra auto-allowed tool patterns (`--allowedTools`);
+        /// repeatable. `Bash(cadence *)` is always included.
+        #[arg(long)]
+        allow: Vec<String>,
+        /// Shortcut for --permission-mode bypassPermissions.
+        #[arg(long, conflicts_with = "permission_mode")]
+        bypass: bool,
+        /// Seconds without any provider event before a turn is declared
+        /// unknown [default: 900]. Liveness is activity-based — a turn
+        /// that keeps emitting events runs as long as it needs.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn_idle_secs: Option<u64>,
+        /// Optional absolute turn cap in seconds — fences even a chatty
+        /// turn. Unset by default.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn_max_secs: Option<u64>,
+        /// File with reusable provider instructions.
+        #[arg(long)]
+        instructions_file: Option<PathBuf>,
+        /// Run the session in an isolated checkout:
+        /// `git worktree add <repo>/.cadence/wt/<name> -b cadence/<name>`
+        /// becomes the agent's cwd.
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Also enqueue the briefing as the agent's first durable
+        /// message (standalone launches get the file + AGENTS.md
+        /// silently by default).
+        #[arg(long, conflicts_with = "no_bootstrap")]
+        bootstrap: bool,
+        /// Skip the briefing file and AGENTS.md block entirely.
+        #[arg(long)]
+        no_bootstrap: bool,
+        /// Accepted for interface parity; managed endpoints never attach.
+        #[arg(long)]
+        detach: bool,
+    },
     /// Enqueue a durable message to an agent — the hot-path alias for
     /// `message send`. Returns once the message is durable; delivery and
     /// reporting continue asynchronously.
@@ -154,13 +211,13 @@ enum Commands {
     },
     /// Join a new worker agent to a group. `<group>` is the PM agent —
     /// its alias or provider-native id — and `<provider>` is devin,
-    /// codex or fake. The worker's results route back to the PM by
-    /// default (its params gain `"upstream"`). This terminal attaches
+    /// codex, claude or fake. The worker's results route back to the PM
+    /// by default (its params gain `"upstream"`). This terminal attaches
     /// once the endpoint is open, same rules as `cadence devin`.
     Join {
         /// Group handle — the PM agent's alias or native session id.
         group: String,
-        /// Worker provider: devin, codex or fake.
+        /// Worker provider: devin, codex, claude or fake.
         provider: String,
         /// Resume an existing native session as the worker (devin).
         #[arg(short = 'r', long)]
@@ -192,6 +249,26 @@ enum Commands {
         /// the daemon probes the pane and self-claims when visibly idle.
         #[arg(long)]
         auto_ready: bool,
+        /// Model flag for provider `claude` (e.g. sonnet, haiku).
+        #[arg(long)]
+        model: Option<String>,
+        /// Claude permission mode [default: manual]. Replayed on resume.
+        #[arg(long)]
+        permission_mode: Option<String>,
+        /// Extra auto-allowed tool patterns for provider `claude`;
+        /// repeatable. `Bash(cadence *)` is always included.
+        #[arg(long)]
+        allow: Vec<String>,
+        /// Claude shortcut for --permission-mode bypassPermissions.
+        #[arg(long, conflicts_with = "permission_mode")]
+        bypass: bool,
+        /// Seconds without any provider event before a claude turn is
+        /// declared unknown [default: 900].
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn_idle_secs: Option<u64>,
+        /// Optional absolute turn cap in seconds for provider `claude`.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn_max_secs: Option<u64>,
     },
     /// Attach this terminal to a live agent's native endpoint. `name`
     /// may be an alias, a provider-native id, or a provider name when
@@ -1296,6 +1373,7 @@ fn run() -> Result<i32> {
             worktree.as_deref(),
             BriefMode::standalone(no_bootstrap, bootstrap),
             auto_ready,
+            &ClaudeOpts::default(),
         ),
         Commands::Codex {
             detach,
@@ -1320,6 +1398,45 @@ fn run() -> Result<i32> {
             worktree.as_deref(),
             BriefMode::standalone(no_bootstrap, bootstrap),
             false,
+            &ClaudeOpts::default(),
+        ),
+        Commands::Claude {
+            cwd,
+            alias,
+            role,
+            model,
+            permission_mode,
+            allow,
+            bypass,
+            turn_idle_secs,
+            turn_max_secs,
+            instructions_file,
+            worktree,
+            bootstrap,
+            no_bootstrap,
+            detach,
+        } => provider_launch(
+            &state_dir,
+            "claude",
+            "managed",
+            cwd,
+            &role,
+            alias,
+            None,
+            instructions_file,
+            detach,
+            None,
+            worktree.as_deref(),
+            BriefMode::standalone(no_bootstrap, bootstrap),
+            false,
+            &ClaudeOpts {
+                model,
+                permission_mode,
+                allow,
+                bypass,
+                turn_idle_secs,
+                turn_max_secs,
+            },
         ),
         Commands::Join {
             group,
@@ -1333,6 +1450,12 @@ fn run() -> Result<i32> {
             worktree,
             no_bootstrap,
             auto_ready,
+            model,
+            permission_mode,
+            allow,
+            bypass,
+            turn_idle_secs,
+            turn_max_secs,
         } => join_group(
             &state_dir,
             &group,
@@ -1346,6 +1469,14 @@ fn run() -> Result<i32> {
             worktree,
             no_bootstrap,
             auto_ready,
+            ClaudeOpts {
+                model,
+                permission_mode,
+                allow,
+                bypass,
+                turn_idle_secs,
+                turn_max_secs,
+            },
         ),
         Commands::Attach { name, print } => attach_command(&state_dir, name, print),
         Commands::Resume { group, all, detach } => resume_command(&state_dir, group, all, detach),
@@ -1561,6 +1692,25 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
     let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
     let agent = &show["agent"];
     let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
+    let provider = agent["provider"].as_str().unwrap_or_default();
+    if kind == "managed" && provider == "claude" {
+        // A managed Claude endpoint is a headless stream-json process —
+        // there is no terminal surface to attach. The explanation is
+        // printed, never exec'd.
+        let thread = agent["thread_id"].as_str().unwrap_or_default();
+        print_json(&json!({
+            "alias": alias,
+            "endpoint_kind": kind,
+            "note": "managed claude is a headless stream-json process — \
+                     nothing to attach",
+            "observe": format!("cadence events --follow {alias}"),
+            "inspect": format!("cadence agent show {alias}"),
+            "manual": format!(
+                "to drive the session by hand: `cadence agent stop {alias}` \
+                 then `claude --resume {thread}` in its cwd"),
+        }));
+        return Ok(0);
+    }
     if !matches!(kind, "managed-ws" | "pty") {
         return Err(Error::rejected(format!(
             "Agent '{alias}' uses endpoint kind '{kind}' — nothing to \
@@ -1633,12 +1783,28 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// `cadence devin [-r slug]` / `cadence codex`: register the provider's
-/// native-terminal endpoint, wait for it to open, then attach this
-/// terminal by default. Re-running against an already-registered name
-/// resumes or reuses it. Once open, the agent answers to its alias and
-/// its provider-native id alike (e.g. `cadence agent show
-/// <devin-session-slug>`).
+/// Claude-specific launch options — stored under `params` so the
+/// adapter replays them verbatim on every resume (`--permission-mode`,
+/// `--allowedTools`, `--model`).
+#[derive(Default)]
+struct ClaudeOpts {
+    model: Option<String>,
+    permission_mode: Option<String>,
+    allow: Vec<String>,
+    bypass: bool,
+    /// `params.turn_idle_secs` — inactivity window before a turn is
+    /// `unknown` (activity-based liveness; default 900).
+    turn_idle_secs: Option<u64>,
+    /// `params.turn_max_secs` — optional absolute turn cap.
+    turn_max_secs: Option<u64>,
+}
+
+/// `cadence devin [-r slug]` / `cadence codex` / `cadence claude`:
+/// register the provider's endpoint, wait for it to open, then attach
+/// this terminal by default where the kind has an attachable surface.
+/// Re-running against an already-registered name resumes or reuses it.
+/// Once open, the agent answers to its alias and its provider-native id
+/// alike (e.g. `cadence agent show <devin-session-slug>`).
 #[allow(clippy::too_many_arguments)]
 fn provider_launch(
     state_dir: &Path,
@@ -1654,6 +1820,7 @@ fn provider_launch(
     worktree: Option<&str>,
     briefing: BriefMode,
     auto_ready: bool,
+    claude: &ClaudeOpts,
 ) -> Result<i32> {
     // `-r <slug>` first resolves the slug to an already-registered agent
     // (by alias or native session id) so re-running is a reopen, not a
@@ -1709,6 +1876,28 @@ fn provider_launch(
     }
     if let Some(upstream) = &upstream {
         params_obj.insert("upstream".to_string(), Value::String(upstream.clone()));
+    }
+    if provider == "claude" {
+        if let Some(model) = &claude.model {
+            params_obj.insert("model".to_string(), json!(model));
+        }
+        let permission_mode = if claude.bypass {
+            Some("bypassPermissions".to_string())
+        } else {
+            claude.permission_mode.clone()
+        };
+        if let Some(mode) = permission_mode {
+            params_obj.insert("permission_mode".to_string(), json!(mode));
+        }
+        if !claude.allow.is_empty() {
+            params_obj.insert("allowed_tools".to_string(), json!(claude.allow));
+        }
+        if let Some(secs) = claude.turn_idle_secs {
+            params_obj.insert("turn_idle_secs".to_string(), json!(secs));
+        }
+        if let Some(secs) = claude.turn_max_secs {
+            params_obj.insert("turn_max_secs".to_string(), json!(secs));
+        }
     }
     if auto_ready {
         params_obj.insert(
@@ -1835,14 +2024,16 @@ fn join_group(
     worktree: Option<String>,
     no_bootstrap: bool,
     auto_ready: bool,
+    claude_opts: ClaudeOpts,
 ) -> Result<i32> {
     let endpoint_kind = match provider {
         "devin" => "pty",
         "codex" => "managed-ws",
+        "claude" => "managed",
         "fake" => "fake",
         other => {
             return Err(Error::rejected(format!(
-                "Unknown provider '{other}' — expected devin, codex or fake"
+                "Unknown provider '{other}' — expected devin, codex, claude or fake"
             )))
         }
     };
@@ -1884,6 +2075,7 @@ fn join_group(
             BriefMode::FilesAndMessage
         },
         auto_ready,
+        &claude_opts,
     )
 }
 
@@ -2043,12 +2235,20 @@ fn brief_agent(state_dir: &Path, alias: &str, enqueue: bool) -> Result<PathBuf> 
         }
     }
     if enqueue {
+        // Managed claude turns complete the message themselves — the
+        // result text IS the report; there is no token flow.
+        let report_line = if agent["provider"].as_str() == Some("claude") {
+            "do the work, then finish — your turn's result text is the \
+             report; no `cadence message result` call is needed"
+        } else {
+            "do the work, then report: `cadence message result <id> \
+             --token <turn_id> --text '<summary>'`"
+        };
         let body = format!(
             "Cadence bootstrap: you are '{alias}', reporting to group root \
              '{root_alias}'. Your briefing is on disk at {} — read it. Run \
-             `cadence self` for this message's id and turn_id, do the work, \
-             then report: `cadence message result <id> --token <turn_id> \
-             --text '<summary>'`. List peers with `cadence agent list`.",
+             `cadence self` for this message's id and turn_id, {report_line}. \
+             List peers with `cadence agent list`.",
             file.display()
         );
         client::rpc(
@@ -2098,6 +2298,20 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // Managed claude messages arrive as stream-json turns; the turn's
+    // result text auto-completes the message — the token flow is for
+    // peers on other endpoints.
+    let reporting = if agent["provider"].as_str() == Some("claude") {
+        "- Each durable message arrives as one turn; your turn's final\n\
+         \x20 text IS the report — no `cadence message result` call is\n\
+         \x20 needed. Tool denials stay denials (they don't fail the\n\
+         \x20 turn); work around them and say so in your result.\n"
+    } else {
+        "- `cadence message result <id> --token <turn_id> --text '<summary>'`\n\
+         \x20 — complete the running task and report it.\n\
+         - `cadence message ack <id> --token <turn_id>` — acknowledge\n\
+         \x20 receipt without completing.\n"
+    };
     format!(
         "# Cadence briefing — {alias} in group {root}\n\n\
          You are `{alias}`, a cadence-managed agent (provider `{provider}`,\n\
@@ -2106,10 +2320,7 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
          ## Protocol\n\n\
          - `cadence self` — prints your alias, running message ids and\n\
          \x20 `turn_id` report tokens.\n\
-         - `cadence message result <id> --token <turn_id> --text '<summary>'`\n\
-         \x20 — complete the running task and report it.\n\
-         - `cadence message ack <id> --token <turn_id>` — acknowledge\n\
-         \x20 receipt without completing.\n\
+         {reporting}\
          - `cadence agent list` — your group (root marked `group_root`);\n\
          \x20 `--all` lists everyone. `cadence agent show <alias>` for one.\n\
          - `cadence message send <peer> --ready --text '<note>'` — reach a\n\
