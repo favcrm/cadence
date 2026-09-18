@@ -1,0 +1,687 @@
+//! A provider terminal UI driven through an owned tmux session,
+//! parameterised by a [`TuiProfile`].
+//!
+//! The daemon launches the provider's TUI inside a detached tmux
+//! session on a private socket (`cadence-<state-hash>`), so every pane
+//! it may kill is one it spawned. Native session ownership is *proven*,
+//! not assumed: how ownership is proven is the profile's business —
+//! [`TuiProfile::owned_session`]/[`TuiProfile::verify_ownership`] — and
+//! a session held by a foreign process is a refusal, never a takeover.
+//!
+//! Submission is gated, never blind: every `run_turn` re-verifies the
+//! pane is alive, unblocked (`pane_in_mode == 0`), still owns its
+//! native session, and consumes a readiness claim. Claims are
+//! single-use, time-boxed ([`READY_TTL`]) and stack FIFO — N claims
+//! release N queued sends, each attributed to its claimer for the audit
+//! record. Agents opted into `params.auto_ready = "verified"` let the
+//! daemon mint the claim itself after a screen probe
+//! ([`TuiProfile::analyze`]) proves the pane idle; a human `agent
+//! ready` still wins whenever both exist.
+//!
+//! Text is delivered literally through a tmux buffer (`load-buffer` +
+//! bracketed `paste-buffer -p` + `Enter`); no shell interpolation and no
+//! control characters — and a body whose first non-space character is
+//! in the profile's [`TuiProfile::forbidden_prefixes`] list is rejected
+//! `PreWrite` before any byte reaches the pane, because TUIs commonly
+//! treat a leading `/`/`!`-style character as a command or mode switch
+//! and a verbatim paste of one is an injection path. After Enter, a
+//! differential render check must see this paste's text newly on the
+//! visible screen *and* the input line empty again within
+//! [`RENDER_DEADLINE`] — a busy TUI drops a bracketed paste silently,
+//! so bytes-sent is not delivery evidence. A miss inside the bound is
+//! `NotRendered` — evidence, not proof, which is why the daemon parks
+//! exhausted informational deliveries and fences task messages as
+//! `unknown` rather than failing them.
+//!
+//! Terminal echo proves *rendering*, never model receipt. A pasted
+//! message stays `running` under its `pty-<generation>-<uuid>` token
+//! until an explicit `message ack` / `message result` report completes
+//! it; tokens from a previous endpoint generation are rejected. If the
+//! endpoint dies after a possible paste the outcome is `unknown` and
+//! the attempt is never replayed.
+//!
+//! Approval prompts are not brokered: `agent respond` is rejected for
+//! this endpoint — the profile supplies the message naming the
+//! provider's prompt.
+
+pub mod devin;
+pub mod profile;
+pub mod stub;
+
+pub use devin::{analyze_devin, DevinProfile};
+pub use profile::TuiProfile;
+pub use stub::StubProfile;
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+use uuid::Uuid;
+
+use crate::error::{Error, Result};
+use crate::store::Agent;
+
+use super::{AdapterHooks, Identity, Probe, ProviderAdapter, TurnResult};
+
+/// How long an operator readiness claim stays valid for one send.
+const READY_TTL: Duration = Duration::from_secs(60);
+/// Pause between bracketed paste and Enter so the TUI consumes it.
+const PASTE_SETTLE: Duration = Duration::from_millis(300);
+/// Bounded post-paste wait for the body to render in the transcript.
+/// A miss inside the bound is *evidence* of a dropped paste, not proof
+/// — a saturated host renders late — which is why a task message lands
+/// `unknown` (uncertainty discipline) rather than `failed`.
+const RENDER_DEADLINE: Duration = Duration::from_secs(4);
+/// Slice of the pasted body used for the differential render check.
+/// The tail is what stays visible: a long input scrolls horizontally
+/// to the cursor, and a wrapped transcript ends with it.
+const PROBE_SLICE: usize = 64;
+/// Stacked operator claims retained for the queue (oldest dropped past
+/// this); each claim releases exactly one gated message.
+const CLAIM_CAPACITY: usize = 16;
+const BUFFER: &str = "cadence-msg";
+
+/// One operator readiness claim: single-use, time-boxed, attributed to
+/// the claimer when known (the pane's `CADENCE_ALIAS` is passed through
+/// `agent ready`). Claims stack FIFO — N claims release N sends.
+struct Claim {
+    at: Instant,
+    by: Option<String>,
+}
+
+struct PtyState {
+    /// tmux session name (the agent alias).
+    session: String,
+    /// Native TUI session id, learned at open.
+    native_session: String,
+    /// Pane pid verified against the profile's ownership proof.
+    pane_pid: u32,
+    /// Endpoint generation minted per `open`; embedded in tokens.
+    generation: String,
+    /// Single-use operator readiness claims, oldest first.
+    claims: std::collections::VecDeque<Claim>,
+}
+
+/// The generic adapter: tmux mechanics, readiness claims and the
+/// differential render check, with every provider-specific fact behind
+/// `profile`.
+pub struct PtyAdapter {
+    hooks: AdapterHooks,
+    state: Mutex<PtyState>,
+    socket: String,
+    /// `tmux` binary (env-overridable for tests).
+    tmux: String,
+    desired_session: Option<String>,
+    cwd: String,
+    /// Cadence state dir, exported into the pane for `cadence self`.
+    state_dir: PathBuf,
+    /// `params.auto_ready == "verified"`: the daemon probes the pane
+    /// itself instead of requiring a human `agent ready` claim.
+    /// Mutable — `agent set` refreshes it on the live adapter.
+    auto_ready: AtomicBool,
+    /// The provider TUI this pane runs.
+    profile: Box<dyn TuiProfile>,
+}
+
+fn short_hash(text: &str) -> String {
+    // FNV-1a — deterministic, private socket per state dir.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+pub(crate) fn shlex_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Strip all whitespace so a body wrapped/indented by the TUI still
+/// matches its source text contiguously.
+fn normalize_screen(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The last `n` characters of `text` (by char, not byte).
+fn tail_chars(text: &str, n: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    chars.iter().skip(chars.len().saturating_sub(n)).collect()
+}
+
+pub(crate) fn resolve_on_path(bin: &str) -> Result<String> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':') {
+        let candidate = Path::new(dir).join(bin);
+        if candidate.is_file() {
+            return Ok(candidate.to_string_lossy().into_owned());
+        }
+    }
+    Err(Error::rejected(format!("`{bin}` not found on PATH")))
+}
+
+/// Is `pid` the pane process or one of its descendants?
+pub(crate) fn descends_from(mut pid: u32, pane_pid: u32) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    while pid != 0 && seen.insert(pid) {
+        if pid == pane_pid {
+            return true;
+        }
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return false;
+        };
+        pid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+    }
+    false
+}
+
+/// Every `/proc` pid holding an open fd to `lock`.
+pub(crate) fn lock_holders(lock: &Path) -> Vec<u32> {
+    let target = lock.to_string_lossy().into_owned();
+    let mut holders = Vec::new();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return holders;
+    };
+    for proc in procs.flatten() {
+        let Ok(pid) = proc.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(proc.path().join("fd")) else {
+            continue;
+        };
+        let holds = fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path())
+                .map(|l| l.to_string_lossy() == target)
+                .unwrap_or(false)
+        });
+        if holds {
+            holders.push(pid);
+        }
+    }
+    holders
+}
+
+impl PtyAdapter {
+    pub fn new(
+        hooks: AdapterHooks,
+        log_path: &Path,
+        agent: &Agent,
+        profile: impl TuiProfile + 'static,
+    ) -> Result<Self> {
+        let state_dir = log_path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let desired_session = agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("session"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| agent.thread_id.clone());
+        Ok(Self {
+            hooks,
+            state: Mutex::new(PtyState {
+                session: agent.alias.clone(),
+                native_session: String::new(),
+                pane_pid: 0,
+                generation: String::new(),
+                claims: std::collections::VecDeque::new(),
+            }),
+            socket: format!("cadence-{}", short_hash(&state_dir.to_string_lossy())),
+            tmux: std::env::var("CADENCE_TMUX_COMMAND")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "tmux".to_string()),
+            desired_session,
+            cwd: agent.cwd.clone(),
+            state_dir,
+            auto_ready: AtomicBool::new(
+                agent
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("auto_ready"))
+                    .and_then(|v| v.as_str())
+                    == Some("verified"),
+            ),
+            profile: Box::new(profile),
+        })
+    }
+
+    fn tmux(&self, args: &[&str]) -> Result<std::process::Output> {
+        Ok(Command::new(&self.tmux)
+            .arg("-L")
+            .arg(&self.socket)
+            .args(args)
+            .output()?)
+    }
+
+    fn tmux_ok(&self, args: &[&str]) -> Result<String> {
+        let out = self.tmux(args)?;
+        if !out.status.success() {
+            return Err(Error::provider(format!(
+                "tmux {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn has_session(&self, session: &str) -> bool {
+        self.tmux(&["has-session", "-t", session])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn pane_value(&self, session: &str, format: &str) -> Result<String> {
+        self.tmux_ok(&["display-message", "-p", "-t", session, format])
+    }
+
+    fn pane_pid(&self, session: &str) -> Result<u32> {
+        self.pane_value(session, "#{pane_pid}")?
+            .parse()
+            .map_err(|_| Error::internal("tmux returned a non-numeric pane_pid"))
+    }
+
+    fn session(&self) -> String {
+        self.state.lock().unwrap().session.clone()
+    }
+
+    fn session_and_native(&self) -> (String, String) {
+        let s = self.state.lock().unwrap();
+        (s.session.clone(), s.native_session.clone())
+    }
+
+    /// Verify the pane currently owns its native session — the proof
+    /// itself is the profile's.
+    fn verify_ownership(&self, session: &str, native: &str) -> Result<u32> {
+        let pane_pid = self.pane_pid(session)?;
+        self.profile.verify_ownership(native, pane_pid)?;
+        Ok(pane_pid)
+    }
+
+    /// Gate evaluation before any paste: the pane must be live, not in a
+    /// tmux mode, and still the session owner — else the endpoint is
+    /// dead. Then readiness: a fresh unconsumed operator claim always
+    /// wins; without one, `auto_ready=verified` agents get a daemon-run
+    /// screen probe (idle pane → self-claim, recorded as a
+    /// `ready_claimed` event by `"daemon"`); anything else requeues for
+    /// a retry.
+    fn check_gate(&self, message_id: &str) -> Result<()> {
+        let (session, native) = self.session_and_native();
+        if !self.has_session(&session) {
+            return Err(Error::provider("tmux session is gone"));
+        }
+        if self.pane_value(&session, "#{pane_dead}")? == "1" {
+            return Err(Error::provider("pane process has exited"));
+        }
+        self.verify_ownership(&session, &native)?;
+        if self.pane_value(&session, "#{pane_in_mode}")? != "0" {
+            return Err(Error::gate("pane is in a tmux mode (copy/view)"));
+        }
+        let claimed = {
+            // Claims stack FIFO: drop expired heads, consume the oldest
+            // fresh one — one paste per claim, always.
+            let mut state = self.state.lock().unwrap();
+            while let Some(front) = state.claims.front() {
+                if front.at.elapsed() > READY_TTL {
+                    state.claims.pop_front();
+                } else {
+                    break;
+                }
+            }
+            state.claims.pop_front()
+        };
+        if let Some(claim) = claimed {
+            // Which claim released this send is audit-relevant (G5):
+            // the claimer is recorded at consumption, not just claim.
+            (self.hooks.on_event)(
+                "cadence/claim_used",
+                serde_json::json!({
+                    "message": message_id,
+                    "by": claim.by.unwrap_or_else(|| "operator".to_string()),
+                }),
+            );
+            return Ok(());
+        }
+        if !self.auto_ready.load(AtomicOrdering::SeqCst) {
+            return Err(Error::gate(
+                "no fresh `agent ready` claim — an operator must verify the \
+                 terminal is idle with an empty input before submission",
+            ));
+        }
+        let probe = self.probe()?;
+        if probe.idle {
+            (self.hooks.on_event)(
+                "cadence/ready_claimed",
+                serde_json::json!({"by": "daemon", "probe": probe.to_json()}),
+            );
+            return Ok(());
+        }
+        Err(Error::gate(format!("tui not idle: {}", probe.reason)))
+    }
+
+    /// Visible screen only (no scrollback) — what the TUI shows now.
+    fn capture_visible(&self) -> Result<String> {
+        let session = self.session();
+        self.tmux_ok(&["capture-pane", "-p", "-t", &session])
+    }
+}
+
+impl ProviderAdapter for PtyAdapter {
+    fn open(&self, _agent: &Agent) -> Result<Identity> {
+        let (session, desired) = {
+            let s = self.state.lock().unwrap();
+            (s.session.clone(), self.desired_session.clone())
+        };
+        let generation = Uuid::new_v4().simple().to_string();
+
+        let (native, pane_pid) = if self.has_session(&session) {
+            // Reattach: verify the pane still owns a native session.
+            // When one was recorded it must match; a pane left by a
+            // crashed first open (nothing recorded yet) is adopted by
+            // discovering which session it owns.
+            let pane_pid = self.pane_pid(&session)?;
+            let found = self.profile.owned_session(pane_pid);
+            (
+                self.profile.resolve_session(desired.as_deref(), found)?,
+                pane_pid,
+            )
+        } else {
+            // Refuse takeover: a session owned outside our (future)
+            // pane means another TUI already owns it.
+            if let Some(want) = &desired {
+                self.profile.refuse_takeover(want)?;
+            }
+            let argv = self.profile.launch_command(desired.as_deref())?;
+            // Keep a dead pane visible briefly instead of dropping to a
+            // bare shell that would accept input meant for the TUI.
+            let command = format!(
+                "{argv}; printf '\\n{}\\n'; sleep 3",
+                self.profile.exit_banner()
+            );
+            // Pane env identifies the agent to `cadence self`; -e args
+            // are tmux options, never shell-interpreted.
+            let env_alias = format!("CADENCE_ALIAS={session}");
+            let env_dir = format!("CADENCE_STATE_DIR={}", self.state_dir.display());
+            self.tmux_ok(&[
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-c",
+                &self.cwd,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                "-e",
+                &env_alias,
+                "-e",
+                &env_dir,
+                &command,
+            ])?;
+            let pane_pid = self.pane_pid(&session)?;
+            // Bound the wait for the TUI to acquire its native session.
+            let deadline = Instant::now() + self.profile.open_deadline();
+            let native = loop {
+                if !self.has_session(&session) {
+                    return Err(Error::provider("pane exited during TUI startup"));
+                }
+                if let Some(found) = self.profile.owned_session(pane_pid) {
+                    break self
+                        .profile
+                        .resolve_session(desired.as_deref(), Some(found))?;
+                }
+                if Instant::now() >= deadline {
+                    return Err(Error::provider(format!(
+                        "timed out waiting for the {} TUI to acquire its session",
+                        self.profile.name()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            (native, pane_pid)
+        };
+
+        // Pane defaults for cadence-owned sessions, scoped to this
+        // private tmux server — `-g`/`-gw` here never touch the user's
+        // own tmux. Best effort: a cosmetic failure must not fence a
+        // working endpoint.
+        let _ = self.tmux_ok(&["set-option", "-g", "mouse", "on"]);
+        let _ = self.tmux_ok(&["set-option", "-g", "set-clipboard", "on"]);
+        let _ = self.tmux_ok(&["set-option", "-g", "status-left-length", "40"]);
+        let _ = self.tmux_ok(&["set-option", "-gw", "pane-border-status", "top"]);
+        let _ = self.tmux_ok(&[
+            "set-option",
+            "-gw",
+            "pane-border-format",
+            " #{session_name} ",
+        ]);
+
+        let endpoint = format!("tmux://{}/{session}", self.socket);
+        {
+            let mut s = self.state.lock().unwrap();
+            s.native_session = native.clone();
+            s.pane_pid = pane_pid;
+            s.generation = generation.clone();
+            s.claims.clear(); // a new endpoint can never inherit claims
+        }
+        Ok(Identity {
+            thread_id: native.clone(),
+            session_id: native,
+            model: None,
+            pid: pane_pid,
+            endpoint: Some(endpoint),
+            generation: Some(generation),
+        })
+    }
+
+    fn run_turn(
+        &self,
+        prompt: &str,
+        client_message_id: &str,
+        on_started: &dyn Fn(&str),
+    ) -> Result<TurnResult> {
+        // Literal-only content: pasted verbatim, so reject anything the
+        // TUI could interpret as keys. These are `pre_write` rejections —
+        // provably no bytes reached the pane, so the message fails
+        // without fencing the endpoint.
+        if prompt.is_empty() || prompt.len() > 4000 {
+            return Err(Error::pre_write("PTY messages must be 1–4000 characters"));
+        }
+        if prompt.chars().any(|c| (c as u32) < 32 || c as u32 == 127) {
+            return Err(Error::pre_write(
+                "PTY messages must be a single line without control characters",
+            ));
+        }
+        // Forbidden input prefixes: a leading character the TUI treats
+        // as a command or mode switch (its own menu, a shell escape)
+        // makes a verbatim paste an injection path — reject before any
+        // byte reaches the pane and before the gate consumes a claim.
+        if let Some(prefix) = prompt.trim_start().chars().next() {
+            if self.profile.forbidden_prefixes().contains(&prefix) {
+                return Err(Error::pre_write(format!(
+                    "message body starts with '{prefix}', which {} treats \
+                     as a command or mode switch — refusing to paste it \
+                     into the terminal",
+                    self.profile.name()
+                )));
+            }
+        }
+        self.check_gate(client_message_id)?;
+
+        let token = {
+            let s = self.state.lock().unwrap();
+            format!("pty-{}-{}", s.generation, Uuid::new_v4().simple())
+        };
+        let session = self.session();
+
+        // The render check is *differential*: "this paste added text",
+        // not "the text is somewhere on screen". Capture before the
+        // paste so an identical earlier body (a repeated routed
+        // notification, a re-sent task) cannot pass for this one.
+        let before = self.capture_visible()?;
+        // The probe slice is the body's normalized tail — the end is
+        // what stays visible on a horizontally-scrolled input line and
+        // what a wrapped transcript renders last. Whitespace is stripped
+        // on both sides so TUI line wrapping/indentation cannot hide a
+        // match. For routed `worker_result` bodies the tail covers the
+        // unique worker turn_id; for repeated plain text the
+        // occurrence-count delta is still differential.
+        let slice = normalize_screen(&tail_chars(prompt, PROBE_SLICE));
+        let before_count = normalize_screen(&before).matches(&slice).count();
+
+        // Literal delivery: content travels in a tmux buffer file, never
+        // through argv or a shell — quoting cannot corrupt or inject it.
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        tmp.write_all(prompt.as_bytes())?;
+        tmp.flush()?;
+        let path = tmp.path().to_string_lossy().into_owned();
+        self.tmux_ok(&["load-buffer", "-b", BUFFER, &path])?;
+        if self
+            .tmux(&["paste-buffer", "-d", "-p", "-b", BUFFER, "-t", &session])?
+            .status
+            .success()
+        {
+            std::thread::sleep(PASTE_SETTLE);
+            // Enter is what may commit the turn — a failure after the
+            // paste is ambiguous: the text could already be submitted.
+            self.tmux_ok(&["send-keys", "-t", &session, "Enter"])
+                .map_err(|e| Error::unknown(format!("post-paste submit failed: {e}")))?;
+        } else {
+            return Err(Error::unknown(
+                "paste-buffer failed after content reached the terminal path",
+            ));
+        }
+        drop(tmp);
+
+        // Post-paste verification, bounded by RENDER_DEADLINE: the
+        // slice's occurrence count must increase AND the input line must
+        // be empty again — text rendered but still sitting in the input
+        // means Enter never submitted (a staged draft is not a turn).
+        // A miss inside the bound is evidence of a dropped paste, never
+        // proof; the daemon decides per message kind what a miss means.
+        let deadline = Instant::now() + RENDER_DEADLINE;
+        let mut rendered = false;
+        loop {
+            let screen = self.capture_visible()?;
+            if normalize_screen(&screen).matches(&slice).count() > before_count {
+                rendered = true;
+                if !self.profile.analyze(&screen).input_nonempty {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::not_rendered(if rendered {
+                    "paste rendered in the input line but was never submitted — \
+                     Enter not observed; the draft is left untouched"
+                } else {
+                    "pasted text never rendered in the pane — the TUI dropped it"
+                }));
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+
+        on_started(&token);
+        Ok(TurnResult {
+            turn_id: token,
+            status: "submitted".to_string(),
+            text: String::new(),
+            stop_reason: None,
+            error: None,
+        })
+    }
+
+    fn respond(&self, _request_id: &Value, _result: Value) -> Result<()> {
+        Err(Error::rejected(self.profile.respond_rejection()))
+    }
+
+    fn interrupt(&self) {
+        let session = self.session();
+        let _ = self.tmux(&["send-keys", "-t", &session, "C-c"]);
+    }
+
+    fn disconnected(&self) -> bool {
+        let (session, native) = self.session_and_native();
+        if !self.has_session(&session) {
+            return true;
+        }
+        let dead = self
+            .pane_value(&session, "#{pane_dead}")
+            .map(|v| v == "1")
+            .unwrap_or(true);
+        // A live pane that lost its native session is not our endpoint.
+        dead || self.verify_ownership(&session, &native).is_err()
+    }
+
+    fn close(&self) {
+        let session = self.session();
+        // Only ever kills a session on our own private socket — one we
+        // launched. Foreign panes are never registered as killable.
+        let _ = self.tmux(&["kill-session", "-t", &session]);
+    }
+
+    /// Daemon shutdown must not kill the visible pane: the TUI belongs
+    /// to the operator's screen and survives for reattach on restart.
+    fn detach(&self) {}
+
+    fn claim_ready(&self, by: Option<String>) -> Result<()> {
+        let (session, native) = self.session_and_native();
+        if !self.has_session(&session) {
+            return Err(Error::provider("cannot claim readiness: pane is gone"));
+        }
+        self.verify_ownership(&session, &native)?;
+        let mut state = self.state.lock().unwrap();
+        if state.claims.len() >= CLAIM_CAPACITY {
+            state.claims.pop_front();
+        }
+        state.claims.push_back(Claim {
+            at: Instant::now(),
+            by,
+        });
+        Ok(())
+    }
+
+    fn capture(&self) -> Result<String> {
+        let session = self.session();
+        self.tmux_ok(&["capture-pane", "-p", "-t", &session, "-S", "-120"])
+    }
+
+    fn probe(&self) -> Result<Probe> {
+        Ok(self.profile.analyze(&self.capture_visible()?))
+    }
+
+    fn update_params(&self, params: &Value) {
+        self.auto_ready.store(
+            params.get("auto_ready").and_then(|v| v.as_str()) == Some("verified"),
+            AtomicOrdering::SeqCst,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_screen, tail_chars};
+
+    #[test]
+    fn normalize_and_tail_helpers() {
+        assert_eq!(normalize_screen("a b\n  c"), "abc");
+        assert_eq!(tail_chars("abcdef", 3), "def");
+        assert_eq!(tail_chars("ab", 9), "ab");
+        // A wrapped body still matches its own tail slice.
+        let body = "alpha beta gamma delta omega";
+        let rendered = "alpha beta\n    gamma delta\n    omega";
+        let slice = normalize_screen(&tail_chars(body, 12));
+        assert!(normalize_screen(rendered).contains(&slice));
+    }
+}

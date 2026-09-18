@@ -1,0 +1,70 @@
+//! The per-TUI contract behind [`super::PtyAdapter`].
+//!
+//! A profile carries every provider-specific fact the generic owned-pane
+//! mechanics need — launch argv, session-ownership proof, screen
+//! analysis, message wording, and input hazards — and nothing more. The
+//! bar for a method is "a second TUI would answer it differently"; a
+//! behaviour with only one sensible implementation belongs in the
+//! generic adapter, not here. Plain data is preferred over callbacks
+//! wherever data is enough.
+
+use std::time::Duration;
+
+use crate::adapter::Probe;
+use crate::error::Result;
+
+/// One provider terminal UI, for a generic owned tmux pane.
+pub trait TuiProfile: Send + Sync {
+    /// Display name interpolated into operator-facing messages
+    /// ("Devin").
+    fn name(&self) -> &'static str;
+
+    /// Shell command the pane runs: a fresh launch, or a resume of the
+    /// native `session` — the resume flag's shape is the profile's own
+    /// (Devin: `-r <session>`).
+    fn launch_command(&self, resume: Option<&str>) -> Result<String>;
+
+    /// Notice the pane shell prints when the TUI exits — keeps a dead
+    /// pane visible briefly instead of dropping to a bare shell that
+    /// would accept input meant for the TUI.
+    fn exit_banner(&self) -> &'static str;
+
+    /// The native session a pane currently owns, discovered from the
+    /// pane's process id. The mechanism is the profile's own (Devin:
+    /// the session-lock flock held by a pane descendant).
+    fn owned_session(&self, pane_pid: u32) -> Option<String>;
+
+    /// Session resolution at open: given the session the agent wants
+    /// (`desired`) and the one the pane actually owns (`found`), return
+    /// the native session to adopt or refuse. Also validates a session
+    /// acquired during a fresh launch's open wait — a mismatch there is
+    /// the same "wrong session" refusal, never an adoption.
+    fn resolve_session(&self, desired: Option<&str>, found: Option<String>) -> Result<String>;
+
+    /// Pre-launch refusal: reject when `session` is already owned
+    /// outside our (future) pane — Cadence never takes over a foreign
+    /// terminal. Profiles that cannot prove foreign ownership return
+    /// `Ok(())`.
+    fn refuse_takeover(&self, session: &str) -> Result<()>;
+
+    /// Gate check: prove the pane still owns `native`. The error text
+    /// is the profile's — the proof mechanism is its own.
+    fn verify_ownership(&self, native: &str, pane_pid: u32) -> Result<()>;
+
+    /// Bound on the TUI acquiring its native session after launch.
+    fn open_deadline(&self) -> Duration;
+
+    /// Reduce a captured screen to gate facts for this TUI.
+    fn analyze(&self, screen: &str) -> Probe;
+
+    /// `agent respond` rejection text — approvals are answered in the
+    /// terminal itself; the message names the provider's prompt.
+    fn respond_rejection(&self) -> &'static str;
+
+    /// First non-space characters that must never be pasted verbatim.
+    /// Terminal UIs commonly treat a leading `/` or `!` as a command or
+    /// mode switch, so a literal paste of such a body is an injection
+    /// path — the adapter rejects it `PreWrite` before any byte reaches
+    /// the pane. An empty list asserts the TUI has no such hazard.
+    fn forbidden_prefixes(&self) -> &'static [char];
+}
