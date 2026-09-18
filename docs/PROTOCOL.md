@@ -45,7 +45,7 @@ Error kinds:
 | `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
 | `agent_respond` | `alias, request, decision?|answers?` | `{state:"answered"}` |
-| `agent_ready` | `alias, by?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; `by` records the claimer |
+| `agent_ready` | `alias, by?, force?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; probes the pane first and refuses a visibly busy one unless `force`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
 | `agent_set` | `alias, patch` | merges an allowlisted param into the live agent — today only `auto_ready` (`"verified"` or null-removal, pty only); `{state:"updated"}` |
@@ -337,10 +337,15 @@ input when the cursor has moved (an unreadable cursor treats it as
 real text — conservative).
 `agent probe <alias>`
 runs the same analyzer on demand (`{idle, reason, prompt_visible,
-input_nonempty, busy_marker, approval_menu}`) without claiming. A
-refused send returns the message to `queued` (event `gate_wait`) and
-retries; it is never pasted blind and never dropped. Message text is a
-single line of 1–4000 chars with no control characters, delivered
+input_nonempty, busy_marker, approval_menu}`) without claiming. An
+operator claim is not blind either: `agent ready` runs the same probe
+first and refuses with the reason when the pane is visibly busy —
+`agent ready --force` (or `send --ready --force`) claims anyway, and
+the `ready_claimed` event records `"forced": true` alongside the probe
+verdict it overrode. A refused send returns the message to `queued`
+(event `gate_wait`) and retries; it is never pasted blind and never
+dropped. Message text is a single line of 1–4000 chars with no
+control characters, delivered
 literally via `load-buffer` + `paste-buffer -p` + `Enter` — no shell
 interpretation. A body whose first non-space character is in the
 profile's forbidden-prefix list is rejected `PreWrite` *before* the
@@ -365,6 +370,9 @@ not submitted: the input line must also be empty again after `Enter` —
 a staged draft left in the input means the keystroke was swallowed.
 Missing the deadline is `NotRendered` — *evidence* of a dropped or
 unsubmitted paste, not proof, since a saturated host can render late.
+The `paste_not_rendered` event carries that evidence: the normalized
+screen tail before the paste and the tail after the deadline (12 rows
+each), plus the probe verdict that admitted the send.
 On that evidence a routed `worker_result` notification is requeued
 (bounded, then the delivery is `failed` with `via=pty_render_miss` and
 a `delivery_parked` event — a notification must never fence the
@@ -389,17 +397,23 @@ A pane that dies after a possible paste leaves submitted messages
 `unknown` (fence, never replay); a pane that dies before the paste
 fails the message. `agent_respond` is `rejected` for pty — provider
 permission prompts are answered in the terminal, and a visible prompt
-is one of the things the ready claim asserts absent. `agent_stop`
-kills the owned pane; daemon shutdown detaches instead, so a restart
-reattaches rather than destroying a terminal the operator may be using.
+is one of the things the ready claim asserts absent. A fence — like
+daemon shutdown — *detaches* the pane rather than killing it: the TUI
+stays alive for inspection (`agent capture` reads its screen), and
+after `agent unfence` reconciles the unknowns, `agent resume` re-adopts
+the same pane and native session. The kill is reserved for explicit
+verbs: `agent_stop` kills the owned pane (a live one through its actor,
+a fenced survivor directly), and `agent_remove`/`agent_gc` kill any
+surviving pane before dropping the row — no orphan sessions on the
+private socket.
 
 **Worker-side conveniences.** The pane is spawned with
 `CADENCE_ALIAS` and `CADENCE_STATE_DIR` in its environment (`tmux
 new-session -e`), so a worker inside it can run `cadence self` to get
 `{alias, running: [{id, turn_id}]}` — its report token without asking
 the operator. `message send --ready` fuses the operator claim with the
-send: the flag *is* the explicit claim (idle, empty input, no prompt —
-verified by the human typing it), applied only on pty endpoints and
+send: the flag runs the same idle probe as `agent ready` (a busy pane
+refuses; `--force` overrides), applied only on pty endpoints and
 skipped silently elsewhere. A `worker_result` routed *to* a pty PM is
 fire-and-forget: once the paste succeeds the delivery completes with
 `{"status":"completed","via":"pty_deliver"}` — the PM is not expected

@@ -5498,6 +5498,191 @@ fn pty_unrendered_task_fences_unknown() {
     assert_eq!(e["payload"]["retry"], false, "{e}");
 }
 
+/// A fence detaches the pane — never kills it. The surviving pane
+/// stays inspectable and `agent resume` re-adopts it after the
+/// operator reconciles: same pid, same native session.
+#[test]
+fn pty_fence_detaches_pane_for_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let native = agent["thread_id"].as_str().unwrap().to_string();
+    let pidfile = d.pane_file(&mock, "dv1", "pid");
+    let pane_pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The pane drops the paste entirely: unrendered → fence.
+    std::fs::write(d.pane_file(&mock, "dv1", "swallow"), "1").unwrap();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m1", &["unknown"], 20);
+    d.wait_agent("dv1", "attention", 15);
+    // The fence detached — the pane process and its pid file are
+    // unchanged, and the screen is still there to inspect.
+    assert_eq!(
+        unsafe { libc::kill(pane_pid, 0) },
+        0,
+        "fence killed the pane"
+    );
+    let pid_now: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(pid_now, pane_pid);
+    // Reconcile, then resume: the surviving pane is re-adopted.
+    d.rpc(
+        "agent_unfence",
+        json!({"alias": "dv1", "status": "interrupted"}),
+    )
+    .unwrap();
+    d.wait_agent("dv1", "stopped", 10);
+    std::fs::remove_file(d.pane_file(&mock, "dv1", "swallow")).unwrap();
+    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let pid_after: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(pid_after, pane_pid, "pane was not re-adopted");
+    assert_eq!(agent["thread_id"].as_str().unwrap(), native);
+    // New work flows over the adopted pane.
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "again", "message": "m2"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m2", &["running"], 20);
+}
+
+/// Explicit lifecycle verbs own the kill: `agent stop`, `agent remove`,
+/// and `agent gc` each kill a fenced agent's surviving pane — the row
+/// never drops leaving an orphan session on the private socket.
+#[test]
+fn pty_stop_remove_gc_kill_surviving_panes() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    for alias in ["dv-stop", "dv-rm", "dv-gc"] {
+        d.register_devin(alias, None);
+        d.wait_agent(alias, "idle", 20);
+    }
+    // Fence all three: each pane survives its fence for inspection.
+    for alias in ["dv-stop", "dv-rm", "dv-gc"] {
+        std::fs::write(d.pane_file(&mock, alias, "swallow"), "1").unwrap();
+        d.rpc("agent_ready", json!({"alias": alias})).unwrap();
+        d.rpc(
+            "agent_send",
+            json!({"alias": alias, "text": "task",
+                   "message": format!("m-{alias}")}),
+        )
+        .unwrap();
+    }
+    for alias in ["dv-stop", "dv-rm", "dv-gc"] {
+        d.wait_agent(alias, "attention", 25);
+    }
+    // `agent stop` on a fenced agent is the explicit kill.
+    d.rpc("agent_stop", json!({"alias": "dv-stop"})).unwrap();
+    wait_pid_gone(&d.pane_file(&mock, "dv-stop", "pid"), 10);
+    // `agent remove` kills the pane before dropping the row.
+    d.rpc("agent_remove", json!({"alias": "dv-rm"})).unwrap();
+    wait_pid_gone(&d.pane_file(&mock, "dv-rm", "pid"), 10);
+    assert!(d.rpc("agent_show", json!({"alias": "dv-rm"})).is_err());
+    // `agent gc` kills the dead agent's pane before dropping the row.
+    let swept = d.rpc("agent_gc", json!({})).unwrap();
+    assert!(
+        swept["removed"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("dv-gc")),
+        "{swept}"
+    );
+    wait_pid_gone(&d.pane_file(&mock, "dv-gc", "pid"), 10);
+    assert!(d.rpc("agent_show", json!({"alias": "dv-gc"})).is_err());
+}
+
+/// `agent ready` runs the same probe verified auto-ready runs: a
+/// visibly busy pane refuses with the probe's reason. `--force`
+/// claims anyway and the event records the override; an idle pane
+/// claims as before.
+#[test]
+fn pty_ready_claim_refuses_busy_pane_unless_forced() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    d.register_stub("st", json!({}));
+    d.wait_agent("st", "idle", 20);
+    // The stub's own busy marker on screen — the claim must refuse.
+    std::fs::write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n").unwrap();
+    let err = d.rpc("agent_ready", json!({"alias": "st"})).unwrap_err();
+    assert!(err.to_string().contains("busy"), "{err}");
+    // `--force` claims anyway; the busy verdict still rides the event.
+    d.rpc("agent_ready", json!({"alias": "st", "force": true}))
+        .unwrap();
+    let e = d.wait_event("st", "ready_claimed", 10);
+    assert_eq!(e["payload"]["forced"], true, "{e}");
+    assert_eq!(e["payload"]["probe"]["busy_marker"], true, "{e}");
+    // Idle again: a plain claim lands and is not marked forced.
+    std::fs::remove_file(d.stub_pane_file(&mock, "st", "tui-state")).unwrap();
+    d.rpc("agent_ready", json!({"alias": "st"})).unwrap();
+    let claims: Vec<Value> = d
+        .events("st")
+        .into_iter()
+        .filter(|e| e["kind"].as_str() == Some("ready_claimed"))
+        .collect();
+    let last = claims.last().unwrap();
+    assert!(last["payload"]["forced"].is_null(), "{last}");
+    assert_eq!(last["payload"]["probe"]["idle"], true, "{last}");
+}
+
+/// An unrendered paste preserves its evidence: the normalized screen
+/// tail before the paste, the tail after the render deadline, and the
+/// probe verdict that admitted the send.
+#[test]
+fn pty_paste_not_rendered_carries_screen_evidence() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    d.register_stub("st", json!({"auto_ready": "verified"}));
+    d.wait_agent("st", "idle", 20);
+    std::fs::write(d.stub_pane_file(&mock, "st", "swallow"), "1").unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "gone", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("st", "m1", &["unknown"], 20);
+    let e = d.wait_event("st", "paste_not_rendered", 10);
+    assert_eq!(e["payload"]["message"], "m1", "{e}");
+    assert!(
+        e["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("never rendered"),
+        "{e}"
+    );
+    let before = e["payload"]["before"].as_array().unwrap();
+    let after = e["payload"]["after"].as_array().unwrap();
+    assert!(!before.is_empty() && before.len() <= 12, "{e}");
+    assert!(!after.is_empty() && after.len() <= 12, "{e}");
+    // The before-tail is what the gate saw: the stub's idle prompt.
+    assert!(
+        before
+            .iter()
+            .any(|l| l.as_str().unwrap_or("").contains("stub ready")),
+        "{e}"
+    );
+    // The daemon's own idle probe admitted the send — recorded verdict.
+    let probe = &e["payload"]["claim_probe"];
+    assert_eq!(probe["idle"], true, "{e}");
+}
+
 #[test]
 fn pty_render_check_is_differential_not_contains() {
     let d = TestDaemon::start();
