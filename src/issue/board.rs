@@ -3,7 +3,7 @@
 //! Everything derived is computed here; the folders store only what
 //! cannot be derived.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -50,6 +50,9 @@ pub struct View {
     pub duplicates: Vec<String>,
     /// Notes chain tagged to this issue (empty without `Issue:` lines).
     pub chain: Vec<notes::Note>,
+    /// `Some("job blocked")` when the bound job's least-advanced live
+    /// task is blocked — the status itself stays notes-or-file.
+    pub blocked_reason: Option<&'static str>,
     pub checks_done: u64,
     pub checks_total: u64,
 }
@@ -214,14 +217,133 @@ fn natural_key(id: &str) -> (String, u64) {
     (p.to_string(), n.parse().unwrap_or(0))
 }
 
+/// What an issue's bound job says about its status — the M3 state,
+/// ahead of notes and the file field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobOutcome {
+    /// The job decides the status outright (`doing`|`review`|`done`).
+    Status(&'static str),
+    /// The least-advanced live task is blocked: the status still comes
+    /// from notes or the file, but the issue is flagged `job blocked`.
+    Blocked,
+}
+
+/// Issue id → job outcome, built once per board render from `job_list`.
+pub type JobOutcomes = std::collections::HashMap<String, JobOutcome>;
+
+/// Lifecycle rank for "least-advanced" — a blocked lane is behind a
+/// running one, a draft behind everything.
+fn task_rank(state: &str) -> u8 {
+    match state {
+        "draft" => 0,
+        "blocked" => 1,
+        "dispatched" => 2,
+        "running" => 3,
+        "revising" => 4,
+        "review" => 5,
+        _ => 3,
+    }
+}
+
+/// Map one job's task-state multiset (`job_list` `tasks` counts) to a
+/// board outcome: the least-advanced non-terminal task decides —
+/// dispatched/running/revising → doing, review → review, blocked →
+/// flag, draft → fall through; all-terminal → done only when nothing
+/// failed or was cancelled.
+fn job_outcome(tasks: &Value) -> Option<JobOutcome> {
+    let mut least: Option<(u8, &str)> = None;
+    let (mut finished, mut dead) = (false, false);
+    for (state, n) in tasks.as_object()? {
+        if n.as_i64().unwrap_or(0) <= 0 {
+            continue;
+        }
+        match state.as_str() {
+            "done" | "verified" => finished = true,
+            "failed" | "cancelled" => dead = true,
+            // Draft tasks are unstarted templates — they must not drag a
+            // job whose live tasks have real state back to "no outcome".
+            "draft" => {}
+            s => {
+                let rank = task_rank(s);
+                if least.is_none_or(|(r, _)| rank < r) {
+                    least = Some((rank, s));
+                }
+            }
+        }
+    }
+    match least {
+        Some((_, "dispatched" | "running" | "revising")) => Some(JobOutcome::Status("doing")),
+        Some((_, "review")) => Some(JobOutcome::Status("review")),
+        Some((_, "blocked")) => Some(JobOutcome::Blocked),
+        _ => {
+            if least.is_none() && finished && !dead {
+                Some(JobOutcome::Status("done"))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Issue-bound job selection: the newest job not `done`/`failed`/
+/// `cancelled`, else the newest job at all — then its task map decides.
+pub fn outcomes_from_jobs(jobs: &[Value]) -> JobOutcomes {
+    let mut by_issue: HashMap<String, Vec<&Value>> = HashMap::new();
+    for job in jobs {
+        if let Some(issue) = job["issue"].as_str().filter(|s| !s.is_empty()) {
+            by_issue.entry(issue.to_string()).or_default().push(job);
+        }
+    }
+    let mut out = JobOutcomes::new();
+    for (issue, mut jobs) in by_issue {
+        let newest = |a: &&Value, b: &&Value| {
+            // `created` is the ordering; `updated`/`id` break ties.
+            (
+                b["created"].as_str().unwrap_or_default(),
+                b["id"].as_str().unwrap_or_default(),
+            )
+                .cmp(&(
+                    a["created"].as_str().unwrap_or_default(),
+                    a["id"].as_str().unwrap_or_default(),
+                ))
+        };
+        jobs.sort_by(newest);
+        let chosen = jobs
+            .iter()
+            .find(|j| !matches!(j["state"].as_str(), Some("done" | "failed" | "cancelled")))
+            .or_else(|| jobs.first());
+        if let Some(outcome) = chosen.and_then(|j| job_outcome(&j["tasks"])) {
+            out.insert(issue, outcome);
+        }
+    }
+    out
+}
+
+/// Live job outcomes from the daemon — an unreachable daemon yields an
+/// empty map, which degrades to pre-job derivation exactly.
+pub fn fetch_job_outcomes(state_dir: &Path) -> JobOutcomes {
+    match crate::client::rpc(state_dir, "job_list", json!({"all": true})) {
+        Ok(list) => outcomes_from_jobs(
+            list["jobs"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .as_slice(),
+        ),
+        Err(_) => JobOutcomes::new(),
+    }
+}
+
 /// Derivation pipeline, in priority order: container roll-up, then the
-/// newest tagged agent-note, then the file field. The M3 job state
-/// slots in ahead of notes when it lands — the seam is here.
+/// bound job's task state, then the newest tagged agent-note, then the
+/// file field. `job_blocked` is the side-channel flag for a blocked
+/// task — the status itself still derives from notes or the file.
 pub fn derive_status(
     children_statuses: &[&str],
     notes_dir: &Path,
     id: &str,
     file_status: &str,
+    job: Option<JobOutcome>,
 ) -> (String, &'static str) {
     if !children_statuses.is_empty() {
         // Roll-up: any child doing|review → doing; all done|dropped →
@@ -240,15 +362,24 @@ pub fn derive_status(
         }
         return (file_status.to_string(), "rollup");
     }
+    if let Some(JobOutcome::Status(status)) = job {
+        return (status.to_string(), "job");
+    }
     if let Some((status, _)) = notes::derive(notes_dir, id) {
         return (status.to_string(), "notes");
     }
     (file_status.to_string(), "file")
 }
 
-/// Compute views for a set of issues (usually everything under the PM
-/// dir so cross-project links resolve).
+/// Compute views for a set of issues with no job data — identical to
+/// pre-job derivation (tests and daemon-less callers).
 pub fn views(notes_dir: &Path, issues: Vec<Issue>) -> Vec<View> {
+    views_with_jobs(notes_dir, issues, &JobOutcomes::new())
+}
+
+/// Compute views for a set of issues (usually everything under the PM
+/// dir so cross-project links resolve) against the daemon's job state.
+pub fn views_with_jobs(notes_dir: &Path, issues: Vec<Issue>, jobs: &JobOutcomes) -> Vec<View> {
     // Children edges decide containers before statuses derive.
     let children_of: HashMap<String, Vec<String>> = {
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
@@ -292,7 +423,13 @@ pub fn views(notes_dir: &Path, issues: Vec<Issue>) -> Vec<View> {
         if children_of.contains_key(&issue.front.id) {
             continue;
         }
-        let (s, src) = derive_status(&[], notes_dir, &issue.front.id, &issue.front.status);
+        let (s, src) = derive_status(
+            &[],
+            notes_dir,
+            &issue.front.id,
+            &issue.front.status,
+            jobs.get(&issue.front.id).copied(),
+        );
         status_of.insert(issue.front.id.clone(), (s, src));
     }
     for issue in &issues {
@@ -315,6 +452,7 @@ pub fn views(notes_dir: &Path, issues: Vec<Issue>) -> Vec<View> {
             notes_dir,
             &issue.front.id,
             &issue.front.status,
+            jobs.get(&issue.front.id).copied(),
         );
         status_of.insert(issue.front.id.clone(), (s, src));
     }
@@ -333,7 +471,12 @@ pub fn views(notes_dir: &Path, issues: Vec<Issue>) -> Vec<View> {
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| (issue.front.status.clone(), "file"));
-            let blocked = issue.front.blocked_by.iter().any(|b| !done(b));
+            let blocked_reason =
+                (jobs.get(&id) == Some(&JobOutcome::Blocked)).then_some("job blocked");
+            // `blocked` covers deps and the job-blocked flag alike — a
+            // job-blocked issue is neither ready nor cleanly movable.
+            let blocked =
+                issue.front.blocked_by.iter().any(|b| !done(b)) || blocked_reason.is_some();
             let ready = matches!(status.as_str(), "backlog" | "ready") && !blocked;
             let blocks = blocks_of.get(&id).cloned().unwrap_or_default();
             let duplicates = duplicates_of.get(&id).cloned().unwrap_or_default();
@@ -348,6 +491,7 @@ pub fn views(notes_dir: &Path, issues: Vec<Issue>) -> Vec<View> {
                 status_source,
                 ready,
                 blocked,
+                blocked_reason,
                 checks_done,
                 checks_total,
                 issue,
@@ -382,6 +526,7 @@ pub fn card_json(view: &View) -> Value {
         "container": view.container,
         "ready": view.ready,
         "blocked": view.blocked,
+        "blocked_reason": view.blocked_reason,
         "created": f.created,
         "rev": rev_of(&view.issue),
         "counts": {
@@ -455,6 +600,7 @@ pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &Vi
         "container": view.container,
         "ready": view.ready,
         "blocked": view.blocked,
+        "blocked_reason": view.blocked_reason,
         "created": f.created,
         "rev": rev_of(&view.issue),
         "frontmatter": f,
@@ -531,15 +677,6 @@ fn git_log(pm_dir: &Path, issue: &Issue) -> Vec<Value> {
                 "subject": parts.next().unwrap_or_default(),
             }))
         })
-        .collect()
-}
-
-/// Issue ids referenced by any of `text`'s tokens — used to mark which
-/// card a busy agent is running on. Conservative: real id grammar only.
-pub fn mentioned_ids(text: &str) -> HashSet<String> {
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-        .filter(|tok| model::valid_id(tok))
-        .map(str::to_string)
         .collect()
 }
 
@@ -668,14 +805,6 @@ mod tests {
     }
 
     #[test]
-    fn mentioned_ids_grammar() {
-        let ids = mentioned_ids("work on CAD-16 and OPS-3, not cad-1 or CAD-");
-        assert!(ids.contains("CAD-16"));
-        assert!(ids.contains("OPS-3"));
-        assert_eq!(ids.len(), 2);
-    }
-
-    #[test]
     fn card_json_shape() {
         let mut i = issue("CAD-1", "ready");
         i.front.refs = vec![Ref {
@@ -690,5 +819,120 @@ mod tests {
         assert_eq!(card["status_source"], "file");
         assert_eq!(card["counts"]["refs"], 1);
         assert_eq!(card["refs"][0]["label"], "PR #1");
+    }
+
+    #[test]
+    fn job_task_states_map_to_board_status() {
+        let counts = |states: &[&str]| {
+            json!(states
+                .iter()
+                .map(|s| (s.to_string(), json!(1)))
+                .collect::<serde_json::Map<String, Value>>())
+        };
+        // Single-task mappings.
+        for s in ["dispatched", "running", "revising"] {
+            assert_eq!(
+                job_outcome(&counts(&[s])),
+                Some(JobOutcome::Status("doing")),
+                "{s}"
+            );
+        }
+        assert_eq!(
+            job_outcome(&counts(&["review"])),
+            Some(JobOutcome::Status("review"))
+        );
+        for s in ["verified", "done"] {
+            assert_eq!(
+                job_outcome(&counts(&[s])),
+                Some(JobOutcome::Status("done")),
+                "{s}"
+            );
+        }
+        assert_eq!(
+            job_outcome(&counts(&["blocked"])),
+            Some(JobOutcome::Blocked)
+        );
+        for s in ["draft", "failed", "cancelled"] {
+            assert_eq!(job_outcome(&counts(&[s])), None, "{s}");
+        }
+        // Least-advanced non-terminal wins over any terminal task.
+        assert_eq!(
+            job_outcome(&counts(&["running", "done"])),
+            Some(JobOutcome::Status("doing"))
+        );
+        assert_eq!(
+            job_outcome(&counts(&["review", "running"])),
+            Some(JobOutcome::Status("doing"))
+        );
+        // `job new` auto-creates a stub draft task — it is a template,
+        // not work-in-progress, so it never suppresses real task state.
+        assert_eq!(
+            job_outcome(&counts(&["draft", "review"])),
+            Some(JobOutcome::Status("review")),
+            "the auto-created draft lane is transparent"
+        );
+        assert_eq!(
+            job_outcome(&counts(&["draft", "draft"])),
+            None,
+            "a job with only drafts falls through to notes"
+        );
+        assert_eq!(
+            job_outcome(&counts(&["blocked", "review"])),
+            Some(JobOutcome::Blocked)
+        );
+        // Mixed terminal: done+cancelled is not "done".
+        assert_eq!(job_outcome(&counts(&["done", "cancelled"])), None);
+        assert_eq!(
+            job_outcome(&counts(&["verified", "done"])),
+            Some(JobOutcome::Status("done"))
+        );
+    }
+
+    #[test]
+    fn outcomes_pick_newest_live_job() {
+        let job = |id: &str, issue: &str, state: &str, created: &str, tasks: &[&str]| {
+            json!({
+                "id": id, "issue": issue, "state": state, "created": created,
+                "tasks": tasks
+                    .iter()
+                    .map(|s| (s.to_string(), json!(1)))
+                    .collect::<serde_json::Map<String, Value>>(),
+            })
+        };
+        let jobs = vec![
+            // Older terminal job must not beat the live one.
+            job("j1", "CAD-1", "done", "2026-01-01", &["done"]),
+            job("j2", "CAD-1", "open", "2026-01-02", &["running"]),
+            // No live job — the newest terminal one still reports done.
+            job("j3", "CAD-2", "done", "2026-01-03", &["done"]),
+            job("j4", "CAD-2", "cancelled", "2026-01-01", &["cancelled"]),
+            // Job without an issue is ignored entirely.
+            job("j5", "", "open", "2026-01-04", &["running"]),
+        ];
+        let out = outcomes_from_jobs(&jobs);
+        assert_eq!(out["CAD-1"], JobOutcome::Status("doing"));
+        assert_eq!(out["CAD-2"], JobOutcome::Status("done"));
+        assert!(!out.contains_key(""));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn job_status_beats_notes_and_flags_blocked() {
+        let i = issue("CAD-1", "backlog");
+        let mut jobs = JobOutcomes::new();
+        jobs.insert("CAD-1".to_string(), JobOutcome::Status("doing"));
+        let vs = views_with_jobs(Path::new("/no-notes"), vec![i], &jobs);
+        let v = view_of(&vs, "CAD-1");
+        assert_eq!(v.status, "doing");
+        assert_eq!(v.status_source, "job");
+        // The same job blocked keeps the file status but flags the row.
+        let mut jobs = JobOutcomes::new();
+        jobs.insert("CAD-1".to_string(), JobOutcome::Blocked);
+        let vs = views_with_jobs(Path::new("/no-notes"), vec![issue("CAD-1", "ready")], &jobs);
+        let v = view_of(&vs, "CAD-1");
+        assert_eq!(v.status, "ready");
+        assert_eq!(v.status_source, "file");
+        assert_eq!(v.blocked_reason, Some("job blocked"));
+        assert_eq!(card_json(v)["blocked_reason"], "job blocked");
     }
 }

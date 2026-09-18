@@ -256,7 +256,10 @@ pub fn run(action: &IssueAction) -> Result<i32> {
         } => {
             let pm = open_pm()?;
             let issues = board::load_all(&pm.dir, project.as_deref())?;
-            let views = board::views(&pm.config.notes_dir(), issues);
+            let jobs = crate::client::state_dir()
+                .map(|d| board::fetch_job_outcomes(&d))
+                .unwrap_or_default();
+            let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
             let mut views: Vec<&board::View> = views.iter().collect();
             if let Some(status) = status {
                 model::check_status(status)?;
@@ -278,7 +281,10 @@ pub fn run(action: &IssueAction) -> Result<i32> {
             let pm = open_pm()?;
             model::check_id(id)?;
             let issues = board::load_all(&pm.dir, None)?;
-            let views = board::views(&pm.config.notes_dir(), issues);
+            let jobs = crate::client::state_dir()
+                .map(|d| board::fetch_job_outcomes(&d))
+                .unwrap_or_default();
+            let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
             let by_id: std::collections::HashMap<String, &board::View> = views
                 .iter()
                 .map(|v| (v.issue.front.id.clone(), v))
@@ -302,12 +308,32 @@ pub fn run(action: &IssueAction) -> Result<i32> {
         }
         IssueAction::Link { id, kind, target } => {
             let pm = open_pm()?;
-            print_json(&write::link(&pm, id, kind, target, false, None, "")?);
+            let sd = crate::client::state_dir().ok();
+            print_json(&write::link(
+                &pm,
+                id,
+                kind,
+                target,
+                false,
+                None,
+                "",
+                sd.as_deref(),
+            )?);
             Ok(0)
         }
         IssueAction::Unlink { id, kind, target } => {
             let pm = open_pm()?;
-            print_json(&write::link(&pm, id, kind, target, true, None, "")?);
+            let sd = crate::client::state_dir().ok();
+            print_json(&write::link(
+                &pm,
+                id,
+                kind,
+                target,
+                true,
+                None,
+                "",
+                sd.as_deref(),
+            )?);
             Ok(0)
         }
         IssueAction::Ref {

@@ -56,9 +56,10 @@ fn check_rev(dir: &Path, if_rev: Option<&str>) -> Result<Option<Value>> {
 /// Lint parity at write time: an issue whose status is ready|doing|
 /// review while a blocked_by target is unfinished succeeds but the
 /// response carries this warning.
-fn blocked_warnings(pm: &Pm, id: &str) -> Result<Vec<String>> {
+fn blocked_warnings(pm: &Pm, id: &str, state_dir: Option<&Path>) -> Result<Vec<String>> {
     let issues = board::load_all(&pm.dir, None)?;
-    let views = board::views(&pm.config.notes_dir(), issues);
+    let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
+    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
     let Some(v) = views.iter().find(|v| v.issue.front.id == id) else {
         return Ok(vec![]);
     };
@@ -488,6 +489,7 @@ pub fn patch_issue(
     patch: &IssuePatch,
     if_rev: Option<&str>,
     actor: &str,
+    state_dir: Option<&Path>,
 ) -> Result<Value> {
     let (project, dir) = issue_dir(pm, id)?;
     let _lock = pm.lock()?;
@@ -495,10 +497,11 @@ pub fn patch_issue(
         return Ok(conflict);
     }
     if patch.status.is_some() {
-        // A derived status is not file-writable: roll-up containers and
-        // note-driven issues refuse with the reason.
+        // A derived status is not file-writable: roll-up containers,
+        // job-bound and note-driven issues refuse with the reason.
         let issues = board::load_all(&pm.dir, None)?;
-        let views = board::views(&pm.config.notes_dir(), issues);
+        let jobs = state_dir.map(board::fetch_job_outcomes).unwrap_or_default();
+        let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
         let src = views
             .iter()
             .find(|v| v.issue.front.id == id)
@@ -556,12 +559,13 @@ pub fn patch_issue(
     }
     save_front(&dir, &front, &body)?;
     commit(pm, &format!("{id}: set {}", changed.join(" ")), actor)?;
-    let warnings = blocked_warnings(pm, id)?;
+    let warnings = blocked_warnings(pm, id, state_dir)?;
     Ok(json!({"id": id, "set": changed, "committed": true, "warnings": warnings}))
 }
 
 /// `issue link` / `issue unlink`. `blocked_by`/`relates` are list
 /// fields; `parent`/`duplicate_of` are scalars.
+#[allow(clippy::too_many_arguments)]
 pub fn link(
     pm: &Pm,
     id: &str,
@@ -570,6 +574,7 @@ pub fn link(
     unlink: bool,
     if_rev: Option<&str>,
     actor: &str,
+    state_dir: Option<&Path>,
 ) -> Result<Value> {
     model::check_link_kind(kind)?;
     model::check_id(target)?;
@@ -642,7 +647,7 @@ pub fn link(
     check_structure(&preview, id)?;
     save_front(&dir, &front, &body)?;
     commit(pm, &format!("{id}: {verb} {kind} {target}"), actor)?;
-    let warnings = blocked_warnings(pm, id)?;
+    let warnings = blocked_warnings(pm, id, state_dir)?;
     Ok(json!({"id": id, "link": kind, "target": target,
               "unlink": unlink, "committed": true, "warnings": warnings}))
 }

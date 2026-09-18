@@ -484,6 +484,38 @@ pub fn respond_rejection(provider: &str, kind: &str) -> Option<&'static str> {
     spec_opt(provider, kind).and_then(|s| s.respond_rejection)
 }
 
+/// The concrete resume command for a stopped agent — the spec's
+/// `resume_label` template with the agent's live ids filled in. `None`
+/// where the endpoint has no meaningful resume surface (mailbox, test
+/// double) or the agent has no native session recorded.
+pub fn resume_command(
+    provider: &str,
+    kind: &str,
+    thread_id: &str,
+    session_id: &str,
+    endpoint: &str,
+) -> Option<String> {
+    let s = spec_opt(provider, kind)?;
+    if !s.resumable || thread_id.is_empty() {
+        return None;
+    }
+    let label = s.resume_label;
+    if label.contains("<slug>") {
+        Some(label.replace("<slug>", thread_id))
+    } else if label.contains("<session>") {
+        let session = if session_id.is_empty() {
+            thread_id
+        } else {
+            session_id
+        };
+        Some(label.replace("<session>", session))
+    } else if !endpoint.is_empty() && label.starts_with("codex resume") {
+        Some(format!("{label} {endpoint} {thread_id}"))
+    } else {
+        None
+    }
+}
+
 /// `agent set` patch validation — the live-mutable allowlist is explicit:
 /// arbitrary keys like `upstream` or `session` would silently rewire
 /// routing and session binding, so they are rejected rather than merged.
@@ -665,6 +697,28 @@ mod tests {
             assert!(caps.contains(&name), "missing {name}");
         }
         assert_eq!(caps.len(), 15);
+    }
+
+    #[test]
+    fn resume_commands_fill_agent_ids() {
+        assert_eq!(
+            resume_command("devin", "pty", "devin-abc123", "", "tmux://s/w"),
+            Some("devin -r devin-abc123".to_string())
+        );
+        assert_eq!(
+            resume_command("claude", "managed", "t1", "claude-sess-9", ""),
+            Some("claude --resume claude-sess-9".to_string())
+        );
+        assert_eq!(
+            resume_command("codex", "managed-ws", "thr-7", "", "ws://127.0.0.1:9/x"),
+            Some("codex resume --remote ws://127.0.0.1:9/x thr-7".to_string())
+        );
+        // No endpoint → no remote resume command; mailbox/fake → none.
+        assert_eq!(resume_command("codex", "managed", "thr-7", "", ""), None);
+        assert_eq!(resume_command("inbox", "inbox", "x", "", ""), None);
+        assert_eq!(resume_command("fake", "fake", "", "", ""), None);
+        // A dead agent with no thread has nothing to resume.
+        assert_eq!(resume_command("devin", "pty", "", "", ""), None);
     }
 
     #[test]

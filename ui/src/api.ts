@@ -1,4 +1,5 @@
 import type {
+  AgentDetail,
   AgentsPayload,
   Health,
   IssueCard,
@@ -87,6 +88,8 @@ export const api = {
     return resp.text();
   },
   agents: () => get<AgentsPayload>("/api/agents"),
+  agent: (alias: string) =>
+    get<AgentDetail>(`/api/agents/${encodeURIComponent(alias)}`),
 
   create: (req: {
     project: string;

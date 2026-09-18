@@ -11,6 +11,7 @@
 //! before any work is done, then go through `issue::write` — the same
 //! writer the CLI uses — so CLI and API cannot disagree.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
@@ -255,47 +256,129 @@ mod embedded {
     });
 }
 
-/// What the board needs from the daemon — agent rows plus the per-agent
-/// queue/fence counts. `daemon: "unreachable"` instead of a 500 when
-/// the socket is down: the board still renders.
-fn agents_payload(state_dir: &Path, known_ids: &std::collections::HashSet<String>) -> Value {
+/// task id → (issue id, task state) for every task that belongs to an
+/// issue-bound job — the join that makes agent binding exact instead of
+/// scanning message text for issue-shaped tokens.
+fn task_issue_map(state_dir: &Path) -> HashMap<String, (String, String)> {
+    let mut map = HashMap::new();
+    let Ok(list) = client::rpc(state_dir, "job_list", json!({"all": true})) else {
+        return map;
+    };
+    for job in list["jobs"].as_array().cloned().unwrap_or_default() {
+        let Some(issue) = job["issue"].as_str().map(str::to_string) else {
+            continue;
+        };
+        if issue.is_empty() {
+            continue;
+        }
+        let Some(job_id) = job["id"].as_str() else {
+            continue;
+        };
+        let Ok(show) = client::rpc(state_dir, "job_show", json!({"job": job_id})) else {
+            continue;
+        };
+        for task in show["job"]["tasks"].as_array().cloned().unwrap_or_default() {
+            if let (Some(tid), Some(state)) = (task["id"].as_str(), task["state"].as_str()) {
+                map.insert(tid.to_string(), (issue.clone(), state.to_string()));
+            }
+        }
+    }
+    map
+}
+
+/// One running message reduced for the board: id, task, turn token.
+fn running_json(m: &Value) -> Value {
+    json!({
+        "id": m["id"],
+        "task": m["task_id"],
+        "turn_id": m["turn_id"],
+        "created": m["created"],
+    })
+}
+
+/// The tail of an agent's event log for the drawer — the last `n`
+/// events via the same `events` RPC the CLI long-polls.
+fn agent_events_tail(state_dir: &Path, alias: &str, cursor: i64, n: i64) -> Vec<Value> {
+    let after = (cursor - n).max(0);
+    client::rpc(state_dir, "events", json!({"alias": alias, "after": after}))
+        .map(|r| {
+            r["events"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e["seq"].as_i64().unwrap_or(0) > cursor - n)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What the board needs from the daemon — agent rows enriched with the
+/// exact task/issue binding, plus the per-agent queue/fence counts and
+/// the per-issue agent map for cards and drawers.
+/// `daemon: "unreachable"` instead of a 500 when the socket is down:
+/// the board still renders.
+fn agents_payload(state_dir: &Path) -> Value {
     let list = match client::rpc(state_dir, "agent_list", json!({})) {
         Ok(list) => list,
         Err(_) => {
-            return json!({"daemon": "unreachable", "agents": [], "totals": null});
+            return json!({"daemon": "unreachable", "agents": [], "totals": null, "by_issue": {}});
         }
     };
+    let task_map = task_issue_map(state_dir);
     let agents = list["agents"].as_array().cloned().unwrap_or_default();
     let mut out = Vec::new();
     let mut inboxes = 0i64;
+    let mut by_issue: HashMap<String, Vec<Value>> = HashMap::new();
     let mut totals = json!({"running": 0, "queued": 0, "fenced": 0, "parked": 0, "inboxes": 0});
     for agent in &agents {
-        // Mailboxes are not workers — report them as their own count
-        // instead of padding idle/stopped.
-        if !registry::has_actor(
-            agent["provider"].as_str().unwrap_or_default(),
-            agent["endpoint_kind"].as_str().unwrap_or_default(),
-        ) {
+        let alias = agent["alias"].as_str().unwrap_or_default();
+        let provider = agent["provider"].as_str().unwrap_or_default();
+        let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
+        let resume = registry::resume_command(
+            provider,
+            kind,
+            agent["thread_id"].as_str().unwrap_or_default(),
+            agent["session_id"].as_str().unwrap_or_default(),
+            agent["endpoint"].as_str().unwrap_or_default(),
+        );
+        // Mailboxes are not workers — they still appear on the Agents
+        // screen (as kind "inbox") but never count as busy/fenced.
+        let actor = registry::has_actor(provider, kind);
+        if !actor {
             inboxes += 1;
+            out.push(json!({
+                "alias": alias, "provider": agent["provider"],
+                "endpoint_kind": agent["endpoint_kind"],
+                "state": "inbox", "group": agent["params"]["upstream"].as_str().unwrap_or(alias),
+                "group_root": agent["params"]["upstream"].is_null(),
+                "running": 0, "queued": 0, "unknown": 0, "parked": 0,
+                "fenced": false, "on": [], "tasks": [], "message": Value::Null,
+                "dead": agent["dead"], "inbox": true,
+            }));
             continue;
         }
-        let alias = agent["alias"].as_str().unwrap_or_default();
         let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}));
         let (mut running, mut parked) = (0i64, 0i64);
-        let mut on = Vec::new();
-        let (queued, unknown) = match &show {
+        let mut running_msgs: Vec<Value> = Vec::new();
+        let mut last_activity = Value::Null;
+        let (queued, unknown, cursor) = match &show {
             Ok(show) => {
                 for m in show["messages"].as_array().cloned().unwrap_or_default() {
+                    for ts in ["completed", "started", "created"] {
+                        let at = &m[ts];
+                        if at
+                            .as_str()
+                            .map(|a| last_activity.as_str().map(|cur| a > cur).unwrap_or(true))
+                            == Some(true)
+                        {
+                            last_activity = at.clone();
+                        }
+                    }
                     match m["state"].as_str() {
                         Some("running") => {
                             running += 1;
-                            // A running turn's body may name an issue —
-                            // that is the card the agent is on.
-                            for id in board::mentioned_ids(m["body"].as_str().unwrap_or_default()) {
-                                if known_ids.contains(&id) {
-                                    on.push(id);
-                                }
-                            }
+                            running_msgs.push(running_json(&m));
                         }
                         _ => {
                             if m["result"]["via"].as_str() == Some("pty_render_miss") {
@@ -307,10 +390,41 @@ fn agents_payload(state_dir: &Path, known_ids: &std::collections::HashSet<String
                 (
                     show["queued"].as_i64().unwrap_or(0),
                     show["unknown"].as_i64().unwrap_or(0),
+                    show["event_cursor"].as_i64().unwrap_or(0),
                 )
             }
-            Err(_) => (0, 0),
+            Err(_) => (0, 0, 0),
         };
+        // Exact binding: the agent's assigned tasks joined through
+        // `jobs.issue_id`. A running kickoff's task is the live one.
+        let mut on: Vec<String> = Vec::new();
+        let mut bound: Vec<Value> = Vec::new();
+        for tid in agent["tasks"].as_array().cloned().unwrap_or_default() {
+            let Some(tid) = tid.as_str() else { continue };
+            let Some((issue, task_state)) = task_map.get(tid) else {
+                continue;
+            };
+            if !on.contains(issue) {
+                on.push(issue.clone());
+            }
+            let message = running_msgs
+                .iter()
+                .find(|m| m["task"].as_str() == Some(tid))
+                .cloned()
+                .unwrap_or(Value::Null);
+            bound.push(json!({
+                "task": tid, "task_state": task_state, "issue": issue,
+                "message": message,
+            }));
+            by_issue.entry(issue.clone()).or_default().push(json!({
+                "alias": alias,
+                "task": tid,
+                "task_state": task_state,
+                "state": agent["state"],
+                "message": message["id"].clone(),
+                "resume": resume,
+            }));
+        }
         let fenced = unknown > 0 || agent["state"].as_str() == Some("attention");
         totals["running"] = json!(totals["running"].as_i64().unwrap_or(0) + running);
         totals["queued"] = json!(totals["queued"].as_i64().unwrap_or(0) + queued);
@@ -318,6 +432,13 @@ fn agents_payload(state_dir: &Path, known_ids: &std::collections::HashSet<String
         if fenced {
             totals["fenced"] = json!(totals["fenced"].as_i64().unwrap_or(0) + 1);
         }
+        // The daemon's own fence text already names the recovery path —
+        // the board renders it as copyable code, verbatim.
+        let recovery = if fenced {
+            agent["error"].as_str().map(str::to_string)
+        } else {
+            None
+        };
         out.push(json!({
             "alias": alias,
             "provider": agent["provider"],
@@ -328,10 +449,82 @@ fn agents_payload(state_dir: &Path, known_ids: &std::collections::HashSet<String
             "running": running, "queued": queued, "unknown": unknown,
             "parked": parked, "fenced": fenced,
             "on": on,
+            "tasks": bound,
+            "message": running_msgs.first().cloned().unwrap_or(Value::Null),
+            "running_messages": running_msgs,
+            "recovery": recovery,
+            "resume": resume,
+            "resume_hint": "after stop",
+            "dead": agent["dead"],
+            "last_activity": last_activity,
+            "event_cursor": cursor,
         }));
     }
     totals["inboxes"] = json!(inboxes);
-    json!({"daemon": "reachable", "agents": out, "totals": totals})
+    json!({"daemon": "reachable", "agents": out, "totals": totals, "by_issue": by_issue})
+}
+
+/// `/api/agents/<alias>` — the drawer detail: the daemon's own
+/// `agent_show` plus the last 20 events and the recovery/resume
+/// commands the row chips hinted at.
+fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result<Value, String> {
+    let show =
+        client::rpc(state_dir, "agent_show", json!({"alias": alias})).map_err(|e| e.to_string())?;
+    let agent = &show["agent"];
+    let cursor = show["event_cursor"].as_i64().unwrap_or(0);
+    let events = agent_events_tail(state_dir, alias, cursor, 20);
+    let provider = agent["provider"].as_str().unwrap_or_default();
+    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
+    let running: Vec<Value> = show["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|m| m["state"].as_str() == Some("running"))
+        .map(running_json)
+        .collect();
+    let fenced =
+        show["unknown"].as_i64().unwrap_or(0) > 0 || agent["state"].as_str() == Some("attention");
+    // `tasks` lives on the agent_list row, not the show payload.
+    let tasks = client::rpc(state_dir, "agent_list", json!({}))
+        .ok()
+        .and_then(|l| {
+            l["agents"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|a| a["alias"].as_str() == Some(alias))
+        })
+        .map(|a| a["tasks"].clone())
+        .unwrap_or(json!([]));
+    // Bound issues through the same tasks × jobs.issue_id join.
+    let task_map = task_issue_map(state_dir);
+    let mut issues: Vec<&str> = Vec::new();
+    for t in tasks.as_array().cloned().unwrap_or_default() {
+        if let Some((issue, _)) = t.as_str().and_then(|tid| task_map.get(tid)) {
+            if !issues.contains(&issue.as_str()) {
+                issues.push(issue);
+            }
+        }
+    }
+    Ok(json!({
+        "agent": agent,
+        "queued": show["queued"],
+        "unknown": show["unknown"],
+        "running": running,
+        "events": events,
+        "fenced": fenced,
+        "recovery": if fenced { agent["error"].clone() } else { Value::Null },
+        "resume": registry::resume_command(
+            provider, kind,
+            agent["thread_id"].as_str().unwrap_or_default(),
+            agent["session_id"].as_str().unwrap_or_default(),
+            agent["endpoint"].as_str().unwrap_or_default(),
+        ),
+        "tasks": tasks,
+        "on": issues,
+    }))
 }
 
 // ---------- write path (I2) ----------
@@ -499,7 +692,7 @@ struct CommentReq {
 /// A write op's outcome → HTTP response. Conflicts are 409 with the
 /// reason; success re-reads the issue and returns the fresh card and
 /// detail payloads so the UI needs no second fetch.
-fn write_reply(pm: &Pm, id: &str, out: Value, created: bool) -> HttpResp {
+fn write_reply(pm: &Pm, state_dir: &Path, id: &str, out: Value, created: bool) -> HttpResp {
     if out.get("conflict").is_some() {
         let mut body = out.clone();
         let msg = match out["conflict"].as_str() {
@@ -516,7 +709,7 @@ fn write_reply(pm: &Pm, id: &str, out: Value, created: bool) -> HttpResp {
         };
         body["error"] = json!(msg);
         // The fresh card lets the caller resync on the spot.
-        if let Ok((card, _)) = issue_payloads(pm, id) {
+        if let Ok((card, _)) = issue_payloads(pm, state_dir, id) {
             body["card"] = card;
         }
         let bytes = serde_json::to_vec_pretty(&body).unwrap_or_default();
@@ -524,7 +717,7 @@ fn write_reply(pm: &Pm, id: &str, out: Value, created: bool) -> HttpResp {
         resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
         return resp;
     }
-    match issue_payloads(pm, id) {
+    match issue_payloads(pm, state_dir, id) {
         Ok((card, detail)) => {
             let warnings = out.get("warnings").cloned().unwrap_or(json!([]));
             let body = serde_json::to_vec_pretty(&json!({
@@ -544,19 +737,21 @@ fn write_reply(pm: &Pm, id: &str, out: Value, created: bool) -> HttpResp {
 }
 
 /// Fresh card + detail payloads for one id after a write.
-fn issue_payloads(pm: &Pm, id: &str) -> Result<(Value, Value)> {
+fn issue_payloads(pm: &Pm, state_dir: &Path, id: &str) -> Result<(Value, Value)> {
     let issues = board::load_all(&pm.dir, None)?;
-    let views = board::views(&pm.config.notes_dir(), issues);
-    let by_id: std::collections::HashMap<String, &board::View> = views
+    let jobs = board::fetch_job_outcomes(state_dir);
+    let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+    let by_id: HashMap<String, &board::View> = views
         .iter()
         .map(|v| (v.issue.front.id.clone(), v))
         .collect();
     let view = by_id
         .get(id)
         .ok_or_else(|| Error::rejected(format!("unknown issue '{id}'")))?;
+    let by_issue = agents_payload(state_dir)["by_issue"].clone();
     Ok((
-        board::card_json(view),
-        board::detail_json(&pm.dir, view, &by_id),
+        with_agents(board::card_json(view), &by_issue, id),
+        with_agents(board::detail_json(&pm.dir, view, &by_id), &by_issue, id),
     ))
 }
 
@@ -579,6 +774,7 @@ fn write_route(
     method: &Method,
     path: &str,
     query: &dyn Fn(&str) -> Option<String>,
+    state_dir: &Path,
     pm_dir: &Path,
     port: u16,
     hosts: &[String],
@@ -666,7 +862,7 @@ fn write_route(
         ) {
             Ok(out) => {
                 let new_id = out["id"].as_str().unwrap_or_default().to_string();
-                send(request, write_reply(&pm, &new_id, out, true));
+                send(request, write_reply(&pm, state_dir, &new_id, out, true));
             }
             Err(e) => send(request, write_err(&e)),
         }
@@ -700,7 +896,7 @@ fn write_route(
             }
         };
         match issue_write::attach_bytes(&pm, &id, &name, &bytes, false, UI_ACTOR) {
-            Ok(out) => send(request, write_reply(&pm, &id, out, false)),
+            Ok(out) => send(request, write_reply(&pm, state_dir, &id, out, false)),
             Err(e) => send(request, write_err(&e)),
         }
         return;
@@ -728,6 +924,7 @@ fn write_route(
                 },
                 req.if_rev.as_deref(),
                 UI_ACTOR,
+                Some(state_dir),
             ),
             Err(resp) => {
                 send(request, resp);
@@ -743,6 +940,7 @@ fn write_route(
                 m == &Method::Delete,
                 req.if_rev.as_deref(),
                 UI_ACTOR,
+                Some(state_dir),
             ),
             Err(resp) => {
                 send(request, resp);
@@ -794,7 +992,7 @@ fn write_route(
         _ => unreachable!("shape_ok gated"),
     };
     match out {
-        Ok(out) => send(request, write_reply(&pm, &id, out, false)),
+        Ok(out) => send(request, write_reply(&pm, state_dir, &id, out, false)),
         Err(e) => send(request, write_err(&e)),
     }
 }
@@ -864,6 +1062,183 @@ fn send(request: Request, mut resp: HttpResp, head_only: bool) {
     }
 }
 
+/// Merge the `by_issue` runtime strip into a card/detail payload —
+/// cards get `agents: [{alias, task, task_state, state, message,
+/// resume}]` only when a job actually binds agents to the issue.
+fn with_agents(mut payload: Value, by_issue: &Value, id: &str) -> Value {
+    if let Some(agents) = by_issue.get(id) {
+        payload["agents"] = agents.clone();
+    }
+    payload
+}
+
+// ---------- /api/stream — server-sent events ----------
+
+/// Newest mtime among regular files under `dir` — the tracker-change
+/// fingerprint. Small tree; a full walk every poll is still cheap.
+fn dir_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest = None;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else if meta.is_file() {
+                let m = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                if newest.is_none_or(|n| m > n) {
+                    newest = Some(m);
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// A cheap content fingerprint for a JSON value — the serialized bytes
+/// through a stable hasher (no new dependency for one hash).
+fn value_fp(value: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_vec(value).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
+
+/// The per-agent fingerprint input: the agent_list row plus the queue
+/// counters and event cursor that only `agent_show` exposes — any
+/// message, fence, or liveness change moves it.
+fn agents_fp(state_dir: &Path, list: &Value) -> u64 {
+    let mut parts = vec![list.clone()];
+    for agent in list["agents"].as_array().cloned().unwrap_or_default() {
+        if let Some(alias) = agent["alias"].as_str() {
+            if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+                parts.push(json!({
+                    "queued": show["queued"], "unknown": show["unknown"],
+                    "cursor": show["event_cursor"],
+                }));
+            }
+        }
+    }
+    value_fp(&json!(parts))
+}
+
+/// Poll the three board inputs once a second and push
+/// `issues|agents|jobs` event names into `tx` on change. The baseline
+/// is taken before the loop so a fresh client only sees deltas.
+/// `__tick` is the per-second liveness probe: the reader drops it, and
+/// a failed send means the client hung up — stop polling the daemon.
+fn watch_changes(
+    state_dir: PathBuf,
+    pm_dir: PathBuf,
+    mut tracker: Option<std::time::SystemTime>,
+    mut jobs: u64,
+    mut agents: u64,
+    tx: std::sync::mpsc::Sender<&'static str>,
+) {
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        if tx.send("__tick").is_err() {
+            return;
+        }
+        let t = dir_mtime(&pm_dir);
+        if t != tracker {
+            tracker = t;
+            if tx.send("issues").is_err() {
+                return;
+            }
+        }
+        if let Ok(list) = client::rpc(&state_dir, "job_list", json!({"all": true})) {
+            let fp = value_fp(&list);
+            if fp != jobs {
+                jobs = fp;
+                if tx.send("jobs").is_err() {
+                    return;
+                }
+            }
+        }
+        if let Ok(list) = client::rpc(&state_dir, "agent_list", json!({})) {
+            let fp = agents_fp(&state_dir, &list);
+            if fp != agents {
+                agents = fp;
+                if tx.send("agents").is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `GET /api/stream` — server-sent events written straight onto the
+/// socket. tiny_http's chunked path buffers small writes inside
+/// `chunked_transfer::Encoder` (it flushes only on `flush()` or a full
+/// chunk), so a reader-based `Response` would never emit a small SSE
+/// frame. `into_writer` hands over the socket: the head is written by
+/// hand, each frame flushes immediately, and dropping the writer on
+/// exit closes the stream — which is also how a dead client surfaces.
+fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
+    let mut w = request.into_writer();
+    // Baselines at connect time, before the client can observe the
+    // stream is live — if they were taken inside the spawned thread
+    // they would race the client's first action and silently absorb it.
+    let tracker0 = dir_mtime(pm_dir);
+    let jobs0 = client::rpc(state_dir, "job_list", json!({"all": true}))
+        .map(|l| value_fp(&l))
+        .unwrap_or(0);
+    let agents0 = client::rpc(state_dir, "agent_list", json!({}))
+        .map(|l| agents_fp(state_dir, &l))
+        .unwrap_or(0);
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                Cache-Control: no-store\r\nConnection: close\r\n\r\n";
+    if w.write_all(head.as_bytes())
+        .and_then(|_| w.flush())
+        .is_err()
+    {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+    std::thread::spawn({
+        let (state_dir, pm_dir) = (state_dir.to_path_buf(), pm_dir.to_path_buf());
+        move || watch_changes(state_dir, pm_dir, tracker0, jobs0, agents0, tx)
+    });
+    let frame = |w: &mut dyn Write, bytes: &[u8]| -> bool {
+        w.write_all(bytes).and_then(|_| w.flush()).is_ok()
+    };
+    // First frame immediately — proves the stream is live and gives
+    // proxies something to flush before the first event exists.
+    if !frame(&mut w, b": ping\n\n") {
+        return;
+    }
+    // `: ping` every 15 s of wire silence — the per-second `__tick`
+    // would otherwise starve the keepalive, and an idle dead client
+    // would never surface without a write.
+    let mut ping_at = Instant::now() + Duration::from_secs(15);
+    loop {
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok("__tick") => {}
+            Ok(name) => {
+                if !frame(&mut w, format!("event: {name}\ndata: {{}}\n\n").as_bytes()) {
+                    return;
+                }
+                ping_at = Instant::now() + Duration::from_secs(15);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        if Instant::now() >= ping_at {
+            if !frame(&mut w, b": ping\n\n") {
+                return;
+            }
+            ping_at = Instant::now() + Duration::from_secs(15);
+        }
+    }
+}
+
 fn handle(
     request: Request,
     state_dir: &Path,
@@ -913,7 +1288,9 @@ fn handle(
     let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
 
     if is_write {
-        write_route(request, &method, &path, &query, pm_dir, port, hosts, &send);
+        write_route(
+            request, &method, &path, &query, state_dir, pm_dir, port, hosts, &send,
+        );
         return;
     }
 
@@ -976,24 +1353,47 @@ fn handle(
                     }
                 }
                 let issues = board::load_all(&pm.dir, filter.as_deref()).unwrap_or_default();
-                let views = board::views(&pm.config.notes_dir(), issues);
+                let jobs = board::fetch_job_outcomes(state_dir);
+                let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+                let by_issue = agents_payload(state_dir)["by_issue"].clone();
                 send(
                     request,
                     json_response(json!({
-                        "issues": views.iter().map(board::card_json).collect::<Vec<_>>(),
+                        "issues": views
+                            .iter()
+                            .map(|v| with_agents(board::card_json(v), &by_issue, &v.issue.front.id))
+                            .collect::<Vec<_>>(),
                     })),
                 );
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
-        "/api/agents" => {
-            let known: std::collections::HashSet<String> = Pm::at(pm_dir)
-                .and_then(|pm| board::load_all(&pm.dir, None))
-                .map(|issues| issues.iter().map(|i| i.front.id.clone()).collect())
-                .unwrap_or_default();
-            send(request, json_response(agents_payload(state_dir, &known)));
+        "/api/agents" => send(request, json_response(agents_payload(state_dir))),
+        "/api/stream" => {
+            if head_only {
+                send(request, err_response(405, "stream is GET only"));
+            } else {
+                stream_events(request, state_dir, pm_dir);
+            }
         }
         _ => {
+            // `/api/agents/<alias>` — the drawer detail endpoint.
+            if let Some(alias) = path.strip_prefix("/api/agents/") {
+                if alias.is_empty()
+                    || alias.len() > 80
+                    || !alias
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                {
+                    send(request, err_response(400, "bad agent alias"));
+                    return;
+                }
+                match agent_detail(state_dir, alias) {
+                    Ok(detail) => send(request, json_response(detail)),
+                    Err(e) => send(request, err_response(404, &e)),
+                }
+                return;
+            }
             // `/api/issues/<ID>[/file|/activity|/artifacts/<name>]` — id
             // grammar checked before the id is ever a path component.
             if let Some(tail) = path.strip_prefix("/api/issues/") {
@@ -1013,7 +1413,8 @@ fn handle(
                 match Pm::at(pm_dir) {
                     Ok(pm) => {
                         let issues = board::load_all(&pm.dir, None).unwrap_or_default();
-                        let views = board::views(&pm.config.notes_dir(), issues);
+                        let jobs = board::fetch_job_outcomes(state_dir);
+                        let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
                         let by_id: std::collections::HashMap<String, &board::View> = views
                             .iter()
                             .map(|v| (v.issue.front.id.clone(), v))
@@ -1023,10 +1424,17 @@ fn handle(
                             return;
                         };
                         match sub {
-                            None => send(
-                                request,
-                                json_response(board::detail_json(&pm.dir, view, &by_id)),
-                            ),
+                            None => {
+                                let by_issue = agents_payload(state_dir)["by_issue"].clone();
+                                send(
+                                    request,
+                                    json_response(with_agents(
+                                        board::detail_json(&pm.dir, view, &by_id),
+                                        &by_issue,
+                                        &id,
+                                    )),
+                                )
+                            }
                             Some("file") => {
                                 let file = view.issue.dir.join("issue.md");
                                 match std::fs::read(&file) {
@@ -1100,6 +1508,10 @@ fn handle(
     }
 }
 
+/// One mutex for every write route — the server is thread-per-request
+/// since `/api/stream`, and issue file writes must not interleave.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn serve(
     state_dir: &Path,
     pm_dir: &Path,
@@ -1112,14 +1524,23 @@ pub fn serve(
         .map_err(|e| Error::internal(format!("ui bind {host}:{port}: {e}")))?;
     eprintln!("cadence ui listening on http://{host}:{port}");
     for request in server.incoming_requests() {
-        handle(
-            request,
-            state_dir,
-            pm_dir,
-            port,
-            dist.as_deref(),
-            allow_hosts,
-        );
+        // Thread per request: `/api/stream` holds its connection open
+        // for the session's lifetime and must not starve the board.
+        let (state_dir, pm_dir, dist) =
+            (state_dir.to_path_buf(), pm_dir.to_path_buf(), dist.clone());
+        let hosts = allow_hosts.to_vec();
+        std::thread::spawn(move || {
+            let is_write = matches!(
+                request.method(),
+                Method::Post | Method::Patch | Method::Delete
+            );
+            if is_write {
+                let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                handle(request, &state_dir, &pm_dir, port, dist.as_deref(), &hosts);
+            } else {
+                handle(request, &state_dir, &pm_dir, port, dist.as_deref(), &hosts);
+            }
+        });
     }
     Ok(())
 }
