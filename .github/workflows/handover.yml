@@ -17,3 +17,11 @@ jobs:
           done
       - name: Run isolated lifecycle regressions
         run: python3 -m unittest discover -s skills/agent-handover/tests -v
+  qa-verdict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Shellcheck the verdict script
+        run: shellcheck scripts/qa-verdict.sh
+      - name: Run verdict gate regressions against a fake gh
+        run: python3 -m unittest discover -s tests/scripts -v

@@ -130,6 +130,7 @@ spec file, `job dispatch` sends a task's kickoff to a group worker, and
 `job verdict` binds QA to the exact reported commit. Messages stay the
 delivery axis — the job layer tracks the work axis on top. See
 [docs/JOBS.md](docs/JOBS.md).
+On GitHub the reviewer binds the same verdict to the PR head with `scripts/qa-verdict.sh` ([verdict gate](docs/DOGFOOD.md#reviewer-verdict-gate)).
 
 ```bash
 cadence job new --pm pm --spec spec.md --issue CAD-26

@@ -99,6 +99,9 @@ wedging. No data migration is needed.
 Deferred to M3b: `artifacts` table, reviewer/merger task roles,
 `--workers-from`, `--verify-worktree`, stall detection, board changes.
 
+GitHub bridge for `job verdict`: not built; until then the reviewer runs
+`scripts/qa-verdict.sh` ([DOGFOOD.md](DOGFOOD.md#reviewer-verdict-gate)).
+
 ---
 
 ## 2. Job-scoped groups
