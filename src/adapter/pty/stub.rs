@@ -41,7 +41,7 @@ mod stub_screen {
 /// Leading characters the stub treats as commands — deliberately
 /// disjoint from the Devin list so the prefix guard proves it reads
 /// the list from the profile.
-const FORBIDDEN_PREFIXES: &[char] = &['~', ';'];
+pub const FORBIDDEN_PREFIXES: &[char] = &['~', ';'];
 
 /// Reduce a stub screen to gate facts — the same algorithm shape as
 /// the Devin analyzer (prompt line, staged draft, status-region
@@ -205,7 +205,7 @@ impl TuiProfile for StubProfile {
         OPEN_DEADLINE
     }
 
-    fn analyze(&self, screen: &str) -> Probe {
+    fn analyze(&self, screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
         analyze_stub(screen)
     }
 

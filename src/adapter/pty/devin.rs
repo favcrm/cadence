@@ -70,7 +70,7 @@ mod devin_screen {
 /// observed live in a scratch pane (CAD-32): `/` opens the slash-
 /// command menu, `!` switches to bash mode, `@` opens the file-picker.
 /// `#` stays a literal draft and is deliberately absent.
-const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
+pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
 
 /// Reduce a captured Devin screen to gate facts. The last `❭` line is
 /// the input line; text after it that is not the placeholder is a
@@ -281,7 +281,7 @@ impl TuiProfile for DevinProfile {
         OPEN_DEADLINE
     }
 
-    fn analyze(&self, screen: &str) -> Probe {
+    fn analyze(&self, screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
         analyze_devin(screen)
     }
 

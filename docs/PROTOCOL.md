@@ -106,13 +106,13 @@ depend on it:
 |---|---|---|
 | `managed` | owned provider process — JSON-RPC stdio (`codex`) or newline-delimited stream-json (`claude`) | implemented: providers `codex`, `claude` |
 | `managed-ws` | owned `codex app-server --listen ws://127.0.0.1:*`; official TUI attachable | implemented: provider `codex` |
-| `pty` | owned tmux pane running the official TUI; literal paste + explicit reports | implemented: provider `devin` |
+| `pty` | owned tmux pane running the official TUI; literal paste + explicit reports | implemented: providers `devin`, `claude` |
 | `inbox` | durable mailbox — no actor; messages queue until `agent_inbox` drains them | implemented: provider `inbox` |
 | `fake` | in-process test double | test fixture only |
 
 `agent_register` accepts `params` (JSON object) for endpoint options:
-pty uses `{"session": "<native-id>"}` to resume an existing Devin
-session instead of starting a fresh one, and `{"auto_ready":
+pty uses `{"session": "<native-id>"}` to resume an existing Devin or
+Claude session instead of starting a fresh one, and `{"auto_ready":
 "verified"}` opts into daemon-side verified claims (see the pty
 section). Provider `inbox` requires endpoint kind `inbox` and vice
 versa — mixed pairs are rejected — and its `cwd` may be omitted (a
@@ -131,8 +131,12 @@ replays verbatim on every resume: `{"model": "<cli model>",
 "permission_mode": "<claude mode>"}` (default `manual`;
 `--bypass` stores `bypassPermissions`), `{"allowed_tools": ["<pat>",
 …]}` — appended to the `Bash(cadence *)` baseline the CLI tool needs
-to self-report — and the turn-liveness knobs `{"turn_idle_secs": N}`
-(default 900) plus `{"turn_max_secs": N}` (optional absolute cap).
+to self-report — and, on the managed endpoint only, the turn-liveness
+knobs `{"turn_idle_secs": N}` (default 900) plus `{"turn_max_secs": N}`
+(optional absolute cap; pty liveness is the pane itself). On the pty
+endpoint the same `permission_mode`/`allowed_tools`/`model` params map
+to the TUI's own launch flags and `{"session": "<claude-session-id>"}`
+resumes a native session (`cadence claude --tui -r <id>`).
 
 For provider `devin`, `{"permission_mode": "<mode>"}` sets Devin's own
 approval policy — `auto`, `accept-edits`, `smart` or `dangerous`
@@ -252,13 +256,13 @@ same table plus daemon-level features (`agent_registry`,
 never hand-listed per provider. Adding a provider or kind means one
 `SPECS` entry; every check, capability list and doctor probe follows.
 
-## pty endpoints (provider `devin`)
+## pty endpoints (providers `devin`, `claude`)
 
-Cadence launches `devin [--permission-mode <mode>] [-r <session>]`
-inside a detached tmux session
-on a private socket (`cadence-<state-hash>`), so every pane it can kill
-is one it spawned. The agent record keeps the fields separate: `alias`,
-`thread_id` = the native Devin session id, `endpoint` =
+Cadence launches `devin [--permission-mode <mode>] [-r <session>]` or
+`claude [--session-id <id> | --resume <id>]` inside a detached tmux
+session on a private socket (`cadence-<state-hash>`), so every pane it
+can kill is one it spawned. The agent record keeps the fields separate:
+`alias`, `thread_id` = the native provider session id, `endpoint` =
 `tmux://<socket>/<session>`, `pid` = pane process, `generation` = a uuid
 minted per `open`.
 
@@ -268,10 +272,10 @@ differential render check — with every provider-specific fact behind a
 `TuiProfile` (`src/adapter/pty/profile.rs`): launch argv, native
 session-ownership proof, the screen analyzer that produces the probe
 verdict, message wording, the open deadline, and the forbidden-prefix
-list below. `devin` is the first profile; `tui-stub` is a test-double
-profile the integration harness registers to prove the mechanics are
-profile-driven. A second real TUI is a new profile module, not a copy
-of the adapter.
+list below. `devin` and `claude` are the real profiles; `tui-stub` is
+a test-double profile the integration harness registers to prove the
+mechanics are profile-driven. A new TUI is a new profile module, not
+a copy of the adapter.
 
 **Ownership is proven, not assumed.** Devin flock's
 `~/.local/share/devin/cli/session_locks/<session>.lock`; Cadence walks
@@ -282,10 +286,20 @@ takeover). On restart a live pane that still owns the recorded session
 is reattached; a dead pane is relaunched with `devin -r <stored>`. A
 pane owning a *different* session fails closed (`attention`).
 
+Claude's proof is its own per-process registry:
+`~/.claude/sessions/<pid>.json` records `{pid, sessionId, cwd,
+procStart}` for every interactive process. An entry counts as owned
+when its pid is alive — `procStart` matched against `/proc/<pid>/stat`
+field 22 so a recycled pid cannot impersonate it — and descends from
+the pane pid. The same three rules follow: a live foreign pid claiming
+the wanted session refuses takeover, a pane owning a different session
+fails closed, and a dead pane relaunches with `claude --resume
+<stored>`.
+
 **Submission gates.** `run_turn` requires all of: pane alive,
-`pane_dead=0`, `pane_in_mode=0`, lock still owned, and a fresh
-unconsumed claim — either an operator claim from `agent ready` (60s
-TTL) or, under `auto_ready=verified`, a daemon-minted claim. Claims
+`pane_dead=0`, `pane_in_mode=0`, native ownership still held, and a
+fresh unconsumed claim — either an operator claim from `agent ready`
+(60s TTL) or, under `auto_ready=verified`, a daemon-minted claim. Claims
 are single-use (consumed atomically by exactly one send), FIFO, and
 capped; every consumption emits a `claim_used` event recording the
 message id and the claimer (`agent ready <alias>` records
@@ -303,7 +317,19 @@ the last non-blank row — `capture-pane` pads short content with blank
 rows, so the region is not the pane's literal bottom) — the transcript
 above can legitimately print the same strings without the pane being
 busy, and the `Guide Devin while it works` input watermark is itself a
-busy signal even outside the region. `agent probe <alias>`
+busy signal even outside the region. Claude's analyzer reads the same
+verdict from its own shapes: the input box is the last `❯`-leading
+line under a `─` border (a menu's `❯` option marker is never boxed),
+busy is the spinner's `esc to interrupt` hint or a `Waiting…` tool
+marker, and menus are the permission prompt and directory-trust
+dialog. One Claude quirk needs the pane cursor: an idle box shows a
+dim *ghost suggestion* (`❯  ls -l …`) that plain capture cannot tell
+from a staged draft — the suggestion never moves the cursor off the
+prompt start, so the adapter fetches `#{cursor_x},#{cursor_y}`
+alongside the capture and the analyzer only counts visible text as
+input when the cursor has moved (an unreadable cursor treats it as
+real text — conservative).
+`agent probe <alias>`
 runs the same analyzer on demand (`{idle, reason, prompt_visible,
 input_nonempty, busy_marker, approval_menu}`) without claiming. A
 refused send returns the message to `queued` (event `gate_wait`) and
@@ -317,7 +343,11 @@ not fenced): TUIs commonly treat a leading character as a command or
 mode switch, so a verbatim paste of one is an injection path. Devin's
 list was fixed by live observation in a scratch pane: `/` opens the
 command menu, `!` switches to bash mode, `@` opens the file picker —
-all forbidden; `#` stays a literal draft character.
+all forbidden; `#` stays a literal draft character. Claude's list was
+observed the same way (2.1.275): `/` opens the command menu, `!`
+switches to shell mode — a command that runs *outside* the permission
+system — `@` opens the agent/file autocomplete; `#` again stays
+literal.
 
 **Durable submission vs. receipt.** Paste alone is not proof: the
 render check is *differential* — the pane is captured before the paste,
@@ -343,11 +373,15 @@ the recorded `turn_id` and belong to the agent's current generation — a
 report against a previous pane life is `rejected` as stale; a
 conflicting result for a completed message is `rejected`; an identical
 retry is idempotent. Reporting identifies the caller by possession of
-the token — self-asserted, not authenticated.
+the token — self-asserted, not authenticated. A real `claude` launch
+additionally wires a `Stop` hook through `--settings` that runs
+`cadence self` and `message ack`s any running message when a turn ends
+— an acknowledgement of turn-end only; the agent's own
+`message result` remains the completing report.
 
 A pane that dies after a possible paste leaves submitted messages
 `unknown` (fence, never replay); a pane that dies before the paste
-fails the message. `agent_respond` is `rejected` for pty — Devin
+fails the message. `agent_respond` is `rejected` for pty — provider
 permission prompts are answered in the terminal, and a visible prompt
 is one of the things the ready claim asserts absent. `agent_stop`
 kills the owned pane; daemon shutdown detaches instead, so a restart

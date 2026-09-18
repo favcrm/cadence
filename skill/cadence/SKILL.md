@@ -77,6 +77,10 @@ cadence join <your-alias> claude                    # headless claude worker —
                                                     #  its turn's result text
                                                     #  IS the report (no
                                                     #  `message result` needed)
+cadence join <your-alias> claude --tui              # interactive claude in an
+                                                    #  owned pane — pty rules:
+                                                    #  ready gate + `message
+                                                    #  result` reporting
 cadence join <your-alias> devin --worktree feat-a   # isolated checkout
                                                     #  (.cadence/wt/feat-a)
 cadence agent ready <worker>                        # gate one paste

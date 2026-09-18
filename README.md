@@ -43,6 +43,10 @@ cadence claude                  # headless managed Claude (stream-json) — each
                                 #  turn fences unknown (default 900; liveness is
                                 #  activity-based) — --turn-max-secs <n> adds an
                                 #  absolute cap
+cadence claude --tui            # interactive Claude in an owned tmux pane —
+                                #  pty rules: ready-gated literal paste, explicit
+                                #  `message result` reporting, -r <session-id>
+                                #  resumes a native session
 
 cadence join <pm-slug> devin    # spawn a worker wired to a group: results route to the PM
                                 #  (providers: devin, codex, claude, fake)

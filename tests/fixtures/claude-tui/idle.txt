@@ -1,0 +1,44 @@
+ ▐▛███▛█   Claude Code v2.1.275
+▝▜██████▀  Opus 5 (1M context) with low effort · Claude Max
+  ▝▝ ▝▝    /tmp/claude-tui-obs/untrusted
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [Opus 5 (1M context)] 📁 untrusted | [░░░░░░░░░░░░░░░░░░░░] 0.0% (0)
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 3 agents
+                                      tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
