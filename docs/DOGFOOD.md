@@ -52,11 +52,14 @@ they were cadence-managed: they didn't know their alias, where the
 report verbs were, or that results routed to a PM. A retrofit
 (`agent bootstrap <alias>`) and the universal briefing writer were added
 after the fact: every launch now writes
-`.cadence/<root>/BRIEFING-<alias>.md` (identity, protocol quickref,
-roster snapshot) plus an idempotent `<!-- cadence:* -->` block in the
-repo's `AGENTS.md`. `join` still enqueues the durable `bootstrap-<alias>`
-kickoff; `--bootstrap` extends that to standalone launches;
-`--no-bootstrap` opts out entirely.
+`$CADENCE_STATE_DIR/briefings/<root>/BRIEFING-<alias>.md` (identity,
+protocol quickref, roster snapshot) — under the state dir, never the
+agent's cwd repo — and `agent show` prints the path. The idempotent
+`<!-- cadence:* -->` block in the repo's `AGENTS.md` is opt-in via
+`--agents-md` (persisted, replayed on resume); `.gitignore` only gains
+`.cadence/` when `--worktree` actually creates `.cadence/wt/`. `join`
+still enqueues the durable `bootstrap-<alias>` kickoff; `--bootstrap`
+extends that to standalone launches; `--no-bootstrap` opts out entirely.
 
 **What it taught.** The protocol primer has to arrive *with* the agent,
 not in the operator's head. An agent that can't discover `cadence self`

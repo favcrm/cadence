@@ -3657,6 +3657,19 @@ fn git_repo(path: &Path) {
     }
 }
 
+/// `git status --porcelain` — empty means the repo is byte-identical
+/// to its index+HEAD (audit N8's launch-purity check).
+fn git_porcelain(repo: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git status: {:?}", out.stderr);
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 #[test]
 fn pty_pane_gets_default_options() {
     let d = TestDaemon::start();
@@ -3715,19 +3728,16 @@ fn join_bootstrap_briefs_and_queues() {
     );
     d.wait_agent("w-join", "idle", 20);
 
-    // Briefing persisted under the PM's .cadence/<pm>/ and the repo's
-    // .gitignore covers .cadence/.
-    let briefing = pm_repo
-        .join(".cadence")
+    // Briefing persisted under the state dir's briefings/<pm>/ — the
+    // PM's repo itself is left byte-identical (audit N8).
+    let briefing = d
+        .state
+        .join("briefings")
         .join("pm")
         .join("BRIEFING-w-join.md");
     let text = std::fs::read_to_string(&briefing).unwrap();
     assert!(text.contains("w-join") && text.contains("pm"), "{text}");
-    let gitignore = std::fs::read_to_string(pm_repo.join(".gitignore")).unwrap();
-    assert!(
-        gitignore.lines().any(|l| l.trim() == ".cadence/"),
-        "{gitignore}"
-    );
+    assert_eq!(git_porcelain(&pm_repo), "", "launch touched the repo");
 
     // The durable bootstrap message sits queued behind the ready gate —
     // no bypass — and its body is one pty-safe line naming alias, PM
@@ -3777,7 +3787,7 @@ fn join_bootstrap_briefs_and_queues() {
         "{}",
         show["messages"]
     );
-    assert!(!pm_repo.join(".cadence/pm/BRIEFING-w-nb.md").exists());
+    assert!(!d.state.join("briefings/pm/BRIEFING-w-nb.md").exists());
 }
 
 #[test]
@@ -3800,8 +3810,9 @@ fn join_bootstrap_runs_on_fake_worker() {
     // No gate on a fake endpoint — the bootstrap completes its turn.
     let m = d.wait_message("w-fake", "bootstrap-w-fake", &["completed"], 15);
     assert_eq!(m["source"], "bootstrap");
-    // The briefing still lands in the PM's .cadence/ (PM cwd = tempdir).
-    assert!(d.dir.path().join(".cadence/pm/BRIEFING-w-fake.md").exists());
+    // The briefing still lands under the PM's briefings/ dir — inside
+    // the state dir, never the PM's cwd.
+    assert!(d.state.join("briefings/pm/BRIEFING-w-fake.md").exists());
 }
 
 #[test]
@@ -4310,10 +4321,11 @@ fn agent_list_scopes_to_callers_group() {
     assert_eq!(aliases(&v), vec!["other", "pm1", "w1"], "{v}");
 }
 
-/// Every launch path writes the briefing + AGENTS.md block; standalone
-/// launches stay silent (no message) unless --bootstrap is passed.
+/// Every launch writes the briefing under the state dir — the cwd repo
+/// stays byte-identical unless the operator opts in. Standalone launches
+/// stay silent (no message) unless --bootstrap is passed.
 #[test]
-fn standalone_launch_writes_briefing_and_agents_block() {
+fn standalone_launch_writes_briefing_only() {
     let d = TestDaemon::start();
     let _mock = d.mock_devin();
     let repo = d.dir.path().join("srepo");
@@ -4334,17 +4346,24 @@ fn standalone_launch_writes_briefing_and_agents_block() {
     );
     d.wait_agent("solo", "idle", 20);
 
-    // Standalone root = itself: briefing in its own .cadence/<alias>/.
-    let text = std::fs::read_to_string(repo.join(".cadence/solo/BRIEFING-solo.md")).unwrap();
+    // Standalone root = itself: briefing under briefings/<alias>/ in
+    // the state dir. The repo is untouched — no .cadence/, .gitignore
+    // or AGENTS.md (audit N8).
+    let briefing = d.state.join("briefings/solo/BRIEFING-solo.md");
+    let text = std::fs::read_to_string(&briefing).unwrap();
     assert!(text.contains("none — you are a group root"), "{text}");
     assert!(text.contains("cadence self"), "{text}");
-    // AGENTS.md carries the marker block; .gitignore covers .cadence/.
-    let agents = std::fs::read_to_string(repo.join("AGENTS.md")).unwrap();
-    assert!(agents.contains("<!-- cadence:begin -->"), "{agents}");
-    let gitignore = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
-    assert!(gitignore.lines().any(|l| l.trim() == ".cadence/"));
-    // Silent by default — no bootstrap message was enqueued.
+    assert_eq!(git_porcelain(&repo), "", "launch touched the repo");
+    assert!(!repo.join(".cadence").exists());
+    assert!(!repo.join("AGENTS.md").exists());
+    assert!(!repo.join(".gitignore").exists());
+    // `agent show` points at the state-dir path.
     let show = d.rpc("agent_show", json!({"alias": "solo"})).unwrap();
+    assert_eq!(
+        show["agent"]["briefing"].as_str().unwrap(),
+        briefing.to_str().unwrap()
+    );
+    // Silent by default — no bootstrap message was enqueued.
     assert!(!show["messages"]
         .as_array()
         .unwrap()
@@ -4389,7 +4408,7 @@ fn standalone_launch_writes_briefing_and_agents_block() {
         String::from_utf8_lossy(&out.stderr)
     );
     d.wait_agent("nb", "idle", 20);
-    assert!(!repo.join(".cadence/nb/BRIEFING-nb.md").exists());
+    assert!(!d.state.join("briefings/nb/BRIEFING-nb.md").exists());
     let show = d.rpc("agent_show", json!({"alias": "nb"})).unwrap();
     assert!(!show["messages"]
         .as_array()
@@ -4417,8 +4436,9 @@ fn agent_bootstrap_retrofits_live_agent() {
     d.wait_agent("solo", "idle", 10);
     let bin = env!("CARGO_BIN_EXE_cadence");
 
-    // Wired worker: briefing lands under the PM's .cadence/<pm>/ and the
-    // message enqueues (fake endpoint — it completes its turn).
+    // Wired worker: briefing lands under the state dir's
+    // briefings/<pm>/ and the message enqueues (fake endpoint — it
+    // completes its turn).
     let out = std::process::Command::new(bin)
         .arg("--state-dir")
         .arg(&d.state)
@@ -4434,11 +4454,11 @@ fn agent_bootstrap_retrofits_live_agent() {
     assert_eq!(v["message"], "bootstrap-w1");
     let m = d.wait_message("w1", "bootstrap-w1", &["completed"], 15);
     assert_eq!(m["source"], "bootstrap");
-    let briefing = d.dir.path().join(".cadence/pm/BRIEFING-w1.md");
+    let briefing = d.state.join("briefings/pm/BRIEFING-w1.md");
     let text = std::fs::read_to_string(&briefing).unwrap();
     assert!(text.contains("`pm` — reported results route"), "{text}");
 
-    // Standalone agent briefs into its own .cadence/<self>/.
+    // Standalone agent briefs under its own briefings/<self>/.
     let out = std::process::Command::new(bin)
         .arg("--state-dir")
         .arg(&d.state)
@@ -4446,7 +4466,7 @@ fn agent_bootstrap_retrofits_live_agent() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(d.dir.path().join(".cadence/solo/BRIEFING-solo.md").exists());
+    assert!(d.state.join("briefings/solo/BRIEFING-solo.md").exists());
     d.wait_message("solo", "bootstrap-solo", &["completed"], 15);
 
     // Unknown alias is refused, nothing is written.
@@ -7848,11 +7868,243 @@ fn cli_join_claude_tui_briefs_prefixes() {
     let argv = std::fs::read_to_string(d.claude_pane_file(&mock, "wj", "argv")).unwrap();
     assert!(argv.contains("--session-id"), "{argv}");
     // The briefing tells the worker which leading chars never paste.
-    let briefing = pm_repo.join(".cadence/pm/BRIEFING-wj.md");
+    let briefing = d.state.join("briefings/pm/BRIEFING-wj.md");
     let text = std::fs::read_to_string(&briefing).unwrap();
     for want in ["`/`", "`!`", "`@`", "refused"] {
         assert!(text.contains(want), "briefing missing {want}:\n{text}");
     }
     // The group upstream is in params so results route to the PM.
     assert_eq!(agent["params"]["upstream"], "pm", "{agent}");
+}
+
+/// Audit N8: a launch of any kind leaves the agent's cwd repository
+/// byte-identical — briefings live under the state dir, AGENTS.md and
+/// .gitignore writes are opt-in only.
+#[test]
+fn launch_leaves_cwd_repo_untouched() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let repo = d.dir.path().join("repo");
+    git_repo(&repo);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "join", "pm", "fake", "--alias", "w-clean", "--detach", "--cwd",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("w-clean", "idle", 15);
+
+    // Nothing in the repo changed — no .cadence/, .gitignore or
+    // AGENTS.md appeared.
+    assert_eq!(git_porcelain(&repo), "", "launch touched the repo");
+    assert!(!repo.join(".cadence").exists());
+    assert!(!repo.join(".gitignore").exists());
+    assert!(!repo.join("AGENTS.md").exists());
+
+    // The briefing lives under the state dir; the bootstrap message
+    // and `agent show` both name that absolute path.
+    let file = d.state.join("briefings/pm/BRIEFING-w-clean.md");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("w-clean"), "{text}");
+    let m = d.wait_message("w-clean", "bootstrap-w-clean", &["completed"], 15);
+    let body = m["body"].as_str().unwrap();
+    assert!(
+        body.contains(file.to_str().unwrap()),
+        "bootstrap body missing the briefing path: {body}"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "w-clean"})).unwrap();
+    assert_eq!(
+        show["agent"]["briefing"].as_str().unwrap(),
+        file.to_str().unwrap()
+    );
+}
+
+/// A launch whose endpoint never opens writes nothing — the cwd repo
+/// stays byte-identical and no briefing is created.
+#[test]
+fn failed_open_writes_nothing() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let repo = d.dir.path().join("repo");
+    git_repo(&repo);
+    // The managed claude spawn fails outright — a bad command.
+    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("CADENCE_CLAUDE_COMMAND", "/definitely-not-a-claude");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "join", "pm", "claude", "--alias", "w-bad", "--detach", "--cwd",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("w-bad", "attention", 15);
+    std::env::remove_var("CADENCE_CLAUDE_COMMAND");
+    drop(guard);
+
+    assert_eq!(git_porcelain(&repo), "", "failed open touched the repo");
+    assert!(!repo.join(".cadence").exists());
+    assert!(!d.state.join("briefings/pm/BRIEFING-w-bad.md").exists());
+    // No bootstrap was enqueued for a pane that never opened.
+    let show = d.rpc("agent_show", json!({"alias": "w-bad"})).unwrap();
+    assert!(!show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["source"] == "bootstrap"));
+}
+
+/// `--agents-md` is the opt-in: the marker block lands in the worker's
+/// repo AGENTS.md once and resume re-applies it without duplicating.
+/// `--worktree` is the other opt-in: `.cadence/` is gitignored only
+/// when the worktree is actually created, and only once.
+#[test]
+fn agents_md_opt_in_and_worktree_gitignore() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let repo = d.dir.path().join("repo");
+    git_repo(&repo);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+
+    // Opted-in worker: AGENTS.md gains the marker block exactly once.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "join",
+            "pm",
+            "fake",
+            "--alias",
+            "w-am",
+            "--detach",
+            "--agents-md",
+            "--cwd",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("w-am", "idle", 15);
+    let agents = std::fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+    assert_eq!(
+        agents.matches("<!-- cadence:begin -->").count(),
+        1,
+        "{agents}"
+    );
+    // The opt-in persisted in params — resume replays it.
+    let show = d.rpc("agent_show", json!({"alias": "w-am"})).unwrap();
+    assert_eq!(show["agent"]["params"]["agents_md"], true);
+
+    // Resume re-applies the block idempotently — still exactly one.
+    d.rpc("agent_stop", json!({"alias": "w-am"})).unwrap();
+    d.wait_agent("w-am", "stopped", 15);
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "resume", "w-am", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("w-am", "idle", 15);
+    let agents = std::fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+    assert_eq!(
+        agents.matches("<!-- cadence:begin -->").count(),
+        1,
+        "{agents}"
+    );
+
+    // --worktree creates .cadence/wt inside the repo — only then does
+    // .gitignore gain the line, and only when missing.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "join",
+            "pm",
+            "fake",
+            "--alias",
+            "w-wt",
+            "--detach",
+            "--worktree",
+            "wt1",
+            "--cwd",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("w-wt", "idle", 15);
+    let gitignore = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
+    assert_eq!(
+        gitignore
+            .lines()
+            .filter(|l| l.trim() == ".cadence/")
+            .count(),
+        1,
+        "{gitignore}"
+    );
+
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "join",
+            "pm",
+            "fake",
+            "--alias",
+            "w-wt2",
+            "--detach",
+            "--worktree",
+            "wt2",
+            "--cwd",
+        ])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("w-wt2", "idle", 15);
+    let gitignore = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
+    assert_eq!(
+        gitignore
+            .lines()
+            .filter(|l| l.trim() == ".cadence/")
+            .count(),
+        1,
+        "{gitignore}"
+    );
 }

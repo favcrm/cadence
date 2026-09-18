@@ -181,9 +181,13 @@ makes their result reports route back to the PM's queue by default.
 Inside a cadence pane `cadence agent list` shows just the caller's group
 (the root row carries `"group_root": true`); `--all` shows every agent.
 
-Every launch writes `.cadence/<group-root>/BRIEFING-<alias>.md` (identity,
-protocol quickref, roster) plus an idempotent `<!-- cadence:* -->` block
-in the repo's `AGENTS.md`; joins also enqueue a `bootstrap-<alias>`
+Every launch writes a briefing under the daemon's state dir —
+`$CADENCE_STATE_DIR/briefings/<group-root>/BRIEFING-<alias>.md`
+(identity, protocol quickref, roster); `agent show` prints the path and
+the bootstrap message names it. Nothing is written into the agent's cwd
+repo by default. `--agents-md` opts the launch into an idempotent
+`<!-- cadence:* -->` block in the repo's `AGENTS.md` (persisted in
+params, replayed on resume); joins also enqueue a `bootstrap-<alias>`
 message. `--bootstrap` adds the message to standalone launches;
 `--no-bootstrap` skips all of it.
 

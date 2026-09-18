@@ -46,7 +46,10 @@ cadence agent list    # your group: every row has "group" (its root);
                       #  the root row also has "group_root": true.
                       #  --all for every agent; "dead" = no live endpoint
 cadence agent show <alias>            # one agent + its message/event cursor
-cat .cadence/<pm>/BRIEFING-<your-alias>.md   # your written briefing, if present
+cat <briefing path>   # your written briefing — the path printed in
+                      # your bootstrap message, also in `agent show`'s
+                      # "briefing" field (under the daemon's state dir,
+                      # never your cwd repo)
 ```
 
 If your briefing names an `upstream` PM, your results are routed to it
