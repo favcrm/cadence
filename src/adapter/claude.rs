@@ -27,11 +27,19 @@
 //!   never fenced for being long.
 //! - One `tool_use` lifecycle event per assistant tool call (name only)
 //!   keeps `events --follow` meaningful without proxying the transcript.
-//! - No approval brokering in phase A: `--permission-mode` (default
-//!   `manual`) and `--allowedTools` (always `Bash(cadence *)` plus
-//!   `params.allowed_tools`) are fixed at launch and replayed on resume.
-//!   Denials surface as `permission_denials` on a still-successful
-//!   result — recorded as an event, never a failure.
+//! - `--permission-mode` (default `manual`) and `--allowedTools`
+//!   (always `Bash(cadence *)` plus `params.allowed_tools`) are fixed at
+//!   launch and replayed on resume. Denials surface as
+//!   `permission_denials` on a still-successful result — recorded as an
+//!   event, never a failure.
+//! - `params.broker_approvals` opts the endpoint into approval
+//!   brokering: `--permission-prompt-tool mcp__cadence__approve` plus a
+//!   generated `--mcp-config` route every prompt the mode can't
+//!   pre-decide to `agent requests`/`agent respond` (via the
+//!   `cadence mcp-permission` stdio server). While a request is open
+//!   the daemon stamps `note_activity` so the wait on a human never
+//!   counts as turn silence. Refused with `--bypass` (moot) and `--tui`
+//!   (a pane answers its own prompts).
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -92,7 +100,15 @@ fn claude_command() -> Vec<String> {
 /// `params.allowed_tools` (added to the `Bash(cadence *)` baseline) and
 /// `params.model` are replayed verbatim on every resume — the launch
 /// line is rebuilt from the durable params, never from memory.
-fn build_command(agent: &Agent, session_id: &str, resume: bool) -> Vec<String> {
+/// `mcp_config` is the generated broker config path when
+/// `params.broker_approvals` is set — it lands beside the permission
+/// flags so every resume replays the broker wiring too.
+fn build_command(
+    agent: &Agent,
+    session_id: &str,
+    resume: bool,
+    mcp_config: Option<&Path>,
+) -> Vec<String> {
     let params = agent.params.clone().unwrap_or(Value::Null);
     let mut cmd = claude_command();
     for flag in [
@@ -129,7 +145,43 @@ fn build_command(agent: &Agent, session_id: &str, resume: bool) -> Vec<String> {
     for tool in allowed {
         cmd.extend(["--allowedTools".to_string(), tool]);
     }
+    if let Some(config) = mcp_config {
+        cmd.extend([
+            "--mcp-config".to_string(),
+            config.to_string_lossy().to_string(),
+            "--strict-mcp-config".to_string(),
+            "--permission-prompt-tool".to_string(),
+            "mcp__cadence__approve".to_string(),
+        ]);
+    }
     cmd
+}
+
+/// The command the generated mcp-config points at — this same binary's
+/// hidden `mcp-permission` subcommand. `CADENCE_MCP_PERMISSION_COMMAND`
+/// overrides the binary path (tests point it at the built binary —
+/// `current_exe` there is the test runner).
+fn mcp_permission_command() -> Vec<String> {
+    let exe = std::env::var("CADENCE_MCP_PERMISSION_COMMAND")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "cadence".to_string());
+    vec![exe, "mcp-permission".to_string()]
+}
+
+/// Is this agent opted into approval brokering.
+fn brokered(agent: &Agent) -> bool {
+    agent
+        .params
+        .as_ref()
+        .and_then(|p| p.get("broker_approvals"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 pub struct ClaudeAdapter {
@@ -213,6 +265,42 @@ impl ClaudeAdapter {
             Box::new(move |incoming| routed.dispatch(incoming)),
             Box::new(move || disconnected.on_disconnect()),
         )
+    }
+
+    /// The `--mcp-config` file a brokered agent launches with:
+    /// `agents/<alias>.mcp.json` under the state dir, naming the
+    /// `cadence mcp-permission` stdio server. Identity env is explicit
+    /// in the config rather than inherited through the provider — the
+    /// server must find its agent and socket no matter how the CLI
+    /// filters the environment it hands to MCP children.
+    fn write_mcp_config(&self, agent: &Agent) -> Result<PathBuf> {
+        let path = self
+            .state_dir
+            .join("agents")
+            .join(format!("{}.mcp.json", agent.alias));
+        let cmd = mcp_permission_command();
+        let timeout = agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("permission_timeout_secs"))
+            .and_then(Value::as_u64)
+            .unwrap_or(900);
+        let config = json!({"mcpServers": {"cadence": {
+        "command": cmd[0],
+        "args": cmd[1..],
+        "env": {
+            "CADENCE_ALIAS": agent.alias,
+            "CADENCE_STATE_DIR": self.state_dir.to_string_lossy(),
+            "CADENCE_PERMISSION_TIMEOUT_SECS": timeout.to_string(),
+        }}}});
+        // Temp + rename — a relaunch never leaves a torn config behind.
+        let tmp = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&tmp, config.to_string())?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(path)
     }
 }
 
@@ -311,6 +399,12 @@ impl Shared {
 }
 
 impl ProviderAdapter for ClaudeAdapter {
+    /// A brokered permission request is open — the provider is silent
+    /// while a human decides, and that wait is activity, not idleness.
+    fn note_activity(&self) {
+        *self.shared.last_activity.lock().unwrap() = Instant::now();
+    }
+
     /// Open: fresh agents mint a `--session-id`; a stored `thread_id`
     /// reopens with `--resume`. The id is verified for real at the
     /// first `system/init` — Claude emits it lazily with the first
@@ -321,7 +415,17 @@ impl ProviderAdapter for ClaudeAdapter {
             .thread_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let command = build_command(agent, &session_id, resume);
+        // Brokered approvals get a generated mcp-config beside the
+        // provider log — written per open so resume replays it like
+        // every other launch param, and carrying the identity env the
+        // `mcp-permission` server needs explicitly (independent of the
+        // provider's own env propagation).
+        let mcp_config = if brokered(agent) {
+            Some(self.write_mcp_config(agent)?)
+        } else {
+            None
+        };
+        let command = build_command(agent, &session_id, resume, mcp_config.as_deref());
         *self.shared.expected_session.lock().unwrap() = Some(session_id.clone());
         *self.shared.session_mismatch.lock().unwrap() = None;
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();

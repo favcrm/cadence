@@ -188,6 +188,17 @@ enum Commands {
         /// Shortcut for --permission-mode bypassPermissions.
         #[arg(long, conflicts_with = "permission_mode")]
         bypass: bool,
+        /// Broker tool-permission prompts through `agent requests` /
+        /// `agent respond` instead of auto-denying them — the CLI's
+        /// `--permission-prompt-tool` is pointed at a cadence MCP
+        /// server. Managed endpoint only; refused with `--bypass`
+        /// (moot) and `--tui` (a pane answers its own prompts).
+        #[arg(long, conflicts_with_all = ["bypass", "tui"])]
+        broker_approvals: bool,
+        /// Seconds a brokered prompt waits on an operator decision
+        /// before the tool call is denied [default: 900].
+        #[arg(long, requires = "broker_approvals", value_parser = clap::value_parser!(u64).range(1..))]
+        permission_timeout_secs: Option<u64>,
         /// Seconds without any provider event before a turn is declared
         /// unknown [default: 900]. Liveness is activity-based — a turn
         /// that keeps emitting events runs as long as it needs.
@@ -334,6 +345,16 @@ enum Commands {
         /// Managed endpoint only.
         #[arg(long, conflicts_with = "tui", value_parser = clap::value_parser!(u64).range(1..))]
         turn_max_secs: Option<u64>,
+        /// Broker a claude worker's tool-permission prompts through
+        /// `agent requests` / `agent respond` instead of auto-denying
+        /// them. Managed endpoint only; refused with `--bypass` and
+        /// `--tui`.
+        #[arg(long, conflicts_with_all = ["bypass", "tui"])]
+        broker_approvals: bool,
+        /// Seconds a brokered prompt waits on an operator decision
+        /// before the tool call is denied [default: 900].
+        #[arg(long, requires = "broker_approvals", value_parser = clap::value_parser!(u64).range(1..))]
+        permission_timeout_secs: Option<u64>,
     },
     /// Attach this terminal to a live agent's native endpoint. `name`
     /// may be an alias, a provider-native id, or a provider name when
@@ -436,6 +457,16 @@ enum Commands {
     Ui {
         #[command(subcommand)]
         action: cadence_agent::ui::UiAction,
+    },
+    /// Stdio MCP server backing `--permission-prompt-tool` on a
+    /// brokered managed claude — spawned by the provider CLI via the
+    /// generated `--mcp-config`, never by hand.
+    #[command(hide = true)]
+    McpPermission {
+        /// Override the decision deadline in seconds (else
+        /// `CADENCE_PERMISSION_TIMEOUT_SECS`, default 900).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout_secs: Option<u64>,
     },
 }
 
@@ -708,6 +739,10 @@ enum AgentAction {
         /// JSON answers file for input requests.
         #[arg(long)]
         answers_file: Option<PathBuf>,
+        /// Operator note carried on a brokered decline — handed to the
+        /// provider as the denial message.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Reconcile every `unknown` message fencing the agent, then resume
     /// it (`--no-resume` leaves it stopped). Same reconcile rules and
@@ -1661,6 +1696,7 @@ fn run() -> Result<i32> {
                     request,
                     decision,
                     answers_file,
+                    reason,
                 } => {
                     let answers = match answers_file {
                         Some(path) => Some(serde_json::from_str::<Value>(
@@ -1672,7 +1708,8 @@ fn run() -> Result<i32> {
                         &state_dir,
                         "agent_respond",
                         json!({"alias": alias, "request": request,
-                               "decision": decision, "answers": answers}),
+                               "decision": decision, "answers": answers,
+                               "reason": reason}),
                     )?
                 }
                 AgentAction::Unfence {
@@ -1869,6 +1906,8 @@ fn run() -> Result<i32> {
             permission_mode,
             allow,
             bypass,
+            broker_approvals,
+            permission_timeout_secs,
             turn_idle_secs,
             turn_max_secs,
             instructions_file,
@@ -1898,6 +1937,8 @@ fn run() -> Result<i32> {
                 permission_mode,
                 allow,
                 bypass,
+                broker_approvals,
+                permission_timeout_secs,
                 turn_idle_secs,
                 turn_max_secs,
             },
@@ -1921,6 +1962,8 @@ fn run() -> Result<i32> {
             permission_mode,
             allow,
             bypass,
+            broker_approvals,
+            permission_timeout_secs,
             turn_idle_secs,
             turn_max_secs,
         } => join_group(
@@ -1943,6 +1986,8 @@ fn run() -> Result<i32> {
                 permission_mode: permission_mode.clone(),
                 allow,
                 bypass,
+                broker_approvals,
+                permission_timeout_secs,
                 turn_idle_secs,
                 turn_max_secs,
             },
@@ -2209,6 +2254,7 @@ fn run() -> Result<i32> {
         Commands::Job { action } => run_job(&state_dir, &action),
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
+        Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
 }
 
@@ -2536,6 +2582,12 @@ struct ClaudeOpts {
     permission_mode: Option<String>,
     allow: Vec<String>,
     bypass: bool,
+    /// `params.broker_approvals` — route permission prompts to
+    /// `agent requests`/`agent respond` via the mcp-permission server.
+    broker_approvals: bool,
+    /// `params.permission_timeout_secs` — operator-decision deadline
+    /// before a brokered prompt denies (default 900).
+    permission_timeout_secs: Option<u64>,
     /// `params.turn_idle_secs` — inactivity window before a turn is
     /// `unknown` (activity-based liveness; default 900).
     turn_idle_secs: Option<u64>,
@@ -2675,6 +2727,23 @@ fn provider_launch(
         }
         if !claude.allow.is_empty() {
             params_obj.insert("allowed_tools".to_string(), json!(claude.allow));
+        }
+        // `--broker-approvals` is managed-only: the verbs refuse it
+        // with `--tui`/`--bypass` already, and the spec gate keeps any
+        // non-verb path honest the same way `turn_idle_secs` is gated.
+        if claude.broker_approvals {
+            if tui || claude.bypass {
+                return Err(Error::rejected(
+                    "--broker-approvals is refused with --tui and --bypass — \
+                     a pane answers its own prompts and bypass makes them moot",
+                ));
+            }
+            if spec.launch_params.contains(&"broker_approvals") {
+                params_obj.insert("broker_approvals".to_string(), json!(true));
+            }
+            if let Some(secs) = claude.permission_timeout_secs {
+                params_obj.insert("permission_timeout_secs".to_string(), json!(secs));
+            }
         }
         if spec.launch_params.contains(&"turn_idle_secs") {
             if let Some(secs) = claude.turn_idle_secs {
@@ -3396,6 +3465,87 @@ mod tests {
             "--bypass"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn broker_approvals_flags_parse() {
+        // `cadence claude` — broker parses; refused with --bypass/--tui;
+        // the timeout requires the flag.
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "claude",
+            "--broker-approvals",
+            "--permission-timeout-secs",
+            "60",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Claude {
+                broker_approvals: true,
+                permission_timeout_secs: Some(60),
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["cadence", "claude", "--broker-approvals", "--bypass"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["cadence", "claude", "--broker-approvals", "--tui"]).is_err());
+        assert!(
+            Cli::try_parse_from(["cadence", "claude", "--permission-timeout-secs", "60"]).is_err()
+        );
+        // `join <pm> claude` carries the same surface.
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "join",
+            "pm",
+            "claude",
+            "--broker-approvals",
+            "--permission-timeout-secs",
+            "30",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Join {
+                broker_approvals: true,
+                permission_timeout_secs: Some(30),
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "cadence",
+            "join",
+            "pm",
+            "claude",
+            "--broker-approvals",
+            "--tui"
+        ])
+        .is_err());
+        // `agent respond --reason` and the hidden MCP verb parse.
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "agent",
+            "respond",
+            "w1",
+            "--request",
+            "perm-1",
+            "--decision",
+            "decline",
+            "--reason",
+            "not safe",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Agent {
+                action: AgentAction::Respond {
+                    reason: Some(r), ..
+                },
+                ..
+            } if r == "not safe"
+        ));
+        assert!(Cli::try_parse_from(["cadence", "mcp-permission"]).is_ok());
     }
 
     #[test]

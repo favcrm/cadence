@@ -6183,8 +6183,14 @@ fn agent_set_opts_live_agent_into_auto_ready() {
 ///   chatty           — activity every ~0.3s forever, never a result
 ///                      (absolute-cap fence)
 ///   tooluse          — one assistant tool_use block, then success
+///   permit           — asks the configured `--mcp-config` server to
+///                      approve a Bash call for the prompt; allow →
+///                      MOCK_OK, deny → DENIED:<message> plus a
+///                      permission_denials entry. The verdict lands in
+///                      `<pidfile>.verdict` too, so tests can observe a
+///                      denial even after the daemon is gone.
 const MOCK_CLAUDE_PY: &str = r#"
-import json, os, signal, sys, time
+import json, os, signal, subprocess, sys, time
 
 pidfile = sys.argv[1]
 # Mode travels in the pidfile basename — the daemon scrubs CADENCE_*
@@ -6246,6 +6252,79 @@ def current_mode():
     except FileNotFoundError:
         return mode
 
+# ---- brokered permission flow (permit mode) ----
+mcp_proc = None
+mcp_next_id = [0]
+
+def mcp_server():
+    """Spawn the `--mcp-config` server once, like the real CLI: env
+    from the config overlays ours, then initialize/initialized."""
+    global mcp_proc
+    if mcp_proc is not None:
+        return mcp_proc
+    cfg_path = None
+    for i, a in enumerate(argv):
+        if a == "--mcp-config" and i + 1 < len(argv):
+            cfg_path = argv[i + 1]
+    if cfg_path is None:
+        return None
+    srv = json.load(open(cfg_path))["mcpServers"]["cadence"]
+    env = dict(os.environ)
+    env.update(srv.get("env", {}))
+    proc = subprocess.Popen([srv["command"]] + srv["args"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            env=env, text=True, bufsize=1)
+    mcp_proc = proc
+    mcp_rpc(proc, "initialize",
+            {"protocolVersion": "2025-11-25", "capabilities": {},
+             "clientInfo": {"name": "mock-claude", "version": "0"}})
+    proc.stdin.write(json.dumps(
+        {"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+    proc.stdin.flush()
+    mcp_rpc(proc, "tools/list", {})
+    return proc
+
+def mcp_rpc(proc, method, params):
+    mcp_next_id[0] += 1
+    proc.stdin.write(json.dumps(
+        {"jsonrpc": "2.0", "id": mcp_next_id[0],
+         "method": method, "params": params}) + "\n")
+    proc.stdin.flush()
+    line = proc.stdout.readline()
+    if not line:
+        raise RuntimeError("mcp server exited")
+    return json.loads(line)
+
+def record_verdict(verdict):
+    tmp = pidfile + ".verdict.tmp"
+    with open(tmp, "w") as f:
+        f.write(json.dumps(verdict))
+    os.rename(tmp, pidfile + ".verdict")
+
+def ask_permission(command_text):
+    """One approve call — returns the verdict object the server put
+    inside the text content block (allow/deny), or a local deny when
+    the broker is unreachable."""
+    proc = mcp_server()
+    if proc is None:
+        verdict = {"behavior": "deny",
+                   "message": "no --mcp-config on argv"}
+        record_verdict(verdict)
+        return verdict
+    try:
+        resp = mcp_rpc(proc, "tools/call",
+                       {"name": "approve",
+                        "arguments": {"tool_name": "Bash",
+                                      "input": {"command": command_text},
+                                      "tool_use_id": "tu_permit_%d"
+                                      % mcp_next_id[0]}})
+        text = resp["result"]["content"][0]["text"]
+        verdict = json.loads(text)
+    except Exception as e:
+        verdict = {"behavior": "deny", "message": "mcp call failed: %s" % e}
+    record_verdict(verdict)
+    return verdict
+
 for line in sys.stdin:
     try:
         msg = json.loads(line)
@@ -6302,6 +6381,24 @@ for line in sys.stdin:
     if mode_now == "fail":
         result(subtype="error_during_execution", is_error=True,
                errors=["mock exploded"], stop_reason="error")
+        continue
+    if mode_now == "permit":
+        # The real CLI blocks on the permission-prompt tool here — one
+        # approve call per tool use; the verdict decides the outcome.
+        verdict = ask_permission(text)
+        if verdict.get("behavior") == "allow":
+            result(subtype="success", is_error=False,
+                   result="MOCK_OK:" + text, stop_reason="end_turn",
+                   permission_denials=[])
+        else:
+            message = verdict.get("message", "denied")
+            denials = [{"tool_name": "Bash",
+                        "tool_use_id": "tu_permit",
+                        "tool_input": {"command": text},
+                        "message": message}]
+            result(subtype="success", is_error=False,
+                   result="DENIED:" + message, stop_reason="end_turn",
+                   permission_denials=denials)
         continue
     denials = []
     if mode_now == "deny":
@@ -6376,6 +6473,33 @@ impl TestDaemon {
         )
         .unwrap();
     }
+
+    /// Poll `agent_requests` until one request is pending (bounded).
+    fn wait_request(&self, alias: &str, secs: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let requests = self.rpc("agent_requests", json!({"alias": alias})).unwrap()["requests"]
+                .as_array()
+                .unwrap()
+                .clone();
+            if let Some(req) = requests.first() {
+                return req.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent {alias} never showed a pending request"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Pending request handles for an alias right now.
+    fn requests(&self, alias: &str) -> Vec<Value> {
+        self.rpc("agent_requests", json!({"alias": alias})).unwrap()["requests"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
 }
 
 impl Drop for MockClaude {
@@ -6383,6 +6507,7 @@ impl Drop for MockClaude {
         std::env::remove_var("CADENCE_CLAUDE_COMMAND");
         std::env::remove_var("CADENCE_CLAUDE_MODE");
         std::env::remove_var("MOCK_CLAUDE_FIXTURE");
+        std::env::remove_var("CADENCE_MCP_PERMISSION_COMMAND");
     }
 }
 
@@ -6892,6 +7017,446 @@ fn claude_max_turn_fences_chatty() {
         "{m1}"
     );
     d.wait_agent("w1", "attention", 15);
+}
+
+// ==== brokered claude permissions (cadence mcp-permission) ====
+
+/// Point the daemon's generated `--mcp-config` at the real cadence
+/// binary — `current_exe` is the test binary without the override.
+/// Must run while a mock holds ENV_LOCK.
+fn broker_command() {
+    std::env::set_var(
+        "CADENCE_MCP_PERMISSION_COMMAND",
+        env!("CARGO_BIN_EXE_cadence"),
+    );
+}
+
+/// A spawned `cadence mcp-permission` talking stdio — drives the real
+/// server binary directly for wire-shape and restart assertions.
+struct Mcp {
+    child: std::process::Child,
+    next_id: u64,
+}
+
+impl Mcp {
+    fn spawn(state: &Path, alias: &str, timeout_secs: u64) -> Self {
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .args(["mcp-permission"])
+            .env("CADENCE_STATE_DIR", state)
+            .env("CADENCE_ALIAS", alias)
+            .env("CADENCE_PERMISSION_TIMEOUT_SECS", timeout_secs.to_string())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut mcp = Self { child, next_id: 0 };
+        mcp.rpc(
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {},
+                   "clientInfo": {"name": "test", "version": "0"}}),
+        );
+        mcp.notify("notifications/initialized");
+        mcp
+    }
+
+    fn notify(&mut self, method: &str) {
+        use std::io::Write;
+        let line = json!({"jsonrpc": "2.0", "method": method});
+        writeln!(self.child.stdin.as_mut().unwrap(), "{line}").unwrap();
+    }
+
+    /// One request → one response line (blocks until it arrives).
+    fn rpc(&mut self, method: &str, params: Value) -> Value {
+        use std::io::{BufRead, BufReader, Write};
+        self.next_id += 1;
+        let id = self.next_id;
+        let line = json!({"jsonrpc": "2.0", "id": id,
+                          "method": method, "params": params});
+        writeln!(self.child.stdin.as_mut().unwrap(), "{line}").unwrap();
+        let mut out = String::new();
+        BufReader::new(self.child.stdout.as_mut().unwrap())
+            .read_line(&mut out)
+            .unwrap();
+        serde_json::from_str(&out).unwrap_or_else(|_| panic!("mcp EOF: {out}"))
+    }
+}
+
+impl Drop for Mcp {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn claude_brokered_permission_accept() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude("permit", None);
+    broker_command();
+    d.register_inbox("pm");
+    d.register_claude("w1", json!({"upstream": "pm", "broker_approvals": true}));
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "run ls", "message": "m1"}),
+    )
+    .unwrap();
+    // The prompt surfaces as a request holding the agent in
+    // waiting_input — the cause orders after the launch argv write.
+    d.wait_agent("w1", "waiting_input", 15);
+    let req = d.wait_request("w1", 15);
+    let handle = req["request"].as_str().unwrap().to_string();
+    assert_eq!(req["method"], "cadence/approval", "{req}");
+    assert_eq!(req["params"]["tool"], "Bash", "{req}");
+    assert_eq!(req["params"]["input"]["command"], "run ls", "{req}");
+    // A retried open with the same handle dedupes — still one request.
+    d.rpc(
+        "request_open",
+        json!({"alias": "w1", "kind": "approval", "tool": "Bash",
+               "request": handle, "input_summary": "run ls",
+               "input": {"command": "run ls"}}),
+    )
+    .unwrap();
+    assert_eq!(d.requests("w1").len(), 1);
+    // request_opened event names the handle.
+    let ev = d.wait_event("w1", "request_opened", 10);
+    assert_eq!(ev["payload"]["request"], handle, "{ev}");
+    // Launch argv carries the broker wiring.
+    let argv = std::fs::read_to_string(mock.pidfile.with_extension("pid.argv")).unwrap();
+    assert!(
+        argv.contains("--permission-prompt-tool\nmcp__cadence__approve"),
+        "{argv}"
+    );
+    assert!(argv.contains("--strict-mcp-config"), "{argv}");
+    assert!(argv.contains("--mcp-config\n"), "{argv}");
+    // The generated config names the mcp-permission server with the
+    // identity env it needs independent of provider propagation.
+    let cfg: Value =
+        serde_json::from_str(&std::fs::read_to_string(d.state.join("agents/w1.mcp.json")).unwrap())
+            .unwrap();
+    let server = &cfg["mcpServers"]["cadence"];
+    assert_eq!(server["args"], json!(["mcp-permission"]), "{cfg}");
+    assert_eq!(server["env"]["CADENCE_ALIAS"], "w1", "{cfg}");
+    assert_eq!(
+        server["env"]["CADENCE_STATE_DIR"].as_str().unwrap(),
+        d.state.to_str().unwrap(),
+        "{cfg}"
+    );
+    // Accept unblocks the tool call; the turn completes and the agent
+    // leaves waiting_input.
+    d.rpc(
+        "agent_respond",
+        json!({"alias": "w1", "request": handle, "decision": "accept"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("w1", "m1", &["completed"], 20);
+    assert_eq!(m1["result"]["text"], "MOCK_OK:run ls", "{m1}");
+    d.wait_agent("w1", "idle", 15);
+    assert!(d.requests("w1").is_empty());
+    // The verdict the provider received: allow carrying the input.
+    let verdict: Value = serde_json::from_str(
+        &std::fs::read_to_string(mock.pidfile.with_extension("pid.verdict")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(verdict["behavior"], "allow", "{verdict}");
+    assert_eq!(verdict["updatedInput"]["command"], "run ls", "{verdict}");
+    // input_answered closed the request lifecycle.
+    d.wait_event("w1", "input_answered", 10);
+    // Exactly one upstream notice, naming the agent and the command.
+    let notices: Vec<Value> = {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+            let found: Vec<Value> = pm["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["source"].as_str() == Some("worker_notice"))
+                .cloned()
+                .collect();
+            if !found.is_empty() {
+                break found;
+            }
+            assert!(Instant::now() < deadline, "no worker_notice on pm: {pm}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let body = notices[0]["body"].as_str().unwrap();
+    assert!(
+        body.contains(&format!("agent respond w1 --request {handle}")),
+        "{body}"
+    );
+    assert!(body.contains("w1"), "{body}");
+}
+
+#[test]
+fn claude_brokered_permission_decline_with_reason() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude("permit", None);
+    broker_command();
+    d.register_claude("w1", json!({"broker_approvals": true}));
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "rm -rf /", "message": "m1"}),
+    )
+    .unwrap();
+    let req = d.wait_request("w1", 15);
+    d.wait_agent("w1", "waiting_input", 15);
+    // The operator's reason reaches the provider as the denial message.
+    d.rpc(
+        "agent_respond",
+        json!({"alias": "w1", "request": req["request"],
+               "decision": "decline", "reason": "no destructive commands"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("w1", "m1", &["completed"], 20);
+    assert_eq!(
+        m1["result"]["text"], "DENIED:no destructive commands",
+        "{m1}"
+    );
+    // The denial lands on the standard permission_denied event too.
+    let ev = d.wait_event("w1", "permission_denied", 10);
+    assert!(
+        ev["payload"]["denials"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no destructive commands"),
+        "{ev}"
+    );
+    let verdict: Value = serde_json::from_str(
+        &std::fs::read_to_string(mock.pidfile.with_extension("pid.verdict")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(verdict["behavior"], "deny", "{verdict}");
+    assert_eq!(verdict["message"], "no destructive commands", "{verdict}");
+}
+
+#[test]
+fn claude_brokered_permission_timeout_denies() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("permit", None);
+    broker_command();
+    d.register_claude(
+        "w1",
+        // turn_idle_secs (2s) is SHORTER than the permission deadline
+        // (4s): the turn only survives because an open brokered request
+        // counts as provider activity — an idle fence here proves the
+        // liveness path is broken.
+        json!({"broker_approvals": true, "permission_timeout_secs": 4,
+               "turn_idle_secs": 2}),
+    );
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "slow", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    d.wait_request("w1", 15);
+    // Nobody responds: the broker's deadline denies the tool call and
+    // retires the server-side request so the agent is not stuck.
+    let m1 = d.wait_message("w1", "m1", &["completed"], 30);
+    assert!(
+        m1["result"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("DENIED:permission request timed out"),
+        "{m1}"
+    );
+    d.wait_agent("w1", "idle", 15);
+    assert!(d.requests("w1").is_empty(), "timed-out request must retire");
+    d.wait_event("w1", "request_closed", 10);
+}
+
+#[test]
+fn claude_brokered_permission_daemon_restart_denies() {
+    // The real server binary under test: open a brokered request,
+    // restart the daemon mid-wait, and read the verdict off the wire.
+    let mut d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    broker_command();
+    d.register_claude("w1", json!({"broker_approvals": true}));
+    d.wait_agent("w1", "idle", 15);
+    let state = d.state.clone();
+    let mut mcp = Mcp::spawn(&state, "w1", 120);
+    // tools/call blocks in request_wait — its response arrives after
+    // the restart as a clean denial, never a hang or a crash.
+    let verdict_reader = {
+        use std::io::Write;
+        let mut stdin = mcp.child.stdin.take().unwrap();
+        let mut stdout = mcp.child.stdout.take().unwrap();
+        stdin
+            .write_all(
+                json!({"jsonrpc": "2.0", "id": 99, "method": "tools/call",
+                       "params": {"name": "approve",
+                                  "arguments": {"tool_name": "Bash",
+                                                "input": {"command": "ls"},
+                                                "tool_use_id": "tu_1"}}})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        stdin.write_all(b"\n").unwrap();
+        thread::spawn(move || {
+            use std::io::BufRead;
+            let mut line = String::new();
+            std::io::BufReader::new(&mut stdout)
+                .read_line(&mut line)
+                .unwrap();
+            line
+        })
+    };
+    d.wait_request("w1", 15);
+    // Restart: pending lives in memory, so the new daemon reports the
+    // request closed — the server retries through the socket gap and
+    // denies cleanly.
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let d2 = TestDaemon::start_on(state);
+    let line = verdict_reader.join().unwrap();
+    let resp: Value = serde_json::from_str(&line).unwrap();
+    let verdict: Value =
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(verdict["behavior"], "deny", "{verdict}");
+    assert!(
+        verdict["message"].as_str().unwrap().contains("closed"),
+        "{verdict}"
+    );
+    // The restarted daemon shows no residue of the lost request.
+    assert!(d2.requests("w1").is_empty());
+}
+
+#[test]
+fn claude_brokered_params_replayed_on_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude("permit", None);
+    broker_command();
+    d.register_claude(
+        "w1",
+        json!({"broker_approvals": true, "permission_timeout_secs": 120}),
+    );
+    d.wait_agent("w1", "idle", 15);
+    // A completed turn is the cause ordered after the argv dump.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "boot", "message": "m-boot"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    // Answer it so the launch turn completes — one request only.
+    let req = d.wait_request("w1", 10);
+    d.rpc(
+        "agent_respond",
+        json!({"alias": "w1", "request": req["request"], "decision": "accept"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-boot", &["completed"], 20);
+    let argv_file = mock.pidfile.with_extension("pid.argv");
+    let argv1 = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv1.contains("--session-id"), "{argv1}");
+    assert!(argv1.contains("--mcp-config\n"), "{argv1}");
+    assert!(argv1.contains("--strict-mcp-config"), "{argv1}");
+    assert!(
+        argv1.contains("--permission-prompt-tool\nmcp__cadence__approve"),
+        "{argv1}"
+    );
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["params"]["broker_approvals"], true, "{agent}");
+    assert_eq!(agent["params"]["permission_timeout_secs"], 120, "{agent}");
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 15);
+    // Resume replays the broker wiring verbatim — config regenerated,
+    // same flags, resumed session.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "boot2", "message": "m-boot2"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    let req2 = d.wait_request("w1", 10);
+    d.rpc(
+        "agent_respond",
+        json!({"alias": "w1", "request": req2["request"], "decision": "accept"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-boot2", &["completed"], 20);
+    let argv2 = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv2.contains("--resume\n"), "{argv2}");
+    assert!(argv2.contains("--mcp-config\n"), "{argv2}");
+    assert!(
+        argv2.contains("--permission-prompt-tool\nmcp__cadence__approve"),
+        "{argv2}"
+    );
+}
+
+#[test]
+fn claude_brokered_flag_validation() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    // request_open refuses a non-brokered agent.
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    let err = d
+        .rpc(
+            "request_open",
+            json!({"alias": "w1", "kind": "approval", "tool": "Bash"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--broker-approvals"), "{err}");
+    // Register-time validation rejects malformed broker params.
+    for (params, want) in [
+        (json!({"broker_approvals": "yes"}), "boolean"),
+        (json!({"permission_timeout_secs": 0}), "positive integer"),
+        (
+            json!({"broker_approvals": true,
+                   "permission_mode": "bypassPermissions"}),
+            "bypassPermissions",
+        ),
+    ] {
+        let err = d
+            .rpc(
+                "agent_register",
+                json!({"alias": "bad", "provider": "claude",
+                       "endpoint_kind": "managed",
+                       "cwd": d.dir.path().to_str().unwrap(),
+                       "params": params.to_string()}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(want), "{want} missing in: {err}");
+    }
+    // CLI refuses --broker-approvals with --bypass and --tui, and
+    // --permission-timeout-secs without broker mode.
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let cases: &[(&[&str], &str)] = &[
+        (&["claude", "--broker-approvals", "--bypass"], "bypass"),
+        (&["claude", "--broker-approvals", "--tui"], "tui"),
+        (
+            &["claude", "--permission-timeout-secs", "30"],
+            "broker-approvals",
+        ),
+        (
+            &["join", "pm", "claude", "--broker-approvals", "--tui"],
+            "tui",
+        ),
+    ];
+    let home = TempDir::new().unwrap();
+    for (args, want) in cases {
+        let out = std::process::Command::new(bin)
+            .args(*args)
+            .env("CADENCE_STATE_DIR", d.state.clone())
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?} unexpectedly succeeded");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(want), "{args:?} error missing '{want}': {err}");
+    }
 }
 
 // ==================== jobs / tasks / verdicts (M3a) ====================

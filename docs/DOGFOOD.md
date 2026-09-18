@@ -315,6 +315,38 @@ workspace check, not a tool approval.
 the approval policy — a permission mode left at "ask a human" turns
 the manager into the bottleneck.
 
+## A headless claude has no one to answer its prompts
+
+**What happened.** A managed claude worker hit a tool its permission
+mode hadn't pre-decided and the prompt had nowhere to go — the process
+is headless, so the menu renders for a terminal that doesn't exist.
+The turn just sat there; from the daemon's side it looked like a slow
+turn, not a stuck one.
+
+**What landed.** `--broker-approvals` on `cadence claude` /
+`cadence join <pm> claude` launches the provider with
+`--permission-prompt-tool mcp__cadence__approve` plus a generated
+`--mcp-config` naming the hidden `cadence mcp-permission` stdio server.
+Every undecided prompt arrives there as one `approve` tool call, which
+the server opens as a durable request (`request_open`/`request_wait`):
+the agent holds `waiting_input`, `agent requests <alias>` shows the
+tool and its input, one `worker_notice` reaches the upstream PM naming
+the exact respond command, and `agent respond <alias> --request <h>
+--decision accept|decline [--reason …]` unblocks the call — `accept`
+allows with the original input, `decline` denies carrying the reason.
+While a human thinks, the open request itself counts as provider
+activity, so the wait never trips the idle fence; the server denies on
+its own `--permission-timeout-secs` deadline (default 900, retiring the
+handle via `request_close` so the agent isn't stuck) and denies
+`closed` when the daemon restarts mid-wait — pending requests are
+in-memory and never replayed. The flag is refused with `--bypass`
+(prompts are moot) and `--tui` (the pane answers its own); without it,
+`agent respond` still rejects naming the real opt-ups.
+
+**Rule that fell out:** a permission prompt is a request whether or
+not a terminal exists — broker it through the same
+`agent requests`/`agent respond` surface every other requester uses.
+
 ## Claude's TUI has a ghost draft you cannot see
 
 **What happened.** CAD-17 put Claude Code's interactive terminal in a
