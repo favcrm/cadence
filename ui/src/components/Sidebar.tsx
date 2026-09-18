@@ -1,4 +1,5 @@
 import type { Project } from "../types";
+import { Logo } from "./Logo";
 
 interface Props {
   tab: string;
@@ -42,15 +43,7 @@ export default function Sidebar({ tab, onTab, project, onProject, projects, tota
     <aside className="hidden lg:flex sticky top-0 h-screen flex-col border-r border-ink-700 bg-ink-875 px-[14px] pt-[22px] pb-4 overflow-y-auto">
       <div className="px-[7px] pb-[23px]">
         <span className="inline-flex items-center gap-2 text-ink-100 text-[17px] font-semibold tracking-[-.035em]">
-          <svg width="25" height="25" viewBox="0 0 25 25" fill="none">
-            <rect x=".5" y=".5" width="24" height="24" rx="5" stroke="#2e3136" />
-            <path
-              d="M6 16.5V8.5M10.3 16.5v-5M14.6 16.5V6.5M18.9 16.5v-3.4"
-              stroke="#e7e9ec"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-            />
-          </svg>
+          <Logo size={25} />
           <span>
             cadence<span className="text-ink-400 font-normal"> board</span>
           </span>

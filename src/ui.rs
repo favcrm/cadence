@@ -205,6 +205,11 @@ fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Vec<u8>)> {
             "/" | "/index.html" => Some(embedded::INDEX.as_bytes()),
             "/assets/index.js" => Some(embedded::JS.as_bytes()),
             "/assets/index.css" => Some(embedded::CSS.as_bytes()),
+            // Brand files Vite copies from `ui/public/` to the dist root —
+            // without these arms the SPA fallback would answer with HTML.
+            "/favicon.svg" => Some(embedded::FAVICON),
+            "/icon.svg" => Some(embedded::ICON),
+            "/apple-touch-icon.png" => Some(embedded::APPLE_TOUCH_ICON),
             _ => path
                 .strip_prefix("/assets/")
                 .and_then(|name| embedded::ASSETS.get(name).copied()),
@@ -223,6 +228,9 @@ mod embedded {
     pub const INDEX: &str = include_str!("../ui/dist/index.html");
     pub const JS: &str = include_str!("../ui/dist/assets/index.js");
     pub const CSS: &str = include_str!("../ui/dist/assets/index.css");
+    pub const FAVICON: &[u8] = include_bytes!("../ui/dist/favicon.svg");
+    pub const ICON: &[u8] = include_bytes!("../ui/dist/icon.svg");
+    pub const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../ui/dist/apple-touch-icon.png");
 
     /// The latin woff2 files the CSS references (woff fallbacks are not
     /// embedded — every supported browser takes woff2 first).
@@ -1715,4 +1723,42 @@ fn status(state_dir: &Path) -> Result<i32> {
         .unwrap_or_default()
     );
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{content_type, static_file};
+
+    /// Brand files sit at the dist root (Vite copies `ui/public/`); they
+    /// must come back as themselves with an image type, never as the
+    /// SPA's HTML fallback.
+    #[test]
+    fn dist_root_brand_files_are_served_with_image_types() {
+        let dist = tempfile::TempDir::new().unwrap();
+        std::fs::write(dist.path().join("favicon.svg"), "<svg/>").unwrap();
+        std::fs::write(
+            dist.path().join("apple-touch-icon.png"),
+            [0x89, b'P', b'N', b'G'],
+        )
+        .unwrap();
+        let (name, bytes) = static_file(Some(dist.path()), "/favicon.svg").unwrap();
+        assert_eq!(bytes, b"<svg/>");
+        assert_eq!(content_type(&name), "image/svg+xml");
+        let (name, _) = static_file(Some(dist.path()), "/apple-touch-icon.png").unwrap();
+        assert_eq!(content_type(&name), "image/png");
+        assert!(static_file(Some(dist.path()), "/../favicon.svg").is_none());
+    }
+
+    /// The embedded build answers the same three paths.
+    #[cfg(feature = "ui")]
+    #[test]
+    fn embedded_brand_files_are_served() {
+        for path in ["/favicon.svg", "/icon.svg", "/apple-touch-icon.png"] {
+            let (name, bytes) = static_file(None, path).unwrap();
+            assert_eq!(name, path);
+            assert!(!bytes.is_empty());
+        }
+        let (_, svg) = static_file(None, "/favicon.svg").unwrap();
+        assert!(svg.starts_with(b"<svg"));
+    }
 }
