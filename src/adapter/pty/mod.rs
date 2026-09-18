@@ -165,23 +165,46 @@ pub(crate) fn resolve_on_path(bin: &str) -> Result<String> {
     Err(Error::rejected(format!("`{bin}` not found on PATH")))
 }
 
-/// Is `pid` the pane process or one of its descendants?
-pub(crate) fn descends_from(mut pid: u32, pane_pid: u32) -> bool {
+/// Bounded re-probe count for evidence that can transiently miss:
+/// a `/proc` read or a subprocess spawn that fails under load is
+/// inconclusive, not a negative. A genuinely dead pane fails every
+/// pass; a churned one clears on the next.
+const EVIDENCE_PROBES: u32 = 3;
+const EVIDENCE_SETTLE: Duration = Duration::from_millis(25);
+
+/// Is `pid` the pane process or one of its descendants? A mid-walk
+/// `/proc` read failure is retried: an unreadable status file is
+/// inconclusive, not a "does not descend" — a wrong false here can
+/// cost a live pane its session.
+pub(crate) fn descends_from(pid: u32, pane_pid: u32) -> bool {
+    for attempt in 0..EVIDENCE_PROBES {
+        match descend_walk(pid, pane_pid) {
+            Some(found) => return found,
+            None if attempt + 1 < EVIDENCE_PROBES => {
+                std::thread::sleep(EVIDENCE_SETTLE);
+            }
+            None => return false,
+        }
+    }
+    unreachable!()
+}
+
+/// One ancestry walk: `Some(bool)` is a definite answer, `None` means
+/// a `/proc` read raced mid-walk and the answer is not yet known.
+fn descend_walk(mut pid: u32, pane_pid: u32) -> Option<bool> {
     let mut seen = std::collections::HashSet::new();
     while pid != 0 && seen.insert(pid) {
         if pid == pane_pid {
-            return true;
+            return Some(true);
         }
-        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-            return false;
-        };
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
         pid = status
             .lines()
             .find_map(|l| l.strip_prefix("PPid:"))
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
     }
-    false
+    Some(false)
 }
 
 /// A pty provider's forbidden input prefixes — the profile's own list,
@@ -196,28 +219,37 @@ pub fn forbidden_prefixes(provider: &str) -> &'static [char] {
     }
 }
 
-/// Every `/proc` pid holding an open fd to `lock`.
+/// Every `/proc` pid holding an open fd to `lock`. The scan reads
+/// `/proc/<pid>/fd` per live pid — a transient read failure silently
+/// drops that pid — so an all-empty result is re-scanned before it is
+/// believed: a lock nobody holds stays empty, a churned scan does not.
 pub(crate) fn lock_holders(lock: &Path) -> Vec<u32> {
     let target = lock.to_string_lossy().into_owned();
     let mut holders = Vec::new();
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return holders;
-    };
-    for proc in procs.flatten() {
-        let Ok(pid) = proc.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(fds) = std::fs::read_dir(proc.path().join("fd")) else {
-            continue;
-        };
-        let holds = fds.flatten().any(|fd| {
-            std::fs::read_link(fd.path())
-                .map(|l| l.to_string_lossy() == target)
-                .unwrap_or(false)
-        });
-        if holds {
-            holders.push(pid);
+    for attempt in 0..EVIDENCE_PROBES {
+        holders.clear();
+        if let Ok(procs) = std::fs::read_dir("/proc") {
+            for proc in procs.flatten() {
+                let Ok(pid) = proc.file_name().to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                let Ok(fds) = std::fs::read_dir(proc.path().join("fd")) else {
+                    continue;
+                };
+                let holds = fds.flatten().any(|fd| {
+                    std::fs::read_link(fd.path())
+                        .map(|l| l.to_string_lossy() == target)
+                        .unwrap_or(false)
+                });
+                if holds {
+                    holders.push(pid);
+                }
+            }
         }
+        if !holders.is_empty() || attempt + 1 == EVIDENCE_PROBES {
+            break;
+        }
+        std::thread::sleep(EVIDENCE_SETTLE);
     }
     holders
 }
@@ -271,11 +303,28 @@ impl PtyAdapter {
     }
 
     fn tmux(&self, args: &[&str]) -> Result<std::process::Output> {
-        Ok(Command::new(&self.tmux)
-            .arg("-L")
-            .arg(&self.socket)
-            .args(args)
-            .output()?)
+        // A failed *spawn* is load, not pane state: EAGAIN/EMFILE while
+        // the host forks heavily must not read downstream as "session
+        // gone". Retry briefly; a real error (bad binary, dead socket)
+        // still surfaces after the bound.
+        let mut attempt = 0u32;
+        loop {
+            match Command::new(&self.tmux)
+                .arg("-L")
+                .arg(&self.socket)
+                .args(args)
+                .output()
+            {
+                Ok(out) => return Ok(out),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt > EVIDENCE_PROBES {
+                        return Err(e.into());
+                    }
+                    std::thread::sleep(EVIDENCE_SETTLE);
+                }
+            }
+        }
     }
 
     fn tmux_ok(&self, args: &[&str]) -> Result<String> {
@@ -316,11 +365,61 @@ impl PtyAdapter {
     }
 
     /// Verify the pane currently owns its native session — the proof
-    /// itself is the profile's.
+    /// itself is the profile's. The proof underneath is a `/proc` scan,
+    /// so a single miss is inconclusive, not a death certificate: a
+    /// failure is re-probed briefly before it fences a live pane. A
+    /// real ownership change persists across every probe.
     fn verify_ownership(&self, session: &str, native: &str) -> Result<u32> {
         let pane_pid = self.pane_pid(session)?;
-        self.profile.verify_ownership(native, pane_pid)?;
-        Ok(pane_pid)
+        let mut attempt = 0u32;
+        loop {
+            match self.profile.verify_ownership(native, pane_pid) {
+                Ok(()) => return Ok(pane_pid),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt == EVIDENCE_PROBES {
+                        return Err(e);
+                    }
+                    std::thread::sleep(4 * EVIDENCE_SETTLE);
+                }
+            }
+        }
+    }
+
+    /// Poll the profile's ownership proof until the pane claims a
+    /// native session or the open deadline passes — the bounded wait
+    /// both `open` branches share. `None` means the deadline elapsed
+    /// with the pane alive but still holding no provable session; the
+    /// caller applies `resolve_session`'s usual errors for that.
+    fn wait_owned_session(&self, session: &str, pane_pid: u32) -> Result<Option<String>> {
+        let deadline = Instant::now() + self.profile.open_deadline();
+        loop {
+            if !self.has_session(session) {
+                return Err(Error::provider("pane exited during TUI startup"));
+            }
+            if let Some(found) = self.profile.owned_session(pane_pid) {
+                return Ok(Some(found));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// One liveness probe: the tmux session exists, the pane is not
+    /// dead, and it still owns its native session.
+    fn pane_alive(&self) -> bool {
+        let (session, native) = self.session_and_native();
+        if !self.has_session(&session) {
+            return false;
+        }
+        let dead = self
+            .pane_value(&session, "#{pane_dead}")
+            .map(|v| v == "1")
+            .unwrap_or(true);
+        // A live pane that lost its native session is not our endpoint.
+        !dead && self.verify_ownership(&session, &native).is_ok()
     }
 
     /// Gate evaluation before any paste: the pane must be live, not in a
@@ -413,9 +512,14 @@ impl ProviderAdapter for PtyAdapter {
             // Reattach: verify the pane still owns a native session.
             // When one was recorded it must match; a pane left by a
             // crashed first open (nothing recorded yet) is adopted by
-            // discovering which session it owns.
+            // discovering which session it owns. The proof is not
+            // necessarily visible the instant the pane is — a provider
+            // mid-registration, or a `/proc` scan that raced, both read
+            // as "no session yet" — so the reattach waits on the same
+            // deadline the spawn path gets rather than fencing a live
+            // pane on one observation.
             let pane_pid = self.pane_pid(&session)?;
-            let found = self.profile.owned_session(pane_pid);
+            let found = self.wait_owned_session(&session, pane_pid)?;
             (
                 self.profile.resolve_session(desired.as_deref(), found)?,
                 pane_pid,
@@ -456,23 +560,16 @@ impl ProviderAdapter for PtyAdapter {
             ])?;
             let pane_pid = self.pane_pid(&session)?;
             // Bound the wait for the TUI to acquire its native session.
-            let deadline = Instant::now() + self.profile.open_deadline();
-            let native = loop {
-                if !self.has_session(&session) {
-                    return Err(Error::provider("pane exited during TUI startup"));
-                }
-                if let Some(found) = self.profile.owned_session(pane_pid) {
-                    break self
-                        .profile
-                        .resolve_session(desired.as_deref(), Some(found))?;
-                }
-                if Instant::now() >= deadline {
+            let native = match self.wait_owned_session(&session, pane_pid)? {
+                Some(found) => self
+                    .profile
+                    .resolve_session(desired.as_deref(), Some(found))?,
+                None => {
                     return Err(Error::provider(format!(
                         "timed out waiting for the {} TUI to acquire its session",
                         self.profile.name()
-                    )));
+                    )))
                 }
-                std::thread::sleep(Duration::from_millis(200));
             };
             (native, pane_pid)
         };
@@ -637,16 +734,19 @@ impl ProviderAdapter for PtyAdapter {
     }
 
     fn disconnected(&self) -> bool {
-        let (session, native) = self.session_and_native();
-        if !self.has_session(&session) {
-            return true;
+        // Disconnect is destructive — the daemon fences the endpoint
+        // and force-closes the pane — so a single evidence miss must
+        // not carry it. The pane gets the full probe bound; a dead one
+        // fails every pass, a transient miss clears on the next.
+        for attempt in 1..=EVIDENCE_PROBES {
+            if self.pane_alive() {
+                return false;
+            }
+            if attempt < EVIDENCE_PROBES {
+                std::thread::sleep(4 * EVIDENCE_SETTLE);
+            }
         }
-        let dead = self
-            .pane_value(&session, "#{pane_dead}")
-            .map(|v| v == "1")
-            .unwrap_or(true);
-        // A live pane that lost its native session is not our endpoint.
-        dead || self.verify_ownership(&session, &native).is_err()
+        true
     }
 
     fn close(&self) {
