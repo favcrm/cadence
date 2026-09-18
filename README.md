@@ -103,11 +103,15 @@ sandboxed, and html/svg download rather than render. See
 [docs/BOARD.md](docs/BOARD.md).
 
 ```bash
-cadence issue init                 # first run creates ~/pm
+cadence issue init                 # first run creates ~/pm and installs its
+                                   # lint/push git hooks (idempotent, keeps
+                                   # foreign hooks)
+cadence issue doctor               # tracker health: hooks, lint, remote, push lag
 cadence issue new "title"          # project resolves from the cwd repo
 cadence issue ls --ready           # leaves with no unfinished blockers
 cadence issue show CAD-16
-cadence issue lint                 # dangling/cyclic links, depth, sizes
+cadence issue lint                 # dangling/cyclic links, depth, sizes —
+                                   # the safety net; writes validate first
 cadence ui run                     # 127.0.0.1:3010 — SPA + read/write API
 ```
 

@@ -8,13 +8,18 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::issue::{board, lint, model, project, write, Pm};
+use crate::issue::{board, doctor, hooks, lint, model, project, write, Pm};
 
 #[derive(Subcommand)]
 pub enum IssueAction {
     /// Create the PM dir skeleton (pm.yaml, README, .gitignore, git
-    /// init + first commit). Idempotent.
+    /// init + first commit) and install the pre-commit/post-commit
+    /// hooks. Idempotent; a foreign hook is never overwritten.
     Init,
+    /// Read-only tracker health report: root, git repo, remote, hook
+    /// state, lint, push lag and the failure-log tail. Non-zero exit
+    /// when any check fails.
+    Doctor,
     /// Manage projects under the PM dir.
     Project {
         #[command(subcommand)]
@@ -165,8 +170,25 @@ pub fn run(action: &IssueAction) -> Result<i32> {
         IssueAction::Init => {
             let dir = crate::issue::default_dir()?;
             let pm = Pm::init(&dir)?;
-            print_json(&json!({"pm_dir": pm.dir, "git": pm.dir.join(".git").is_dir()}));
+            let installed = hooks::install(&pm.dir)?;
+            print_json(&json!({"pm_dir": pm.dir,
+                               "git": hooks::git_dir(&pm.dir).is_some(),
+                               "hooks": installed}));
             Ok(0)
+        }
+        IssueAction::Doctor => {
+            let pm = open_pm()?;
+            let report = doctor::run(&pm)?;
+            if report["ok"].as_bool() == Some(true) {
+                print_json(&report);
+                Ok(0)
+            } else {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                );
+                Ok(1)
+            }
         }
         IssueAction::Project { action } => match action {
             ProjectAction::Add {

@@ -928,3 +928,299 @@ fn ui_pm_absent_is_honest() {
     let (code, _) = http(port, "GET", "/api/issues", &host);
     assert_eq!(code, 503);
 }
+
+#[test]
+fn writes_validate_fields() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    // A project that declares components, so membership is checkable.
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &[
+                "issue",
+                "project",
+                "add",
+                "ops",
+                "--prefix",
+                "OPS",
+                "--component",
+                "api",
+                "--component",
+                "cli"
+            ]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "new", "task one", "--project", "ops"]
+        )
+        .0
+    );
+
+    // --- CLI rejections: each names the allowed values, no commit ---
+    let base = commits(pm.path());
+    for (args, want) in [
+        (vec!["issue", "set", "OPS-1", "component=bogus"], "api, cli"),
+        (vec!["issue", "set", "OPS-1", "status=flying"], "backlog"),
+        (vec!["issue", "set", "OPS-1", "priority=P9"], "P0"),
+        (
+            vec![
+                "issue",
+                "new",
+                "bad comp",
+                "--project",
+                "ops",
+                "--component",
+                "bogus",
+            ],
+            "api, cli",
+        ),
+        (
+            vec![
+                "issue",
+                "new",
+                "bad prio",
+                "--project",
+                "ops",
+                "--priority",
+                "P9",
+            ],
+            "P0",
+        ),
+        // Field-path link targets must exist too.
+        (
+            vec![
+                "issue",
+                "new",
+                "bad dep",
+                "--project",
+                "ops",
+                "--blocked-by",
+                "OPS-99",
+            ],
+            "OPS-99",
+        ),
+        (
+            vec![
+                "issue",
+                "new",
+                "bad parent",
+                "--project",
+                "ops",
+                "--parent",
+                "OPS-99",
+            ],
+            "OPS-99",
+        ),
+        (
+            vec!["issue", "link", "OPS-1", "blocked_by", "OPS-99"],
+            "OPS-99",
+        ),
+        (vec!["issue", "link", "OPS-1", "parent", "OPS-99"], "OPS-99"),
+        (
+            vec!["issue", "link", "OPS-1", "relates", "OPS-99"],
+            "OPS-99",
+        ),
+        (
+            vec!["issue", "link", "OPS-1", "duplicate_of", "OPS-99"],
+            "OPS-99",
+        ),
+    ] {
+        let (ok, err) = cli(pm.path(), state.path(), &args);
+        assert!(!ok, "{args:?} unexpectedly succeeded");
+        let msg = err["error"].as_str().unwrap_or_default();
+        assert!(msg.contains(want), "{args:?}: '{msg}' lacks '{want}'");
+    }
+    assert_eq!(commits(pm.path()), base, "a rejection still committed");
+
+    // A declared component and an empty clear still work.
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "set", "OPS-1", "component=api"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "set", "OPS-1", "component="]
+        )
+        .0
+    );
+
+    // --- HTTP: the same writer, the same rejections (400) ---
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let before = commits(pm.path());
+    for (method, path, body, want) in [
+        (
+            "POST",
+            "/api/issues".to_string(),
+            r#"{"project":"ops","title":"bad comp","component":"bogus"}"#.to_string(),
+            "api, cli",
+        ),
+        (
+            "POST",
+            "/api/issues".to_string(),
+            r#"{"project":"ops","title":"bad prio","priority":"P9"}"#.to_string(),
+            "P0",
+        ),
+        (
+            "POST",
+            "/api/issues".to_string(),
+            r#"{"project":"ops","title":"bad dep","blocked_by":["OPS-99"]}"#.to_string(),
+            "OPS-99",
+        ),
+        (
+            "POST",
+            "/api/issues".to_string(),
+            r#"{"project":"ops","title":"bad parent","parent":"OPS-99"}"#.to_string(),
+            "OPS-99",
+        ),
+        (
+            "PATCH",
+            "/api/issues/OPS-1".to_string(),
+            r#"{"component":"bogus"}"#.to_string(),
+            "api, cli",
+        ),
+        (
+            "PATCH",
+            "/api/issues/OPS-1".to_string(),
+            r#"{"status":"flying"}"#.to_string(),
+            "backlog",
+        ),
+        (
+            "PATCH",
+            "/api/issues/OPS-1".to_string(),
+            r#"{"priority":"P9"}"#.to_string(),
+            "P0",
+        ),
+        (
+            "POST",
+            "/api/issues/OPS-1/links".to_string(),
+            r#"{"type":"blocked_by","target":"OPS-99"}"#.to_string(),
+            "OPS-99",
+        ),
+    ] {
+        let (code, _, body) = write_json(port, method, &path, &host, &body);
+        // Field validation rejects 400; an unknown link target is a
+        // 404 through write_err's "Unknown issue" mapping.
+        assert!(
+            code == 400 || code == 404,
+            "{method} {path} returned {code}: {body}"
+        );
+        assert!(
+            body.contains(want),
+            "{method} {path}: '{body}' lacks '{want}'"
+        );
+    }
+    assert_eq!(
+        commits(pm.path()),
+        before,
+        "an HTTP rejection still committed"
+    );
+
+    // And the happy path is unchanged through HTTP.
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/OPS-1",
+        &host,
+        r#"{"component":"api"}"#,
+    );
+    assert_eq!(code, 200, "{body}");
+}
+
+#[test]
+fn init_hooks_and_doctor() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+
+    // Plant a foreign pre-commit before init: git repo first, then the
+    // hook, so `issue init` sees it as pre-existing and must keep it.
+    let hooks_dir = pm.path().join(".git/hooks");
+    Command::new("git")
+        .arg("-C")
+        .arg(pm.path())
+        .args(["init", "-q"])
+        .output()
+        .unwrap();
+    std::fs::create_dir_all(&hooks_dir).unwrap();
+    std::fs::write(hooks_dir.join("pre-commit"), "#!/bin/sh\necho foreign\n").unwrap();
+
+    let (ok, out) = cli(pm.path(), state.path(), &["issue", "init"]);
+    assert!(ok, "init failed: {out}");
+    let pre = hooks_dir.join("pre-commit");
+    let post = hooks_dir.join("post-commit");
+    // Foreign hook preserved; our post-commit installed and executable.
+    assert_eq!(
+        std::fs::read_to_string(&pre).unwrap(),
+        "#!/bin/sh\necho foreign\n"
+    );
+    assert_eq!(out["hooks"]["pre-commit"]["action"], "kept_foreign");
+    assert_eq!(out["hooks"]["pre-commit"]["owner"], "foreign");
+    assert_eq!(out["hooks"]["post-commit"]["action"], "installed");
+    let post_text = std::fs::read_to_string(&post).unwrap();
+    assert!(post_text.contains("cadence board tracker"));
+    use std::os::unix::fs::PermissionsExt;
+    assert!(std::fs::metadata(&post).unwrap().permissions().mode() & 0o111 != 0);
+
+    // Second init is a no-op on disk and reports both hooks.
+    let before_pre = std::fs::read(&pre).unwrap();
+    let before_post = std::fs::read(&post).unwrap();
+    let (ok, out) = cli(pm.path(), state.path(), &["issue", "init"]);
+    assert!(ok);
+    assert_eq!(out["hooks"]["pre-commit"]["action"], "kept_foreign");
+    assert_eq!(out["hooks"]["post-commit"]["action"], "present");
+    assert_eq!(std::fs::read(&pre).unwrap(), before_pre);
+    assert_eq!(std::fs::read(&post).unwrap(), before_post);
+
+    // Doctor reports every field; a foreign hook makes it not-ok.
+    let (ok, report) = cli(pm.path(), state.path(), &["issue", "doctor"]);
+    assert!(!ok, "doctor should fail with a foreign hook: {report}");
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["git"], true);
+    assert_eq!(report["remote"], Value::Null);
+    assert_eq!(report["hooks"]["pre-commit"]["owner"], "foreign");
+    assert_eq!(report["hooks"]["post-commit"]["owner"], "cadence");
+    assert_eq!(report["hooks"]["post-commit"]["executable"], true);
+    assert_eq!(report["lint"]["ok"], true);
+    assert!(report["push"].is_null());
+    assert!(report["push_failures"].is_null());
+
+    // Restore our hook — a drifted cadence-owned file is refreshed.
+    std::fs::write(&pre, "#!/bin/sh\n# cadence board tracker: stale\nexit 0\n").unwrap();
+    let (ok, out) = cli(pm.path(), state.path(), &["issue", "init"]);
+    assert!(ok);
+    assert_eq!(out["hooks"]["pre-commit"]["action"], "updated");
+    let pre_text = std::fs::read_to_string(&pre).unwrap();
+    assert!(pre_text.contains("cadence issue lint"));
+
+    // The failure-log tail shows up verbatim.
+    std::fs::write(
+        pm.path().join(".git/push-failures.log"),
+        "2026-09-18T00:00:00Z push failed\n2026-09-18T01:00:00Z push failed\n",
+    )
+    .unwrap();
+    let (ok, report) = cli(pm.path(), state.path(), &["issue", "doctor"]);
+    assert!(ok, "clean tracker should pass: {report}");
+    assert_eq!(report["ok"], true);
+    let tail = report["push_failures"]["tail"].as_array().unwrap();
+    assert_eq!(tail.len(), 2);
+    assert!(tail[1].as_str().unwrap().contains("01:00:00Z"));
+
+    // A missing hook fails the check and names which.
+    std::fs::remove_file(&post).unwrap();
+    let (ok, report) = cli(pm.path(), state.path(), &["issue", "doctor"]);
+    assert!(!ok);
+    assert_eq!(report["hooks"]["post-commit"]["present"], false);
+}
