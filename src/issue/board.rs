@@ -356,6 +356,12 @@ pub fn views(notes_dir: &Path, issues: Vec<Issue>) -> Vec<View> {
         .collect()
 }
 
+/// Content hash of the issue's `issue.md` — the `if_rev` token write
+/// calls may send for optimistic concurrency.
+pub fn rev_of(issue: &Issue) -> Value {
+    json!(crate::issue::write::issue_rev(&issue.dir).unwrap_or_default())
+}
+
 /// Compact card payload for `GET /api/issues` and `issue ls --json`.
 pub fn card_json(view: &View) -> Value {
     let f = &view.issue.front;
@@ -377,6 +383,7 @@ pub fn card_json(view: &View) -> Value {
         "ready": view.ready,
         "blocked": view.blocked,
         "created": f.created,
+        "rev": rev_of(&view.issue),
         "counts": {
             "comments": view.issue.comments.len(),
             "artifacts": view.issue.artifacts.len(),
@@ -449,6 +456,7 @@ pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &Vi
         "ready": view.ready,
         "blocked": view.blocked,
         "created": f.created,
+        "rev": rev_of(&view.issue),
         "frontmatter": f,
         "body": view.issue.body,
         "path": view.issue.dir.join("issue.md"),

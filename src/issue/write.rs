@@ -1,8 +1,10 @@
 //! The write side — the only writer for issue folders. Every op takes
 //! the PM lock, mutates files (`issue.md` via temp+rename; comments and
-//! artifacts create-only), then makes one git commit.
+//! artifacts create-only), then makes one git commit. The HTTP API in
+//! `ui.rs` calls these same functions with `actor = "operator (ui)"`.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -10,6 +12,79 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
 use crate::issue::{board, parse, project, time, Pm};
+
+/// Commit with the actor named when one is given — API writes show as
+/// `CAD-16: set status=review (operator (ui))`; CLI writes pass "" and
+/// keep the bare subject.
+fn commit(pm: &Pm, message: &str, actor: &str) -> Result<()> {
+    if actor.is_empty() {
+        pm.commit(message)
+    } else {
+        pm.commit(&format!("{message} ({actor})"))
+    }
+}
+
+/// Content hash of `issue.md` — the optimistic-concurrency token the
+/// write API calls `if_rev`. FNV-1a: no deps, stable across versions.
+pub fn issue_rev(dir: &Path) -> Result<String> {
+    let bytes = std::fs::read(dir.join("issue.md"))?;
+    Ok(rev_bytes(&bytes))
+}
+
+fn rev_bytes(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fnv1a:{h:016x}")
+}
+
+/// Optimistic-concurrency check, run under the write lock. Returns a
+/// conflict payload (the route maps it to 409) or None.
+fn check_rev(dir: &Path, if_rev: Option<&str>) -> Result<Option<Value>> {
+    let Some(want) = if_rev else {
+        return Ok(None);
+    };
+    let cur = issue_rev(dir)?;
+    if want != cur {
+        return Ok(Some(json!({"conflict": "if_rev", "current_rev": cur})));
+    }
+    Ok(None)
+}
+
+/// Lint parity at write time: an issue whose status is ready|doing|
+/// review while a blocked_by target is unfinished succeeds but the
+/// response carries this warning.
+fn blocked_warnings(pm: &Pm, id: &str) -> Result<Vec<String>> {
+    let issues = board::load_all(&pm.dir, None)?;
+    let views = board::views(&pm.config.notes_dir(), issues);
+    let Some(v) = views.iter().find(|v| v.issue.front.id == id) else {
+        return Ok(vec![]);
+    };
+    if !(v.blocked && matches!(v.status.as_str(), "ready" | "doing" | "review")) {
+        return Ok(vec![]);
+    }
+    let open: Vec<String> = v
+        .issue
+        .front
+        .blocked_by
+        .iter()
+        .filter(|b| {
+            views
+                .iter()
+                .find(|o| &o.issue.front.id == *b)
+                .map(|o| !matches!(o.status.as_str(), "done" | "dropped"))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    Ok(vec![format!(
+        "{id} is {} but still waits on {}",
+        v.status,
+        open.join(", ")
+    )])
+}
 
 /// Write `text` to `path` atomically (temp file + rename).
 fn atomic_write(path: &Path, text: &str) -> Result<()> {
@@ -183,6 +258,7 @@ pub fn new_issue(
     owner: Option<&str>,
     component: Option<&str>,
     explicit_id: Option<&str>,
+    actor: &str,
 ) -> Result<Value> {
     let project = project::resolve(&pm.dir, project_flag, cwd)?;
     let priority = priority.unwrap_or("P2");
@@ -245,7 +321,7 @@ pub fn new_issue(
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
-    pm.commit(&format!("{id}: created"))?;
+    commit(pm, &format!("{id}: created"), actor)?;
     Ok(json!({"id": id, "project": project.key, "path": dir, "committed": true}))
 }
 
@@ -333,7 +409,7 @@ fn check_parent(by_id: &HashMap<&str, &board::Issue>, this: &board::Issue) -> Re
 }
 
 /// `issue set <ID> key=value…` — the writable frontmatter fields.
-pub fn set_fields(pm: &Pm, id: &str, pairs: &[String]) -> Result<Value> {
+pub fn set_fields(pm: &Pm, id: &str, pairs: &[String], actor: &str) -> Result<Value> {
     if pairs.is_empty() {
         return Err(Error::rejected(
             "set needs key=value pairs — e.g. `cadence issue set CAD-16 status=doing`",
@@ -375,17 +451,117 @@ pub fn set_fields(pm: &Pm, id: &str, pairs: &[String]) -> Result<Value> {
         changed.push(format!("{key}={value}"));
     }
     save_front(&dir, &front, &body)?;
-    pm.commit(&format!("{id}: set {}", changed.join(" ")))?;
+    commit(pm, &format!("{id}: set {}", changed.join(" ")), actor)?;
     Ok(json!({"id": id, "set": changed, "committed": true}))
+}
+
+/// The HTTP PATCH surface: typed fields instead of `key=value` pairs,
+/// `body` replaces the markdown body (frontmatter untouched), `if_rev`
+/// optimistic concurrency, and a derived status refuses `status`.
+pub struct IssuePatch {
+    pub status: Option<String>,
+    pub priority: Option<String>,
+    /// `Some("")` clears owner.
+    pub owner: Option<String>,
+    /// `Some("")` clears component.
+    pub component: Option<String>,
+    pub title: Option<String>,
+    pub body: Option<String>,
+}
+
+pub fn patch_issue(
+    pm: &Pm,
+    id: &str,
+    patch: &IssuePatch,
+    if_rev: Option<&str>,
+    actor: &str,
+) -> Result<Value> {
+    let (_project, dir) = issue_dir(pm, id)?;
+    let _lock = pm.lock()?;
+    if let Some(conflict) = check_rev(&dir, if_rev)? {
+        return Ok(conflict);
+    }
+    if patch.status.is_some() {
+        // A derived status is not file-writable: roll-up containers and
+        // note-driven issues refuse with the reason.
+        let issues = board::load_all(&pm.dir, None)?;
+        let views = board::views(&pm.config.notes_dir(), issues);
+        let src = views
+            .iter()
+            .find(|v| v.issue.front.id == id)
+            .map(|v| v.status_source)
+            .unwrap_or("file");
+        if src != "file" {
+            return Ok(json!({
+                "id": id,
+                "conflict": "status_derived",
+                "status_source": src,
+                "reason": format!(
+                    "{id} status is derived from {src} — the file field is not authoritative"
+                ),
+            }));
+        }
+    }
+    let (mut front, mut body) = load_front(&dir)?;
+    let mut changed = Vec::new();
+    if let Some(v) = &patch.status {
+        model::check_status(v)?;
+        front.status = v.clone();
+        changed.push(format!("status={v}"));
+    }
+    if let Some(v) = &patch.priority {
+        model::check_priority(v)?;
+        front.priority = v.clone();
+        changed.push(format!("priority={v}"));
+    }
+    if let Some(v) = &patch.title {
+        if v.is_empty() {
+            return Err(Error::rejected("title cannot be empty"));
+        }
+        front.title = v.clone();
+        changed.push("title".to_string());
+    }
+    if let Some(v) = &patch.owner {
+        front.owner = (!v.is_empty()).then(|| v.clone());
+        changed.push(format!("owner={v}"));
+    }
+    if let Some(v) = &patch.component {
+        front.component = (!v.is_empty()).then(|| v.clone());
+        changed.push(format!("component={v}"));
+    }
+    if let Some(v) = &patch.body {
+        body = v.clone();
+        changed.push("body".to_string());
+    }
+    if changed.is_empty() {
+        return Err(Error::rejected(
+            "nothing to patch — send at least one field",
+        ));
+    }
+    save_front(&dir, &front, &body)?;
+    commit(pm, &format!("{id}: set {}", changed.join(" ")), actor)?;
+    let warnings = blocked_warnings(pm, id)?;
+    Ok(json!({"id": id, "set": changed, "committed": true, "warnings": warnings}))
 }
 
 /// `issue link` / `issue unlink`. `blocked_by`/`relates` are list
 /// fields; `parent`/`duplicate_of` are scalars.
-pub fn link(pm: &Pm, id: &str, kind: &str, target: &str, unlink: bool) -> Result<Value> {
+pub fn link(
+    pm: &Pm,
+    id: &str,
+    kind: &str,
+    target: &str,
+    unlink: bool,
+    if_rev: Option<&str>,
+    actor: &str,
+) -> Result<Value> {
     model::check_link_kind(kind)?;
     model::check_id(target)?;
     let (_project, dir) = issue_dir(pm, id)?;
     let _lock = pm.lock()?;
+    if let Some(conflict) = check_rev(&dir, if_rev)? {
+        return Ok(conflict);
+    }
     let (mut front, body) = load_front(&dir)?;
     let verb = if unlink { "unlink" } else { "link" };
     match kind {
@@ -449,17 +625,29 @@ pub fn link(pm: &Pm, id: &str, kind: &str, target: &str, unlink: bool) -> Result
     }
     check_structure(&preview, id)?;
     save_front(&dir, &front, &body)?;
-    pm.commit(&format!("{id}: {verb} {kind} {target}"))?;
+    commit(pm, &format!("{id}: {verb} {kind} {target}"), actor)?;
+    let warnings = blocked_warnings(pm, id)?;
     Ok(json!({"id": id, "link": kind, "target": target,
-              "unlink": unlink, "committed": true}))
+              "unlink": unlink, "committed": true, "warnings": warnings}))
 }
 
 /// `issue ref <ID> <kind> <url-or-path> [--label x]`. A scheme makes it
 /// `url:`; everything else is a `path:` (previews store publish paths).
-pub fn add_ref(pm: &Pm, id: &str, kind: &str, target: &str, label: Option<&str>) -> Result<Value> {
+pub fn add_ref(
+    pm: &Pm,
+    id: &str,
+    kind: &str,
+    target: &str,
+    label: Option<&str>,
+    if_rev: Option<&str>,
+    actor: &str,
+) -> Result<Value> {
     model::check_ref_kind(kind)?;
     let (_project, dir) = issue_dir(pm, id)?;
     let _lock = pm.lock()?;
+    if let Some(conflict) = check_rev(&dir, if_rev)? {
+        return Ok(conflict);
+    }
     let (mut front, body) = load_front(&dir)?;
     let is_url = target.starts_with("http://") || target.starts_with("https://");
     let r = Ref {
@@ -470,7 +658,7 @@ pub fn add_ref(pm: &Pm, id: &str, kind: &str, target: &str, label: Option<&str>)
     };
     front.refs.push(r);
     save_front(&dir, &front, &body)?;
-    pm.commit(&format!("{id}: ref {kind}"))?;
+    commit(pm, &format!("{id}: ref {kind}"), actor)?;
     Ok(json!({"id": id, "ref": {"kind": kind, "target": target},
               "committed": true}))
 }
@@ -483,6 +671,8 @@ pub fn add_comment(
     body: &str,
     author: Option<&str>,
     kind: Option<&str>,
+    if_rev: Option<&str>,
+    actor: &str,
 ) -> Result<Value> {
     let (_project, dir) = issue_dir(pm, id)?;
     let author = author
@@ -503,6 +693,9 @@ pub fn add_comment(
         return Err(Error::rejected("Comment body is empty — pass -m or --file"));
     }
     let _lock = pm.lock()?;
+    if let Some(conflict) = check_rev(&dir, if_rev)? {
+        return Ok(conflict);
+    }
     let comments = dir.join("comments");
     if comments.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
         return Err(Error::rejected(format!(
@@ -522,7 +715,7 @@ pub fn add_comment(
         &format!("{}-{author}.md", time::basic(epoch)),
         text.as_bytes(),
     )?;
-    pm.commit(&format!("{id}: comment by {author}"))?;
+    commit(pm, &format!("{id}: comment by {author}"), actor)?;
     Ok(
         json!({"id": id, "comment": path.file_name().map(|n| n.to_string_lossy().to_string()),
               "author": author, "committed": true}),
@@ -532,7 +725,6 @@ pub fn add_comment(
 /// `issue attach <ID> <file>` — copy into `artifacts/` (basename only),
 /// create-only, under `artifact_max_bytes`.
 pub fn attach(pm: &Pm, id: &str, file: &Path) -> Result<Value> {
-    let (_project, dir) = issue_dir(pm, id)?;
     let meta = std::fs::metadata(file)
         .map_err(|e| Error::rejected(format!("Cannot read {}: {e}", file.display())))?;
     if !meta.is_file() {
@@ -550,9 +742,36 @@ pub fn attach(pm: &Pm, id: &str, file: &Path) -> Result<Value> {
     let name = file
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .filter(|n| !n.is_empty() && !n.starts_with('.'))
         .ok_or_else(|| Error::rejected("Attachment needs a plain file name"))?;
     let bytes = std::fs::read(file)?;
+    attach_bytes(pm, id, &name, &bytes, true, "")
+}
+
+/// Attach raw bytes as `artifacts/<name>` — the upload route's path.
+/// Names follow the read grammar so every stored file is fetchable.
+/// With `autorename` a collision becomes `<stem>-N<ext>` (CLI parity);
+/// without it an existing name is a conflict the route maps to 409.
+pub fn attach_bytes(
+    pm: &Pm,
+    id: &str,
+    name: &str,
+    bytes: &[u8],
+    autorename: bool,
+    actor: &str,
+) -> Result<Value> {
+    let (_project, dir) = issue_dir(pm, id)?;
+    if !model::valid_artifact_name(name) {
+        return Err(Error::rejected(format!(
+            "Bad artifact name '{name}' — [A-Za-z0-9._-]{{1,120}}, no leading dot"
+        )));
+    }
+    if bytes.len() as u64 > pm.config.artifact_max_bytes {
+        return Err(Error::rejected(format!(
+            "{name} is {} bytes — over the {} cap; link it instead",
+            bytes.len(),
+            pm.config.artifact_max_bytes
+        )));
+    }
     let _lock = pm.lock()?;
     let artifacts = dir.join("artifacts");
     if artifacts.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
@@ -561,10 +780,28 @@ pub fn attach(pm: &Pm, id: &str, file: &Path) -> Result<Value> {
         )));
     }
     std::fs::create_dir_all(&artifacts)?;
-    let path = create_exclusive(&artifacts, &name, &bytes)?;
-    pm.commit(&format!("{id}: attach {name}"))?;
+    let path = if autorename {
+        create_exclusive(&artifacts, name, bytes)?
+    } else {
+        let target = artifacts.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                target
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(json!({"id": id, "conflict": "exists", "artifact": name}));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    commit(pm, &format!("{id}: attach {name}"), actor)?;
     Ok(
         json!({"id": id, "artifact": path.file_name().map(|n| n.to_string_lossy().to_string()),
-              "size": meta.len(), "committed": true}),
+              "size": bytes.len(), "committed": true}),
     )
 }

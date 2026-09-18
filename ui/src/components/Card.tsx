@@ -22,9 +22,18 @@ interface Props {
   onOpen: (id: string) => void;
 }
 
+/** Why a card is not draggable — surfaced on hover. */
+export function noDragReason(t: IssueCard): string | null {
+  if (t.container) return "container — status rolls up from its children";
+  if (t.status_source !== "file")
+    return `status is derived from ${t.status_source} — set it there`;
+  return null;
+}
+
 export default function Card({ issue, parentTitle, busyBy, onOpen }: Props) {
   const t = issue;
   const derived = t.status_source !== "file";
+  const noDrag = noDragReason(t);
   const pr = prLabel(t);
   const artifacts = t.counts.artifacts + t.counts.refs;
   const meta: React.ReactNode[] = [];
@@ -64,6 +73,15 @@ export default function Card({ issue, parentTitle, busyBy, onOpen }: Props) {
       tabIndex={0}
       role="button"
       aria-label={`${t.id} ${t.title}`}
+      draggable={!noDrag}
+      title={noDrag ?? undefined}
+      onDragStart={(e) => {
+        if (noDrag) return;
+        e.dataTransfer.setData("text/plain", t.id);
+        e.dataTransfer.effectAllowed = "move";
+        e.currentTarget.classList.add("opacity-35");
+      }}
+      onDragEnd={(e) => e.currentTarget.classList.remove("opacity-35")}
       onClick={() => onOpen(t.id)}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -71,7 +89,9 @@ export default function Card({ issue, parentTitle, busyBy, onOpen }: Props) {
           onOpen(t.id);
         }
       }}
-      className={`card tcard p-3 ${t.status === "done" ? "opacity-70" : ""}`}
+      className={`card tcard p-3 ${t.status === "done" ? "opacity-70" : ""} ${
+        noDrag ? "cursor-default" : "cursor-grab active:cursor-grabbing"
+      }`}
     >
       <div className="flex items-center gap-1.5 flex-wrap">
         <span className="num text-label text-ink-100 font-medium">{t.id}</span>
