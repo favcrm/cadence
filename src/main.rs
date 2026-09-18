@@ -203,6 +203,10 @@ enum Commands {
         /// Route the result to another agent when the turn finishes.
         #[arg(long)]
         reply_to: Option<String>,
+        /// Attach this delivery to a task — ad-hoc follow-up inside a
+        /// job's delivery record.
+        #[arg(long)]
+        task: Option<String>,
         /// Claim `agent ready` for the target first — the flag IS the
         /// operator's explicit claim (idle, empty input, no prompt).
         /// No-op on non-pty endpoints.
@@ -339,7 +343,11 @@ enum Commands {
     /// Read the durable event log for an agent.
     Events {
         /// Agent alias or provider-native id (Devin slug, Codex thread).
-        alias: String,
+        /// Omit when --job names a job's scoped event view.
+        alias: Option<String>,
+        /// Read the job-scoped event view instead of one alias's log.
+        #[arg(long)]
+        job: Option<String>,
         /// Return events after this cursor.
         #[arg(long, default_value_t = 0)]
         after: i64,
@@ -349,6 +357,13 @@ enum Commands {
         /// Keep streaming new events until interrupted.
         #[arg(long)]
         follow: bool,
+    },
+    /// Jobs: the work axis. A job binds a spec, a PM (group root or
+    /// inbox) and tasks; each task revision is one kickoff message and
+    /// a verdict binds QA to the exact reported commit. See docs/JOBS.md.
+    Job {
+        #[command(subcommand)]
+        action: JobAction,
     },
     /// The issue board: folders under the PM dir (`~/pm` or
     /// `CADENCE_PM_DIR`); this CLI is the only writer.
@@ -361,6 +376,185 @@ enum Commands {
         #[command(subcommand)]
         action: cadence_agent::ui::UiAction,
     },
+}
+
+#[derive(Subcommand)]
+enum JobAction {
+    /// Create a job — bookkeeping, not spawning. Requires a registered
+    /// PM (any endpoint kind; an inbox alias collects notifications for
+    /// `cadence inbox`) and a readable spec file. Writes the job plus
+    /// one default task `<job>-t1` covering the spec.
+    New {
+        /// Owning PM agent — the job's group root.
+        #[arg(long)]
+        pm: String,
+        /// Spec/brief file — hashed at creation for drift detection.
+        #[arg(long)]
+        spec: PathBuf,
+        /// Client idempotency key; same id + same spec hash dedupes.
+        #[arg(long)]
+        job: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Board issue this job tracks (`<PREFIX>-<n>`, grammar only —
+        /// the daemon never reads the board filesystem).
+        #[arg(long)]
+        issue: Option<String>,
+        /// Repo root the job's worktrees live under.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Base branch/SHA QA is relative to.
+        #[arg(long)]
+        base_ref: Option<String>,
+        /// Automatic revision cycles before a revise verdict escalates
+        /// the task to blocked.
+        #[arg(long, default_value_t = 2)]
+        max_revisions: i64,
+        /// Title for the default `<job>-t1` task.
+        #[arg(long)]
+        task_title: Option<String>,
+    },
+    /// List jobs — non-terminal by default; `--all` or `--state` widen.
+    List {
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show a job: tasks with live kickoff state, drift flags, latest
+    /// verdicts.
+    Show { job: String },
+    /// The job-scoped event view — every event any alias row recorded
+    /// for this job.
+    Events {
+        job: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        /// Seconds to wait for new events per request (0-30).
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Dispatch a task: enqueue its kickoff to the assignee at a new
+    /// revision. Legal from draft/revising and — once the live kickoff
+    /// ended without completing — dispatched/running. A live kickoff
+    /// makes this an idempotent retry of the same revision.
+    Dispatch {
+        task: String,
+        /// Reassign to another group member (bumps the revision).
+        #[arg(long)]
+        to: Option<String>,
+        /// Claim `agent ready` for the worker first — same operator
+        /// claim as `send --ready`; no-op on non-pty endpoints.
+        #[arg(long)]
+        ready: bool,
+        /// Explicit kickoff message id (default: deterministic
+        /// cadence-dispatch:<task>:r<n>).
+        #[arg(long)]
+        message: Option<String>,
+    },
+    /// Record a QA verdict bound to the task's reported commit.
+    /// Inside a cadence pane the reviewer is that pane's alias —
+    /// `--reviewer` is refused there. Outside a pane `--reviewer` is
+    /// required (`operator` is the human's id). The reviewer can never
+    /// be the assignee.
+    #[command(group = clap::ArgGroup::new("verdict").required(true).args(["pass", "revise", "blocked"]))]
+    Verdict {
+        task: String,
+        /// The commit this verdict judges — must equal the task's
+        /// reported head_sha.
+        #[arg(long)]
+        sha: String,
+        /// Approve the revision — task moves to verified.
+        #[arg(long)]
+        pass: bool,
+        /// Request changes — task re-dispatches until max_revisions,
+        /// then escalates to blocked.
+        #[arg(long)]
+        revise: bool,
+        /// Stop the task — blocked until an operator reopens it.
+        #[arg(long)]
+        blocked: bool,
+        /// Reviewer identity (required outside a pane; forbidden inside
+        /// one).
+        #[arg(long)]
+        reviewer: Option<String>,
+        /// Evidence file — commands run, outputs, artifact paths.
+        #[arg(long)]
+        evidence: Option<PathBuf>,
+        /// Message id that carried the QA report, if any.
+        #[arg(long)]
+        message: Option<String>,
+        /// Pin the revision this verdict names — a stale value rejects.
+        #[arg(long)]
+        revision: Option<i64>,
+    },
+    /// Accept a verified task — records the merge claim. Cadence never
+    /// runs git merges itself.
+    Accept {
+        task: String,
+        /// The merge commit once it lands — recorded as evidence.
+        #[arg(long)]
+        merged_sha: Option<String>,
+    },
+    /// Cancel every non-terminal task and the job. Queued kickoffs are
+    /// cancelled in the same transaction; running ones finish alone.
+    /// Agents are never stopped by a job.
+    Cancel { job: String },
+    /// Close a job — legal only when every task is done.
+    Close { job: String },
+    /// Manage a job's tasks.
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// Add a draft task to an open job.
+    Add {
+        job: String,
+        /// Task id (global identifier charset; default `<job>-t<n>`).
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        /// Assignee — the PM itself or a member of its group.
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Task-level spec (falls back to the job's).
+        #[arg(long)]
+        spec: Option<PathBuf>,
+        /// Acceptance criteria — inline text or a path.
+        #[arg(long)]
+        accept: Option<String>,
+        /// Worktree name (`.cadence/wt/<name>`) — the scope claim.
+        #[arg(long)]
+        worktree: Option<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        /// Revision the work starts from.
+        #[arg(long)]
+        base_sha: Option<String>,
+    },
+    /// Show one task: row, live kickoff, attached messages, verdicts.
+    Show { task: String },
+    /// Record the reported commit manually — the repair path when a
+    /// kickoff completed without `SHA:`/`--sha`. Review-state tasks
+    /// only; never overwrites a bound SHA.
+    Sha { task: String, sha: String },
+    /// Mark a task unrecoverable (PM/operator decision).
+    Fail {
+        task: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Reopen a blocked/verified/failed task to draft — operator only.
+    Reopen { task: String },
+    /// Cancel a task; a still-queued kickoff is cancelled with it.
+    Cancel { task: String },
 }
 
 #[derive(Subcommand)]
@@ -538,6 +732,10 @@ enum MessageAction {
         /// Route the result to another agent when the turn finishes.
         #[arg(long)]
         reply_to: Option<String>,
+        /// Attach this delivery to a task — ad-hoc follow-up inside a
+        /// job's delivery record.
+        #[arg(long)]
+        task: Option<String>,
         /// Claim `agent ready` for the target first — the flag IS the
         /// operator's explicit claim (idle, empty input, no prompt),
         /// fused with the send. No-op on non-pty endpoints.
@@ -556,6 +754,10 @@ enum MessageAction {
         /// Route the result to another agent when the turn finishes.
         #[arg(long)]
         reply_to: Option<String>,
+        /// Attach this delivery to a task — ad-hoc follow-up inside a
+        /// job's delivery record.
+        #[arg(long)]
+        task: Option<String>,
         /// Claim `agent ready` for the target first — same operator
         /// claim as `send --ready`; no-op on non-pty endpoints.
         #[arg(long)]
@@ -587,6 +789,10 @@ enum MessageAction {
         /// Result text reported for the message.
         #[arg(long)]
         text: String,
+        /// The commit this report produced — binds the message to an
+        /// exact revision for `job verdict`.
+        #[arg(long)]
+        sha: Option<String>,
     },
     /// Operator reconcile of an `unknown` message — the exit that keeps
     /// history. No turn token: `unknown` means the submission token is
@@ -603,6 +809,10 @@ enum MessageAction {
         /// Single-line note recorded with the reconcile event.
         #[arg(long)]
         note: Option<String>,
+        /// Commit the operator states for a `completed` reconcile —
+        /// bound exactly like a worker's `--sha`.
+        #[arg(long)]
+        sha: Option<String>,
     },
 }
 
@@ -652,6 +862,7 @@ fn atty_stdin() -> bool {
 /// resolve the body, apply the `--ready` operator claim on pty
 /// endpoints, enqueue. Returns the RPC result plus a `pending` flag
 /// (always false for send — kept for the shared call shape).
+#[allow(clippy::too_many_arguments)]
 fn send_message(
     state_dir: &Path,
     alias: &str,
@@ -660,6 +871,7 @@ fn send_message(
     message: Option<String>,
     reply_to: Option<String>,
     ready: bool,
+    task: Option<String>,
 ) -> Result<(Value, bool)> {
     let body = read_body(text, file)?;
     // --ready IS the operator's explicit claim — the human typing it
@@ -678,7 +890,8 @@ fn send_message(
             state_dir,
             "agent_send",
             json!({"alias": alias, "text": body,
-                   "message": message, "reply_to": reply_to}),
+                   "message": message, "reply_to": reply_to,
+                   "task": task}),
         )?,
         false,
     ))
@@ -1498,12 +1711,14 @@ fn run() -> Result<i32> {
             file,
             message,
             reply_to,
+            task,
             ready,
         } => {
             // Identical path to `message send` — the verb form is sugar,
             // not a second implementation.
-            let (result, _) =
-                send_message(&state_dir, &alias, text, file, message, reply_to, ready)?;
+            let (result, _) = send_message(
+                &state_dir, &alias, text, file, message, reply_to, ready, task,
+            )?;
             print_json(&result);
             Ok(0)
         }
@@ -1527,7 +1742,10 @@ fn run() -> Result<i32> {
                 .map(|ms| {
                     ms.iter()
                         .filter(|m| m["state"].as_str() == Some("running"))
-                        .map(|m| json!({"id": m["id"], "turn_id": m["turn_id"]}))
+                        .map(|m| {
+                            json!({"id": m["id"], "turn_id": m["turn_id"],
+                                   "task": m["task_id"]})
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -1583,8 +1801,11 @@ fn run() -> Result<i32> {
                     file,
                     message,
                     reply_to,
+                    task,
                     ready,
-                } => send_message(&state_dir, &alias, text, file, message, reply_to, ready)?,
+                } => send_message(
+                    &state_dir, &alias, text, file, message, reply_to, ready, task,
+                )?,
                 MessageAction::Ack {
                     message,
                     token,
@@ -1602,12 +1823,13 @@ fn run() -> Result<i32> {
                     message,
                     token,
                     text,
+                    sha,
                 } => (
                     client::rpc(
                         &state_dir,
                         "message_report",
                         json!({"message": message, "token": token,
-                               "kind": "result", "text": text}),
+                               "kind": "result", "text": text, "sha": sha}),
                     )?,
                     false,
                 ),
@@ -1615,12 +1837,13 @@ fn run() -> Result<i32> {
                     message,
                     status,
                     note,
+                    sha,
                 } => (
                     client::rpc(
                         &state_dir,
                         "message_reconcile",
                         json!({"message": message, "status": status.as_str(),
-                               "note": note,
+                               "note": note, "sha": sha,
                                "by": std::env::var("CADENCE_ALIAS")
                                    .unwrap_or_else(|_| "operator".into())}),
                     )?,
@@ -1632,6 +1855,7 @@ fn run() -> Result<i32> {
                     file,
                     message,
                     reply_to,
+                    task,
                     ready,
                     wait,
                 } => {
@@ -1653,7 +1877,7 @@ fn run() -> Result<i32> {
                         "agent_ask",
                         json!({"alias": alias, "text": body,
                                "message": message, "reply_to": reply_to,
-                               "wait": wait}),
+                               "task": task, "wait": wait}),
                     )?;
                     let state = result
                         .get("state")
@@ -1668,18 +1892,27 @@ fn run() -> Result<i32> {
         }
         Commands::Events {
             alias,
+            job,
             after,
             wait,
             follow,
         } => {
+            let (method, key) = match (alias, job) {
+                (Some(a), None) => ("agent_events", json!({"alias": a})),
+                (None, Some(j)) => ("job_events", json!({"job": j})),
+                (Some(_), Some(_)) => {
+                    return Err(Error::rejected("events takes an alias or --job, not both"))
+                }
+                (None, None) => {
+                    return Err(Error::rejected("events needs an alias or --job <job>"))
+                }
+            };
             let mut cursor = after;
             loop {
-                let page = client::rpc(
-                    &state_dir,
-                    "agent_events",
-                    json!({"alias": alias, "after": cursor,
-                           "wait": if follow { 25 } else { wait }}),
-                )?;
+                let mut req = key.clone();
+                req["after"] = json!(cursor);
+                req["wait"] = json!(if follow { 25 } else { wait });
+                let page = client::rpc(&state_dir, method, req)?;
                 let empty = page
                     .get("events")
                     .and_then(Value::as_array)
@@ -1693,9 +1926,204 @@ fn run() -> Result<i32> {
                 }
             }
         }
+        Commands::Job { action } => run_job(&state_dir, &action),
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action),
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
     }
+}
+
+/// The `cadence job` tree — thin RPC wrappers. Validation, transitions
+/// and notifications live in the daemon/store so every caller (CLI,
+/// agent pane, operator) sees the same rules. `pane`/`by` carry the
+/// caller's identity claim: inside a cadence pane `CADENCE_ALIAS` is
+/// the actor; outside, `operator`.
+fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
+    let pane = std::env::var("CADENCE_ALIAS").ok();
+    let by = pane.clone().unwrap_or_else(|| "operator".to_string());
+    let rpc = |method: &str, params: Value| client::rpc(state_dir, method, params);
+    match action {
+        JobAction::New {
+            pm,
+            spec,
+            job,
+            title,
+            issue,
+            repo,
+            base_ref,
+            max_revisions,
+            task_title,
+        } => {
+            // Canonicalize + hash client-side: the daemon stores the
+            // path/hash and never needs the board or spec filesystem.
+            let spec_path = spec.canonicalize().map_err(|_| {
+                Error::rejected(format!("Spec file {} is unreadable", spec.display()))
+            })?;
+            let bytes = std::fs::read(&spec_path)?;
+            use sha2::{Digest, Sha256};
+            let spec_sha256 = format!("{:x}", Sha256::digest(&bytes));
+            let repo = repo
+                .as_ref()
+                .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()));
+            print_json(&rpc(
+                "job_new",
+                json!({"pm": pm, "spec": spec_path, "spec_sha256": spec_sha256,
+                       "job": job, "title": title, "issue": issue,
+                       "repo": repo, "base_ref": base_ref,
+                       "max_revisions": max_revisions,
+                       "task_title": task_title}),
+            )?);
+        }
+        JobAction::List { state, all } => {
+            print_json(&rpc("job_list", json!({"state": state, "all": all}))?);
+        }
+        JobAction::Show { job } => {
+            print_json(&rpc("job_show", json!({"job": job}))?);
+        }
+        JobAction::Events {
+            job,
+            after,
+            wait,
+            follow,
+        } => {
+            let mut cursor = *after;
+            loop {
+                let page = rpc(
+                    "job_events",
+                    json!({"job": job, "after": cursor,
+                           "wait": if *follow { 25 } else { *wait }}),
+                )?;
+                let empty = page
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty);
+                if !empty || !*follow {
+                    print_json(&page);
+                }
+                cursor = page.get("cursor").and_then(Value::as_i64).unwrap_or(cursor);
+                if !*follow {
+                    return Ok(0);
+                }
+            }
+        }
+        JobAction::Dispatch {
+            task,
+            to,
+            ready,
+            message,
+        } => {
+            // --ready is the same operator claim as `send --ready`:
+            // resolve the assignee (explicit --to or the stored one),
+            // claim the pty gate if there is one, then dispatch.
+            if *ready {
+                let assignee = match to {
+                    Some(a) => Some(a.clone()),
+                    None => rpc("task_show", json!({"task": task}))?["task"]["assignee"]
+                        .as_str()
+                        .map(str::to_string),
+                };
+                if let Some(assignee) = assignee {
+                    let show = rpc("agent_show", json!({"alias": assignee}))?;
+                    if show["agent"]["endpoint_kind"].as_str() == Some("pty") {
+                        rpc("agent_ready", json!({"alias": assignee, "by": pane}))?;
+                    }
+                }
+            }
+            print_json(&rpc(
+                "task_dispatch",
+                json!({"task": task, "to": to, "message": message,
+                       "by": by}),
+            )?);
+        }
+        JobAction::Verdict {
+            task,
+            sha,
+            pass,
+            revise,
+            blocked,
+            reviewer,
+            evidence,
+            message,
+            revision,
+        } => {
+            let verdict = if *pass {
+                "pass"
+            } else if *revise {
+                "revise"
+            } else if *blocked {
+                "blocked"
+            } else {
+                return Err(Error::rejected(
+                    "job verdict needs one of --pass, --revise, --blocked",
+                ));
+            };
+            let evidence = evidence.as_ref().map(std::fs::read_to_string).transpose()?;
+            print_json(&rpc(
+                "task_verdict",
+                json!({"task": task, "sha": sha, "verdict": verdict,
+                       "reviewer": reviewer, "pane": pane,
+                       "evidence": evidence, "message": message,
+                       "revision": revision}),
+            )?);
+        }
+        JobAction::Accept { task, merged_sha } => {
+            print_json(&rpc(
+                "task_accept",
+                json!({"task": task, "merged_sha": merged_sha, "by": by}),
+            )?);
+        }
+        JobAction::Cancel { job } => {
+            print_json(&rpc("job_cancel", json!({"job": job, "by": by}))?);
+        }
+        JobAction::Close { job } => {
+            print_json(&rpc("job_close", json!({"job": job, "by": by}))?);
+        }
+        JobAction::Task { action } => match action {
+            TaskAction::Add {
+                job,
+                task,
+                title,
+                assignee,
+                spec,
+                accept,
+                worktree,
+                branch,
+                base_sha,
+            } => {
+                let spec = spec
+                    .as_ref()
+                    .map(|s| s.canonicalize().unwrap_or_else(|_| s.clone()));
+                print_json(&rpc(
+                    "task_new",
+                    json!({"job": job, "task": task, "title": title,
+                           "assignee": assignee, "spec": spec,
+                           "acceptance": accept, "worktree": worktree,
+                           "branch": branch, "base_sha": base_sha}),
+                )?);
+            }
+            TaskAction::Show { task } => {
+                print_json(&rpc("task_show", json!({"task": task}))?);
+            }
+            TaskAction::Sha { task, sha } => {
+                print_json(&rpc(
+                    "task_sha",
+                    json!({"task": task, "sha": sha, "by": by}),
+                )?);
+            }
+            TaskAction::Fail { task, reason } => {
+                print_json(&rpc(
+                    "task_fail",
+                    json!({"task": task, "reason": reason, "by": by}),
+                )?);
+            }
+            TaskAction::Reopen { task } => {
+                print_json(&rpc("task_reopen", json!({"task": task, "pane": pane}))?);
+            }
+            TaskAction::Cancel { task } => {
+                print_json(&rpc("task_cancel", json!({"task": task, "by": by}))?);
+            }
+        },
+    }
+    Ok(0)
 }
 
 /// Print or exec the native attach for an agent's live endpoint.
@@ -2625,6 +3053,87 @@ mod tests {
     fn self_command_parses() {
         let cli = Cli::try_parse_from(["cadence", "self"]).unwrap();
         assert!(matches!(cli.command, Commands::SelfInfo));
+    }
+
+    #[test]
+    fn job_command_tree_parses() {
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "job",
+            "new",
+            "--pm",
+            "pm",
+            "--spec",
+            "s.md",
+            "--issue",
+            "CAD-26",
+            "--max-revisions",
+            "3",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Job {
+                action: JobAction::New {
+                    max_revisions: 3,
+                    ..
+                }
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["cadence", "job", "dispatch", "t1", "--to", "w2", "--ready"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Job {
+                action: JobAction::Dispatch { ready: true, .. }
+            }
+        ));
+        // A verdict with no flag is a parse-level error, not a default.
+        assert!(Cli::try_parse_from(["cadence", "job", "verdict", "t1", "--sha", "x",]).is_err());
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "job",
+            "verdict",
+            "t1",
+            "--sha",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--pass",
+            "--reviewer",
+            "rev",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Job {
+                action: JobAction::Verdict { pass: true, .. }
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "job",
+            "task",
+            "sha",
+            "t1",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Job {
+                action: JobAction::Task {
+                    action: TaskAction::Sha { .. }
+                }
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["cadence", "send", "w1", "--text", "hi", "--task", "t1"]).unwrap();
+        match cli.command {
+            Commands::Send { task, .. } => {
+                assert_eq!(task.as_deref(), Some("t1"));
+            }
+            _ => panic!(),
+        }
     }
 
     #[test]
