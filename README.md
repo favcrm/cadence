@@ -1,3 +1,5 @@
+<p align="center"><img src="ui/public/icon.svg" width="112" height="112" alt="Cadence icon"></p>
+
 # Cadence
 
 Coordinate coding agents across terminals, from planning through verified delivery.
