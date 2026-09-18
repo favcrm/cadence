@@ -1,10 +1,14 @@
 //! The PM board: issue folders under a private directory (`~/pm` or
-//! `CADENCE_PM_DIR`) that is its own git repo, never pushed. The
-//! `cadence issue` CLI is the only writer; `cadence ui` is a read-only
-//! view over the same files plus agent-notes and the daemon socket.
+//! `CADENCE_PM_DIR`) that is its own git repo — `issue init` installs
+//! hooks that lint each commit and push the private `origin` remote.
+//! The `cadence issue` CLI is the only writer; `cadence ui` is a
+//! read/write front end over the same files plus agent-notes and the
+//! daemon socket.
 
 pub mod board;
 pub mod cli;
+pub mod doctor;
+pub mod hooks;
 pub mod lint;
 pub mod model;
 pub mod notes;

@@ -73,7 +73,17 @@ the board (`issue ls` still lists them).
 ## `cadence issue` — the only writer
 
 ```bash
-cadence issue init                          # create pm.yaml + README + git init
+cadence issue init                          # create pm.yaml + README + git init and
+                                            # install the git hooks: pre-commit runs
+                                            # `issue lint`, post-commit background-
+                                            # pushes `origin`. Idempotent — ours are
+                                            # refreshed, a foreign hook is kept and
+                                            # reported, never overwritten
+cadence issue doctor                        # read-only health: root, git repo,
+                                            # remote, each hook (present/executable/
+                                            # ours), lint, push lag, the
+                                            # push-failures.log tail; exit !=0 on a
+                                            # failing check
 cadence issue project add cadence --prefix CAD --repo ~/Project/cadence \
     --component adapter --owner cookie-cesium
 cadence issue new "title"                   # --project wins, else CADENCE_PROJECT,
@@ -96,9 +106,14 @@ cadence issue set CAD-16 owner=             # empty value clears the field
 ```
 
 Every write is exactly one git commit in the PM repo, made under a lock
-file (`~/pm/.lock`) with atomic `issue.md` replacement. Writes validate
-what lint would catch: dangling links, `blocked_by`/parent cycles,
-depth > 2, oversize artifacts, unknown components/statuses/priorities.
+file (`~/pm/.lock`) with atomic `issue.md` replacement. Field values are
+validated inside `issue::write` itself — on `new`, `set` and the HTTP
+PATCH alike — so a bad value can never be committed and lint stays the
+safety net: `status` is one of the six, `priority` is P0–P3, `component`
+must be declared by the issue's project (`""` clears it), and every
+link target must exist — on `link`/`unlink` and on the `--blocked-by`/
+`--parent` create fields alike. Writes also validate what lint would
+catch: `blocked_by`/parent cycles, depth > 2, oversize artifacts.
 Symlinks inside the tracker are never followed — a linked folder or
 `issue.md` is invisible to reads, an error in lint, and refused by
 writes.
