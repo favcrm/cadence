@@ -105,6 +105,12 @@ cadence issue blame CAD-16                  # per field: the entry that last
                                             # changed it (value, sha, at, by)
 cadence issue trailer CAD-16                # prints `Issue: CAD-16` — the
                                             # trailer line for code commits
+cadence issue start CAD-16                  # mints .cadence/wt/cad-16-<slug> on
+    [--repo <path>] [--name <slug>]         # cadence/cad-16-<slug> in the project
+    [--base <ref>] [--owner <who>]          # repo, records branch+worktree refs,
+    [--job --pm <alias> --spec <file>       # moves backlog|ready to doing, prints
+     [--assignee <alias>]]                  # the trailer; --job also opens the M3
+                                            # job + scoped task (daemon required)
 cadence issue set CAD-16 status=doing owner=fable-cc
 cadence issue link CAD-16 blocked_by CAD-12 # also relates|parent|duplicate_of
 cadence issue unlink CAD-16 blocked_by CAD-12
@@ -215,6 +221,52 @@ The board API serves the same entries:
 `GET /api/issues/<ID>/history?limit=N` (default 50) — same shape as
 `issue log`. The drawer's History section lists them newest-first,
 10 at a time with a "show more" that refetches a larger limit.
+
+## Issue worktrees — `issue start`
+
+`issue start <ID>` is the one command a worker runs to begin: it mints
+`.cadence/wt/<id-lower>-<slug>` on branch `cadence/<id-lower>-<slug>`
+inside the project repo, records both as refs on the issue, moves
+`backlog`/`ready` to `doing` (other statuses are left alone), sets
+`owner` when empty (`--owner`, else the resolved actor), and prints
+everything the worker needs — worktree, branch, base `{ref, sha}` and
+the `Issue: <ID>` trailer — as JSON.
+
+- **Repo** resolves `--repo`, then the cwd's repo when it is one of
+  the project's `project.yaml` repos, then the project's only repo —
+  else it refuses naming the candidates. An explicit `--repo` must be
+  one of the declared repos (code-commit discovery only walks those);
+  an undeclared path is refused with the declared list and a pointer
+  to `repos` in `project.yaml`. **Base** resolves `--base`, then the
+  repo's `origin/HEAD` target, then the current branch; no fetch ever
+  runs.
+- The worktree is minted through the same helper as
+  `cadence devin --worktree` (shared `src/worktree.rs`), including the
+  `.gitignore` `.cadence/` rule — added only when missing.
+- One tracker commit records a `branch` ref (label = repo basename)
+  and a `worktree` ref (absolute path), the status/owner updates and
+  the CAD-42 `Issue:`/`Actor:` trailers under subject
+  `<ID>: start <branch>`.
+- Idempotent: when the worktree and branch already exist *for this
+  issue* (matching refs recorded), the command returns them with
+  `created: false` and makes no commit. It refuses — naming both —
+  when the branch exists but points somewhere unrelated to a recorded
+  worktree.
+- `--job --pm <alias> --spec <file> [--assignee <alias>]` opens the
+  M3 job through `job_new`: the job carries `--issue`, `--repo` and
+  `--base-ref <base sha>`, and the `task_worktree`/`task_branch`/
+  `task_base_sha`/`task_assignee` params scope the default `<job>-t1`
+  task — exactly one task, already bound to the worktree. The daemon,
+  the PM alias and any assignee (the PM itself or a member of its
+  group) are probed *before* anything is created, so a daemon-down,
+  unknown-PM or bad-assignee run leaves no worktree, branch or
+  commit.
+
+Ref kinds `branch` and `worktree` are written by `issue start` (the
+drawer renders them as `repo: branch` and `wt/<name>` chips); adding
+them by hand via `issue ref` works but is unusual — and a tracker
+whose pre-commit hook runs a pre-CAD-43 `cadence` will refuse these
+refs at lint time, so upgrade the installed binary first.
 
 ## `cadence ui` — the reader
 

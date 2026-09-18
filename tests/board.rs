@@ -24,15 +24,44 @@ fn cli(pm: &Path, state: &Path, args: &[&str]) -> (bool, Value) {
 }
 
 fn cli_env(pm: &Path, state: &Path, args: &[&str], env: &[(&str, &str)]) -> (bool, Value) {
+    cli_run(pm, state, None, args, env)
+}
+
+/// `cli_env` run from `cwd` — `issue start` resolves the repo from it.
+fn cli_dir(pm: &Path, state: &Path, cwd: &Path, args: &[&str]) -> (bool, Value) {
+    cli_run(pm, state, Some(cwd), args, &[])
+}
+
+fn cli_run(
+    pm: &Path,
+    state: &Path,
+    cwd: Option<&Path>,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (bool, Value) {
     let mut cmd = Command::new(bin());
     cmd.arg("--state-dir")
         .arg(state)
         .args(args)
         .env("CADENCE_PM_DIR", pm)
         .env("HOME", std::env::var("HOME").unwrap())
+        // The tracker's pre-commit hook runs `cadence` from PATH —
+        // put the just-built binary first so its lint sees the ref
+        // kinds this build writes.
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                Path::new(bin()).parent().unwrap().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
         // Ambient aliases would leak into Actor: trailers and comment
         // authors — remove it so every env resolves to `operator`.
         .env_remove("CADENCE_ALIAS");
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -3084,4 +3113,266 @@ fn issue_doctor_reports_trailer_share() {
     );
     // 7 issue writes + project add + init all carry `Actor:` now.
     assert!(window > 0 && with >= 9, "{trailers}");
+}
+
+// ---------- CAD-43: issue start ----------
+
+/// Temp project repo (`main`, one commit) + tracker with a `demo`/`D`
+/// project pointing at it. Returns the tmp guard plus the paths.
+fn start_fx() -> (TempDir, PathBuf, PathBuf, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let pm = tmp.path().join("pm");
+    let state = tmp.path().join("state");
+    let repo = tmp.path().join("repo");
+    for d in [&pm, &state, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    assert!(git(&repo, &["init", "-b", "main"]).0);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    assert!(git(&repo, &["commit", "-qm", "init"]).0);
+    assert!(cli(&pm, &state, &["issue", "init"]).0);
+    let repo_s = repo.to_str().unwrap().to_string();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]
+        )
+        .0
+    );
+    (tmp, pm, state, repo)
+}
+
+#[test]
+fn issue_start_creates_records_and_is_idempotent() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "Start Work", "--project", "demo"]
+        )
+        .0
+    );
+    let base_commits = commits(&pm);
+
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let wt = repo.join(".cadence/wt/d-1-start-work");
+    assert_eq!(out["issue"], "D-1");
+    assert_eq!(out["worktree"].as_str().unwrap(), wt.to_str().unwrap());
+    assert_eq!(out["branch"], "cadence/d-1-start-work");
+    assert_eq!(
+        out["repo"].as_str().unwrap(),
+        repo.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(out["trailer"], "Issue: D-1");
+    assert_eq!(out["created"], true);
+    assert_eq!(out["base"]["sha"].as_str().unwrap().len(), 40);
+    assert!(wt.is_dir());
+    // The worktree is checked out on the new branch.
+    assert_eq!(
+        git(&wt, &["symbolic-ref", "--short", "HEAD"]).1,
+        "cadence/d-1-start-work"
+    );
+    // `.cadence/` ignore line added exactly once.
+    let ignore = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
+    assert_eq!(
+        ignore.lines().filter(|l| l.trim() == ".cadence/").count(),
+        1
+    );
+
+    // One tracker commit: `<ID>: start <branch>` + CAD-42 trailers.
+    assert_eq!(commits(&pm), base_commits + 1);
+    let (_, body) = git(&pm, &["log", "-1", "--format=%B"]);
+    assert!(body.contains("D-1: start cadence/d-1-start-work"), "{body}");
+    assert!(body.contains("Issue: D-1"), "{body}");
+    assert!(body.contains("Actor: operator"), "{body}");
+
+    // Front: both refs, status doing, owner = resolved actor.
+    let front = std::fs::read_to_string(pm.join("demo/D-1/issue.md")).unwrap();
+    assert!(front.contains("kind: branch"), "{front}");
+    assert!(front.contains("cadence/d-1-start-work"), "{front}");
+    assert!(front.contains("kind: worktree"), "{front}");
+    assert!(front.contains("status: doing"), "{front}");
+    assert!(front.contains("owner: operator"), "{front}");
+
+    // Second run: idempotent — same answer, created:false, no commit.
+    let (ok, out2) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out2}");
+    assert_eq!(out2["created"], false);
+    assert_eq!(out2["worktree"], out["worktree"]);
+    assert_eq!(commits(&pm), base_commits + 1);
+}
+
+#[test]
+fn issue_start_repo_resolution() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "Repo Pick", "--project", "demo"]
+        )
+        .0
+    );
+    let repo_s = repo.to_str().unwrap().to_string();
+
+    // --repo explicit.
+    let (ok, out) = cli(
+        &pm,
+        &state,
+        &[
+            "issue", "start", "D-1", "--repo", &repo_s, "--name", "explicit",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert!(out["worktree"].as_str().unwrap().ends_with("d-1-explicit"));
+
+    // cwd inside the repo resolves without --repo.
+    let (ok, out) = cli_dir(
+        &pm,
+        &state,
+        &repo,
+        &["issue", "start", "D-1", "--name", "from-cwd"],
+    );
+    assert!(ok, "{out}");
+    assert!(out["worktree"].as_str().unwrap().ends_with("d-1-from-cwd"));
+
+    // Single-repo fallback (cwd is the test process — not a project repo).
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1", "--name", "single"]);
+    assert!(ok, "{out}");
+
+    // Ambiguous: a second repo on a second project refuses with the list.
+    let repo2 = _tmp.path().join("repo2");
+    std::fs::create_dir_all(&repo2).unwrap();
+    assert!(git(&repo2, &["init", "-b", "main"]).0);
+    git(&repo2, &["config", "user.email", "t@t"]);
+    git(&repo2, &["config", "user.name", "t"]);
+    std::fs::write(repo2.join("g"), "y").unwrap();
+    git(&repo2, &["add", "-A"]);
+    assert!(git(&repo2, &["commit", "-qm", "init"]).0);
+    let repo2_s = repo2.to_str().unwrap().to_string();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &[
+                "issue", "project", "add", "two", "--prefix", "T", "--repo", &repo_s, "--repo",
+                &repo2_s
+            ]
+        )
+        .0
+    );
+    assert!(cli(&pm, &state, &["issue", "new", "Ambig", "--project", "two"]).0);
+    let (ok, err) = cli(&pm, &state, &["issue", "start", "T-1"]);
+    assert!(!ok);
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("--repo"), "{msg}");
+    assert!(msg.contains(&repo_s) && msg.contains(&repo2_s), "{msg}");
+
+    // A real repo undeclared on the issue's project refuses, naming
+    // the declared repos — code-commit discovery only walks those.
+    let before = git(&pm, &["rev-list", "--count", "HEAD"]).1;
+    let (ok, err) = cli(
+        &pm,
+        &state,
+        &[
+            "issue",
+            "start",
+            "D-1",
+            "--repo",
+            &repo2_s,
+            "--name",
+            "undeclared",
+        ],
+    );
+    assert!(!ok);
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("not declared"), "{msg}");
+    assert!(msg.contains(&repo_s), "{msg}");
+    assert!(msg.contains("project.yaml"), "{msg}");
+    assert!(!repo2.join(".cadence/wt/d-1-undeclared").exists());
+    assert!(!git(&repo2, &["rev-parse", "--verify", "cadence/d-1-undeclared"]).0);
+    assert_eq!(git(&pm, &["rev-list", "--count", "HEAD"]).1, before);
+
+    // Bad --repo path refuses; bad --base refuses.
+    let (ok, err) = cli(
+        &pm,
+        &state,
+        &["issue", "start", "D-1", "--repo", "/nonexistent"],
+    );
+    assert!(!ok && err["error"].as_str().unwrap().contains("git repository"));
+    let (ok, err) = cli(
+        &pm,
+        &state,
+        &[
+            "issue", "start", "D-1", "--name", "bad-base", "--base", "nope-ref",
+        ],
+    );
+    assert!(!ok && err["error"].as_str().unwrap().contains("does not resolve"));
+
+    // --job without --pm/--spec is a clap error, not a start (usage
+    // text, not JSON — plain-text read).
+    let (ok, usage) = cli_raw(&pm, &state, &["issue", "start", "D-1", "--job"]);
+    assert!(!ok && usage.contains("--pm"), "{usage}");
+}
+
+#[test]
+fn issue_start_conflicting_branch_refused_and_status_owner() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Clash", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "set", "D-1", "status=ready"]).0);
+
+    // A pre-existing branch under the same name refuses, naming the
+    // branch and the recorded worktree — nothing created, no commit.
+    assert!(git(&repo, &["branch", "cadence/d-1-clash"]).0);
+    let before = commits(&pm);
+    let (ok, err) = cli(&pm, &state, &["issue", "start", "D-1", "--name", "clash"]);
+    assert!(!ok);
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("cadence/d-1-clash") && msg.contains("worktree"),
+        "{msg}"
+    );
+    assert!(!repo.join(".cadence/wt/d-1-clash").exists());
+    assert_eq!(commits(&pm), before);
+    git(&repo, &["branch", "-D", "cadence/d-1-clash"]);
+
+    // ready -> doing, --owner wins when empty.
+    let (ok, _) = cli(&pm, &state, &["issue", "start", "D-1", "--owner", "alice"]);
+    assert!(ok);
+    let front = std::fs::read_to_string(pm.join("demo/D-1/issue.md")).unwrap();
+    assert!(
+        front.contains("status: doing") && front.contains("owner: alice"),
+        "{front}"
+    );
+
+    // review stays review; an existing owner is kept.
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "In Review", "--project", "demo"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "set", "D-2", "status=review", "owner=bob"]
+        )
+        .0
+    );
+    let (ok, _) = cli(&pm, &state, &["issue", "start", "D-2"]);
+    assert!(ok);
+    let front = std::fs::read_to_string(pm.join("demo/D-2/issue.md")).unwrap();
+    assert!(
+        front.contains("status: review") && front.contains("owner: bob"),
+        "{front}"
+    );
 }

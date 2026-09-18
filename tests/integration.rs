@@ -7569,6 +7569,10 @@ fn restart_fences_task_kickoff_and_job_show_reports_drift() {
                 None,
                 2,
                 None,
+                None,
+                None,
+                None,
+                None,
             )
             .unwrap();
         store
@@ -9092,4 +9096,226 @@ fn long_report_text_survives_pty_report_to_inbox() {
             "inbox routed body truncated at {size}"
         );
     }
+}
+
+/// CAD-43 `--job`: `issue start --job --pm --spec` opens an M3 job +
+/// a worktree-scoped task through the same `job_new`/`task_new` RPCs —
+/// and refuses before creating anything when the daemon can't answer.
+#[test]
+fn issue_start_job_opens_scoped_task() {
+    let d = TestDaemon::start();
+    let tmp = TempDir::new().unwrap();
+    let (pm, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    // The tracker's pre-commit hook runs `cadence` from PATH — the
+    // just-built binary must come first.
+    let cli = |state: &Path, args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(cli(&d.state, &["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(
+        cli(
+            &d.state,
+            &["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            &d.state,
+            &["issue", "new", "Job Start", "--project", "demo"]
+        )
+        .0
+    );
+    let (spec, _sha) = d.spec_file("spec.md", "do the seeded work");
+    let tracker_commits = || {
+        String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&pm)
+                .args(["rev-list", "--count", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .parse::<usize>()
+        .unwrap()
+    };
+    let wt = repo.join(".cadence/wt/d-1-job-start");
+
+    // Daemon down (state dir without a socket): refused, nothing created.
+    let dead = TempDir::new().unwrap();
+    let (ok, err) = cli(
+        dead.path(),
+        &[
+            "issue", "start", "D-1", "--job", "--pm", "pm", "--spec", &spec,
+        ],
+    );
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("not reachable"),
+        "{err}"
+    );
+    assert!(!wt.exists());
+    let before = tracker_commits();
+
+    // Daemon up but the pm alias unknown: also refused before creating.
+    let (ok, _) = cli(
+        &d.state,
+        &[
+            "issue", "start", "D-1", "--job", "--pm", "pm", "--spec", &spec,
+        ],
+    );
+    assert!(!ok);
+    assert!(!wt.exists());
+    assert_eq!(tracker_commits(), before);
+
+    // Daemon up, pm known, assignee unknown: refused before creating.
+    d.register("pm");
+    let (ok, err) = cli(
+        &d.state,
+        &[
+            "issue",
+            "start",
+            "D-1",
+            "--job",
+            "--pm",
+            "pm",
+            "--spec",
+            &spec,
+            "--assignee",
+            "ghost",
+        ],
+    );
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("ghost"),
+        "{err}"
+    );
+    assert!(!wt.exists());
+    assert_eq!(tracker_commits(), before);
+
+    // Assignee exists but outside the pm's group: refused too.
+    d.register("outsider");
+    let (ok, err) = cli(
+        &d.state,
+        &[
+            "issue",
+            "start",
+            "D-1",
+            "--job",
+            "--pm",
+            "pm",
+            "--spec",
+            &spec,
+            "--assignee",
+            "outsider",
+        ],
+    );
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("group"),
+        "{err}"
+    );
+    assert!(!wt.exists());
+    assert_eq!(tracker_commits(), before);
+
+    // Real path: one job, one task — <job>-t1 scoped to the worktree.
+    d.register_member("w1", "pm");
+    let (ok, out) = cli(
+        &d.state,
+        &[
+            "issue",
+            "start",
+            "D-1",
+            "--job",
+            "--pm",
+            "pm",
+            "--spec",
+            &spec,
+            "--assignee",
+            "w1",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["created"], true);
+    assert_eq!(tracker_commits(), before + 1);
+    let (job_id, task_id) = (
+        out["job"].as_str().unwrap().to_string(),
+        out["task"].as_str().unwrap().to_string(),
+    );
+    assert_eq!(task_id, format!("{job_id}-t1"));
+    let show = d.rpc("job_show", json!({"job": job_id})).unwrap();
+    let job = &show["job"];
+    assert_eq!(job["issue"], "D-1");
+    assert_eq!(job["repo"].as_str().unwrap(), repo_s);
+    assert_eq!(
+        job["base_ref"].as_str().unwrap(),
+        out["base"]["sha"].as_str().unwrap()
+    );
+    let tasks = job["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1, "{job}");
+    let scoped = &tasks[0];
+    assert_eq!(scoped["id"].as_str().unwrap(), task_id);
+    assert_eq!(scoped["worktree"].as_str().unwrap(), "d-1-job-start");
+    assert_eq!(scoped["branch"].as_str().unwrap(), "cadence/d-1-job-start");
+    assert_eq!(
+        scoped["base_sha"].as_str().unwrap(),
+        out["base"]["sha"].as_str().unwrap()
+    );
+    assert_eq!(scoped["assignee"].as_str().unwrap(), "w1");
 }

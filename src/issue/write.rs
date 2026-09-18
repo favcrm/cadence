@@ -30,7 +30,7 @@ pub(crate) fn actor_who(actor: &str, who: Option<&str>) -> String {
 /// blank line: `Issue: <ID>` once per issue the write touches (links
 /// record both ends) and `Actor: <who>` — the truthful actor history
 /// reads instead of the git author.
-fn commit(pm: &Pm, message: &str, ids: &[&str], actor: &str) -> Result<()> {
+pub(crate) fn commit(pm: &Pm, message: &str, ids: &[&str], actor: &str) -> Result<()> {
     commit_who(pm, message, ids, actor, None)
 }
 
@@ -157,7 +157,7 @@ fn create_exclusive(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
 /// project's prefix — ids cannot smuggle across projects. Symlinks are
 /// never followed: a linked folder or issue.md does not exist as far
 /// as the writer is concerned.
-fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
+pub(crate) fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
     model::check_id(id)?;
     for project in project::list(&pm.dir)? {
         let dir = pm.dir.join(&project.key).join(id);
@@ -170,7 +170,7 @@ fn issue_dir(pm: &Pm, id: &str) -> Result<(project::Project, PathBuf)> {
     )))
 }
 
-fn load_front(dir: &Path) -> Result<(Front, String)> {
+pub(crate) fn load_front(dir: &Path) -> Result<(Front, String)> {
     let text = std::fs::read_to_string(dir.join("issue.md"))?;
     parse::parse_issue(&text)
 }
@@ -189,7 +189,7 @@ fn check_component(project: &project::Project, component: &str) -> Result<()> {
     Ok(())
 }
 
-fn save_front(dir: &Path, front: &Front, body: &str) -> Result<()> {
+pub(crate) fn save_front(dir: &Path, front: &Front, body: &str) -> Result<()> {
     atomic_write(&dir.join("issue.md"), &parse::render(front, body)?)
 }
 
