@@ -73,6 +73,7 @@ impl ProviderAdapter for FakeAdapter {
             pid: std::process::id(),
             endpoint: None,
             generation: None,
+            attach: None,
         })
     }
 

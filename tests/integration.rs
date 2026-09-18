@@ -865,6 +865,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
                     pid: 1,
                     endpoint: None,
                     generation: None,
+                    attach: None,
                 },
             )
             .unwrap();
@@ -4063,7 +4064,8 @@ fn agent_remove_and_gc_sweep() {
         .unwrap_err();
     assert!(err.to_string().contains("agent stop"), "{err}");
 
-    // Stopped agents are dead: endpoint NULL shows in `agent list`.
+    // A stopped fake is not dead — fake never dies — but it is
+    // resumable: stopped with a saved thread and no fence.
     d.rpc("agent_stop", json!({"alias": "w-old"})).unwrap();
     d.rpc("agent_stop", json!({"alias": "w-recent"})).unwrap();
     d.wait_agent("w-old", "stopped", 15);
@@ -4075,7 +4077,8 @@ fn agent_remove_and_gc_sweep() {
         .iter()
         .find(|a| a["alias"] == "w-old")
         .unwrap();
-    assert_eq!(w_old["dead"], true, "{w_old}");
+    assert_eq!(w_old["dead"], false, "{w_old}");
+    assert_eq!(w_old["resumable"], true, "{w_old}");
     assert!(w_old["endpoint"].is_null());
     let live = list["agents"]
         .as_array()
@@ -4084,6 +4087,7 @@ fn agent_remove_and_gc_sweep() {
         .find(|a| a["alias"] == "dv1")
         .unwrap();
     assert_eq!(live["dead"], false, "{live}");
+    assert_eq!(live["resumable"], false, "{live}");
 
     // Explicit remove drops the row and its history.
     d.rpc("agent_remove", json!({"alias": "w-old"})).unwrap();
@@ -5607,6 +5611,244 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
     );
     wait_pid_gone(&d.pane_file(&mock, "dv-gc", "pid"), 10);
     assert!(d.rpc("agent_show", json!({"alias": "dv-gc"})).is_err());
+}
+
+/// `agent_unfence` with `resume: true` reconciles and resumes in one
+/// call and reports what the endpoint actually did. A surviving pane
+/// is adopted — same pid, same native session.
+#[test]
+fn pty_unfence_resume_reports_adopted_pane() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let native = agent["thread_id"].as_str().unwrap().to_string();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    pty_token(&d, "dv1", "m1");
+    let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // Fence: the paste never renders; the pane is detached, not killed.
+    std::fs::write(d.pane_file(&mock, "dv1", "swallow"), "1").unwrap();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "dropped", "message": "m2"}),
+    )
+    .unwrap();
+    d.wait_agent("dv1", "attention", 25);
+    // One call reconciles the unknown and brings the agent back.
+    let r = d
+        .rpc(
+            "agent_unfence",
+            json!({"alias": "dv1", "status": "interrupted",
+                   "resume": true}),
+        )
+        .unwrap();
+    assert_eq!(r["reconciled"], json!(["m2"]), "{r}");
+    assert_eq!(r["resumed"], true, "{r}");
+    assert_eq!(r["pane"], "adopted", "{r}");
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let pid_after: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(pid_after, pane_pid, "adopted pane changed pid");
+    assert_eq!(agent["thread_id"].as_str().unwrap(), native);
+}
+
+/// The same call reports `respawned` when no pane survived: a new
+/// pane is launched on the recorded session — new pid, same native
+/// thread.
+#[test]
+fn pty_unfence_resume_reports_respawned_pane() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let native = agent["thread_id"].as_str().unwrap().to_string();
+    let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::fs::write(d.pane_file(&mock, "dv1", "swallow"), "1").unwrap();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "dropped", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("dv1", "attention", 25);
+    // The detached pane dies out-of-band before the resume — nothing
+    // left to adopt.
+    std::process::Command::new(mock.dir.join("tmux"))
+        .args(["-L", &socket_for(&d.state), "kill-session", "-t", "dv1"])
+        .env("MOCK_TMUX_STATE", mock.dir.join("tmux-state"))
+        .output()
+        .unwrap();
+    wait_pid_gone(&d.pane_file(&mock, "dv1", "pid"), 10);
+    let r = d
+        .rpc(
+            "agent_unfence",
+            json!({"alias": "dv1", "status": "interrupted",
+                   "resume": true}),
+        )
+        .unwrap();
+    assert_eq!(r["resumed"], true, "{r}");
+    assert_eq!(r["pane"], "respawned", "{r}");
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let pid_after: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(pid_after, pane_pid, "respawn kept the dead pid");
+    assert_eq!(agent["thread_id"].as_str().unwrap(), native);
+}
+
+/// Non-pty kinds carry no pane field at all — the response still says
+/// `resumed` and the state the resume reached.
+#[test]
+fn unfence_resume_non_pty_reports_no_pane() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    fence_agent(&d, "w1", "x1");
+    let r = d
+        .rpc(
+            "agent_unfence",
+            json!({"alias": "w1", "status": "interrupted",
+                   "resume": true}),
+        )
+        .unwrap();
+    assert_eq!(r["reconciled"], json!(["x1"]), "{r}");
+    assert_eq!(r["resumed"], true, "{r}");
+    assert!(r.get("pane").is_none(), "{r}");
+    d.wait_agent("w1", "idle", 15);
+}
+
+/// Adopted does not mean idle: a surviving pane that is visibly busy
+/// is still adopted by resume, but sends stay gated until the screen
+/// probe sees it idle.
+#[test]
+fn pty_unfence_resume_busy_adopted_pane_stays_gated() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    d.register_stub("st", json!({"auto_ready": "verified"}));
+    d.wait_agent("st", "idle", 20);
+    // Fence; the pane survives detached.
+    std::fs::write(d.stub_pane_file(&mock, "st", "swallow"), "1").unwrap();
+    d.rpc("agent_ready", json!({"alias": "st"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "dropped", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("st", "attention", 25);
+    // The surviving pane is visibly busy — adoption still lands.
+    std::fs::write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n").unwrap();
+    let r = d
+        .rpc(
+            "agent_unfence",
+            json!({"alias": "st", "status": "interrupted",
+                   "resume": true}),
+        )
+        .unwrap();
+    assert_eq!(r["resumed"], true, "{r}");
+    assert_eq!(r["pane"], "adopted", "{r}");
+    d.wait_agent("st", "idle", 20);
+    // A send without ready must not paste into the busy pane.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "wait for idle", "message": "m2"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("st", "gate_wait", 15);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("busy"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("st", "m2"), "queued");
+    // Operator clears the pane: busy marker off, the swallowed draft
+    // out of the input line, the pane accepting pastes again — then
+    // the queued send delivers.
+    std::fs::remove_file(d.stub_pane_file(&mock, "st", "tui-state")).unwrap();
+    std::fs::remove_file(d.stub_pane_file(&mock, "st", "swallow")).unwrap();
+    std::fs::write(d.stub_pane_file(&mock, "st", "input"), "").unwrap();
+    pty_token(&d, "st", "m2");
+}
+
+/// `dead` and `resumable` answer different questions per endpoint
+/// kind: dead = "the surface is gone and this wasn't operator-stopped"
+/// (attachable), or fenced/unattended (managed); inbox and fake never
+/// die. Resumable = stopped-or-dead with a saved thread and no
+/// unreconciled unknowns fencing it.
+#[test]
+fn agent_dead_and_resumable_per_endpoint_kind() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    // pty fenced: the actor is dead (detached pane, no endpoint) but
+    // the unknown still fences it — dead, not resumable.
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    std::fs::write(d.pane_file(&_mock, "dv1", "swallow"), "1").unwrap();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "dropped", "message": "m1"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("dv1", "attention", 25);
+    assert_eq!(agent["dead"], true, "{agent}");
+    assert_eq!(agent["resumable"], false, "{agent}");
+    // Unfence without resume → stopped: not dead, resumable — the
+    // recorded thread can be re-attached.
+    d.rpc(
+        "agent_unfence",
+        json!({"alias": "dv1", "status": "interrupted"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("dv1", "stopped", 10);
+    assert_eq!(agent["dead"], false, "{agent}");
+    assert_eq!(agent["resumable"], true, "{agent}");
+    // Live again: neither.
+    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    let agent = d.wait_agent("dv1", "idle", 20);
+    assert_eq!(agent["dead"], false, "{agent}");
+    assert_eq!(agent["resumable"], false, "{agent}");
+    // A stopped fake: never dead, resumable.
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let agent = d.wait_agent("w1", "stopped", 15);
+    assert_eq!(agent["dead"], false, "{agent}");
+    assert_eq!(agent["resumable"], true, "{agent}");
+    // A fenced fake: not dead (fake never dies), not resumable while
+    // the unknown stands.
+    d.register("w2");
+    d.wait_agent("w2", "idle", 10);
+    fence_agent(&d, "w2", "x1");
+    let agent = d.wait_agent("w2", "attention", 10);
+    assert_eq!(agent["dead"], false, "{agent}");
+    assert_eq!(agent["resumable"], false, "{agent}");
+    // An inbox is a mailbox, not a process: never dead, never
+    // resumable.
+    d.register_inbox("obs");
+    let show = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    assert_eq!(show["agent"]["dead"], false, "{show}");
+    assert_eq!(show["agent"]["resumable"], false, "{show}");
 }
 
 /// `agent ready` runs the same probe verified auto-ready runs: a
