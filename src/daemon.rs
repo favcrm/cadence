@@ -860,6 +860,14 @@ impl Shared {
             (None, e) if !registry::has_actor(provider, e) => self.state_dir.clone(),
             (None, _) => return Err(Error::rejected("Missing 'cwd'")),
         };
+        // Enumerated launch params are validated at the door — a bad
+        // value rejected here never lands on the agent row to be
+        // replayed into a provider argv on every resume.
+        if let Some(raw) = agent_params {
+            let parsed: Value = serde_json::from_str(raw)
+                .map_err(|_| Error::rejected("'params' must be a JSON object"))?;
+            registry::validate_launch_params(provider, endpoint, &parsed)?;
+        }
         self.store.register_agent(&crate::store::NewAgent {
             alias,
             provider,
