@@ -22,6 +22,8 @@ pub const CAPABILITIES: &[&str] = &[
     "pty_verified_autoready",
     "operator_reconcile",
     "inbox_endpoint",
+    "job_lifecycle",
+    "revision_bound_verdicts",
     "approval_brokering",
     "result_routing",
     "fake_provider_tests",
