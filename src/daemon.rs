@@ -300,11 +300,15 @@ impl Shared {
     fn run_actor(self: &Arc<Self>, alias: &str, ctl: Arc<AgentCtl>) {
         let outcome = self.actor_inner(alias, &ctl);
         // Cleanup always runs: release the adapter, clear ctl, final
-        // state. On daemon shutdown we detach instead — endpoints like
-        // an owned tmux pane outlive the controller and are revalidated
-        // on the next open rather than destroyed mid-use.
+        // state. Detach — never kill — on daemon shutdown and on any
+        // error exit (a fence): owned endpoints like a tmux pane
+        // outlive the controller so the operator can inspect the screen
+        // a failure left behind and `agent resume` re-adopt it. Explicit
+        // stops keep `close()`. `detach` defaults to `close` for
+        // adapters that own their provider process, so managed
+        // endpoints are still reaped on every exit.
         if let Some(adapter) = ctl.adapter.lock().unwrap().take() {
-            if self.closing.load(Ordering::SeqCst) {
+            if self.closing.load(Ordering::SeqCst) || outcome.is_err() {
                 adapter.detach();
             } else {
                 adapter.close();
@@ -379,15 +383,13 @@ impl Shared {
         // Publish before `open` so stop/shutdown can force-close the
         // transport while initialization RPCs are still in flight.
         *ctl.adapter.lock().unwrap() = Some(Arc::clone(&adapter));
-        let opened = adapter
+        // A failed open returns Err — run_actor's cleanup detaches on
+        // any error, which still closes owned provider processes
+        // (detach defaults to close) while leaving a pty pane visible
+        // for inspection.
+        adapter
             .open(&agent)
-            .and_then(|identity| self.store.set_identity(alias, &identity));
-        if let Err(error) = opened {
-            // A half-open adapter may still own a provider process;
-            // never leave it running past a failed initialization.
-            adapter.close();
-            return Err(error);
-        }
+            .and_then(|identity| self.store.set_identity(alias, &identity))?;
         self.wake();
         let mut gate_notice: Option<String> = None;
         let mut gate_waits: u32 = 0;
@@ -445,17 +447,31 @@ impl Shared {
                         // is lost. Task messages keep the uncertainty
                         // discipline: `unknown` + fence, never a blind
                         // replay.
-                        Err(Error::NotRendered(reason)) => {
+                        Err(Error::NotRendered(miss)) => {
                             unrendered += 1;
                             let routed = message.is_routed();
                             let retry = routed && unrendered <= 3;
+                            // The miss carries the pane's own evidence:
+                            // screen tails before the paste and after
+                            // the deadline plus the probe verdict that
+                            // admitted the send — what "idle" looked
+                            // like when delivery failed.
+                            let crate::error::RenderMiss {
+                                reason,
+                                before_tail,
+                                after_tail,
+                                claim_probe,
+                            } = miss;
                             let _ = self.store.event_public(
                                 alias,
                                 "paste_not_rendered",
                                 json!({"message": message.id,
                                        "reason": reason,
                                        "attempt": unrendered,
-                                       "retry": retry}),
+                                       "retry": retry,
+                                       "before": before_tail,
+                                       "after": after_tail,
+                                       "claim_probe": claim_probe}),
                             );
                             if retry {
                                 let _ = self.store.requeue(&message.id);
@@ -773,6 +789,12 @@ impl Shared {
                              run `cadence agent stop {alias}` first"
                         )));
                     }
+                    // A fenced pty pane may still be alive — remove is
+                    // the explicit kill; never leave an orphan session
+                    // on the private socket behind a dropped row.
+                    if agent.endpoint_kind == "pty" {
+                        adapter::pty::kill_pane(&self.state_dir, &alias);
+                    }
                     // Re-checks endpoint/state inside its transaction.
                     self.store.remove_agent(&alias)?;
                 }
@@ -788,8 +810,16 @@ impl Shared {
                     for agent in candidates {
                         // Skip an alias owned mid-transition rather than
                         // failing the whole sweep.
-                        if !lc.owned(&agent.alias) && self.store.remove_agent(&agent.alias).is_ok()
-                        {
+                        if lc.owned(&agent.alias) {
+                            continue;
+                        }
+                        // A fenced pty pane may still be alive — gc is
+                        // the explicit kill; no orphan sessions behind
+                        // dropped rows.
+                        if agent.endpoint_kind == "pty" {
+                            adapter::pty::kill_pane(&self.state_dir, &agent.alias);
+                        }
+                        if self.store.remove_agent(&agent.alias).is_ok() {
                             removed.push(agent.alias);
                         }
                     }
@@ -1096,12 +1126,22 @@ impl Shared {
     fn rpc_ready(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let by = optional_str(params, "by").map(str::to_string);
-        self.adapter_for(&alias)?.claim_ready(by.clone())?;
-        let _ = self.store.event_public(
-            &alias,
-            "ready_claimed",
-            json!({"by": by.unwrap_or_else(|| "operator".to_string())}),
-        );
+        let force = params
+            .get("force")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // The claim itself runs the idle probe and refuses a busy
+        // pane — `force` is the operator's explicit override and is
+        // recorded as such on the event.
+        let probe = self.adapter_for(&alias)?.claim_ready(by.clone(), force)?;
+        let mut detail = json!({
+            "by": by.unwrap_or_else(|| "operator".to_string()),
+            "probe": probe.to_json(),
+        });
+        if force {
+            detail["forced"] = json!(true);
+        }
+        let _ = self.store.event_public(&alias, "ready_claimed", detail);
         // Wake the actor's gate wait — a claim should release the head
         // message immediately, not on the next poll tick.
         self.notify_agent(&alias);
@@ -1716,6 +1756,12 @@ impl Shared {
         }
         if let Some(ctl) = ctl {
             self.stop_ctls(&[ctl]);
+        }
+        // A fenced pty agent's pane survived the fence for inspection —
+        // `agent stop` is the explicit kill. For a live agent the
+        // actor's own close() already ran, so this is a no-op for it.
+        if agent.endpoint_kind == "pty" {
+            adapter::pty::kill_pane(&self.state_dir, &alias);
         }
         // The actor writes its own terminal state on exit; do not mask a
         // fence it may have raised while finishing.

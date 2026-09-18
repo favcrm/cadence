@@ -93,6 +93,10 @@ const BUFFER: &str = "cadence-msg";
 struct Claim {
     at: Instant,
     by: Option<String>,
+    /// The screen probe that admitted the claim — recorded so a later
+    /// `paste_not_rendered` can show what "idle" looked like at claim
+    /// time. Forced claims keep the busy verdict they overrode.
+    probe: Probe,
 }
 
 struct PtyState {
@@ -110,6 +114,10 @@ struct PtyState {
     /// believed dead after `DISCONNECT_MISS_BUDGET` misses across
     /// idle ticks (never inside one tick — see `disconnected`).
     disconnected_misses: usize,
+    /// The probe verdict that admitted the in-flight send — the claim's
+    /// own verdict for an operator claim, the just-run probe for a
+    /// daemon auto-claim. Carried on `NotRendered` evidence.
+    gate_probe: Option<Probe>,
 }
 
 /// The generic adapter: tmux mechanics, readiness claims and the
@@ -156,6 +164,46 @@ fn normalize_screen(text: &str) -> String {
 fn tail_chars(text: &str, n: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     chars.iter().skip(chars.len().saturating_sub(n)).collect()
+}
+
+/// The last `rows` lines of a screen capture — control characters
+/// stripped, lines right-trimmed, trailing blanks dropped. The
+/// normalized tail a `paste_not_rendered` event carries so a fenced
+/// paste shows what the pane actually displayed.
+fn screen_tail(text: &str, rows: usize) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| {
+            l.chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let skip = lines.len().saturating_sub(rows);
+    lines.into_iter().skip(skip).collect()
+}
+
+/// Kill `alias`'s session on this state dir's private tmux socket —
+/// the explicit kill path for `agent stop`/`remove`/`gc` on a pty
+/// agent whose pane may have survived a fence (fences detach now).
+/// Best effort: only sessions we launched exist on this socket, and a
+/// missing session or server is already the goal state.
+pub(crate) fn kill_pane(state_dir: &Path, alias: &str) {
+    let tmux = std::env::var("CADENCE_TMUX_COMMAND")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "tmux".to_string());
+    let socket = format!("cadence-{}", short_hash(&state_dir.to_string_lossy()));
+    let _ = Command::new(tmux)
+        .arg("-L")
+        .arg(&socket)
+        .args(["kill-session", "-t", alias])
+        .output();
 }
 
 pub(crate) fn resolve_on_path(bin: &str) -> Result<String> {
@@ -261,6 +309,7 @@ impl PtyAdapter {
                 generation: String::new(),
                 claims: std::collections::VecDeque::new(),
                 disconnected_misses: 0,
+                gate_probe: None,
             }),
             socket: format!("cadence-{}", short_hash(&state_dir.to_string_lossy())),
             tmux: std::env::var("CADENCE_TMUX_COMMAND")
@@ -407,6 +456,9 @@ impl PtyAdapter {
         if let Some(claim) = claimed {
             // Which claim released this send is audit-relevant (G5):
             // the claimer is recorded at consumption, not just claim.
+            // The claim's own probe verdict rides along — it is the
+            // "idle" the sender believed in if the paste never renders.
+            self.state.lock().unwrap().gate_probe = Some(claim.probe.clone());
             (self.hooks.on_event)(
                 "cadence/claim_used",
                 serde_json::json!({
@@ -424,6 +476,7 @@ impl PtyAdapter {
         }
         let probe = self.probe()?;
         if probe.idle {
+            self.state.lock().unwrap().gate_probe = Some(probe.clone());
             (self.hooks.on_event)(
                 "cadence/ready_claimed",
                 serde_json::json!({"by": "daemon", "probe": probe.to_json()}),
@@ -654,11 +707,28 @@ impl ProviderAdapter for PtyAdapter {
                 }
             }
             if Instant::now() >= deadline {
-                return Err(Error::not_rendered(if rendered {
+                // The miss carries what the pane actually showed — the
+                // screen tail before the paste and after the deadline,
+                // plus the probe verdict that admitted the send — so a
+                // fence records evidence, not just a verdict.
+                let reason = if rendered {
                     "paste rendered in the input line but was never submitted — \
                      Enter not observed; the draft is left untouched"
                 } else {
                     "pasted text never rendered in the pane — the TUI dropped it"
+                };
+                let claim_probe = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .gate_probe
+                    .as_ref()
+                    .map(Probe::to_json);
+                return Err(Error::not_rendered(crate::error::RenderMiss {
+                    reason: reason.to_string(),
+                    before_tail: screen_tail(&before, 12),
+                    after_tail: screen_tail(&screen, 12),
+                    claim_probe,
                 }));
             }
             std::thread::sleep(Duration::from_millis(150));
@@ -713,12 +783,24 @@ impl ProviderAdapter for PtyAdapter {
     /// to the operator's screen and survives for reattach on restart.
     fn detach(&self) {}
 
-    fn claim_ready(&self, by: Option<String>) -> Result<()> {
+    fn claim_ready(&self, by: Option<String>, force: bool) -> Result<Probe> {
         let (session, native) = self.session_and_native();
         if !self.has_session(&session) {
             return Err(Error::provider("cannot claim readiness: pane is gone"));
         }
         self.verify_ownership(&session, &native)?;
+        // The claim runs the same probe verified auto-ready uses: a
+        // visibly busy pane refuses rather than letting a paste land
+        // mid-turn. `--force` claims anyway — the busy verdict is
+        // still recorded on the claim for the audit trail.
+        let probe = self.probe()?;
+        if !probe.idle && !force {
+            return Err(Error::rejected(format!(
+                "refusing readiness claim — {} \
+                 (inspect with `agent capture`, or pass --force)",
+                probe.reason
+            )));
+        }
         let mut state = self.state.lock().unwrap();
         if state.claims.len() >= CLAIM_CAPACITY {
             state.claims.pop_front();
@@ -726,8 +808,9 @@ impl ProviderAdapter for PtyAdapter {
         state.claims.push_back(Claim {
             at: Instant::now(),
             by,
+            probe: probe.clone(),
         });
-        Ok(())
+        Ok(probe)
     }
 
     fn capture(&self) -> Result<String> {
