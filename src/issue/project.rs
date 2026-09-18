@@ -79,7 +79,7 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 /// The cwd's repo identity: `(main checkout root, normalised remote)`.
 /// The main checkout root comes from `--git-common-dir` so every
 /// worktree maps to the same identity.
-fn repo_identity(cwd: &Path) -> Option<(PathBuf, Option<String>)> {
+pub(crate) fn repo_identity(cwd: &Path) -> Option<(PathBuf, Option<String>)> {
     let common = git(cwd, &["rev-parse", "--git-common-dir"])?;
     let common = if Path::new(&common).is_absolute() {
         PathBuf::from(common)

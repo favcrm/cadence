@@ -8,7 +8,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::issue::{board, doctor, history, hooks, lint, model, project, sync, write, Pm};
+use crate::issue::{board, doctor, history, hooks, lint, model, project, start, sync, write, Pm};
 
 #[derive(Subcommand)]
 pub enum IssueAction {
@@ -100,6 +100,42 @@ pub enum IssueAction {
     /// agents and hooks append it to code commits without guessing
     /// the format. Refuses an id that does not exist.
     Trailer { id: String },
+    /// Start work on an issue: mint `.cadence/wt/<id>-<slug>` on
+    /// `cadence/<id>-<slug>` in the project repo, record both refs,
+    /// move backlog|ready to doing, print the commit trailer. `--job`
+    /// also opens an M3 job scoped to the worktree (needs the daemon).
+    Start {
+        id: String,
+        /// Repo path — else the cwd's repo when it is one of the
+        /// project's repos, else the project's only repo.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Worktree slug — default: the slugified title (≤32 chars).
+        #[arg(long)]
+        name: Option<String>,
+        /// Base ref — else the repo's origin/HEAD, else its current
+        /// branch. No fetch.
+        #[arg(long)]
+        base: Option<String>,
+        /// Owner to record when the issue has none — default: the
+        /// resolved actor.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Open an M3 job bound to the worktree through `job new` +
+        /// `job task add` (daemon required; checked before anything
+        /// is created).
+        #[arg(long, requires_all = ["pm", "spec"])]
+        job: bool,
+        /// Owning PM agent for the job.
+        #[arg(long, requires = "job")]
+        pm: Option<String>,
+        /// Job spec file — hashed at creation like `job new`.
+        #[arg(long, requires = "job")]
+        spec: Option<PathBuf>,
+        /// Assignee for the worktree-scoped task.
+        #[arg(long, requires = "job")]
+        assignee: Option<String>,
+    },
     /// Show one issue — frontmatter, body, links both ways, comments,
     /// artifacts, activity.
     Show {
@@ -218,7 +254,7 @@ fn open_pm() -> Result<Pm> {
 }
 
 /// `cadence issue …` — returns the process exit code.
-pub fn run(action: &IssueAction) -> Result<i32> {
+pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
     match action {
         IssueAction::Init => {
             let dir = crate::issue::default_dir()?;
@@ -383,6 +419,36 @@ pub fn run(action: &IssueAction) -> Result<i32> {
             let pm = open_pm()?;
             let issue = board::find_issue(&pm.dir, id)?;
             println!("Issue: {}", issue.front.id);
+            Ok(0)
+        }
+        IssueAction::Start {
+            id,
+            repo,
+            name,
+            base,
+            owner,
+            job,
+            pm,
+            spec,
+            assignee,
+        } => {
+            let pm_dir = open_pm()?;
+            let args = start::StartArgs {
+                repo: repo.clone(),
+                name: name.clone(),
+                base: base.clone(),
+                owner: owner.clone(),
+                job: if *job {
+                    Some(start::JobArgs {
+                        pm: pm.clone().unwrap_or_default(),
+                        spec: spec.clone().unwrap_or_default(),
+                        assignee: assignee.clone(),
+                    })
+                } else {
+                    None
+                },
+            };
+            print_json(&start::run(&pm_dir, id, &args, "", state_dir)?);
             Ok(0)
         }
         IssueAction::Show { id, json } => {

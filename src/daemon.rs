@@ -1520,6 +1520,10 @@ impl Shared {
             optional_str(params, "base_ref"),
             optional_i64(params, "max_revisions").unwrap_or(2),
             optional_str(params, "task_title"),
+            optional_str(params, "task_worktree"),
+            optional_str(params, "task_branch"),
+            optional_str(params, "task_base_sha"),
+            optional_str(params, "task_assignee"),
         )?;
         self.wake();
         Ok(json!({"job": job.to_json(), "duplicate": duplicate}))

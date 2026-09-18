@@ -15,6 +15,7 @@ pub mod model;
 pub mod notes;
 pub mod parse;
 pub mod project;
+pub mod start;
 pub mod sync;
 pub mod time;
 pub mod write;
