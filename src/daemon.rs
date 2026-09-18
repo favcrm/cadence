@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::adapter::{self, registry, AdapterHooks, ProviderAdapter, ProviderRequest, TurnResult};
+use crate::client;
 use crate::error::{Error, Result};
 use crate::proto;
 use crate::store::{self, Message, Store, Take};
@@ -683,6 +684,15 @@ impl Shared {
                 let mut agent_json = agent.to_json();
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
+                // The briefing lives under the state dir — actors read
+                // it there, never inside their cwd repository.
+                if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+                    agent_json["briefing"] = json!(client::briefing_path(
+                        &self.state_dir,
+                        agent.params.as_ref().unwrap_or(&Value::Null),
+                        &agent.alias,
+                    ));
+                }
                 Ok(json!({
                     "agent": agent_json,
                     "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),

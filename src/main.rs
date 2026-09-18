@@ -95,6 +95,11 @@ enum Commands {
         /// (a human `agent ready` still wins).
         #[arg(long)]
         auto_ready: bool,
+        /// Write the cadence marker block into the cwd repo's AGENTS.md
+        /// once the endpoint opens (persisted, re-applied on resume).
+        /// Off by default — launches leave the repo untouched.
+        #[arg(long)]
+        agents_md: bool,
         /// Devin permission mode: auto, accept-edits, smart or
         /// dangerous. Persisted and replayed on every launch/resume.
         #[arg(long)]
@@ -140,6 +145,11 @@ enum Commands {
         /// endpoint so this is always a clear error, not a clap one.
         #[arg(long)]
         tui: bool,
+        /// Write the cadence marker block into the cwd repo's AGENTS.md
+        /// once the endpoint opens (persisted, re-applied on resume).
+        /// Off by default — launches leave the repo untouched.
+        #[arg(long)]
+        agents_md: bool,
     },
     /// Launch a Claude agent on a managed stream-json endpoint — one
     /// long-lived headless `claude -p` process per agent; each durable
@@ -213,6 +223,11 @@ enum Commands {
         /// Accepted for interface parity; managed endpoints never attach.
         #[arg(long)]
         detach: bool,
+        /// Write the cadence marker block into the cwd repo's AGENTS.md
+        /// once the endpoint opens (persisted, re-applied on resume).
+        /// Off by default — launches leave the repo untouched.
+        #[arg(long)]
+        agents_md: bool,
     },
     /// Enqueue a durable message to an agent — the hot-path alias for
     /// `message send`. Returns once the message is durable; delivery and
@@ -288,6 +303,11 @@ enum Commands {
         /// the daemon probes the pane and self-claims when visibly idle.
         #[arg(long)]
         auto_ready: bool,
+        /// Write the cadence marker block into the worker's repo
+        /// AGENTS.md once the endpoint opens (persisted, re-applied on
+        /// resume). Off by default — joins leave the repo untouched.
+        #[arg(long)]
+        agents_md: bool,
         /// Model flag for provider `claude` (e.g. sonnet, haiku).
         #[arg(long)]
         model: Option<String>,
@@ -1062,7 +1082,10 @@ fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Result<i32> {
         agent["endpoint_kind"].as_str().unwrap_or_default(),
     );
     if !registry::attachable(provider, kind) {
-        print_json(&result);
+        // Non-attachable actors prove their open by reaching a live
+        // state — finish_resume waits for that (bounded) before any
+        // briefing/AGENTS.md housekeeping.
+        print_json(&finish_resume(state_dir, alias, result));
         return Ok(0);
     }
     // Poll until the endpoint is live or the actor gives up.
@@ -1090,10 +1113,14 @@ fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Result<i32> {
     } else {
         json!({"attach": format!("cadence agent attach {alias}")})
     };
-    print_json(&json!({
-        "alias": alias, "state": state,
-        "endpoint": agent["endpoint"], "next": next,
-    }));
+    print_json(&finish_resume(
+        state_dir,
+        alias,
+        json!({
+            "alias": alias, "state": state,
+            "endpoint": agent["endpoint"], "next": next,
+        }),
+    ));
     if detach || agent["endpoint"].is_null() {
         return Ok(0);
     }
@@ -1189,7 +1216,11 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
             Some("idle") | Some("running") | Some("waiting_input") | Some("starting")
         );
     if live {
-        return json!({"alias": alias, "resumed": false, "skipped": "live"});
+        return finish_resume(
+            state_dir,
+            alias,
+            json!({"alias": alias, "resumed": false, "skipped": "live"}),
+        );
     }
     // Fenced by an unreconciled `unknown` — never attempted; the sweep
     // reports it under `fenced` with the reconcile-first commands.
@@ -1232,13 +1263,17 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
             .unwrap_or_default();
         let state = agent["state"].as_str().unwrap_or_default();
         if agent["endpoint"].is_string() {
-            return json!({"alias": alias, "resumed": true,
-                          "endpoint": agent["endpoint"]});
+            return finish_resume(
+                state_dir,
+                alias,
+                json!({"alias": alias, "resumed": true,
+                          "endpoint": agent["endpoint"]}),
+            );
         }
         // Kinds without an attachable endpoint are done once the actor
         // is back — there is nothing to wait on.
         if !attachable && matches!(state, "idle" | "running") {
-            return json!({"alias": alias, "resumed": true});
+            return finish_resume(state_dir, alias, json!({"alias": alias, "resumed": true}));
         }
         if matches!(state, "attention" | "stopped" | "offline") {
             let error = agent["error"].as_str().unwrap_or("unknown").to_string();
@@ -1262,6 +1297,55 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Post-resume housekeeping on a successfully resumed agent: regenerate
+/// a missing briefing in its state-dir location (agents registered
+/// before briefings moved out of the repo have none there) and re-apply
+/// the opt-in AGENTS.md block — the persisted `agents_md` param replays
+/// here like the other launch params. Best-effort: the resume already
+/// succeeded, so a failure surfaces as a warning field, not an error.
+fn finish_resume(state_dir: &Path, alias: &str, mut out: Value) -> Value {
+    match refresh_briefing(state_dir, alias) {
+        Ok(Some(file)) => out["briefing"] = json!(file),
+        Ok(None) => {}
+        Err(e) => out["briefing_warning"] = json!(e.to_string()),
+    }
+    out
+}
+
+/// `Some(path)` when a briefing was (re)written, `None` when nothing
+/// was needed. Post-open only, same rule as launch: the actor must
+/// prove it is live before anything is written — a resume whose open
+/// stalls or fences writes nothing (terminal states exit early, a slow
+/// open gives up after 15s).
+fn refresh_briefing(state_dir: &Path, alias: &str) -> Result<Option<PathBuf>> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let agent = loop {
+        let agent = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
+            .map(|s| s["agent"].clone())
+            .unwrap_or_default();
+        let state = agent["state"].as_str().unwrap_or_default();
+        if agent["endpoint"].is_string() || matches!(state, "idle" | "running" | "waiting_input") {
+            break agent;
+        }
+        if matches!(state, "stopped" | "offline" | "attention") || Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    if !registry::has_actor(
+        agent["provider"].as_str().unwrap_or_default(),
+        agent["endpoint_kind"].as_str().unwrap_or_default(),
+    ) {
+        return Ok(None);
+    }
+    let file = client::briefing_path(state_dir, &agent["params"], alias);
+    let opted_in = agent["params"]["agents_md"].as_bool() == Some(true);
+    if file.exists() && !opted_in {
+        return Ok(None);
+    }
+    brief_agent(state_dir, alias, false).map(Some)
 }
 
 /// Resume a list of aliases in order, printing a per-member status line
@@ -1638,6 +1722,7 @@ fn run() -> Result<i32> {
             bootstrap,
             no_bootstrap,
             auto_ready,
+            agents_md,
             permission_mode,
             bypass,
         } => provider_launch(
@@ -1653,6 +1738,7 @@ fn run() -> Result<i32> {
             worktree.as_deref(),
             BriefMode::standalone(no_bootstrap, bootstrap),
             auto_ready,
+            agents_md,
             false,
             &ClaudeOpts::default(),
             &DevinOpts {
@@ -1670,6 +1756,7 @@ fn run() -> Result<i32> {
             bootstrap,
             no_bootstrap,
             tui,
+            agents_md,
         } => provider_launch(
             &state_dir,
             "codex",
@@ -1683,6 +1770,7 @@ fn run() -> Result<i32> {
             worktree.as_deref(),
             BriefMode::standalone(no_bootstrap, bootstrap),
             false,
+            agents_md,
             tui,
             &ClaudeOpts::default(),
             &DevinOpts::default(),
@@ -1705,6 +1793,7 @@ fn run() -> Result<i32> {
             no_bootstrap,
             auto_ready,
             detach,
+            agents_md,
         } => provider_launch(
             &state_dir,
             "claude",
@@ -1718,6 +1807,7 @@ fn run() -> Result<i32> {
             worktree.as_deref(),
             BriefMode::standalone(no_bootstrap, bootstrap),
             auto_ready,
+            agents_md,
             tui,
             &ClaudeOpts {
                 model,
@@ -1742,6 +1832,7 @@ fn run() -> Result<i32> {
             worktree,
             no_bootstrap,
             auto_ready,
+            agents_md,
             model,
             permission_mode,
             allow,
@@ -1762,6 +1853,7 @@ fn run() -> Result<i32> {
             worktree,
             no_bootstrap,
             auto_ready,
+            agents_md,
             ClaudeOpts {
                 model,
                 permission_mode: permission_mode.clone(),
@@ -2364,6 +2456,7 @@ fn provider_launch(
     worktree: Option<&str>,
     briefing: BriefMode,
     auto_ready: bool,
+    agents_md: bool,
     tui: bool,
     claude: &ClaudeOpts,
     devin: &DevinOpts,
@@ -2497,6 +2590,12 @@ fn provider_launch(
             Value::String("verified".to_string()),
         );
     }
+    // `--agents-md` is a cadence-level opt-in, not provider config —
+    // it rides in params so resume replays it like the other launch
+    // params.
+    if agents_md {
+        params_obj.insert("agents_md".to_string(), Value::Bool(true));
+    }
     let params = (!params_obj.is_empty()).then(|| Value::Object(params_obj).to_string());
     // Reopening an already-registered name keeps its stored params — a
     // requested upstream is not retro-applied to a pre-existing agent.
@@ -2527,13 +2626,6 @@ fn provider_launch(
         }
         Err(err) => return Err(err),
     }
-    // A fresh agent gets its briefing: the file + AGENTS.md block, and
-    // for joins (or an explicit --bootstrap) also the durable kickoff
-    // message. Normal gating applies — a pty pane still needs the
-    // ready claim.
-    if registered_fresh && briefing != BriefMode::Off {
-        brief_agent(state_dir, &alias, briefing == BriefMode::FilesAndMessage)?;
-    }
     // The provider endpoint opens asynchronously (a pty open can wait on
     // the native session lock) — poll until it is live or gives up.
     // Kinds with no attachable endpoint are done once the actor is back.
@@ -2556,6 +2648,25 @@ fn provider_launch(
         std::thread::sleep(Duration::from_millis(250));
     };
     let state = agent["state"].as_str().unwrap_or_default();
+    // A fresh agent gets its briefing (and for joins, or an explicit
+    // --bootstrap, the durable kickoff message) only once the endpoint
+    // reports open — a launch that fences or stalls leaves the cwd
+    // repository byte-identical. Normal gating applies on the message:
+    // a pty pane still needs the ready claim.
+    let opened = agent["endpoint"].is_string()
+        || (!attachable && matches!(state, "idle" | "running" | "waiting_input"));
+    let mut briefing_file = Value::Null;
+    if opened && briefing != BriefMode::Off {
+        if registered_fresh {
+            let file = brief_agent(state_dir, &alias, briefing == BriefMode::FilesAndMessage)?;
+            briefing_file = json!(file);
+        } else if let Ok(Some(file)) = refresh_briefing(state_dir, &alias) {
+            // A re-launched pre-existing agent: regen a missing
+            // briefing / re-apply an opted-in AGENTS.md — the same
+            // post-open housekeeping `agent resume` runs.
+            briefing_file = json!(file);
+        }
+    }
     let native = agent["session_id"]
         .as_str()
         .or_else(|| agent["thread_id"].as_str());
@@ -2578,6 +2689,7 @@ fn provider_launch(
         "session": native,
         "endpoint": agent["endpoint"],
         "permission_mode": agent["params"]["permission_mode"],
+        "briefing": briefing_file,
         "upstream": if registered_fresh { upstream.clone() } else { None },
         "next": next,
     }));
@@ -2618,6 +2730,7 @@ fn join_group(
     worktree: Option<String>,
     no_bootstrap: bool,
     auto_ready: bool,
+    agents_md: bool,
     claude_opts: ClaudeOpts,
     devin_opts: DevinOpts,
 ) -> Result<i32> {
@@ -2661,6 +2774,7 @@ fn join_group(
             BriefMode::FilesAndMessage
         },
         auto_ready,
+        agents_md,
         tui,
         &claude_opts,
         &devin_opts,
@@ -2771,13 +2885,15 @@ fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
 const AGENTS_BEGIN: &str = "<!-- cadence:begin -->";
 const AGENTS_END: &str = "<!-- cadence:end -->";
 
-/// Brief an agent: write `.cadence/<root>/BRIEFING-<alias>.md` under the
-/// group root's cwd (the PM's repo for a joined worker, the agent's own
-/// for a standalone launch), keep `.cadence/` gitignored, and drop the
-/// marker-delimited cadence block into the repo's AGENTS.md where one
-/// exists. With `enqueue` also sends the durable `bootstrap-<alias>`
-/// message (`source = "bootstrap"` — provenance only, no routing role;
-/// the deterministic id dedupes re-enqueues of an in-flight copy).
+/// Brief an agent: write `BRIEFING-<alias>.md` under the daemon's
+/// state dir — `<state>/briefings/<root>/`, where `<root>` is the
+/// upstream PM's alias when wired, else the agent's own — never inside
+/// any repository the agent works in. When the agent's params opt in
+/// (`--agents-md`), the marker-delimited cadence block also lands in
+/// its cwd repo's AGENTS.md. With `enqueue` also sends the durable
+/// `bootstrap-<alias>` message (`source = "bootstrap"` — provenance
+/// only, no routing role; the deterministic id dedupes re-enqueues of
+/// an in-flight copy).
 /// Returns the briefing path. `agent_show` on the alias propagates the
 /// usual unknown-name rejection.
 fn brief_agent(state_dir: &Path, alias: &str, enqueue: bool) -> Result<PathBuf> {
@@ -2793,36 +2909,20 @@ fn brief_agent(state_dir: &Path, alias: &str, enqueue: bool) -> Result<PathBuf> 
         )));
     }
     // The group root is the upstream PM when wired, else the agent
-    // itself — briefing files always land in the root's `.cadence/`.
-    let upstream = agent["params"]["upstream"].as_str();
-    let (root_alias, root_cwd) = match upstream {
-        Some(up) => {
-            let pm = client::rpc(state_dir, "agent_show", json!({"alias": up}))?["agent"].clone();
-            (
-                up.to_string(),
-                PathBuf::from(pm["cwd"].as_str().unwrap_or(".")),
-            )
-        }
-        None => (
-            alias.to_string(),
-            PathBuf::from(agent["cwd"].as_str().unwrap_or(".")),
-        ),
-    };
-    let dir = root_cwd.join(".cadence").join(&root_alias);
+    // itself — briefings are grouped under the root's state-dir dir.
+    let root_alias = agent["params"]["upstream"].as_str().unwrap_or(alias);
+    let dir = state_dir.join("briefings").join(root_alias);
     std::fs::create_dir_all(&dir)?;
-    let file = dir.join(format!("BRIEFING-{alias}.md"));
-    std::fs::write(&file, briefing_body(state_dir, &agent, &root_alias))?;
-    // `.cadence/` is operator-local state; keep it out of the index when
-    // the root's cwd sits inside a git repository.
-    if let Ok(root) = git(&root_cwd, &["rev-parse", "--show-toplevel"]) {
-        ensure_cadence_ignored(Path::new(&root))?;
-    }
-    // Ambient repo knowledge — the marker block in AGENTS.md where the
-    // agent actually works. Outside a git repo there is nothing to
-    // amend; skip silently.
-    if let Some(cwd) = agent["cwd"].as_str() {
-        if let Ok(root) = git(Path::new(cwd), &["rev-parse", "--show-toplevel"]) {
-            ensure_agents_block(Path::new(&root))?;
+    let file = client::briefing_path(state_dir, &agent["params"], alias);
+    std::fs::write(&file, briefing_body(state_dir, &agent, root_alias))?;
+    // AGENTS.md is opt-in (`--agents-md` persists the param and resume
+    // replays it). Only the agent's own cwd repo is ever touched, and
+    // only when it sits inside a git repository.
+    if agent["params"]["agents_md"].as_bool() == Some(true) {
+        if let Some(cwd) = agent["cwd"].as_str() {
+            if let Ok(root) = git(Path::new(cwd), &["rev-parse", "--show-toplevel"]) {
+                ensure_agents_block(Path::new(&root))?;
+            }
         }
     }
     if enqueue {
@@ -2977,8 +3077,9 @@ fn ensure_agents_block(repo: &Path) -> Result<()> {
          ## Cadence-managed agents\n\n\
          This repo may be worked on by cadence-managed agents. If\n\
          `CADENCE_ALIAS` is set in your environment: run `cadence self` for\n\
-         your identity and running turn token, read your briefing at\n\
-         `.cadence/<group>/BRIEFING-<alias>.md`, report with\n\
+         your identity and running turn token, read your briefing at the\n\
+         path `cadence agent show` prints (it lives under the daemon's\n\
+         state dir, not in this repo), report with\n\
          `cadence message result <msg-id> --token <turn_id> --text ...`,\n\
          and discover peers with `cadence agent list`.\n\
          {AGENTS_END}\n"
