@@ -2,7 +2,7 @@ import type { Project } from "../types";
 
 interface Props {
   tab: string;
-  onTab: (tab: "board" | "plan") => void;
+  onTab: (tab: "board" | "plan" | "agents") => void;
   project: string;
   onProject: (key: string) => void;
   projects: Project[];
@@ -71,11 +71,15 @@ export default function Sidebar({ tab, onTab, project, onProject, projects, tota
         >
           {planIcon}Plan
         </button>
+        <button
+          onClick={() => onTab("agents")}
+          className="navlink"
+          aria-current={tab === "agents" ? "page" : undefined}
+        >
+          {agentsIcon}Agents
+        </button>
         <span className="navlink opacity-45 cursor-not-allowed" title="iteration 4">
           {loopsIcon}Loops <span className="ml-auto num text-[10px] text-ink-500">I4</span>
-        </span>
-        <span className="navlink opacity-45 cursor-not-allowed" title="iteration 3">
-          {agentsIcon}Agents <span className="ml-auto num text-[10px] text-ink-500">I3</span>
         </span>
       </nav>
       <div className="slabel flex justify-between mx-[11px] mt-[22px] mb-[7px]">

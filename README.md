@@ -103,7 +103,11 @@ every write is one git commit (`operator (ui)` for API writes). The HTTP
 write path carries no auth — loopback + `Host` allowlist + four
 cross-site guards (exact content type, `X-Cadence-Board` marker,
 Origin/Sec-Fetch-Site) are the whole boundary; artifacts always serve
-sandboxed, and html/svg download rather than render. See
+sandboxed, and html/svg download rather than render. Job state drives
+card status when an issue is bound (`status_source: job`), agent
+binding joins `agent.tasks` × `jobs.issue_id` exactly, `GET /api/stream`
+pushes live `issues`/`jobs`/`agents` events, and an Agents screen ranks
+fenced agents first with their recovery commands. See
 [docs/BOARD.md](docs/BOARD.md).
 
 ```bash

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./api";
+import Agents from "./components/Agents";
 import Board from "./components/Board";
 import Drawer from "./components/Drawer";
 import Plan from "./components/Plan";
@@ -8,7 +9,7 @@ import Toast, { type ToastMsg } from "./components/Toast";
 import type { AgentsPayload, Health, IssueCard, IssueDetail, Project } from "./types";
 
 export default function App() {
-  const [tab, setTab] = useState<"board" | "plan">("board");
+  const [tab, setTab] = useState<"board" | "plan" | "agents">("board");
   const [project, setProject] = useState("all");
   const [query, setQuery] = useState("");
   const [issues, setIssues] = useState<IssueCard[]>([]);
@@ -66,8 +67,20 @@ export default function App() {
 
   useEffect(refresh, [refresh]);
 
-  // No event stream until I3 — re-read on focus and every 30s while the
-  // tab is visible, so CLI/agent writes surface without a manual refresh.
+  // Live updates: /api/stream pushes `issues|agents|jobs` event names —
+  // each one just triggers the normal refresh. EventSource reconnects
+  // on its own; the 30 s poll below stays as the fallback while the
+  // stream is down.
+  useEffect(() => {
+    const es = new EventSource("/api/stream");
+    es.addEventListener("issues", refresh);
+    es.addEventListener("agents", refresh);
+    es.addEventListener("jobs", refresh);
+    return () => es.close();
+  }, [refresh]);
+
+  // Fallback poll — re-read on focus and every 30s while the tab is
+  // visible, covering any gap while the stream reconnects.
   useEffect(() => {
     const onFocus = () => refresh();
     const tick = () => {
@@ -178,6 +191,12 @@ export default function App() {
               board
             </button>
             <button
+              onClick={() => setTab("agents")}
+              className="chip bg-ink-800 text-ink-200"
+            >
+              agents
+            </button>
+            <button
               onClick={() => setTab("plan")}
               className="chip bg-ink-800 text-ink-200"
             >
@@ -225,7 +244,7 @@ export default function App() {
           </div>
         )}
 
-        {tab === "board" ? (
+        {tab === "board" && (
           <Board
             issues={issues}
             projects={projects}
@@ -238,10 +257,11 @@ export default function App() {
             onMove={moveIssue}
             onCreated={applyWrite}
             onError={writeError}
+            onAgents={() => setTab("agents")}
           />
-        ) : (
-          <Plan />
         )}
+        {tab === "agents" && <Agents payload={agents} onOpenIssue={openIssue} />}
+        {tab === "plan" && <Plan />}
       </div>
 
       {openId && (
