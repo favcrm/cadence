@@ -1432,7 +1432,8 @@ impl Shared {
         let ids = self.store.unknown_messages(&alias)?;
         if ids.is_empty() {
             return Err(Error::rejected(format!(
-                "Agent '{alias}' has no unknown messages to reconcile"
+                "Agent '{alias}' has no unknown messages to reconcile \
+                 — use `cadence agent resume {alias}`"
             )));
         }
         let mut reconciled = Vec::new();
