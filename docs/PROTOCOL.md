@@ -68,7 +68,7 @@ Error kinds:
 | `task_cancel` | `task, by?` | `{task}` — cancels the task; a `queued`/`submitting` kickoff cancels in the same tx, a `running` one completes on its own |
 | `job_cancel` | `job, by?` | `{job}` — cancels the job + every non-terminal task |
 | `job_close` | `job, by?` | `{job}` — legal only when every task is `done` |
-| `agent_unfence` | `alias, status?, note?, by?` | reconciles every `unknown` on the agent (default `interrupted`); `{alias, reconciled:[id], state}` |
+| `agent_unfence` | `alias, status?, note?, by?, resume?` | reconciles every `unknown` on the agent (default `interrupted`); `{alias, reconciled:[id], resumed, pane?, state, error?}` — `resume:true` also starts the actor and waits (bounded ~30s) for its open; `pane` is pty-only: `adopted`/`respawned`/`none` |
 | `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 | `agent_remove` | `alias` | deletes the agent + its history; refuses live endpoints |
@@ -217,11 +217,18 @@ endpoint, printing the same resumed/skipped/fenced/failed summary;
 Resuming an already-live agent is rejected with a `cadence attach
 <alias>` hint.
 
-**Dead-agent hygiene.** `agent list` marks attention/stopped agents with
-no live endpoint as `dead`. `agent remove <alias>` deletes the row and
-its message/event history, refusing while an endpoint is live or a
-lifecycle actor owns the alias. `agent gc [--older-than <dur>]` sweeps
-dead agents (manual only, never automatic); each candidate is
+**Dead-agent hygiene.** `agent list` and `agent show` report `dead`
+per endpoint kind, not "no endpoint string": attachable kinds (`pty`,
+`managed-ws`) are dead when registered, not operator-stopped, and
+holding no live endpoint; `managed` agents are dead when fenced
+(`attention`) or enabled but unattended; `inbox` and `fake` never die.
+A second flag
+`resumable` answers the question `dead` was being asked — the agent is
+stopped-or-dead, still holds a saved native thread/session, and has no
+unreconciled `unknown` fencing it. `agent remove <alias>` deletes the
+row and its message/event history, refusing while an endpoint is live
+or a lifecycle actor owns the alias. `agent gc [--older-than <dur>]`
+sweeps dead agents (manual only, never automatic); each candidate is
 independent so one in-transition alias doesn't fail the sweep. A fenced
 agent with no endpoint prints the `devin -r <session>` resume hint from
 its launch summary.
@@ -402,7 +409,18 @@ is one of the things the ready claim asserts absent. A fence — like
 daemon shutdown — *detaches* the pane rather than killing it: the TUI
 stays alive for inspection (`agent capture` reads its screen), and
 after `agent unfence` reconciles the unknowns, `agent resume` re-adopts
-the same pane and native session. The kill is reserved for explicit
+the same pane and native session. `agent_unfence` accepts
+`resume: true` to run that recovery in one call — reconcile, start the
+actor, wait (bounded ~30s) for its open — and reports `resumed` plus
+`pane`: `adopted` when the surviving pane was re-attached (same pid,
+same native session), `respawned` when a new pane was launched on the
+recorded session (new pid, same native session), `none` when the resume
+was not requested or did not land (with `error` when the start was
+rejected). The CLI's `cadence agent unfence` resumes by default
+(`--no-resume` reconciles only); the bare RPC defaults to
+reconcile-only. Adoption is attachment, not readiness — a visibly busy
+adopted pane still gates sends behind the screen probe (or `agent
+ready --force`). The kill is reserved for explicit
 verbs: `agent_stop` kills the owned pane (a live one through its actor,
 a fenced survivor directly), and `agent_remove`/`agent_gc` kill any
 surviving pane before dropping the row — no orphan sessions on the

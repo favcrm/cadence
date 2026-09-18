@@ -511,7 +511,7 @@ impl ProviderAdapter for PtyAdapter {
         };
         let generation = Uuid::new_v4().simple().to_string();
 
-        let (native, pane_pid) = if self.has_session(&session) {
+        let (native, pane_pid, attach) = if self.has_session(&session) {
             // Reattach: verify the pane still owns a native session.
             // When one was recorded it must match; a pane left by a
             // crashed first open (nothing recorded yet) is adopted by
@@ -526,6 +526,7 @@ impl ProviderAdapter for PtyAdapter {
             (
                 self.profile.resolve_session(desired.as_deref(), found)?,
                 pane_pid,
+                "adopted",
             )
         } else {
             // Refuse takeover: a session owned outside our (future)
@@ -574,7 +575,7 @@ impl ProviderAdapter for PtyAdapter {
                     )))
                 }
             };
-            (native, pane_pid)
+            (native, pane_pid, "respawned")
         };
 
         // Pane defaults for cadence-owned sessions, scoped to this
@@ -607,6 +608,7 @@ impl ProviderAdapter for PtyAdapter {
             pid: pane_pid,
             endpoint: Some(endpoint),
             generation: Some(generation),
+            attach: Some(attach),
         })
     }
 

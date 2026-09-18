@@ -361,6 +361,7 @@ impl ProviderAdapter for CodexAdapter {
                 pid: launched.pid,
                 endpoint: launched.endpoint.clone(),
                 generation: None,
+                attach: None,
             })
         })();
         opened.inspect_err(|_| self.transport.close())

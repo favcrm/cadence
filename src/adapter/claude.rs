@@ -355,6 +355,7 @@ impl ProviderAdapter for ClaudeAdapter {
             pid,
             endpoint: None,
             generation: Some(generation),
+            attach: None,
         })
     }
 

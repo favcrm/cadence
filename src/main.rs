@@ -1670,19 +1670,49 @@ fn run() -> Result<i32> {
                     note,
                     no_resume,
                 } => {
-                    let result = client::rpc(
+                    let mut result = client::rpc(
                         &state_dir,
                         "agent_unfence",
                         json!({"alias": alias, "status": status.as_str(),
-                               "note": note,
+                               "note": note, "resume": !no_resume,
                                "by": std::env::var("CADENCE_ALIAS")
                                    .unwrap_or_else(|_| "operator".into())}),
                     )?;
-                    print_json(&result);
                     if no_resume {
+                        print_json(&result);
                         return Ok(0);
                     }
-                    return resume_agent(&state_dir, &alias, false);
+                    // The daemon waited for the open; surface what it
+                    // actually did. A failed resume gets the same
+                    // recovery hint `agent resume` prints.
+                    let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
+                    let agent = show["agent"].clone();
+                    result["endpoint"] = agent["endpoint"].clone();
+                    if result["resumed"] != json!(true) {
+                        if result["state"] == "attention" {
+                            result["next"] = fenced_next(
+                                &alias,
+                                agent["error"].as_str().unwrap_or_default(),
+                                show["unknown"].as_i64().unwrap_or(0),
+                            );
+                        }
+                        print_json(&result);
+                        return Ok(0);
+                    }
+                    let (provider, kind) = (
+                        agent["provider"].as_str().unwrap_or_default(),
+                        agent["endpoint_kind"].as_str().unwrap_or_default(),
+                    );
+                    if !registry::attachable(provider, kind) || agent["endpoint"].is_null() {
+                        print_json(&finish_resume(&state_dir, &alias, result));
+                        return Ok(0);
+                    }
+                    result["next"] = json!({"attach": format!("cadence agent attach {alias}")});
+                    print_json(&finish_resume(&state_dir, &alias, result));
+                    if atty_stdin() && std::env::var_os("TMUX").is_none() {
+                        return attach_agent(&state_dir, &alias, true);
+                    }
+                    return attach_agent(&state_dir, &alias, false);
                 }
                 AgentAction::Stop { alias } => {
                     client::rpc(&state_dir, "agent_stop", json!({"alias": alias}))?
