@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::model::{self, CommentFront, Front};
-use crate::issue::{notes, parse, project};
+use crate::issue::{history, notes, parse, project};
 
 /// A loaded issue folder.
 #[derive(Clone, Debug)]
@@ -587,6 +587,7 @@ pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &Vi
         .collect();
     let history = git_log(pm_dir, &view.issue);
     let activity = activity_json(pm_dir, view);
+    let (commits, commits_skipped) = history::code_commits(pm_dir, &view.issue);
     json!({
         "id": f.id,
         "project": view.issue.project,
@@ -615,6 +616,8 @@ pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &Vi
         "notes_chain": chain,
         "history": history,
         "activity": activity,
+        "commits": commits,
+        "commits_skipped": commits_skipped,
         "checks": {"done": view.checks_done, "total": view.checks_total},
     })
 }

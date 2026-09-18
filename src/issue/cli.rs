@@ -96,6 +96,10 @@ pub enum IssueAction {
     /// For every frontmatter field currently set, the history entry
     /// that last changed it (`value`, `sha`, `at`, `by`).
     Blame { id: String },
+    /// Print the exact trailer line for this issue (`Issue: <ID>`) —
+    /// agents and hooks append it to code commits without guessing
+    /// the format. Refuses an id that does not exist.
+    Trailer { id: String },
     /// Show one issue — frontmatter, body, links both ways, comments,
     /// artifacts, activity.
     Show {
@@ -373,6 +377,12 @@ pub fn run(action: &IssueAction) -> Result<i32> {
             let pm = open_pm()?;
             let issue = board::find_issue(&pm.dir, id)?;
             print_json(&history::blame(&pm.dir, &issue)?);
+            Ok(0)
+        }
+        IssueAction::Trailer { id } => {
+            let pm = open_pm()?;
+            let issue = board::find_issue(&pm.dir, id)?;
+            println!("Issue: {}", issue.front.id);
             Ok(0)
         }
         IssueAction::Show { id, json } => {

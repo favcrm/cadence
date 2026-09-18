@@ -13,15 +13,39 @@ use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
 use crate::issue::{board, parse, project, time, Pm};
 
+/// `Actor:` trailer resolution, in order: an explicit `--author`/`--by`
+/// (`who`), the API actor string (`actor`), `CADENCE_ALIAS`, else
+/// `operator`. The same chain feeds `issue comment`'s author fallback.
+pub(crate) fn actor_who(actor: &str, who: Option<&str>) -> String {
+    who.map(str::to_string)
+        .or_else(|| (!actor.is_empty()).then(|| actor.to_string()))
+        .or_else(|| std::env::var("CADENCE_ALIAS").ok())
+        .filter(|w| !w.is_empty())
+        .unwrap_or_else(|| "operator".to_string())
+}
+
 /// Commit with the actor named when one is given — API writes show as
 /// `CAD-16: set status=review (operator (ui))`; CLI writes pass "" and
-/// keep the bare subject.
-fn commit(pm: &Pm, message: &str, actor: &str) -> Result<()> {
-    if actor.is_empty() {
-        pm.commit(message)
+/// keep the bare subject. Every commit also carries trailers after a
+/// blank line: `Issue: <ID>` once per issue the write touches (links
+/// record both ends) and `Actor: <who>` — the truthful actor history
+/// reads instead of the git author.
+fn commit(pm: &Pm, message: &str, ids: &[&str], actor: &str) -> Result<()> {
+    commit_who(pm, message, ids, actor, None)
+}
+
+fn commit_who(pm: &Pm, message: &str, ids: &[&str], actor: &str, who: Option<&str>) -> Result<()> {
+    let subject = if actor.is_empty() {
+        message.to_string()
     } else {
-        pm.commit(&format!("{message} ({actor})"))
+        format!("{message} ({actor})")
+    };
+    let mut trailers = String::new();
+    for id in ids {
+        trailers.push_str(&format!("Issue: {id}\n"));
     }
+    trailers.push_str(&format!("Actor: {}\n", actor_who(actor, who)));
+    pm.commit(&format!("{subject}\n\n{trailers}"))
 }
 
 /// Content hash of `issue.md` — the optimistic-concurrency token the
@@ -240,7 +264,7 @@ pub fn project_add(
     let yaml = serde_yaml::to_string(&project)
         .map_err(|e| Error::internal(format!("project.yaml: {e}")))?;
     std::fs::write(dir.join("project.yaml"), yaml)?;
-    pm.commit(&format!("project {key} added"))?;
+    commit(pm, &format!("project {key} added"), &[], "")?;
     Ok(json!({"project": key, "prefix": project.prefix,
               "path": dir, "committed": true}))
 }
@@ -330,7 +354,7 @@ pub fn new_issue(
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
-    commit(pm, &format!("{id}: created"), actor)?;
+    commit(pm, &format!("{id}: created"), &[&id], actor)?;
     Ok(json!({"id": id, "project": project.key, "path": dir, "committed": true}))
 }
 
@@ -465,7 +489,12 @@ pub fn set_fields(pm: &Pm, id: &str, pairs: &[String], actor: &str) -> Result<Va
         changed.push(format!("{key}={value}"));
     }
     save_front(&dir, &front, &body)?;
-    commit(pm, &format!("{id}: set {}", changed.join(" ")), actor)?;
+    commit(
+        pm,
+        &format!("{id}: set {}", changed.join(" ")),
+        &[id],
+        actor,
+    )?;
     Ok(json!({"id": id, "set": changed, "committed": true}))
 }
 
@@ -558,7 +587,12 @@ pub fn patch_issue(
         ));
     }
     save_front(&dir, &front, &body)?;
-    commit(pm, &format!("{id}: set {}", changed.join(" ")), actor)?;
+    commit(
+        pm,
+        &format!("{id}: set {}", changed.join(" ")),
+        &[id],
+        actor,
+    )?;
     let warnings = blocked_warnings(pm, id, state_dir)?;
     Ok(json!({"id": id, "set": changed, "committed": true, "warnings": warnings}))
 }
@@ -646,7 +680,12 @@ pub fn link(
     }
     check_structure(&preview, id)?;
     save_front(&dir, &front, &body)?;
-    commit(pm, &format!("{id}: {verb} {kind} {target}"), actor)?;
+    commit(
+        pm,
+        &format!("{id}: {verb} {kind} {target}"),
+        &[id, target],
+        actor,
+    )?;
     let warnings = blocked_warnings(pm, id, state_dir)?;
     Ok(json!({"id": id, "link": kind, "target": target,
               "unlink": unlink, "committed": true, "warnings": warnings}))
@@ -679,7 +718,7 @@ pub fn add_ref(
     };
     front.refs.push(r);
     save_front(&dir, &front, &body)?;
-    commit(pm, &format!("{id}: ref {kind}"), actor)?;
+    commit(pm, &format!("{id}: ref {kind}"), &[id], actor)?;
     Ok(json!({"id": id, "ref": {"kind": kind, "target": target},
               "committed": true}))
 }
@@ -696,7 +735,8 @@ pub fn add_comment(
     actor: &str,
 ) -> Result<Value> {
     let (_project, dir) = issue_dir(pm, id)?;
-    let author = author
+    let author_opt = author;
+    let author = author_opt
         .map(str::to_string)
         .or_else(|| std::env::var("CADENCE_ALIAS").ok())
         .unwrap_or_else(|| "operator".to_string());
@@ -736,7 +776,13 @@ pub fn add_comment(
         &format!("{}-{author}.md", time::basic(epoch)),
         text.as_bytes(),
     )?;
-    commit(pm, &format!("{id}: comment by {author}"), actor)?;
+    commit_who(
+        pm,
+        &format!("{id}: comment by {author}"),
+        &[id],
+        actor,
+        author_opt,
+    )?;
     Ok(
         json!({"id": id, "comment": path.file_name().map(|n| n.to_string_lossy().to_string()),
               "author": author, "committed": true}),
@@ -820,7 +866,7 @@ pub fn attach_bytes(
             Err(e) => return Err(e.into()),
         }
     };
-    commit(pm, &format!("{id}: attach {name}"), actor)?;
+    commit(pm, &format!("{id}: attach {name}"), &[id], actor)?;
     Ok(
         json!({"id": id, "artifact": path.file_name().map(|n| n.to_string_lossy().to_string()),
               "size": bytes.len(), "committed": true}),

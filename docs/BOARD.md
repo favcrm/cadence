@@ -103,6 +103,8 @@ cadence issue diff CAD-16 [<rev>] [--to <rev>]
                                             # counts, comment/artifact files
 cadence issue blame CAD-16                  # per field: the entry that last
                                             # changed it (value, sha, at, by)
+cadence issue trailer CAD-16                # prints `Issue: CAD-16` — the
+                                            # trailer line for code commits
 cadence issue set CAD-16 status=doing owner=fable-cc
 cadence issue link CAD-16 blocked_by CAD-12 # also relates|parent|duplicate_of
 cadence issue unlink CAD-16 blocked_by CAD-12
@@ -159,15 +161,22 @@ same ahead/behind counts against `origin/<branch>` and points at
 
 Every write is one commit whose subject carries the verb
 (`CAD-16: set status=review (operator (ui))`), so the tracker's own
-log is the audit trail. The history verbs are strictly read-only — no
-lock, no commit, no fetch — and work on a tracker with no remote. A PM
-dir that is not a git repository refuses cleanly.
+log is the audit trail. Each commit also carries trailers after a
+blank line: `Issue: <ID>` once per issue the write touches (link and
+unlink record both ends) and `Actor: <who>` — resolved from an
+explicit `--author`/`--by`, the API actor string, `CADENCE_ALIAS`,
+else `operator`. Lint never requires trailers on historical commits;
+`issue doctor` reports the trailer share of the last 50 commits,
+informational only. The history verbs are strictly read-only — no
+lock, no commit, no fetch — and work on a tracker with no remote. A
+PM dir that is not a git repository refuses cleanly.
 
 - `issue log <ID> [--limit N]` walks `git log` for the issue folder
   (`issue.md`, `comments/`, `artifacts/` — `--follow` stays off so
   identical templates never leak a sibling's commits) and parses each
-  entry: `sha` (short), `at` (RFC 3339 UTC), `by` (the ` (actor)`
-  suffix, else the commit author name), `kind`
+  entry: `sha` (short), `at` (RFC 3339 UTC), `by` (the `Actor:`
+  trailer, else the ` (actor)` suffix, else `comment by <name>`, else
+  the commit author), `kind`
   (`created|set|link|unlink|ref|comment|attach|other`), `summary`
   (subject minus the id prefix and actor), and a `fields` map for
   `set` entries. Commits that are not cadence-shaped — hand edits,
@@ -191,6 +200,16 @@ dir that is not a git repository refuses cleanly.
   property of *now*, so every card reports `status_source: "file"`
   (containers still `rollup` — that is the tree's own truth). The
   response carries `at: {sha, time}`.
+- `issue trailer <ID>` prints the exact `Issue: <ID>` trailer line so
+  agents and hooks can tag code commits without guessing the format.
+  The issue's detail (`issue show --json`, `GET /api/issues/<ID>`,
+  the drawer's Commits section) lists matching commits from the
+  project's `project.yaml` repos: the newest ≤20 on any ref whose
+  message carries an `Issue: <ID>` trailer or names the id as a
+  whole word in the subject (the `(CAD-47)` squash-merge convention)
+  as `{repo, sha, at, author, subject}` — read-only `git log --all`
+  bounded to 2000 commits and 5s per repo; a missing or non-git repo
+  path lands in `commits_skipped`, never an error.
 
 The board API serves the same entries:
 `GET /api/issues/<ID>/history?limit=N` (default 50) — same shape as

@@ -90,6 +90,34 @@ fn push_state(pm_dir: &Path) -> Option<Value> {
     Some(push)
 }
 
+/// Share of the last 50 commits carrying the CAD-42 `Actor:`/`Issue:`
+/// trailers — informational only; history works without them and lint
+/// does not require them.
+fn trailer_share(pm_dir: &Path) -> Value {
+    let Some(log) = probe(
+        pm_dir,
+        &[
+            "log",
+            "-50",
+            "--format=%x1f%(trailers:key=Actor,valueonly,separator=%x2C)",
+        ],
+    ) else {
+        return Value::Null;
+    };
+    let mut checked = 0u64;
+    let mut with_actor = 0u64;
+    for line in log.lines() {
+        let Some((_, actor)) = line.split_once('\x1f') else {
+            continue;
+        };
+        checked += 1;
+        if !actor.trim().is_empty() {
+            with_actor += 1;
+        }
+    }
+    json!({"window": checked, "with_trailers": with_actor})
+}
+
 pub fn run(pm: &Pm) -> Result<Value> {
     let git_dir = hooks::git_dir(&pm.dir);
     let hooks_report = hooks::report(&pm.dir);
@@ -120,5 +148,6 @@ pub fn run(pm: &Pm) -> Result<Value> {
         },
         "push": push,
         "push_failures": git_dir.as_deref().map(push_failures).unwrap_or(Value::Null),
+        "trailers": trailer_share(&pm.dir),
     }))
 }
