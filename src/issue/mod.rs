@@ -139,7 +139,7 @@ impl Pm {
         let pm = Self::at(dir)?;
         // Every write is a commit — the skeleton included.
         if pm.git_dirty() {
-            pm.commit("init")?;
+            pm.commit(&format!("init\n\nActor: {}", write::actor_who("", None)))?;
         }
         Ok(pm)
     }

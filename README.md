@@ -132,7 +132,12 @@ cadence issue sync                 # multi-host: fetch, rebase, lint, push —
 cadence issue log CAD-16           # the audit trail from git alone:
 cadence issue diff CAD-16 --to HEAD   # log/diff/blame, `ls --at <rev>`
 cadence issue blame CAD-16            # for the board at a revision —
-                                      # all read-only
+                                      # all read-only; every tracker
+                                      # commit carries Issue:/Actor:
+                                      # trailers history reads for `by`
+cadence issue trailer CAD-16       # prints `Issue: CAD-16` — tag code
+                                      # commits so issue detail lists
+                                      # them (`commits` on show/API)
 cadence ui run                     # 127.0.0.1:3010 — SPA + read/write API
 ```
 
