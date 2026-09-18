@@ -2422,6 +2422,22 @@ if cmd == "display-message":
     elif fmt == "#{pane_in_mode}":
         try: print(open(sess_path(name, "mode")).read().strip() or "0")
         except FileNotFoundError: print("0")
+    elif fmt == "#{cursor_x},#{cursor_y}":
+        # The cursor sits on the TUI's input line: column 2 (right
+        # after the prompt glyph + space) when empty, or after the
+        # staged draft. Row = the rendered input row — the staged line
+        # capture-pane appends when text is staged, else the last
+        # prompt-glyph row of the screen.
+        try: staged = open(sess_path(name, "input")).read()
+        except FileNotFoundError: staged = ""
+        try: rows = open(sess_path(name, "screen")).read().splitlines()
+        except FileNotFoundError: rows = []
+        if staged:
+            print("%d,%d" % (2 + len(staged), len(rows)))
+        else:
+            y = max((i for i, l in enumerate(rows)
+                     if l.strip().startswith(("❯", "❭", "»"))), default=0)
+            print("2,%d" % y)
     else: die("unknown format " + fmt)
     sys.exit(0)
 if cmd == "capture-pane":
@@ -2736,6 +2752,162 @@ impl Drop for MockStub {
         std::env::remove_var("CADENCE_STUB_LOCKS");
         std::env::remove_var("MOCK_TMUX_STATE");
     }
+}
+
+/// Fake `claude` TUI — the Claude profile's endpoint. Instead of a
+/// session lock it publishes the real registry's shape:
+/// `<sessions>/<pid>.json` = `{"pid", "sessionId", "cwd", "procStart"}`.
+/// `--session-id`/`--resume` arrive as argv (the profile appends them
+/// to the verbatim override); MOCK_CLAUDE_SWAP makes the registry
+/// claim a different session than asked — a changed-owner fence.
+/// `$FAKE_PANE` (set by the mock tmux) points at the session state.
+const MOCK_CLAUDE_TUI_PY: &str = r#"
+import json, os, sys, time
+
+sessions = sys.argv[1]
+if "--resume" in sys.argv:
+    sid = sys.argv[sys.argv.index("--resume") + 1]
+elif "--session-id" in sys.argv:
+    sid = sys.argv[sys.argv.index("--session-id") + 1]
+else:
+    sid = "mock-claude-%d" % os.getpid()
+os.makedirs(sessions, exist_ok=True)
+# Record the launch argv so tests can assert the profile's flags.
+open(os.environ["FAKE_PANE"] + ".argv", "w").write(" ".join(sys.argv[1:]))
+pid = os.getpid()
+# /proc/self/stat field 22 — what the real registry's procStart is.
+try:
+    stat = open("/proc/self/stat").read()
+    proc_start = stat[stat.rindex(")") + 1:].split()[19]
+except Exception:
+    proc_start = None
+entry = {"pid": pid, "sessionId": sid, "cwd": os.getcwd(),
+         "procStart": proc_start, "kind": "interactive"}
+if os.environ.get("MOCK_CLAUDE_SWAP"):
+    entry["sessionId"] = "swapped-" + sid
+open(os.path.join(sessions, "%d.json" % pid), "w").write(json.dumps(entry))
+# Record the pane env the adapter exported via tmux -e.
+open(os.environ["FAKE_PANE"] + ".env", "w").write(
+    "CADENCE_ALIAS=%s\nCADENCE_STATE_DIR=%s\n" % (
+        os.environ.get("CADENCE_ALIAS", ""),
+        os.environ.get("CADENCE_STATE_DIR", "")))
+# The pane's own input-line glyph + a boxed empty prompt — the shape
+# the real TUI shows so the screen probe recognizes idle.
+open(os.environ["FAKE_PANE"] + ".glyph", "w").write("❯")
+with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+    f.write("Mock Claude TUI [%s]\n" % sid)
+    f.write("  [Opus] mock-mode on\n")
+    f.write("─" * 40 + "\n❯ \n" + "─" * 40 + "\n")
+while True:
+    inp = os.environ["FAKE_PANE"] + ".input"
+    try:
+        data = open(inp).read()
+    except FileNotFoundError:
+        data = ""
+    if "<ENTER>" in data:
+        text, rest = data.split("<ENTER>", 1)
+        open(inp, "w").write(rest)
+        if text.strip():
+            with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+                f.write("> %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()))
+                # The submitted line echoes into the transcript and the
+                # box re-renders empty below it.
+                f.write("─" * 40 + "\n❯ \n" + "─" * 40 + "\n")
+    if "<KEY:C-c>" in data:
+        open(inp, "w").write("")
+        with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+            f.write("^C interrupt\n")
+    time.sleep(0.05)
+"#;
+
+struct MockClaudeTui {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    dir: PathBuf,
+    sessions: PathBuf,
+}
+
+/// Install the mock tmux/claude pair — the same private-tmux harness as
+/// `install_mock_devin`, pointing the adapter at the claude profile's
+/// env overrides instead.
+fn install_mock_claude_tui(dir: &Path) -> MockClaudeTui {
+    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sessions = dir.join("claude-sessions");
+    let tmux_state = dir.join("tmux-state");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(&tmux_state).unwrap();
+    let tmux = dir.join("tmux");
+    let claude_py = dir.join("mock-claude.py");
+    std::fs::write(&tmux, MOCK_TMUX_PY).unwrap();
+    std::fs::write(&claude_py, MOCK_CLAUDE_TUI_PY).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
+    std::env::set_var("CADENCE_TMUX_COMMAND", &tmux);
+    std::env::set_var(
+        "CADENCE_CLAUDE_TUI_COMMAND",
+        format!("python3 {} {}", claude_py.display(), sessions.display()),
+    );
+    std::env::set_var("CADENCE_CLAUDE_SESSIONS", &sessions);
+    MockClaudeTui {
+        _guard: guard,
+        dir: dir.to_path_buf(),
+        sessions,
+    }
+}
+
+impl TestDaemon {
+    fn mock_claude_tui(&self) -> MockClaudeTui {
+        install_mock_claude_tui(self.dir.path())
+    }
+
+    /// Register a pty agent on the claude profile.
+    fn register_claude_pty(&self, alias: &str, params: Value) {
+        let cwd = self.dir.path().to_str().unwrap().to_string();
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "claude",
+                   "endpoint_kind": "pty", "cwd": cwd,
+                   "params": params.to_string()}),
+        )
+        .unwrap();
+    }
+
+    /// The tmux-side state dir for a claude-pane agent session name.
+    fn claude_pane_file(&self, mock: &MockClaudeTui, alias: &str, ext: &str) -> PathBuf {
+        mock.dir
+            .join("tmux-state")
+            .join(socket_for(&self.state))
+            .join(format!("{alias}.{ext}"))
+    }
+}
+
+impl Drop for MockClaudeTui {
+    fn drop(&mut self) {
+        kill_mock_panes(&self.dir);
+        std::env::remove_var("CADENCE_TMUX_COMMAND");
+        std::env::remove_var("CADENCE_CLAUDE_TUI_COMMAND");
+        std::env::remove_var("CADENCE_CLAUDE_SESSIONS");
+        std::env::remove_var("MOCK_CLAUDE_SWAP");
+        std::env::remove_var("MOCK_TMUX_STATE");
+    }
+}
+
+/// The live entries a mock-claude sessions dir holds: `(pid, sessionId)`.
+fn claude_sessions(dir: &Path) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if let Ok(v) = serde_json::from_str::<Value>(
+                &std::fs::read_to_string(e.path()).unwrap_or_default(),
+            ) {
+                out.push((
+                    v["pid"].as_u64().unwrap_or(0) as u32,
+                    v["sessionId"].as_str().unwrap_or_default().to_string(),
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Mirror of the adapter's `cadence-<fnv64(state_dir)>` socket name.
@@ -7270,4 +7442,417 @@ fn agent_capabilities_match_the_registry_table() {
     .unwrap();
     let show = d.rpc("agent_show", json!({"alias": "cap-bogus"})).unwrap();
     assert!(show["agent"]["capabilities"].is_null());
+}
+
+// ── Claude TUI profile through the generic adapter (CAD-17) ────────
+
+/// A fresh `claude` pty launch mints `--session-id`, the pane's own
+/// process records it in the sessions registry, and ownership is
+/// proven by matching that entry to a process under the pane.
+#[test]
+fn pty_claude_launch_mints_session_and_proves_ownership() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
+    let agent = d.wait_agent("cl", "idle", 20);
+    let session = agent["session_id"].as_str().unwrap().to_string();
+    assert!(!session.is_empty(), "{agent}");
+    // The profile passed its own launch flag verbatim to the pane.
+    let argv = std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "argv")).unwrap();
+    assert!(
+        argv.contains(&format!("--session-id {session}")),
+        "argv: {argv} / session: {session}"
+    );
+    // The registry entry belongs to a live process in the pane tree.
+    let entries = claude_sessions(&mock.sessions);
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].1, session);
+    // tmux -e exports reached the pane (the real TUI's Stop hook cwd).
+    let env = std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "env")).unwrap();
+    assert!(env.contains("CADENCE_ALIAS=cl"), "{env}");
+    // The registry row advertises the tmux endpoint.
+    let show = d.rpc("agent_show", json!({"alias": "cl"})).unwrap();
+    let caps = &show["agent"]["capabilities"];
+    assert_eq!(caps["attach"], "tmux", "{caps}");
+    assert_eq!(caps["ready_gate"], true, "{caps}");
+    assert_eq!(caps["reports"], "explicit", "{caps}");
+}
+
+/// `-r <id>` resumes the native session: the pane argv carries
+/// `--resume` and the registry confirms the same id.
+#[test]
+fn pty_claude_resume_passes_resume_flag() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    d.register_claude_pty(
+        "cl",
+        json!({"session": "4f9b1c2e-aaaa-bbbb-cccc-0000000000aa"}),
+    );
+    let agent = d.wait_agent("cl", "idle", 20);
+    assert_eq!(
+        agent["session_id"].as_str().unwrap(),
+        "4f9b1c2e-aaaa-bbbb-cccc-0000000000aa"
+    );
+    let argv = std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "argv")).unwrap();
+    assert!(
+        argv.contains("--resume 4f9b1c2e-aaaa-bbbb-cccc-0000000000aa"),
+        "{argv}"
+    );
+    let entries = claude_sessions(&mock.sessions);
+    assert_eq!(entries[0].1, "4f9b1c2e-aaaa-bbbb-cccc-0000000000aa");
+}
+
+/// A live registry entry owned by a process outside the pane refuses
+/// takeover — the session is already attached elsewhere.
+#[test]
+fn pty_claude_foreign_session_refuses_takeover() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    // A foreign live process claims "held-session".
+    let mut holder = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = holder.id();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let proc_start: u64 = stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    std::fs::write(
+        mock.sessions.join(format!("{pid}.json")),
+        json!({"pid": pid, "sessionId": "held-session", "procStart": proc_start}).to_string(),
+    )
+    .unwrap();
+    d.register_claude_pty("cl", json!({"session": "held-session"}));
+    let agent = d.wait_agent("cl", "attention", 20);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("owned by another terminal"), "{err}");
+    holder.kill().unwrap();
+    let _ = holder.wait();
+}
+
+/// The registry claiming a different native session than the one we
+/// asked for is a changed-owner fence, never an adoption.
+#[test]
+fn pty_claude_session_mismatch_fences_closed() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude_tui();
+    std::env::set_var("MOCK_CLAUDE_SWAP", "1");
+    d.register_claude_pty("cl", json!({"session": "want-session"}));
+    let agent = d.wait_agent("cl", "attention", 20);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("changed owner fails closed"), "{err}");
+}
+
+/// Send → paste → echo → explicit report, under the claude profile.
+/// `auto_ready=verified` self-claims on the boxed idle `❯` prompt.
+#[test]
+fn pty_claude_send_pastes_and_completes_via_report() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
+    d.wait_agent("cl", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cl", "text": "say hi claude", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "cl", "m1");
+    assert!(token.starts_with("pty-"), "{token}");
+    let claim = d.wait_event("cl", "ready_claimed", 5);
+    assert_eq!(claim["payload"]["by"], "daemon", "{claim}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen =
+            std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "screen")).unwrap_or_default();
+        if screen.contains("MOCK_REPLY: say hi claude") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no reply: {screen}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("cl", "m1", &["completed"], 10);
+}
+
+/// Claude's forbidden prefixes — `/` command menu, `!` shell mode,
+/// `@` autocomplete — observed live — reject pre-write and keep the
+/// claim; `#` is a literal draft char.
+#[test]
+fn pty_claude_forbidden_prefixes_reject_prewrite() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    d.register_claude_pty("cl", json!({}));
+    d.wait_agent("cl", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "cl"})).unwrap();
+    for (id, body, prefix) in [
+        ("m1", "/quit", '/'),
+        ("m2", "!ls", '!'),
+        ("m3", "@agent", '@'),
+        ("m4", "  /indented also forbidden", '/'),
+    ] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "cl", "text": body, "message": id}),
+        )
+        .unwrap();
+        d.wait_message("cl", id, &["failed"], 15);
+        let failed = d.rpc("agent_show", json!({"alias": "cl"})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap()
+            .clone();
+        let err = failed["result"]["error"].as_str().unwrap_or("").to_string();
+        assert!(err.contains(&format!("'{prefix}'")), "{err}");
+        assert!(err.contains("command or mode switch"), "{err}");
+    }
+    // No bytes reached the pane for any rejection.
+    assert!(
+        std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "input"))
+            .unwrap_or_default()
+            .is_empty()
+    );
+    // The claim survived: `#` pastes on it without a second ready.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cl", "text": "# literal tag", "message": "m5"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "cl", "m5");
+    assert!(token.starts_with("pty-"), "{token}");
+}
+
+/// Claude's own busy line — not Devin's — holds the gate, and its
+/// permission menu (answered in the terminal, never via respond)
+/// blocks sends until the worker resolves it.
+#[test]
+fn pty_claude_busy_and_approval_gate_sends() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
+    d.wait_agent("cl", "idle", 20);
+    let state = d.claude_pane_file(&mock, "cl", "tui-state");
+    // Devin's marker is inert under this profile.
+    std::fs::write(&state, "stub working\n").unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cl", "text": "stub marker is inert", "message": "m1"}),
+    )
+    .unwrap();
+    pty_token(&d, "cl", "m1");
+    // The claude spinner's own phrase holds the gate.
+    std::fs::write(&state, "✻ Churning… (esc to interrupt · 4s)\n").unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cl", "text": "do not paste", "message": "m2"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("cl", "gate_wait", 10);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("busy"),
+        "{wait}"
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "cl"})).unwrap();
+    assert_eq!(probe["busy_marker"], true, "{probe}");
+    std::fs::remove_file(&state).unwrap();
+    pty_token(&d, "cl", "m2");
+    // A permission select holds the next send; the pane answers it.
+    std::fs::write(
+        &state,
+        "Do you want to proceed?\n ❯ 1. Yes\n   2. No\n\n Esc to cancel\n",
+    )
+    .unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cl", "text": "queued behind menu", "message": "m3"}),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let wait = loop {
+        let e = d
+            .events("cl")
+            .into_iter()
+            .find(|e| {
+                e["kind"].as_str() == Some("gate_wait")
+                    && e["payload"]["message"].as_str() == Some("m3")
+            })
+            .unwrap_or_default();
+        if !e.is_null() {
+            break e;
+        }
+        assert!(Instant::now() < deadline, "m3 never hit the gate");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("approval menu"),
+        "{wait}"
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "cl"})).unwrap();
+    assert_eq!(probe["approval_menu"], true, "{probe}");
+    std::fs::remove_file(&state).unwrap();
+    pty_token(&d, "cl", "m3");
+}
+
+/// `cadence claude --tui` launches the pty endpoint through the CLI —
+/// flags, endpoint selection and param passing end to end.
+#[test]
+fn cli_claude_tui_flag_launches_pty_endpoint() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["claude", "--tui", "--alias", "cl", "--cwd"])
+        .arg(d.dir.path())
+        .args(["--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let agent = d.wait_agent("cl", "idle", 20);
+    assert_eq!(agent["provider"], "claude");
+    assert_eq!(agent["endpoint_kind"], "pty");
+    let argv = std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "argv")).unwrap();
+    assert!(argv.contains("--session-id"), "{argv}");
+}
+
+/// `cadence claude --tui -r` forwards the resume flag to the pane.
+#[test]
+fn cli_claude_tui_resume_passes_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "claude",
+            "--tui",
+            "-r",
+            "c1d2e3f4-1111-2222-3333-444455556666",
+            "--alias",
+            "cl",
+            "--cwd",
+        ])
+        .arg(d.dir.path())
+        .args(["--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("cl", "idle", 20);
+    let argv = std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "argv")).unwrap();
+    assert!(
+        argv.contains("--resume c1d2e3f4-1111-2222-3333-444455556666"),
+        "{argv}"
+    );
+}
+
+/// `-r` without `--tui` names a managed-agent resume — rejected rather
+/// than silently registered as a param the managed endpoint ignores.
+#[test]
+fn cli_claude_resume_without_tui_rejected() {
+    let d = TestDaemon::start();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["claude", "-r", "some-session", "--cwd"])
+        .arg(d.dir.path())
+        .args(["--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("requires `--tui`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `--tui` on a provider with no pty endpoint is a clear error.
+#[test]
+fn cli_tui_flag_rejects_provider_without_pty() {
+    let d = TestDaemon::start();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["codex", "--tui", "--cwd"])
+        .arg(d.dir.path())
+        .args(["--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("has no pty endpoint"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `cadence join <group> claude --tui` threads the flag through:
+/// the worker opens as a claude pty endpoint and its briefing names
+/// the forbidden input prefixes.
+#[test]
+fn cli_join_claude_tui_briefs_prefixes() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    let pm_repo = d.dir.path().join("pmrepo");
+    git_repo(&pm_repo);
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": pm_repo}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 10);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["join", "pm", "claude", "--tui", "--alias", "wj", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let agent = d.wait_agent("wj", "idle", 20);
+    assert_eq!(agent["provider"], "claude");
+    assert_eq!(agent["endpoint_kind"], "pty");
+    let argv = std::fs::read_to_string(d.claude_pane_file(&mock, "wj", "argv")).unwrap();
+    assert!(argv.contains("--session-id"), "{argv}");
+    // The briefing tells the worker which leading chars never paste.
+    let briefing = pm_repo.join(".cadence/pm/BRIEFING-wj.md");
+    let text = std::fs::read_to_string(&briefing).unwrap();
+    for want in ["`/`", "`!`", "`@`", "refused"] {
+        assert!(text.contains(want), "briefing missing {want}:\n{text}");
+    }
+    // The group upstream is in params so results route to the PM.
+    assert_eq!(agent["params"]["upstream"], "pm", "{agent}");
 }

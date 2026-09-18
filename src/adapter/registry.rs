@@ -193,6 +193,37 @@ pub static SPECS: &[EndpointSpec] = &[
         internal: false,
     },
     EndpointSpec {
+        provider: "claude",
+        endpoint_kind: "pty",
+        display: "Claude (pty/tmux)",
+        has_actor: true,
+        attach: Attach::Tmux,
+        ready_gate: true,
+        screen_probe: true,
+        reports: Reporting::Explicit,
+        report_hint: Reporting::Explicit,
+        brokers_requests: false,
+        resumable: true,
+        resume_label: "claude --resume <session>",
+        live_settable_params: &["auto_ready"],
+        launch_params: &[
+            "model",
+            "permission_mode",
+            "bypass",
+            "allowed_tools",
+            "session",
+            "upstream",
+            "auto_ready",
+        ],
+        session_id_label: "Claude session",
+        respond_rejection: None,
+        capabilities: &["pty_claude_tmux", "pty_verified_autoready"],
+        doctor_caps: &["pty_claude_tmux"],
+        probe_bins: &[("claude", &["--version"]), ("tmux", &["-V"])],
+        launch_default: false,
+        internal: false,
+    },
+    EndpointSpec {
         provider: "devin",
         endpoint_kind: "pty",
         display: "Devin (pty/tmux)",
@@ -308,11 +339,15 @@ const DAEMON_FEATURES: &[&str] = &[
 /// generated from the table — never hand-listed per provider.
 pub fn capabilities() -> &'static [&'static str] {
     static CAPS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-        DAEMON_FEATURES
-            .iter()
-            .copied()
-            .chain(SPECS.iter().flat_map(|s| s.capabilities.iter().copied()))
-            .collect()
+        // A capability several specs share (pty_verified_autoready)
+        // lists once — the set is semantic, not per-pair.
+        let mut caps: Vec<&'static str> = DAEMON_FEATURES.to_vec();
+        for c in SPECS.iter().flat_map(|s| s.capabilities.iter().copied()) {
+            if !caps.contains(&c) {
+                caps.push(c);
+            }
+        }
+        caps
     });
     &CAPS
 }
@@ -568,6 +603,7 @@ mod tests {
             ("codex", "managed"),
             ("codex", "managed-ws"),
             ("claude", "managed"),
+            ("claude", "pty"),
             ("devin", "pty"),
             ("tui-stub", "pty"),
             ("fake", "fake"),
@@ -593,7 +629,7 @@ mod tests {
     fn unknown_pairs_reject_with_supported_combos() {
         assert_eq!(
             spec("codex", "pty").unwrap_err().to_string(),
-            "No pty adapter for provider 'codex' (implemented: devin)"
+            "No pty adapter for provider 'codex' (implemented: claude, devin)"
         );
         assert_eq!(
             spec("devin", "managed").unwrap_err().to_string(),
@@ -615,6 +651,7 @@ mod tests {
             "managed_codex_stdio",
             "managed_codex_ws",
             "managed_claude_stream",
+            "pty_claude_tmux",
             "pty_devin_tmux",
             "pty_verified_autoready",
             "operator_reconcile",
@@ -627,7 +664,7 @@ mod tests {
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 14);
+        assert_eq!(caps.len(), 15);
     }
 
     #[test]
