@@ -27,7 +27,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use crate::adapter::registry;
 use crate::client;
 use crate::error::{Error, Result};
-use crate::issue::{board, model, project, write as issue_write, Pm};
+use crate::issue::{board, history, model, project, write as issue_write, Pm};
 
 #[derive(Subcommand)]
 pub enum UiAction {
@@ -1402,14 +1402,14 @@ fn handle(
                 }
                 return;
             }
-            // `/api/issues/<ID>[/file|/activity|/artifacts/<name>]` — id
-            // grammar checked before the id is ever a path component.
+            // `/api/issues/<ID>[/file|/activity|/history|/artifacts/<name>]`
+            // — id grammar checked before the id is ever a path component.
             if let Some(tail) = path.strip_prefix("/api/issues/") {
                 let mut segs = tail.splitn(2, '/');
                 let id_raw = segs.next().unwrap_or_default();
                 let sub = segs.next();
                 if sub.is_some_and(|s| {
-                    !matches!(s, "file" | "activity") && !s.starts_with("artifacts/")
+                    !matches!(s, "file" | "activity" | "history") && !s.starts_with("artifacts/")
                 }) {
                     send(request, err_response(404, "no such route"));
                     return;
@@ -1467,6 +1467,27 @@ fn handle(
                                     "activity": board::activity_json(&pm.dir, view),
                                 })),
                             ),
+                            // `GET /api/issues/<ID>/history?limit=N` —
+                            // the same entries `issue log` prints.
+                            Some("history") => {
+                                let limit = match query("limit") {
+                                    Some(raw) => match raw.parse::<usize>() {
+                                        Ok(n) if n > 0 => n,
+                                        _ => {
+                                            send(request, err_response(400, "bad limit"));
+                                            return;
+                                        }
+                                    },
+                                    None => 50,
+                                };
+                                match history::log(&pm.dir, &view.issue, limit) {
+                                    Ok(h) => send(
+                                        request,
+                                        json_response(json!({"id": id, "history": h})),
+                                    ),
+                                    Err(e) => send(request, err_response(503, &e.to_string())),
+                                }
+                            }
                             Some(s) if s.starts_with("artifacts/") => {
                                 let name = s.strip_prefix("artifacts/").unwrap_or_default();
                                 send(request, artifact_response(view, name));

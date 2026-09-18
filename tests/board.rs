@@ -2254,3 +2254,519 @@ fn ui_agents_payload_covers_all_kinds() {
     assert!(totals["fenced"].as_i64().unwrap_or(0) >= 1);
     assert_eq!(totals["inboxes"], 1);
 }
+
+// ---------- CAD-41: issue history from git plumbing ----------
+
+/// A tracker whose CAD-1 has a varied, deterministic write history:
+/// created → two CLI sets → link → comment → attach → one HTTP PATCH
+/// (the ` (operator (ui))` actor) last, so `diff`'s default lands on a
+/// field change. Shas per step are captured for blame/diff asserts.
+struct HistFx {
+    pm: TempDir,
+    state: TempDir,
+    port: u16,
+    created_sha: String,
+    set2_sha: String,
+    patch_sha: String,
+    link_sha: String,
+}
+
+fn history_fixture() -> HistFx {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "project", "add", "cadence", "--prefix", "CAD"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "new", "alpha", "--project", "cadence"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "new", "beta", "--project", "cadence"]
+        )
+        .0
+    );
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "set", "CAD-1", "status=doing"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "set", "CAD-1", "priority=P1", "owner=alice"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "link", "CAD-1", "relates", "CAD-2"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "comment", "CAD-1", "-m", "hello", "--author", "fable-cc"]
+        )
+        .0
+    );
+    // The attach source lives outside the PM dir so `git add -A` does
+    // not drag it into the tracker commit.
+    let src = state.path().join("note.txt");
+    std::fs::write(&src, b"artifact body").unwrap();
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "attach", "CAD-1", src.to_str().unwrap()]
+        )
+        .0
+    );
+    // One set through the HTTP write path — the commit subject ends in
+    // ` (operator (ui))`.
+    let (_, detail) = http(port, "GET", "/api/issues/CAD-1", &host);
+    let rev = serde_json::from_str::<Value>(&detail).unwrap()["rev"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/CAD-1",
+        &host,
+        &format!(r#"{{"status":"review","if_rev":"{rev}"}}"#),
+    );
+    assert_eq!(code, 200, "{body}");
+    let log = git(pm.path(), &["log", "--format=%H %s", "--", "cadence/CAD-1"]).1;
+    let sha_of = |needle: &str| -> String {
+        log.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no commit containing '{needle}': {log}"))
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    HistFx {
+        created_sha: sha_of("created"),
+        set2_sha: sha_of("priority=P1"),
+        patch_sha: sha_of("set status=review"),
+        link_sha: sha_of("link relates"),
+        pm,
+        state,
+        port,
+    }
+}
+
+#[test]
+fn issue_log_kinds_actors_limit() {
+    let fx = history_fixture();
+    let (ok, out) = cli(fx.pm.path(), fx.state.path(), &["issue", "log", "CAD-1"]);
+    assert!(ok, "{out}");
+    let hist = out["history"].as_array().unwrap();
+    let kinds: Vec<&str> = hist.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    // Newest-first: the UI patch lands on top.
+    assert_eq!(
+        kinds,
+        ["set", "attach", "comment", "link", "set", "set", "created"]
+    );
+    // `by`: the ` (actor)` suffix when present, else the author name.
+    assert_eq!(hist[0]["by"], "operator (ui)");
+    assert_eq!(hist[1]["by"], "cadence");
+    // Summaries drop the id prefix and the actor suffix.
+    assert_eq!(hist[0]["summary"], "set status=review");
+    assert_eq!(hist[1]["summary"], "attach note.txt");
+    assert_eq!(hist[2]["summary"], "comment by fable-cc");
+    // `fields` only on set entries; bare patch words map to null.
+    assert_eq!(hist[0]["fields"]["status"], "review");
+    assert_eq!(hist[4]["fields"]["owner"], "alice");
+    assert!(hist[1].get("fields").is_none());
+    // `sha` is short, `at` is RFC 3339 UTC.
+    let sha = hist[0]["sha"].as_str().unwrap();
+    assert!(sha.len() >= 7 && fx.patch_sha.starts_with(sha));
+    assert!(hist[0]["at"].as_str().unwrap().ends_with('Z'));
+    // --limit trims.
+    let (ok, out) = cli(
+        fx.pm.path(),
+        fx.state.path(),
+        &["issue", "log", "CAD-1", "--limit", "2"],
+    );
+    assert!(ok);
+    assert_eq!(out["history"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn issue_diff_fields_and_files() {
+    let fx = history_fixture();
+    // Default: the issue's newest change (the UI patch) vs its parent —
+    // the last field change shows as from/to.
+    let (ok, out) = cli(fx.pm.path(), fx.state.path(), &["issue", "diff", "CAD-1"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["to"]["sha"], fx.patch_sha);
+    let fields = out["fields"].as_array().unwrap();
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0]["field"], "status");
+    assert_eq!(fields[0]["from"], "doing");
+    assert_eq!(fields[0]["to"], "review");
+
+    // <first-sha> --to HEAD: every field changed since creation, plus
+    // the added comment and artifact files.
+    let (ok, out) = cli(
+        fx.pm.path(),
+        fx.state.path(),
+        &["issue", "diff", "CAD-1", &fx.created_sha, "--to", "HEAD"],
+    );
+    assert!(ok, "{out}");
+    let fields = out["fields"].as_array().unwrap();
+    let get = |name: &str| {
+        fields
+            .iter()
+            .find(|f| f["field"] == name)
+            .unwrap_or_else(|| panic!("no {name} field in {fields:?}"))
+    };
+    assert_eq!(get("status")["from"], "backlog");
+    assert_eq!(get("status")["to"], "review");
+    assert_eq!(get("priority")["to"], "P1");
+    assert!(get("owner")["from"].is_null());
+    assert_eq!(get("owner")["to"], "alice");
+    assert_eq!(get("relates")["to"], json!(["CAD-2"]));
+    assert_eq!(
+        out["comments"]["added"].as_array().unwrap().len(),
+        1,
+        "one comment file added"
+    );
+    assert!(out["comments"]["added"][0]
+        .as_str()
+        .unwrap()
+        .ends_with("-fable-cc.md"));
+    assert_eq!(out["artifacts"]["added"], json!(["note.txt"]));
+
+    // Unknown and unrelated revs are refused with a clear message.
+    let (ok, err) = cli(
+        fx.pm.path(),
+        fx.state.path(),
+        &["issue", "diff", "CAD-1", "notasha"],
+    );
+    assert!(!ok);
+    assert!(
+        err["error"].as_str().unwrap().contains("Unknown revision"),
+        "{err}"
+    );
+    // A commit from a foreign repo resolves nowhere in this history.
+    let foreign = TempDir::new().unwrap();
+    assert!(git(foreign.path(), &["init", "-q"]).0);
+    let f = foreign.path().join("f");
+    std::fs::write(&f, b"x").unwrap();
+    assert!(git(foreign.path(), &["add", "f"]).0);
+    assert!(
+        git(
+            foreign.path(),
+            &[
+                "-c",
+                "user.name=x",
+                "-c",
+                "user.email=x@x",
+                "commit",
+                "-q",
+                "-m",
+                "x"
+            ]
+        )
+        .0
+    );
+    let foreign_sha = head(foreign.path());
+    let (ok, err) = cli(
+        fx.pm.path(),
+        fx.state.path(),
+        &["issue", "diff", "CAD-1", &foreign_sha],
+    );
+    assert!(!ok);
+    assert!(
+        err["error"].as_str().unwrap().contains("Unknown revision"),
+        "{err}"
+    );
+    // A commit that resolves but is off HEAD's history — an orphan
+    // side-branch — is "unrelated" and refused by name.
+    let main_branch = branch(fx.pm.path());
+    assert!(git(fx.pm.path(), &["checkout", "-q", "--orphan", "side"]).0);
+    let side = fx.pm.path().join("side.txt");
+    std::fs::write(&side, b"x").unwrap();
+    assert!(git(fx.pm.path(), &["add", "side.txt"]).0);
+    assert!(
+        git(
+            fx.pm.path(),
+            &[
+                "-c",
+                "user.name=x",
+                "-c",
+                "user.email=x@x",
+                "commit",
+                "-q",
+                "-m",
+                "side"
+            ]
+        )
+        .0
+    );
+    let side_sha = head(fx.pm.path());
+    assert!(git(fx.pm.path(), &["checkout", "-q", &main_branch]).0);
+    let (ok, err) = cli(
+        fx.pm.path(),
+        fx.state.path(),
+        &["issue", "diff", "CAD-1", &side_sha],
+    );
+    assert!(!ok);
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("not part of this tracker's history"),
+        "{err}"
+    );
+}
+
+#[test]
+fn issue_blame_attributes_fields() {
+    let fx = history_fixture();
+    let (ok, out) = cli(fx.pm.path(), fx.state.path(), &["issue", "blame", "CAD-1"]);
+    assert!(ok, "{out}");
+    let fields = out["fields"].as_array().unwrap();
+    let get = |name: &str| {
+        fields
+            .iter()
+            .find(|f| f["field"] == name)
+            .unwrap_or_else(|| panic!("no {name} in {fields:?}"))
+    };
+    // status last changed by the UI patch — actor, not author.
+    assert_eq!(get("status")["value"], "review");
+    assert!(fx
+        .patch_sha
+        .starts_with(get("status")["sha"].as_str().unwrap()));
+    assert_eq!(get("status")["by"], "operator (ui)");
+    // priority and owner both came from the second set.
+    assert_eq!(get("priority")["value"], "P1");
+    assert!(fx
+        .set2_sha
+        .starts_with(get("priority")["sha"].as_str().unwrap()));
+    assert_eq!(get("owner")["value"], "alice");
+    assert!(fx
+        .set2_sha
+        .starts_with(get("owner")["sha"].as_str().unwrap()));
+    // relates from the link commit; title/id/created from creation.
+    assert!(fx
+        .link_sha
+        .starts_with(get("relates")["sha"].as_str().unwrap()));
+    assert!(fx
+        .created_sha
+        .starts_with(get("title")["sha"].as_str().unwrap()));
+}
+
+#[test]
+fn issue_ls_at_historical_board() {
+    let fx = history_fixture();
+    // No `cadence-issue-at-*` temp dirs before — compare the set after.
+    let tmp_entries = || -> Vec<String> {
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("cadence-issue-at-"))
+            .collect()
+    };
+    let before = tmp_entries();
+    let (ok, out) = cli(
+        fx.pm.path(),
+        fx.state.path(),
+        &["issue", "ls", "--at", &fx.created_sha, "--json"],
+    );
+    assert!(ok, "{out}");
+    let issues = out["issues"].as_array().unwrap();
+    let cad1 = issues
+        .iter()
+        .find(|i| i["id"] == "CAD-1")
+        .expect("CAD-1 card");
+    assert_eq!(cad1["status"], "backlog", "status at the creation sha");
+    assert_eq!(cad1["status_source"], "file");
+    assert_eq!(out["at"]["sha"], fx.created_sha);
+    assert!(out["at"]["time"].as_str().unwrap().ends_with('Z'));
+    // The temp export is gone afterwards.
+    assert_eq!(tmp_entries(), before);
+    // --project still filters on the historical tree.
+    let (ok, out) = cli(
+        fx.pm.path(),
+        fx.state.path(),
+        &[
+            "issue",
+            "ls",
+            "--at",
+            &fx.created_sha,
+            "--project",
+            "cadence",
+            "--json",
+        ],
+    );
+    assert!(ok);
+    assert!(out["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|i| i["project"] == "cadence"));
+    // Current ls shows the current status — the historical read moved
+    // nothing.
+    let (ok, out) = cli(fx.pm.path(), fx.state.path(), &["issue", "ls", "--json"]);
+    assert!(ok);
+    let cur = out["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "CAD-1")
+        .unwrap()
+        .clone();
+    assert_eq!(cur["status"], "review");
+}
+
+#[test]
+fn issue_log_other_for_hand_and_revert() {
+    let fx = history_fixture();
+    // A hand-made commit: body append on CAD-1's issue.md under a
+    // foreign author — `other`, raw subject, author name as `by`.
+    let md = fx.pm.path().join("cadence/CAD-1/issue.md");
+    let mut text = std::fs::read_to_string(&md).unwrap();
+    text.push_str("\nhand edit\n");
+    std::fs::write(&md, text).unwrap();
+    assert!(git(fx.pm.path(), &["add", "-A"]).0);
+    assert!(
+        git(
+            fx.pm.path(),
+            &[
+                "-c",
+                "user.name=hand",
+                "-c",
+                "user.email=hand@h",
+                "commit",
+                "-q",
+                "-m",
+                "wip manual edit"
+            ]
+        )
+        .0
+    );
+    // A revert of the UI patch — subject `Revert "…"` is `other` too.
+    assert!(
+        git(
+            fx.pm.path(),
+            &[
+                "-c",
+                "user.name=hand",
+                "-c",
+                "user.email=hand@h",
+                "revert",
+                "--no-edit",
+                &fx.patch_sha
+            ]
+        )
+        .0
+    );
+    let (ok, out) = cli(fx.pm.path(), fx.state.path(), &["issue", "log", "CAD-1"]);
+    assert!(ok, "{out}");
+    let hist = out["history"].as_array().unwrap();
+    assert_eq!(hist[0]["kind"], "other");
+    assert!(hist[0]["summary"].as_str().unwrap().starts_with("Revert"));
+    assert_eq!(hist[0]["by"], "hand", "author name, never paren-parsed");
+    assert_eq!(hist[1]["kind"], "other");
+    assert_eq!(hist[1]["summary"], "wip manual edit");
+    // The cadence entries still parse underneath.
+    assert_eq!(hist[2]["kind"], "set");
+    assert!(hist.iter().any(|e| e["kind"] == "created"));
+}
+
+#[test]
+fn issue_history_api_matches_cli_and_guards() {
+    let fx = history_fixture();
+    let host = format!("127.0.0.1:{}", fx.port);
+    let (code, body) = http(fx.port, "GET", "/api/issues/CAD-1/history?limit=50", &host);
+    assert_eq!(code, 200);
+    let api: Value = serde_json::from_str(&body).unwrap();
+    let (ok, cli_out) = cli(fx.pm.path(), fx.state.path(), &["issue", "log", "CAD-1"]);
+    assert!(ok);
+    assert_eq!(api["history"], cli_out["history"]);
+    // `?limit` honoured; a bad one is a 400.
+    let (code, body) = http(fx.port, "GET", "/api/issues/CAD-1/history?limit=2", &host);
+    assert_eq!(code, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let (code, _) = http(fx.port, "GET", "/api/issues/CAD-1/history?limit=x", &host);
+    assert_eq!(code, 400);
+    // The route is read-only — POST has no write route to reach.
+    let (code, _) = http(fx.port, "POST", "/api/issues/CAD-1/history", &host);
+    assert_eq!(code, 404);
+}
+
+#[test]
+fn issue_history_refuses_non_git() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "project", "add", "cadence", "--prefix", "CAD"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "new", "alpha", "--project", "cadence"]
+        )
+        .0
+    );
+    // Detach the repo — pm.yaml stays, `.git` moves aside.
+    std::fs::rename(pm.path().join(".git"), pm.path().join("git-aside")).unwrap();
+    for args in [
+        vec!["issue", "log", "CAD-1"],
+        vec!["issue", "diff", "CAD-1"],
+        vec!["issue", "blame", "CAD-1"],
+        vec!["issue", "ls", "--at", "HEAD"],
+    ] {
+        let (ok, err) = cli(pm.path(), state.path(), &args);
+        assert!(!ok, "{args:?} unexpectedly ok");
+        assert!(
+            err["error"]
+                .as_str()
+                .unwrap()
+                .contains("not a git repository"),
+            "{args:?}: {err}"
+        );
+    }
+}
