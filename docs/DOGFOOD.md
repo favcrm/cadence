@@ -347,6 +347,64 @@ skipped), so that fixture is synthesized from the known dialog shape
 — when text can be rendered without existing, the cursor is the only
 witness that knows.
 
+## Reviewer verdict gate
+
+Every agent on this host pushes and comments as one GitHub account, so
+a review-bypass rule for that account would be a bypass for every
+agent. The reviewer's verdict lived only in a host-local note, and the
+operator merged with `gh pr merge --admin` after reading it — nothing
+tied the verdict to the commit that was merged.
+
+The fix is a commit status named `qa-verdict`, posted by the reviewer
+on the exact PR head it reviewed:
+
+```bash
+scripts/qa-verdict.sh 30 pass --sha feae08c \
+    --note /var/www/agent-notes/20260918-095830-319f2-cadence-readopt-race-r3-verdict.md
+scripts/qa-verdict.sh 30 blocked --note <abs path of the verdict note>
+```
+
+The script resolves the PR's current head with `gh pr view`, refuses a
+`--sha` that is no longer the head, refuses a note that is missing, is
+not a `verdict` note, or does not name that PR number and that short
+SHA, and only then posts `success` (pass) or `failure` (blocked) with
+the note's basename as the description. A status sits on one SHA: a
+later push moves the head and the status does not follow, so a verdict
+never covers code the reviewer did not see.
+
+The operator's merge habit becomes check-then-merge:
+
+```bash
+scripts/qa-verdict.sh --check 30 && gh pr merge 30 --squash
+```
+
+`--check` prints the `qa-verdict` state of the current head and exits 0
+only on `success`. To make GitHub enforce it, the operator adds the
+context to the required checks on `main` (shown here, not run by any
+agent; the `POST` form appends and leaves the existing `test` check in
+place):
+
+```bash
+gh api --method POST \
+    repos/favcrm/cadence/branches/main/protection/required_status_checks/contexts \
+    -f 'contexts[]=qa-verdict'
+```
+
+The honest limit: any agent holding the shared identity can post this
+status, including the author of the PR. The gate binds a verdict to a
+SHA and makes skipping review visible — a merged head with no
+`qa-verdict`, or one whose description names no note, is evidence — it
+is not an authorization boundary. The one-approving-review rule on
+`main` is a separate setting that the shared account cannot satisfy for
+its own PRs; whether `qa-verdict` replaces it is the operator's call.
+One trap: required checks match workflow job names too, so no CI job
+may ever be called `qa-verdict` — its check run would satisfy the gate
+with no reviewer involved. `--check` reads commit statuses only and is
+not fooled; branch protection would be.
+
+**Rule that fell out:** a verdict is about a commit, so store it on the
+commit — a note about a branch goes stale the moment the branch moves.
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not
