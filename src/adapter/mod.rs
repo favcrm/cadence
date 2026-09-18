@@ -171,7 +171,19 @@ pub fn build(
             ))),
         },
         "pty" => match agent.provider.as_str() {
-            "devin" => Ok(Box::new(pty::DevinPtyAdapter::new(hooks, log_path, agent)?)),
+            "devin" => Ok(Box::new(pty::PtyAdapter::new(
+                hooks,
+                log_path,
+                agent,
+                pty::DevinProfile::new()?,
+            )?)),
+            // Harness double: proves the adapter is profile-driven.
+            "tui-stub" => Ok(Box::new(pty::PtyAdapter::new(
+                hooks,
+                log_path,
+                agent,
+                pty::StubProfile::new()?,
+            )?)),
             other => Err(crate::error::Error::rejected(format!(
                 "No pty adapter for provider '{other}' (implemented: devin)"
             ))),

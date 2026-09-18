@@ -214,6 +214,17 @@ is one it spawned. The agent record keeps the fields separate: `alias`,
 `tmux://<socket>/<session>`, `pid` = pane process, `generation` = a uuid
 minted per `open`.
 
+**Per-TUI profiles.** The adapter is generic owned-pane machinery —
+private socket, pane lifecycle, readiness claims, literal paste, the
+differential render check — with every provider-specific fact behind a
+`TuiProfile` (`src/adapter/pty/profile.rs`): launch argv, native
+session-ownership proof, the screen analyzer that produces the probe
+verdict, message wording, the open deadline, and the forbidden-prefix
+list below. `devin` is the first profile; `tui-stub` is a test-double
+profile the integration harness registers to prove the mechanics are
+profile-driven. A second real TUI is a new profile module, not a copy
+of the adapter.
+
 **Ownership is proven, not assumed.** Devin flock's
 `~/.local/share/devin/cli/session_locks/<session>.lock`; Cadence walks
 `/proc` to require that a lock holder is a descendant of the pane pid —
@@ -251,7 +262,14 @@ refused send returns the message to `queued` (event `gate_wait`) and
 retries; it is never pasted blind and never dropped. Message text is a
 single line of 1–4000 chars with no control characters, delivered
 literally via `load-buffer` + `paste-buffer -p` + `Enter` — no shell
-interpretation.
+interpretation. A body whose first non-space character is in the
+profile's forbidden-prefix list is rejected `PreWrite` *before* the
+gate (so no claim is consumed, nothing reaches the pane, the agent is
+not fenced): TUIs commonly treat a leading character as a command or
+mode switch, so a verbatim paste of one is an injection path. Devin's
+list was fixed by live observation in a scratch pane: `/` opens the
+command menu, `!` switches to bash mode, `@` opens the file picker —
+all forbidden; `#` stays a literal draft character.
 
 **Durable submission vs. receipt.** Paste alone is not proof: the
 render check is *differential* — the pane is captured before the paste,
