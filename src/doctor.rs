@@ -7,6 +7,7 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
+use crate::adapter::registry;
 use crate::error::Result;
 use crate::store::Store;
 
@@ -42,10 +43,19 @@ pub fn run(state_dir: &Path) -> Result<Value> {
     let _ = std::fs::remove_file(probe.with_extension("sqlite3-wal"));
     let _ = std::fs::remove_file(probe.with_extension("sqlite3-shm"));
     checks["storage"] = storage;
-    checks["codex"] = command_version("codex", &["--version"]);
-    checks["claude"] = command_version("claude", &["--version"]);
-    checks["devin"] = command_version("devin", &["--version"]);
-    checks["tmux"] = command_version("tmux", &["-V"]);
+    // Provider binaries are probed from the registry's `probe_bins`
+    // entries — a new provider lands here with its spec, not by
+    // hand-listing a command_version call.
+    for (program, args) in registry::SPECS
+        .iter()
+        .flat_map(|s| s.probe_bins.iter())
+        .fold(std::collections::BTreeMap::new(), |mut m, (p, a)| {
+            m.entry(*p).or_insert(*a);
+            m
+        })
+    {
+        checks[program] = command_version(program, args);
+    }
     // The PM board: does the tracker dir exist, is it a git repo, and
     // does `issue lint` pass. Absent is a fact, not a failure.
     let pm = match crate::issue::default_dir().and_then(|d| crate::issue::Pm::at(&d)) {
@@ -74,24 +84,25 @@ pub fn run(state_dir: &Path) -> Result<Value> {
     };
     let pm_present = pm["present"].as_bool().unwrap_or(false);
     checks["pm"] = pm;
-    let codex_ok = checks["codex"]["present"].as_bool().unwrap_or(false);
-    let claude_ok = checks["claude"]["present"].as_bool().unwrap_or(false);
-    let devin_ok = checks["devin"]["present"].as_bool().unwrap_or(false);
-    let tmux_ok = checks["tmux"]["present"].as_bool().unwrap_or(false);
+    // Each spec's doctor capabilities gate on its probe binaries all
+    // being present; daemon/board-level extras stay hand-listed.
+    let mut caps = json!({});
+    for spec in registry::SPECS {
+        let ok = spec
+            .probe_bins
+            .iter()
+            .all(|(p, _)| checks[p]["present"].as_bool().unwrap_or(false));
+        for cap in spec.doctor_caps {
+            caps[*cap] = json!(ok);
+        }
+    }
+    caps["managed_devin_acp"] = json!(false);
+    caps["issue_folders"] = json!(pm_present);
+    caps["ui_board"] = json!(pm_present);
     Ok(json!({
         "state_dir": state_dir,
         "checks": checks,
-        "capabilities": {
-            "managed_codex_stdio": codex_ok,
-            "managed_codex_ws": codex_ok,
-            "managed_claude_stream": claude_ok,
-            "pty_devin_tmux": devin_ok && tmux_ok,
-            "managed_devin_acp": false,
-            "native_inbox_endpoint": true,
-            "fake_provider_tests": true,
-            "issue_folders": pm_present,
-            "ui_board": pm_present,
-        },
+        "capabilities": caps,
         "notes": [
             "pty devin endpoint requires devin + tmux; submission is gated on an explicit operator ready claim",
             "PTY submission cannot establish provider receipt; only an explicit message ack/result report completes it",

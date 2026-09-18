@@ -152,6 +152,12 @@ group root or a `reply_to` target, queueing messages in SQLite until
 `cadence inbox` drains them over the daemon socket — no actor, no
 polling loop, and the backlog survives restarts.
 
+A capability registry (`src/adapter/registry.rs`) holds one descriptor
+per `(provider, endpoint_kind)` pair — what the endpoint can do (actor,
+attach surface, ready gate, reporting style, params). `agent show` /
+`agent list` expose it as `capabilities`, and `health` + `cadence doctor`
+generate their capability lists from it instead of string checks.
+
 A **group** is a PM agent plus its workers; the PM's slug is the group
 handle. Workers join with `params.upstream` set to the PM's alias, which
 makes their result reports route back to the PM's queue by default.

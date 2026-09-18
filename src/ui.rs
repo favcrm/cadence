@@ -23,6 +23,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use crate::adapter::registry;
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::{board, model, project, write as issue_write, Pm};
@@ -271,7 +272,10 @@ fn agents_payload(state_dir: &Path, known_ids: &std::collections::HashSet<String
     for agent in &agents {
         // Mailboxes are not workers — report them as their own count
         // instead of padding idle/stopped.
-        if agent["endpoint_kind"].as_str() == Some("inbox") {
+        if !registry::has_actor(
+            agent["provider"].as_str().unwrap_or_default(),
+            agent["endpoint_kind"].as_str().unwrap_or_default(),
+        ) {
             inboxes += 1;
             continue;
         }
