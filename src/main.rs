@@ -873,6 +873,21 @@ enum MessageAction {
         #[arg(long)]
         sha: Option<String>,
     },
+    /// Cancel a still-`queued` message — it is never delivered. A
+    /// `reply_to` gets one `worker_notice` so a waiter isn't left
+    /// hanging. Refused once a turn is claimed or terminal — a running
+    /// turn is interrupted at the provider. Task-bound deliveries are
+    /// refused: `job task cancel` owns that lifecycle.
+    Cancel {
+        /// Message id (must currently be `queued`).
+        message: String,
+        /// Who cancelled — recorded on the event and result.
+        #[arg(long)]
+        by: Option<String>,
+        /// Why — recorded on the event, result and the routed notice.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 /// Terminal state an operator reconcile may record.
@@ -2018,6 +2033,22 @@ fn run() -> Result<i32> {
                                "note": note, "sha": sha,
                                "by": std::env::var("CADENCE_ALIAS")
                                    .unwrap_or_else(|_| "operator".into())}),
+                    )?,
+                    false,
+                ),
+                // Same `by` convention as reconcile: the cadence alias
+                // when an agent cancels, "operator" otherwise.
+                MessageAction::Cancel {
+                    message,
+                    by,
+                    reason,
+                } => (
+                    client::rpc(
+                        &state_dir,
+                        "message_cancel",
+                        json!({"message": message, "reason": reason,
+                               "by": by.or_else(|| std::env::var("CADENCE_ALIAS").ok())
+                                   .unwrap_or_else(|| "operator".into())}),
                     )?,
                     false,
                 ),
@@ -3512,6 +3543,48 @@ mod tests {
             cli.command,
             Commands::Message {
                 action: MessageAction::Send { ready: false, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn message_cancel_parses() {
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "message",
+            "cancel",
+            "m1",
+            "--by",
+            "board-dev",
+            "--reason",
+            "wrong spec",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Message {
+                action:
+                    MessageAction::Cancel {
+                        message,
+                        by,
+                        reason,
+                    },
+            } => {
+                assert_eq!(message, "m1");
+                assert_eq!(by.as_deref(), Some("board-dev"));
+                assert_eq!(reason.as_deref(), Some("wrong spec"));
+            }
+            _ => panic!("expected message cancel"),
+        }
+        // Flags optional — bare id parses with None defaults.
+        let cli = Cli::try_parse_from(["cadence", "message", "cancel", "m2"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Message {
+                action: MessageAction::Cancel {
+                    by: None,
+                    reason: None,
+                    ..
+                }
             }
         ));
     }

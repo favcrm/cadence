@@ -732,6 +732,7 @@ impl Shared {
             "agent_inbox" => self.rpc_inbox(params),
             "message_report" => self.rpc_message_report(params),
             "message_reconcile" => self.rpc_reconcile(params),
+            "message_cancel" => self.rpc_cancel(params),
             "job_new" => self.rpc_job_new(params),
             "job_list" => self.rpc_job_list(params),
             "job_show" => self.rpc_job_show(params),
@@ -1287,6 +1288,20 @@ impl Shared {
         let message = self.store.reconcile(message_id, status, note, by, sha)?;
         self.wake();
         Ok(json!({"state": "reconciled", "message": message.to_json()}))
+    }
+
+    /// Cancel a still-`queued` message — never delivered. The store's
+    /// state-guarded UPDATE makes the cancel atomic against an actor's
+    /// `take_queued` claim; a `reply_to` gets one `worker_notice` so a
+    /// waiter isn't left hanging. `wake()` so a pending ask waiter sees
+    /// the terminal state promptly.
+    fn rpc_cancel(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let message_id = required_str(params, "message")?;
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let reason = optional_str(params, "reason");
+        let message = self.store.cancel(message_id, by, reason)?;
+        self.wake();
+        Ok(json!({"state": "cancelled", "message": message.to_json()}))
     }
 
     /// Convenience wrapper: reconcile every `unknown` message fencing

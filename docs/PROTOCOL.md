@@ -52,6 +52,7 @@ Error kinds:
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit PTY ack/result; `sha` names the produced commit for task-attached kickoffs |
 | `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?, sha?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice. A `sha` on `completed` binds like a worker `--sha` |
+| `message_cancel` | `message, by?, reason?` | `{state:"cancelled", message}` — terminal exit from `queued`; never delivered. Refused for any other state (the error names it) and for task-bound deliveries (`task cancel` owns those) |
 | `job_new` | `pm, spec, spec_sha256, job?, title?, issue?, repo?, base_ref?, max_revisions?, task_title?` | `{job, duplicate}` — bookkeeping only; creates the `open` job + default `<job>-t1` draft task |
 | `job_list` | `state?, all?` | `{jobs:[Job+task counts]}` |
 | `job_show` | `job` | `{job:{...,tasks:[Task+kickoff+attention+latest_verdict]}}` — lazily flags drift |
@@ -587,13 +588,16 @@ provider outcome needs human review; the actor will not relaunch itself.
 ## Messages
 
 States: `queued → submitting → running → completed | failed | interrupted
-| unknown`. `unknown` is durable and fences its actor. Any ambiguous
+| unknown | cancelled`. `unknown` is durable and fences its actor. Any ambiguous
 post-submission outcome lands there — transport loss mid-turn, a turn
 deadline, an acknowledged `turn/start` that cannot be correlated to a
 turn id, an unclassifiable completion status, or a forced close while a
 turn was in flight. `interrupted` is terminal for "the outcome was
 never learned and the operator moved on" — written by a reconcile, or
 by a provider that reports an interrupted turn; it is never replayed.
+`cancelled` is terminal for "dequeued before delivery" — written by
+`message_cancel` or a `task cancel` sweeping its queued kickoff; the row
+keeps its history and is never claimed, pasted or replayed.
 
 **Fencing and reconcile.** An `unknown` message fences its agent
 (`attention`, no relaunch, queued work waits). The only exit that keeps
@@ -620,6 +624,20 @@ relaunching it; `agent resume` re-enables it.
 call, printing each id; `cadence agent unfence <alias>` then resumes
 unless `--no-resume`.
 
+**Cancel.** `message_cancel` is the only exit from `queued`: one
+state-guarded UPDATE moves the message to `cancelled` with result
+`{status:"cancelled", via:"message_cancel", by, reason}` and emits a
+`cancelled` event carrying the id, caller and reason. The guard makes
+the cancel atomic against an actor's `take_queued` claim — a claim that
+already moved the message to `submitting` wins, and the cancel is
+refused naming the current state. Terminal states refuse the same way.
+A `reply_to` gets one `worker_notice` (`"cancelled before delivery —
+nothing ran"`) so a waiter is never left hanging; the notice rides the
+`cadence-notice:` namespace like every other. A task-bound delivery is
+refused with a pointer to `cadence task cancel` — the task lifecycle
+owns its kickoff. Cancel never touches a running turn: interruption
+happens at the provider, then reconcile settles the record.
+
 Idempotency: a client-supplied `message` id makes retries of the *same
 envelope* (alias+body+reply_to+source) return `duplicate:true`. The same
 id with different content is a `rejected` conflict.
@@ -631,6 +649,14 @@ no-op) and carries no `reply_to`, so routing cannot loop. A routed
 `worker_result` delivered to a pty endpoint is fire-and-forget: once the
 paste is submitted the delivery itself completes — the receiving PM is
 not expected to report a result on a notification.
+
+Routed bodies to a pty endpoint are bounded: the pty paste gate refuses
+an oversized body outright, which would fail the delivery whole. The
+record itself is never truncated — `messages.result` keeps every byte —
+but for a pty recipient an overlong `text`/`note`/`reason` field in the
+routed payload is clipped to a preview and the prompt gains a pointer to
+`cadence agent show <worker>`. Non-pty recipients (inbox, managed) get
+the full body — nothing else in the path bounds text length.
 
 Notices share the same mechanism with a distinct namespace and source:
 `worker_notice`, `uuid5("cadence-notice:<kind>:" + message_id)`, no
