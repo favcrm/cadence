@@ -1813,21 +1813,22 @@ fn wait_pid_gone(path: &Path, secs: u64) {
     }
 }
 
-/// Poll a file until its content contains `needle` — a mock provider's
-/// dump files appear after the actor reports idle, and a relaunch
-/// rewrites them, so a single read races both ways.
-fn wait_file_contains(path: &Path, needle: &str, secs: u64) -> String {
+/// Poll `agent_probe` until the pane reads idle — a daemon-side cause
+/// ordered after the endpoint's own process has exec'd and painted:
+/// the mocks write their argv/env dumps BEFORE the first screen paint,
+/// so `idle` proves those dumps are on disk. `wait_agent` on `idle`
+/// alone only proves the transport opened (spawn happened); under load
+/// the child may still be booting. Read launch-shape files only after
+/// this — never poll the file itself, whose previous generation's
+/// content looks valid while stale.
+fn wait_probe_idle(d: &TestDaemon, alias: &str, secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let body = std::fs::read_to_string(path).unwrap_or_default();
-        if body.contains(needle) {
-            return body;
+        let probe = d.rpc("agent_probe", json!({"alias": alias})).unwrap();
+        if probe["idle"] == true {
+            return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "file {} never contained '{needle}'",
-            path.display()
-        );
+        assert!(Instant::now() < deadline, "probe never read {alias} idle");
         thread::sleep(Duration::from_millis(50));
     }
 }
@@ -2621,12 +2622,17 @@ except BlockingIOError:
     print("session_locked: %s" % sid); sys.exit(1)
 open(os.environ["FAKE_PANE"] + ".sid", "w").write(sid)
 # Record the launch argv — tests assert flags are replayed on resume.
-open(os.environ["FAKE_PANE"] + ".argv", "w").write("\n".join(sys.argv))
+# Temp + rename so a reader never sees the file torn mid-write.
+_argv_tmp = os.environ["FAKE_PANE"] + ".argv.tmp"
+open(_argv_tmp, "w").write("\n".join(sys.argv))
+os.rename(_argv_tmp, os.environ["FAKE_PANE"] + ".argv")
 # Record the pane env the adapter exported via tmux -e.
-open(os.environ["FAKE_PANE"] + ".env", "w").write(
+_env_tmp = os.environ["FAKE_PANE"] + ".env.tmp"
+open(_env_tmp, "w").write(
     "CADENCE_ALIAS=%s\nCADENCE_STATE_DIR=%s\n" % (
         os.environ.get("CADENCE_ALIAS", ""),
         os.environ.get("CADENCE_STATE_DIR", "")))
+os.rename(_env_tmp, os.environ["FAKE_PANE"] + ".env")
 with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
     f.write("Mock Devin TUI [%s]\n" % sid)
     # An idle input line — the same shape the real TUI shows so the
@@ -2885,8 +2891,11 @@ elif "--session-id" in sys.argv:
 else:
     sid = "mock-claude-%d" % os.getpid()
 os.makedirs(sessions, exist_ok=True)
-# Record the launch argv so tests can assert the profile's flags.
-open(os.environ["FAKE_PANE"] + ".argv", "w").write(" ".join(sys.argv[1:]))
+# Record the launch argv so tests can assert the profile's flags —
+# temp + rename so a reader never sees the file torn mid-write.
+_argv_tmp = os.environ["FAKE_PANE"] + ".argv.tmp"
+open(_argv_tmp, "w").write(" ".join(sys.argv[1:]))
+os.rename(_argv_tmp, os.environ["FAKE_PANE"] + ".argv")
 pid = os.getpid()
 # /proc/self/stat field 22 — what the real registry's procStart is.
 try:
@@ -2900,10 +2909,12 @@ if os.environ.get("MOCK_CLAUDE_SWAP"):
     entry["sessionId"] = "swapped-" + sid
 open(os.path.join(sessions, "%d.json" % pid), "w").write(json.dumps(entry))
 # Record the pane env the adapter exported via tmux -e.
-open(os.environ["FAKE_PANE"] + ".env", "w").write(
+_env_tmp = os.environ["FAKE_PANE"] + ".env.tmp"
+open(_env_tmp, "w").write(
     "CADENCE_ALIAS=%s\nCADENCE_STATE_DIR=%s\n" % (
         os.environ.get("CADENCE_ALIAS", ""),
         os.environ.get("CADENCE_STATE_DIR", "")))
+os.rename(_env_tmp, os.environ["FAKE_PANE"] + ".env")
 # The pane's own input-line glyph + a boxed empty prompt — the shape
 # the real TUI shows so the screen probe recognizes idle.
 open(os.environ["FAKE_PANE"] + ".glyph", "w").write("❯")
@@ -3297,9 +3308,12 @@ fn devin_permission_mode_persisted_and_replayed() {
     let agent = d.wait_agent("dv1", "idle", 20);
     assert_eq!(agent["params"]["permission_mode"], "smart", "{agent}");
     let sid = agent["thread_id"].as_str().unwrap().to_string();
-    // The mock devin records its launch argv per pane life.
+    // The mock devin records its launch argv per pane life. Probe-idle
+    // is the cause ordered after the dump: the TUI paint that makes the
+    // probe read idle happens after the mock writes .argv.
     let argv_file = d.pane_file(&mock, "dv1", "argv");
-    let argv1 = wait_file_contains(&argv_file, "--permission-mode", 10);
+    wait_probe_idle(&d, "dv1", 15);
+    let argv1 = std::fs::read_to_string(&argv_file).unwrap();
     assert!(argv1.contains("--permission-mode\nsmart"), "{argv1}");
     assert!(
         !argv1.contains("\n-r\n"),
@@ -3311,7 +3325,10 @@ fn devin_permission_mode_persisted_and_replayed() {
     d.wait_agent("dv1", "stopped", 15);
     d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
     let agent = d.wait_agent("dv1", "idle", 20);
-    let argv2 = wait_file_contains(&argv_file, "\n-r\n", 10);
+    // Same cause on the new pane life — the file still holds the first
+    // launch's argv until the respawned mock rewrites it.
+    wait_probe_idle(&d, "dv1", 15);
+    let argv2 = std::fs::read_to_string(&argv_file).unwrap();
     assert!(argv2.contains(&format!("-r\n{sid}")), "{argv2}");
     assert!(argv2.contains("--permission-mode\nsmart"), "{argv2}");
     assert_eq!(agent["params"]["permission_mode"], "smart", "{agent}");
@@ -3635,16 +3652,10 @@ fn pty_pane_env_exports_identity() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
     // tmux -e exports land in the pane process env: the mock TUI
-    // records CADENCE_* so `cadence self` can identify the agent.
-    let path = d.pane_file(&_mock, "dv1", "env");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let env = loop {
-        if let Ok(env) = std::fs::read_to_string(&path) {
-            break env;
-        }
-        assert!(Instant::now() < deadline, "pane env file never appeared");
-        thread::sleep(Duration::from_millis(50));
-    };
+    // records CADENCE_* so `cadence self` can identify the agent. The
+    // env dump precedes the TUI paint — probe-idle orders after it.
+    wait_probe_idle(&d, "dv1", 15);
+    let env = std::fs::read_to_string(d.pane_file(&_mock, "dv1", "env")).unwrap();
     assert!(env.contains("CADENCE_ALIAS=dv1"), "{env}");
     assert!(
         env.contains(&format!("CADENCE_STATE_DIR={}", d.state.display())),
@@ -5937,8 +5948,12 @@ for i, a in enumerate(argv):
         sid = argv[i + 1]
 with open(pidfile, "w") as f:
     f.write(str(os.getpid()))
-with open(pidfile + ".argv", "w") as f:
+# Atomic dump — a reader between truncate and write must never see a
+# torn file; the same temp+rename shape .env uses below.
+argv_tmp = pidfile + ".argv.tmp"
+with open(argv_tmp, "w") as f:
     f.write("\n".join(sys.argv))
+os.rename(argv_tmp, pidfile + ".argv")
 env_tmp = pidfile + ".env.tmp"
 with open(env_tmp, "w") as f:
     for k in sorted(os.environ):
@@ -6260,18 +6275,21 @@ fn claude_death_mid_turn_unknown_then_unfence_resume() {
     assert_eq!(unfenced["state"], "stopped", "{unfenced}");
     d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
     d.wait_agent("w1", "idle", 15);
-    // Resume relaunched on the SAME session id via --resume.
-    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
-    assert_eq!(agent["session_id"].as_str().unwrap(), sid);
-    let argv = wait_file_contains(&mock.pidfile.with_extension("pid.argv"), "--resume", 10);
-    assert!(argv.contains(&format!("--resume\n{sid}")), "{argv}");
-    // And the resumed process takes a real turn.
+    // `idle` only proves the transport opened — under load the
+    // relaunched mock can still be booting, so `.argv` may still hold
+    // the first launch's flags. A completed turn is the cause ordered
+    // after the dump: init/result emits mean the script exec'd.
     d.rpc(
         "agent_send",
         json!({"alias": "w1", "text": "again", "message": "m2"}),
     )
     .unwrap();
     d.wait_message("w1", "m2", &["completed"], 20);
+    // Resume relaunched on the SAME session id via --resume.
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["session_id"].as_str().unwrap(), sid);
+    let argv = std::fs::read_to_string(mock.pidfile.with_extension("pid.argv")).unwrap();
+    assert!(argv.contains(&format!("--resume\n{sid}")), "{argv}");
 }
 
 #[test]
@@ -6379,13 +6397,17 @@ fn claude_env_injected_and_scrubbed() {
     ] {
         std::env::remove_var(k);
     }
-    // The mock writes its env dump at process start — poll for it;
-    // `idle` only means the actor's transport opened.
-    let env = wait_file_contains(
-        &mock.pidfile.with_extension("pid.env"),
-        "CADENCE_ALIAS=w1\n",
-        10,
-    );
+    // The mock writes its env dump at process start, before any
+    // protocol emit — `idle` only means the actor's transport opened.
+    // A completed turn is the cause ordered after the dump.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "boot", "message": "m-env"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-env", &["completed"], 20);
+    let env = std::fs::read_to_string(mock.pidfile.with_extension("pid.env")).unwrap();
+    assert!(env.contains("CADENCE_ALIAS=w1\n"), "{env}");
     assert!(
         env.contains(&format!("CADENCE_STATE_DIR={}\n", d.state.display())),
         "{env}"
@@ -6423,9 +6445,18 @@ fn claude_params_replayed_on_resume() {
     );
     d.wait_agent("w1", "idle", 15);
     // `idle` means the actor's transport opened — the mock may not have
-    // written its argv dump yet under load; poll for it.
+    // exec'd its script and written the argv dump yet under load. A
+    // completed turn is the cause ordered after the dump: init/result
+    // emits mean the script ran.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "boot", "message": "m-boot"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-boot", &["completed"], 20);
     let argv_file = mock.pidfile.with_extension("pid.argv");
-    let argv1 = wait_file_contains(&argv_file, "--session-id", 10);
+    let argv1 = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv1.contains("--session-id"), "{argv1}");
     assert!(argv1.contains("--permission-mode\nacceptEdits"), "{argv1}");
     assert!(argv1.contains("--allowedTools\nBash(cadence *)"), "{argv1}");
     assert!(argv1.contains("--allowedTools\nBash(git *)"), "{argv1}");
@@ -6438,10 +6469,16 @@ fn claude_params_replayed_on_resume() {
     d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
     d.wait_agent("w1", "idle", 15);
-    // Same spawn/write gap as the first read — and the file still holds
-    // the first launch's argv until the resumed mock rewrites it, so
-    // poll for the resume-shaped content, not just non-empty.
-    let argv2 = wait_file_contains(&argv_file, "--resume", 10);
+    // Same spawn/write gap on the resumed generation — and the file
+    // still holds the first launch's argv until the resumed mock
+    // rewrites it. Another completed turn orders after the rewrite.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "boot2", "message": "m-boot2"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-boot2", &["completed"], 20);
+    let argv2 = std::fs::read_to_string(&argv_file).unwrap();
     // Resume replays the same permission/model params verbatim and
     // resumes the stored session — it never mints a fresh one.
     assert!(argv2.contains(&format!("--resume\n{sid}")), "{argv2}");
@@ -7773,6 +7810,9 @@ fn pty_claude_launch_mints_session_and_proves_ownership() {
     let mock = d.mock_claude_tui();
     d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
     let agent = d.wait_agent("cl", "idle", 20);
+    // The TUI paint that makes the probe read idle happens after the
+    // mock's argv/env dumps — the cause ordered after them.
+    wait_probe_idle(&d, "cl", 15);
     let session = agent["session_id"].as_str().unwrap().to_string();
     assert!(!session.is_empty(), "{agent}");
     // The profile passed its own launch flag verbatim to the pane.
@@ -7811,6 +7851,8 @@ fn pty_claude_resume_passes_resume_flag() {
         agent["session_id"].as_str().unwrap(),
         "4f9b1c2e-aaaa-bbbb-cccc-0000000000aa"
     );
+    // Idle probe ⇒ the mock painted its TUI ⇒ its argv dump is on disk.
+    wait_probe_idle(&d, "cl", 15);
     let argv = std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "argv")).unwrap();
     assert!(
         argv.contains("--resume 4f9b1c2e-aaaa-bbbb-cccc-0000000000aa"),
@@ -8050,6 +8092,7 @@ fn cli_claude_tui_flag_launches_pty_endpoint() {
     let agent = d.wait_agent("cl", "idle", 20);
     assert_eq!(agent["provider"], "claude");
     assert_eq!(agent["endpoint_kind"], "pty");
+    wait_probe_idle(&d, "cl", 15);
     let argv = std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "argv")).unwrap();
     assert!(argv.contains("--session-id"), "{argv}");
 }
@@ -8082,6 +8125,7 @@ fn cli_claude_tui_resume_passes_resume() {
         String::from_utf8_lossy(&out.stderr)
     );
     d.wait_agent("cl", "idle", 20);
+    wait_probe_idle(&d, "cl", 15);
     let argv = std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "argv")).unwrap();
     assert!(
         argv.contains("--resume c1d2e3f4-1111-2222-3333-444455556666"),
@@ -8163,6 +8207,7 @@ fn cli_join_claude_tui_briefs_prefixes() {
     let agent = d.wait_agent("wj", "idle", 20);
     assert_eq!(agent["provider"], "claude");
     assert_eq!(agent["endpoint_kind"], "pty");
+    wait_probe_idle(&d, "wj", 15);
     let argv = std::fs::read_to_string(d.claude_pane_file(&mock, "wj", "argv")).unwrap();
     assert!(argv.contains("--session-id"), "{argv}");
     // The briefing tells the worker which leading chars never paste.
