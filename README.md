@@ -26,6 +26,10 @@ cadence skill install           # install the `cadence` agent skill into
 
 cadence devin                   # fresh Devin TUI in an owned tmux pane, then attach
 cadence devin -r cookie-cesium  # resume an existing Devin session, like `devin -r`
+                                # (--permission-mode auto|accept-edits|smart|dangerous
+                                #  or --bypass for dangerous — stored and replayed
+                                #  on every launch/resume, so the pane never stalls
+                                #  on its first approval menu)
 cadence codex                   # Codex managed-ws endpoint, then `codex resume --remote`
                                 # (--detach opts out; non-TTY or inside tmux prints
                                 #  the attach command instead of exec'ing it;
@@ -45,7 +49,8 @@ cadence join <pm-slug> devin    # spawn a worker wired to a group: results route
                                 #  (--worktree <name> isolates it in .cadence/wt/<name>
                                 #   on branch cadence/<name>; --no-bootstrap skips the
                                 #   briefing file + kickoff message — note a bootstrap
-                                #   on provider claude spends one real model turn)
+                                #   on provider claude spends one real model turn;
+                                #   --permission-mode/--bypass also apply to devin)
 cadence attach [name]           # attach this terminal (alias, native id, or unambiguous
                                 #  provider name); no name lists live attachable agents
                                 #  grouped by PM; non-TTY/in-tmux prints the command

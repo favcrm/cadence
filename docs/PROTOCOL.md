@@ -134,6 +134,16 @@ replays verbatim on every resume: `{"model": "<cli model>",
 to self-report — and the turn-liveness knobs `{"turn_idle_secs": N}`
 (default 900) plus `{"turn_max_secs": N}` (optional absolute cap).
 
+For provider `devin`, `{"permission_mode": "<mode>"}` sets Devin's own
+approval policy — `auto`, `accept-edits`, `smart` or `dangerous`
+(`cadence devin --bypass` stores `dangerous`). The pane profile replays
+it as `--permission-mode <mode>` on every open, fresh launch and `-r`
+resume alike, so an unattended pane never stalls on its first approval
+menu. `agent_register` validates the four values and rejects anything
+else; `agent set` cannot patch it live (the mode is launch-time only —
+relaunch or rejoin to change it). When the key is absent the flag is
+omitted entirely and Devin's own default applies.
+
 **Briefings.** Every launch path (`devin`, `codex`, `claude`, `join`) writes
 `.cadence/<root>/BRIEFING-<alias>.md` — the group root's `.cadence/`
 dir in the root's cwd (the PM's repo for a joined worker, the agent's
@@ -244,7 +254,8 @@ never hand-listed per provider. Adding a provider or kind means one
 
 ## pty endpoints (provider `devin`)
 
-Cadence launches `devin [-r <session>]` inside a detached tmux session
+Cadence launches `devin [--permission-mode <mode>] [-r <session>]`
+inside a detached tmux session
 on a private socket (`cadence-<state-hash>`), so every pane it can kill
 is one it spawned. The agent record keeps the fields separate: `alias`,
 `thread_id` = the native Devin session id, `endpoint` =

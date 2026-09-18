@@ -2493,6 +2493,8 @@ try:
 except BlockingIOError:
     print("session_locked: %s" % sid); sys.exit(1)
 open(os.environ["FAKE_PANE"] + ".sid", "w").write(sid)
+# Record the launch argv — tests assert flags are replayed on resume.
+open(os.environ["FAKE_PANE"] + ".argv", "w").write("\n".join(sys.argv))
 # Record the pane env the adapter exported via tmux -e.
 open(os.environ["FAKE_PANE"] + ".env", "w").write(
     "CADENCE_ALIAS=%s\nCADENCE_STATE_DIR=%s\n" % (
@@ -2990,6 +2992,152 @@ fn pty_locked_session_refuses_takeover() {
     );
     holder.kill().unwrap();
     let _ = holder.wait();
+}
+
+/// CAD-18: `params.permission_mode` lands on the agent row at register
+/// and is replayed into the pane argv on every open — the fresh launch
+/// gets `--permission-mode <mode>`, the resume gets it plus `-r <sid>`.
+#[test]
+fn devin_permission_mode_persisted_and_replayed() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "dv1", "provider": "devin", "endpoint_kind": "pty",
+               "cwd": cwd,
+               "params": json!({"permission_mode": "smart"}).to_string()}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("dv1", "idle", 20);
+    assert_eq!(agent["params"]["permission_mode"], "smart", "{agent}");
+    let sid = agent["thread_id"].as_str().unwrap().to_string();
+    // The mock devin records its launch argv per pane life.
+    let argv_file = d.pane_file(&mock, "dv1", "argv");
+    let argv1 = wait_file_contains(&argv_file, "--permission-mode", 10);
+    assert!(argv1.contains("--permission-mode\nsmart"), "{argv1}");
+    assert!(
+        !argv1.contains("\n-r\n"),
+        "fresh launch must not resume: {argv1}"
+    );
+    // A stop+resume respawns the pane with `-r <sid>` — the mode must
+    // be replayed verbatim alongside it.
+    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.wait_agent("dv1", "stopped", 15);
+    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let argv2 = wait_file_contains(&argv_file, "\n-r\n", 10);
+    assert!(argv2.contains(&format!("-r\n{sid}")), "{argv2}");
+    assert!(argv2.contains("--permission-mode\nsmart"), "{argv2}");
+    assert_eq!(agent["params"]["permission_mode"], "smart", "{agent}");
+}
+
+/// CAD-18: the four-value vocabulary is enforced at `agent_register`
+/// (not just the CLI), and `agent set` cannot patch it live.
+#[test]
+fn devin_permission_mode_validated_at_register_and_not_settable() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    for bad in ["bogus", "manual", "bypass", "acceptEdits"] {
+        let err = d
+            .rpc(
+                "agent_register",
+                json!({"alias": "bad", "provider": "devin", "endpoint_kind": "pty",
+                       "cwd": cwd,
+                       "params": json!({"permission_mode": bad}).to_string()}),
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        for accepted in ["auto", "accept-edits", "smart", "dangerous"] {
+            assert!(
+                msg.contains(accepted),
+                "'{bad}' error missing '{accepted}': {msg}"
+            );
+        }
+    }
+    // The same check does not fire for other providers' params.
+    let err = d.rpc(
+        "agent_register",
+        json!({"alias": "cl1", "provider": "claude", "endpoint_kind": "managed",
+               "cwd": cwd,
+               "params": json!({"permission_mode": "anything-goes"}).to_string()}),
+    );
+    assert!(err.is_ok(), "claude params must pass through: {err:?}");
+    d.rpc("agent_stop", json!({"alias": "cl1"})).unwrap();
+    // agent set: launch params are not live-settable.
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    let err = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "dv1", "patch": {"permission_mode": "smart"}}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("not live-settable"), "{err}");
+    // auto_ready stays the one live-settable key — the patch still works.
+    d.rpc(
+        "agent_set",
+        json!({"alias": "dv1", "patch": {"auto_ready": "verified"}}),
+    )
+    .unwrap();
+}
+
+/// CAD-18, CLI end-to-end: `--bypass` persists `dangerous` on the agent
+/// row and shows in the launch summary; an invalid `--permission-mode`
+/// is rejected by the verb before any registration happens.
+#[test]
+fn cli_devin_permission_mode_flag_and_bypass() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    // --bypass → stored as permission_mode=dangerous, echoed in the
+    // launch summary, and replayed into the pane argv.
+    let out = std::process::Command::new(bin)
+        .args(["--state-dir"])
+        .arg(&d.state)
+        .args([
+            "devin",
+            "--bypass",
+            "--detach",
+            "--no-bootstrap",
+            "--alias",
+            "dv9",
+            "--cwd",
+        ])
+        .arg(d.dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(summary["permission_mode"], "dangerous", "{summary}");
+    let agent = d.wait_agent("dv9", "idle", 20);
+    assert_eq!(agent["params"]["permission_mode"], "dangerous", "{agent}");
+    // An invalid mode fails before agent_register — the rejection names
+    // the four accepted values and leaves no agent behind.
+    let out = std::process::Command::new(bin)
+        .args(["--state-dir"])
+        .arg(&d.state)
+        .args(["devin", "--permission-mode", "bogus", "--detach"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    for accepted in ["auto", "accept-edits", "smart", "dangerous"] {
+        assert!(err.contains(accepted), "missing '{accepted}': {err}");
+    }
+    let list = d.rpc("agent_list", json!({})).unwrap();
+    let aliases: Vec<&str> = list["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["alias"].as_str())
+        .collect();
+    assert_eq!(aliases, ["dv9"], "{aliases:?}");
 }
 
 #[test]

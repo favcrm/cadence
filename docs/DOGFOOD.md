@@ -283,6 +283,35 @@ adapter reads every one of those facts from the profile.
 **Rule that fell out:** when you paste into someone else's UI, the
 first character is part of the protocol — observe it, then forbid it.
 
+## A managed Devin pane stalls on its own approval menu
+
+**What happened.** A Devin worker launched by cadence sat at its first
+tool-approval menu for four hours — the TUI was waiting on a keypress
+nobody was there to make. The pane is owned and watched by the daemon,
+but approval prompts are answered in the terminal, so an unattended
+launch deadlocks the very autonomy it was launched for. Devin's own
+`--permission-mode` flag fixes it, but cadence launched the TUI with
+no way to pass one.
+
+**What landed.** `cadence devin --permission-mode <mode>` and
+`--bypass` (the `dangerous` shorthand, conflicting with an explicit
+mode exactly like the claude verb's), plus the same flags on
+`cadence join <pm> devin`. The choice stores as
+`params.permission_mode` — `auto`, `accept-edits`, `smart` or
+`dangerous`, validated at `agent_register` with the four values named
+in the rejection — and the pane profile replays it as
+`--permission-mode <mode>` in the launch argv on every open, fresh and
+`-r` resume alike. It is launch-time only: `agent set` refuses to patch
+it, because a live edit would diverge the stored mode from the running
+pane's actual policy. Verified live (CAD-18): a scratch
+`cadence devin --bypass --detach` pane ran `ls` with no approval menu;
+Devin's separate directory-trust prompt still appears — it is a
+workspace check, not a tool approval.
+
+**Rule that fell out:** automation that owns the launch must also own
+the approval policy — a permission mode left at "ask a human" turns
+the manager into the bottleneck.
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not
