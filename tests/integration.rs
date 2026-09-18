@@ -752,7 +752,11 @@ fn agent_unfence_reconciles_all_then_resume_works() {
             json!({"alias": "w2", "status": "interrupted"}),
         )
         .unwrap_err();
-    assert!(err.to_string().contains("no unknown"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("no unknown messages to reconcile — use `cadence agent resume w2`"),
+        "{err}"
+    );
     // Unfence reconciles each unknown and lands the agent stopped.
     let r = d
         .rpc(
@@ -5384,9 +5388,11 @@ fn pty_auto_ready_waits_on_busy_pane_then_delivers() {
     d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
     d.wait_agent("dv", "idle", 20);
     // The TUI shows a working state — the probe must refuse the paste.
+    // The busy tail is the real shape: status row directly above the
+    // box, busy watermark in the input line.
     std::fs::write(
         d.pane_file(&mock, "dv", "tui-state"),
-        "(esc twice to interrupt)\n",
+        "⠸ Thinking · 12s (esc twice to interrupt)\n❭ Guide Devin while it works\n",
     )
     .unwrap();
     d.rpc(
@@ -5431,7 +5437,8 @@ fn pty_probe_busy_markers_survive_trailing_blank_rows() {
     // idle and the daemon pastes into it.
     std::fs::write(
         d.pane_file(&mock, "dv", "tui-state"),
-        "⠸ Thinking · 12s (esc twice to interrupt)\n".to_string() + &"\n".repeat(30),
+        "⠸ Thinking · 12s (esc twice to interrupt)\n❭ Guide Devin while it works\n".to_string()
+            + &"\n".repeat(30),
     )
     .unwrap();
     let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
