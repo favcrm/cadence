@@ -122,6 +122,10 @@ cadence issue ls --ready           # leaves with no unfinished blockers
 cadence issue show CAD-16
 cadence issue lint                 # dangling/cyclic links, depth, sizes —
                                    # the safety net; writes validate first
+cadence issue sync                 # multi-host: fetch, rebase, lint, push —
+                                   # conflict/lint aborts leave the tree
+                                   # untouched; --dry-run, --no-push,
+                                   # --resolve ours|theirs
 cadence ui run                     # 127.0.0.1:3010 — SPA + read/write API
 ```
 

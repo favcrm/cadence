@@ -8,7 +8,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::issue::{board, doctor, hooks, lint, model, project, write, Pm};
+use crate::issue::{board, doctor, hooks, lint, model, project, sync, write, Pm};
 
 #[derive(Subcommand)]
 pub enum IssueAction {
@@ -126,6 +126,24 @@ pub enum IssueAction {
     Lint {
         #[arg(long)]
         project: Option<String>,
+    },
+    /// Bring the tracker level with `origin`: fetch, rebase the local
+    /// commits on top, lint the result, push. A conflict or lint
+    /// failure aborts and leaves the tree exactly as found; the report
+    /// names the paths. Needs a clean tree and no rebase in progress.
+    Sync {
+        /// Rebase and lint but do not push.
+        #[arg(long)]
+        no_push: bool,
+        /// Fetch and report ahead/behind plus the paths that would
+        /// conflict — nothing changes.
+        #[arg(long)]
+        dry_run: bool,
+        /// Resolve conflicting paths by taking one side whole:
+        /// `ours` keeps the local commit's content, `theirs` takes the
+        /// fetched remote's.
+        #[arg(long, value_parser = ["ours", "theirs"])]
+        resolve: Option<String>,
     },
 }
 
@@ -393,6 +411,28 @@ pub fn run(action: &IssueAction) -> Result<i32> {
         IssueAction::Lint { project } => {
             let pm = open_pm()?;
             let report = lint::run(&pm, project.as_deref())?;
+            if report["ok"].as_bool() == Some(true) {
+                print_json(&report);
+                Ok(0)
+            } else {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                );
+                Ok(1)
+            }
+        }
+        IssueAction::Sync {
+            no_push,
+            dry_run,
+            resolve,
+        } => {
+            let pm = open_pm()?;
+            let side = resolve.as_deref().map(|s| match s {
+                "ours" => sync::Resolve::Ours,
+                _ => sync::Resolve::Theirs,
+            });
+            let report = sync::run(&pm, !no_push, *dry_run, side)?;
             if report["ok"].as_bool() == Some(true) {
                 print_json(&report);
                 Ok(0)

@@ -102,6 +102,7 @@ cadence issue lint                          # schema, links, depth, sizes, symli
                                             # → exit !=0 on errors; warnings
                                             #   (e.g. ready/doing/review with an
                                             #   open blocked_by) never fail it
+cadence issue sync [--no-push] [--dry-run] [--resolve ours|theirs]
 cadence issue set CAD-16 owner=             # empty value clears the field
 ```
 
@@ -117,6 +118,31 @@ catch: `blocked_by`/parent cycles, depth > 2, oversize artifacts.
 Symlinks inside the tracker are never followed — a linked folder or
 `issue.md` is invisible to reads, an error in lint, and refused by
 writes.
+
+## Multi-host trackers — `issue sync`
+
+The post-commit hook pushes `origin` opportunistically after every
+write, but when two hosts both write before either pushes, the losing
+push is rejected non-fast-forward and the tracker's branch diverges.
+`cadence issue sync` is the recovery: it fetches `origin`, rebases the
+local branch onto `origin/<branch>`, lints the merged tree, then pushes
+the result. The branch must be clean, no rebase or merge may be in
+progress, and `origin` must exist — each refusal names the offending
+paths.
+
+A same-file conflict aborts the rebase and restores the tree exactly as
+found (same HEAD, clean status), reporting each conflicted path with
+both the local and remote commit subjects — exit 1, nothing pushed.
+`--resolve ours|theirs` instead takes the named side whole for every
+conflict and continues; a replayed commit that becomes empty is
+skipped. A rebase that merges cleanly but fails `issue lint` aborts the
+same way — the tree is restored and the push never happens.
+
+`--dry-run` fetches and reports `ahead`/`behind` plus `would_conflict`
+paths without touching the tree or the remote; `--no-push` rebases and
+lints but leaves the push for a later sync. `issue doctor` reports the
+same ahead/behind counts against `origin/<branch>` and points at
+`issue sync` whenever the local side is behind.
 
 ## `cadence ui` — the reader
 
