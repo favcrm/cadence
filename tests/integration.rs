@@ -1112,7 +1112,7 @@ fn pty_reattach_waits_for_session_proof() {
     // proof that was merely not-yet-visible (a provider still
     // registering, a raced /proc scan) fenced a live pane — and the
     // failed open then closed it, destroying the session it was meant
-    // to adopt. The stub's OWNED_MISS knob replays that window
+    // to adopt. The stub's `owned_misses` file replays that window
     // deterministically: the first probes see nothing while the pane
     // holds its lock throughout, and adoption must still succeed.
     let dir = TempDir::new().unwrap();
@@ -1120,23 +1120,22 @@ fn pty_reattach_waits_for_session_proof() {
     std::fs::create_dir_all(&seeded).unwrap();
     let fixtures = TempDir::new().unwrap();
     {
-        let _mock = install_mock_stub(fixtures.path());
+        let mock = install_mock_stub(fixtures.path());
         let d = TestDaemon::start_on(seeded.clone());
         d.register_stub("st1", json!({}));
         let agent = d.wait_agent("st1", "idle", 20);
         let native = agent["thread_id"].as_str().unwrap().to_string();
         let pane_pid = agent["pid"].as_i64().unwrap();
         drop(d);
-        // The profile the restart builds for the relaunched actor
-        // reports no session for its first owned_session calls — the
+        // The next owned_session calls report no session — the
         // transient-miss window the reattach must wait out rather than
-        // fence on.
-        std::env::set_var("CADENCE_STUB_OWNED_MISS", "3");
+        // fence on. The knob is a file in this stub's locks dir,
+        // scoped to this fixture, never process env.
+        std::fs::write(mock.locks.join("owned_misses"), "3").unwrap();
         let d2 = TestDaemon::start_on(seeded.clone());
         let agent2 = d2.wait_agent("st1", "idle", 25);
         assert_eq!(agent2["thread_id"].as_str().unwrap(), native);
         assert_eq!(agent2["pid"].as_i64().unwrap(), pane_pid);
-        std::env::remove_var("CADENCE_STUB_OWNED_MISS");
     }
 }
 
@@ -2826,6 +2825,7 @@ while True:
 struct MockStub {
     _guard: std::sync::MutexGuard<'static, ()>,
     dir: PathBuf,
+    locks: PathBuf,
 }
 
 /// Install the mock tmux/stub pair — the same private-tmux harness as
@@ -2853,6 +2853,7 @@ fn install_mock_stub(dir: &Path) -> MockStub {
     MockStub {
         _guard: guard,
         dir: dir.to_path_buf(),
+        locks,
     }
 }
 
