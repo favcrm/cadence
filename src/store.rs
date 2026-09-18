@@ -145,6 +145,10 @@ pub struct Verdict {
     pub reviewer: String,
     pub evidence: Option<Value>,
     pub message: Option<String>,
+    /// The CLI's worktree-verification result (`{checked, skipped}`)
+    /// bound to this verdict — NULL on unscoped tasks and on verdicts
+    /// recorded before CAD-51.
+    pub verify: Option<Value>,
     pub created: f64,
 }
 
@@ -237,6 +241,7 @@ fn row_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
 
 fn row_verdict(row: &rusqlite::Row) -> rusqlite::Result<Verdict> {
     let evidence: Option<String> = row.get("evidence")?;
+    let verify: Option<String> = row.get("verify")?;
     Ok(Verdict {
         seq: row.get("seq")?,
         task_id: row.get("task_id")?,
@@ -246,6 +251,7 @@ fn row_verdict(row: &rusqlite::Row) -> rusqlite::Result<Verdict> {
         reviewer: row.get("reviewer")?,
         evidence: evidence.and_then(|e| serde_json::from_str(&e).ok()),
         message: row.get("message")?,
+        verify: verify.and_then(|v| serde_json::from_str(&v).ok()),
         created: row.get("created")?,
     })
 }
@@ -375,7 +381,8 @@ impl Verdict {
             "seq": self.seq, "task": self.task_id, "revision": self.revision,
             "sha": self.sha, "verdict": self.verdict,
             "reviewer": self.reviewer, "evidence": self.evidence,
-            "message": self.message, "created": self.created,
+            "message": self.message, "verify": self.verify,
+            "created": self.created,
         })
     }
 }
@@ -532,6 +539,23 @@ impl Store {
                  CREATE INDEX IF NOT EXISTS events_job ON events(job_id, seq);
                  UPDATE schema_version SET version=4;",
             )?;
+            tx.commit()?;
+        }
+        if version < 5 {
+            // v5: `verdicts.verify` — the CLI's worktree-verification
+            // result ({checked, skipped}) stored with the verdict it
+            // gated (CAD-51). Same atomic column-check + transaction
+            // pattern as v2/v3; old rows read verify NULL.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(verdicts)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !columns.iter().any(|c| c == "verify") {
+                tx.execute_batch("ALTER TABLE verdicts ADD COLUMN verify TEXT")?;
+            }
+            tx.execute("UPDATE schema_version SET version=5", [])?;
             tx.commit()?;
         }
         let store = Self {
@@ -2078,6 +2102,10 @@ impl Store {
     /// cadence pane, `--reviewer` outside it); `pane` records whether a
     /// pane alias was present. Reviewer independence is enforced here:
     /// reviewer == assignee is rejected.
+    ///
+    /// `verify` is the CLI's worktree-verification result as JSON text
+    /// (`{checked, skipped}`) — stored verbatim with the verdict and
+    /// echoed on the `verdict_recorded` event.
     #[allow(clippy::too_many_arguments)]
     pub fn record_verdict(
         &self,
@@ -2089,6 +2117,7 @@ impl Store {
         evidence: Option<&str>,
         message: Option<&str>,
         expect_revision: Option<i64>,
+        verify: Option<&str>,
     ) -> Result<(Task, Verdict)> {
         if !matches!(verdict, "pass" | "revise" | "blocked") {
             return Err(Error::rejected(format!(
@@ -2139,9 +2168,17 @@ impl Store {
                 .map(|v| v.to_string())
                 .unwrap_or_else(|_| json!({"text": e}).to_string())
         });
+        let verify_json: Option<String> = verify.map(|v| {
+            serde_json::from_str::<Value>(v)
+                .map(|j| j.to_string())
+                .unwrap_or_else(|_| json!({"text": v}).to_string())
+        });
+        let verify_val = verify_json
+            .as_deref()
+            .and_then(|v| serde_json::from_str::<Value>(v).ok());
         tx.execute(
             "INSERT INTO verdicts(task_id,revision,sha,verdict,reviewer,evidence,
-             message,created) VALUES(?,?,?,?,?,?,?,?)",
+             message,verify,created) VALUES(?,?,?,?,?,?,?,?,?)",
             params![
                 task_id,
                 task.revision,
@@ -2150,6 +2187,7 @@ impl Store {
                 reviewer,
                 evidence_json,
                 message,
+                verify_json,
                 now()
             ],
         )?;
@@ -2174,7 +2212,7 @@ impl Store {
             "verdict_recorded",
             json!({"task": task_id, "job": job.id, "revision": task.revision,
                    "sha": sha, "verdict": verdict, "reviewer": reviewer,
-                   "pane": pane, "state": next}),
+                   "pane": pane, "state": next, "verify": verify_val}),
             Some(&job.id),
             Some(task_id),
         )?;
@@ -2966,7 +3004,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         Store::open(&db).unwrap();
     }
 
@@ -3030,7 +3068,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 4);
+            assert_eq!(v, 5);
         }
         // Half-applied: v4 objects present but version rolled back —
         // reopening must converge, not fail on duplicates.
@@ -3065,7 +3103,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 4);
+            assert_eq!(v, 5);
         }
     }
 
@@ -3136,10 +3174,10 @@ mod tests {
         assert_eq!(t.head_sha.as_deref(), Some(SHA40_A));
         // verdict binding: wrong sha rejected, right sha passes.
         assert!(s
-            .record_verdict("t1", SHA40_B, "pass", "rev", None, None, None, None)
+            .record_verdict("t1", SHA40_B, "pass", "rev", None, None, None, None, None)
             .is_err());
         let (t, v) = s
-            .record_verdict("t1", SHA40_A, "pass", "rev", None, None, None, None)
+            .record_verdict("t1", SHA40_A, "pass", "rev", None, None, None, None, None)
             .unwrap();
         assert_eq!(t.state, "verified");
         assert_eq!(v.revision, 1);
@@ -3179,12 +3217,12 @@ mod tests {
         assert_eq!(t2.state, "review");
         assert_eq!(t2.head_sha, None);
         assert!(s
-            .record_verdict("t2", SHA40_A, "pass", "rev", None, None, None, None)
+            .record_verdict("t2", SHA40_A, "pass", "rev", None, None, None, None, None)
             .unwrap_err()
             .to_string()
             .contains("job task sha"));
         s.set_task_sha("t2", SHA40_A, "op").unwrap();
-        s.record_verdict("t2", SHA40_A, "pass", "rev", None, None, None, None)
+        s.record_verdict("t2", SHA40_A, "pass", "rev", None, None, None, None, None)
             .unwrap();
         assert_eq!(s.task("t2").unwrap().state, "verified");
     }
@@ -3249,18 +3287,28 @@ mod tests {
         .unwrap();
         // Stale revision.
         assert!(s
-            .record_verdict("t1", SHA40_A, "pass", "rev", None, None, None, Some(9))
+            .record_verdict(
+                "t1",
+                SHA40_A,
+                "pass",
+                "rev",
+                None,
+                None,
+                None,
+                Some(9),
+                None
+            )
             .unwrap_err()
             .to_string()
             .contains("stale"));
         // Reviewer == assignee.
         assert!(s
-            .record_verdict("t1", SHA40_A, "pass", "w1", None, None, None, None)
+            .record_verdict("t1", SHA40_A, "pass", "w1", None, None, None, None, None)
             .unwrap_err()
             .to_string()
             .contains("assignee"));
         // Verdicts are append-only across revisions: revise then pass.
-        s.record_verdict("t1", SHA40_A, "revise", "rev", None, None, None, None)
+        s.record_verdict("t1", SHA40_A, "revise", "rev", None, None, None, None, None)
             .unwrap();
         assert_eq!(s.task("t1").unwrap().state, "revising");
         let (_, k2, ..) = s.dispatch_task("t1", None, None, "test").unwrap();
@@ -3274,9 +3322,9 @@ mod tests {
         .unwrap();
         // The r1 sha is stale for r2.
         assert!(s
-            .record_verdict("t1", SHA40_A, "pass", "rev", None, None, None, None)
+            .record_verdict("t1", SHA40_A, "pass", "rev", None, None, None, None, None)
             .is_err());
-        s.record_verdict("t1", SHA40_B, "pass", "rev", None, None, None, None)
+        s.record_verdict("t1", SHA40_B, "pass", "rev", None, None, None, None, None)
             .unwrap();
         let vs = s.verdicts_for_task("t1").unwrap();
         assert_eq!(vs.len(), 2);
