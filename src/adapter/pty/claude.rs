@@ -296,15 +296,26 @@ impl ClaudeProfile {
 
     /// Every live session-registry entry — parsed `<pid>.json` files
     /// whose process is still running under the recorded start tick.
+    /// A transient read miss silently drops an entry, so an all-empty
+    /// result is re-scanned before it is believed: a registry nobody
+    /// occupies stays empty, a raced one does not.
     fn live_entries(&self) -> Vec<SessionEntry> {
-        let Ok(entries) = std::fs::read_dir(&self.sessions_dir) else {
-            return Vec::new();
-        };
+        let mut entries = Vec::new();
+        for attempt in 0..super::EVIDENCE_PROBES {
+            entries = std::fs::read_dir(&self.sessions_dir)
+                .map(|dir| {
+                    dir.flatten()
+                        .filter_map(|e| self.read_entry(&e.path()))
+                        .filter(SessionEntry::alive)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !entries.is_empty() || attempt + 1 == super::EVIDENCE_PROBES {
+                break;
+            }
+            std::thread::sleep(super::EVIDENCE_SETTLE);
+        }
         entries
-            .flatten()
-            .filter_map(|e| self.read_entry(&e.path()))
-            .filter(SessionEntry::alive)
-            .collect()
     }
 
     /// One `<pid>.json` entry: the filename pid is authoritative, and

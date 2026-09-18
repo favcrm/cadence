@@ -1107,6 +1107,107 @@ fn pty_restart_fence_unfence_resume_readopts_pane() {
 }
 
 #[test]
+fn pty_reattach_waits_for_session_proof() {
+    // The reattach branch once read `owned_session` exactly once: a
+    // proof that was merely not-yet-visible (a provider still
+    // registering, a raced /proc scan) fenced a live pane — and the
+    // failed open then closed it, destroying the session it was meant
+    // to adopt. The stub's OWNED_MISS knob replays that window
+    // deterministically: the first probes see nothing while the pane
+    // holds its lock throughout, and adoption must still succeed.
+    let dir = TempDir::new().unwrap();
+    let seeded = dir.path().join("state");
+    std::fs::create_dir_all(&seeded).unwrap();
+    let fixtures = TempDir::new().unwrap();
+    {
+        let _mock = install_mock_stub(fixtures.path());
+        let d = TestDaemon::start_on(seeded.clone());
+        d.register_stub("st1", json!({}));
+        let agent = d.wait_agent("st1", "idle", 20);
+        let native = agent["thread_id"].as_str().unwrap().to_string();
+        let pane_pid = agent["pid"].as_i64().unwrap();
+        drop(d);
+        // The profile the restart builds for the relaunched actor
+        // reports no session for its first owned_session calls — the
+        // transient-miss window the reattach must wait out rather than
+        // fence on.
+        std::env::set_var("CADENCE_STUB_OWNED_MISS", "3");
+        let d2 = TestDaemon::start_on(seeded.clone());
+        let agent2 = d2.wait_agent("st1", "idle", 25);
+        assert_eq!(agent2["thread_id"].as_str().unwrap(), native);
+        assert_eq!(agent2["pid"].as_i64().unwrap(), pane_pid);
+        std::env::remove_var("CADENCE_STUB_OWNED_MISS");
+    }
+}
+
+#[test]
+fn pty_shutdown_straggler_detaches_pane() {
+    // Regression for the force-close half of the re-adoption race:
+    // stop_ctls once ran adapter.close() on actors still working when
+    // the stop grace expired — even during daemon shutdown, where the
+    // contract is detach. kill-session SIGKILLed the pane the restart
+    // was meant to re-adopt, and resume then legitimately spawned a
+    // replacement ("pane was not re-adopted"). MOCK_TMUX_HOLD stretches
+    // every `#{pane_dead}` read past the grace window, so the actor is a
+    // deterministic straggler — no sleeps, the latency lives in the
+    // mock's response time. (Only pane_dead is held: holding every
+    // display-message would let a held cursor read burn the render
+    // deadline and fail the send before it ever reaches `running`.)
+    let mut d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    let agent = d.wait_agent("dv1", "idle", 25);
+    let native = agent["thread_id"].as_str().unwrap().to_string();
+    let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::env::set_var("MOCK_TMUX_HOLD", "4"); // > STOP_GRACE (3s)
+    std::env::set_var("MOCK_TMUX_HOLD_FMT", "#{pane_dead}");
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    // Once the turn is running the actor is inside held adapter probes
+    // (gate, then the idle loop's disconnected check); it cannot finish
+    // inside the 3s grace, so the straggler path fires every run.
+    d.wait_message("dv1", "m1", &["running"], 40);
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    std::env::remove_var("MOCK_TMUX_HOLD");
+    std::env::remove_var("MOCK_TMUX_HOLD_FMT");
+    // Leak d's TempDir — it owns the state dir and the mock's pane
+    // state, which must outlive the second daemon.
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    // Recover fenced the in-flight turn; the pane itself survived the
+    // straggler stop, so unfence → resume re-adopts the same pane.
+    d.wait_agent("dv1", "attention", 15);
+    d.rpc(
+        "agent_unfence",
+        json!({"alias": "dv1", "status": "interrupted"}),
+    )
+    .unwrap();
+    d.wait_agent("dv1", "stopped", 10);
+    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    let agent = d.wait_agent("dv1", "idle", 25);
+    let pid_after: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        pid_after, pane_pid,
+        "straggler pane was killed, not detached"
+    );
+    assert_eq!(agent["thread_id"].as_str().unwrap(), native);
+}
+
+#[test]
 fn cli_doctor_smoke() {
     let dir = TempDir::new().unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
@@ -2363,7 +2464,7 @@ fn ws_second_pending_request_keeps_waiting() {
 /// command (`bash -c`) in its own process group so pane_pid and the
 /// /proc lock-descendant checks exercise real ownership logic.
 const MOCK_TMUX_PY: &str = r##"#!/usr/bin/env python3
-import os, signal, subprocess, sys
+import os, signal, subprocess, sys, time
 
 args = sys.argv[1:]
 if args[0] == "-L":
@@ -2386,6 +2487,17 @@ def die(msg, code=1):
     sys.stderr.write(msg + "\n"); sys.exit(code)
 
 cmd, rest = args[0], args[1:]
+# Deterministic latency injection: MOCK_TMUX_HOLD=<secs> delays the
+# command named by MOCK_TMUX_HOLD_CMD (default display-message) — the
+# harness's way to make an adapter probe straggle past the daemon's
+# stop grace without any sleep in test code. MOCK_TMUX_HOLD_FMT narrows
+# the hold to calls whose args contain it (e.g. only #{pane_dead}), so
+# latency lands on the probe under test instead of every probe.
+hold = float(os.environ.get("MOCK_TMUX_HOLD", "0"))
+hold_fmt = os.environ.get("MOCK_TMUX_HOLD_FMT", "")
+if hold and cmd == os.environ.get("MOCK_TMUX_HOLD_CMD", "display-message") \
+        and (not hold_fmt or hold_fmt in rest):
+    time.sleep(hold)
 if cmd == "new-session":
     name = rest[rest.index("-s") + 1]
     cwd = rest[rest.index("-c") + 1] if "-c" in rest else os.getcwd()

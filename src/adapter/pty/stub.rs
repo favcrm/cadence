@@ -8,6 +8,7 @@
 //! provider; nothing outside tests should register it.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::adapter::Probe;
@@ -104,13 +105,18 @@ fn analyze_stub(screen: &str) -> Probe {
 pub struct StubProfile {
     locks_dir: PathBuf,
     command: String,
+    /// Count of `owned_session` calls still to answer with `None` —
+    /// the transient "proof not yet visible" window, injected via
+    /// `CADENCE_STUB_OWNED_MISS` so tests can replay it exactly.
+    owned_misses: AtomicUsize,
 }
 
 impl StubProfile {
     /// Resolve from the environment: `CADENCE_STUB_LOCKS` for the
     /// session locks and `CADENCE_STUB_COMMAND` used verbatim as the
     /// launch argv — both required; there is no real `stub` binary to
-    /// fall back to.
+    /// fall back to. `CADENCE_STUB_OWNED_MISS=N` (optional) makes the
+    /// first N `owned_session` calls on this instance report nothing.
     pub fn new() -> Result<Self> {
         let locks_dir = std::env::var("CADENCE_STUB_LOCKS")
             .map(PathBuf::from)
@@ -119,7 +125,17 @@ impl StubProfile {
             .ok()
             .filter(|v| !v.is_empty())
             .ok_or_else(|| Error::rejected("CADENCE_STUB_COMMAND is not set"))?;
-        Ok(Self { locks_dir, command })
+        let owned_misses = AtomicUsize::new(
+            std::env::var("CADENCE_STUB_OWNED_MISS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        );
+        Ok(Self {
+            locks_dir,
+            command,
+            owned_misses,
+        })
     }
 
     fn lock_path(&self, session: &str) -> PathBuf {
@@ -147,6 +163,13 @@ impl TuiProfile for StubProfile {
     /// Same lock-file family as Devin's: the stub TUI flocks
     /// `<locks>/<session>.lock`, so ownership is the same /proc scan.
     fn owned_session(&self, pane_pid: u32) -> Option<String> {
+        if self
+            .owned_misses
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return None;
+        }
         let entries = std::fs::read_dir(&self.locks_dir).ok()?;
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
