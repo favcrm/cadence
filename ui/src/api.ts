@@ -4,6 +4,7 @@ import type {
   Health,
   IssueCard,
   IssueDetail,
+  IssueHistoryEntry,
   Project,
 } from "./types";
 
@@ -82,6 +83,10 @@ export const api = {
       project ? `/api/issues?project=${encodeURIComponent(project)}` : "/api/issues",
     ),
   issue: (id: string) => get<IssueDetail>(`/api/issues/${id}`),
+  history: (id: string, limit = 10) =>
+    get<{ id: string; history: IssueHistoryEntry[] }>(
+      `/api/issues/${id}/history?limit=${limit}`,
+    ),
   file: async (id: string) => {
     const resp = await fetch(`/api/issues/${id}/file`);
     if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);

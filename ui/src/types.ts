@@ -68,6 +68,24 @@ export interface ActivityItem {
   subject?: string;
 }
 
+/** `GET /api/issues/<id>/history` — one parsed git-log entry. */
+export interface IssueHistoryEntry {
+  sha: string;
+  at: string;
+  by: string;
+  kind:
+    | "created"
+    | "set"
+    | "link"
+    | "unlink"
+    | "ref"
+    | "comment"
+    | "attach"
+    | "other";
+  summary: string;
+  fields?: Record<string, string | null>;
+}
+
 export interface IssueDetail extends IssueCard {
   frontmatter: Record<string, unknown>;
   body: string;
