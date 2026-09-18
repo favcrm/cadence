@@ -8406,3 +8406,403 @@ fn agents_md_opt_in_and_worktree_gitignore() {
         "{gitignore}"
     );
 }
+
+// ---- message cancel (CAD-25) ----
+
+#[test]
+fn message_cancel_queued_lifecycle() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.register_inbox("pm");
+    d.wait_agent("w1", "idle", 10);
+
+    // A completed message refuses, naming its terminal state.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "done work", "message": "m-done"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-done", &["completed"], 15);
+    let err = d
+        .rpc("message_cancel", json!({"message": "m-done"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("'completed'"), "{err}");
+
+    // Stop the worker so the next send parks queued.
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 10);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "queued work", "message": "m-q",
+               "reply_to": "pm"}),
+    )
+    .unwrap();
+    assert_eq!(d.message_state("w1", "m-q"), "queued");
+
+    // Cancel: state, result payload, event, and exactly one notice on pm.
+    let out = d
+        .rpc(
+            "message_cancel",
+            json!({"message": "m-q", "by": "board-dev", "reason": "wrong spec"}),
+        )
+        .unwrap();
+    assert_eq!(out["state"], "cancelled");
+    assert_eq!(out["message"]["state"], "cancelled");
+    assert_eq!(out["message"]["result"]["status"], "cancelled");
+    assert_eq!(out["message"]["result"]["by"], "board-dev");
+    assert_eq!(out["message"]["result"]["reason"], "wrong spec");
+    let ev = d
+        .events("w1")
+        .into_iter()
+        .find(|e| e["kind"] == "cancelled" && e["payload"]["message"] == "m-q")
+        .expect("no cancelled event");
+    assert_eq!(ev["payload"]["by"], "board-dev");
+    assert_eq!(ev["payload"]["reason"], "wrong spec");
+    let inbox = d.rpc("agent_inbox", json!({"alias": "pm"})).unwrap();
+    let notices: Vec<&Value> = inbox["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["source"] == "worker_notice")
+        .collect();
+    assert_eq!(notices.len(), 1, "{inbox}");
+    let body = notices[0]["body"].as_str().unwrap();
+    assert!(body.contains("cancelled"), "{body}");
+    assert!(body.contains("m-q"), "{body}");
+    assert!(body.contains("wrong spec"), "{body}");
+
+    // Cancelling again refuses, naming the state; an unknown id refuses.
+    let err = d
+        .rpc("message_cancel", json!({"message": "m-q"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("'cancelled'"), "{err}");
+    let err = d
+        .rpc("message_cancel", json!({"message": "m-nope"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("No such message"), "{err}");
+
+    // Resume: the cancelled message never delivers; a fresh one does.
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 10);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "real work", "message": "m-new"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-new", &["completed"], 15);
+    assert_eq!(d.message_state("w1", "m-q"), "cancelled");
+}
+
+#[test]
+fn message_cancel_gate_pty_and_running_refusal() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+
+    // Queued behind the ready gate: the message is durable but the pane
+    // has not been claimed.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "first", "message": "m1"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(d.message_state("dv1", "m1"), "queued");
+    d.rpc("message_cancel", json!({"message": "m1", "reason": "typo"}))
+        .unwrap();
+    assert_eq!(d.message_state("dv1", "m1"), "cancelled");
+
+    // A ready claim now must NOT paste m1 — the gate only releases a
+    // queued message.
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    thread::sleep(Duration::from_secs(2));
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    assert!(!input.contains("first"), "{input}");
+
+    // The claim stays outstanding, so the next queued message delivers
+    // normally.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "second", "message": "m2"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "m2");
+
+    // A running turn refuses — interruption happens at the provider.
+    let err = d
+        .rpc("message_cancel", json!({"message": "m2"}))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("'running'") || err.to_string().contains("'submitting'"),
+        "{err}"
+    );
+    d.rpc(
+        "message_report",
+        json!({"message": "m2", "token": token, "kind": "result", "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m2", &["completed"], 15);
+}
+
+#[test]
+fn message_cancel_races_claim_atomically() {
+    // Store-level: cancel vs take_queued — the state-guarded UPDATE and
+    // the claim's own guard make exactly one winner per message; a
+    // claimed message is never cancelled and a cancelled one is never
+    // claimed.
+    let seeded = TempDir::new().unwrap();
+    let store = Store::open(&seeded.path().join("cadence.sqlite3")).unwrap();
+    let cwd = seeded.path().to_str().unwrap().to_string();
+    store
+        .register_agent(&NewAgent {
+            alias: "w",
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "worker",
+            cwd: &cwd,
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+        })
+        .unwrap();
+    for i in 0..40 {
+        let id = format!("m{i}");
+        store.enqueue("w", "work", None, &id, "user").unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = store.take_queued("w");
+            });
+            s.spawn(|| {
+                let _ = store.cancel(&id, "tester", None);
+            });
+        });
+        let m = store.message(&id).unwrap().unwrap();
+        match m.state.as_str() {
+            // Claim won the race; cancel was refused with the state.
+            "submitting" | "running" => {}
+            // Cancel won; the claim found nothing queued.
+            "cancelled" => {
+                assert_eq!(m.result.as_ref().unwrap()["status"], "cancelled")
+            }
+            other => panic!("message {id} landed in '{other}'"),
+        }
+    }
+}
+
+#[test]
+fn message_cancel_task_bound_refused() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register("w1");
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    let (spec, sha) = d.spec_file("spec.md", "task-bound work");
+    d.job_new("pm", "j1", &spec, &sha);
+    // --task binds the delivery to j1-t1; message cancel defers to the
+    // task lifecycle.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "followup", "message": "m-t",
+               "task": "j1-t1"}),
+    )
+    .unwrap();
+    let err = d
+        .rpc("message_cancel", json!({"message": "m-t"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("task cancel j1-t1"), "{err}");
+    // The message itself is untouched — still whatever the send did.
+    let m = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let mt = m["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "m-t")
+        .unwrap();
+    assert_ne!(mt["state"], "cancelled");
+}
+
+// ---- CAD-23: result text must never truncate on the store/route ----
+
+#[test]
+fn long_result_text_survives_store_and_inbox_route() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    d.register_inbox("pm");
+    d.register_claude("w1", json!({"upstream": "pm"}));
+    d.wait_agent("w1", "idle", 15);
+    // The claude result echoes the prompt ("MOCK_OK:<prompt>") — the
+    // same single-line result text at each probed size.
+    for size in [200usize, 2_000, 8_000, 39_000] {
+        let id = format!("m{size}");
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w1", "text": "x".repeat(size), "message": id}),
+        )
+        .unwrap();
+        let m = d.wait_message("w1", &id, &["completed"], 30);
+        assert_eq!(
+            m["result"]["text"].as_str().unwrap().len(),
+            size + 8,
+            "store truncated the {size}-char result"
+        );
+    }
+    // An inbox PM receives the full text in every routed body — nothing
+    // bounds a non-pty delivery.
+    let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    let routed: Vec<&Value> = pm["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["source"] == "worker_result")
+        .collect();
+    assert_eq!(routed.len(), 4, "{pm}");
+    for (m, size) in routed.iter().zip([200usize, 2_000, 8_000, 39_000]) {
+        assert!(
+            m["body"].as_str().unwrap().contains(&"x".repeat(size)),
+            "routed body truncated at {size}: {}",
+            m["body"].as_str().unwrap().len()
+        );
+    }
+}
+
+#[test]
+fn long_result_bounded_only_for_pty_paste() {
+    // The pty paste gate refuses bodies over its size bound — the routed
+    // delivery would FAIL outright. The store keeps the record whole;
+    // only the paste is bounded, with a pointer to the full record.
+    let d = TestDaemon::start();
+    let pm_mock = d.mock_devin();
+    let _worker_mock = d.mock_claude_locked("ok");
+    d.register_devin("pm", None);
+    d.wait_agent("pm", "idle", 20);
+    d.register_claude("w1", json!({"upstream": "pm"}));
+    d.wait_agent("w1", "idle", 15);
+    d.rpc("agent_ready", json!({"alias": "pm"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "x".repeat(39_000), "message": "m1"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("w1", "m1", &["completed"], 30);
+    assert_eq!(m1["result"]["text"].as_str().unwrap().len(), 39_008);
+    // The routed delivery pastes (completes) — before the bound it
+    // failed at the pty pre-write gate.
+    let routed = {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+            if let Some(m) = pm["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["source"].as_str() == Some("worker_result"))
+            {
+                break m.clone();
+            }
+            assert!(Instant::now() < deadline, "no routed result on pm");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let body = routed["body"].as_str().unwrap();
+    assert!(body.len() < 4000, "routed body not bounded: {}", body.len());
+    assert!(body.contains("agent show w1"), "{body}");
+    assert!(
+        !body.contains(&"x".repeat(3900)),
+        "routed body carried the full text"
+    );
+    d.wait_message("pm", routed["id"].as_str().unwrap(), &["completed"], 20);
+    let screen = std::fs::read_to_string(d.pane_file(&pm_mock, "pm", "screen")).unwrap_or_default();
+    assert!(screen.contains("agent show w1"), "{screen}");
+}
+
+#[test]
+fn long_reconcile_note_survives_store_and_route() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.register_inbox("pm");
+    d.wait_agent("w1", "idle", 10);
+    // An unknown message with reply_to reconciled completed routes its
+    // note — a 40k single-line note keeps whole in store and inbox.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "DISCONNECT", "message": "u1",
+               "reply_to": "pm"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "u1", &["unknown"], 15);
+    let note = "n".repeat(40_000);
+    d.rpc(
+        "message_reconcile",
+        json!({"message": "u1", "status": "completed", "note": note}),
+    )
+    .unwrap();
+    let m = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "u1")
+        .unwrap()
+        .clone();
+    assert_eq!(m["result"]["note"].as_str().unwrap().len(), 40_000);
+    let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    let routed = pm["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["source"] == "worker_result")
+        .cloned()
+        .expect("no routed result on pm");
+    assert!(
+        routed["body"].as_str().unwrap().contains(&note),
+        "routed body truncated the note"
+    );
+}
+
+#[test]
+fn long_report_text_survives_pty_report_to_inbox() {
+    // The pty report path: `message result --text` carries the full
+    // single-line text into the store, and an inbox PM's routed
+    // worker_result body carries it whole.
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("w1", None);
+    d.register_inbox("pm");
+    d.wait_agent("w1", "idle", 20);
+    for size in [200usize, 2_000, 8_000, 40_000] {
+        let id = format!("r{size}");
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w1", "text": "w", "message": id, "reply_to": "pm"}),
+        )
+        .unwrap();
+        d.rpc("agent_ready", json!({"alias": "w1"})).unwrap();
+        let token = pty_token(&d, "w1", &id);
+        d.rpc(
+            "message_report",
+            json!({"message": id, "token": token, "kind": "result",
+                   "text": "x".repeat(size)}),
+        )
+        .unwrap();
+        let m = d.wait_message("w1", &id, &["completed"], 15);
+        assert_eq!(
+            m["result"]["text"].as_str().unwrap().len(),
+            size,
+            "store truncated the {size}-char report"
+        );
+    }
+    let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    let routed: Vec<&Value> = pm["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["source"] == "worker_result")
+        .collect();
+    assert_eq!(routed.len(), 4, "{pm}");
+    for (m, size) in routed.iter().zip([200usize, 2_000, 8_000, 40_000]) {
+        assert!(
+            m["body"].as_str().unwrap().contains(&"x".repeat(size)),
+            "inbox routed body truncated at {size}"
+        );
+    }
+}
