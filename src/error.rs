@@ -9,6 +9,22 @@
 
 use std::fmt;
 
+/// Evidence captured around a missed pty render check — carried on
+/// [`Error::NotRendered`] so the daemon's `paste_not_rendered` event
+/// records what the pane actually showed, not just the verdict.
+#[derive(Debug)]
+pub struct RenderMiss {
+    /// What the check concluded — dropped paste or unsubmitted draft.
+    pub reason: String,
+    /// Normalized screen tail before the paste (last 12 rows).
+    pub before_tail: Vec<String>,
+    /// Normalized screen tail after the render deadline (last 12 rows).
+    pub after_tail: Vec<String>,
+    /// The probe verdict that admitted the send at claim time, when
+    /// one was recorded — what "idle" looked like to the gate.
+    pub claim_probe: Option<serde_json::Value>,
+}
+
 #[derive(Debug)]
 pub enum Error {
     Rejected(String),
@@ -27,7 +43,7 @@ pub enum Error {
     /// not proof (pty post-paste screen check). The actor decides:
     /// routed notifications requeue bounded then park; task messages go
     /// `unknown` under the usual uncertainty discipline.
-    NotRendered(String),
+    NotRendered(RenderMiss),
 }
 
 impl Error {
@@ -49,8 +65,8 @@ impl Error {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
-    pub fn not_rendered(message: impl Into<String>) -> Self {
-        Self::NotRendered(message.into())
+    pub fn not_rendered(miss: RenderMiss) -> Self {
+        Self::NotRendered(miss)
     }
     /// Stable wire kind for [`crate::proto`].
     pub fn kind(&self) -> &'static str {
@@ -78,8 +94,8 @@ impl fmt::Display for Error {
             | Self::OutcomeUnknown(m)
             | Self::Internal(m)
             | Self::GateRefused(m)
-            | Self::PreWrite(m)
-            | Self::NotRendered(m) => f.write_str(m),
+            | Self::PreWrite(m) => f.write_str(m),
+            Self::NotRendered(m) => f.write_str(&m.reason),
         }
     }
 }

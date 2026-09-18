@@ -125,8 +125,11 @@ pub trait ProviderAdapter: Send + Sync {
     /// Record an operator readiness claim (pty-style gated endpoints
     /// only); `by` names the claimer (the caller's `CADENCE_ALIAS` when
     /// set) for the audit record. Claims stack FIFO — each is consumed
-    /// by exactly one send.
-    fn claim_ready(&self, _by: Option<String>) -> Result<()> {
+    /// by exactly one send. The claim runs the same screen probe the
+    /// verified auto-ready gate uses and refuses a visibly busy pane —
+    /// `force` overrides the refusal (recorded on the claim). Returns
+    /// the probe verdict the claim was admitted under.
+    fn claim_ready(&self, _by: Option<String>, _force: bool) -> Result<Probe> {
         Err(crate::error::Error::rejected(
             "this endpoint kind has no readiness gate",
         ))

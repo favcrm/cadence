@@ -252,10 +252,13 @@ enum Commands {
         #[arg(long)]
         task: Option<String>,
         /// Claim `agent ready` for the target first — the flag IS the
-        /// operator's explicit claim (idle, empty input, no prompt).
-        /// No-op on non-pty endpoints.
+        /// operator's explicit claim; the claim probes the pane and
+        /// refuses a visibly busy one. No-op on non-pty endpoints.
         #[arg(long)]
         ready: bool,
+        /// Force the ready claim past a busy probe verdict.
+        #[arg(long, requires = "ready")]
+        force: bool,
     },
     /// Join a new worker agent to a group. `<group>` is the PM agent —
     /// its alias or provider-native id — and `<provider>` is devin,
@@ -508,6 +511,9 @@ enum JobAction {
         /// claim as `send --ready`; no-op on non-pty endpoints.
         #[arg(long)]
         ready: bool,
+        /// Force the ready claim past a busy probe verdict.
+        #[arg(long, requires = "ready")]
+        force: bool,
         /// Explicit kickoff message id (default: deterministic
         /// cadence-dispatch:<task>:r<n>).
         #[arg(long)]
@@ -729,10 +735,16 @@ enum AgentAction {
         run: bool,
     },
     /// Claim a gated endpoint is ready for one submission (pty only).
-    /// Asserts the operator inspected the terminal: idle, empty input,
-    /// no permission prompt. Consumed by a single send, expires quickly.
+    /// Runs the same screen probe verified auto-ready uses and refuses
+    /// a visibly busy pane — `--force` claims anyway and is recorded.
+    /// Consumed by a single send, expires quickly.
     /// Claims stack — N claims release N queued messages.
-    Ready { alias: String },
+    Ready {
+        alias: String,
+        /// Claim even when the pane probes busy.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print the current terminal contents of a pty endpoint.
     Capture { alias: String },
     /// Reduce a pty pane to gate facts: `{idle, reason, input_nonempty,
@@ -796,10 +808,14 @@ enum MessageAction {
         #[arg(long)]
         task: Option<String>,
         /// Claim `agent ready` for the target first — the flag IS the
-        /// operator's explicit claim (idle, empty input, no prompt),
-        /// fused with the send. No-op on non-pty endpoints.
+        /// operator's explicit claim, fused with the send; the claim
+        /// probes the pane and refuses a visibly busy one.
+        /// No-op on non-pty endpoints.
         #[arg(long)]
         ready: bool,
+        /// Force the ready claim past a busy probe verdict.
+        #[arg(long, requires = "ready")]
+        force: bool,
     },
     /// Send and wait for the turn's terminal state.
     Ask {
@@ -821,6 +837,9 @@ enum MessageAction {
         /// claim as `send --ready`; no-op on non-pty endpoints.
         #[arg(long)]
         ready: bool,
+        /// Force the ready claim past a busy probe verdict.
+        #[arg(long, requires = "ready")]
+        force: bool,
         /// Seconds to wait (max 600).
         #[arg(long, default_value_t = 120)]
         wait: u64,
@@ -930,13 +949,14 @@ fn send_message(
     message: Option<String>,
     reply_to: Option<String>,
     ready: bool,
+    force: bool,
     task: Option<String>,
 ) -> Result<(Value, bool)> {
     let body = read_body(text, file)?;
-    // --ready IS the operator's explicit claim — the human typing it
-    // asserts the pane is idle with an empty input. Skipped silently on
-    // endpoints where readiness claims don't exist. The claim is
-    // attributed to CADENCE_ALIAS when sent from inside a pane.
+    // --ready IS the operator's explicit claim — and the claim probes
+    // the pane: a visibly busy endpoint refuses unless --force. Skipped
+    // silently on endpoints where readiness claims don't exist. The
+    // claim is attributed to CADENCE_ALIAS when sent from inside a pane.
     if ready {
         let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
         let agent = &show["agent"];
@@ -945,7 +965,11 @@ fn send_message(
             agent["endpoint_kind"].as_str().unwrap_or_default(),
         ) {
             let by = std::env::var("CADENCE_ALIAS").ok();
-            client::rpc(state_dir, "agent_ready", json!({"alias": alias, "by": by}))?;
+            client::rpc(
+                state_dir,
+                "agent_ready",
+                json!({"alias": alias, "by": by, "force": force}),
+            )?;
         }
     }
     Ok((
@@ -1654,11 +1678,15 @@ fn run() -> Result<i32> {
                 AgentAction::Attach { alias, run } => {
                     return attach_agent(&state_dir, &alias, run);
                 }
-                AgentAction::Ready { alias } => {
+                AgentAction::Ready { alias, force } => {
                     // The claimer identity is recorded for audit —
                     // CADENCE_ALIAS when the claim came from a pane.
                     let by = std::env::var("CADENCE_ALIAS").ok();
-                    client::rpc(&state_dir, "agent_ready", json!({"alias": alias, "by": by}))?
+                    client::rpc(
+                        &state_dir,
+                        "agent_ready",
+                        json!({"alias": alias, "by": by, "force": force}),
+                    )?
                 }
                 AgentAction::Probe { alias } => {
                     client::rpc(&state_dir, "agent_probe", json!({"alias": alias}))?
@@ -1881,11 +1909,12 @@ fn run() -> Result<i32> {
             reply_to,
             task,
             ready,
+            force,
         } => {
             // Identical path to `message send` — the verb form is sugar,
             // not a second implementation.
             let (result, _) = send_message(
-                &state_dir, &alias, text, file, message, reply_to, ready, task,
+                &state_dir, &alias, text, file, message, reply_to, ready, force, task,
             )?;
             print_json(&result);
             Ok(0)
@@ -1975,8 +2004,9 @@ fn run() -> Result<i32> {
                     reply_to,
                     task,
                     ready,
+                    force,
                 } => send_message(
-                    &state_dir, &alias, text, file, message, reply_to, ready, task,
+                    &state_dir, &alias, text, file, message, reply_to, ready, force, task,
                 )?,
                 MessageAction::Ack {
                     message,
@@ -2029,10 +2059,12 @@ fn run() -> Result<i32> {
                     reply_to,
                     task,
                     ready,
+                    force,
                     wait,
                 } => {
                     let body = read_body(text, file)?;
-                    // Same flag semantics as send: --ready IS the claim.
+                    // Same flag semantics as send: --ready IS the claim,
+                    // and the claim probes the pane unless --force.
                     if ready {
                         let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
                         let agent = &show["agent"];
@@ -2044,7 +2076,7 @@ fn run() -> Result<i32> {
                             client::rpc(
                                 &state_dir,
                                 "agent_ready",
-                                json!({"alias": alias, "by": by}),
+                                json!({"alias": alias, "by": by, "force": force}),
                             )?;
                         }
                     }
@@ -2185,11 +2217,13 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
             task,
             to,
             ready,
+            force,
             message,
         } => {
             // --ready is the same operator claim as `send --ready`:
             // resolve the assignee (explicit --to or the stored one),
-            // claim the pty gate if there is one, then dispatch.
+            // claim the pty gate if there is one, then dispatch. The
+            // claim probes the pane — --force overrides a busy verdict.
             if *ready {
                 let assignee = match to {
                     Some(a) => Some(a.clone()),
@@ -2204,7 +2238,10 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                         agent["provider"].as_str().unwrap_or_default(),
                         agent["endpoint_kind"].as_str().unwrap_or_default(),
                     ) {
-                        rpc("agent_ready", json!({"alias": assignee, "by": pane}))?;
+                        rpc(
+                            "agent_ready",
+                            json!({"alias": assignee, "by": pane, "force": force}),
+                        )?;
                     }
                 }
             }
