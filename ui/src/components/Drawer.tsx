@@ -780,7 +780,38 @@ export default function Drawer({
                   </h3>
                   <span className="kicker">derived from the daemon</span>
                 </div>
-                {sessions.length ? (
+                {(detail.agents?.length ?? 0) > 0 ? (
+                  <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
+                    {detail.agents!.map((a) => (
+                      <li
+                        key={`${a.alias}:${a.task}`}
+                        className="flex items-center gap-2.5 px-3 py-2.5 flex-wrap"
+                      >
+                        <i
+                          className={`w-1.5 h-1.5 rounded-full ${
+                            a.state === "attention"
+                              ? "bg-fail"
+                              : a.message
+                                ? "bg-info"
+                                : "bg-ink-600"
+                          }`}
+                        />
+                        <span className="num text-label text-ink-200">
+                          {a.alias}
+                        </span>
+                        <span className="num text-micro text-ink-500">
+                          {a.task} · {a.task_state}
+                          {a.message ? ` · ${a.message}` : ""}
+                        </span>
+                        {a.resume && (
+                          <code className="num text-micro text-ink-400 ml-auto">
+                            {a.resume}
+                          </code>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                ) : sessions.length ? (
                   <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
                     {sessions.map((a) => (
                       <li

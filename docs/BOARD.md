@@ -60,11 +60,11 @@ created: 2026-09-17T16:01:23Z
 
 | Field | Rule |
 |---|---|
-| `status` | Latest note whose header carries `Issue: <id>` beats the file; a container's status rolls up from its children. `status_source` says which: `file` \| `notes` \| `rollup`. |
+| `status` | A container's status rolls up from its children; else a bound job's task states (`dispatched`/`running`/`revising` → `doing`, `review` → `review`, all-terminal → `done`, `blocked` only flags `blocked_reason`); else the latest note carrying `Issue: <id>`; else the file. `status_source` says which: `rollup` \| `job` \| `notes` \| `file`. Draft tasks are unstarted templates and never drive the board. |
 | `blocks` / `duplicates` | Inverses of `blocked_by` / `duplicate_of`, computed at read time. |
 | `ready` | Leaf issue, status `ready`, nothing unfinished in `blocked_by`. |
 | `blocked` | Any `blocked_by` target not `done`. |
-| counts, activity, sessions | Comments/artifacts/refs lengths; merged notes+comments+git log; agents whose running turn names the id. |
+| counts, activity, sessions | Comments/artifacts/refs lengths; merged notes+comments+git log; agents bound through `agent.tasks` × `jobs.issue_id` — exact, never a text scan. |
 
 Statuses: `backlog ready doing review done dropped`. Issues are never
 deleted — `dropped` is the end state. `dropped` issues don't render on
@@ -143,7 +143,9 @@ emits fixed names) so `--dist` is unnecessary.
 | `GET /api/issues/:id/file` | raw `issue.md`, `text/markdown` |
 | `GET /api/issues/:id/activity` | the merged activity stream only |
 | `GET /api/issues/:id/artifacts/:name` | one artifact file — inline for a small safe list (`text/plain` for md/txt/logs/code, images), **`Content-Disposition: attachment` for everything else, always for html/svg/xml/js/pdf**. Every artifact response carries `Content-Security-Policy: sandbox; default-src 'none'` and `Cache-Control: no-store`; names must satisfy the write grammar (no `/`, no leading dot); symlinks → `404` |
-| `GET /api/agents` | worker agent rows + running/queued/fenced/parked totals; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down |
+| `GET /api/agents` | worker agent rows enriched with the exact task/issue binding (`agent.tasks` × `jobs.issue_id`) + running/queued/fenced/parked totals and `by_issue` for card strips; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down |
+| `GET /api/agents/:alias` | the agent drawer: `agent_show` + last 20 events + `tasks`/`on` bindings + `recovery`/`resume` commands; `404` on unknown alias, `400` on alias grammar |
+| `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents` on daemon state change; `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
 
 ### API — writes
 
@@ -166,8 +168,8 @@ Success bodies are `{issue, card, warnings}` — the fresh payloads, so
 the UI needs no second fetch. `warnings` notes a `ready`/`doing`/`review`
 status that still has open blockers (usable, just flagged). Conflicts
 are `409` with `conflict: if_rev | status_derived | exists` plus the
-current card; a `notes`- or `rollup`-derived status refuses `status`
-writes with the reason. `if_rev` is the `rev` field — a hash of
+current card; a `job`-, `notes`- or `rollup`-derived status refuses
+`status` writes with the reason. `if_rev` is the `rev` field — a hash of
 `issue.md` — for optimistic concurrency; a stale one returns `409` and
 the current rev. Unknown JSON fields are rejected
 (`deny_unknown_fields`); JSON bodies cap at 256 KiB, artifact uploads at
@@ -237,8 +239,14 @@ pnpm build       # → ui/dist (committed; --features ui embeds it)
 The original mock is `ui/design/board-mock-v4.html`. In I2 cards drag
 between columns (derived/container cards don't — the reason shows on
 hover), the drawer edits fields/body/links/refs, comments and attaches
-artifacts, and backlog has quick-add. There is no event stream — the
-board re-fetches on window focus and every 30 s while visible.
+artifacts, and backlog has quick-add. In I3 the board is live: the SPA
+opens an `EventSource` on `/api/stream` and each `issues`/`jobs`/`agents`
+frame triggers the normal refresh — EventSource reconnects on its own
+and the 30 s/focus poll stays as the fallback. The Agents screen ranks
+fenced agents first, shows the daemon's recovery text verbatim, and
+opens a drawer with identity, params, capabilities, tasks, bound
+issues, running messages, and the event tail. A fence banner on the
+board links straight to it.
 
 ## Seeding
 

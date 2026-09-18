@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use cadence_agent::issue::board;
 use cadence_agent::ui;
-use serde_json::Value;
+use cadence_agent::{client, daemon};
+use serde_json::{json, Value};
 use tempfile::TempDir;
 
 fn bin() -> &'static str {
@@ -1223,4 +1224,462 @@ fn init_hooks_and_doctor() {
     let (ok, report) = cli(pm.path(), state.path(), &["issue", "doctor"]);
     assert!(!ok);
     assert_eq!(report["hooks"]["post-commit"]["present"], false);
+}
+
+// ---------- I3: job-derived status, exact binding, SSE, agent detail ----------
+
+/// In-process daemon for the runtime strip — the same `daemon::serve`
+/// integration.rs wraps in TestDaemon, pared down to what the board
+/// routes need.
+struct UiDaemon {
+    state: TempDir,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl UiDaemon {
+    fn start() -> Self {
+        let state = TempDir::new().unwrap();
+        let owned = state.path().to_path_buf();
+        let handle = thread::spawn(move || {
+            let _ = daemon::serve(&owned);
+        });
+        let d = Self {
+            state,
+            handle: Some(handle),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if d.rpc_opt("health", json!({})).is_ok() {
+                return d;
+            }
+            assert!(Instant::now() < deadline, "daemon did not become healthy");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn rpc_opt(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        client::rpc(self.state.path(), method, params)
+    }
+
+    fn rpc(&self, method: &str, params: Value) -> Value {
+        self.rpc_opt(method, params).unwrap()
+    }
+
+    fn state(&self) -> PathBuf {
+        self.state.path().to_path_buf()
+    }
+}
+
+impl Drop for UiDaemon {
+    fn drop(&mut self) {
+        let _ = self.rpc_opt("shutdown", json!({}));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Seed the tracker and daemon-side world for the binding tests:
+/// pm + wk fake agents, a job bound to `issue`, one task for `wk`
+/// dispatched so the task is live. Returns (job_id, task_id).
+fn bound_job(pm: &Path, d: &UiDaemon, issue: &str) -> (String, String) {
+    let cwd = pm.to_str().unwrap();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": cwd}),
+    );
+    // The worker must sit in the pm's group or dispatch refuses it.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "wk", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": cwd,
+               "params": "{\"upstream\":\"pm\"}"}),
+    );
+    let spec = pm.join("spec.md");
+    std::fs::write(&spec, "# spec\n").unwrap();
+    let job = d.rpc(
+        "job_new",
+        json!({"pm": "pm", "spec": spec, "spec_sha256": "test",
+               "issue": issue, "title": "bound job"}),
+    );
+    let job_id = job["job"]["id"].as_str().unwrap().to_string();
+    // The acceptance text names a DIFFERENT issue on purpose — the
+    // kickoff body embeds it ahead of the real "tracks issue <id>"
+    // line, so a message-text scan would bind `wk` to CAD-1 while the
+    // task join binds the job's real issue.
+    let task = d.rpc(
+        "task_new",
+        json!({"job": job_id, "assignee": "wk", "title": "worker task",
+               "acceptance": "verify against CAD-1"}),
+    );
+    let task_id = task["task"]["id"].as_str().unwrap().to_string();
+    d.rpc("task_dispatch", json!({"task": task_id, "by": "operator"}));
+    (job_id, task_id)
+}
+
+#[test]
+fn ui_job_state_drives_status_and_binding() {
+    let pm = TempDir::new().unwrap();
+    let d = UiDaemon::start();
+    seed(pm.path(), &d.state());
+    // CAD-3 is the leaf — CAD-1 is a container whose roll-up legitimately
+    // outranks any job.
+    let (_, task_id) = bound_job(pm.path(), &d, "CAD-3");
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+
+    // Card: job state wins over notes/file and binds the agent.
+    let (code, body) = http(port, "GET", "/api/issues", &host);
+    assert_eq!(code, 200);
+    let issues: Value = serde_json::from_str(&body).unwrap();
+    let card = issues["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "CAD-3")
+        .cloned()
+        .expect("CAD-3 card");
+    assert_eq!(card["status_source"], "job");
+    assert!(
+        matches!(card["status"].as_str(), Some("doing" | "review" | "done")),
+        "job-derived status: {}",
+        card["status"]
+    );
+    let bound = &card["agents"];
+    assert!(
+        bound
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["alias"] == "wk" && a["task"] == task_id),
+        "card agents strip: {bound}"
+    );
+
+    // Detail: same strip on the drawer payload.
+    let (code, body) = http(port, "GET", "/api/issues/CAD-3", &host);
+    assert_eq!(code, 200);
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(detail["status_source"], "job");
+    assert!(
+        detail["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["alias"] == "wk" && a["task"] == task_id),
+        "detail agents strip: {}",
+        detail["agents"]
+    );
+
+    // Agents payload: the exact join — wk is `on` CAD-3 through its
+    // task, and by_issue carries the strip for the card.
+    let (code, body) = http(port, "GET", "/api/agents", &host);
+    assert_eq!(code, 200);
+    let agents: Value = serde_json::from_str(&body).unwrap();
+    let wk = agents["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "wk")
+        .cloned()
+        .expect("wk row");
+    assert!(
+        wk["on"].as_array().unwrap().iter().any(|i| i == "CAD-3"),
+        "wk.on: {}",
+        wk["on"]
+    );
+    assert!(
+        wk["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["task"] == task_id && t["issue"] == "CAD-3"),
+        "wk.tasks: {}",
+        wk["tasks"]
+    );
+    assert!(
+        agents["by_issue"]["CAD-3"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["alias"] == "wk" && a["task"] == task_id),
+        "by_issue.CAD-3: {}",
+        agents["by_issue"]["CAD-3"]
+    );
+    // The kickoff body names CAD-1 (acceptance text) ahead of the real
+    // issue line — a message-text scan would bind `wk` there. The join
+    // must not.
+    let binds_cad1 = agents["by_issue"]["CAD-1"]
+        .as_array()
+        .map(|v| v.iter().any(|a| a["alias"] == "wk"))
+        .unwrap_or(false)
+        || wk["on"].as_array().unwrap().iter().any(|i| i == "CAD-1");
+    assert!(!binds_cad1, "decoy issue id in the message must not bind");
+
+    // A manual status write against a job-derived status is refused —
+    // the same 409 the CLI enforces on notes/rollup-derived statuses.
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/CAD-3",
+        &host,
+        r#"{"status":"done"}"#,
+    );
+    assert_eq!(code, 409, "derived status write must conflict: {body}");
+    assert!(body.contains("derived"), "409 names the cause: {body}");
+}
+
+#[test]
+fn ui_agent_detail_route_and_guards() {
+    let pm = TempDir::new().unwrap();
+    let d = UiDaemon::start();
+    seed(pm.path(), &d.state());
+    d.rpc(
+        "agent_register",
+        json!({"alias": "wk", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": pm.path().to_str().unwrap()}),
+    );
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+
+    let (code, body) = http(port, "GET", "/api/agents/wk", &host);
+    assert_eq!(code, 200);
+    let detail: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(detail["agent"]["alias"], "wk");
+    assert_eq!(detail["fenced"], false);
+    assert!(detail["events"].is_array());
+    assert!(detail["agent"]["capabilities"].is_object());
+
+    // Alias grammar is enforced before the daemon is asked.
+    let (code, _) = http(port, "GET", "/api/agents/bad%20alias", &host);
+    assert_eq!(code, 400);
+    let (code, _) = http(port, "GET", "/api/agents/..%2Fetc", &host);
+    assert!(matches!(code, 400 | 404));
+    // A well-formed but unknown alias is a daemon-level 404.
+    let (code, _) = http(port, "GET", "/api/agents/ghost-1", &host);
+    assert_eq!(code, 404);
+}
+
+#[test]
+fn ui_stream_sse_and_guards() {
+    let pm = TempDir::new().unwrap();
+    let d = UiDaemon::start();
+    seed(pm.path(), &d.state());
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+
+    // Method guard: HEAD on the stream is refused, not hung.
+    let (code, _, _) = http_full(port, "HEAD", "/api/stream", &host);
+    assert_eq!(code, 405);
+    // Host guard applies to the stream exactly like any other route.
+    let (code, _, _) = http_full(port, "GET", "/api/stream", "evil.example");
+    assert_eq!(code, 421);
+
+    // GET streams SSE: headers first, then frames. The reader emits a
+    // `: ping` immediately, so first bytes arrive fast.
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    write!(s, "GET /api/stream HTTP/1.0\r\nHost: {host}\r\n\r\n").unwrap();
+    let mut raw = Vec::new();
+    let mut tmp = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        match s.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&tmp[..n]);
+                let text = String::from_utf8_lossy(&raw);
+                if text.contains(": ping") {
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&raw).to_string();
+    assert!(text.contains("text/event-stream"), "headers: {text}");
+    assert!(
+        text.contains(": ping"),
+        "first frame is the keepalive: {text}"
+    );
+
+    // A tracker write moves the mtime fingerprint → `event: issues`.
+    std::fs::write(pm.path().join("poke.txt"), "x").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut got_issues = false;
+    while Instant::now() < deadline {
+        match s.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&tmp[..n]);
+                if String::from_utf8_lossy(&raw).contains("event: issues") {
+                    got_issues = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        got_issues,
+        "no issues event within 8s: {}",
+        String::from_utf8_lossy(&raw)
+    );
+
+    // An agent change moves the agent fingerprint → `event: agents`.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "late", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": pm.path().to_str().unwrap()}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut got_agents = false;
+    while Instant::now() < deadline {
+        match s.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&tmp[..n]);
+                if String::from_utf8_lossy(&raw).contains("event: agents") {
+                    got_agents = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(got_agents, "no agents event within 8s");
+
+    // A dispatch moves the job fingerprint → `event: jobs`. `bound_job`
+    // creates + dispatches, both of which change `job_list`.
+    bound_job(pm.path(), &d, "CAD-3");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut got_jobs = false;
+    while Instant::now() < deadline {
+        match s.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&tmp[..n]);
+                if String::from_utf8_lossy(&raw).contains("event: jobs") {
+                    got_jobs = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(got_jobs, "no jobs event within 8s");
+}
+
+/// Poll `agent_show` until `pred` holds or the deadline passes — the
+/// board-test equivalent of integration's wait_agent.
+fn wait_agent_pred(d: &UiDaemon, alias: &str, secs: u64, pred: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let show = d.rpc("agent_show", json!({"alias": alias}));
+        if pred(&show) {
+            return show;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent {alias} never reached condition: {show}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn ui_agents_payload_covers_all_kinds() {
+    let pm = TempDir::new().unwrap();
+    let d = UiDaemon::start();
+    seed(pm.path(), &d.state());
+    let cwd = pm.path().to_str().unwrap();
+
+    // Mailbox — inbox endpoints are counted separately, never fenced.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "obs", "provider": "inbox",
+               "endpoint_kind": "inbox", "cwd": cwd}),
+    );
+    // Idle worker — registered, no turn in flight.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "idle1", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": cwd}),
+    );
+    // Busy worker — SLEEP holds the turn so `running` stays up.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "busy1", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": cwd}),
+    );
+    d.rpc(
+        "agent_send",
+        json!({"alias": "busy1", "text": "SLEEP:30", "message": "b1"}),
+    );
+    wait_agent_pred(&d, "busy1", 10, |s| {
+        s["messages"]
+            .as_array()
+            .map(|ms| ms.iter().any(|m| m["state"] == "running"))
+            .unwrap_or(false)
+    });
+    // Stopped worker — registered then stopped.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "stop1", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": cwd}),
+    );
+    d.rpc("agent_stop", json!({"alias": "stop1"}));
+    // Fenced worker — DISCONNECT drops mid-turn → unknown → attention.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "fenced1", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": cwd}),
+    );
+    d.rpc(
+        "agent_send",
+        json!({"alias": "fenced1", "text": "DISCONNECT", "message": "f1"}),
+    );
+    wait_agent_pred(&d, "fenced1", 15, |s| {
+        s["unknown"].as_i64().unwrap_or(0) > 0 || s["agent"]["state"].as_str() == Some("attention")
+    });
+
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+    let (code, body) = http(port, "GET", "/api/agents", &host);
+    assert_eq!(code, 200);
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["daemon"], "reachable");
+    let row = |alias: &str| {
+        payload["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["alias"] == alias)
+            .cloned()
+            .unwrap_or_else(|| panic!("{alias} row: {}", payload["agents"]))
+    };
+
+    let obs = row("obs");
+    assert_eq!(obs["inbox"], true);
+    assert_eq!(obs["state"], "inbox");
+    assert_eq!(obs["fenced"], false);
+
+    let idle = row("idle1");
+    assert_eq!(idle["fenced"], false);
+    assert!(matches!(idle["state"].as_str(), Some("idle" | "stopped")));
+
+    let busy = row("busy1");
+    assert!(
+        busy["running"].as_i64().unwrap_or(0) >= 1,
+        "busy row: {busy}"
+    );
+    assert_eq!(busy["message"]["id"], "b1");
+
+    let fenced = row("fenced1");
+    assert_eq!(fenced["fenced"], true, "fenced row: {fenced}");
+    assert!(
+        fenced["recovery"].as_str().is_some_and(|t| !t.is_empty()),
+        "fenced row carries the daemon recovery text: {fenced}"
+    );
+
+    let totals = &payload["totals"];
+    assert!(totals["running"].as_i64().unwrap_or(0) >= 1);
+    assert!(totals["fenced"].as_i64().unwrap_or(0) >= 1);
+    assert_eq!(totals["inboxes"], 1);
 }

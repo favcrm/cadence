@@ -38,6 +38,7 @@ interface Props {
   onMove: (issue: IssueCard, status: string) => void;
   onCreated: (resp: WriteResp, verb: string) => void;
   onError: (e: unknown, verb: string) => void;
+  onAgents: () => void;
 }
 
 /// Quick-add at the top of Backlog: title + project + priority, Enter
@@ -154,6 +155,7 @@ export default function Board({
   onMove,
   onCreated,
   onError,
+  onAgents,
 }: Props) {
   const [over, setOver] = useState<string | null>(null);
   const visible = issues.filter(
@@ -181,6 +183,7 @@ export default function Board({
   const titleOf = new Map(issues.map((i) => [i.id, i.title]));
 
   const totals = agents?.totals;
+  const fencedAgents = (agents?.agents ?? []).filter((a) => a.fenced);
   const activeAgents = (agents?.agents ?? []).filter(
     (a) => a.running > 0 || a.fenced,
   );
@@ -200,6 +203,25 @@ export default function Board({
             Nothing at {health.pm_dir ?? "~/pm"} yet —{" "}
             <span className="num">cadence issue init</span> creates it.
           </span>
+        </div>
+      )}
+
+      {fencedAgents.length > 0 && (
+        <div className="card mb-4 px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-fail/40 reveal">
+          <span className="chip bg-fail/10 text-fail">
+            {fencedAgents.length} fenced
+          </span>
+          <span className="text-secondary text-ink-300 min-w-0">
+            {fencedAgents.map((a) => a.alias).join(", ")} —{" "}
+            {fencedAgents[0]?.recovery ??
+              "outcomes are uncertain until an operator reconciles"}
+          </span>
+          <button
+            onClick={onAgents}
+            className="chip bg-fail/10 text-fail hover:bg-fail/20 transition-colors ml-auto"
+          >
+            open Agents →
+          </button>
         </div>
       )}
 

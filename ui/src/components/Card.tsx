@@ -103,19 +103,49 @@ export default function Card({ issue, parentTitle, busyBy, onOpen }: Props) {
             className="chip bg-info/10 text-info"
             title={`status derived from ${t.status_source}, not set by hand`}
           >
-            derived
+            {t.status_source === "job" ? "job" : "derived"}
           </span>
         )}
         {t.component && (
           <span className="chip bg-ink-800 text-ink-500">{t.component}</span>
         )}
         {t.blocked && (
-          <span className="chip bg-warn/10 text-warn ml-auto">blocked</span>
+          <span
+            className="chip bg-warn/10 text-warn ml-auto"
+            title={t.blocked_reason ?? undefined}
+          >
+            {t.blocked_reason ?? "blocked"}
+          </span>
         )}
       </div>
       <h3 className="mt-2 text-secondary text-ink-200 leading-[1.45]">
         {t.title}
       </h3>
+      {(t.agents?.length ?? 0) > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
+          {t.agents!.map((a) => (
+            <span
+              key={`${a.alias}:${a.task}`}
+              className="chip bg-ink-800 !py-[.1rem] text-ink-400"
+              title={`${a.alias} · task ${a.task} (${a.task_state})${
+                a.message ? ` · ${a.message}` : ""
+              }`}
+            >
+              <i
+                className={`w-1.5 h-1.5 rounded-full ${
+                  a.state === "attention"
+                    ? "bg-fail"
+                    : a.message
+                      ? "bg-info"
+                      : "bg-ink-600"
+                }`}
+              />
+              {a.alias}
+              <span className="text-ink-600">{a.task_state}</span>
+            </span>
+          ))}
+        </div>
+      )}
       {t.parent && (
         <div className="mt-1.5 num text-micro text-ink-500">
           in {t.parent}
