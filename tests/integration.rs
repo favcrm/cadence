@@ -2429,10 +2429,14 @@ if cmd == "capture-pane":
     out = ""
     try: out += open(sess_path(name, "screen")).read()
     except FileNotFoundError: die("no such session")
-    # The input line renders like the real TUI: `❭ ` + staged draft.
+    # The input line renders like the TUI's own: the pane's `.glyph`
+    # file (written by its TUI; `❭` is the Devin default) + staged draft.
     try:
         staged = open(sess_path(name, "input")).read()
-        if staged: out += "❭ " + staged + "\n"
+        if staged:
+            try: glyph = open(sess_path(name, "glyph")).read().strip() or "❭"
+            except FileNotFoundError: glyph = "❭"
+            out += glyph + " " + staged + "\n"
     except FileNotFoundError: pass
     # Test-controlled extra screen content — a file the test writes to
     # make the pane look busy, approval-blocked, etc.
@@ -2591,30 +2595,143 @@ impl TestDaemon {
     }
 }
 
-impl Drop for MockDevin {
-    fn drop(&mut self) {
-        // Panes legitimately outlive a daemon (shutdown detaches), so
-        // clean any survivors ourselves by their recorded pane pids.
-        if let Ok(socks) = std::fs::read_dir(self.dir.join("tmux-state")) {
-            for sock in socks.flatten() {
-                if let Ok(files) = std::fs::read_dir(sock.path()) {
-                    for f in files.flatten() {
-                        if f.file_name().to_string_lossy().ends_with(".pid") {
-                            if let Ok(pid) = std::fs::read_to_string(f.path())
-                                .unwrap_or_default()
-                                .trim()
-                                .parse::<i32>()
-                            {
-                                unsafe { libc::killpg(pid, libc::SIGKILL) };
-                            }
+impl TestDaemon {
+    fn mock_stub(&self) -> MockStub {
+        install_mock_stub(self.dir.path())
+    }
+
+    /// Register a pty agent on the stub (test-double) profile.
+    fn register_stub(&self, alias: &str, params: Value) {
+        let cwd = self.dir.path().to_str().unwrap().to_string();
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "tui-stub",
+                   "endpoint_kind": "pty", "cwd": cwd,
+                   "params": params.to_string()}),
+        )
+        .unwrap();
+    }
+
+    /// The tmux-side state dir for a stub-pane agent session name.
+    fn stub_pane_file(&self, mock: &MockStub, alias: &str, ext: &str) -> PathBuf {
+        mock.dir
+            .join("tmux-state")
+            .join(socket_for(&self.state))
+            .join(format!("{alias}.{ext}"))
+    }
+}
+
+/// Panes legitimately outlive a daemon (shutdown detaches), so clean
+/// any survivors ourselves by their recorded pane pids.
+fn kill_mock_panes(dir: &Path) {
+    if let Ok(socks) = std::fs::read_dir(dir.join("tmux-state")) {
+        for sock in socks.flatten() {
+            if let Ok(files) = std::fs::read_dir(sock.path()) {
+                for f in files.flatten() {
+                    if f.file_name().to_string_lossy().ends_with(".pid") {
+                        if let Ok(pid) = std::fs::read_to_string(f.path())
+                            .unwrap_or_default()
+                            .trim()
+                            .parse::<i32>()
+                        {
+                            unsafe { libc::killpg(pid, libc::SIGKILL) };
                         }
                     }
                 }
             }
         }
+    }
+}
+
+impl Drop for MockDevin {
+    fn drop(&mut self) {
+        kill_mock_panes(&self.dir);
         std::env::remove_var("CADENCE_TMUX_COMMAND");
         std::env::remove_var("CADENCE_DEVIN_COMMAND");
         std::env::remove_var("CADENCE_DEVIN_LOCKS");
+        std::env::remove_var("MOCK_TMUX_STATE");
+    }
+}
+
+/// Fake `stub` TUI — the second profile's endpoint: different prompt
+/// glyph (`»`), different placeholder, different session-lock dir. It
+/// proves the adapter's gate/render/claim mechanics come from the
+/// profile, not from Devin-shaped constants. Same contract as
+/// MOCK_DEVIN_PY: flock `<locks>/<sid>.lock`, `-r` resumes.
+const MOCK_STUB_PY: &str = r#"
+import fcntl, os, sys, time
+
+locks = sys.argv[1]
+sid = sys.argv[sys.argv.index("-r") + 1] if "-r" in sys.argv else \
+    "stub-session-%d" % os.getpid()
+os.makedirs(locks, exist_ok=True)
+lf = open(os.path.join(locks, sid + ".lock"), "a")
+try:
+    fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("session_locked: %s" % sid); sys.exit(1)
+open(os.environ["FAKE_PANE"] + ".sid", "w").write(sid)
+# The pane's own input-line glyph — the mock tmux renders staged text
+# with it, so a staged draft reads as this TUI's prompt line.
+open(os.environ["FAKE_PANE"] + ".glyph", "w").write("»")
+with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+    f.write("Mock Stub TUI [%s]\n" % sid)
+    # The stub profile's empty-prompt signature.
+    f.write("» stub ready\n")
+while True:
+    inp = os.environ["FAKE_PANE"] + ".input"
+    try:
+        data = open(inp).read()
+    except FileNotFoundError:
+        data = ""
+    if "<ENTER>" in data:
+        text, rest = data.split("<ENTER>", 1)
+        open(inp, "w").write(rest)
+        if text.strip():
+            with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+                f.write("> %s\nSTUB_REPLY: %s\n" % (text.strip(), text.strip()))
+    time.sleep(0.05)
+"#;
+
+struct MockStub {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    dir: PathBuf,
+}
+
+/// Install the mock tmux/stub pair — the same private-tmux harness as
+/// `install_mock_devin`, pointing the adapter at the stub profile's env
+/// overrides instead.
+fn install_mock_stub(dir: &Path) -> MockStub {
+    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let locks = dir.join("stub-locks");
+    let tmux_state = dir.join("tmux-state");
+    std::fs::create_dir_all(&locks).unwrap();
+    std::fs::create_dir_all(&tmux_state).unwrap();
+    let tmux = dir.join("tmux");
+    let stub_py = dir.join("mock-stub.py");
+    std::fs::write(&tmux, MOCK_TMUX_PY).unwrap();
+    std::fs::write(&stub_py, MOCK_STUB_PY).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
+    std::env::set_var("CADENCE_TMUX_COMMAND", &tmux);
+    std::env::set_var(
+        "CADENCE_STUB_COMMAND",
+        format!("python3 {} {}", stub_py.display(), locks.display()),
+    );
+    std::env::set_var("CADENCE_STUB_LOCKS", &locks);
+    MockStub {
+        _guard: guard,
+        dir: dir.to_path_buf(),
+    }
+}
+
+impl Drop for MockStub {
+    fn drop(&mut self) {
+        kill_mock_panes(&self.dir);
+        std::env::remove_var("CADENCE_TMUX_COMMAND");
+        std::env::remove_var("CADENCE_STUB_COMMAND");
+        std::env::remove_var("CADENCE_STUB_LOCKS");
         std::env::remove_var("MOCK_TMUX_STATE");
     }
 }
@@ -6734,4 +6851,211 @@ fn message_result_sha_flag_on_pty_path() {
     d.job_verdict("j1-t2", SHA_A, "pass", Some("rev"), None)
         .unwrap();
     assert_eq!(d.task_state("j1-t2"), "verified");
+}
+
+// ==== pty profile split: second profile + forbidden prefixes (CAD-32) ====
+
+/// The generic adapter driven by a non-Devin profile: a different
+/// prompt glyph, placeholder, session-lock dir and launch argv — the
+/// profile, not hardcoded Devin facts, carries the TUI.
+#[test]
+fn pty_stub_profile_drives_gate_and_render() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    d.register_stub("st", json!({"auto_ready": "verified"}));
+    d.wait_agent("st", "idle", 20);
+    // Idle detection is the stub's own `» stub ready` line: the daemon
+    // probe self-claims and the send pastes. `/` is forbidden on Devin
+    // but literal here — the prefix list is the profile's too.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "/looks like a command elsewhere",
+               "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "st", "m1");
+    assert!(token.starts_with("pty-"), "{token}");
+    let claim = d.wait_event("st", "ready_claimed", 5);
+    assert_eq!(claim["payload"]["by"], "daemon", "{claim}");
+    // The render check passed on the stub's screen.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen =
+            std::fs::read_to_string(d.stub_pane_file(&mock, "st", "screen")).unwrap_or_default();
+        if screen.contains("> /looks like a command elsewhere") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "stub never echoed: {screen}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("st", "m1", &["completed"], 10);
+    // The stub's own forbidden prefixes still reject pre-write.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "~tilde is stub's mode key",
+               "message": "m2"}),
+    )
+    .unwrap();
+    let failed = d.wait_message("st", "m2", &["failed"], 15);
+    let err = failed["error"].as_str().unwrap_or("").to_string();
+    assert!(
+        err.contains("'~'") && err.contains("command or mode switch"),
+        "{err}"
+    );
+    assert!(
+        std::fs::read_to_string(d.stub_pane_file(&mock, "st", "input"))
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+/// The stub's busy signature — not Devin's — is what blocks the gate.
+#[test]
+fn pty_stub_profile_busy_marker_blocks_paste() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    d.register_stub("st", json!({"auto_ready": "verified"}));
+    d.wait_agent("st", "idle", 20);
+    // Devin's busy marker means nothing to the stub profile: a send
+    // with it on screen still goes through.
+    std::fs::write(
+        d.stub_pane_file(&mock, "st", "tui-state"),
+        "(esc twice to interrupt)\n",
+    )
+    .unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "devin marker is inert here",
+               "message": "m1"}),
+    )
+    .unwrap();
+    pty_token(&d, "st", "m1");
+    // The stub's own marker must block.
+    std::fs::write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n").unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "do not paste", "message": "m2"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("st", "gate_wait", 10);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("busy"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("st", "m2"), "queued");
+    assert!(
+        std::fs::read_to_string(d.stub_pane_file(&mock, "st", "input"))
+            .unwrap_or_default()
+            .is_empty()
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "st"})).unwrap();
+    assert_eq!(probe["busy_marker"], true, "{probe}");
+    // Busy clears — the queued send delivers.
+    std::fs::remove_file(d.stub_pane_file(&mock, "st", "tui-state")).unwrap();
+    pty_token(&d, "st", "m2");
+}
+
+/// Claims stay single-use under a second profile: one claim releases
+/// exactly one send; the next waits at the gate.
+#[test]
+fn pty_stub_profile_consumes_one_claim_per_send() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register_stub("st", json!({}));
+    d.wait_agent("st", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "st"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "first", "message": "m1"}),
+    )
+    .unwrap();
+    pty_token(&d, "st", "m1");
+    // The claim is spent: a second send waits at the gate.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "second", "message": "m2"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("st", "gate_wait", 10);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("agent ready"),
+        "{wait}"
+    );
+    // A fresh claim releases exactly the queued send.
+    d.rpc("agent_ready", json!({"alias": "st"})).unwrap();
+    pty_token(&d, "st", "m2");
+}
+
+/// Devin's forbidden input prefixes — `/`, `!`, `@` observed live
+/// (command menu, bash mode, file picker) — are `PreWrite` rejections:
+/// the message fails, the pane is untouched, the agent stays idle, and
+/// the readiness claim is not consumed. `#` is a literal draft char.
+#[test]
+fn pty_forbidden_prefix_is_prewrite_and_keeps_claim() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.wait_agent("dv", "idle", 20);
+    // One claim: every rejection below must leave it unconsumed.
+    d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
+    for (id, body, prefix) in [
+        ("m1", "/menu", '/'),
+        ("m2", "!bash", '!'),
+        ("m3", "@file", '@'),
+    ] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "dv", "text": body, "message": id}),
+        )
+        .unwrap();
+        d.wait_message("dv", id, &["failed"], 15);
+        let failed = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap()
+            .clone();
+        let err = failed["result"]["error"].as_str().unwrap_or("").to_string();
+        assert!(err.contains(&format!("'{prefix}'")), "{err}");
+        assert!(err.contains("command or mode switch"), "{err}");
+    }
+    // Provably no bytes reached the pane for any rejection...
+    assert!(std::fs::read_to_string(d.pane_file(&mock, "dv", "input"))
+        .unwrap_or_default()
+        .is_empty());
+    // ...the agent is not fenced...
+    let agent = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(agent["state"].as_str().unwrap(), "idle", "{agent}");
+    // ...and the original claim survived: `#` is literal and this send
+    // goes through on the SAME claim — no second `agent_ready`.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "#literal tag", "message": "m4"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv", "m4");
+    assert!(token.starts_with("pty-"), "{token}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen =
+            std::fs::read_to_string(d.pane_file(&mock, "dv", "screen")).unwrap_or_default();
+        if screen.contains("> #literal tag") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never echoed: {screen}");
+        thread::sleep(Duration::from_millis(50));
+    }
 }

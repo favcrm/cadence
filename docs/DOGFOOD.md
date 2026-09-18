@@ -257,6 +257,32 @@ was written, so nothing is uncertain. And `assistant` events now emit
 compact `tool_use` lifecycle events (name only) so `events --follow`
 shows a long turn working.
 
+## Splitting the pty adapter surfaced a literal-paste hazard
+
+**What happened.** CAD-32 pulled `DevinPtyAdapter` apart into a
+generic owned-tmux-pane adapter plus a per-TUI profile — launch argv,
+session-ownership proof, screen signatures, wording, deadlines — so a
+second provider TUI is a new profile module, not a copy of a
+thousand-line file. The one deliberate behaviour change came straight
+from the claude terminal investigation: a leading `!` there runs a
+shell command immediately, outside permission checks — and cadence
+pastes message bodies verbatim. Typed into a scratch Devin pane (never
+submitted, so it cost no turns), the observed specials were `/` →
+command menu, `!` → bash mode, `@` → file picker; `#` stayed a literal
+draft char.
+
+**What it taught.** A verbatim paste of a command-looking body is an
+injection path, so the guard lives *before* the gate: a leading
+forbidden prefix is `PreWrite` — provably no bytes reached the pane,
+no claim consumed, no fence — and the list is the profile's, because
+what is dangerous is a TUI fact, not a transport fact. A `tui-stub`
+test-double profile (different glyph, markers, argv, prefix list) now
+drives the whole fake-tmux harness, which is what actually proves the
+adapter reads every one of those facts from the profile.
+
+**Rule that fell out:** when you paste into someone else's UI, the
+first character is part of the protocol — observe it, then forbid it.
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not
