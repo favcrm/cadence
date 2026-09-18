@@ -312,6 +312,38 @@ workspace check, not a tool approval.
 the approval policy — a permission mode left at "ask a human" turns
 the manager into the bottleneck.
 
+## Claude's TUI has a ghost draft you cannot see
+
+**What happened.** CAD-17 put Claude Code's interactive terminal in a
+cadence-owned tmux pane through a `ClaudeProfile` on the generic pty
+adapter — same owned-pane mechanics, provider facts behind the
+profile: `claude --session-id <uuid>` on fresh launch (`--resume <id>`
+on reopen), session ownership proven through Claude's own registry
+(`~/.claude/sessions/<pid>.json`, pid liveness pinned by `procStart`
+against `/proc/<pid>/stat` field 22, so a recycled pid cannot
+impersonate a live entry), and the screen analyzer from live captures
+of 2.1.275 under `tests/fixtures/claude-tui/`. Prefixes observed by
+typing without submitting: `/` → command menu, `!` → shell mode (a
+command outside permission checks), `@` → agent/file autocomplete —
+all forbidden `PreWrite`; `#` stays literal.
+
+**What it taught.** After a turn, Claude's input box shows a dim
+*ghost suggestion* (`❯  ls -l …`). In a plain `capture-pane -p` it is
+indistinguishable from a staged draft — a naïve analyzer would park
+the gate forever on "unsubmitted text". The tell is the cursor: the
+suggestion never moves it off the prompt start, real input always
+does, so the adapter now fetches `#{cursor_x},#{cursor_y}` with the
+capture and the analyzer counts box text as input only when the
+cursor moved — and when the cursor is unreadable it counts it as real
+(conservative; a stuck gate is recoverable, a pasted-over draft is
+not). The trust dialog never appeared on this build (pre-trusted or
+skipped), so that fixture is synthesized from the known dialog shape
+— kept so another build still reads as a menu, never as idle.
+
+**Rule that fell out:** a screen capture is the pane minus the cursor
+— when text can be rendered without existing, the cursor is the only
+witness that knows.
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not

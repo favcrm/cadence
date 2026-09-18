@@ -192,6 +192,12 @@ pub fn build(
                     },
                 )),
             )?)),
+            "claude" => Ok(Box::new(pty::PtyAdapter::new(
+                hooks,
+                log_path,
+                agent,
+                pty::ClaudeProfile::new(agent)?,
+            )?)),
             // Harness double: proves the adapter is profile-driven.
             "tui-stub" => Ok(Box::new(pty::PtyAdapter::new(
                 hooks,
@@ -200,7 +206,7 @@ pub fn build(
                 pty::StubProfile::new()?,
             )?)),
             other => Err(crate::error::Error::rejected(format!(
-                "No pty adapter for provider '{other}' (implemented: devin)"
+                "No pty adapter for provider '{other}' (implemented: devin, claude)"
             ))),
         },
         "fake" => Ok(Box::new(fake::FakeAdapter::new(hooks))),

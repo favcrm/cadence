@@ -54,8 +54,14 @@ pub trait TuiProfile: Send + Sync {
     /// Bound on the TUI acquiring its native session after launch.
     fn open_deadline(&self) -> Duration;
 
-    /// Reduce a captured screen to gate facts for this TUI.
-    fn analyze(&self, screen: &str) -> Probe;
+    /// Reduce a captured screen to gate facts for this TUI. `cursor` is
+    /// the pane cursor cell `(x, y)` when the adapter could read it —
+    /// some TUIs render dim "ghost" suggestion text in an empty input
+    /// line that a plain-text capture cannot tell from a staged draft;
+    /// the suggestion never moves the cursor, so a profile uses the
+    /// cursor to tell them apart. `None` means unknown — treat any
+    /// visible draft text as real (conservative).
+    fn analyze(&self, screen: &str, cursor: Option<(u32, u32)>) -> Probe;
 
     /// `agent respond` rejection text — approvals are answered in the
     /// terminal itself; the message names the provider's prompt.

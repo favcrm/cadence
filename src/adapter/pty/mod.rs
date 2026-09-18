@@ -44,10 +44,12 @@
 //! this endpoint — the profile supplies the message naming the
 //! provider's prompt.
 
+pub mod claude;
 pub mod devin;
 pub mod profile;
 pub mod stub;
 
+pub use claude::{analyze_claude, ClaudeProfile};
 pub use devin::{analyze_devin, DevinProfile};
 pub use profile::TuiProfile;
 pub use stub::StubProfile;
@@ -180,6 +182,18 @@ pub(crate) fn descends_from(mut pid: u32, pane_pid: u32) -> bool {
             .unwrap_or(0);
     }
     false
+}
+
+/// A pty provider's forbidden input prefixes — the profile's own list,
+/// surfaced here so the briefing can warn without constructing a
+/// profile. Unknown providers get an empty list (no hazard asserted).
+pub fn forbidden_prefixes(provider: &str) -> &'static [char] {
+    match provider {
+        "devin" => devin::FORBIDDEN_PREFIXES,
+        "claude" => claude::FORBIDDEN_PREFIXES,
+        "tui-stub" => stub::FORBIDDEN_PREFIXES,
+        _ => &[],
+    }
 }
 
 /// Every `/proc` pid holding an open fd to `lock`.
@@ -374,6 +388,16 @@ impl PtyAdapter {
     fn capture_visible(&self) -> Result<String> {
         let session = self.session();
         self.tmux_ok(&["capture-pane", "-p", "-t", &session])
+    }
+
+    /// The pane cursor cell `(x, y)` for the analyzer — profiles use it
+    /// to tell ghost suggestion text (never moves the cursor) from a
+    /// real staged draft. `None` when unreadable — the analyzer then
+    /// treats any visible draft as real.
+    fn cursor_pos(&self, session: &str) -> Option<(u32, u32)> {
+        let v = self.pane_value(session, "#{cursor_x},#{cursor_y}").ok()?;
+        let (x, y) = v.split_once(',')?;
+        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
     }
 }
 
@@ -577,7 +601,8 @@ impl ProviderAdapter for PtyAdapter {
             let screen = self.capture_visible()?;
             if normalize_screen(&screen).matches(&slice).count() > before_count {
                 rendered = true;
-                if !self.profile.analyze(&screen).input_nonempty {
+                let cursor = self.cursor_pos(&session);
+                if !self.profile.analyze(&screen, cursor).input_nonempty {
                     break;
                 }
             }
@@ -658,7 +683,9 @@ impl ProviderAdapter for PtyAdapter {
     }
 
     fn probe(&self) -> Result<Probe> {
-        Ok(self.profile.analyze(&self.capture_visible()?))
+        let session = self.session();
+        let cursor = self.cursor_pos(&session);
+        Ok(self.profile.analyze(&self.capture_visible()?, cursor))
     }
 
     fn update_params(&self, params: &Value) {
