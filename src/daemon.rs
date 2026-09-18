@@ -1746,7 +1746,20 @@ impl Shared {
         for ctl in ctls {
             if !ctl_finished(ctl) {
                 if let Some(adapter) = ctl.adapter.lock().unwrap().clone() {
-                    adapter.close();
+                    // A forced close makes any outstanding attempt
+                    // OutcomeUnknown — fenced, never replayed. During
+                    // daemon shutdown the endpoint must detach, not
+                    // die: owned endpoints (a pty pane) outlive the
+                    // controller and are revalidated on the next open —
+                    // killing one here orphans the session the restart
+                    // is meant to re-adopt. `detach` defaults to
+                    // `close` for adapters that own their provider
+                    // process, so managed endpoints are still reaped.
+                    if self.closing.load(Ordering::SeqCst) {
+                        adapter.detach();
+                    } else {
+                        adapter.close();
+                    }
                 }
                 ctl.wake.notify_all();
             }
