@@ -150,6 +150,20 @@ fn load_front(dir: &Path) -> Result<(Front, String)> {
     parse::parse_issue(&text)
 }
 
+/// Lint parity for the component field on every write path (`new`,
+/// `set`, HTTP PATCH): the value must be one the issue's project
+/// declares — a project with no component list accepts any.
+fn check_component(project: &project::Project, component: &str) -> Result<()> {
+    if !project.components.is_empty() && !project.components.iter().any(|c| c == component) {
+        return Err(Error::rejected(format!(
+            "Unknown component '{component}' — {} declares: {}",
+            project.key,
+            project.components.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn save_front(dir: &Path, front: &Front, body: &str) -> Result<()> {
     atomic_write(&dir.join("issue.md"), &parse::render(front, body)?)
 }
@@ -273,13 +287,7 @@ pub fn new_issue(
         }
     }
     if let Some(component) = component {
-        if !project.components.is_empty() && !project.components.iter().any(|c| c == component) {
-            return Err(Error::rejected(format!(
-                "Unknown component '{component}' — {} declares: {}",
-                project.key,
-                project.components.join(", ")
-            )));
-        }
+        check_component(&project, component)?;
     }
     let _lock = pm.lock()?;
     let id = match explicit_id {
@@ -415,7 +423,7 @@ pub fn set_fields(pm: &Pm, id: &str, pairs: &[String], actor: &str) -> Result<Va
             "set needs key=value pairs — e.g. `cadence issue set CAD-16 status=doing`",
         ));
     }
-    let (_project, dir) = issue_dir(pm, id)?;
+    let (project, dir) = issue_dir(pm, id)?;
     let _lock = pm.lock()?;
     let (mut front, body) = load_front(&dir)?;
     let mut changed = Vec::new();
@@ -445,7 +453,12 @@ pub fn set_fields(pm: &Pm, id: &str, pairs: &[String], actor: &str) -> Result<Va
                 front.title = value.to_string();
             }
             "owner" => front.owner = (!value.is_empty()).then(|| value.to_string()),
-            "component" => front.component = (!value.is_empty()).then(|| value.to_string()),
+            "component" => {
+                if !value.is_empty() {
+                    check_component(&project, value)?;
+                }
+                front.component = (!value.is_empty()).then(|| value.to_string());
+            }
             _ => unreachable!(),
         }
         changed.push(format!("{key}={value}"));
@@ -476,7 +489,7 @@ pub fn patch_issue(
     if_rev: Option<&str>,
     actor: &str,
 ) -> Result<Value> {
-    let (_project, dir) = issue_dir(pm, id)?;
+    let (project, dir) = issue_dir(pm, id)?;
     let _lock = pm.lock()?;
     if let Some(conflict) = check_rev(&dir, if_rev)? {
         return Ok(conflict);
@@ -526,6 +539,9 @@ pub fn patch_issue(
         changed.push(format!("owner={v}"));
     }
     if let Some(v) = &patch.component {
+        if !v.is_empty() {
+            check_component(&project, v)?;
+        }
         front.component = (!v.is_empty()).then(|| v.clone());
         changed.push(format!("component={v}"));
     }
