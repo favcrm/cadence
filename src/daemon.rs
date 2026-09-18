@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::adapter::{self, AdapterHooks, ProviderAdapter, ProviderRequest, TurnResult};
+use crate::adapter::{self, registry, AdapterHooks, ProviderAdapter, ProviderRequest, TurnResult};
 use crate::error::{Error, Result};
 use crate::proto;
 use crate::store::{self, Message, Store, Take};
@@ -166,7 +166,8 @@ impl Shared {
         enable: bool,
     ) -> Result<bool> {
         // A mailbox never gets an actor — regardless of who asked.
-        if self.store.agent(alias)?.endpoint_kind == "inbox" {
+        let a = self.store.agent(alias)?;
+        if !registry::has_actor(&a.provider, &a.endpoint_kind) {
             return Err(Error::rejected(format!(
                 "Agent '{alias}' is an inbox — it has no actor to start"
             )));
@@ -648,7 +649,7 @@ impl Shared {
             "health" => Ok(json!({
                 "state": "ready",
                 "protocol": proto::PROTOCOL_VERSION,
-                "capabilities": proto::CAPABILITIES,
+                "capabilities": proto::capabilities(),
             })),
             "shutdown" => {
                 self.closing.store(true, Ordering::SeqCst);
@@ -669,6 +670,8 @@ impl Shared {
                         .map(|t| t.id.clone())
                         .collect();
                     j["tasks"] = json!(tasks);
+                    j["capabilities"] =
+                        registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
                     agents.push(j);
                 }
                 Ok(json!({"agents": agents}))
@@ -677,8 +680,11 @@ impl Shared {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
                 let messages = self.store.messages(&alias)?;
+                let mut agent_json = agent.to_json();
+                agent_json["capabilities"] =
+                    registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
                 Ok(json!({
-                    "agent": agent.to_json(),
+                    "agent": agent_json,
                     "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
                     "event_cursor": self.store.event_cursor(&alias)?,
                     // Inbound backlog — what `cadence inbox` would drain
@@ -741,7 +747,9 @@ impl Shared {
                 // before ownership so the error suggests the remedy.
                 // Inbox pseudo-endpoints are permanent mailboxes, not
                 // processes — removal is the only lifecycle they have.
-                if agent.endpoint.is_some() && agent.endpoint_kind != "inbox" {
+                if agent.endpoint.is_some()
+                    && registry::has_actor(&agent.provider, &agent.endpoint_kind)
+                {
                     return Err(Error::rejected(format!(
                         "Agent '{alias}' still has a live endpoint — \
                          run `cadence agent stop {alias}` first"
@@ -782,7 +790,7 @@ impl Shared {
             "agent_resume" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
                 let agent = self.store.agent(&alias)?;
-                if agent.endpoint_kind == "inbox" {
+                if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
                     return Err(Error::rejected(format!(
                         "Agent '{alias}' is an inbox — nothing to resume; \
                          `cadence inbox {alias}` drains it"
@@ -832,13 +840,14 @@ impl Shared {
     fn rpc_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = required_str(params, "alias")?;
         let provider = required_str(params, "provider")?;
-        let endpoint = optional_str(params, "endpoint_kind").unwrap_or("managed");
+        let endpoint =
+            optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND);
         let role = optional_str(params, "role").unwrap_or("worker");
         let cwd = optional_str(params, "cwd");
         let sandbox = optional_str(params, "sandbox").unwrap_or("read-only");
         let instructions = optional_str(params, "instructions");
         let agent_params = optional_str(params, "params");
-        if (endpoint == "inbox") != (provider == "inbox") {
+        if registry::is_inbox_kind(endpoint) != registry::is_inbox_provider(provider) {
             return Err(Error::rejected(
                 "Provider 'inbox' and endpoint kind 'inbox' must be used together",
             ));
@@ -848,7 +857,7 @@ impl Shared {
         let cwd = match (cwd, endpoint) {
             (Some(cwd), _) => std::fs::canonicalize(cwd)
                 .map_err(|_| Error::rejected("Working directory must exist"))?,
-            (None, "inbox") => self.state_dir.clone(),
+            (None, e) if !registry::has_actor(provider, e) => self.state_dir.clone(),
             (None, _) => return Err(Error::rejected("Missing 'cwd'")),
         };
         self.store.register_agent(&crate::store::NewAgent {
@@ -863,7 +872,7 @@ impl Shared {
         })?;
         // A mailbox has no actor — it is `idle` with its pseudo-endpoint
         // from registration and simply accrues queued messages.
-        if endpoint == "inbox" {
+        if !registry::has_actor(provider, endpoint) {
             return Ok(json!({
                 "alias": alias, "state": "idle", "provider": provider,
                 "endpoint": format!("inbox://{alias}"),
@@ -949,16 +958,12 @@ impl Shared {
     fn rpc_respond(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         // Managed Claude brokers no provider requests in phase A — the
-        // rejection names the real opt-ups rather than hunting the
-        // pending map.
-        if self.store.agent(&alias)?.provider == "claude" {
-            return Err(Error::rejected(
-                "managed claude endpoints broker no requests — widen \
-                 permissions by relaunching or rejoining with \
-                 `--permission-mode <mode>` or `--allow \"<pattern>\"` \
-                 (or `--bypass`); denials are recorded as \
-                 permission_denied events on the agent",
-            ));
+        // spec's rejection names the real opt-ups rather than hunting
+        // the pending map.
+        let agent = self.store.agent(&alias)?;
+        if let Some(rejection) = registry::respond_rejection(&agent.provider, &agent.endpoint_kind)
+        {
+            return Err(Error::rejected(rejection));
         }
         let handle = required_str(params, "request")?;
         let decision = optional_str(params, "decision");
@@ -1052,7 +1057,7 @@ impl Shared {
                 if self
                     .store
                     .agent(alias)
-                    .map(|a| a.endpoint_kind == "inbox")
+                    .map(|a| !registry::has_actor(&a.provider, &a.endpoint_kind))
                     .unwrap_or(false)
                 {
                     Error::rejected(format!(
@@ -1118,29 +1123,7 @@ impl Shared {
         let agent = self.store.agent(&alias)?;
         for (key, value) in patch.as_object().unwrap() {
             proto::param_key(key)?;
-            match key.as_str() {
-                "auto_ready" => {
-                    if agent.endpoint_kind != "pty" {
-                        return Err(Error::rejected(
-                            "'auto_ready' only applies to pty endpoints — \
-                             a screen probe exists only there",
-                        ));
-                    }
-                    if !(value.is_null() || value.as_str() == Some("verified")) {
-                        return Err(Error::rejected(
-                            "'auto_ready' accepts \"verified\" or a bare key \
-                             (removal) — no other value is implemented",
-                        ));
-                    }
-                }
-                other => {
-                    return Err(Error::rejected(format!(
-                        "'{other}' is not live-settable — allowed keys: auto_ready \
-                         (pty only). Recreate the agent to change wiring params \
-                         like upstream or session"
-                    )));
-                }
-            }
+            registry::validate_live_param(&agent.provider, &agent.endpoint_kind, key, value)?;
         }
         self.store.set_params(&alias, &patch)?;
         // Push the merged params into the live adapter so cached
@@ -1435,7 +1418,7 @@ impl Shared {
         if let Some(assignee) = &task.assignee {
             if let Ok(agent) = self.store.agent(assignee) {
                 if agent.endpoint.is_none()
-                    && agent.endpoint_kind != "inbox"
+                    && registry::has_actor(&agent.provider, &agent.endpoint_kind)
                     && !is_task_terminal(&task.state)
                 {
                     j["assignee_dead"] = json!(format!(
@@ -1683,7 +1666,7 @@ impl Shared {
     fn rpc_stop(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let agent = self.store.agent(&alias)?;
-        if agent.endpoint_kind == "inbox" {
+        if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Err(Error::rejected(format!(
                 "Agent '{alias}' is an inbox — no actor to stop; \
                  `cadence agent remove {alias}` deletes the mailbox"
@@ -1941,7 +1924,7 @@ pub fn serve(state_dir: &Path) -> Result<()> {
     // Inbox rows are durable mailboxes — enabled or not, they own no
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {
-        if !agent.enabled || agent.endpoint_kind == "inbox" {
+        if !agent.enabled || !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             continue;
         }
         // A fenced agent stays registered but must never churn on a

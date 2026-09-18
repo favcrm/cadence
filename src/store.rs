@@ -18,6 +18,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::adapter::registry;
 use crate::error::{Error, Result};
 use crate::proto::identifier;
 
@@ -680,7 +681,7 @@ impl Store {
         // Inbox agents are durable mailboxes, not processes: they
         // register directly into `idle` with a stable pseudo-endpoint
         // (so `dead` reads false) and never spawn an actor.
-        let (state, endpoint) = if new.endpoint_kind == "inbox" {
+        let (state, endpoint) = if !registry::has_actor(new.provider, new.endpoint_kind) {
             ("idle", Some(format!("inbox://{}", new.alias)))
         } else {
             ("starting", None)
@@ -1346,7 +1347,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
-        if agent.endpoint_kind != "inbox" {
+        if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             return Err(Error::rejected(format!(
                 "Agent '{alias}' is endpoint kind '{}' — `cadence inbox` only \
                  drains inbox agents",
@@ -1419,7 +1420,7 @@ impl Store {
         let agent = self.agent_in(&tx, alias)?;
         // Inbox rows own no process or pane — their pseudo-endpoint is
         // permanent, so neither gate applies to them.
-        if agent.endpoint_kind != "inbox" {
+        if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
             if agent.endpoint.is_some() {
                 return Err(Error::rejected(format!(
                     "Agent '{alias}' still has a live endpoint — \
@@ -1933,7 +1934,8 @@ impl Store {
             Some(task_id),
         )?;
         tx.commit()?;
-        let behind_dead = worker.endpoint.is_none() && worker.endpoint_kind != "inbox";
+        let behind_dead = worker.endpoint.is_none()
+            && registry::has_actor(&worker.provider, &worker.endpoint_kind);
         Ok((self.task_in(&conn, task_id)?, kickoff, false, behind_dead))
     }
 
@@ -2597,10 +2599,7 @@ fn kickoff_body(
             )
         })
         .unwrap_or_default();
-    let managed = matches!(
-        assignee.endpoint_kind.as_str(),
-        "managed" | "managed-ws" | "fake"
-    );
+    let managed = registry::reports_turn_result(&assignee.provider, &assignee.endpoint_kind);
     let report = if managed {
         " Report when done: end your final answer with a one-line \
          summary followed by a last line `SHA: <40-hex>` naming the \

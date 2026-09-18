@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use cadence_agent::adapter::registry::{self, Attach, Reporting};
 use cadence_agent::client;
 use cadence_agent::error::{Error, Result};
 use cadence_agent::proto;
@@ -585,7 +586,7 @@ enum AgentAction {
         /// Endpoint kind: managed (stdio), managed-ws (official-TUI
         /// attachable WebSocket app-server), pty (official TUI in an
         /// owned tmux session; devin only) or fake (test double).
-        #[arg(long, default_value = "managed")]
+        #[arg(long, default_value = registry::DEFAULT_ENDPOINT_KIND)]
         endpoint: String,
         /// pm or worker.
         #[arg(long, default_value = "worker")]
@@ -880,7 +881,11 @@ fn send_message(
     // attributed to CADENCE_ALIAS when sent from inside a pane.
     if ready {
         let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
-        if show["agent"]["endpoint_kind"].as_str() == Some("pty") {
+        let agent = &show["agent"];
+        if registry::ready_gate(
+            agent["provider"].as_str().unwrap_or_default(),
+            agent["endpoint_kind"].as_str().unwrap_or_default(),
+        ) {
             let by = std::env::var("CADENCE_ALIAS").ok();
             client::rpc(state_dir, "agent_ready", json!({"alias": alias, "by": by}))?;
         }
@@ -1013,8 +1018,12 @@ fn list_agents(state_dir: &Path, all: bool) -> Result<Value> {
 fn resume_agent(state_dir: &Path, alias: &str, detach: bool) -> Result<i32> {
     let result = client::rpc(state_dir, "agent_resume", json!({"alias": alias}))?;
     let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
-    let kind = show["agent"]["endpoint_kind"].as_str().unwrap_or_default();
-    if !matches!(kind, "pty" | "managed-ws") {
+    let agent = &show["agent"];
+    let (provider, kind) = (
+        agent["provider"].as_str().unwrap_or_default(),
+        agent["endpoint_kind"].as_str().unwrap_or_default(),
+    );
+    if !registry::attachable(provider, kind) {
         print_json(&result);
         return Ok(0);
     }
@@ -1129,8 +1138,11 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
     // live endpoint address — fake/managed actors never expose one, so
     // endpoint alone cannot detect "already up".
     // A mailbox has nothing to resume — its queue survives regardless.
-    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
-    if kind == "inbox" {
+    let (provider, kind) = (
+        agent["provider"].as_str().unwrap_or_default(),
+        agent["endpoint_kind"].as_str().unwrap_or_default(),
+    );
+    if !registry::has_actor(provider, kind) {
         return json!({"alias": alias, "resumed": false, "skipped": "mailbox"});
     }
     let live = agent["endpoint"].is_string()
@@ -1171,7 +1183,7 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
         return json!({"alias": alias, "resumed": false, "fenced": true,
                       "state": "attention", "error": error, "hint": hint});
     }
-    let attachable = matches!(kind, "pty" | "managed-ws");
+    let attachable = registry::attachable(provider, kind);
     if let Err(e) = client::rpc(state_dir, "agent_resume", json!({"alias": alias})) {
         return json!({"alias": alias, "resumed": false, "error": e.to_string()});
     }
@@ -1317,7 +1329,12 @@ fn stop_group(state_dir: &Path, group: &str) -> Result<i32> {
         // A mailbox is never "stopped" — it has no actor and its queue
         // is the point. Removing it is the only lifecycle action.
         let is_inbox = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
-            .map(|s| s["agent"]["endpoint_kind"].as_str() == Some("inbox"))
+            .map(|s| {
+                !registry::has_actor(
+                    s["agent"]["provider"].as_str().unwrap_or_default(),
+                    s["agent"]["endpoint_kind"].as_str().unwrap_or_default(),
+                )
+            })
             .unwrap_or(false);
         if is_inbox {
             eprintln!("stop {alias}: skipped (inbox — durable mailbox)");
@@ -1438,9 +1455,9 @@ fn run() -> Result<i32> {
                     // `--provider inbox` is the mailbox registration —
                     // the endpoint kind follows the provider, and no
                     // working directory is involved.
-                    let inbox = provider == "inbox";
-                    let endpoint = if inbox && endpoint == "managed" {
-                        "inbox".to_string()
+                    let inbox = registry::is_inbox_provider(&provider);
+                    let endpoint = if inbox && endpoint == registry::DEFAULT_ENDPOINT_KIND {
+                        registry::INBOX.to_string()
                     } else {
                         endpoint
                     };
@@ -1586,7 +1603,6 @@ fn run() -> Result<i32> {
         } => provider_launch(
             &state_dir,
             "devin",
-            "pty",
             cwd,
             &role,
             alias,
@@ -1611,7 +1627,6 @@ fn run() -> Result<i32> {
         } => provider_launch(
             &state_dir,
             "codex",
-            "managed-ws",
             cwd,
             &role,
             alias,
@@ -1642,7 +1657,6 @@ fn run() -> Result<i32> {
         } => provider_launch(
             &state_dir,
             "claude",
-            "managed",
             cwd,
             &role,
             alias,
@@ -1729,10 +1743,14 @@ fn run() -> Result<i32> {
             let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
             // A mailbox has no running turn — report the inbound
             // backlog a consumer would drain instead.
-            if show["agent"]["endpoint_kind"].as_str() == Some("inbox") {
+            let (provider, kind) = (
+                show["agent"]["provider"].as_str().unwrap_or_default(),
+                show["agent"]["endpoint_kind"].as_str().unwrap_or_default(),
+            );
+            if !registry::has_actor(provider, kind) {
                 print_json(&json!({
                     "alias": show["agent"]["alias"],
-                    "endpoint_kind": "inbox",
+                    "endpoint_kind": kind,
                     "queued": show["queued"],
                 }));
                 return Ok(0);
@@ -1863,7 +1881,11 @@ fn run() -> Result<i32> {
                     // Same flag semantics as send: --ready IS the claim.
                     if ready {
                         let show = client::rpc(&state_dir, "agent_show", json!({"alias": alias}))?;
-                        if show["agent"]["endpoint_kind"].as_str() == Some("pty") {
+                        let agent = &show["agent"];
+                        if registry::ready_gate(
+                            agent["provider"].as_str().unwrap_or_default(),
+                            agent["endpoint_kind"].as_str().unwrap_or_default(),
+                        ) {
                             let by = std::env::var("CADENCE_ALIAS").ok();
                             client::rpc(
                                 &state_dir,
@@ -2023,7 +2045,11 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                 };
                 if let Some(assignee) = assignee {
                     let show = rpc("agent_show", json!({"alias": assignee}))?;
-                    if show["agent"]["endpoint_kind"].as_str() == Some("pty") {
+                    let agent = &show["agent"];
+                    if registry::ready_gate(
+                        agent["provider"].as_str().unwrap_or_default(),
+                        agent["endpoint_kind"].as_str().unwrap_or_default(),
+                    ) {
                         rpc("agent_ready", json!({"alias": assignee, "by": pane}))?;
                     }
                 }
@@ -2134,7 +2160,10 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
     let agent = &show["agent"];
     let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
     let provider = agent["provider"].as_str().unwrap_or_default();
-    if kind == "managed" && provider == "claude" {
+    let attach = registry::spec_opt(provider, kind)
+        .map(|s| s.attach)
+        .unwrap_or(Attach::None);
+    if attach == Attach::Headless {
         // A managed Claude endpoint is a headless stream-json process —
         // there is no terminal surface to attach. The explanation is
         // printed, never exec'd.
@@ -2152,7 +2181,7 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
         }));
         return Ok(0);
     }
-    if !matches!(kind, "managed-ws" | "pty") {
+    if !matches!(attach, Attach::Tmux | Attach::ProviderTui(_)) {
         return Err(Error::rejected(format!(
             "Agent '{alias}' uses endpoint kind '{kind}' — nothing to \
              attach; `cadence send {alias} --text '…'` still reaches it"
@@ -2184,7 +2213,7 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
     let thread = agent["thread_id"]
         .as_str()
         .ok_or_else(|| Error::rejected("Agent has no native thread yet"))?;
-    if kind == "pty" {
+    if attach == Attach::Tmux {
         // tmux://<socket>/<session> — attach is a view of
         // the owned pane, not a takeover of anything else.
         let (socket, session) = endpoint
@@ -2207,8 +2236,11 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
         }));
         return Ok(0);
     }
+    let Attach::ProviderTui(program) = attach else {
+        return Err(Error::internal("unreachable: attach arm narrowed above"));
+    };
     if run {
-        let status = Command::new("codex")
+        let status = Command::new(program)
             .args(["resume", "--remote", endpoint, thread])
             .status()?;
         return Ok(status.code().unwrap_or(1));
@@ -2217,7 +2249,7 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
         "alias": alias,
         "endpoint": endpoint,
         "thread_id": thread,
-        "command": format!("codex resume --remote {endpoint} {thread}"),
+        "command": format!("{program} resume --remote {endpoint} {thread}"),
         "note": "Attach shows the native thread; terminal echo is not \
                  agent receipt — message state remains authoritative.",
     }));
@@ -2250,7 +2282,6 @@ struct ClaudeOpts {
 fn provider_launch(
     state_dir: &Path,
     provider: &str,
-    endpoint_kind: &str,
     cwd: Option<PathBuf>,
     role: &str,
     alias: Option<String>,
@@ -2263,6 +2294,9 @@ fn provider_launch(
     auto_ready: bool,
     claude: &ClaudeOpts,
 ) -> Result<i32> {
+    // The provider's launch endpoint kind comes from the registry —
+    // one lookup replaces the per-verb literals and join's match.
+    let endpoint_kind = registry::default_kind(provider)?;
     // `-r <slug>` first resolves the slug to an already-registered agent
     // (by alias or native session id) so re-running is a reopen, not a
     // duplicate registration fighting over the same session lock.
@@ -2304,7 +2338,7 @@ fn provider_launch(
         Some(name) => create_worktree(&cwd, name)?,
         None => cwd,
     };
-    if auto_ready && endpoint_kind != "pty" {
+    if auto_ready && !registry::screen_probe(provider, endpoint_kind) {
         return Err(Error::rejected(
             "--auto-ready only applies to pty (devin) endpoints — a screen \
              probe exists only there",
@@ -2318,7 +2352,11 @@ fn provider_launch(
     if let Some(upstream) = &upstream {
         params_obj.insert("upstream".to_string(), Value::String(upstream.clone()));
     }
-    if provider == "claude" {
+    // Claude's launch params ride in `params` so the adapter replays
+    // them verbatim on resume; only the claude spec lists them.
+    if registry::spec_opt(provider, endpoint_kind)
+        .is_some_and(|s| s.launch_params.contains(&"permission_mode"))
+    {
         if let Some(model) = &claude.model {
             params_obj.insert("model".to_string(), json!(model));
         }
@@ -2386,7 +2424,7 @@ fn provider_launch(
     // The provider endpoint opens asynchronously (a pty open can wait on
     // the native session lock) — poll until it is live or gives up.
     // Kinds with no attachable endpoint are done once the actor is back.
-    let attachable = matches!(endpoint_kind, "pty" | "managed-ws");
+    let attachable = registry::attachable(provider, endpoint_kind);
     let deadline = Instant::now() + Duration::from_secs(45);
     let (agent, unknown) = loop {
         let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
@@ -2467,17 +2505,9 @@ fn join_group(
     auto_ready: bool,
     claude_opts: ClaudeOpts,
 ) -> Result<i32> {
-    let endpoint_kind = match provider {
-        "devin" => "pty",
-        "codex" => "managed-ws",
-        "claude" => "managed",
-        "fake" => "fake",
-        other => {
-            return Err(Error::rejected(format!(
-                "Unknown provider '{other}' — expected devin, codex, claude or fake"
-            )))
-        }
-    };
+    // Validate the provider before any work — the registry names the
+    // supported launch verbs in the rejection.
+    registry::default_kind(provider)?;
     let show = client::rpc(state_dir, "agent_show", json!({"alias": group})).map_err(|_| {
         Error::rejected(format!(
             "Unknown group '{group}' — no such agent; \
@@ -2501,7 +2531,6 @@ fn join_group(
     provider_launch(
         state_dir,
         provider,
-        endpoint_kind,
         cwd,
         role,
         alias,
@@ -2636,7 +2665,10 @@ const AGENTS_END: &str = "<!-- cadence:end -->";
 fn brief_agent(state_dir: &Path, alias: &str, enqueue: bool) -> Result<PathBuf> {
     let agent = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?["agent"].clone();
     // A mailbox consumes no briefing — nothing runs in it.
-    if agent["endpoint_kind"].as_str() == Some("inbox") {
+    if !registry::has_actor(
+        agent["provider"].as_str().unwrap_or_default(),
+        agent["endpoint_kind"].as_str().unwrap_or_default(),
+    ) {
         return Err(Error::rejected(format!(
             "Agent '{alias}' is an inbox — nothing to brief; \
              `cadence inbox {alias}` drains its queue"
@@ -2676,9 +2708,13 @@ fn brief_agent(state_dir: &Path, alias: &str, enqueue: bool) -> Result<PathBuf> 
         }
     }
     if enqueue {
-        // Managed claude turns complete the message themselves — the
+        // Turn-result reporters complete the message themselves — the
         // result text IS the report; there is no token flow.
-        let report_line = if agent["provider"].as_str() == Some("claude") {
+        let report_line = if registry::report_hint(
+            agent["provider"].as_str().unwrap_or_default(),
+            agent["endpoint_kind"].as_str().unwrap_or_default(),
+        ) == Reporting::TurnResult
+        {
             "do the work, then finish — your turn's result text is the \
              report; no `cadence message result` call is needed"
         } else {
@@ -2739,10 +2775,13 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    // Managed claude messages arrive as stream-json turns; the turn's
-    // result text auto-completes the message — the token flow is for
-    // peers on other endpoints.
-    let reporting = if agent["provider"].as_str() == Some("claude") {
+    // Turn-result reporters auto-complete the message — the token flow
+    // is for peers on explicitly-reported endpoints.
+    let reporting = if registry::report_hint(
+        agent["provider"].as_str().unwrap_or_default(),
+        agent["endpoint_kind"].as_str().unwrap_or_default(),
+    ) == Reporting::TurnResult
+    {
         "- Each durable message arrives as one turn; your turn's final\n\
          \x20 text IS the report — no `cadence message result` call is\n\
          \x20 needed. Tool denials stay denials (they don't fail the\n\
@@ -2838,9 +2877,9 @@ fn attachable(state_dir: &Path) -> Result<Vec<Value>> {
     Ok(agents
         .into_iter()
         .filter(|a| {
-            matches!(
-                a["endpoint_kind"].as_str(),
-                Some("pty") | Some("managed-ws")
+            registry::attachable(
+                a["provider"].as_str().unwrap_or_default(),
+                a["endpoint_kind"].as_str().unwrap_or_default(),
             ) && a["endpoint"].is_string()
         })
         .collect())

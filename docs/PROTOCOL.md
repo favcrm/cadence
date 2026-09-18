@@ -38,8 +38,8 @@ Error kinds:
 | `health` | — | `{state:"ready", protocol:1, capabilities:[...]}` |
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded) then exits |
 | `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?` | `{alias,state:"starting"|"idle",provider}` |
-| `agent_list` | — | `{agents:[Agent+tasks]}` — `tasks` names the alias's non-terminal task assignments |
-| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown}` — `unknown` counts unreconciled unknowns fencing the agent |
+| `agent_list` | — | `{agents:[Agent+tasks+capabilities]}` — `tasks` names the alias's non-terminal task assignments; `capabilities` is the registry descriptor |
+| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown}` — `unknown` counts unreconciled unknowns fencing the agent; `agent.capabilities` is the registry descriptor |
 | `agent_send` | `alias, text, message?, reply_to?, source?, task?` | `{message,state,duplicate}` — `task` attaches the delivery to a task for indexing |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
@@ -204,6 +204,43 @@ dead agents (manual only, never automatic); each candidate is
 independent so one in-transition alias doesn't fail the sweep. A fenced
 agent with no endpoint prints the `devin -r <session>` resume hint from
 its launch summary.
+
+## Endpoint capabilities
+
+Every `(provider, endpoint_kind)` pair resolves to one descriptor in
+`src/adapter/registry.rs` (`SPECS`) — the single table daemon, CLI,
+`doctor` and the board consult instead of comparing provider/kind
+strings. `registry::spec(provider, kind)` validates the pair and
+rejects unknown combinations with the supported list; `spec_opt` is
+the non-failing form, and kind-scoped helpers (`has_actor`,
+`attachable`, `ready_gate`, `screen_probe`, `reports_turn_result`,
+`report_hint`, `respond_rejection`) answer the recurring questions.
+
+`agent_show.agent.capabilities` and each `agent_list.agents[]` row carry
+the spec rendered as JSON (`null` when the registered pair has no
+spec):
+
+| field | meaning |
+|---|---|
+| `provider`, `endpoint_kind` | the registered pair |
+| `display` | human-readable name |
+| `has_actor` | `false` for the `inbox` mailbox — no actor, no process |
+| `attach` | `none` \| `headless` \| `tmux` \| `provider_tui` — the attach surface |
+| `ready_gate` | operator ready-claim gate exists (pty) |
+| `screen_probe` | pane capture/probe exists (pty) |
+| `reports` | `explicit` (`message result`) or `turn_result` (the adapter's turn result completes the message) |
+| `brokers_requests` | provider-initiated requests reach `agent_respond` |
+| `resumable` / `resume` | whether resume applies and what it means |
+| `live_settable_params` | keys `agent_set` may patch live (`auto_ready` on pty) |
+| `launch_params` | params the provider's launch verb accepts |
+| `session_id_label` | label for the native session id |
+
+`health.capabilities` and `doctor.capabilities` are generated from the
+same table plus daemon-level features (`agent_registry`,
+`durable_queue`, `operator_reconcile`, `job_lifecycle`,
+`revision_bound_verdicts`, `approval_brokering`, `result_routing`) —
+never hand-listed per provider. Adding a provider or kind means one
+`SPECS` entry; every check, capability list and doctor probe follows.
 
 ## pty endpoints (provider `devin`)
 
