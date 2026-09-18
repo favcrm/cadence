@@ -1739,6 +1739,10 @@ impl Store {
         base_ref: Option<&str>,
         max_revisions: i64,
         task_title: Option<&str>,
+        task_worktree: Option<&str>,
+        task_branch: Option<&str>,
+        task_base_sha: Option<&str>,
+        task_assignee: Option<&str>,
     ) -> Result<(bool, Job)> {
         identifier(id, "Job id")?;
         if let Some(issue) = issue_id {
@@ -1805,11 +1809,27 @@ impl Store {
             Some(id),
             None,
         )?;
+        if let Some(a) = task_assignee {
+            let job = self.job_in(&tx, id)?;
+            let worker = self.agent_in(&tx, a)?;
+            self.check_group_member(&job, &worker)?;
+        }
         let task_id = format!("{id}-t1");
         tx.execute(
-            "INSERT INTO tasks(id,job_id,title,state,created,updated)
-             VALUES(?,?,?,'draft',?,?)",
-            params![task_id, id, task_title.or(title), t, t],
+            "INSERT INTO tasks(id,job_id,title,assignee,worktree,branch,
+             base_sha,state,created,updated)
+             VALUES(?,?,?,?,?,?,?,'draft',?,?)",
+            params![
+                task_id,
+                id,
+                task_title.or(title),
+                task_assignee,
+                task_worktree,
+                task_branch,
+                task_base_sha,
+                t,
+                t
+            ],
         )?;
         Self::event_scoped(
             &tx,
@@ -2998,6 +3018,10 @@ mod tests {
                 None,
                 2,
                 None,
+                None,
+                None,
+                None,
+                None,
             )
             .unwrap();
             let v: i64 = s
@@ -3069,6 +3093,10 @@ mod tests {
             None,
             None,
             2,
+            None,
+            None,
+            None,
+            None,
             None,
         )
         .unwrap();

@@ -129,6 +129,18 @@ in `job show`/`job list`, rides in the routed `worker_result` payload,
 and — when set — the kickoff body tells the worker to put the header
 line `Issue: <ID>` in any agent-note it writes.
 
+`cadence issue start <ID> --job --pm <alias> --spec <file>` is the
+board-side entry point (CAD-43): it mints the issue's
+`.cadence/wt/<id>-<slug>` worktree + `cadence/<id>-<slug>` branch in
+the project repo, records both refs on the issue, and then opens the
+job through `job_new` — `--issue <ID>`, `--repo`, `--base-ref <base
+sha>` on the job, and `task_worktree`/`task_branch`/`task_base_sha`
+/`task_assignee` scoping the default `<job>-t1` task, so the job has
+exactly one task already bound to the worktree. The daemon, the PM
+alias and any `--assignee` (PM or group member) are probed before
+anything is created, so a daemon-down, unknown-PM or bad-assignee run
+leaves nothing behind.
+
 ---
 
 ## 3. Lifecycle
@@ -204,6 +216,8 @@ without an operator `reopen`.
 cadence job new --pm <pm> --spec <file> [--job <id>] [--title t]
                 [--issue CAD-31] [--repo <path>] [--base-ref <ref>]
                 [--max-revisions 2] [--task-title t]
+                [--task-worktree <name>] [--task-branch <b>]
+                [--task-base-sha <sha>] [--task-assignee <alias>]
 cadence job list [--state s] [--all]
 cadence job show <job>                 # job + tasks + verdicts + live kickoffs + drift flags
 cadence job events <job> [--after n] [--wait s] [--follow]
@@ -323,6 +337,12 @@ and a disciplined retry path, never a blind replay.
 `task_sha`, `task_fail`, `task_reopen`, `task_cancel`, `job_cancel`,
 `job_close`. Plus `message_report.sha`, `agent_send.task`, and the
 `task` binding in `agent_list`/`self` output.
+
+`job_new` also accepts optional task-scope params — `task_worktree`,
+`task_branch`, `task_base_sha`, `task_assignee` — applied to the
+default `<job>-t1` it mints (assignee is validated against the job's
+group, same rule as `task_new`). Absent params keep the original
+behaviour: an unscoped draft `t1`.
 
 Capabilities: `job_lifecycle`, `revision_bound_verdicts`.
 

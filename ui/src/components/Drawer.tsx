@@ -598,7 +598,15 @@ export default function Drawer({
                             {r.label ?? r.url}
                           </a>
                         ) : (
-                          <span>{r.label ?? r.path}</span>
+                          <span>
+                            {r.kind === "branch" && r.label
+                              ? `${r.label}: ${r.path}`
+                              : r.kind === "worktree" && r.path
+                                ? (r.path.split(".cadence/wt/")[1]
+                                    ? `wt/${r.path.split(".cadence/wt/")[1]}`
+                                    : r.path)
+                                : (r.label ?? r.path)}
+                          </span>
                         )}
                       </span>
                     ))}

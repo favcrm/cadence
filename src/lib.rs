@@ -13,5 +13,6 @@ pub mod proto;
 pub mod skill;
 pub mod store;
 pub mod ui;
+pub mod worktree;
 
 pub use error::{Error, Result};

@@ -17,7 +17,6 @@ use cadence_agent::adapter::pty;
 use cadence_agent::adapter::registry::{self, Attach, Reporting};
 use cadence_agent::client;
 use cadence_agent::error::{Error, Result};
-use cadence_agent::proto;
 
 #[derive(Parser)]
 #[command(
@@ -475,6 +474,18 @@ enum JobAction {
         /// Title for the default `<job>-t1` task.
         #[arg(long)]
         task_title: Option<String>,
+        /// Worktree name (`.cadence/wt/<name>`) scoped onto `<job>-t1`.
+        #[arg(long)]
+        task_worktree: Option<String>,
+        /// Branch scoped onto `<job>-t1`.
+        #[arg(long)]
+        task_branch: Option<String>,
+        /// Base revision scoped onto `<job>-t1`.
+        #[arg(long)]
+        task_base_sha: Option<String>,
+        /// Assignee scoped onto `<job>-t1` — the PM or a group member.
+        #[arg(long)]
+        task_assignee: Option<String>,
     },
     /// List jobs — non-terminal by default; `--all` or `--state` widen.
     List {
@@ -2196,7 +2207,7 @@ fn run() -> Result<i32> {
             }
         }
         Commands::Job { action } => run_job(&state_dir, &action),
-        Commands::Issue { action } => cadence_agent::issue::cli::run(&action),
+        Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
     }
 }
@@ -2221,6 +2232,10 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
             base_ref,
             max_revisions,
             task_title,
+            task_worktree,
+            task_branch,
+            task_base_sha,
+            task_assignee,
         } => {
             // Canonicalize + hash client-side: the daemon stores the
             // path/hash and never needs the board or spec filesystem.
@@ -2239,7 +2254,11 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                        "job": job, "title": title, "issue": issue,
                        "repo": repo, "base_ref": base_ref,
                        "max_revisions": max_revisions,
-                       "task_title": task_title}),
+                       "task_title": task_title,
+                       "task_worktree": task_worktree,
+                       "task_branch": task_branch,
+                       "task_base_sha": task_base_sha,
+                       "task_assignee": task_assignee}),
             )?);
         }
         JobAction::List { state, all } => {
@@ -2922,61 +2941,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Keep `.cadence/` out of a repo's index: append the entry to its
-/// `.gitignore` when nothing already covers it.
-fn ensure_cadence_ignored(root: &Path) -> Result<()> {
-    let path = root.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let covered = existing.lines().any(|l| {
-        matches!(
-            l.trim(),
-            ".cadence" | ".cadence/" | "/.cadence" | "/.cadence/"
-        )
-    });
-    if !covered {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, ".cadence/")?;
-    }
-    Ok(())
-}
-
 /// `git worktree add <root>/.cadence/wt/<name> -b cadence/<name>` — the
-/// new checkout becomes the agent's cwd. Clean failures: no git repo
-/// under `base`, a pre-existing worktree dir, or a branch collision.
+/// new checkout becomes the agent's cwd. Shared with `issue start`
+/// through `cadence_agent::worktree`.
 fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
-    proto::identifier(name, "Worktree name")?;
-    let root = match git(base, &["rev-parse", "--show-toplevel"]) {
-        Ok(root) => PathBuf::from(root),
-        Err(_) => {
-            return Err(Error::rejected(format!(
-                "--worktree requires a git repository — '{}' is not inside one",
-                base.display()
-            )))
-        }
-    };
-    let dir = root.join(".cadence").join("wt").join(name);
-    if dir.exists() {
-        return Err(Error::rejected(format!(
-            "Worktree '{name}' already exists at {} — reuse it with \
-             --cwd {}",
-            dir.display(),
-            dir.display()
-        )));
-    }
-    let branch = format!("cadence/{name}");
-    let target = dir.to_string_lossy().into_owned();
-    git(&root, &["worktree", "add", &target, "-b", &branch]).map_err(|e| {
-        Error::rejected(format!(
-            "{e} — if branch '{branch}' already exists, reuse the checkout \
-             with --cwd or pick another --worktree name"
-        ))
-    })?;
-    ensure_cadence_ignored(&root)?;
-    Ok(dir)
+    cadence_agent::worktree::create_worktree(base, name)
 }
 
 /// Marker pair delimiting the cadence block inside a repo's AGENTS.md.
