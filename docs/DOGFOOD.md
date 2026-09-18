@@ -397,6 +397,10 @@ SHA and makes skipping review visible — a merged head with no
 is not an authorization boundary. The one-approving-review rule on
 `main` is a separate setting that the shared account cannot satisfy for
 its own PRs; whether `qa-verdict` replaces it is the operator's call.
+One trap: required checks match workflow job names too, so no CI job
+may ever be called `qa-verdict` — its check run would satisfy the gate
+with no reviewer involved. `--check` reads commit statuses only and is
+not fooled; branch protection would be.
 
 **Rule that fell out:** a verdict is about a commit, so store it on the
 commit — a note about a branch goes stale the moment the branch moves.
