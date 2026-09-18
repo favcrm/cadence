@@ -28,8 +28,17 @@ const POST_COMMIT: &str = "#!/bin/sh\n\
 # cadence board tracker: keep the private remote current after every write.\n\
 # No-op until an `origin` remote exists; runs in the background so writers never wait.\n\
 git remote get-url origin >/dev/null 2>&1 || exit 0\n\
-branch=$(git rev-parse --abbrev-ref HEAD)\n\
-( git push -q origin \"$branch\" >/dev/null 2>&1 || echo \"$(date -u +%FT%TZ) push failed\" >> .git/push-failures.log ) &\n";
+gd=$(git rev-parse --git-dir 2>/dev/null) || exit 0\n\
+# A rebase, merge or cherry-pick is mid-sequence — whoever drives it\n\
+# (e.g. `cadence issue sync`) owns the push; replayed commits are not\n\
+# settled state and pushing them leaks work that may still be undone.\n\
+if [ -d \"$gd/rebase-merge\" ] || [ -d \"$gd/rebase-apply\" ] || \\\n\
+   [ -f \"$gd/MERGE_HEAD\" ] || [ -f \"$gd/CHERRY_PICK_HEAD\" ]; then\n\
+  exit 0\n\
+fi\n\
+# A detached HEAD has no branch to push — leave it alone.\n\
+branch=$(git symbolic-ref --quiet --short HEAD) || exit 0\n\
+( git push -q origin \"$branch\" >/dev/null 2>&1 || echo \"$(date -u +%FT%TZ) push failed\" >> \"$gd/push-failures.log\" ) &\n";
 
 /// The hooks init manages: name → content.
 const HOOKS: [(&str, &str); 2] = [("pre-commit", PRE_COMMIT), ("post-commit", POST_COMMIT)];

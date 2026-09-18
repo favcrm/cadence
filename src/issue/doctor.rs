@@ -61,27 +61,33 @@ fn push_state(pm_dir: &Path) -> Option<Value> {
         let range = format!("{}...{}", upstream.as_deref().unwrap_or_default(), "HEAD");
         let counts = probe(pm_dir, &["rev-list", "--left-right", "--count", &range]);
         let mut parts = counts.as_deref().unwrap_or("0\t0").split_whitespace();
-        (
-            parts
-                .next()
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0),
-            parts
-                .next()
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0),
-        )
+        // Left of `...` counts upstream-only commits (behind), right
+        // counts HEAD-only ones (ahead).
+        let behind = parts
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        let ahead = parts
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        (ahead, behind)
     } else {
         (0, 0)
     };
-    Some(json!({
+    let mut push = json!({
         "remote": url,
         "branch": branch,
         "upstream": has_upstream,
         "ahead": ahead,
         "behind": behind,
         "up_to_date": has_upstream && ahead == 0,
-    }))
+    });
+    // Behind the remote → `issue sync` is the path back level.
+    if behind > 0 {
+        push["sync"] = json!("cadence issue sync");
+    }
+    Some(push)
 }
 
 pub fn run(pm: &Pm) -> Result<Value> {

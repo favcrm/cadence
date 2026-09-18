@@ -14,6 +14,7 @@ pub mod model;
 pub mod notes;
 pub mod parse;
 pub mod project;
+pub mod sync;
 pub mod time;
 pub mod write;
 
@@ -231,7 +232,7 @@ impl Drop for PmLock {
 }
 
 /// Run a git subcommand in `dir`; rejected error carries stderr.
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
