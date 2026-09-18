@@ -94,6 +94,13 @@ enum Commands {
         /// (a human `agent ready` still wins).
         #[arg(long)]
         auto_ready: bool,
+        /// Devin permission mode: auto, accept-edits, smart or
+        /// dangerous. Persisted and replayed on every launch/resume.
+        #[arg(long)]
+        permission_mode: Option<String>,
+        /// Shortcut for --permission-mode dangerous.
+        #[arg(long, conflicts_with = "permission_mode")]
+        bypass: bool,
     },
     /// Launch a Codex agent on a managed-ws endpoint, attachable by the
     /// official Codex TUI via `codex resume --remote`. This terminal
@@ -257,14 +264,17 @@ enum Commands {
         /// Model flag for provider `claude` (e.g. sonnet, haiku).
         #[arg(long)]
         model: Option<String>,
-        /// Claude permission mode [default: manual]. Replayed on resume.
+        /// Permission mode, replayed on resume. Claude takes its own
+        /// modes [default: manual]; devin takes auto, accept-edits,
+        /// smart or dangerous.
         #[arg(long)]
         permission_mode: Option<String>,
         /// Extra auto-allowed tool patterns for provider `claude`;
         /// repeatable. `Bash(cadence *)` is always included.
         #[arg(long)]
         allow: Vec<String>,
-        /// Claude shortcut for --permission-mode bypassPermissions.
+        /// Permission-mode shortcut: bypassPermissions for claude,
+        /// dangerous for devin.
         #[arg(long, conflicts_with = "permission_mode")]
         bypass: bool,
         /// Seconds without any provider event before a claude turn is
@@ -1600,6 +1610,8 @@ fn run() -> Result<i32> {
             bootstrap,
             no_bootstrap,
             auto_ready,
+            permission_mode,
+            bypass,
         } => provider_launch(
             &state_dir,
             "devin",
@@ -1614,6 +1626,10 @@ fn run() -> Result<i32> {
             BriefMode::standalone(no_bootstrap, bootstrap),
             auto_ready,
             &ClaudeOpts::default(),
+            &DevinOpts {
+                permission_mode,
+                bypass,
+            },
         ),
         Commands::Codex {
             detach,
@@ -1638,6 +1654,7 @@ fn run() -> Result<i32> {
             BriefMode::standalone(no_bootstrap, bootstrap),
             false,
             &ClaudeOpts::default(),
+            &DevinOpts::default(),
         ),
         Commands::Claude {
             cwd,
@@ -1675,6 +1692,7 @@ fn run() -> Result<i32> {
                 turn_idle_secs,
                 turn_max_secs,
             },
+            &DevinOpts::default(),
         ),
         Commands::Join {
             group,
@@ -1709,11 +1727,18 @@ fn run() -> Result<i32> {
             auto_ready,
             ClaudeOpts {
                 model,
-                permission_mode,
+                permission_mode: permission_mode.clone(),
                 allow,
                 bypass,
                 turn_idle_secs,
                 turn_max_secs,
+            },
+            // The shared --permission-mode/--bypass flags feed the
+            // devin worker too — its four-mode vocabulary is validated
+            // in provider_launch.
+            DevinOpts {
+                permission_mode,
+                bypass,
             },
         ),
         Commands::Attach { name, print } => attach_command(&state_dir, name, print),
@@ -2272,6 +2297,16 @@ struct ClaudeOpts {
     turn_max_secs: Option<u64>,
 }
 
+/// Devin-specific launch options — `params.permission_mode` rides the
+/// profile so the same `--permission-mode` argv replays on every pane
+/// open, fresh and `-r` resume alike. `--bypass` is the `dangerous`
+/// shorthand.
+#[derive(Default)]
+struct DevinOpts {
+    permission_mode: Option<String>,
+    bypass: bool,
+}
+
 /// `cadence devin [-r slug]` / `cadence codex` / `cadence claude`:
 /// register the provider's endpoint, wait for it to open, then attach
 /// this terminal by default where the kind has an attachable surface.
@@ -2293,6 +2328,7 @@ fn provider_launch(
     briefing: BriefMode,
     auto_ready: bool,
     claude: &ClaudeOpts,
+    devin: &DevinOpts,
 ) -> Result<i32> {
     // The provider's launch endpoint kind comes from the registry —
     // one lookup replaces the per-verb literals and join's match.
@@ -2353,10 +2389,8 @@ fn provider_launch(
         params_obj.insert("upstream".to_string(), Value::String(upstream.clone()));
     }
     // Claude's launch params ride in `params` so the adapter replays
-    // them verbatim on resume; only the claude spec lists them.
-    if registry::spec_opt(provider, endpoint_kind)
-        .is_some_and(|s| s.launch_params.contains(&"permission_mode"))
-    {
+    // them verbatim on resume.
+    if provider == "claude" {
         if let Some(model) = &claude.model {
             params_obj.insert("model".to_string(), json!(model));
         }
@@ -2376,6 +2410,20 @@ fn provider_launch(
         }
         if let Some(secs) = claude.turn_max_secs {
             params_obj.insert("turn_max_secs".to_string(), json!(secs));
+        }
+    }
+    // Devin's `permission_mode` persists the same way — the profile
+    // replays it into the pane argv on every open, so a `--bypass`
+    // worker never stalls on its first approval menu again.
+    if provider == "devin" {
+        let mode = if devin.bypass {
+            Some("dangerous")
+        } else {
+            devin.permission_mode.as_deref()
+        };
+        if let Some(mode) = mode {
+            registry::devin_permission_mode(mode)?;
+            params_obj.insert("permission_mode".to_string(), json!(mode));
         }
     }
     if auto_ready {
@@ -2464,6 +2512,7 @@ fn provider_launch(
         "state": state,
         "session": native,
         "endpoint": agent["endpoint"],
+        "permission_mode": agent["params"]["permission_mode"],
         "upstream": if registered_fresh { upstream.clone() } else { None },
         "next": next,
     }));
@@ -2504,6 +2553,7 @@ fn join_group(
     no_bootstrap: bool,
     auto_ready: bool,
     claude_opts: ClaudeOpts,
+    devin_opts: DevinOpts,
 ) -> Result<i32> {
     // Validate the provider before any work — the registry names the
     // supported launch verbs in the rejection.
@@ -2546,6 +2596,7 @@ fn join_group(
         },
         auto_ready,
         &claude_opts,
+        &devin_opts,
     )
 }
 
@@ -2752,6 +2803,12 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
         Some(up) => format!("`{up}` — reported results route to it automatically"),
         None => "none — you are a group root".to_string(),
     };
+    // The launch-time permission mode is a fact of this agent's
+    // endpoint — it replays on every open, so the briefing says so.
+    let permission = agent["params"]["permission_mode"]
+        .as_str()
+        .map(|m| format!(" Permission mode: `{m}` (replayed on every launch)."))
+        .unwrap_or_default();
     let roster = client::rpc(state_dir, "agent_list", json!({}))
         .ok()
         .and_then(|l| l["agents"].as_array().cloned())
@@ -2796,7 +2853,7 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
         "# Cadence briefing — {alias} in group {root}\n\n\
          You are `{alias}`, a cadence-managed agent (provider `{provider}`,\n\
          endpoint `{kind}`). Native session: `{native}`.\n\
-         Upstream: {upstream}.\n\n\
+         Upstream: {upstream}.{permission}\n\n\
          ## Protocol\n\n\
          - `cadence self` — prints your alias, running message ids and\n\
          \x20 `turn_id` report tokens.\n\
@@ -3014,6 +3071,74 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn devin_permission_flags_parse() {
+        let cli = Cli::try_parse_from(["cadence", "devin", "--permission-mode", "smart"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Devin {
+                permission_mode: Some(m),
+                bypass: false,
+                ..
+            } if m == "smart"
+        ));
+        let cli = Cli::try_parse_from(["cadence", "devin", "--bypass"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Devin {
+                permission_mode: None,
+                bypass: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn devin_bypass_conflicts_with_permission_mode() {
+        // Same rule as the claude verb — the shorthand must not fight
+        // an explicit mode.
+        assert!(Cli::try_parse_from([
+            "cadence",
+            "devin",
+            "--permission-mode",
+            "smart",
+            "--bypass"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn join_permission_flags_parse_for_devin() {
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "join",
+            "pm",
+            "devin",
+            "--permission-mode",
+            "dangerous",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Join {
+                permission_mode: Some(m),
+                ..
+            } if m == "dangerous"
+        ));
+        let cli = Cli::try_parse_from(["cadence", "join", "pm", "devin", "--bypass"]).unwrap();
+        assert!(matches!(cli.command, Commands::Join { bypass: true, .. }));
+        assert!(Cli::try_parse_from([
+            "cadence",
+            "join",
+            "pm",
+            "devin",
+            "--permission-mode",
+            "auto",
+            "--bypass"
+        ])
+        .is_err());
     }
 
     #[test]

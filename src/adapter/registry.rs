@@ -24,6 +24,11 @@ pub const INBOX: &str = "inbox";
 /// default, kept verbatim from the historical `unwrap_or`.
 pub const DEFAULT_ENDPOINT_KIND: &str = "managed";
 
+/// The four modes `devin --permission-mode` accepts. `--bypass` is a
+/// launch shorthand that stores `dangerous`; it is never a stored
+/// value itself.
+pub const DEVIN_PERMISSION_MODES: &[&str] = &["auto", "accept-edits", "smart", "dangerous"];
+
 /// How a live endpoint's native surface is attached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attach {
@@ -201,7 +206,13 @@ pub static SPECS: &[EndpointSpec] = &[
         resumable: true,
         resume_label: "devin -r <slug>",
         live_settable_params: &["auto_ready"],
-        launch_params: &["session", "upstream", "auto_ready"],
+        launch_params: &[
+            "session",
+            "upstream",
+            "auto_ready",
+            "permission_mode",
+            "bypass",
+        ],
         session_id_label: "Devin session",
         respond_rejection: None,
         capabilities: &["pty_devin_tmux", "pty_verified_autoready"],
@@ -467,6 +478,40 @@ pub fn validate_live_param(provider: &str, kind: &str, key: &str, value: &Value)
     }
 }
 
+/// Reject a Devin permission mode outside the four-value vocabulary —
+/// the launch verbs and `agent_register` share this check, and the
+/// error always names every accepted value.
+pub fn devin_permission_mode(mode: &str) -> Result<()> {
+    if DEVIN_PERMISSION_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        Err(Error::rejected(format!(
+            "unknown devin permission mode '{mode}' — expected one of: {}",
+            DEVIN_PERMISSION_MODES.join(", ")
+        )))
+    }
+}
+
+/// Register-time validation for enumerated launch params. Params not
+/// named here keep their historical pass-through (claude's modes are
+/// provider-validated — its own CLI rejects bad values on spawn).
+pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Result<()> {
+    if provider == "devin" && kind == "pty" {
+        if let Some(v) = params.get("permission_mode") {
+            match v.as_str() {
+                Some(mode) => devin_permission_mode(mode)?,
+                None => {
+                    return Err(Error::rejected(format!(
+                        "devin permission_mode must be a string, one of: {}",
+                        DEVIN_PERMISSION_MODES.join(", ")
+                    )))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Attach {
     fn label(&self) -> &'static str {
         match self {
@@ -607,5 +652,72 @@ mod tests {
         assert_eq!(report_hint("codex", "managed-ws"), Reporting::Explicit);
         assert!(respond_rejection("claude", "managed").is_some());
         assert!(respond_rejection("codex", "managed-ws").is_none());
+    }
+
+    #[test]
+    fn devin_permission_modes_validated() {
+        for mode in DEVIN_PERMISSION_MODES {
+            assert!(devin_permission_mode(mode).is_ok(), "{mode}");
+        }
+        // Everything else rejects — including claude's own vocabulary —
+        // and the error always lists the four accepted values.
+        for bad in [
+            "bypass",
+            "manual",
+            "acceptEdits",
+            "bypassPermissions",
+            "",
+            "AUTO",
+        ] {
+            let msg = devin_permission_mode(bad).unwrap_err().to_string();
+            for accepted in DEVIN_PERMISSION_MODES {
+                assert!(
+                    msg.contains(accepted),
+                    "'{bad}' error missing '{accepted}': {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn devin_launch_params_validated_at_register() {
+        // Only (devin, pty) carries the enumerated check — other pairs
+        // pass params through untouched.
+        for mode in DEVIN_PERMISSION_MODES {
+            assert!(
+                validate_launch_params("devin", "pty", &json!({"permission_mode": mode})).is_ok(),
+                "{mode}"
+            );
+        }
+        let msg = validate_launch_params("devin", "pty", &json!({"permission_mode": "bogus"}))
+            .unwrap_err()
+            .to_string();
+        for accepted in DEVIN_PERMISSION_MODES {
+            assert!(msg.contains(accepted), "missing '{accepted}': {msg}");
+        }
+        // Non-string values reject too; unrelated keys pass through.
+        assert!(validate_launch_params("devin", "pty", &json!({"permission_mode": 1})).is_err());
+        assert!(validate_launch_params(
+            "devin",
+            "pty",
+            &json!({"session": "s", "upstream": "pm", "auto_ready": "verified"})
+        )
+        .is_ok());
+        assert!(
+            validate_launch_params("claude", "managed", &json!({"permission_mode": "bogus"}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn permission_mode_is_not_live_settable() {
+        // Launch-only: `agent set` must refuse it — a live patch would
+        // silently diverge the stored mode from the running pane.
+        for pair in [("devin", "pty"), ("claude", "managed")] {
+            let msg = validate_live_param(pair.0, pair.1, "permission_mode", &json!("smart"))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("not live-settable"), "{msg}");
+        }
     }
 }

@@ -181,7 +181,16 @@ pub fn build(
                 hooks,
                 log_path,
                 agent,
-                pty::DevinProfile::new()?,
+                // The stored permission mode rides the profile so the
+                // same argv is replayed on every open — fresh launch
+                // and `-r` resume alike.
+                pty::DevinProfile::new()?.with_permission_mode(agent.params.as_ref().and_then(
+                    |p| {
+                        p.get("permission_mode")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    },
+                )),
             )?)),
             // Harness double: proves the adapter is profile-driven.
             "tui-stub" => Ok(Box::new(pty::PtyAdapter::new(

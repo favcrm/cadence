@@ -149,6 +149,9 @@ pub struct DevinProfile {
     locks_dir: PathBuf,
     /// Absolute `devin` argv resolved at construction.
     command: String,
+    /// `params.permission_mode` replayed into every launch argv —
+    /// fresh and `-r` resume alike. `None` keeps Devin's own default.
+    permission_mode: Option<String>,
 }
 
 impl DevinProfile {
@@ -168,7 +171,18 @@ impl DevinProfile {
             Ok(cmd) if !cmd.is_empty() => cmd,
             _ => resolve_on_path("devin").map(|p| shlex_quote(&p))?,
         };
-        Ok(Self { locks_dir, command })
+        Ok(Self {
+            locks_dir,
+            command,
+            permission_mode: None,
+        })
+    }
+
+    /// Set the launch permission mode from the agent's stored params —
+    /// replayed into every launch argv, fresh and `-r` resume alike.
+    pub fn with_permission_mode(mut self, mode: Option<String>) -> Self {
+        self.permission_mode = mode;
+        self
     }
 
     fn lock_path(&self, session: &str) -> PathBuf {
@@ -183,6 +197,11 @@ impl TuiProfile for DevinProfile {
 
     fn launch_command(&self, resume: Option<&str>) -> Result<String> {
         let mut argv = self.command.clone();
+        // `--permission-mode` is a top-level flag — it combines with
+        // `-r` on resume exactly as on a fresh launch.
+        if let Some(mode) = &self.permission_mode {
+            argv.push_str(&format!(" --permission-mode {}", shlex_quote(mode)));
+        }
         if let Some(want) = resume {
             argv.push_str(&format!(" -r {}", shlex_quote(want)));
         }
@@ -278,7 +297,52 @@ impl TuiProfile for DevinProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze_devin, STATUS_LINES};
+    use super::{analyze_devin, DevinProfile, STATUS_LINES};
+    use crate::adapter::pty::profile::TuiProfile;
+    use crate::adapter::registry::DEVIN_PERMISSION_MODES;
+    use std::path::PathBuf;
+
+    fn profile(mode: Option<&str>) -> DevinProfile {
+        DevinProfile {
+            locks_dir: PathBuf::from("/nonexistent"),
+            command: "devin".to_string(),
+            permission_mode: mode.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn launch_argv_replays_permission_mode_fresh_and_resume() {
+        for mode in DEVIN_PERMISSION_MODES {
+            let p = profile(Some(mode));
+            assert_eq!(
+                p.launch_command(None).unwrap(),
+                format!("devin --permission-mode '{mode}'")
+            );
+            assert_eq!(
+                p.launch_command(Some("slug-1")).unwrap(),
+                format!("devin --permission-mode '{mode}' -r 'slug-1'")
+            );
+        }
+    }
+
+    #[test]
+    fn launch_argv_omits_flag_when_mode_unset() {
+        let p = profile(None);
+        assert_eq!(p.launch_command(None).unwrap(), "devin");
+        assert_eq!(
+            p.launch_command(Some("slug-1")).unwrap(),
+            "devin -r 'slug-1'"
+        );
+    }
+
+    #[test]
+    fn permission_mode_is_shell_quoted() {
+        // Values are validated upstream, but a hand-edited params row
+        // must never reach the pane shell unquoted.
+        let p = profile(Some("dangerous; rm -rf /"));
+        let argv = p.launch_command(None).unwrap();
+        assert_eq!(argv, "devin --permission-mode 'dangerous; rm -rf /'");
+    }
 
     /// Real idle screen captured from a live Devin pane.
     const IDLE: &str = "\
