@@ -22,8 +22,10 @@ use super::{descends_from, lock_holders, resolve_on_path, shlex_quote};
 const OPEN_DEADLINE: Duration = Duration::from_secs(30);
 /// How much of the screen bottom counts as the status region: input
 /// line, divider, status bar and a menu tall enough for Devin's
-/// approval select. Busy/approval markers only match inside it — the
+/// approval select. Approval markers only match inside it — the
 /// transcript above can legitimately show these strings as text.
+/// (Busy is anchored tighter still: the status row directly above the
+/// input box — see `analyze_devin`.)
 const STATUS_LINES: usize = 14;
 
 /// Devin TUI screen signatures — THE one place they live. A provider
@@ -40,13 +42,16 @@ mod devin_screen {
     /// this placeholder; reading it as a staged draft would misjudge a
     /// healthy turn as unsubmitted (observed live with a ~3.6KB body).
     pub const BUSY_PLACEHOLDER: &str = "Guide Devin while it works";
-    /// On-screen markers while a turn is running.
-    pub const BUSY: &[&str] = &[
+    /// Spinner labels on the status row directly above the input box
+    /// while a turn runs — `<label> · Ns (esc twice to interrupt)`.
+    pub const SPINNER: &[&str] = &["Thinking", "Typing", "Running tools"];
+    /// Interrupt hints on that same status row. Busy evidence only in
+    /// that position: a `Did you know` tip in the region can quote the
+    /// same strings and stays neutral.
+    pub const INTERRUPT: &[&str] = &[
         "(esc again to interrupt)",
         "(esc twice to interrupt)",
         "Cancel agent (esc twice)",
-        "Guide Devin while it works",
-        "Press Ctrl+O to view the full thinking trace",
     ];
     /// An open select/permission menu — the hint-bar fragments plus the
     /// option labels only a menu renders. `↑↓ select · ↵ confirm ·
@@ -75,12 +80,16 @@ pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
 /// Reduce a captured Devin screen to gate facts. The last `❭` line is
 /// the input line; text after it that is not the placeholder is a
 /// staged draft. Menus and busy markers win over prompt parsing — a
-/// `❭` leads the first approval option too — and both are only read
-/// in the bottom status region: the transcript above can legitimately
-/// print these same strings (source text, docs) without the pane being
-/// busy at all. The region is anchored at the last NON-BLANK row —
-/// `capture-pane` pads the capture to pane height, so a young session
-/// on a tall pane has blank rows below the real content.
+/// `❭` leads the first approval option too. Approval menus are only
+/// read in the bottom status region (the transcript above can
+/// legitimately print the same strings), and busy is anchored tighter
+/// still: the busy watermark in the input line, or the status row
+/// directly above the box — the spinner label or interrupt hint.
+/// A `Did you know` tip in the region is neutral: it quotes the same
+/// hints as documentation, never as a status row. The region is
+/// anchored at the last NON-BLANK row — `capture-pane` pads the
+/// capture to pane height, so a young session on a tall pane has
+/// blank rows below the real content.
 pub fn analyze_devin(screen: &str) -> Probe {
     let content = screen.trim_end();
     let tail: String = content
@@ -93,38 +102,53 @@ pub fn analyze_devin(screen: &str) -> Probe {
         .collect::<Vec<_>>()
         .join("\n");
     let approval_menu = devin_screen::APPROVAL.iter().any(|m| tail.contains(m));
-    let region_busy = devin_screen::BUSY
+    let lines: Vec<&str> = screen.lines().collect();
+    let prompt_idx = lines
         .iter()
-        .chain(devin_screen::QUEUED.iter())
-        .any(|m| tail.contains(m));
-    let prompt_line = screen
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with(devin_screen::PROMPT));
-    let prompt_visible = prompt_line.is_some();
-    let draft = prompt_line
-        .map(|l| {
-            l.trim_start()
+        .rposition(|l| l.trim_start().starts_with(devin_screen::PROMPT));
+    let prompt_visible = prompt_idx.is_some();
+    let draft = prompt_idx
+        .map(|i| {
+            lines[i]
+                .trim_start()
                 .trim_start_matches(devin_screen::PROMPT)
                 .trim()
                 .to_string()
         })
         .unwrap_or_default();
+    // Busy is decided by positive evidence tied to the input box: the
+    // busy watermark in the input line itself, or the status row
+    // directly above the box — the spinner label or interrupt hint.
+    // Blank rows and the box's rules (which can carry embedded status
+    // text like `(bypass permissions on)`) sit between the two and are
+    // skipped; a `Did you know` tip in the region is neutral — it
+    // quotes the same hints as documentation, never as a status row.
+    let status_row = prompt_idx.and_then(|i| {
+        lines[..i].iter().rev().find(|l| {
+            let t = l.trim();
+            !t.is_empty() && t.chars().filter(|c| matches!(c, '─' | '═')).count() < 8
+        })
+    });
+    let status_busy = status_row.is_some_and(|row| {
+        devin_screen::SPINNER.iter().any(|m| row.contains(m))
+            || devin_screen::INTERRUPT.iter().any(|m| row.contains(m))
+            || devin_screen::QUEUED.iter().any(|m| row.contains(m))
+    });
     let input_nonempty = !draft.is_empty()
         && !draft.starts_with(devin_screen::PLACEHOLDER)
         && !draft.starts_with(devin_screen::BUSY_PLACEHOLDER);
     // Defence in depth: the busy watermark in the input line is itself
-    // a busy signal, checked before the region markers so the reason
-    // stays precise — and so the verdict survives even if the line ever
-    // falls outside the status window.
+    // a busy signal, checked before the status row so the reason stays
+    // precise — and so the verdict survives even if the row ever falls
+    // outside the capture.
     let watermark_busy = draft.starts_with(devin_screen::BUSY_PLACEHOLDER);
-    let busy_marker = region_busy || watermark_busy;
+    let busy_marker = status_busy || watermark_busy;
     let (idle, reason) = if approval_menu {
         (false, "approval menu is open")
     } else if watermark_busy {
         (false, "tui is busy (guide watermark in the input line)")
-    } else if region_busy {
-        (false, "tui is busy (interrupt marker on screen)")
+    } else if status_busy {
+        (false, "tui is busy (status row above the input box)")
     } else if !prompt_visible {
         (false, "no prompt line visible")
     } else if input_nonempty {
@@ -350,6 +374,37 @@ mod tests {
 ──────────────────────────────────────────────────────────────────
 SWE-2 Max                                          Context: 43k / 262k";
 
+    /// The input box's horizontal rule — can carry embedded status
+    /// text (`(bypass permissions on)`).
+    const RULE: &str = "──────────────────────────────────────────────────────────────────";
+
+    /// Idle pane with a `Did you know` tip banner between the
+    /// transcript and the input box — captured verbatim from a live
+    /// pane (CAD-50). The tip body quotes the same Ctrl+O hint the
+    /// busy status row shows; it must stay neutral.
+    const IDLE_TIP: &str = "\
+transcript tail
+
+ ✱ Did you know
+   Press Ctrl+O to view the full thinking trace
+
+──────────────────────────────────────────────────────────────────
+❭ Ask Devin to build features, fix bugs, or work on your code
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                          Context: 43k / 262k";
+
+    /// Busy pane with the same tip banner still visible — the status
+    /// row directly above the box is the busy evidence (captured
+    /// shape; the rule carries `(bypass permissions on)`).
+    const BUSY_TIP: &str = "\
+ ✱ Did you know
+   Press Ctrl+O to view the full thinking trace
+⡆⠀ Running tools · 5m 51s (esc twice to interrupt)
+─────────────── (bypass permissions on) ────────────────────────────
+❭ Guide Devin while it works
+───────────────────────────────────────────────────────────────────
+SWE-2 Max                          Context: 153k / 262k tokens (58%)";
+
     /// Real approval menu captured verbatim from a live Devin pane
     /// (v3000.10.31): option list plus the `↑↓ select · ↵ confirm ·
     /// esc cancel` footer.
@@ -384,17 +439,67 @@ Allow this tool call?
     }
 
     #[test]
-    fn busy_markers_block_even_with_prompt() {
-        for marker in [
-            "(esc twice to interrupt)",
+    fn status_row_markers_block_even_with_prompt() {
+        // Busy evidence lives on the status row directly above the
+        // input box — spinner labels, interrupt hints, the staged-
+        // queue hint. The same strings elsewhere stay neutral.
+        for row in [
+            "⠸  Thinking · 0s (esc twice to interrupt)",
+            "⡆⠀ Running tools · 5m 51s (esc twice to interrupt)",
+            "Typing · 2s (esc again to interrupt)",
             "Cancel agent (esc twice)",
-            "Guide Devin while it works",
-            "Press Ctrl+O to view the full thinking trace",
+            "Press Enter to send queued messages",
         ] {
-            let screen = format!("{IDLE}\nWorking on it {marker}");
+            let screen = format!("{row}\n{RULE}\n❭ Guide Devin while it works\n{RULE}\nSWE-2 Max");
             let p = analyze_devin(&screen);
-            assert!(!p.idle && p.busy_marker, "{marker}: {}", p.reason);
+            assert!(!p.idle && p.busy_marker, "{row}: {}", p.reason);
         }
+    }
+
+    #[test]
+    fn idle_tip_banner_is_neutral_not_busy() {
+        // CAD-50: the `Did you know` tip quotes the Ctrl+O hint the
+        // busy status row shows — a tip between transcript and box is
+        // neutral, never busy evidence.
+        let p = analyze_devin(IDLE_TIP);
+        assert!(p.idle, "{} / {}", p.idle, p.reason);
+        assert!(p.prompt_visible && !p.input_nonempty);
+        assert!(!p.busy_marker && !p.approval_menu);
+    }
+
+    #[test]
+    fn busy_with_tip_still_blocks() {
+        // The tip stays neutral but the status row directly above the
+        // box is authoritative — a really busy pane still reads busy.
+        // The watermark on the input line reports first.
+        let p = analyze_devin(BUSY_TIP);
+        assert!(!p.idle && p.busy_marker, "{} / {}", p.idle, p.reason);
+        assert_eq!(p.reason, "tui is busy (guide watermark in the input line)");
+    }
+
+    #[test]
+    fn status_row_above_box_reports_busy_reason() {
+        // A spinner row with the idle placeholder still in the input
+        // (turn just started): the status row is the busy evidence.
+        let screen = format!(
+            "⠸  Thinking · 2s (esc twice to interrupt)\n{RULE}\n❭ Ask Devin to build features, fix bugs, or work on your code\n{RULE}\nSWE-2 Max"
+        );
+        let p = analyze_devin(&screen);
+        assert!(!p.idle && p.busy_marker);
+        assert_eq!(p.reason, "tui is busy (status row above the input box)");
+    }
+
+    #[test]
+    fn markers_elsewhere_in_region_do_not_count() {
+        // A marker quoted in the region but NOT on the status row is
+        // transcript-like content — only the row directly above the
+        // box is authoritative.
+        let screen = format!(
+            "note: (esc twice to interrupt) appeared in output\nordinary row\n{RULE}\n❭ Ask Devin to build features, fix bugs, or work on your code\n{RULE}\nSWE-2 Max"
+        );
+        let p = analyze_devin(&screen);
+        assert!(p.idle, "{} / {}", p.idle, p.reason);
+        assert!(!p.busy_marker);
     }
 
     #[test]
@@ -419,8 +524,11 @@ SWE-2 Max                                      Alt+Enter for multiline prompts";
     #[test]
     fn staged_tui_queue_is_busy_not_idle() {
         // A26 sibling: the TUI shows queued input while busy — adding
-        // more to it is still unsafe.
-        let screen = format!("{IDLE}\nPress Enter to send queued messages now");
+        // more to it is still unsafe. The hint renders on the status
+        // row directly above the box.
+        let screen = format!(
+            "Press Enter to send queued messages\n{RULE}\n❭ Guide Devin while it works\n{RULE}\nSWE-2 Max"
+        );
         let p = analyze_devin(&screen);
         assert!(!p.idle && p.busy_marker);
     }
@@ -476,10 +584,12 @@ SWE-2 Max                                      Alt+Enter for multiline prompts";
     }
 
     #[test]
-    fn markers_in_status_region_still_block() {
-        // Same strings inside the bottom region DO mean busy — the
-        // region is the TUI's live status/menu area.
-        let screen = format!("{IDLE}\n⠀⠇ Thinking · 30s (esc twice to interrupt)");
+    fn markers_on_the_status_row_still_block() {
+        // The spinner row directly above the box is the live status —
+        // it blocks even when the rest of the region looks calm.
+        let screen = format!(
+            "⠀⠇ Thinking · 30s (esc twice to interrupt)\n{RULE}\n❭ Ask Devin to build features, fix bugs, or work on your code\n{RULE}\nSWE-2 Max"
+        );
         let p = analyze_devin(&screen);
         assert!(!p.idle && p.busy_marker);
     }

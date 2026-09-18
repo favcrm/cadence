@@ -322,16 +322,21 @@ record `"daemon"` on the `ready_claimed` event itself).
 
 With `auto_ready=verified` the daemon mints a claim only after a pane
 probe verifies idle: the screen must show the `❭` prompt with an empty
-input line, and none of the observed busy signatures (`esc to
-interrupt` hints, the guide/steer bar, queued-message footers) or an
-approval menu — an approval screen's `❭` option marker can mimic a
-prompt, so menu detection wins over prompt shape. Busy and menu
-markers are matched only in the status region (the ~14 lines ending at
-the last non-blank row — `capture-pane` pads short content with blank
-rows, so the region is not the pane's literal bottom) — the transcript
-above can legitimately print the same strings without the pane being
-busy, and the `Guide Devin while it works` input watermark is itself a
-busy signal even outside the region. Claude's analyzer reads the same
+input line, and none of the observed busy signatures or an approval
+menu — an approval screen's `❭` option marker can mimic a prompt, so
+menu detection wins over prompt shape. Menu markers are matched only
+in the status region (the ~14 lines ending at the last non-blank row —
+`capture-pane` pads short content with blank rows, so the region is
+not the pane's literal bottom), and busy is anchored tighter still:
+the `Guide Devin while it works` input watermark, or the status row
+directly above the input box — the spinner label (`Thinking`,
+`Typing`, `Running tools`) or an `esc to interrupt`/`Cancel agent`
+hint, plus the queued-message footer. Blank rows and the box's rules
+(they can carry embedded text like `(bypass permissions on)`) sit
+between the two and are skipped; a `Did you know` tip banner in the
+region is neutral — it quotes the same hints as documentation, never
+as a status row, so a tip never stalls verified auto-ready.
+Claude's analyzer reads the same
 verdict from its own shapes: the input box is the last `❯`-leading
 line under a `─` border (a menu's `❯` option marker is never boxed),
 busy is the spinner's `esc to interrupt` hint or a `Waiting…` tool
