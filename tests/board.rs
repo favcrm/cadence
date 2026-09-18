@@ -20,14 +20,23 @@ fn bin() -> &'static str {
 }
 
 fn cli(pm: &Path, state: &Path, args: &[&str]) -> (bool, Value) {
-    let out = Command::new(bin())
-        .arg("--state-dir")
+    cli_env(pm, state, args, &[])
+}
+
+fn cli_env(pm: &Path, state: &Path, args: &[&str], env: &[(&str, &str)]) -> (bool, Value) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--state-dir")
         .arg(state)
         .args(args)
         .env("CADENCE_PM_DIR", pm)
         .env("HOME", std::env::var("HOME").unwrap())
-        .output()
-        .unwrap();
+        // Ambient aliases would leak into Actor: trailers and comment
+        // authors — remove it so every env resolves to `operator`.
+        .env_remove("CADENCE_ALIAS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
     // Errors print their JSON to stderr; successes to stdout.
     let text = if out.stdout.is_empty() {
         String::from_utf8_lossy(&out.stderr).to_string()
@@ -41,6 +50,26 @@ fn cli(pm: &Path, state: &Path, args: &[&str]) -> (bool, Value) {
         )
     });
     (out.status.success(), json)
+}
+
+/// `cadence …` for verbs that print plain text instead of JSON
+/// (`issue trailer`). Returns (ok, stdout-or-stderr).
+fn cli_raw(pm: &Path, state: &Path, args: &[&str]) -> (bool, String) {
+    let out = Command::new(bin())
+        .arg("--state-dir")
+        .arg(state)
+        .args(args)
+        .env("CADENCE_PM_DIR", pm)
+        .env("HOME", std::env::var("HOME").unwrap())
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap();
+    let text = if out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stderr).to_string()
+    } else {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    (out.status.success(), text.trim().to_string())
 }
 
 fn commits(pm: &Path) -> usize {
@@ -2393,9 +2422,11 @@ fn issue_log_kinds_actors_limit() {
         kinds,
         ["set", "attach", "comment", "link", "set", "set", "created"]
     );
-    // `by`: the ` (actor)` suffix when present, else the author name.
+    // `by`: the `Actor:` trailer — `operator (ui)` for the HTTP patch,
+    // `operator` for CLI writes (no alias in the test env).
     assert_eq!(hist[0]["by"], "operator (ui)");
-    assert_eq!(hist[1]["by"], "cadence");
+    assert_eq!(hist[1]["by"], "operator");
+    assert_eq!(hist[2]["by"], "fable-cc");
     // Summaries drop the id prefix and the actor suffix.
     assert_eq!(hist[0]["summary"], "set status=review");
     assert_eq!(hist[1]["summary"], "attach note.txt");
@@ -2769,4 +2800,288 @@ fn issue_history_refuses_non_git() {
             "{args:?}: {err}"
         );
     }
+}
+
+// ---------- CAD-42: Issue:/Actor: trailers, truthful `by`, code commits ----------
+
+/// `git interpret-trailers --parse` on one commit's message — the
+/// acceptance criterion checks trailers through git's own parser.
+fn trailers_of(dir: &Path, sha: &str) -> String {
+    let (_, msg) = git(dir, &["show", "-s", "--format=%B", sha]);
+    let mut child = Command::new("git")
+        .args(["interpret-trailers", "--parse"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(msg.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Find the sha of the issue-folder commit whose subject contains
+/// `needle` — same lookup shape as `history_fixture`'s `sha_of`.
+fn sha_of(pm: &Path, rel: &str, needle: &str) -> String {
+    let (_, log) = git(pm, &["log", "--format=%H %s", "--", rel]);
+    log.lines()
+        .find(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("no commit containing '{needle}': {log}"))
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn issue_commits_carry_trailers() {
+    let fx = history_fixture();
+    let rel = "cadence/CAD-1";
+    // Every write kind lands `Issue:` + `Actor:` trailers that
+    // `git interpret-trailers --parse` reads back.
+    for (needle, issue, actor) in [
+        ("created", "CAD-1", "operator"),
+        ("set status=doing", "CAD-1", "operator"),
+        ("set priority=P1", "CAD-1", "operator"),
+        ("link relates", "CAD-1", "operator"),
+        ("comment by fable-cc", "CAD-1", "fable-cc"),
+        ("attach note.txt", "CAD-1", "operator"),
+        ("set status=review", "CAD-1", "operator (ui)"),
+    ] {
+        let sha = sha_of(fx.pm.path(), rel, needle);
+        let trailers = trailers_of(fx.pm.path(), &sha);
+        assert!(
+            trailers.contains(&format!("Issue: {issue}")),
+            "{needle}: {trailers}"
+        );
+        assert!(
+            trailers.contains(&format!("Actor: {actor}")),
+            "{needle}: {trailers}"
+        );
+    }
+    // The link commit carries both ends, own id first.
+    let sha = sha_of(fx.pm.path(), rel, "link relates");
+    let trailers = trailers_of(fx.pm.path(), &sha);
+    let ids: Vec<&str> = trailers
+        .lines()
+        .filter_map(|l| l.strip_prefix("Issue: "))
+        .collect();
+    assert_eq!(ids, ["CAD-1", "CAD-2"], "{trailers}");
+    // CADENCE_ALIAS resolves before the `operator` fallback.
+    assert!(
+        cli_env(
+            fx.pm.path(),
+            fx.state.path(),
+            &["issue", "set", "CAD-1", "priority=P2"],
+            &[("CADENCE_ALIAS", "agent-x")],
+        )
+        .0
+    );
+    let sha = sha_of(fx.pm.path(), rel, "priority=P2");
+    assert!(trailers_of(fx.pm.path(), &sha).contains("Actor: agent-x"));
+    // Non-issue commits carry Actor only (project add), init too.
+    let proj = sha_of(fx.pm.path(), "cadence/project.yaml", "project cadence");
+    let t = trailers_of(fx.pm.path(), &proj);
+    assert!(
+        t.contains("Actor: operator") && !t.contains("Issue:"),
+        "{t}"
+    );
+    let (_, first) = git(fx.pm.path(), &["log", "--format=%H", "--reverse"]);
+    let init_sha = first.lines().next().unwrap().to_string();
+    assert!(
+        trailers_of(fx.pm.path(), &init_sha).contains("Actor:"),
+        "init commit carries Actor"
+    );
+}
+
+#[test]
+fn issue_log_by_from_trailers() {
+    let fx = history_fixture();
+    let (ok, out) = cli(fx.pm.path(), fx.state.path(), &["issue", "log", "CAD-1"]);
+    assert!(ok, "{out}");
+    let hist = out["history"].as_array().unwrap();
+    let by_for = |summary: &str| {
+        hist.iter()
+            .find(|e| e["summary"].as_str().unwrap_or("").contains(summary))
+            .unwrap_or_else(|| panic!("no entry '{summary}' in {hist:?}"))["by"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(by_for("set status=review"), "operator (ui)");
+    assert_eq!(by_for("comment by fable-cc"), "fable-cc");
+    assert_eq!(by_for("attach note.txt"), "operator");
+    assert_eq!(by_for("link relates"), "operator");
+    assert_eq!(by_for("created"), "operator");
+    // A trailer-less `comment by` commit still resolves its author
+    // from the subject; a plain hand commit falls to the git author.
+    // Each touches the issue folder so the path-filtered log sees it.
+    let md = fx.pm.path().join("cadence/CAD-1/issue.md");
+    for (name, subject) in [
+        ("ghost", "CAD-1: comment by ghost"),
+        ("hand", "wip manual edit"),
+    ] {
+        let text = std::fs::read_to_string(&md).unwrap();
+        std::fs::write(&md, format!("{text}\n{name}\n")).unwrap();
+        assert!(git(fx.pm.path(), &["add", "-A"]).0);
+        assert!(
+            git(
+                fx.pm.path(),
+                &[
+                    "-c",
+                    &format!("user.name={name}"),
+                    "-c",
+                    "user.email=h@h",
+                    "commit",
+                    "-q",
+                    "-m",
+                    subject
+                ]
+            )
+            .0
+        );
+    }
+    let (ok, out) = cli(fx.pm.path(), fx.state.path(), &["issue", "log", "CAD-1"]);
+    assert!(ok);
+    let hist = out["history"].as_array().unwrap();
+    assert_eq!(hist[0]["kind"], "other");
+    assert_eq!(hist[0]["by"], "hand");
+    assert_eq!(hist[1]["kind"], "comment");
+    assert_eq!(hist[1]["by"], "ghost", "subject fallback without trailer");
+}
+
+/// A tracker whose `x` project declares two repos: `repo` (a real
+/// git dir the test fills) and `/definitely/missing` (skip target).
+fn commits_fixture() -> (TempDir, TempDir, TempDir, u16) {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    assert!(git(repo.path(), &["init", "-q"]).0);
+    assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &[
+                "issue",
+                "project",
+                "add",
+                "x",
+                "--prefix",
+                "X",
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--repo",
+                "/definitely/missing",
+            ]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "new", "feat", "--project", "x"]
+        )
+        .0
+    );
+    let commit = |subject: &str, trailer: Option<&str>| {
+        let f = repo
+            .path()
+            .join(format!("f{}", repo.path().read_dir().unwrap().count()));
+        std::fs::write(&f, b"x").unwrap();
+        assert!(git(repo.path(), &["add", "."]).0);
+        let msg = match trailer {
+            Some(t) => format!("{subject}\n\n{t}"),
+            None => subject.to_string(),
+        };
+        assert!(
+            git(
+                repo.path(),
+                &[
+                    "-c",
+                    "user.name=dev",
+                    "-c",
+                    "user.email=d@d",
+                    "commit",
+                    "-q",
+                    "-m",
+                    &msg
+                ]
+            )
+            .0
+        );
+    };
+    commit("feat: wire it", Some("Issue: X-1"));
+    commit("fix (X-1) edge case", None);
+    commit("wip X-12 unrelated", None);
+    commit("unrelated refactor", None);
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    (pm, state, repo, port)
+}
+
+#[test]
+fn issue_detail_lists_code_commits() {
+    let (pm, state, repo, port) = commits_fixture();
+    let (ok, out) = cli(pm.path(), state.path(), &["issue", "show", "X-1", "--json"]);
+    assert!(ok, "{out}");
+    let commits = out["commits"].as_array().unwrap();
+    let subjects: Vec<&str> = commits
+        .iter()
+        .map(|c| c["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        subjects,
+        ["fix (X-1) edge case", "feat: wire it"],
+        "trailer + whole-word matches, newest first: {subjects:?}"
+    );
+    for c in commits {
+        assert_eq!(c["repo"], repo.path().to_str().unwrap());
+        assert_eq!(c["author"], "dev");
+        assert!(c["at"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(c["sha"].as_str().unwrap().len(), 7);
+    }
+    let skipped = out["commits_skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0]["repo"], "/definitely/missing");
+    // The API detail carries the identical payload.
+    let host = format!("127.0.0.1:{port}");
+    let (code, body) = http(port, "GET", "/api/issues/X-1", &host);
+    assert_eq!(code, 200);
+    let api: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(api["commits"], out["commits"]);
+    assert_eq!(api["commits_skipped"], out["commits_skipped"]);
+}
+
+#[test]
+fn issue_trailer_prints_and_validates() {
+    let (pm, state, _repo, _port) = commits_fixture();
+    let (ok, out) = cli_raw(pm.path(), state.path(), &["issue", "trailer", "X-1"]);
+    assert!(ok, "{out}");
+    assert_eq!(out, "Issue: X-1");
+    let (ok, err) = cli_raw(pm.path(), state.path(), &["issue", "trailer", "X-9"]);
+    assert!(!ok);
+    assert!(err.contains("Unknown issue"), "{err}");
+    let (ok, err) = cli_raw(pm.path(), state.path(), &["issue", "trailer", "bad id"]);
+    assert!(!ok);
+    assert!(err.contains("issue id") || err.contains("Unknown"), "{err}");
+}
+
+#[test]
+fn issue_doctor_reports_trailer_share() {
+    let fx = history_fixture();
+    // Doctor exits non-zero when checks fail; the report prints
+    // either way, so assert the payload not the status.
+    let (_, out) = cli(fx.pm.path(), fx.state.path(), &["issue", "doctor"]);
+    let trailers = &out["trailers"];
+    let (window, with) = (
+        trailers["window"].as_u64().unwrap_or(0),
+        trailers["with_trailers"].as_u64().unwrap_or(0),
+    );
+    // 7 issue writes + project add + init all carry `Actor:` now.
+    assert!(window > 0 && with >= 9, "{trailers}");
 }

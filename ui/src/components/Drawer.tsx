@@ -869,6 +869,51 @@ export default function Drawer({
               <section>
                 <div className="flex items-baseline gap-2 mb-2">
                   <h3 className="text-cardtitle font-semibold text-ink-100">
+                    Commits
+                  </h3>
+                  <span className="kicker">from project repos</span>
+                </div>
+                {(detail.commits?.length ?? 0) > 0 ? (
+                  <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
+                    {detail.commits!.map((c) => (
+                      <li
+                        key={`${c.repo}:${c.sha}`}
+                        className="flex items-center gap-2.5 px-3 py-2"
+                      >
+                        <span className="num text-micro text-ink-500 shrink-0 whitespace-nowrap">
+                          {fmtTime(c.at)}
+                        </span>
+                        <span className="num text-micro text-accent-300 shrink-0">
+                          {c.sha.slice(0, 7)}
+                        </span>
+                        <span className="text-secondary text-ink-300 truncate min-w-0">
+                          {c.subject}
+                        </span>
+                        <span className="text-micro text-ink-500 shrink-0 truncate max-w-[8rem]">
+                          {c.repo}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (detail.commits_skipped?.length ?? 0) > 0 ? (
+                  <p className="text-secondary text-ink-500">
+                    No commits listed —{" "}
+                    {detail.commits_skipped!.map(
+                      (s) => `${s.repo} (${s.reason})`,
+                    ).join(", ")}
+                    .
+                  </p>
+                ) : (
+                  <p className="text-secondary text-ink-500">
+                    No code commits yet — tag one with an `Issue: {id}`
+                    trailer or `({id})` in the subject.
+                  </p>
+                )}
+              </section>
+
+              <section>
+                <div className="flex items-baseline gap-2 mb-2">
+                  <h3 className="text-cardtitle font-semibold text-ink-100">
                     History
                   </h3>
                   <span className="kicker">parsed from git log</span>

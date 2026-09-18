@@ -1,17 +1,19 @@
 //! History: everything the tracker's own git log can answer about an
-//! issue — `log`, `diff`, `blame` and `ls --at`. Strictly read-only:
-//! no lock, no commit, no fetch; a tracker with no remote works. The
-//! only stored state is the git history that already exists.
+//! issue — `log`, `diff`, `blame` and `ls --at` — plus `code_commits`,
+//! the same question asked of the project's own repos. Strictly
+//! read-only: no lock, no commit, no fetch; a tracker with no remote
+//! works. The only stored state is the git history that already exists.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front};
-use crate::issue::{board, git, hooks, parse, time};
+use crate::issue::{board, git, hooks, parse, project, time};
 
 /// Front keys in file order — the union over `Front` is fixed, so
 /// diff/blame output is stable instead of map-ordered.
@@ -56,22 +58,31 @@ struct RawCommit {
     sha: String,
     /// RFC 3339 UTC (`%at` epoch through `time::iso`).
     at: String,
-    /// `%an` — commit author name, the fallback `by`.
+    /// `%an` — commit author name, the last-resort `by`.
     author: String,
     /// `%s` — the raw subject.
     subject: String,
+    /// `%(trailers:key=Actor)` — the CAD-42 trailer; empty on
+    /// commits written before trailers existed.
+    trailer_actor: String,
 }
 
 fn raw_log(pm_dir: &Path, rel: &str) -> Result<Vec<RawCommit>> {
     let out = git(
         pm_dir,
-        &["log", "--format=%H%x1f%h%x1f%at%x1f%an%x1f%s", "--", rel],
+        &[
+            "log",
+            "--format=%H%x1f%h%x1f%at%x1f%an%x1f%s%x1f%(trailers:key=Actor,valueonly,separator=%x2C)",
+            "--",
+            rel,
+        ],
     )?;
     Ok(out
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(5, '\x1f');
-            let (full, sha, at, author, subject) = (
+            let mut parts = line.splitn(6, '\x1f');
+            let (full, sha, at, author, subject, trailer) = (
+                parts.next()?,
                 parts.next()?,
                 parts.next()?,
                 parts.next()?,
@@ -87,6 +98,7 @@ fn raw_log(pm_dir: &Path, rel: &str) -> Result<Vec<RawCommit>> {
                     .unwrap_or_else(|_| at.to_string()),
                 author: author.to_string(),
                 subject: subject.to_string(),
+                trailer_actor: trailer.trim().to_string(),
             })
         })
         .collect())
@@ -141,26 +153,40 @@ fn parse_subject(subject: &str, id: &str) -> Option<(&'static str, String, Strin
     Some((kind, summary, actor.unwrap_or_default()))
 }
 
-/// The `by` field: the ` (actor)` suffix on cadence-shaped subjects,
-/// else the commit author name.
+/// The `by` field, most-truthful first: the `Actor:` trailer (CAD-42
+/// commits), then the ` (actor)` subject suffix (API writes), then
+/// `comment by <name>` (comments name their author), else the git
+/// author. Pre-trailer commits resolve through the same chain minus
+/// the first step.
 fn actor_of(raw: &RawCommit, id: &str) -> String {
-    parse_subject(&raw.subject, id)
-        .map(|(_, _, a)| a)
-        .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| raw.author.clone())
+    if !raw.trailer_actor.is_empty() {
+        return raw.trailer_actor.clone();
+    }
+    if let Some((kind, summary, actor)) = parse_subject(&raw.subject, id) {
+        if !actor.is_empty() {
+            return actor;
+        }
+        if kind == "comment" {
+            if let Some(name) = summary.strip_prefix("comment by ") {
+                return name.to_string();
+            }
+        }
+    }
+    raw.author.clone()
 }
 
 /// One history entry for `issue log` and `GET …/history`.
 fn entry(raw: &RawCommit, id: &str) -> Value {
-    let Some((kind, summary, actor)) = parse_subject(&raw.subject, id) else {
+    let by = actor_of(raw, id);
+    let Some((kind, summary, _actor)) = parse_subject(&raw.subject, id) else {
         return json!({
-            "sha": raw.sha, "at": raw.at, "by": raw.author,
+            "sha": raw.sha, "at": raw.at, "by": by,
             "kind": "other", "summary": raw.subject,
         });
     };
     let mut e = json!({
         "sha": raw.sha, "at": raw.at,
-        "by": if actor.is_empty() { raw.author.clone() } else { actor },
+        "by": by,
         "kind": kind, "summary": summary,
     });
     if kind == "set" {
@@ -543,6 +569,138 @@ pub fn ls_at(
     Ok((at, views))
 }
 
+/// `<id>` whole-word in a code-commit subject — `(CAD-47)`, `CAD-47:`
+/// match; `CAD-479`, `XCAD-47`, `CAD-47-x` do not (`-`/`_` join words).
+fn subject_mentions(subject: &str, id: &str) -> bool {
+    let joiner = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    subject.match_indices(id).any(|(i, _)| {
+        let before = subject[..i].chars().next_back();
+        let after = subject[i + id.len()..].chars().next();
+        !before.is_some_and(joiner) && !after.is_some_and(joiner)
+    })
+}
+
+/// `git log --all -n <scan>` under `dir` with a hard timeout — project
+/// repos are user paths, not ours, so a slow or locked repo must not
+/// stall a detail read. Returns the log text or a skip reason.
+fn git_bounded(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> std::result::Result<String, String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn: {e}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let out = child.wait_with_output().map_err(|e| e.to_string())?;
+                return if out.status.success() {
+                    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+                } else {
+                    Err("git log failed".to_string())
+                };
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("timed out".to_string());
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// `commits` for an issue's detail: for each repo the project lists,
+/// the newest commits on any ref whose message carries an
+/// `Issue: <ID>` trailer or names the id as a whole word in the
+/// subject (the `(CAD-47)` convention) — `{repo, sha, at, author,
+/// subject}`. Read-only `git log --all` bounded to the newest 2000
+/// commits per repo, ≤20 matches per repo, ≤20 merged; a missing or
+/// non-git path is skipped and reported in `commits_skipped`, never
+/// an error.
+pub fn code_commits(pm_dir: &Path, issue: &board::Issue) -> (Vec<Value>, Vec<Value>) {
+    let Ok(projects) = project::list(pm_dir) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(proj) = projects.iter().find(|p| p.key == issue.project) else {
+        return (Vec::new(), Vec::new());
+    };
+    let id = issue.front.id.as_str();
+    let mut commits = Vec::new();
+    let mut skipped = Vec::new();
+    for repo in &proj.repos {
+        let label = repo
+            .path
+            .clone()
+            .or_else(|| repo.remote.clone())
+            .unwrap_or_default();
+        let Some(path) = &repo.path else {
+            skipped.push(json!({"repo": label, "reason": "no local path"}));
+            continue;
+        };
+        let dir = project::expand_home(path);
+        if !dir.is_dir() || hooks::git_dir(&dir).is_none() {
+            skipped.push(json!({"repo": label, "reason": "not a git repo"}));
+            continue;
+        }
+        let out = git_bounded(
+            &dir,
+            &[
+                "log",
+                "--all",
+                "-n",
+                "2000",
+                "--format=%h%x1f%at%x1f%an%x1f%s%x1f%(trailers:key=Issue,valueonly,separator=%x2C)",
+            ],
+            Duration::from_secs(5),
+        );
+        match out {
+            Err(reason) => skipped.push(json!({"repo": label, "reason": reason})),
+            Ok(log) => {
+                let mut hits = log
+                    .lines()
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(5, '\x1f');
+                        let (sha, at, author, subject, issues) = (
+                            parts.next()?,
+                            parts.next()?,
+                            parts.next()?,
+                            parts.next()?,
+                            parts.next()?,
+                        );
+                        let tagged = issues.split(',').any(|t| t.trim() == id);
+                        (tagged || subject_mentions(subject, id)).then(|| {
+                            json!({
+                                "repo": label,
+                                "sha": sha,
+                                "at": at
+                                    .parse::<i64>()
+                                    .map(time::iso)
+                                    .unwrap_or_else(|_| at.to_string()),
+                                "author": author,
+                                "subject": subject,
+                            })
+                        })
+                    })
+                    .take(20)
+                    .collect();
+                commits.append(&mut hits);
+            }
+        }
+    }
+    commits.sort_by(|a, b| b["at"].as_str().cmp(&a["at"].as_str()));
+    commits.truncate(20);
+    (commits, skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,11 +737,30 @@ mod tests {
             at: "2026-09-18T00:00:00Z".into(),
             author: "cadence".into(),
             subject: "CAD-1: set status=review body (operator (ui))".into(),
+            trailer_actor: String::new(),
         };
         let e = entry(&raw, "CAD-1");
         assert_eq!(e["kind"], "set");
         assert_eq!(e["by"], "operator (ui)");
         assert_eq!(e["fields"]["status"], "review");
         assert!(e["fields"]["body"].is_null());
+        // A trailer beats the subject actor and the git author.
+        let raw = RawCommit {
+            trailer_actor: "fable-cc".into(),
+            author: "cadence".into(),
+            ..raw
+        };
+        assert_eq!(entry(&raw, "CAD-1")["by"], "fable-cc");
+    }
+
+    #[test]
+    fn subject_whole_word() {
+        assert!(subject_mentions("fix (X-1) edge", "X-1"));
+        assert!(subject_mentions("X-1: the fix", "X-1"));
+        assert!(subject_mentions("backport X-1 to stable", "X-1"));
+        assert!(!subject_mentions("wip X-12", "X-1"));
+        assert!(!subject_mentions("X-1x thing", "X-1"));
+        assert!(!subject_mentions("fix-X-1 thing", "X-1"));
+        assert!(!subject_mentions("unrelated", "X-1"));
     }
 }

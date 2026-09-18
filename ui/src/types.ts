@@ -68,6 +68,16 @@ export interface ActivityItem {
   subject?: string;
 }
 
+/** A code commit that names this issue — an `Issue: <ID>` trailer or
+ *  a whole-word `(ID)` in the subject, found in a project repo. */
+export interface IssueCommit {
+  repo: string;
+  sha: string;
+  at: string;
+  author: string;
+  subject: string;
+}
+
 /** `GET /api/issues/<id>/history` — one parsed git-log entry. */
 export interface IssueHistoryEntry {
   sha: string;
@@ -103,6 +113,8 @@ export interface IssueDetail extends IssueCard {
   notes_chain: { name: string; kind: string; at: string; title: string }[];
   artifacts: { name: string; size: number }[];
   activity: ActivityItem[];
+  commits?: IssueCommit[];
+  commits_skipped?: { repo: string; reason: string }[];
 }
 
 export interface Project {
