@@ -10,6 +10,7 @@ pub mod codex;
 pub mod fake;
 pub mod link;
 pub mod pty;
+pub mod registry;
 pub mod stdio;
 pub mod ws;
 
@@ -156,6 +157,11 @@ pub fn build(
     hooks: AdapterHooks,
     log_path: &std::path::Path,
 ) -> Result<Box<dyn ProviderAdapter>> {
+    // The registry is consulted for pair validation only — its
+    // rejections carry the same per-kind text the match arms below
+    // produced inline. `fake` resolves for any provider via the
+    // registry's provider-agnostic lookup, so no bypass is needed here.
+    registry::spec(&agent.provider, &agent.endpoint_kind)?;
     match agent.endpoint_kind.as_str() {
         "managed" => match agent.provider.as_str() {
             "codex" => Ok(Box::new(codex::CodexAdapter::new(hooks, log_path))),

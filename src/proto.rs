@@ -11,23 +11,9 @@ use crate::error::{Error, Result};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Server capabilities reported by `health`.
-pub const CAPABILITIES: &[&str] = &[
-    "agent_registry",
-    "durable_queue",
-    "managed_codex_stdio",
-    "managed_codex_ws",
-    "managed_claude_stream",
-    "pty_devin_tmux",
-    "pty_verified_autoready",
-    "operator_reconcile",
-    "inbox_endpoint",
-    "job_lifecycle",
-    "revision_bound_verdicts",
-    "approval_brokering",
-    "result_routing",
-    "fake_provider_tests",
-];
+/// Server capabilities reported by `health` — generated from the
+/// endpoint registry plus daemon-level features, never hand-listed.
+pub use crate::adapter::registry::capabilities;
 
 pub fn ok(result: Value) -> Value {
     json!({"ok": true, "result": result})

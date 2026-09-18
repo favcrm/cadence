@@ -7059,3 +7059,67 @@ fn pty_forbidden_prefix_is_prewrite_and_keeps_claim() {
         thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// `agent show`/`agent list` expose the registry's capabilities object
+/// verbatim for every (provider, endpoint_kind) spec — the daemon is
+/// authoritative, so the wire value must match the table exactly.
+#[test]
+fn agent_capabilities_match_the_registry_table() {
+    use cadence_agent::adapter::registry;
+    let d = TestDaemon::start();
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    for spec in registry::SPECS {
+        let alias = format!("cap-{}-{}", spec.provider, spec.endpoint_kind);
+        d.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": spec.provider,
+                   "endpoint_kind": spec.endpoint_kind, "cwd": cwd}),
+        )
+        .unwrap();
+        let show = d.rpc("agent_show", json!({"alias": alias})).unwrap();
+        assert_eq!(
+            show["agent"]["capabilities"],
+            spec.to_json(),
+            "capabilities mismatch for {}/{}",
+            spec.provider,
+            spec.endpoint_kind
+        );
+        let list = d.rpc("agent_list", json!({})).unwrap();
+        let row = list["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["alias"].as_str() == Some(alias.as_str()))
+            .expect("registered agent missing from agent_list");
+        assert_eq!(row["capabilities"], spec.to_json());
+    }
+    // `health.capabilities` is generated from the same table plus the
+    // daemon-level features — identical content to the legacy list.
+    let health = d.rpc("health", json!({})).unwrap();
+    let caps: Vec<&str> = health["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    assert_eq!(caps, registry::capabilities());
+    for name in [
+        "managed_codex_stdio",
+        "managed_codex_ws",
+        "managed_claude_stream",
+        "pty_devin_tmux",
+        "inbox_endpoint",
+        "fake_provider_tests",
+    ] {
+        assert!(caps.contains(&name), "health missing {name}");
+    }
+    // An unknown registered pair renders `capabilities: null`.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "cap-bogus", "provider": "devin",
+               "endpoint_kind": "bogus", "cwd": cwd}),
+    )
+    .unwrap();
+    let show = d.rpc("agent_show", json!({"alias": "cap-bogus"})).unwrap();
+    assert!(show["agent"]["capabilities"].is_null());
+}
