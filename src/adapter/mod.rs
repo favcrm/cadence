@@ -30,6 +30,11 @@ pub struct Identity {
     /// Live endpoint generation minted per `open` (pty uses it for
     /// stale-report rejection); `None` where not applicable.
     pub generation: Option<String>,
+    /// How the endpoint came up for attachable surfaces: `"adopted"`
+    /// when an existing pane was re-attached (same pid and native
+    /// session), `"respawned"` when a new pane was launched on the
+    /// recorded session. `None` for kinds with no such distinction.
+    pub attach: Option<&'static str>,
 }
 
 /// A provider-initiated request (approval, user input). `id` is the raw

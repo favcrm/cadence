@@ -2920,6 +2920,7 @@ mod tests {
                     pid: 1,
                     endpoint: Some("ws://x".into()),
                     generation: None,
+                    attach: None,
                 },
             )
             .unwrap();

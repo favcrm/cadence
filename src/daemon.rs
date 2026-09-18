@@ -26,7 +26,7 @@ use crate::adapter::{self, registry, AdapterHooks, ProviderAdapter, ProviderRequ
 use crate::client;
 use crate::error::{Error, Result};
 use crate::proto;
-use crate::store::{self, Message, Store, Take};
+use crate::store::{self, Agent, Message, Store, Take};
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
 pub struct Notify {
@@ -121,6 +121,10 @@ pub struct Shared {
     closing: AtomicBool,
     provider_log_dir: PathBuf,
     state_dir: PathBuf,
+    /// How each agent's endpoint last came up (`"adopted"` /
+    /// `"respawned"` — attachable kinds only), recorded before the
+    /// identity write so a resume report can say which happened.
+    open_attach: Mutex<HashMap<String, &'static str>>,
 }
 
 impl Shared {
@@ -136,6 +140,7 @@ impl Shared {
             closing: AtomicBool::new(false),
             provider_log_dir,
             state_dir: state_dir.to_path_buf(),
+            open_attach: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -387,9 +392,17 @@ impl Shared {
         // any error, which still closes owned provider processes
         // (detach defaults to close) while leaving a pty pane visible
         // for inspection.
-        adapter
-            .open(&agent)
-            .and_then(|identity| self.store.set_identity(alias, &identity))?;
+        let identity = adapter.open(&agent)?;
+        // Record how the endpoint came up *before* set_identity makes
+        // it visible — a resume report polling the agent row must find
+        // the outcome already written.
+        if let Some(attach) = identity.attach {
+            self.open_attach
+                .lock()
+                .unwrap()
+                .insert(alias.to_string(), attach);
+        }
+        self.store.set_identity(alias, &identity)?;
         self.wake();
         let mut gate_notice: Option<String> = None;
         let mut gate_waits: u32 = 0;
@@ -689,6 +702,9 @@ impl Shared {
                     j["tasks"] = json!(tasks);
                     j["capabilities"] =
                         registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
+                    let (dead, resumable) = self.agent_liveness(&agent);
+                    j["dead"] = json!(dead);
+                    j["resumable"] = json!(resumable);
                     agents.push(j);
                 }
                 Ok(json!({"agents": agents}))
@@ -700,6 +716,9 @@ impl Shared {
                 let mut agent_json = agent.to_json();
                 agent_json["capabilities"] =
                     registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
+                let (dead, resumable) = self.agent_liveness(&agent);
+                agent_json["dead"] = json!(dead);
+                agent_json["resumable"] = json!(resumable);
                 // The briefing lives under the state dir — actors read
                 // it there, never inside their cwd repository.
                 if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
@@ -796,6 +815,7 @@ impl Shared {
                     if agent.endpoint_kind == "pty" {
                         adapter::pty::kill_pane(&self.state_dir, &alias);
                     }
+                    self.open_attach.lock().unwrap().remove(&alias);
                     // Re-checks endpoint/state inside its transaction.
                     self.store.remove_agent(&alias)?;
                 }
@@ -821,6 +841,7 @@ impl Shared {
                             adapter::pty::kill_pane(&self.state_dir, &agent.alias);
                         }
                         if self.store.remove_agent(&agent.alias).is_ok() {
+                            self.open_attach.lock().unwrap().remove(&agent.alias);
                             removed.push(agent.alias);
                         }
                     }
@@ -830,47 +851,7 @@ impl Shared {
             }
             "agent_resume" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
-                let agent = self.store.agent(&alias)?;
-                if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
-                    return Err(Error::rejected(format!(
-                        "Agent '{alias}' is an inbox — nothing to resume; \
-                         `cadence inbox {alias}` drains it"
-                    )));
-                }
-                let mut lc = self.lifecycle.lock().unwrap();
-                if lc.owned(&alias) {
-                    // Distinguish the two owned cases for the operator:
-                    // a live actor means "attach" (fake/managed actors
-                    // may carry no endpoint address, so state is the
-                    // signal), a starting/stopping one means "retry".
-                    let live = agent.endpoint.is_some()
-                        || matches!(agent.state.as_str(), "idle" | "running" | "waiting_input");
-                    return if live {
-                        Err(Error::rejected(format!(
-                            "Agent '{alias}' is already live — attach with \
-                             `cadence attach {alias}`"
-                        )))
-                    } else {
-                        Err(Error::rejected(format!(
-                            "Agent '{alias}' is still starting or stopping — \
-                             retry shortly"
-                        )))
-                    };
-                }
-                // An unreconciled `unknown` fences the agent — the exit
-                // is an explicit operator reconcile, not another resume
-                // (which would fail closed anyway inside start_actor).
-                if self.store.has_unknown(&alias)? {
-                    return Err(Error::rejected(format!(
-                        "Agent '{alias}' is fenced by an unreconciled unknown \
-                         message — reconcile it first: `cadence agent unfence \
-                         {alias} --status interrupted`, then `cadence agent \
-                         resume {alias}`"
-                    )));
-                }
-                // Enable only after the ownership/fence checks pass —
-                // a rejected resume must leave no side effects behind.
-                let started = self.start_actor_locked(&mut lc, &alias, true)?;
+                let started = self.try_resume(&alias)?;
                 let state = if started { "starting" } else { "attention" };
                 Ok(json!({"alias": alias, "state": state}))
             }
@@ -1344,9 +1325,102 @@ impl Shared {
         Ok(json!({"state": "cancelled", "message": message.to_json()}))
     }
 
-    /// Convenience wrapper: reconcile every `unknown` message fencing
-    /// the agent in one call. Returns each reconciled id; the agent
-    /// lands `stopped` (never auto-started) when the last one clears.
+    /// The resume path shared by `agent_resume` and `agent_unfence`:
+    /// inbox guard, ownership/fence checks, then start the actor.
+    /// Returns whether the actor started — a failed start records
+    /// `attention` instead.
+    fn try_resume(self: &Arc<Self>, alias: &str) -> Result<bool> {
+        let agent = self.store.agent(alias)?;
+        if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is an inbox — nothing to resume; \
+                 `cadence inbox {alias}` drains it"
+            )));
+        }
+        let mut lc = self.lifecycle.lock().unwrap();
+        if lc.owned(alias) {
+            // Distinguish the two owned cases for the operator: a live
+            // actor means "attach" (fake/managed actors may carry no
+            // endpoint address, so state is the signal), a
+            // starting/stopping one means "retry".
+            let live = agent.endpoint.is_some()
+                || matches!(agent.state.as_str(), "idle" | "running" | "waiting_input");
+            return if live {
+                Err(Error::rejected(format!(
+                    "Agent '{alias}' is already live — attach with \
+                     `cadence attach {alias}`"
+                )))
+            } else {
+                Err(Error::rejected(format!(
+                    "Agent '{alias}' is still starting or stopping — \
+                     retry shortly"
+                )))
+            };
+        }
+        // An unreconciled `unknown` fences the agent — the exit is an
+        // explicit operator reconcile, not another resume (which would
+        // fail closed anyway inside start_actor).
+        if self.store.has_unknown(alias)? {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is fenced by an unreconciled unknown \
+                 message — reconcile it first: `cadence agent unfence \
+                 {alias} --status interrupted`, then `cadence agent \
+                 resume {alias}`"
+            )));
+        }
+        // Enable only after the ownership/fence checks pass — a
+        // rejected resume must leave no side effects behind.
+        self.start_actor_locked(&mut lc, alias, true)
+    }
+
+    /// Bounded wait for a just-started actor's `open`: live when an
+    /// endpoint is published or a live state lands, over when the
+    /// actor gives up (`attention`/`stopped`/`offline`). Same 30s
+    /// bound the CLI's resume polling uses. Returns `(live, state)`.
+    fn wait_open_outcome(&self, alias: &str) -> (bool, String) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let agent = match self.store.agent(alias) {
+                Ok(a) => a,
+                Err(_) => return (false, "gone".to_string()),
+            };
+            let live = agent.endpoint.is_some()
+                || matches!(agent.state.as_str(), "idle" | "running" | "waiting_input");
+            if live {
+                return (true, agent.state);
+            }
+            if matches!(agent.state.as_str(), "attention" | "stopped" | "offline") {
+                return (false, agent.state);
+            }
+            if Instant::now() >= deadline {
+                return (false, agent.state);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// `dead` is per endpoint kind, not "no endpoint string":
+    /// attachable kinds (pty, managed-ws) are dead when registered,
+    /// not operator-stopped, and holding no live endpoint; managed
+    /// kinds are dead when fenced or enabled-but-unattended; inbox and
+    /// fake never die. `resumable` is the question `dead` was being
+    /// asked: stopped-or-dead with a saved native thread and no
+    /// unreconciled unknowns fencing it.
+    fn agent_liveness(&self, agent: &Agent) -> (bool, bool) {
+        let dead = if registry::attachable(&agent.provider, &agent.endpoint_kind) {
+            agent.endpoint.is_none() && agent.state != "stopped"
+        } else if agent.endpoint_kind == "managed" {
+            agent.state == "attention"
+                || (agent.enabled && !self.lifecycle.lock().unwrap().owned(&agent.alias))
+        } else {
+            false
+        };
+        let resumable = (agent.state == "stopped" || dead)
+            && agent.thread_id.as_deref().is_some_and(|t| !t.is_empty())
+            && !self.store.has_unknown(&agent.alias).unwrap_or(false);
+        (dead, resumable)
+    }
+
     fn rpc_unfence(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let status = required_str(params, "status")?;
@@ -1354,7 +1428,7 @@ impl Shared {
         let by = optional_str(params, "by").unwrap_or("operator");
         // Resolve the agent before any reconcile so a bad alias fails
         // without side effects.
-        let _ = self.store.agent(&alias)?;
+        let agent = self.store.agent(&alias)?;
         let ids = self.store.unknown_messages(&alias)?;
         if ids.is_empty() {
             return Err(Error::rejected(format!(
@@ -1366,9 +1440,60 @@ impl Shared {
             self.store.reconcile(id, status, note, by, None)?;
             reconciled.push(id.clone());
         }
-        let state = self.store.agent(&alias)?.state;
+        // `resume` is opt-in over the socket — the CLI's `agent unfence`
+        // passes it unless `--no-resume`, keeping the bare-RPC call a
+        // reconcile-only operation.
+        let resume = params
+            .get("resume")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let pty = agent.endpoint_kind == "pty";
+        let mut out = json!({"alias": alias, "reconciled": reconciled});
+        if !resume {
+            out["resumed"] = json!(false);
+            if pty {
+                out["pane"] = json!("none");
+            }
+            out["state"] = json!(self.store.agent(&alias)?.state);
+            self.wake();
+            return Ok(out);
+        }
+        // The settled default: reconcile then bring the agent back,
+        // and say what the endpoint actually did — adopted the
+        // surviving pane, respawned on the recorded session, or
+        // nothing because the resume failed. A resume rejection is
+        // reported, not thrown: the reconcile already committed.
+        let (resumed, state) = match self.try_resume(&alias) {
+            Ok(true) => self.wait_open_outcome(&alias),
+            Ok(false) => (false, self.store.agent(&alias)?.state),
+            Err(e) => {
+                out["resumed"] = json!(false);
+                if pty {
+                    out["pane"] = json!("none");
+                }
+                out["state"] = json!(self.store.agent(&alias)?.state);
+                out["error"] = json!(e.to_string());
+                self.wake();
+                return Ok(out);
+            }
+        };
+        out["resumed"] = json!(resumed);
+        if pty {
+            let pane = if resumed {
+                self.open_attach
+                    .lock()
+                    .unwrap()
+                    .get(&alias)
+                    .copied()
+                    .unwrap_or("respawned")
+            } else {
+                "none"
+            };
+            out["pane"] = json!(pane);
+        }
+        out["state"] = json!(state);
         self.wake();
-        Ok(json!({"alias": alias, "reconciled": reconciled, "state": state}))
+        Ok(out)
     }
 
     // ---- Jobs: the work axis (docs/JOBS.md) ----
