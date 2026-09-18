@@ -149,26 +149,32 @@ relaunch or rejoin to change it). When the key is absent the flag is
 omitted entirely and Devin's own default applies.
 
 **Briefings.** Every launch path (`devin`, `codex`, `claude`, `join`) writes
-`.cadence/<root>/BRIEFING-<alias>.md` — the group root's `.cadence/`
-dir in the root's cwd (the PM's repo for a joined worker, the agent's
-own for a standalone launch). The file carries identity (alias, native
-session id, upstream), a protocol quickref, and the group roster at
-write time — a snapshot; `cadence self`/`agent list` stay live truth.
-Where the agent's cwd sits in a git repo, `<repo>/AGENTS.md` gains an
-idempotent `<!-- cadence:begin -->`/`<!-- cadence:end -->` block (created
-or appended, never touching outside content). `join` additionally
-enqueues the deterministic `bootstrap-<worker>` message
-(`source="bootstrap"`); standalone launches stay silent unless
-`--bootstrap` is passed; `--no-bootstrap` skips file, block and message.
-`cadence agent bootstrap <alias>` retrofits a live agent — file, block
-and the durable message — and refuses unknown aliases.
+`$CADENCE_STATE_DIR/briefings/<root>/BRIEFING-<alias>.md` — under the
+daemon's state dir, keyed by group root, never in the agent's cwd repo.
+`cadence agent show <alias>` prints the absolute path; agents are told
+to read the path printed in their bootstrap message. The file carries
+identity (alias, native session id, upstream), a protocol quickref, and
+the group roster at write time — a snapshot; `cadence self`/`agent list`
+stay live truth. Briefings are written only after the endpoint reports
+open, and regenerated on resume when missing. Nothing else lands in the
+cwd repo unless the operator opts in: `--agents-md` (persisted in
+launch params, replayed on resume) adds an idempotent
+`<!-- cadence:begin -->`/`<!-- cadence:end -->` block to
+`<repo>/AGENTS.md` (created or appended, never touching outside
+content). `join` additionally enqueues the deterministic
+`bootstrap-<worker>` message (`source="bootstrap"`); standalone
+launches stay silent unless `--bootstrap` is passed; `--no-bootstrap`
+skips file, block and message. `cadence agent bootstrap <alias>`
+retrofits a live agent — file and the durable message — and refuses
+unknown aliases.
 
 **Isolated worktrees.** `--worktree <name>` on `devin`, `codex`, and
 `join` runs the worker in `<repo>/.cadence/wt/<name>` on branch
 `cadence/<name>` via `git worktree add -b`. It requires a git repo,
 rejects invalid names, existing target dirs, branch collisions, and
-applying it to an already-registered agent, and appends `.cadence/` to
-`.gitignore` when absent.
+applying it to an already-registered agent. Because the worktree lives
+inside the repo, `.cadence/` is appended to `.gitignore` when absent —
+only after `git worktree add` succeeds.
 
 **Group scoping.** `agent_list` (the RPC) always returns every agent.
 Every row carries `"group"`: the agent's own `params.upstream` when
