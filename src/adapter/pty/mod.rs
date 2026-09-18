@@ -106,6 +106,10 @@ struct PtyState {
     generation: String,
     /// Single-use operator readiness claims, oldest first.
     claims: std::collections::VecDeque<Claim>,
+    /// Consecutive failed `disconnected()` probes — the pane is only
+    /// believed dead after `DISCONNECT_MISS_BUDGET` misses across
+    /// idle ticks (never inside one tick — see `disconnected`).
+    disconnected_misses: usize,
 }
 
 /// The generic adapter: tmux mechanics, readiness claims and the
@@ -165,46 +169,29 @@ pub(crate) fn resolve_on_path(bin: &str) -> Result<String> {
     Err(Error::rejected(format!("`{bin}` not found on PATH")))
 }
 
-/// Bounded re-probe count for evidence that can transiently miss:
-/// a `/proc` read or a subprocess spawn that fails under load is
-/// inconclusive, not a negative. A genuinely dead pane fails every
-/// pass; a churned one clears on the next.
-const EVIDENCE_PROBES: u32 = 3;
-const EVIDENCE_SETTLE: Duration = Duration::from_millis(25);
+/// Consecutive `disconnected()` misses before the pane is believed
+/// dead — counted across idle ticks so no single tick pays for a
+/// re-probe (see `disconnected`).
+const DISCONNECT_MISS_BUDGET: usize = 3;
 
-/// Is `pid` the pane process or one of its descendants? A mid-walk
-/// `/proc` read failure is retried: an unreadable status file is
-/// inconclusive, not a "does not descend" — a wrong false here can
-/// cost a live pane its session.
-pub(crate) fn descends_from(pid: u32, pane_pid: u32) -> bool {
-    for attempt in 0..EVIDENCE_PROBES {
-        match descend_walk(pid, pane_pid) {
-            Some(found) => return found,
-            None if attempt + 1 < EVIDENCE_PROBES => {
-                std::thread::sleep(EVIDENCE_SETTLE);
-            }
-            None => return false,
-        }
-    }
-    unreachable!()
-}
-
-/// One ancestry walk: `Some(bool)` is a definite answer, `None` means
-/// a `/proc` read raced mid-walk and the answer is not yet known.
-fn descend_walk(mut pid: u32, pane_pid: u32) -> Option<bool> {
+/// Is `pid` the pane process or one of its descendants? Single-shot:
+/// callers that need resilience retry at their own decision point.
+pub(crate) fn descends_from(mut pid: u32, pane_pid: u32) -> bool {
     let mut seen = std::collections::HashSet::new();
     while pid != 0 && seen.insert(pid) {
         if pid == pane_pid {
-            return Some(true);
+            return true;
         }
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return false;
+        };
         pid = status
             .lines()
             .find_map(|l| l.strip_prefix("PPid:"))
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
     }
-    Some(false)
+    false
 }
 
 /// A pty provider's forbidden input prefixes — the profile's own list,
@@ -219,37 +206,29 @@ pub fn forbidden_prefixes(provider: &str) -> &'static [char] {
     }
 }
 
-/// Every `/proc` pid holding an open fd to `lock`. The scan reads
-/// `/proc/<pid>/fd` per live pid — a transient read failure silently
-/// drops that pid — so an all-empty result is re-scanned before it is
-/// believed: a lock nobody holds stays empty, a churned scan does not.
+/// Every `/proc` pid holding an open fd to `lock`. Single-shot:
+/// callers that need resilience retry at their own decision point.
 pub(crate) fn lock_holders(lock: &Path) -> Vec<u32> {
     let target = lock.to_string_lossy().into_owned();
     let mut holders = Vec::new();
-    for attempt in 0..EVIDENCE_PROBES {
-        holders.clear();
-        if let Ok(procs) = std::fs::read_dir("/proc") {
-            for proc in procs.flatten() {
-                let Ok(pid) = proc.file_name().to_string_lossy().parse::<u32>() else {
-                    continue;
-                };
-                let Ok(fds) = std::fs::read_dir(proc.path().join("fd")) else {
-                    continue;
-                };
-                let holds = fds.flatten().any(|fd| {
-                    std::fs::read_link(fd.path())
-                        .map(|l| l.to_string_lossy() == target)
-                        .unwrap_or(false)
-                });
-                if holds {
-                    holders.push(pid);
-                }
-            }
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return holders;
+    };
+    for proc in procs.flatten() {
+        let Ok(pid) = proc.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(proc.path().join("fd")) else {
+            continue;
+        };
+        let holds = fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path())
+                .map(|l| l.to_string_lossy() == target)
+                .unwrap_or(false)
+        });
+        if holds {
+            holders.push(pid);
         }
-        if !holders.is_empty() || attempt + 1 == EVIDENCE_PROBES {
-            break;
-        }
-        std::thread::sleep(EVIDENCE_SETTLE);
     }
     holders
 }
@@ -281,6 +260,7 @@ impl PtyAdapter {
                 pane_pid: 0,
                 generation: String::new(),
                 claims: std::collections::VecDeque::new(),
+                disconnected_misses: 0,
             }),
             socket: format!("cadence-{}", short_hash(&state_dir.to_string_lossy())),
             tmux: std::env::var("CADENCE_TMUX_COMMAND")
@@ -303,28 +283,11 @@ impl PtyAdapter {
     }
 
     fn tmux(&self, args: &[&str]) -> Result<std::process::Output> {
-        // A failed *spawn* is load, not pane state: EAGAIN/EMFILE while
-        // the host forks heavily must not read downstream as "session
-        // gone". Retry briefly; a real error (bad binary, dead socket)
-        // still surfaces after the bound.
-        let mut attempt = 0u32;
-        loop {
-            match Command::new(&self.tmux)
-                .arg("-L")
-                .arg(&self.socket)
-                .args(args)
-                .output()
-            {
-                Ok(out) => return Ok(out),
-                Err(e) => {
-                    attempt += 1;
-                    if attempt > EVIDENCE_PROBES {
-                        return Err(e.into());
-                    }
-                    std::thread::sleep(EVIDENCE_SETTLE);
-                }
-            }
-        }
+        Ok(Command::new(&self.tmux)
+            .arg("-L")
+            .arg(&self.socket)
+            .args(args)
+            .output()?)
     }
 
     fn tmux_ok(&self, args: &[&str]) -> Result<String> {
@@ -365,25 +328,12 @@ impl PtyAdapter {
     }
 
     /// Verify the pane currently owns its native session — the proof
-    /// itself is the profile's. The proof underneath is a `/proc` scan,
-    /// so a single miss is inconclusive, not a death certificate: a
-    /// failure is re-probed briefly before it fences a live pane. A
-    /// real ownership change persists across every probe.
+    /// itself is the profile's. Single-shot: callers that need
+    /// resilience retry at their own decision point.
     fn verify_ownership(&self, session: &str, native: &str) -> Result<u32> {
         let pane_pid = self.pane_pid(session)?;
-        let mut attempt = 0u32;
-        loop {
-            match self.profile.verify_ownership(native, pane_pid) {
-                Ok(()) => return Ok(pane_pid),
-                Err(e) => {
-                    attempt += 1;
-                    if attempt == EVIDENCE_PROBES {
-                        return Err(e);
-                    }
-                    std::thread::sleep(4 * EVIDENCE_SETTLE);
-                }
-            }
-        }
+        self.profile.verify_ownership(native, pane_pid)?;
+        Ok(pane_pid)
     }
 
     /// Poll the profile's ownership proof until the pane claims a
@@ -736,17 +686,20 @@ impl ProviderAdapter for PtyAdapter {
     fn disconnected(&self) -> bool {
         // Disconnect is destructive — the daemon fences the endpoint
         // and force-closes the pane — so a single evidence miss must
-        // not carry it. The pane gets the full probe bound; a dead one
-        // fails every pass, a transient miss clears on the next.
-        for attempt in 1..=EVIDENCE_PROBES {
-            if self.pane_alive() {
-                return false;
-            }
-            if attempt < EVIDENCE_PROBES {
-                std::thread::sleep(4 * EVIDENCE_SETTLE);
-            }
+        // not carry it. Rather than sleep inside the call (which
+        // stalls the actor loop under load), exactly one probe runs
+        // per idle tick and consecutive misses are counted across
+        // ticks: a dead pane fails every probe and is fenced after
+        // DISCONNECT_MISS_BUDGET ticks, a transient miss clears on
+        // the next tick. Per-tick cost of a negative: one /proc scan
+        // plus two cheap tmux reads — well under a second.
+        if self.pane_alive() {
+            self.state.lock().unwrap().disconnected_misses = 0;
+            return false;
         }
-        true
+        let mut s = self.state.lock().unwrap();
+        s.disconnected_misses += 1;
+        s.disconnected_misses >= DISCONNECT_MISS_BUDGET
     }
 
     fn close(&self) {
