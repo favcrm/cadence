@@ -25,6 +25,8 @@ export interface IssueCard {
   ready: boolean;
   blocked: boolean;
   created: string;
+  /** Content hash of issue.md — send as `if_rev` on writes. */
+  rev: string;
   counts: { comments: number; artifacts: number; refs: number };
   checks: { done: number; total: number };
 }

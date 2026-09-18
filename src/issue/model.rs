@@ -155,6 +155,18 @@ pub fn check_priority(priority: &str) -> Result<()> {
     }
 }
 
+/// Artifact basename grammar — shared by the upload route and the
+/// constrained read, so every stored file is fetchable:
+/// `[A-Za-z0-9._-]{1,120}`, never a leading dot.
+pub fn valid_artifact_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 120
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 pub fn check_link_kind(kind: &str) -> Result<()> {
     if LINK_KINDS.contains(&kind) {
         Ok(())

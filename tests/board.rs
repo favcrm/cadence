@@ -68,8 +68,10 @@ fn free_port() -> u16 {
 fn http_full(port: u16, method: &str, path: &str, host: &str) -> (u16, String, String) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     write!(s, "{method} {path} HTTP/1.0\r\nHost: {host}\r\n\r\n").unwrap();
-    let mut buf = String::new();
-    s.read_to_string(&mut buf).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    // Bodies may be binary (png artifacts) — lossy-decode for asserts.
+    let buf = String::from_utf8_lossy(&raw).to_string();
     let status = buf
         .split_whitespace()
         .nth(1)
@@ -84,6 +86,55 @@ fn http_full(port: u16, method: &str, path: &str, host: &str) -> (u16, String, S
 fn http(port: u16, method: &str, path: &str, host: &str) -> (u16, String) {
     let (status, _, body) = http_full(port, method, path, host);
     (status, body)
+}
+
+/// A write request: extra headers plus a raw body. `(status, headers,
+/// body)` — headers joined so tests can assert on what is (not) sent.
+fn http_write(
+    port: u16,
+    method: &str,
+    path: &str,
+    host: &str,
+    headers: &[&str],
+    body: &[u8],
+) -> (u16, String, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut req = format!("{method} {path} HTTP/1.0\r\nHost: {host}\r\n");
+    for h in headers {
+        req.push_str(h);
+        req.push_str("\r\n");
+    }
+    req.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    s.write_all(req.as_bytes()).unwrap();
+    s.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let buf = String::from_utf8_lossy(&raw).to_string();
+    let status = buf
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let mut parts = buf.splitn(2, "\r\n\r\n");
+    let head = parts.next().unwrap_or("").to_string();
+    (status, head, parts.next().unwrap_or("").to_string())
+}
+
+/// The headers a legitimate board write always carries.
+const WRITE_HEADERS: &[&str] = &[
+    "Content-Type: application/json",
+    "X-Cadence-Board: 1",
+    "Sec-Fetch-Site: same-origin",
+];
+
+fn write_json(
+    port: u16,
+    method: &str,
+    path: &str,
+    host: &str,
+    body: &str,
+) -> (u16, String, String) {
+    http_write(port, method, path, host, WRITE_HEADERS, body.as_bytes())
 }
 
 /// Spawn `ui::serve` on a free port and wait for health. The caller owns
@@ -360,10 +411,18 @@ fn ui_routes_and_rejections() {
     // --- rejections ---
     let (code, _) = http(port, "GET", "/api/issues", "evil.example");
     assert_eq!(code, 421);
-    let (code, _) = http(port, "POST", "/api/issues", &ok_host);
-    assert_eq!(code, 405);
+    // POST on the create route exists in I2 — without the write headers
+    // it stops at the cross-site guards (403), never reaching the writer.
+    let (code, body) = http(port, "POST", "/api/issues", &ok_host);
+    assert_eq!(code, 403);
+    assert!(body.contains("content_type"));
     let (code, _) = http(port, "DELETE", "/api/issues/CAD-1", &ok_host);
     assert_eq!(code, 405);
+    // OPTIONS is never a preflight — 405, and no Access-Control-* header
+    // is ever sent on any response.
+    let (code, headers, _) = http_full(port, "OPTIONS", "/api/issues", &ok_host);
+    assert_eq!(code, 405);
+    assert!(!headers.to_lowercase().contains("access-control"));
     let (code, _) = http(port, "GET", "/api/issues/nope", &ok_host);
     assert_eq!(code, 400);
     let (code, _) = http(port, "GET", "/api/issues/CAD-1%2F..%2Fsecret", &ok_host);
@@ -392,6 +451,455 @@ fn ui_routes_and_rejections() {
     assert!(headers
         .to_lowercase()
         .contains("x-content-type-options: nosniff"));
+}
+
+#[test]
+fn ui_write_path() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let before = commits(pm.path());
+
+    // --- cross-site guards, each failing separately ---
+    // 1. Simulated cross-site form post: simple content type + foreign
+    //    origin — the first guard that fails is named.
+    let (code, _, body) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-2",
+        &host,
+        &[
+            "Content-Type: application/x-www-form-urlencoded",
+            "X-Cadence-Board: 1",
+            "Origin: http://evil.example",
+        ],
+        b"status=done",
+    );
+    assert_eq!(code, 403);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["check"],
+        "content_type"
+    );
+
+    // 2. Right content type, no board marker.
+    let (code, _, body) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-2",
+        &host,
+        &["Content-Type: application/json"],
+        b"{}",
+    );
+    assert_eq!(code, 403);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["check"],
+        "x_cadence_board"
+    );
+
+    // 3. Foreign Origin.
+    let (code, _, body) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-2",
+        &host,
+        &[
+            "Content-Type: application/json",
+            "X-Cadence-Board: 1",
+            "Origin: http://evil.example",
+        ],
+        b"{}",
+    );
+    assert_eq!(code, 403);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["check"],
+        "origin"
+    );
+
+    // 4. Cross-site fetch metadata.
+    let (code, _, body) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-2",
+        &host,
+        &[
+            "Content-Type: application/json",
+            "X-Cadence-Board: 1",
+            "Sec-Fetch-Site: cross-site",
+        ],
+        b"{}",
+    );
+    assert_eq!(code, 403);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["check"],
+        "sec_fetch_site"
+    );
+
+    // 5. A wrong marker value is the same refusal as a missing one.
+    let (code, _, body) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-2",
+        &host,
+        &["Content-Type: application/json", "X-Cadence-Board: yes"],
+        b"{}",
+    );
+    assert_eq!(code, 403);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["check"],
+        "x_cadence_board"
+    );
+    assert_eq!(commits(pm.path()), before, "guards ran before any write");
+
+    // --- the happy path: every write route through the same writer ---
+    let (code, _, body) = write_json(
+        port,
+        "POST",
+        "/api/issues",
+        &host,
+        r#"{"project":"cadence","title":"via api","priority":"P1"}"#,
+    );
+    assert_eq!(code, 201);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let new_id = v["card"]["id"].as_str().unwrap().to_string();
+    assert!(new_id.starts_with("CAD-"));
+    assert_eq!(v["card"]["status"], "backlog");
+    assert_eq!(v["issue"]["title"], "via api");
+
+    // PATCH fields + body; rev moves; commit names the ui actor.
+    let rev = v["card"]["rev"].as_str().unwrap().to_string();
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        &format!("/api/issues/{new_id}"),
+        &host,
+        &format!(
+            r##"{{"status":"ready","owner":"operator","body":"# new body","if_rev":"{rev}"}}"##
+        ),
+    );
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["card"]["status"], "ready");
+    assert_eq!(v["card"]["owner"], "operator");
+    assert_eq!(v["issue"]["body"], "# new body");
+    assert_ne!(v["card"]["rev"].as_str().unwrap(), rev);
+
+    // PATCH with the same (now stale) if_rev → 409 + current rev.
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        &format!("/api/issues/{new_id}"),
+        &host,
+        &format!(r#"{{"status":"doing","if_rev":"{rev}"}}"#),
+    );
+    assert_eq!(code, 409);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["conflict"], "if_rev");
+    assert!(v["current_rev"].as_str().unwrap().starts_with("fnv1a:"));
+
+    // Empty strings clear owner and component.
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        &format!("/api/issues/{new_id}"),
+        &host,
+        r#"{"owner":"","component":""}"#,
+    );
+    assert_eq!(code, 200);
+    let card = serde_json::from_str::<Value>(&body).unwrap()["card"].clone();
+    assert!(card["owner"].is_null());
+    assert!(card["component"].is_null());
+
+    // Derived status refuses: CAD-1 is a rollup container.
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/CAD-1",
+        &host,
+        r#"{"status":"done"}"#,
+    );
+    assert_eq!(code, 409);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["conflict"],
+        "status_derived"
+    );
+
+    // ready while still blocked → succeeds, warns. CAD-3 waits on CAD-2
+    // (seeded link); move CAD-3 to ready and expect the warning.
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "link", "CAD-3", "blocked_by", "CAD-2"]
+        )
+        .0
+    );
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/CAD-3",
+        &host,
+        r#"{"status":"ready"}"#,
+    );
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["card"]["status"], "ready");
+    assert!(v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("CAD-2")));
+
+    // links: add relates + delete it; self-link rejected.
+    let (code, _, body) = write_json(
+        port,
+        "POST",
+        "/api/issues/CAD-3/links",
+        &host,
+        r#"{"type":"relates","target":"CAD-1"}"#,
+    );
+    assert_eq!(code, 200);
+    assert!(
+        serde_json::from_str::<Value>(&body).unwrap()["issue"]["links"]["relates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["id"] == "CAD-1")
+    );
+    let (code, _, _) = write_json(
+        port,
+        "POST",
+        "/api/issues/CAD-3/links",
+        &host,
+        r#"{"type":"blocked_by","target":"CAD-3"}"#,
+    );
+    assert_eq!(code, 400);
+    let (code, _, body) = write_json(
+        port,
+        "DELETE",
+        "/api/issues/CAD-3/links",
+        &host,
+        r#"{"type":"relates","target":"CAD-1"}"#,
+    );
+    assert_eq!(code, 200);
+    assert!(
+        serde_json::from_str::<Value>(&body).unwrap()["issue"]["links"]["relates"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // refs: url form lands as a url ref.
+    let (code, _, body) = write_json(
+        port,
+        "POST",
+        "/api/issues/CAD-3/refs",
+        &host,
+        r#"{"kind":"url","url":"https://example.com/doc","label":"doc"}"#,
+    );
+    assert_eq!(code, 200);
+    assert!(
+        serde_json::from_str::<Value>(&body).unwrap()["issue"]["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["label"] == "doc")
+    );
+
+    // comments: author operator, kind ui, markdown body stored verbatim.
+    let (code, _, body) = write_json(
+        port,
+        "POST",
+        "/api/issues/CAD-3/comments",
+        &host,
+        r#"{"body":"hello **bold** <script>x</script>"}"#,
+    );
+    assert_eq!(code, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let comment = v["issue"]["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["body"].as_str().unwrap().contains("**bold**"))
+        .unwrap()
+        .clone();
+    assert_eq!(comment["author"], "operator");
+    assert_eq!(comment["kind"], "ui");
+
+    // --- artifacts ---
+    // upload: octet-stream body, ?name= grammar.
+    let (code, _, body) = http_write(
+        port,
+        "POST",
+        "/api/issues/CAD-3/artifacts?name=notes.md",
+        &host,
+        &[
+            "Content-Type: application/octet-stream",
+            "X-Cadence-Board: 1",
+        ],
+        b"# report\n",
+    );
+    assert_eq!(code, 200);
+    assert!(
+        serde_json::from_str::<Value>(&body).unwrap()["issue"]["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["name"] == "notes.md")
+    );
+
+    // json content-type on the upload route is refused.
+    let (code, _, _) = write_json(
+        port,
+        "POST",
+        "/api/issues/CAD-3/artifacts?name=x.md",
+        &host,
+        "{}",
+    );
+    assert_eq!(code, 403);
+
+    // same name again → create-only conflict.
+    let (code, _, body) = http_write(
+        port,
+        "POST",
+        "/api/issues/CAD-3/artifacts?name=notes.md",
+        &host,
+        &[
+            "Content-Type: application/octet-stream",
+            "X-Cadence-Board: 1",
+        ],
+        b"v2",
+    );
+    assert_eq!(code, 409);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["conflict"],
+        "exists"
+    );
+
+    // over-cap upload refused without buffering (cap is 1 MiB).
+    let big = vec![b'x'; 1_048_577];
+    let (code, _, body) = http_write(
+        port,
+        "POST",
+        "/api/issues/CAD-3/artifacts?name=big.bin",
+        &host,
+        &[
+            "Content-Type: application/octet-stream",
+            "X-Cadence-Board: 1",
+        ],
+        &big,
+    );
+    assert_eq!(code, 413);
+    assert!(body.contains("cap"));
+
+    // bad names.
+    for bad in ["a/b.txt", ".hidden", ""] {
+        let (code, _, _) = http_write(
+            port,
+            "POST",
+            &format!("/api/issues/CAD-3/artifacts?name={bad}"),
+            &host,
+            &[
+                "Content-Type: application/octet-stream",
+                "X-Cadence-Board: 1",
+            ],
+            b"x",
+        );
+        assert_eq!(code, 400, "name {bad:?}");
+    }
+
+    // The constrained read: text inline, html/svg/pdf as attachments.
+    std::fs::write(
+        pm.path().join("cadence/CAD-3/artifacts/report.html"),
+        "<script>alert(1)</script>",
+    )
+    .unwrap();
+    std::fs::write(pm.path().join("cadence/CAD-3/artifacts/scan.svg"), "<svg/>").unwrap();
+    let (code, headers, body) =
+        http_full(port, "GET", "/api/issues/CAD-3/artifacts/notes.md", &host);
+    assert_eq!(code, 200);
+    let h = headers.to_lowercase();
+    assert!(h.contains("text/plain"));
+    assert!(h.contains("content-security-policy: sandbox; default-src 'none'"));
+    assert!(!h.contains("content-disposition"));
+    assert!(body.contains("# report"));
+
+    // Images open inline too — the drawer previews them.
+    std::fs::write(
+        pm.path().join("cadence/CAD-3/artifacts/shot.png"),
+        b"\x89PNG",
+    )
+    .unwrap();
+    let (code, headers, _) = http_full(port, "GET", "/api/issues/CAD-3/artifacts/shot.png", &host);
+    assert_eq!(code, 200);
+    let h = headers.to_lowercase();
+    assert!(h.contains("image/png"));
+    assert!(!h.contains("content-disposition"));
+
+    // Active formats never render: html/svg/xml/js/pdf download as
+    // octet-stream attachments under the sandbox CSP.
+    for (name, bytes) in [
+        ("x.pdf", b"%PDF".as_slice()),
+        ("feed.xml", b"<x/>".as_slice()),
+        ("app.js", b"alert(1)".as_slice()),
+    ] {
+        std::fs::write(pm.path().join("cadence/CAD-3/artifacts").join(name), bytes).unwrap();
+    }
+    for name in ["report.html", "scan.svg", "x.pdf", "feed.xml", "app.js"] {
+        let (code, headers, _) = http_full(
+            port,
+            "GET",
+            &format!("/api/issues/CAD-3/artifacts/{name}"),
+            &host,
+        );
+        assert_eq!(code, 200, "{name}");
+        let h = headers.to_lowercase();
+        assert!(h.contains("content-disposition: attachment"), "{name}: {h}");
+        assert!(h.contains("application/octet-stream"), "{name}: {h}");
+        assert!(h.contains("sandbox"), "{name}: {h}");
+    }
+
+    // A nested name is not a traversal escape — the name grammar
+    // refuses "/" outright.
+    let (code, _) = http(
+        port,
+        "GET",
+        "/api/issues/CAD-3/artifacts/../issue.md",
+        &host,
+    );
+    assert_eq!(code, 400);
+    // a symlinked artifact is refused.
+    let outside = pm.path().join("outside.txt");
+    std::fs::write(&outside, "secret").unwrap();
+    std::os::unix::fs::symlink(&outside, pm.path().join("cadence/CAD-3/artifacts/leak.txt"))
+        .unwrap();
+    let (code, _) = http(port, "GET", "/api/issues/CAD-3/artifacts/leak.txt", &host);
+    assert_eq!(code, 404);
+
+    // Every write produced exactly one commit naming the ui actor.
+    let log = Command::new("git")
+        .arg("-C")
+        .arg(pm.path())
+        .args(["log", "--format=%s"])
+        .output()
+        .unwrap();
+    let subjects = String::from_utf8_lossy(&log.stdout);
+    assert!(subjects.contains("(operator (ui))"), "{subjects}");
+    assert!(subjects.contains("attach notes.md (operator (ui))"));
+
+    // unknown field rejected; bad json rejected.
+    let (code, _, _) = write_json(port, "PATCH", "/api/issues/CAD-2", &host, r#"{"bogus":1}"#);
+    assert_eq!(code, 400);
+    let (code, _, _) = write_json(port, "PATCH", "/api/issues/CAD-2", &host, "{");
+    assert_eq!(code, 400);
+
+    // One commit per successful write: 9 HTTP writes + the 1 CLI link.
+    assert_eq!(
+        commits(pm.path()),
+        before + 10,
+        "each write is exactly one commit"
+    );
 }
 
 #[test]

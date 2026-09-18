@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
-import { api } from "./api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, ApiError, type WriteResp } from "./api";
 import Board from "./components/Board";
 import Drawer from "./components/Drawer";
 import Plan from "./components/Plan";
 import Sidebar from "./components/Sidebar";
-import type { AgentsPayload, Health, IssueCard, Project } from "./types";
+import Toast, { type ToastMsg } from "./components/Toast";
+import type { AgentsPayload, Health, IssueCard, IssueDetail, Project } from "./types";
 
 export default function App() {
   const [tab, setTab] = useState<"board" | "plan">("board");
@@ -15,7 +16,10 @@ export default function App() {
   const [agents, setAgents] = useState<AgentsPayload | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
+  const [openDetail, setOpenDetail] = useState<IssueDetail | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
+  const [toast, setToast] = useState<ToastMsg | null>(null);
+  const toastTimer = useRef<number>(0);
 
   // Selection lives in the URL (`?project=cadence&issue=CAD-16`) so a
   // refresh or a pasted link restores the same view.
@@ -52,9 +56,100 @@ export default function App() {
       })
       .catch((e) => setFailed(String(e.message ?? e)));
     api.agents().then(setAgents).catch(() => setAgents(null));
-  }, []);
+    if (openId) {
+      api
+        .issue(openId)
+        .then(setOpenDetail)
+        .catch(() => {});
+    }
+  }, [openId]);
 
   useEffect(refresh, [refresh]);
+
+  // No event stream until I3 — re-read on focus and every 30s while the
+  // tab is visible, so CLI/agent writes surface without a manual refresh.
+  useEffect(() => {
+    const onFocus = () => refresh();
+    const tick = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    const timer = setInterval(tick, 30_000);
+    addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      clearInterval(timer);
+      removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, [refresh]);
+
+  const say = useCallback((kind: ToastMsg["kind"], text: string) => {
+    setToast({ kind, text });
+    clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 4200);
+  }, []);
+
+  /// A write response is authoritative: merge the fresh card into the
+  /// board and the fresh detail into the drawer — no second fetch.
+  const applyWrite = useCallback(
+    (resp: WriteResp, verb: string) => {
+      setIssues((prev) => {
+        const i = prev.findIndex((c) => c.id === resp.card.id);
+        if (i === -1) return [...prev, resp.card];
+        const next = prev.slice();
+        next[i] = resp.card;
+        return next;
+      });
+      setOpenDetail((d) => (d && d.id === resp.issue.id ? resp.issue : d));
+      const warns = (resp.warnings ?? []).filter(Boolean);
+      if (warns.length) {
+        say("warn", `${verb} · ${warns.join(" · ")}`);
+      } else {
+        say("ok", verb);
+      }
+    },
+    [say],
+  );
+
+  const writeError = useCallback(
+    (e: unknown, verb: string) => {
+      const err = e as ApiError;
+      // A conflict carries the fresh card — resync so the board shows
+      // the state that won.
+      if (err.card) {
+        setIssues((prev) => {
+          const i = prev.findIndex((c) => c.id === err.card!.id);
+          if (i === -1) return prev;
+          const next = prev.slice();
+          next[i] = err.card!;
+          return next;
+        });
+      }
+      say("err", `${verb} failed: ${err.message ?? e}`);
+    },
+    [say],
+  );
+
+  /// Drag or drawer status change. `rev` is the card's if_rev token;
+  /// `rollback` restores the previous card on failure.
+  const moveIssue = useCallback(
+    (issue: IssueCard, status: string) => {
+      if (issue.status === status) return;
+      const prev = issue;
+      // Optimistic: the card moves now, the write decides for real.
+      setIssues((all) =>
+        all.map((c) => (c.id === issue.id ? { ...c, status } : c)),
+      );
+      api
+        .patch(issue.id, { status }, issue.rev)
+        .then((resp) => applyWrite(resp, `${issue.id} → ${status}`))
+        .catch((e) => {
+          setIssues((all) => all.map((c) => (c.id === issue.id ? prev : c)));
+          writeError(e, `${issue.id} move`);
+        });
+    },
+    [applyWrite, writeError],
+  );
 
   const openIssue = useCallback((id: string) => setOpenId(id), []);
 
@@ -109,12 +204,15 @@ export default function App() {
             <button
               onClick={refresh}
               className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
-              title="no live updates in I1 — click to re-read the folders"
+              title="re-read the folders — writes also land here from the API"
             >
               refresh
             </button>
-            <span className="hidden sm:inline-flex chip bg-ink-800 text-ink-400">
-              read-only
+            <span
+              className="hidden sm:inline-flex chip bg-ink-800 text-ink-400"
+              title="writes commit to the tracker as operator (ui)"
+            >
+              writes: operator
             </span>
           </div>
         </header>
@@ -137,6 +235,9 @@ export default function App() {
             query={query}
             onQuery={setQuery}
             onOpen={openIssue}
+            onMove={moveIssue}
+            onCreated={applyWrite}
+            onError={writeError}
           />
         ) : (
           <Plan />
@@ -145,13 +246,20 @@ export default function App() {
 
       {openId && (
         <Drawer
+          key={openId}
           id={openId}
           agents={agents}
+          projects={projects}
           pmDir={health?.pm_dir}
+          detail={openDetail}
           onClose={() => setOpenId(null)}
           onOpen={openIssue}
+          onWrite={applyWrite}
+          onError={writeError}
         />
       )}
+
+      <Toast msg={toast} />
     </div>
   );
 }
