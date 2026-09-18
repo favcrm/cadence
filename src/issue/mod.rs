@@ -8,6 +8,7 @@
 pub mod board;
 pub mod cli;
 pub mod doctor;
+pub mod history;
 pub mod hooks;
 pub mod lint;
 pub mod model;

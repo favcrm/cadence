@@ -6,6 +6,7 @@ import { noDragReason } from "./Card";
 import type {
   AgentsPayload,
   IssueDetail,
+  IssueHistoryEntry,
   LinkRef,
   Project,
 } from "../types";
@@ -127,6 +128,9 @@ export default function Drawer({
   const [comment, setComment] = useState("");
   const [commentPreview, setCommentPreview] = useState(false);
   const [dropHot, setDropHot] = useState(false);
+  const [history, setHistory] = useState<IssueHistoryEntry[] | null>(null);
+  const [histLimit, setHistLimit] = useState(10);
+  const [histErr, setHistErr] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -148,6 +152,33 @@ export default function Drawer({
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  // A different issue starts the history list back at the first page.
+  useEffect(() => {
+    setHistLimit(10);
+    setHistory(null);
+    setHistErr(null);
+  }, [id]);
+
+  // History pages: "show more" refetches with a bigger limit.
+  useEffect(() => {
+    let live = true;
+    api
+      .history(id, histLimit)
+      .then((r) => {
+        if (!live) return;
+        setHistory(r.history);
+        setHistErr(null);
+      })
+      .catch((e) => {
+        if (!live) return;
+        setHistory([]);
+        setHistErr(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      live = false;
+    };
+  }, [id, histLimit]);
 
   const sessions = (agents?.agents ?? []).filter((a) => a.on.includes(id));
   const rev = detail?.rev;
@@ -832,6 +863,57 @@ export default function Drawer({
                   <p className="text-secondary text-ink-500">
                     No live session. The issue file never stores sessions.
                   </p>
+                )}
+              </section>
+
+              <section>
+                <div className="flex items-baseline gap-2 mb-2">
+                  <h3 className="text-cardtitle font-semibold text-ink-100">
+                    History
+                  </h3>
+                  <span className="kicker">parsed from git log</span>
+                  {history !== null && history.length >= histLimit && (
+                    <button
+                      onClick={() => setHistLimit(histLimit + 20)}
+                      className="lnk num text-label ml-auto"
+                    >
+                      show more
+                    </button>
+                  )}
+                </div>
+                {histErr ? (
+                  <p className="text-secondary text-ink-500">
+                    History unavailable — {histErr}
+                  </p>
+                ) : history === null ? (
+                  <p className="text-secondary text-ink-500">Loading…</p>
+                ) : history.length === 0 ? (
+                  <p className="text-secondary text-ink-500">
+                    No git history yet.
+                  </p>
+                ) : (
+                  <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
+                    {history.map((h) => (
+                      <li
+                        key={h.sha}
+                        className="flex items-center gap-2.5 px-3 py-2"
+                      >
+                        <span className="num text-micro text-ink-500 shrink-0 whitespace-nowrap">
+                          {fmtTime(h.at)}
+                        </span>
+                        <span className="chip bg-ink-800 text-ink-300 shrink-0 max-w-[9rem] truncate">
+                          {h.by}
+                        </span>
+                        <span
+                          className={`text-secondary truncate min-w-0 ${
+                            h.kind === "other" ? "text-ink-500" : "text-ink-300"
+                          }`}
+                        >
+                          {h.summary}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
                 )}
               </section>
             </>

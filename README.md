@@ -129,6 +129,10 @@ cadence issue sync                 # multi-host: fetch, rebase, lint, push —
                                    # conflict/lint aborts leave the tree
                                    # untouched; --dry-run, --no-push,
                                    # --resolve ours|theirs
+cadence issue log CAD-16           # the audit trail from git alone:
+cadence issue diff CAD-16 --to HEAD   # log/diff/blame, `ls --at <rev>`
+cadence issue blame CAD-16            # for the board at a revision —
+                                      # all read-only
 cadence ui run                     # 127.0.0.1:3010 — SPA + read/write API
 ```
 

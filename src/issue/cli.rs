@@ -8,7 +8,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::issue::{board, doctor, hooks, lint, model, project, sync, write, Pm};
+use crate::issue::{board, doctor, history, hooks, lint, model, project, sync, write, Pm};
 
 #[derive(Subcommand)]
 pub enum IssueAction {
@@ -62,9 +62,40 @@ pub enum IssueAction {
         /// Only computed-ready leaves.
         #[arg(long)]
         ready: bool,
+        /// Board state at a git revision — exports the tree at `<rev>`
+        /// and lists it read-only; cards report `status_source: file`.
+        #[arg(long)]
+        at: Option<String>,
         #[arg(long)]
         json: bool,
     },
+    /// `git log` for the issue folder, parsed: `sha`, `at`, `by`
+    /// (the ` (actor)` suffix, else the commit author), `kind`
+    /// (`created|set|link|unlink|ref|comment|attach|other`), `summary`
+    /// and a `fields` map for `set` entries. Read-only.
+    Log {
+        /// Issue id (CAD-16).
+        id: String,
+        /// Max entries [default: 50].
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Field-level diff of `issue.md` between two revisions — `{field,
+    /// from, to}` entries plus body line counts and comment/artifact
+    /// files added/removed. `issue diff CAD-16` compares the issue's
+    /// newest change with its parent; `diff CAD-16 <rev> --to HEAD`
+    /// shows everything that changed since `<rev>`.
+    Diff {
+        id: String,
+        /// From-revision [default: the parent of the newest change].
+        rev: Option<String>,
+        /// To-revision [default: the newest commit on the issue].
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// For every frontmatter field currently set, the history entry
+    /// that last changed it (`value`, `sha`, `at`, `by`).
+    Blame { id: String },
     /// Show one issue — frontmatter, body, links both ways, comments,
     /// artifacts, activity.
     Show {
@@ -270,14 +301,26 @@ pub fn run(action: &IssueAction) -> Result<i32> {
             project,
             status,
             ready,
+            at,
             json: json_flag,
         } => {
             let pm = open_pm()?;
-            let issues = board::load_all(&pm.dir, project.as_deref())?;
-            let jobs = crate::client::state_dir()
-                .map(|d| board::fetch_job_outcomes(&d))
-                .unwrap_or_default();
-            let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+            let (views, at_meta) = match at {
+                Some(rev) => {
+                    let (meta, views) = history::ls_at(&pm.dir, rev, project.as_deref())?;
+                    (views, Some(meta))
+                }
+                None => {
+                    let issues = board::load_all(&pm.dir, project.as_deref())?;
+                    let jobs = crate::client::state_dir()
+                        .map(|d| board::fetch_job_outcomes(&d))
+                        .unwrap_or_default();
+                    (
+                        board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs),
+                        None,
+                    )
+                }
+            };
             let mut views: Vec<&board::View> = views.iter().collect();
             if let Some(status) = status {
                 model::check_status(status)?;
@@ -287,12 +330,49 @@ pub fn run(action: &IssueAction) -> Result<i32> {
                 views.retain(|v| v.ready);
             }
             if *json_flag {
-                print_json(&json!({
+                let mut out = json!({
                     "issues": views.iter().map(|v| board::card_json(v)).collect::<Vec<_>>(),
-                }));
+                });
+                if let Some(meta) = at_meta {
+                    out["at"] = meta;
+                }
+                print_json(&out);
             } else {
+                if let Some(meta) = &at_meta {
+                    eprintln!(
+                        "at {} {}",
+                        meta["sha"].as_str().unwrap_or("?"),
+                        meta["time"].as_str().unwrap_or("?")
+                    );
+                }
                 print_ls_table(&views);
             }
+            Ok(0)
+        }
+        IssueAction::Log { id, limit } => {
+            let pm = open_pm()?;
+            let issue = board::find_issue(&pm.dir, id)?;
+            print_json(&json!({
+                "id": issue.front.id,
+                "history": history::log(&pm.dir, &issue, *limit)?,
+            }));
+            Ok(0)
+        }
+        IssueAction::Diff { id, rev, to } => {
+            let pm = open_pm()?;
+            let issue = board::find_issue(&pm.dir, id)?;
+            print_json(&history::diff(
+                &pm.dir,
+                &issue,
+                rev.as_deref(),
+                to.as_deref(),
+            )?);
+            Ok(0)
+        }
+        IssueAction::Blame { id } => {
+            let pm = open_pm()?;
+            let issue = board::find_issue(&pm.dir, id)?;
+            print_json(&history::blame(&pm.dir, &issue)?);
             Ok(0)
         }
         IssueAction::Show { id, json } => {

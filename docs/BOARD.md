@@ -91,7 +91,18 @@ cadence issue new "title"                   # --project wins, else CADENCE_PROJE
                                             # match fails closed. --parent, --priority,
                                             # --blocked-by, --owner, --component, --id
 cadence issue ls [--project p] [--status s] [--ready] [--json]
+cadence issue ls --at <rev> [--project p] [--json]
+                                            # the board as it was at <rev> —
+                                            # cards report status_source: file
 cadence issue show CAD-16 [--json]
+cadence issue log CAD-16 [--limit 50]       # parsed git log for the issue
+                                            # folder: sha, at, by, kind,
+                                            # summary, fields for `set`
+cadence issue diff CAD-16 [<rev>] [--to <rev>]
+                                            # field-level from/to, body line
+                                            # counts, comment/artifact files
+cadence issue blame CAD-16                  # per field: the entry that last
+                                            # changed it (value, sha, at, by)
 cadence issue set CAD-16 status=doing owner=fable-cc
 cadence issue link CAD-16 blocked_by CAD-12 # also relates|parent|duplicate_of
 cadence issue unlink CAD-16 blocked_by CAD-12
@@ -144,6 +155,48 @@ lints but leaves the push for a later sync. `issue doctor` reports the
 same ahead/behind counts against `origin/<branch>` and points at
 `issue sync` whenever the local side is behind.
 
+## History — from git alone
+
+Every write is one commit whose subject carries the verb
+(`CAD-16: set status=review (operator (ui))`), so the tracker's own
+log is the audit trail. The history verbs are strictly read-only — no
+lock, no commit, no fetch — and work on a tracker with no remote. A PM
+dir that is not a git repository refuses cleanly.
+
+- `issue log <ID> [--limit N]` walks `git log` for the issue folder
+  (`issue.md`, `comments/`, `artifacts/` — `--follow` stays off so
+  identical templates never leak a sibling's commits) and parses each
+  entry: `sha` (short), `at` (RFC 3339 UTC), `by` (the ` (actor)`
+  suffix, else the commit author name), `kind`
+  (`created|set|link|unlink|ref|comment|attach|other`), `summary`
+  (subject minus the id prefix and actor), and a `fields` map for
+  `set` entries. Commits that are not cadence-shaped — hand edits,
+  reverts, sync replays with foreign subjects — appear as `other`
+  with the raw subject; nothing in the walk can fail on them.
+- `issue diff <ID> [<rev>] [--to <rev>]` diffs two snapshots of
+  `issue.md` field by field — `{field, from, to}` over the fixed
+  frontmatter keys — plus `body_changed`, added/removed body line
+  counts, and comment/artifact files added or removed. Bare `diff`
+  compares the issue's newest change with its parent; `<rev>` is a
+  from-revision (`diff <ID> <first-sha> --to HEAD` shows everything
+  since creation). Revs must resolve to commits reachable from `HEAD`
+  — unknown or unrelated revs are refused by name.
+- `issue blame <ID>` reports, for every frontmatter field currently
+  set, the history entry that last changed it (`value`, `sha`, `at`,
+  `by`) — derived by comparing parsed frontmatter at each commit with
+  its parent, not by reading raw `git blame` line output.
+- `issue ls --at <rev> [--project P]` exports the tree at `<rev>`
+  (`git archive | tar`) into a temp dir, loads it through the normal
+  loader, and discards the export. Job and note derivation is a
+  property of *now*, so every card reports `status_source: "file"`
+  (containers still `rollup` — that is the tree's own truth). The
+  response carries `at: {sha, time}`.
+
+The board API serves the same entries:
+`GET /api/issues/<ID>/history?limit=N` (default 50) — same shape as
+`issue log`. The drawer's History section lists them newest-first,
+10 at a time with a "show more" that refetches a larger limit.
+
 ## `cadence ui` — the reader
 
 ```bash
@@ -168,6 +221,7 @@ emits fixed names) so `--dist` is unnecessary.
 | `GET /api/issues/:id` | the drawer payload: frontmatter, body, links both ways, refs, files, comments, notes chain, merged activity |
 | `GET /api/issues/:id/file` | raw `issue.md`, `text/markdown` |
 | `GET /api/issues/:id/activity` | the merged activity stream only |
+| `GET /api/issues/:id/history?limit=N` | parsed git history for the issue — same entries as `issue log` (default limit 50, `400` on a bad limit) |
 | `GET /api/issues/:id/artifacts/:name` | one artifact file — inline for a small safe list (`text/plain` for md/txt/logs/code, images), **`Content-Disposition: attachment` for everything else, always for html/svg/xml/js/pdf**. Every artifact response carries `Content-Security-Policy: sandbox; default-src 'none'` and `Cache-Control: no-store`; names must satisfy the write grammar (no `/`, no leading dot); symlinks → `404` |
 | `GET /api/agents` | worker agent rows enriched with the exact task/issue binding (`agent.tasks` × `jobs.issue_id`) + running/queued/fenced/parked totals and `by_issue` for card strips; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down |
 | `GET /api/agents/:alias` | the agent drawer: `agent_show` + last 20 events + `tasks`/`on` bindings + `recovery`/`resume` commands; `404` on unknown alias, `400` on alias grammar |
