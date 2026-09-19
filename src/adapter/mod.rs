@@ -146,6 +146,21 @@ pub struct AdapterHooks {
 pub trait ProviderAdapter: Send + Sync {
     /// Open or resume the provider session for `agent`.
     fn open(&self, agent: &Agent) -> Result<Identity>;
+    /// Re-open after a provably clean daemon restart to adopt the
+    /// recorded in-flight turn (CAD-89): the endpoint must still be
+    /// the one the shutdown recorded — same pane pid, same native
+    /// session — and the recorded endpoint generation is reused so
+    /// the turn's token stays valid. Managed kinds cannot adopt: a
+    /// provider process dies with its daemon, so the default refuses.
+    fn open_adopted(
+        &self,
+        _agent: &Agent,
+        _adoption: &crate::store::AdoptEntry,
+    ) -> Result<Identity> {
+        Err(crate::error::Error::rejected(
+            "this endpoint kind cannot adopt turns",
+        ))
+    }
     /// Run one turn. `on_started` fires once the provider acknowledges a
     /// turn id; after that point a lost connection is `OutcomeUnknown`.
     fn run_turn(
