@@ -27,10 +27,6 @@ use crate::error::{Error, Result};
 use crate::issue::{board, model::Front, project, write, Pm};
 use crate::proc::{run_bounded, BoundedError};
 
-/// Message states that mean the owner is or will be working — a
-/// queued kickoff points at the worktree even before it starts.
-const LIVE_MESSAGE_STATES: &[&str] = &["queued", "submitting", "running"];
-
 /// Every git/gh probe in this file runs through the bounded runner —
 /// user repos can be slow or locked and finish must not stall.
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -284,10 +280,21 @@ fn resolve(pm: &Pm, id: &str) -> Result<Resolve> {
                     .unwrap_or_default()
             ))
         })?;
+    // Message refs bind the worktree they were dispatched against: a
+    // ref carrying a `worktree` field scopes to that pair only, so a
+    // re-start under `--name` doesn't inherit the earlier kickoff's
+    // binding. Unscoped refs (hand-added, pre-CAD-94) bind any target.
     let msg_refs = front
         .refs
         .iter()
         .filter(|r| r.kind == "message")
+        .filter(|r| match r.worktree.as_deref() {
+            Some(w) => {
+                wt_name.as_deref() == Some(w)
+                    || wt_dir.as_deref().is_some_and(|d| d.to_string_lossy() == w)
+            }
+            None => true,
+        })
         .filter_map(|r| r.path.clone())
         .collect();
     Ok(Resolve::Target(Box::new(Target {
@@ -425,18 +432,30 @@ fn branch_state(t: &Target) -> Branch {
 /// checks, evaluated read-only. In-use means THIS worktree: a live
 /// message recorded against it, the owner's pane tree with cwd inside
 /// it, or any process standing in it. An owner busy elsewhere does
-/// not block. Daemon-down while an owner is recorded blocks rather
-/// than guesses — a pane the daemon can't see may still be mid-run.
+/// not block. Only a daemon TRANSPORT failure blocks the owner check —
+/// a `Rejected` answer (unknown or absent agent) is the daemon proving
+/// the owner cannot be using anything, and the /proc scans still run.
 fn inspect(state_dir: &Path, t: &Target) -> Check {
     let mut blocks = Vec::new();
     let mut pane_pid = None;
     if let Some(owner) = t.front.owner.as_deref() {
         match client::rpc(state_dir, "agent_show", json!({"alias": owner})) {
             Ok(show) => {
+                // A queued message blocks only while someone can start
+                // it: an inbox queue is durable backlog that drains
+                // only on `cadence inbox` (CAD-64), and a dead agent's
+                // queue can never begin. running/submitting are live
+                // work for every owner kind.
+                let dead = show["agent"]["dead"].as_bool() == Some(true);
+                let inbox = show["agent"]["endpoint_kind"].as_str() == Some("inbox");
                 if let Some(msg) = show["messages"].as_array().and_then(|ms| {
                     ms.iter().find(|m| {
-                        LIVE_MESSAGE_STATES.contains(&m["state"].as_str().unwrap_or_default())
-                            && message_bound(state_dir, m, t)
+                        let live = match m["state"].as_str().unwrap_or_default() {
+                            "running" | "submitting" => true,
+                            "queued" => !dead && !inbox,
+                            _ => false,
+                        };
+                        live && message_bound(state_dir, m, t)
                     })
                 }) {
                     let body: String = msg["body"]
@@ -456,20 +475,22 @@ fn inspect(state_dir: &Path, t: &Target) -> Check {
                         ),
                     });
                 }
-                if show["agent"]["endpoint_kind"].as_str() == Some("pty")
-                    && show["agent"]["dead"].as_bool() != Some(true)
-                {
+                if show["agent"]["endpoint_kind"].as_str() == Some("pty") && !dead {
                     pane_pid = show["agent"]["pid"].as_u64().map(|p| p as u32);
                 }
             }
-            Err(e) => blocks.push(Block {
-                tag: "owner-check-unreachable".to_string(),
+            // Only a transport failure blocks: `Rejected` is the daemon
+            // answering — an unknown or absent owner is provably not
+            // using the worktree. The /proc scans below still run.
+            Err(e) if matches!(e, Error::Internal(_)) => blocks.push(Block {
+                tag: "daemon-unreachable".to_string(),
                 reason: format!(
-                    "Cannot check owner '{owner}' ({e}) — the daemon must be \
-                     reachable to finish safely; rerun when it is up or \
-                     pass --force"
+                    "Daemon unreachable while checking owner '{owner}' ({e}) — \
+                     the owner checks cannot run; rerun when the daemon is \
+                     up or pass --force"
                 ),
             }),
+            Err(_) => {}
         }
     }
     // Any process standing in the worktree blocks it — an owner pane's
@@ -501,7 +522,7 @@ fn inspect(state_dir: &Path, t: &Target) -> Check {
                 tag: "proc-cwd".to_string(),
                 reason: format!(
                     "Process {pid} ({}) has cwd inside {} — close it or \
-                     pass --force",
+                     cd out of the worktree, or pass --force",
                     comm_of(pid),
                     d.display()
                 ),

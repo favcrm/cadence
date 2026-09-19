@@ -13289,10 +13289,10 @@ fn dispatch_kickoff_and_finish_guards() {
     assert_eq!(ref_msg, out["message"].as_str().unwrap());
 
     // `issue finish` with w1's kickoff still queued: the kickoff's
-    // message ref is recorded against THIS worktree, so the
-    // per-worktree guard refuses naming the message — even though w1
-    // is an `inbox` mailbox (CAD-94: bound live messages block for
-    // every owner kind).
+    // message ref is recorded against THIS worktree, but a queued
+    // message on an `inbox` mailbox is durable backlog — it drains
+    // only on `cadence inbox`, never on its own (CAD-64). Only the
+    // unmerged branch blocks.
     std::fs::write(wt1.join("work.txt"), "x").unwrap();
     git(&wt1, &["add", "-A"]);
     git(&wt1, &["commit", "-qm", "d-1 work"]);
@@ -13300,31 +13300,21 @@ fn dispatch_kickoff_and_finish_guards() {
     assert!(!ok, "{err}");
     let msg = err["error"].as_str().unwrap();
     assert!(
-        msg.contains(&msg_id) && msg.contains("recorded against this worktree"),
+        msg.contains("neither merged") && !msg.contains(&msg_id),
         "{msg}"
     );
     assert!(wt1.is_dir());
 
-    // Merging the branch does not lift the bound-message block —
-    // --force records it and finishes anyway, without consuming the
-    // mail.
+    // Merged: the queued inbox kickoff never blocks — finish succeeds
+    // without --force and the mail stays queued, unconsumed.
     git(&repo, &["merge", "-q", "cadence/d-1-one"]);
-    let (ok, err) = cli(&["issue", "finish", "D-1"]);
-    assert!(
-        !ok && err["error"].as_str().unwrap().contains(&msg_id),
-        "{err}"
-    );
-    let (ok, out) = cli(&["issue", "finish", "D-1", "--force"]);
+    let (ok, out) = cli(&["issue", "finish", "D-1"]);
     assert!(
         ok && out["finished"] == true
-            && out["overrode"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|o| o == "bound-message"),
+            && out["overrode"] == json!([])
+            && out["merged_by"] == "ancestry",
         "{out}"
     );
-    assert_eq!(out["merged_by"], "ancestry", "{out}");
     assert!(!wt1.exists());
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     assert_eq!(show["messages"].as_array().unwrap()[0]["state"], "queued");
@@ -13456,6 +13446,29 @@ fn finish_guard_per_worktree() {
                 })
                 .unwrap();
         }
+        // A fenced devin/pty agent that was never launched: endpoint
+        // none + state attention reads `dead: true` (a `starting`
+        // agent races the daemon's failed-launch → `stopped` parking,
+        // which would read alive). Its queue can never start — a
+        // queued message bound to its worktree must not block finish.
+        store
+            .register_agent(&NewAgent {
+                alias: "deadpty",
+                provider: "devin",
+                endpoint_kind: "pty",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: Some("{\"upstream\":\"pm\"}"),
+            })
+            .unwrap();
+        store
+            .set_agent_state("deadpty", "attention", Some("never launched"))
+            .unwrap();
+        store
+            .enqueue("deadpty", "queued forever", None, "mkdead", "test")
+            .unwrap();
     }
     let d = TestDaemon::start_on(state);
     let tmp = TempDir::new().unwrap();
@@ -13522,7 +13535,7 @@ fn finish_guard_per_worktree() {
     assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
     assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
-    for title in ["Awt", "Bwt", "Cwt"] {
+    for title in ["Awt", "Bwt", "Cwt", "Dwt", "Ghost"] {
         assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
     }
     let note = tmp.path().join("kickoff.md");
@@ -13543,7 +13556,10 @@ fn finish_guard_per_worktree() {
     assert!(ok && out["dispatched"] == true, "{out}");
     let msg_a = out["message"].as_str().unwrap().to_string();
 
-    // Same owner's merged worktree B finishes without --force.
+    // Same owner's merged worktree B finishes without --force: the
+    // dispatch's message ref carries worktree A, so it doesn't bind
+    // this target at all (and a queued inbox message is backlog, not
+    // live work).
     let (ok, _) = cli(&["issue", "start", "D-2", "--owner", "w1"]);
     assert!(ok);
     let wt_b = repo.join(".cadence/wt/d-2-bwt");
@@ -13577,10 +13593,16 @@ fn finish_guard_per_worktree() {
     shell.kill().unwrap();
     let _ = shell.wait();
 
-    // A live message recorded against C refuses naming the message id.
+    // A queued message blocks only on a LIVE non-inbox owner — give
+    // C to a live devin pane and bind a queued message to it.
+    let _mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.wait_agent("dv", "idle", 15);
+    let (ok, _) = cli(&["issue", "set", "D-3", "owner=dv"]);
+    assert!(ok);
     d.rpc(
         "agent_send",
-        json!({"alias": "w1", "text": "queued against C", "message": "mkc"}),
+        json!({"alias": "dv", "text": "queued against C", "message": "mkc"}),
     )
     .unwrap();
     let (ok, _) = cli(&["issue", "ref", "D-3", "message", "mkc"]);
@@ -13589,10 +13611,50 @@ fn finish_guard_per_worktree() {
     assert!(!ok, "{err}");
     let msg = err["error"].as_str().unwrap();
     assert!(
-        msg.contains("mkc") && msg.contains("queued") && !msg.contains(&msg_a),
+        msg.contains("mkc")
+            && msg.contains("recorded against this worktree")
+            && !msg.contains(&msg_a),
         "message refusal names the bound id: {msg}"
     );
     assert!(wt_c.is_dir());
+
+    // A dead pty owner with a queued bound message does not block —
+    // its queue can never start.
+    let show = d.rpc("agent_show", json!({"alias": "deadpty"})).unwrap();
+    assert_eq!(show["agent"]["dead"], true, "fixture must read dead");
+    let (ok, _) = cli(&["issue", "start", "D-4", "--owner", "deadpty"]);
+    assert!(ok);
+    let wt_d = repo.join(".cadence/wt/d-4-dwt");
+    std::fs::write(wt_d.join("d.txt"), "x").unwrap();
+    git(&wt_d, &["add", "-A"]);
+    git(&wt_d, &["commit", "-qm", "d work"]);
+    git(&repo, &["merge", "-q", "cadence/d-4-dwt"]);
+    let (ok, _) = cli(&["issue", "ref", "D-4", "message", "mkdead"]);
+    assert!(ok);
+    let (ok, out) = cli(&["issue", "finish", "D-4"]);
+    assert!(
+        ok && out["finished"] == true && out["overrode"] == json!([]),
+        "queued on a dead owner must not block: {out}"
+    );
+    assert!(!wt_d.exists());
+
+    // An owner the daemon has never heard of cannot be using the
+    // worktree — Rejected is an answer, not a transport failure.
+    let (ok, _) = cli(&["issue", "start", "D-5"]);
+    assert!(ok);
+    let (ok, _) = cli(&["issue", "set", "D-5", "owner=ghost"]);
+    assert!(ok);
+    let wt_g = repo.join(".cadence/wt/d-5-ghost");
+    std::fs::write(wt_g.join("g.txt"), "x").unwrap();
+    git(&wt_g, &["add", "-A"]);
+    git(&wt_g, &["commit", "-qm", "g work"]);
+    git(&repo, &["merge", "-q", "cadence/d-5-ghost"]);
+    let (ok, out) = cli(&["issue", "finish", "D-5"]);
+    assert!(
+        ok && out["finished"] == true && out["overrode"] == json!([]),
+        "unknown owner must not block: {out}"
+    );
+    assert!(!wt_g.exists());
 }
 
 /// CAD-93: `issue finish --merged` sweeps every open worktree ref
@@ -13670,21 +13732,31 @@ fn finish_merged_sweep() {
     assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
     assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
-    for title in ["Merged", "Inuse", "Unmerged", "Dirty"] {
+    for title in ["Merged", "Inuse", "Unmerged", "Dirty", "Ghost"] {
         assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
     }
-    // All four started ownerless — no daemon involvement anywhere.
-    for id in ["D-1", "D-2", "D-3", "D-4"] {
+    // All started ownerless — no daemon involvement anywhere; D-5
+    // keeps an owner the daemon can't answer for.
+    for id in ["D-1", "D-2", "D-3", "D-4", "D-5"] {
         let (ok, out) = cli(&["issue", "start", id]);
         assert!(ok, "{out}");
         let (ok, _) = cli(&["issue", "set", id, "owner="]);
         assert!(ok);
     }
+    let (ok, _) = cli(&["issue", "set", "D-5", "owner=ghost"]);
+    assert!(ok);
     let wt = |slug: &str| repo.join(format!(".cadence/wt/{slug}"));
-    // D-1 merged+idle, D-2 merged+in-use, D-3 unmerged, D-4 merged+dirty.
+    // D-1 merged+idle, D-2 merged+in-use, D-3 unmerged, D-4 merged+dirty,
+    // D-5 merged with an owner check the daemon can't answer.
     // Each branch writes its own file — identical diffs would collapse
     // to one SHA and every branch would read `merged_by: ancestry`.
-    for slug in ["d-1-merged", "d-2-inuse", "d-3-unmerged", "d-4-dirty"] {
+    for slug in [
+        "d-1-merged",
+        "d-2-inuse",
+        "d-3-unmerged",
+        "d-4-dirty",
+        "d-5-ghost",
+    ] {
         std::fs::write(wt(slug).join(format!("{slug}.txt")), "x").unwrap();
         git(&wt(slug), &["add", "-A"]);
         git(&wt(slug), &["commit", "-qm", "work"]);
@@ -13692,6 +13764,7 @@ fn finish_merged_sweep() {
     git(&repo, &["merge", "-q", "cadence/d-1-merged"]);
     git(&repo, &["merge", "-q", "cadence/d-2-inuse"]);
     git(&repo, &["merge", "-q", "cadence/d-4-dirty"]);
+    git(&repo, &["merge", "-q", "cadence/d-5-ghost"]);
     let mut shell = std::process::Command::new("sleep")
         .arg("300")
         .current_dir(wt("d-2-inuse"))
@@ -13715,7 +13788,7 @@ fn finish_merged_sweep() {
     assert_eq!(code, 1, "{stdout}");
     let plan: Value = serde_json::from_str(stdout.trim()).unwrap();
     let rows = plan["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 4, "{plan}");
+    assert_eq!(rows.len(), 5, "{plan}");
     let outcome = |id: &str| {
         rows.iter()
             .find(|r| r["issue"] == id)
@@ -13740,8 +13813,18 @@ fn finish_merged_sweep() {
     );
     let (o, r) = outcome("D-4");
     assert!(o == "refused" && r.contains("uncommitted"), "{plan}");
+    // An owned worktree whose owner can't be checked still refuses —
+    // a transport failure is not proof of absence.
+    let (o, r) = outcome("D-5");
+    assert!(o == "refused" && r.contains("unreachable"), "{plan}");
     // Nothing changed: dirs exist, refs open, tracker untouched.
-    for slug in ["d-1-merged", "d-2-inuse", "d-3-unmerged", "d-4-dirty"] {
+    for slug in [
+        "d-1-merged",
+        "d-2-inuse",
+        "d-3-unmerged",
+        "d-4-dirty",
+        "d-5-ghost",
+    ] {
         assert!(wt(slug).is_dir(), "{slug} must survive dry-run");
     }
     let commits_after = String::from_utf8_lossy(
@@ -13757,7 +13840,7 @@ fn finish_merged_sweep() {
     .to_string();
     assert_eq!(commits_before, commits_after, "dry-run must not commit");
 
-    // Real sweep: D-1 finishes, D-2/D-4 refuse, D-3 skips — exit 1.
+    // Real sweep: D-1 finishes, D-2/D-4/D-5 refuse, D-3 skips — exit 1.
     let (code, stdout, _) = cli_raw(&["issue", "finish", "--merged", "--json"]);
     assert_eq!(code, 1, "{stdout}");
     let out: Value = serde_json::from_str(stdout.trim()).unwrap();
@@ -13772,20 +13855,25 @@ fn finish_merged_sweep() {
     assert_eq!(outcome("D-2"), "refused", "{out}");
     assert_eq!(outcome("D-3"), "skipped", "{out}");
     assert_eq!(outcome("D-4"), "refused", "{out}");
+    assert_eq!(outcome("D-5"), "refused", "{out}");
     assert!(!wt("d-1-merged").exists());
     assert!(wt("d-2-inuse").is_dir() && wt("d-3-unmerged").is_dir());
-    assert!(wt("d-4-dirty").is_dir());
+    assert!(wt("d-4-dirty").is_dir() && wt("d-5-ghost").is_dir());
 
-    // Clear the two refusals → a second sweep exits 0 on skip-only.
+    // Clear the refusals — including D-5's stale owner — and the
+    // second sweep exits 0 on skip-only.
     shell.kill().unwrap();
     let _ = shell.wait();
     std::fs::remove_file(wt("d-4-dirty").join("wip.txt")).unwrap();
+    let (ok, _) = cli(&["issue", "set", "D-5", "owner="]);
+    assert!(ok);
     let (code, stdout, _) = cli_raw(&["issue", "finish", "--merged", "--json"]);
     assert_eq!(code, 0, "{stdout}");
     let out: Value = serde_json::from_str(stdout.trim()).unwrap();
     let rows = out["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 3, "{out}"); // D-1 already finished → no row
+    assert_eq!(rows.len(), 4, "{out}"); // D-1 already finished → no row
     assert!(!wt("d-2-inuse").exists() && !wt("d-4-dirty").exists());
+    assert!(!wt("d-5-ghost").exists());
     assert!(wt("d-3-unmerged").is_dir());
 
     // The done-hint: status=done with an open worktree prints it.

@@ -324,12 +324,15 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         comment_text.push_str(&format!("\nLessons injected: {}", lessons.join(", ")));
     }
     let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
+    // The message ref carries the worktree it ran against — a re-start
+    // under `--name` must not inherit a binding meant for this pair.
     write::add_ref(
         pm,
         id,
         "message",
         &message,
         Some(&format!("dispatch → {}", args.to)),
+        started["worktree"].as_str(),
         None,
         actor,
     )?;

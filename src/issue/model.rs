@@ -37,6 +37,11 @@ pub struct Ref {
     /// deleting them — the ref stays as history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<bool>,
+    /// `message` refs only: the worktree the dispatch ran against, so
+    /// a re-start under `--name` leaves the earlier kickoff bound to
+    /// its own pair instead of every worktree the issue ever opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
 }
 
 /// `issue.md` YAML frontmatter. No `project` field (the folder says

@@ -808,6 +808,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 target,
                 label.as_deref(),
                 None,
+                None,
                 "",
             )?);
             Ok(0)
