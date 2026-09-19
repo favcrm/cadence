@@ -13687,6 +13687,139 @@ fn dispatch_kickoff_and_finish_guards() {
     );
 }
 
+/// CAD-107: dispatch commits the `message` ref BEFORE the send — a
+/// finish racing the dispatch sees the binding as soon as the ref
+/// lands, and a send that then fails leaves only a stale ref, which
+/// binds nothing.
+#[test]
+fn dispatch_records_ref_before_send() {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        for (alias, params, kind) in [
+            ("pm", None, "fake"),
+            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox"),
+        ] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params,
+                })
+                .unwrap();
+        }
+    }
+    let d = TestDaemon::start_on(state);
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
+    assert!(cli(&["issue", "new", "Reffirst", "--project", "demo"]).0);
+    let note = tmp.path().join("kickoff.md");
+    std::fs::write(&note, "# kickoff").unwrap();
+    let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
+
+    // --reply-to names an agent that does not exist — the daemon's
+    // enqueue rejects it, so the send fails AFTER the ref commits.
+    let (ok, err) = cli(&[
+        "dispatch",
+        "D-1",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "ghost",
+    ]);
+    assert!(!ok, "{err}");
+
+    // The binding landed anyway — before the send.
+    let issue = cli(&["issue", "show", "D-1", "--json"]).1;
+    let mid = issue["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "message")
+        .and_then(|r| r["path"].as_str().map(String::from))
+        .expect("the message ref must be recorded before the send");
+    assert!(!mid.is_empty());
+
+    // A stale ref binds nothing: the forced finish still works and
+    // the dead ref never becomes a bound-message block.
+    let (ok, out) = cli(&["issue", "finish", "D-1", "--force"]);
+    assert!(ok && out["finished"] == true, "{out}");
+    assert!(
+        !out["overrode"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == "bound-message"),
+        "a ref for a message that was never sent must not block: {out}"
+    );
+}
+
 /// CAD-94: the finish guard is per worktree, not per agent. An owner
 /// busy on worktree A does not block finishing the same owner's
 /// merged worktree B; a process with cwd inside B is refused naming
@@ -13805,7 +13938,7 @@ fn finish_guard_per_worktree() {
     assert!(cli(&["issue", "init"]).0);
     let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
     assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
-    for title in ["Awt", "Bwt", "Cwt", "Dwt", "Ghost"] {
+    for title in ["Awt", "Bwt", "Cwt", "Dwt", "Ghost", "Scoped", "Inboxrun"] {
         assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
     }
     let note = tmp.path().join("kickoff.md");
@@ -13919,12 +14052,124 @@ fn finish_guard_per_worktree() {
     git(&wt_g, &["add", "-A"]);
     git(&wt_g, &["commit", "-qm", "g work"]);
     git(&repo, &["merge", "-q", "cadence/d-5-ghost"]);
+    // The probe runs WITHOUT the pm lock: with the lock file held, a
+    // daemon-down finish still returns the owner-check refusal — it
+    // never waits on (or times out against) the lock.
+    std::fs::write(pm_dir.join(".write.lock"), "held").unwrap();
+    let dead_state = tmp.path().join("deadstate");
+    std::fs::create_dir_all(&dead_state).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&dead_state)
+        .args(["issue", "finish", "D-5"])
+        .env("CADENCE_PM_DIR", &pm_dir)
+        .env("HOME", &home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap();
+    std::fs::remove_file(pm_dir.join(".write.lock")).unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
+    assert!(
+        text.contains("unreachable") && !text.contains("locked"),
+        "the probe must not wait on the pm lock: {text}"
+    );
     let (ok, out) = cli(&["issue", "finish", "D-5"]);
     assert!(
         ok && out["finished"] == true && out["overrode"] == json!([]),
         "unknown owner must not block: {out}"
     );
     assert!(!wt_g.exists());
+
+    // D-6: a bound live message must be found on the agent that
+    // HOLDS it, not only the current owner — re-assigning the issue
+    // leaves the earlier dispatchee's message bound (CAD-107). And a
+    // worktree-scoped message ref must not bind a re-started pair.
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-6",
+        "--to",
+        "dv",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(ok && out["dispatched"] == true, "{out}");
+    let msg_d6 = out["message"].as_str().unwrap().to_string();
+    let (ok, err) = cli(&["issue", "finish", "D-6"]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains(&msg_d6), "bound refusal names the id: {msg}");
+    // owner=w1 now, but the bound message lives on dv — it must
+    // still block.
+    let (ok, _) = cli(&["issue", "set", "D-6", "owner=w1"]);
+    assert!(ok);
+    let (ok, err) = cli(&["issue", "finish", "D-6"]);
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains(&msg_d6),
+        "a non-owner recipient's bound message still blocks: {err}"
+    );
+    // Re-start under --name: the old pair still refuses; the new
+    // pair is not bound to a message scoped to the old worktree.
+    let (ok, out) = cli(&["issue", "start", "D-6", "--name", "scd"]);
+    assert!(ok, "{out}");
+    let (ok, err) = cli(&["issue", "finish", "D-6"]);
+    assert!(!ok, "the first open pair still refuses: {err}");
+    let (ok, out) = cli(&["issue", "finish", "D-6", "--force"]);
+    assert!(
+        ok && out["overrode"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == "bound-message"),
+        "the bound-message block is what --force overrode: {out}"
+    );
+    // The new pair's branch sits at the base tip (merged by
+    // ancestry) and the still-live message is scoped to the removed
+    // pair — the finish succeeds clean.
+    let wt_scd = repo.join(".cadence/wt/d-6-scd");
+    let (ok, out) = cli(&["issue", "finish", "D-6"]);
+    assert!(
+        ok && out["finished"] == true && out["overrode"] == json!([]),
+        "a ref scoped to the old worktree must not bind the new one: {out}"
+    );
+    assert!(!wt_scd.exists());
+
+    // D-7: `running` is live even on an inbox endpoint — the durable
+    // backlog exemption covers only `queued`. The ref is unscoped
+    // (`issue ref` writes no worktree) and still binds.
+    let (ok, _) = cli(&["issue", "start", "D-7", "--owner", "w1"]);
+    assert!(ok);
+    {
+        let store = Store::open(&d.state.join("cadence.sqlite3")).unwrap();
+        store
+            .enqueue("w1", "running on inbox", None, "mir", "test")
+            .unwrap();
+        store.mark_running("mir", "turn-mir").unwrap();
+    }
+    let (ok, _) = cli(&["issue", "ref", "D-7", "message", "mir"]);
+    assert!(ok);
+    let (ok, err) = cli(&["issue", "finish", "D-7"]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("mir") && msg.contains("running"),
+        "a running message on an inbox owner must block: {msg}"
+    );
 }
 
 /// CAD-93: `issue finish --merged` sweeps every open worktree ref
@@ -14152,6 +14397,118 @@ fn finish_merged_sweep() {
     assert!(
         stderr.contains("worktree open: run cadence issue finish D-3"),
         "{stderr}"
+    );
+
+    // CAD-106: a merged PR binds its recorded head COMMIT, not the
+    // branch name. A github origin plus a `gh` stub answers per
+    // branch: D-6's tip IS the recorded merge head (`merged_by: pr`);
+    // D-7 reuses the name with an extra commit the recorded head does
+    // not cover — the sweep must report it unmerged and leave the
+    // branch alone.
+    git(
+        &repo,
+        &["remote", "add", "origin", "https://github.com/x/y.git"],
+    );
+    for title in ["Prbound", "Prreused"] {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+    for id in ["D-6", "D-7"] {
+        let (ok, out) = cli(&["issue", "start", id]);
+        assert!(ok, "{out}");
+        let (ok, _) = cli(&["issue", "set", id, "owner="]);
+        assert!(ok);
+    }
+    let sha = |dir: &Path, rev: &str| -> String {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    // D-6's single commit IS the merged PR head; D-7 records that
+    // same position as its merged head, then adds an unmerged commit.
+    std::fs::write(wt("d-6-prbound").join("pr6.txt"), "x").unwrap();
+    git(&wt("d-6-prbound"), &["add", "-A"]);
+    git(&wt("d-6-prbound"), &["commit", "-qm", "merged head"]);
+    let tip6 = sha(&repo, "cadence/d-6-prbound");
+    std::fs::write(wt("d-7-prreused").join("pr7.txt"), "x").unwrap();
+    git(&wt("d-7-prreused"), &["add", "-A"]);
+    git(&wt("d-7-prreused"), &["commit", "-qm", "merged head"]);
+    let tip7a = sha(&repo, "cadence/d-7-prreused");
+    std::fs::write(wt("d-7-prreused").join("extra.txt"), "x").unwrap();
+    git(&wt("d-7-prreused"), &["add", "-A"]);
+    git(&wt("d-7-prreused"), &["commit", "-qm", "unmerged extra"]);
+    let tip7b = sha(&repo, "cadence/d-7-prreused");
+    let gh_bin = tmp.path().join("ghbin");
+    std::fs::create_dir_all(&gh_bin).unwrap();
+    std::fs::write(
+        gh_bin.join("gh"),
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in\n\
+             cadence/d-6-prbound) printf '[{{\"number\":6,\"headRefOid\":\"{tip6}\"}}]'; exit 0;;\n\
+             cadence/d-7-prreused) printf '[{{\"number\":7,\"headRefOid\":\"{tip7a}\"}}]'; exit 0;;\n\
+             esac; done\nprintf '[]'\n"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(gh_bin.join("gh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let cli_gh = |args: &[&str]| -> (i32, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:{}",
+                    gh_bin.display(),
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+        )
+    };
+    let (code, stdout) = cli_gh(&["issue", "finish", "--merged", "--dry-run", "--json"]);
+    let plan: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rows = plan["rows"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|r| r["issue"] == id).unwrap().clone();
+    assert_eq!(row("D-6")["outcome"], "would-finish", "{plan}");
+    assert_eq!(row("D-6")["merged_by"], "pr", "{plan}");
+    assert_eq!(row("D-7")["outcome"], "skipped", "{plan}");
+    assert_eq!(row("D-7")["reason"], "unmerged", "{plan}");
+    let _ = code;
+    // Real sweep: D-6 finishes (its tip IS the recorded head); D-7's
+    // extra commit keeps it skipped — the worktree AND branch stay.
+    let (_, stdout) = cli_gh(&["issue", "finish", "--merged", "--json"]);
+    let out: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rows = out["rows"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|r| r["issue"] == id).unwrap().clone();
+    assert_eq!(row("D-6")["outcome"], "finished", "{out}");
+    assert_eq!(row("D-6")["deleted_branch"], true, "{out}");
+    assert_eq!(row("D-7")["outcome"], "skipped", "{out}");
+    assert!(
+        !wt("d-6-prbound").exists() && wt("d-7-prreused").is_dir(),
+        "the reused-name branch must survive: {out}"
+    );
+    assert_eq!(
+        sha(&repo, "cadence/d-7-prreused"),
+        tip7b,
+        "the unmerged tip must still resolve — the branch survived: {out}"
     );
 }
 

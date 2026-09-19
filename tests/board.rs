@@ -4419,15 +4419,31 @@ fn issue_finish_pr_merge_via_gh() {
     );
 
     // D-1: branch commits not on main, nothing pushed — but gh says
-    // a PR with this head is MERGED → finished, merged_by "pr".
+    // a PR whose recorded head IS this tip is MERGED → finished,
+    // merged_by "pr". A bare name match proves nothing (CAD-106):
+    // first answer with a head oid that does not cover the tip.
     assert!(cli(&pm, &state, &["issue", "new", "Pr", "--project", "demo"]).0);
     assert!(cli(&pm, &state, &["issue", "start", "D-1"]).0);
     let wt = repo.join(".cadence/wt/d-1-pr");
     std::fs::write(wt.join("p.txt"), "p").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "pr work"]);
+    let tip = git(&repo, &["rev-parse", "cadence/d-1-pr"]).1;
     strip_owner(&pm, "D-1");
-    set_gh("[{\"number\":7}]");
+    set_gh("[{\"number\":7,\"headRefOid\":\"0000000000000000000000000000000000000000\"}]");
+    let (ok, err) = cli_env(
+        &pm,
+        &state,
+        &["issue", "finish", "D-1"],
+        &[("PATH", path.as_str())],
+    );
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains("neither merged"),
+        "a stale headRefOid must not prove the merge: {err}"
+    );
+    assert!(wt.is_dir());
+    set_gh(&format!("[{{\"number\":7,\"headRefOid\":\"{tip}\"}}]"));
     let (ok, out) = cli_env(
         &pm,
         &state,

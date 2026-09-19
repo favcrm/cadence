@@ -249,7 +249,11 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     let mut lessons: Vec<String> = vec![];
     let mut lessons_file: Option<PathBuf> = None;
     let mut lessons_error: Option<String> = None;
-    let mut message_id: Option<String> = None;
+    // The message id is minted up front so the `message` ref commits
+    // BEFORE the send: a finish racing the dispatch sees the binding
+    // the moment the ref lands. The old send→add_ref order left the
+    // kickoff live but unbound for a window (CAD-107).
+    let mid = Uuid::new_v4().simple().to_string();
     let mut body = body;
     if !args.no_lessons {
         if let Some(b) = body.as_mut() {
@@ -266,9 +270,8 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
                 Ok(matched) => {
                     let (text, slugs) = memory::render_lessons(&matched);
                     if !slugs.is_empty() {
-                        let msgid = Uuid::new_v4().simple().to_string();
                         let ddir = state_dir.join("dispatch");
-                        let file = ddir.join(format!("{msgid}-lessons.md"));
+                        let file = ddir.join(format!("{mid}-lessons.md"));
                         let prior = b.clone();
                         *b = format!("{prior} Lessons: {}.", file.display());
                         if let Err(e) = check_body(b, &provider) {
@@ -284,7 +287,6 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
                         } else {
                             lessons = slugs;
                             lessons_file = Some(file);
-                            message_id = Some(msgid);
                         }
                     }
                 }
@@ -292,14 +294,43 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         }
     }
 
+    // The ref lands before the send, naming the worktree the kickoff
+    // runs against — a re-start under `--name` must not inherit it.
+    // If the send then fails the ref stays as the attempt's history
+    // (a ref id no live message ever matches blocks nothing) and the
+    // failure comment below records it.
+    write::add_ref(
+        pm,
+        id,
+        "message",
+        &mid,
+        Some(&format!("dispatch → {}", args.to)),
+        started["worktree"].as_str(),
+        None,
+        actor,
+    )?;
+    let send_failed = |e: Error| -> Error {
+        let _ = write::add_comment(
+            pm,
+            id,
+            &format!("Dispatch send to {} failed: {e}", args.to),
+            None,
+            Some("dispatch"),
+            None,
+            actor,
+        );
+        e
+    };
+
     // Exactly one send — plain text kickoff, or `job dispatch`'s
     // spec-bound kickoff for --job (its state lives on the task).
     let (message, sent_state) = if let Some(body) = body {
-        let mut params = json!({"alias": args.to, "text": body, "reply_to": reply_to});
-        if let Some(id) = &message_id {
-            params["message"] = json!(id);
-        }
-        let sent = client::rpc(state_dir, "agent_send", params)?;
+        let sent = client::rpc(
+            state_dir,
+            "agent_send",
+            json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid}),
+        )
+        .map_err(&send_failed)?;
         (
             sent["message"].as_str().unwrap_or_default().to_string(),
             ("message_state", sent["state"].clone()),
@@ -309,34 +340,38 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         let sent = client::rpc(
             state_dir,
             "task_dispatch",
-            json!({"task": task, "by": reply_to}),
-        )?;
+            json!({"task": task, "by": reply_to, "message": mid}),
+        )
+        .map_err(&send_failed)?;
         (
             sent["message"].as_str().unwrap_or_default().to_string(),
             ("task_state", sent["task"]["state"].clone()),
         )
     };
+    // A same-revision `task_dispatch` retry ignores the minted id and
+    // returns the still-live kickoff's id — bind THAT message too so
+    // the live one is never unbound. The pre-send ref stays as the
+    // attempt's history.
+    if message != mid {
+        write::add_ref(
+            pm,
+            id,
+            "message",
+            &message,
+            Some(&format!("dispatch → {}", args.to)),
+            started["worktree"].as_str(),
+            None,
+            actor,
+        )?;
+    }
 
-    // The comment and the ref ride separate commits through the
-    // existing helpers — each is independently consistent. A second
-    // comment line records which lessons were injected.
+    // The comment rides its own commit through the existing helper. A
+    // second line records which lessons were injected.
     let mut comment_text = format!("Dispatched to {}: {}", args.to, note.display());
     if !lessons.is_empty() {
         comment_text.push_str(&format!("\nLessons injected: {}", lessons.join(", ")));
     }
     let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
-    // The message ref carries the worktree it ran against — a re-start
-    // under `--name` must not inherit a binding meant for this pair.
-    write::add_ref(
-        pm,
-        id,
-        "message",
-        &message,
-        Some(&format!("dispatch → {}", args.to)),
-        started["worktree"].as_str(),
-        None,
-        actor,
-    )?;
 
     // The worker's current probe verdict — pty only; the operator
     // learns whether delivery happens now or when the pane idles.
