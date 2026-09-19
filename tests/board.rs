@@ -3652,10 +3652,13 @@ fn issue_finish_squash_cherry_and_ignored() {
     assert!(cli(&pm, &state, &["issue", "new", "Sq", "--project", "demo"]).0);
     assert!(cli(&pm, &state, &["issue", "start", "D-1"]).0);
     let wt = repo.join(".cadence/wt/d-1-sq");
-    std::fs::write(wt.join("a.txt"), "a").unwrap();
+    // Newline-terminated, multi-line, one file edited twice — the
+    // shape of real code, whose diff ends in a newline.
+    std::fs::write(wt.join("a.txt"), "1\n").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "part a"]);
-    std::fs::write(wt.join("b.txt"), "b").unwrap();
+    std::fs::write(wt.join("a.txt"), "1\n2\n").unwrap();
+    std::fs::write(wt.join("b.txt"), "b1\nb2\n").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "part b"]);
     git(&repo, &["merge", "--squash", "-q", "cadence/d-1-sq"]);
@@ -3673,7 +3676,7 @@ fn issue_finish_squash_cherry_and_ignored() {
     assert!(cli(&pm, &state, &["issue", "new", "Ch", "--project", "demo"]).0);
     assert!(cli(&pm, &state, &["issue", "start", "D-2"]).0);
     let wt = repo.join(".cadence/wt/d-2-ch");
-    std::fs::write(wt.join("c.txt"), "c").unwrap();
+    std::fs::write(wt.join("c.txt"), "c1\nc2\n").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "cherry work"]);
     // -x records the source sha in the message — a different commit
@@ -3688,12 +3691,12 @@ fn issue_finish_squash_cherry_and_ignored() {
     assert!(cli(&pm, &state, &["issue", "new", "Ex", "--project", "demo"]).0);
     assert!(cli(&pm, &state, &["issue", "start", "D-3"]).0);
     let wt = repo.join(".cadence/wt/d-3-ex");
-    std::fs::write(wt.join("d.txt"), "d").unwrap();
+    std::fs::write(wt.join("d.txt"), "d1\nd2\n").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "part d"]);
     git(&repo, &["merge", "--squash", "-q", "cadence/d-3-ex"]);
     git(&repo, &["commit", "-qm", "D-3 part (#3)"]);
-    std::fs::write(wt.join("late.txt"), "late").unwrap();
+    std::fs::write(wt.join("late.txt"), "late\n").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "unmerged late work"]);
     strip_owner(&pm, "D-3");
@@ -3746,6 +3749,40 @@ fn issue_finish_squash_cherry_and_ignored() {
     std::fs::remove_file(wt.join("real.txt")).unwrap();
     let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-5"]);
     assert!(ok && out["finished"] == true, "{out}");
+
+    // D-6 / D-7: two-commit squashes of a binary file and of a file
+    // with no trailing newline — both diff shapes still apply → "patch".
+    for (id, name, first, second) in [
+        (
+            "D-6",
+            "Bi",
+            &b"\x00\x01\xff\n\x00"[..],
+            &b"\x00\x02\xfe\x00"[..],
+        ),
+        ("D-7", "Nn", &b"x\ny"[..], &b"x\ny\nz"[..]),
+    ] {
+        assert!(cli(&pm, &state, &["issue", "new", name, "--project", "demo"]).0);
+        assert!(cli(&pm, &state, &["issue", "start", id]).0);
+        let branch = format!("cadence/{}-{}", id.to_lowercase(), name.to_lowercase());
+        let wt = repo.join(format!(
+            ".cadence/wt/{}-{}",
+            id.to_lowercase(),
+            name.to_lowercase()
+        ));
+        std::fs::write(wt.join("f.bin"), first).unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "first"]);
+        std::fs::write(wt.join("f.bin"), second).unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "second"]);
+        git(&repo, &["merge", "--squash", "-q", &branch]);
+        git(&repo, &["commit", "-qm", &format!("{id}: squash")]);
+        strip_owner(&pm, id);
+        let (ok, out) = cli(&pm, &state, &["issue", "finish", id]);
+        assert!(ok, "{id}: {out}");
+        assert_eq!(out["merged_by"], "patch", "{id}: {out}");
+        assert!(!wt.exists(), "{id}");
+    }
 }
 
 /// CAD-64: with a GitHub origin and `gh` on PATH, a merged PR with

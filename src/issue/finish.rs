@@ -108,8 +108,11 @@ fn patch_applied(root: &Path, branch: &str, into: &str) -> bool {
     let Ok(base) = git(root, &["merge-base", into, branch]) else {
         return false;
     };
-    let Ok(diff) = git(root, &["diff", "--binary", &base, branch]) else {
-        return false;
+    // Raw stdout bytes, not `git()`'s trimmed string — `git apply`
+    // rejects a patch whose final newline was stripped as corrupt.
+    let diff = match git_out(root, &["diff", "--binary", &base, branch], &[]) {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return false,
     };
     // An empty diff means the branch contributes nothing — deleting
     // it loses no work.
