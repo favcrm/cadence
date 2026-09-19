@@ -102,6 +102,10 @@ pub struct Job {
     pub base_ref: Option<String>,
     pub state: String,
     pub max_revisions: i64,
+    /// Silence budget for turns this job's kickoffs start: over it the
+    /// turn is reported stalled. NULL → the assignee's `stall_secs`
+    /// param, then the daemon default.
+    pub stall_secs: Option<i64>,
     pub error: Option<String>,
     pub created: f64,
     pub updated: f64,
@@ -211,6 +215,7 @@ fn row_job(row: &rusqlite::Row) -> rusqlite::Result<Job> {
         base_ref: row.get("base_ref")?,
         state: row.get("state")?,
         max_revisions: row.get("max_revisions")?,
+        stall_secs: row.get("stall_secs")?,
         error: row.get("error")?,
         created: row.get("created")?,
         updated: row.get("updated")?,
@@ -355,6 +360,7 @@ impl Job {
             "spec_sha256": self.spec_sha256, "pm": self.pm_alias,
             "issue": self.issue_id, "repo": self.repo, "base_ref": self.base_ref,
             "state": self.state, "max_revisions": self.max_revisions,
+            "stall_secs": self.stall_secs,
             "error": self.error, "created": self.created, "updated": self.updated,
         })
     }
@@ -558,6 +564,22 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=5", [])?;
             tx.commit()?;
         }
+        if version < 6 {
+            // v6: `jobs.stall_secs` — the per-job silence budget for
+            // stall detection (CAD-52). NULL leaves resolution to the
+            // assignee's `stall_secs` param, then the daemon default.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(jobs)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !columns.iter().any(|c| c == "stall_secs") {
+                tx.execute_batch("ALTER TABLE jobs ADD COLUMN stall_secs INTEGER")?;
+            }
+            tx.execute("UPDATE schema_version SET version=6", [])?;
+            tx.commit()?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -625,6 +647,21 @@ impl Store {
     pub fn event_public(&self, alias: &str, kind: &str, payload: Value) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         Self::event(&conn, alias, kind, payload)
+    }
+
+    /// `event_public` with job/task scope — the stall watch uses it so
+    /// `turn_stalled`/`turn_resumed` surface in `job events`, not only
+    /// the agent's own stream.
+    pub fn event_public_scoped(
+        &self,
+        alias: &str,
+        kind: &str,
+        payload: Value,
+        job_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::event_scoped(&conn, alias, kind, payload, job_id, task_id)
     }
 
     pub fn agent(&self, alias: &str) -> Result<Agent> {
@@ -1635,6 +1672,23 @@ impl Store {
         self.message_in(&conn, id)
     }
 
+    /// The agent's in-flight turn, if any — at most one message per
+    /// alias is `running` at a time (the actor loop is serial). The
+    /// stall watch and the view surfaces both read this.
+    pub fn running_message(&self, alias: &str) -> Result<Option<Message>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT * FROM messages WHERE alias=? AND state='running'
+             ORDER BY seq DESC LIMIT 1",
+            [alias],
+            row_message,
+        ) {
+            Ok(m) => Ok(Some(m)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Latest event seq for `agent_show`'s cursor.
     pub fn event_cursor(&self, alias: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
@@ -1770,6 +1824,7 @@ impl Store {
         repo: Option<&str>,
         base_ref: Option<&str>,
         max_revisions: i64,
+        stall_secs: Option<i64>,
         task_title: Option<&str>,
         task_worktree: Option<&str>,
         task_branch: Option<&str>,
@@ -1782,6 +1837,9 @@ impl Store {
         }
         if max_revisions < 0 {
             return Err(Error::rejected("--max-revisions must be >= 0"));
+        }
+        if stall_secs.is_some_and(|s| s < 0) {
+            return Err(Error::rejected("--stall-secs must be >= 0"));
         }
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
@@ -1817,8 +1875,8 @@ impl Store {
         let t = now();
         tx.execute(
             "INSERT INTO jobs(id,title,spec_path,spec_sha256,pm_alias,issue_id,
-             repo,base_ref,state,max_revisions,created,updated)
-             VALUES(?,?,?,?,?,?,?,?,'open',?,?,?)",
+             repo,base_ref,state,max_revisions,stall_secs,created,updated)
+             VALUES(?,?,?,?,?,?,?,?,'open',?,?,?,?)",
             params![
                 id,
                 title,
@@ -1829,6 +1887,7 @@ impl Store {
                 repo,
                 base_ref,
                 max_revisions,
+                stall_secs,
                 t,
                 t
             ],
@@ -2582,6 +2641,25 @@ impl Store {
         Ok(())
     }
 
+    /// Notify a job's PM outside a state transition — the stall watch
+    /// uses it for `turn_stalled`/`turn_resumed` on a task's kickoff.
+    /// Same deterministic-dedupe delivery as [`route_job_event`].
+    pub fn job_notice(
+        &self,
+        task_id: &str,
+        new_state: &str,
+        dedupe: &str,
+        note: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let task = self.task_in(&tx, task_id)?;
+        let job = self.job_in(&tx, &task.job_id)?;
+        self.route_job_event(&tx, &job, &task, new_state, dedupe, note)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Task edge for `mark_running`: a task-attached kickoff observed
     /// `running` moves its task `dispatched → running`. Only
     /// `job_dispatch` messages are kickoffs — `--task` follow-ups and
@@ -3012,7 +3090,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         Store::open(&db).unwrap();
     }
 
@@ -3068,6 +3146,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let v: i64 = s
@@ -3076,7 +3155,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 5);
+            assert_eq!(v, 6);
         }
         // Half-applied: v4 objects present but version rolled back —
         // reopening must converge, not fail on duplicates.
@@ -3111,7 +3190,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 5);
+            assert_eq!(v, 6);
         }
     }
 
@@ -3139,6 +3218,7 @@ mod tests {
             None,
             None,
             2,
+            None,
             None,
             None,
             None,

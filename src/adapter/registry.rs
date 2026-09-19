@@ -122,8 +122,8 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: true,
         resumable: true,
         resume_label: "codex resume --remote",
-        live_settable_params: &[],
-        launch_params: &["session", "upstream", "agents_md"],
+        live_settable_params: &["stall_secs"],
+        launch_params: &["session", "upstream", "agents_md", "stall_secs"],
         session_id_label: "Codex thread",
         respond_rejection: None,
         capabilities: &["managed_codex_stdio"],
@@ -145,8 +145,8 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: true,
         resumable: true,
         resume_label: "codex resume --remote",
-        live_settable_params: &[],
-        launch_params: &["session", "upstream", "agents_md"],
+        live_settable_params: &["stall_secs"],
+        launch_params: &["session", "upstream", "agents_md", "stall_secs"],
         session_id_label: "Codex thread",
         respond_rejection: None,
         capabilities: &["managed_codex_ws"],
@@ -168,7 +168,7 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: true,
         resumable: true,
         resume_label: "claude --resume <session>",
-        live_settable_params: &[],
+        live_settable_params: &["stall_secs"],
         launch_params: &[
             "model",
             "permission_mode",
@@ -180,6 +180,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "session",
             "upstream",
             "agents_md",
+            "stall_secs",
         ],
         session_id_label: "Claude session",
         respond_rejection: Some(
@@ -209,7 +210,7 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "claude --resume <session>",
-        live_settable_params: &["auto_ready"],
+        live_settable_params: &["auto_ready", "stall_secs"],
         launch_params: &[
             "model",
             "permission_mode",
@@ -219,6 +220,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "upstream",
             "auto_ready",
             "agents_md",
+            "stall_secs",
         ],
         session_id_label: "Claude session",
         respond_rejection: None,
@@ -241,7 +243,7 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "devin -r <slug>",
-        live_settable_params: &["auto_ready"],
+        live_settable_params: &["auto_ready", "stall_secs"],
         launch_params: &[
             "session",
             "upstream",
@@ -249,6 +251,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "permission_mode",
             "bypass",
             "agents_md",
+            "stall_secs",
         ],
         session_id_label: "Devin session",
         respond_rejection: None,
@@ -271,8 +274,14 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "stub -r <session>",
-        live_settable_params: &["auto_ready"],
-        launch_params: &["session", "upstream", "auto_ready", "agents_md"],
+        live_settable_params: &["auto_ready", "stall_secs"],
+        launch_params: &[
+            "session",
+            "upstream",
+            "auto_ready",
+            "agents_md",
+            "stall_secs",
+        ],
         session_id_label: "Stub session",
         respond_rejection: None,
         capabilities: &[],
@@ -317,8 +326,8 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: true,
         resumable: true,
         resume_label: "in-process double",
-        live_settable_params: &[],
-        launch_params: &["session", "upstream", "agents_md"],
+        live_settable_params: &["stall_secs"],
+        launch_params: &["session", "upstream", "agents_md", "stall_secs"],
         session_id_label: "Fake session",
         respond_rejection: None,
         capabilities: &["fake_provider_tests"],
@@ -543,10 +552,25 @@ pub fn validate_live_param(provider: &str, kind: &str, key: &str, value: &Value)
             }
             Ok(())
         }
+        "stall_secs" => {
+            if !has_actor(provider, kind) {
+                return Err(Error::rejected(
+                    "'stall_secs' only applies to endpoints with an actor — \
+                     there is no turn to watch without one",
+                ));
+            }
+            if !check_stall_secs(value) {
+                return Err(Error::rejected(
+                    "'stall_secs' must be a non-negative integer (0 \
+                     disables stall detection) or a bare key removal",
+                ));
+            }
+            Ok(())
+        }
         other => Err(Error::rejected(format!(
             "'{other}' is not live-settable — allowed keys: auto_ready \
-             (pty only). Recreate the agent to change wiring params \
-             like upstream or session"
+             (pty only), stall_secs. Recreate the agent to change \
+             wiring params like upstream or session"
         ))),
     }
 }
@@ -565,10 +589,33 @@ pub fn devin_permission_mode(mode: &str) -> Result<()> {
     }
 }
 
+/// `stall_secs` accepts an unsigned integer, a digit string (`agent
+/// set` values arrive as strings), or null — shared by the launch and
+/// live-set checks so both reject the same values.
+fn check_stall_secs(value: &Value) -> bool {
+    value.is_null()
+        || value.as_u64().is_some()
+        || value.as_str().is_some_and(|s| s.parse::<u64>().is_ok())
+}
+
 /// Register-time validation for enumerated launch params. Params not
 /// named here keep their historical pass-through (claude's modes are
 /// provider-validated — its own CLI rejects bad values on spawn).
 pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Result<()> {
+    if let Some(v) = params.get("stall_secs") {
+        if !has_actor(provider, kind) {
+            return Err(Error::rejected(
+                "'stall_secs' only applies to endpoints with an actor — \
+                 there is no turn to watch without one",
+            ));
+        }
+        if !check_stall_secs(v) {
+            return Err(Error::rejected(
+                "'stall_secs' must be a non-negative integer (0 disables \
+                 stall detection) or a bare key removal",
+            ));
+        }
+    }
     if provider == "devin" && kind == "pty" {
         if let Some(v) = params.get("permission_mode") {
             match v.as_str() {

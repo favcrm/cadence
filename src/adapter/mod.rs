@@ -161,6 +161,13 @@ pub trait ProviderAdapter: Send + Sync {
     /// `unknown` while the operator thinks. No-op where liveness isn't
     /// activity-derived (pty watches its pane instead).
     fn note_activity(&self) {}
+    /// The adapter's own last-observed provider activity, when it keeps
+    /// a raw clock (managed transcripts stamp every notification).
+    /// `None` means the daemon's event clock is the activity source —
+    /// pty agents are additionally sampled by screen hash.
+    fn activity_at(&self) -> Option<std::time::Instant> {
+        None
+    }
 }
 
 /// Build the adapter for an agent's `provider`/`endpoint_kind`.

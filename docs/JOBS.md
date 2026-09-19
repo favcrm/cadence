@@ -245,7 +245,8 @@ without an operator `reopen`.
 ```
 cadence job new --pm <pm> --spec <file> [--job <id>] [--title t]
                 [--issue CAD-31] [--repo <path>] [--base-ref <ref>]
-                [--max-revisions 2] [--task-title t]
+                [--max-revisions 2] [--stall-secs <n>]
+                [--task-title t]
                 [--task-worktree <name>] [--task-branch <b>]
                 [--task-base-sha <sha>] [--task-assignee <alias>]
 cadence job list [--state s] [--all]
@@ -358,6 +359,18 @@ and a disciplined retry path, never a blind replay.
   completion on pty, bounded render-miss retry, and park-instead-of-
   fence behaviour — a job notification can never fence or kill a PM
   pane. They are never agent turn results.
+- **Stalled kickoffs notify the PM.** When a running kickoff goes
+  silent past the resolved budget (`jobs.stall_secs` → the assignee's
+  `stall_secs` param → daemon default 1800s; `0` disables), the daemon
+  emits one `turn_stalled` event per silence episode — job/task-scoped,
+  so `job events` pages it — and routes one `job_event` notice to the
+  PM naming the task, the silence, and the read-only inspection
+  commands. `turn_resumed` closes the episode to the same recipient
+  and re-arms. The kickoff stays `running`; the stall watch never
+  interrupts, fences, or replays the turn — it is a visibility edge,
+  not a lifecycle one. While it lasts, `job show`/`task show` flag the
+  task row with `stalled` + `silent_secs`. Non-kickoff deliveries
+  (`send --task` follow-ups) notify their `reply_to` instead.
 
 ---
 
