@@ -363,9 +363,51 @@ impl Shared {
             if kind == "session_minted" {
                 // A pty profile minted its native session id before
                 // spawning — persist it so the next open resumes it
-                // even if this launch dies before session proof.
+                // even if this launch dies before session proof. A
+                // lost persist must be loud: without it the next open
+                // silently re-mints, churning a new session per retry.
                 if let Some(session) = params.get("session").and_then(Value::as_str) {
-                    let _ = self.store.set_params(alias, &json!({"session": session}));
+                    if let Err(e) = self.store.set_params(alias, &json!({"session": session})) {
+                        eprintln!("session_minted: persist failed for '{alias}': {e}");
+                        let _ = self.store.event_public(
+                            alias,
+                            "session_persist_failed",
+                            json!({"session": session, "error": e.to_string()}),
+                        );
+                    }
+                }
+            }
+            if kind == "session_resume_failed" {
+                // The stored native session failed to prove after the
+                // pane ran — the chat/session is unresumable. Clearing
+                // it lets the next open mint a fresh one instead of
+                // wedging the alias on the same dead id forever. The
+                // adapter only emits for profiles that opt in, and the
+                // daemon refuses independently for every endpoint that
+                // did not declare disposable sessions — a misbehaving
+                // profile must never drop an operator's Claude/Devin
+                // session on a transient proof failure.
+                let disposable = self
+                    .store
+                    .agent(alias)
+                    .ok()
+                    .and_then(|a| {
+                        registry::spec_opt(&a.provider, &a.endpoint_kind)
+                            .map(|s| s.session_disposable)
+                    })
+                    .unwrap_or(false);
+                if disposable {
+                    // params.session AND thread_id both feed
+                    // desired_session — clear both in one write or the
+                    // dead id keeps resuming through the fallback.
+                    if let Err(e) = self.store.clear_native_session(alias) {
+                        eprintln!("session_resume_failed: clear failed for '{alias}': {e}");
+                        let _ = self.store.event_public(
+                            alias,
+                            "session_persist_failed",
+                            json!({"error": e.to_string()}),
+                        );
+                    }
                 }
             }
             let _ = self.store.event_public(alias, kind, params);
@@ -3110,6 +3152,88 @@ mod tests {
         if let Some(ctl) = lc.agents.get("w1") {
             ctl.wake.notify_all();
         }
+    }
+
+    /// A `session_minted` whose `set_params` fails must not vanish:
+    /// the mint is still recorded and a `session_persist_failed` sits
+    /// beside it — a lost persist would otherwise silently re-mint a
+    /// new session on every retry. The deterministic failure is an
+    /// alias the store doesn't know; events key on alias text, so
+    /// registering the alias afterwards still surfaces both rows.
+    #[test]
+    fn session_minted_persist_failure_is_evented() {
+        let (dir, shared) = shared();
+        shared.on_provider_event(
+            "ghost",
+            "cadence/session_minted",
+            json!({"session": "chat-1"}),
+        );
+        register(&shared, dir.path(), "ghost");
+        let kinds: Vec<String> = shared
+            .store
+            .events("ghost", 0, 50)
+            .unwrap()
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect();
+        assert!(kinds.iter().any(|k| k == "session_minted"), "{kinds:?}");
+        assert!(
+            kinds.iter().any(|k| k == "session_persist_failed"),
+            "{kinds:?}"
+        );
+    }
+
+    /// The daemon refuses to clear for an endpoint that never opted
+    /// in: `session_resume_failed` fired at a non-disposable provider
+    /// is recorded for visibility but `params.session` survives — the
+    /// spec gate is the second boundary so a misbehaving profile can
+    /// never drop an operator's session.
+    #[test]
+    fn session_resume_failed_never_clears_nondisposable() {
+        let (dir, shared) = shared();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "cl1",
+                provider: "claude",
+                endpoint_kind: "pty",
+                role: "worker",
+                cwd: dir.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .set_params("cl1", &json!({"session": "claude-session-1"}))
+            .unwrap();
+        shared.on_provider_event(
+            "cl1",
+            "cadence/session_resume_failed",
+            json!({"session": "claude-session-1", "reason": "timed out"}),
+        );
+        let agent = shared.store.agent("cl1").unwrap();
+        assert_eq!(
+            agent
+                .params
+                .as_ref()
+                .and_then(|p| p.get("session"))
+                .and_then(Value::as_str),
+            Some("claude-session-1"),
+            "non-disposable endpoint must keep its stored session"
+        );
+        let kinds: Vec<String> = shared
+            .store
+            .events("cl1", 0, 50)
+            .unwrap()
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect();
+        assert!(
+            kinds.iter().any(|k| k == "session_resume_failed"),
+            "{kinds:?}"
+        );
     }
 
     /// While a stop reservation is in flight (its owner has not yet

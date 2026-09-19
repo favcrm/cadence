@@ -30,6 +30,18 @@ pub trait TuiProfile: Send + Sync {
         Ok(None)
     }
 
+    /// Whether a stored native session id may be discarded when a
+    /// resume proves it can never come back — true only for providers
+    /// whose sessions are cheap mintable ids (cursor chats). Claude
+    /// and Devin sessions can name a real conversation the operator
+    /// chose, so a transient proof failure must never drop one. When
+    /// this returns false the adapter never emits
+    /// `cadence/session_resume_failed` and the daemon refuses to clear
+    /// `params.session` for the endpoint either.
+    fn session_is_disposable(&self) -> bool {
+        false
+    }
+
     /// Shell command the pane runs: a fresh launch, or a resume of the
     /// native `session` — the resume flag's shape is the profile's own
     /// (Devin: `-r <session>`).
