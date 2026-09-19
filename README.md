@@ -40,9 +40,15 @@ cadence codex                   # Codex managed-ws endpoint, then `codex resume 
                                 #  --worktree <name> isolates it like join's)
 cadence claude                  # headless managed Claude (stream-json) — each
                                 #  message is one turn; the result IS the report
-                                #  (--model/--permission-mode/--allow/--bypass are
-                                #  stored and replayed on resume; no attach —
-                                #  `cadence events --follow` observes)
+                                #  (--model/--effort/--permission-mode/--allow/
+                                #  --bypass are stored and replayed on resume; no
+                                #  attach — `cadence events --follow` observes)
+                                #  e.g. `cadence claude --model opus --effort low`;
+                                #  unset = the CLI's own settings default, shown
+                                #  as `model_source: "provider default"` beside
+                                #  `model_reported` in `agent show`/`list`;
+                                #  `agent set <a> model=… effort=… --next-launch`
+                                #  changes them for the next stop + resume
                                 #  --turn-idle-secs <n> bounds silence before a
                                 #  turn fences unknown (default 900; liveness is
                                 #  activity-based) — --turn-max-secs <n> adds an

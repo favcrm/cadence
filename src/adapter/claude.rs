@@ -98,7 +98,7 @@ fn claude_command() -> Vec<String> {
 /// `claude -p --input-format stream-json …` plus session/permission
 /// flags. Stored `params.permission_mode` (default `manual`),
 /// `params.allowed_tools` (added to the `Bash(cadence *)` baseline) and
-/// `params.model` are replayed verbatim on every resume — the launch
+/// `params.model`/`params.effort` are replayed verbatim on every resume — the launch
 /// line is rebuilt from the durable params, never from memory.
 /// `mcp_config` is the generated broker config path when
 /// `params.broker_approvals` is set — it lands beside the permission
@@ -126,12 +126,13 @@ fn build_command(
     } else {
         cmd.extend(["--session-id".to_string(), session_id.to_string()]);
     }
-    if let Some(model) = params
-        .get("model")
-        .and_then(Value::as_str)
-        .or(agent.model.as_deref())
-    {
+    // Only the configured param — `agent.model` holds the model the
+    // provider reported, and replaying it would pin a cleared model.
+    if let Some(model) = params.get("model").and_then(Value::as_str) {
         cmd.extend(["--model".to_string(), model.to_string()]);
+    }
+    if let Some(effort) = params.get("effort").and_then(Value::as_str) {
+        cmd.extend(["--effort".to_string(), effort.to_string()]);
     }
     let mode = params
         .get("permission_mode")
@@ -351,6 +352,11 @@ impl Shared {
     /// anything but the id this process was opened with means another
     /// Claude owns the expected session — fail closed into `attention`.
     fn on_init(&self, event: &Value) {
+        // The model the CLI actually runs — inherited settings included —
+        // recorded as the agent's reported model.
+        if let Some(model) = event.get("model").and_then(Value::as_str) {
+            self.emit("cadence/claude_init", &json!({"model": model}));
+        }
         let observed = event.get("session_id").and_then(Value::as_str);
         let expected = self.expected_session.lock().unwrap().clone();
         if let (Some(want), Some(got)) = (expected, observed) {

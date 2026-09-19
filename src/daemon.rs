@@ -337,6 +337,11 @@ impl Shared {
         // `cadence/<kind>` is the adapter's own bookkeeping channel —
         // recorded verbatim, not provider traffic.
         if let Some(kind) = method.strip_prefix("cadence/") {
+            if kind == "claude_init" {
+                if let Some(model) = params.get("model").and_then(Value::as_str) {
+                    let _ = self.store.set_model_reported(alias, model);
+                }
+            }
             let _ = self.store.event_public(alias, kind, params);
             self.wake();
             return;
@@ -1532,11 +1537,29 @@ impl Shared {
         // like `upstream` or `session` would silently rewire routing and
         // session binding, so they are rejected rather than merged.
         let agent = self.store.agent(&alias)?;
+        // `next_launch`: launch params (model, effort) stored for the
+        // next open only — the live process is left exactly as it is.
+        let next_launch = params
+            .get("next_launch")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         for (key, value) in patch.as_object().unwrap() {
             proto::param_key(key)?;
-            registry::validate_live_param(&agent.provider, &agent.endpoint_kind, key, value)?;
+            if next_launch {
+                registry::validate_next_launch_param(
+                    &agent.provider,
+                    &agent.endpoint_kind,
+                    key,
+                    value,
+                )?;
+            } else {
+                registry::validate_live_param(&agent.provider, &agent.endpoint_kind, key, value)?;
+            }
         }
         self.store.set_params(&alias, &patch)?;
+        if next_launch {
+            return Ok(json!({"alias": alias, "state": "updated", "applies": "next launch"}));
+        }
         // Push the merged params into the live adapter so cached
         // endpoint options (auto_ready) take effect without a restart.
         if let Ok(adapter) = self.adapter_for(&alias) {
