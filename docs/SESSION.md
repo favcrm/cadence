@@ -31,6 +31,7 @@ cadence inbox pm --follow                      # blocks; one JSON object per rou
 ```bash
 cadence daemon start          # or: cadence doctor, if anything looks off
 cadence ui start              # board at http://cadence.localhost:18000 behind the dev gateway
+cadence ui tailscale start    # optional: phone/laptop access at https://<dns>:9450 — tailnet-only, loopback bind unchanged
 cadence issue doctor          # tracker: hooks ours, lint clean, ahead/behind origin
 cadence issue sync            # pull other hosts' tracker writes before you plan
 cadence agent list --all      # who exists; `resumable: true` agents can come back

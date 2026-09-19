@@ -29,6 +29,8 @@ interface Props {
   projects: Project[];
   pmDir?: string;
   detail: IssueDetail | null;
+  readOnly: boolean;
+  actor: string;
   onClose: () => void;
   onOpen: (id: string) => void;
   onWrite: (resp: WriteResp, verb: string) => void;
@@ -105,6 +107,8 @@ export default function Drawer({
   projects,
   pmDir,
   detail,
+  readOnly,
+  actor,
   onClose,
   onOpen,
   onWrite,
@@ -186,11 +190,14 @@ export default function Drawer({
   const linkRows: [string, LinkRef, (() => void)?][] = [];
   if (detail) {
     const l = detail.links;
-    const rm = (kind: string, target: string) => () =>
-      api
-        .unlink(id, kind, target, rev)
-        .then((r) => onWrite(r, `${id} unlink ${kind} ${target}`))
-        .catch((e) => onError(e, "unlink"));
+    const rm = (kind: string, target: string) =>
+      readOnly
+        ? undefined
+        : () =>
+            api
+              .unlink(id, kind, target, rev)
+              .then((r) => onWrite(r, `${id} unlink ${kind} ${target}`))
+              .catch((e) => onError(e, "unlink"));
     if (l.parent) linkRows.push(["parent", l.parent, rm("parent", l.parent.id)]);
     for (const c of l.children) linkRows.push(["child", c, undefined]);
     for (const b of l.blocked_by)
@@ -327,7 +334,7 @@ export default function Drawer({
                     Fields
                   </h3>
                   <span className="kicker">writes commit to git</span>
-                  {!edit && (
+                  {!edit && !readOnly && (
                     <button
                       onClick={startEdit}
                       className="lnk num text-label ml-auto"
@@ -491,56 +498,59 @@ export default function Drawer({
                     ))}
                   </ul>
                 )}
-                <div className="flex gap-1.5">
-                  <select
-                    value={linkKind}
-                    onChange={(e) => setLinkKind(e.target.value)}
-                    className="field !h-8 text-label"
-                    aria-label="link type"
-                  >
-                    {LINK_KINDS.map((k) => (
-                      <option key={k}>{k}</option>
-                    ))}
-                  </select>
-                  <input
-                    value={linkTarget}
-                    onChange={(e) => setLinkTarget(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && linkTarget.trim()) {
+                {!readOnly && (
+                  <div className="flex gap-1.5">
+                    <select
+                      value={linkKind}
+                      onChange={(e) => setLinkKind(e.target.value)}
+                      className="field !h-8 text-label"
+                      aria-label="link type"
+                    >
+                      {LINK_KINDS.map((k) => (
+                        <option key={k}>{k}</option>
+                      ))}
+                    </select>
+                    <input
+                      value={linkTarget}
+                      onChange={(e) => setLinkTarget(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && linkTarget.trim()) {
+                          api
+                            .link(id, linkKind, linkTarget.trim(), rev)
+                            .then((r) => {
+                              onWrite(r, `${id} ${linkKind} ${linkTarget.trim()}`);
+                              setLinkTarget("");
+                            })
+                            .catch((e2) => onError(e2, "link"));
+                        }
+                      }}
+                      className="field !h-8 flex-1 num text-label"
+                      placeholder="CAD-16"
+                    />
+                    <button
+                      onClick={() => {
+                        const t = linkTarget.trim();
+                        if (!t) return;
                         api
-                          .link(id, linkKind, linkTarget.trim(), rev)
+                          .link(id, linkKind, t, rev)
                           .then((r) => {
-                            onWrite(r, `${id} ${linkKind} ${linkTarget.trim()}`);
+                            onWrite(r, `${id} ${linkKind} ${t}`);
                             setLinkTarget("");
                           })
-                          .catch((e2) => onError(e2, "link"));
-                      }
-                    }}
-                    className="field !h-8 flex-1 num text-label"
-                    placeholder="CAD-16"
-                  />
-                  <button
-                    onClick={() => {
-                      const t = linkTarget.trim();
-                      if (!t) return;
-                      api
-                        .link(id, linkKind, t, rev)
-                        .then((r) => {
-                          onWrite(r, `${id} ${linkKind} ${t}`);
-                          setLinkTarget("");
-                        })
-                        .catch((e) => onError(e, "link"));
-                    }}
-                    disabled={!linkTarget.trim()}
-                    className="h-8 px-2.5 rounded border border-ink-600 text-label text-ink-300 hover:border-accent/60 hover:text-accent disabled:opacity-40"
-                  >
-                    link
-                  </button>
-                </div>
+                          .catch((e) => onError(e, "link"));
+                      }}
+                      disabled={!linkTarget.trim()}
+                      className="h-8 px-2.5 rounded border border-ink-600 text-label text-ink-300 hover:border-accent/60 hover:text-accent disabled:opacity-40"
+                    >
+                      link
+                    </button>
+                  </div>
+                )}
               </section>
 
               <section
                 onDragOver={(e) => {
+                  if (readOnly) return;
                   e.preventDefault();
                   setDropHot(true);
                 }}
@@ -548,7 +558,7 @@ export default function Drawer({
                 onDrop={(e) => {
                   e.preventDefault();
                   setDropHot(false);
-                  attachFiles(e.dataTransfer.files);
+                  if (!readOnly) attachFiles(e.dataTransfer.files);
                 }}
               >
                 <div className="flex items-baseline gap-2 mb-2">
@@ -558,12 +568,14 @@ export default function Drawer({
                   <span className="kicker num">
                     {detail.refs.length} refs · {detail.artifacts.length} files
                   </span>
-                  <button
-                    onClick={() => fileInput.current?.click()}
-                    className="lnk num text-label ml-auto"
-                  >
-                    + attach
-                  </button>
+                  {!readOnly && (
+                    <button
+                      onClick={() => fileInput.current?.click()}
+                      className="lnk num text-label ml-auto"
+                    >
+                      + attach
+                    </button>
+                  )}
                   <input
                     ref={fileInput}
                     type="file"
@@ -645,57 +657,59 @@ export default function Drawer({
                     ))}
                   </ul>
                 )}
-                <div className="flex gap-1.5 mt-2">
-                  <select
-                    value={refKind}
-                    onChange={(e) => setRefKind(e.target.value)}
-                    className="field !h-8 text-label"
-                    aria-label="ref kind"
-                  >
-                    {REF_KINDS.map((k) => (
-                      <option key={k}>{k}</option>
-                    ))}
-                  </select>
-                  <input
-                    value={refTarget}
-                    onChange={(e) => setRefTarget(e.target.value)}
-                    className="field !h-8 flex-1 num text-label"
-                    placeholder="https://… or path"
-                  />
-                  <input
-                    value={refLabel}
-                    onChange={(e) => setRefLabel(e.target.value)}
-                    className="field !h-8 w-20 text-label"
-                    placeholder="label"
-                  />
-                  <button
-                    onClick={() => {
-                      const t = refTarget.trim();
-                      if (!t) return;
-                      const target = /^https?:\/\//.test(t)
-                        ? { url: t }
-                        : { path: t };
-                      api
-                        .addRef(
-                          id,
-                          refKind,
-                          target,
-                          refLabel.trim() || undefined,
-                          rev,
-                        )
-                        .then((r) => {
-                          onWrite(r, `${id} ref ${refKind}`);
-                          setRefTarget("");
-                          setRefLabel("");
-                        })
-                        .catch((e) => onError(e, "ref"));
-                    }}
-                    disabled={!refTarget.trim()}
-                    className="h-8 px-2.5 rounded border border-ink-600 text-label text-ink-300 hover:border-accent/60 hover:text-accent disabled:opacity-40"
-                  >
-                    ref
-                  </button>
-                </div>
+                {!readOnly && (
+                  <div className="flex gap-1.5 mt-2">
+                    <select
+                      value={refKind}
+                      onChange={(e) => setRefKind(e.target.value)}
+                      className="field !h-8 text-label"
+                      aria-label="ref kind"
+                    >
+                      {REF_KINDS.map((k) => (
+                        <option key={k}>{k}</option>
+                      ))}
+                    </select>
+                    <input
+                      value={refTarget}
+                      onChange={(e) => setRefTarget(e.target.value)}
+                      className="field !h-8 flex-1 num text-label"
+                      placeholder="https://… or path"
+                    />
+                    <input
+                      value={refLabel}
+                      onChange={(e) => setRefLabel(e.target.value)}
+                      className="field !h-8 w-20 text-label"
+                      placeholder="label"
+                    />
+                    <button
+                      onClick={() => {
+                        const t = refTarget.trim();
+                        if (!t) return;
+                        const target = /^https?:\/\//.test(t)
+                          ? { url: t }
+                          : { path: t };
+                        api
+                          .addRef(
+                            id,
+                            refKind,
+                            target,
+                            refLabel.trim() || undefined,
+                            rev,
+                          )
+                          .then((r) => {
+                            onWrite(r, `${id} ref ${refKind}`);
+                            setRefTarget("");
+                            setRefLabel("");
+                          })
+                          .catch((e) => onError(e, "ref"));
+                      }}
+                      disabled={!refTarget.trim()}
+                      className="h-8 px-2.5 rounded border border-ink-600 text-label text-ink-300 hover:border-accent/60 hover:text-accent disabled:opacity-40"
+                    >
+                      ref
+                    </button>
+                  </div>
+                )}
               </section>
 
               <section>
@@ -776,43 +790,45 @@ export default function Drawer({
                   </p>
                 )}
 
-                <div className="mt-3">
-                  <div className="flex items-baseline gap-2 mb-1">
-                    <span className="slabel">comment as operator</span>
-                    <button
-                      onClick={() => setCommentPreview(!commentPreview)}
-                      className="lnk num text-micro"
-                    >
-                      {commentPreview ? "write" : "preview"}
-                    </button>
-                    <span className="num text-micro text-ink-600 ml-auto">
-                      ⌘/Ctrl+Enter sends
-                    </span>
-                  </div>
-                  {commentPreview ? (
-                    <div className="card p-3 text-secondary text-ink-300 min-h-[4rem]">
-                      {comment.trim() ? (
-                        <Md text={comment} onOpen={onOpen} />
-                      ) : (
-                        <span className="text-ink-500">nothing to preview</span>
-                      )}
+                {!readOnly && (
+                  <div className="mt-3">
+                    <div className="flex items-baseline gap-2 mb-1">
+                      <span className="slabel">comment as {actor}</span>
+                      <button
+                        onClick={() => setCommentPreview(!commentPreview)}
+                        className="lnk num text-micro"
+                      >
+                        {commentPreview ? "write" : "preview"}
+                      </button>
+                      <span className="num text-micro text-ink-600 ml-auto">
+                        ⌘/Ctrl+Enter sends
+                      </span>
                     </div>
-                  ) : (
-                    <textarea
-                      value={comment}
-                      onChange={(e) => setComment(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                          e.preventDefault();
-                          sendComment();
-                        }
-                      }}
-                      rows={3}
-                      className="field w-full !h-auto py-2 text-secondary"
-                      placeholder="markdown — raw html stays inert"
-                    />
-                  )}
-                </div>
+                    {commentPreview ? (
+                      <div className="card p-3 text-secondary text-ink-300 min-h-[4rem]">
+                        {comment.trim() ? (
+                          <Md text={comment} onOpen={onOpen} />
+                        ) : (
+                          <span className="text-ink-500">nothing to preview</span>
+                        )}
+                      </div>
+                    ) : (
+                      <textarea
+                        value={comment}
+                        onChange={(e) => setComment(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                            e.preventDefault();
+                            sendComment();
+                          }
+                        }}
+                        rows={3}
+                        className="field w-full !h-auto py-2 text-secondary"
+                        placeholder="markdown — raw html stays inert"
+                      />
+                    )}
+                  </div>
+                )}
               </section>
 
               <section>
@@ -987,8 +1003,10 @@ export default function Drawer({
         <footer className="shrink-0 border-t border-ink-700 px-5 py-3 flex items-center gap-3 bg-ink-875">
           <span className="text-label text-ink-500 leading-[1.4]">
             {edit
-              ? "Editing fields — Save commits once as operator (ui)."
-              : "Edits, comments and attaches write through the board API. Dispatch waits for a token."}
+              ? `Editing fields — Save commits once as ${actor}.`
+              : readOnly
+                ? "Read-only — the server refuses every write."
+                : "Edits, comments and attaches write through the board API. Dispatch waits for a token."}
           </span>
           <div className="ml-auto flex gap-2 shrink-0">
             {edit ? (
@@ -1007,22 +1025,24 @@ export default function Drawer({
                 </button>
               </>
             ) : (
-              <>
-                <button
-                  onClick={sendComment}
-                  disabled={!comment.trim()}
-                  className="h-9 px-3 rounded border border-ink-600 text-secondary text-ink-300 hover:border-accent/60 hover:text-accent disabled:opacity-45 disabled:cursor-not-allowed"
-                >
-                  Comment
-                </button>
-                <button
-                  disabled
-                  title="dispatch waits for a token — not in I2"
-                  className="h-9 px-3 rounded bg-accent text-ink-950 text-secondary font-medium opacity-40 cursor-not-allowed"
-                >
-                  Kick off
-                </button>
-              </>
+              !readOnly && (
+                <>
+                  <button
+                    onClick={sendComment}
+                    disabled={!comment.trim()}
+                    className="h-9 px-3 rounded border border-ink-600 text-secondary text-ink-300 hover:border-accent/60 hover:text-accent disabled:opacity-45 disabled:cursor-not-allowed"
+                  >
+                    Comment
+                  </button>
+                  <button
+                    disabled
+                    title="dispatch waits for a token — not in I2"
+                    className="h-9 px-3 rounded bg-accent text-ink-950 text-secondary font-medium opacity-40 cursor-not-allowed"
+                  >
+                    Kick off
+                  </button>
+                </>
+              )
             )}
           </div>
         </footer>

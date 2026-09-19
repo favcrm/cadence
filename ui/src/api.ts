@@ -5,6 +5,7 @@ import type {
   IssueCard,
   IssueDetail,
   IssueHistoryEntry,
+  Meta,
   Project,
 } from "./types";
 
@@ -77,6 +78,7 @@ async function write<T extends object | undefined>(
 
 export const api = {
   health: () => get<Health>("/api/health"),
+  meta: () => get<Meta>("/api/meta"),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   issues: (project?: string) =>
     get<{ issues: IssueCard[] }>(

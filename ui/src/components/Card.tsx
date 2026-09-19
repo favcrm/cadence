@@ -19,6 +19,8 @@ interface Props {
   issue: IssueCard;
   parentTitle?: string;
   busyBy: string[];
+  /** False on a read-only board — cards never start a drag. */
+  canDrag?: boolean;
   onOpen: (id: string) => void;
 }
 
@@ -30,10 +32,16 @@ export function noDragReason(t: IssueCard): string | null {
   return null;
 }
 
-export default function Card({ issue, parentTitle, busyBy, onOpen }: Props) {
+export default function Card({
+  issue,
+  parentTitle,
+  busyBy,
+  canDrag = true,
+  onOpen,
+}: Props) {
   const t = issue;
   const derived = t.status_source !== "file";
-  const noDrag = noDragReason(t);
+  const noDrag = noDragReason(t) ?? (canDrag ? null : "board is read-only");
   const pr = prLabel(t);
   const artifacts = t.counts.artifacts + t.counts.refs;
   const meta: React.ReactNode[] = [];

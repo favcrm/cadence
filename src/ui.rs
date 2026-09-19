@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use clap::Subcommand;
-use serde::Deserialize;
+use clap::{Args, Subcommand};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -28,71 +28,308 @@ use crate::adapter::registry;
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::{board, history, model, project, write as issue_write, Pm};
+use crate::proc::{self, BoundedError};
+
+/// The options `ui run` and `ui start` share. Every field is optional:
+/// a given flag overrides the persisted `ui.json`, an absent one
+/// inherits it, and `--reset` on `start` forgets the file first.
+#[derive(Args, Clone, Default)]
+pub struct UiFlags {
+    /// Bind address [default: 127.0.0.1]. Tailscale sharing requires
+    /// loopback — the proxy connects from the same host.
+    #[arg(long)]
+    pub host: Option<String>,
+    /// Port [default: 3010].
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Serve the SPA from this directory (required when the binary
+    /// was built without `--features ui`).
+    #[arg(long)]
+    pub dist: Option<PathBuf>,
+    /// Extra allowed Host header values (repeatable).
+    #[arg(long = "allow-host")]
+    pub allow_hosts: Vec<String>,
+    /// Extra allowed write Origin values (repeatable) — e.g.
+    /// `https://<name>.ts.net:9450` for a tailnet-shared board.
+    #[arg(long = "allow-origin")]
+    pub allow_origins: Vec<String>,
+    /// Refuse every write route with 403; the SPA hides edit controls.
+    #[arg(long, overrides_with = "no_read_only")]
+    pub read_only: bool,
+    /// Clear a persisted --read-only.
+    #[arg(long, overrides_with = "read_only")]
+    pub no_read_only: bool,
+    /// Publish the board on the tailnet through `tailscale serve`
+    /// (https port default: 9450). Ensures the serve mapping, adds the
+    /// tailnet name to the Host and Origin allowlists, and attributes
+    /// writes to the Tailscale user. Never funnel.
+    #[arg(long, num_args = 0..=1, default_missing_value = "9450",
+           value_name = "HTTPS_PORT")]
+    pub tailscale: Option<u16>,
+}
 
 #[derive(Subcommand)]
 pub enum UiAction {
     /// Serve the board + JSON API in the foreground.
     Run {
-        /// Bind address [default: 127.0.0.1].
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Port [default: 3010].
-        #[arg(long, default_value_t = 3010)]
-        port: u16,
-        /// Serve the SPA from this directory (required when the binary
-        /// was built without `--features ui`).
-        #[arg(long)]
-        dist: Option<PathBuf>,
-        /// Extra allowed Host header values (repeatable).
-        #[arg(long = "allow-host")]
-        allow_hosts: Vec<String>,
+        #[command(flatten)]
+        flags: UiFlags,
     },
     /// Detached `ui run`: pid + log under the state dir, mirrors
-    /// `daemon start`.
+    /// `daemon start`. Effective options persist to `ui.json`; a later
+    /// plain `ui start` reuses them.
     Start {
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(long, default_value_t = 3010)]
-        port: u16,
+        #[command(flatten)]
+        flags: UiFlags,
+        /// Forget the persisted options before applying flags.
         #[arg(long)]
-        dist: Option<PathBuf>,
-        #[arg(long = "allow-host")]
-        allow_hosts: Vec<String>,
+        reset: bool,
     },
     /// Stop the detached UI server.
+    Stop {
+        /// Also remove the tailscale serve mapping cadence created.
+        #[arg(long)]
+        tailscale_off: bool,
+    },
+    /// Report UI server health and the persisted options.
+    Status,
+    /// Share the board over the tailnet (`tailscale serve`, never
+    /// funnel). The primary UX for phone/laptop access.
+    Tailscale {
+        #[command(subcommand)]
+        action: TailscaleAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TailscaleAction {
+    /// Publish the board on the tailnet: ensure the serve mapping,
+    /// persist the options, (re)start the detached board so the Host
+    /// and Origin allowlists take effect, print the tailnet URL.
+    Start {
+        /// Tailscale https port [default: 9450].
+        #[arg(long, default_value_t = 9450)]
+        port: u16,
+        /// Make every write route answer 403 — browse-only sharing.
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// Remove the serve mapping cadence created, drop the tailnet
+    /// Host/Origin entries, and restart the board local-only.
     Stop,
-    /// Report UI server health.
+    /// Report sharing state, the tailnet URL, and a terminal QR code.
     Status,
 }
 
 /// `cadence ui …`
 pub fn run_cli(state_dir: &Path, action: &UiAction) -> Result<i32> {
     match action {
-        UiAction::Run {
-            host,
-            port,
-            dist,
-            allow_hosts,
-        } => {
-            serve(
-                state_dir,
-                &crate::issue::default_dir()?,
-                host,
-                *port,
-                dist.clone(),
-                allow_hosts,
-            )?;
-            Ok(0)
-        }
-        UiAction::Start {
-            host,
-            port,
-            dist,
-            allow_hosts,
-        } => start(state_dir, host, *port, dist.clone(), allow_hosts),
-        UiAction::Stop => stop(state_dir),
+        UiAction::Run { flags } => run(state_dir, flags),
+        UiAction::Start { flags, reset } => start(state_dir, flags, *reset),
+        UiAction::Stop { tailscale_off } => stop(state_dir, *tailscale_off),
         UiAction::Status => status(state_dir),
+        UiAction::Tailscale { action } => tailscale_cli(state_dir, action),
     }
+}
+
+// ---------- persisted options (`<state>/ui.json`) ----------
+
+/// Tailscale sharing as `ui start` recorded it. The derived Host and
+/// Origin entries are computed from the dns name + port at resolve
+/// time, never stored, so `tailscale stop` can drop them exactly.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TailscaleOpts {
+    /// `Self.DNSName` from `tailscale status --json` (dot stripped).
+    pub dns_name: String,
+    /// The tailnet https port the serve mapping answers on.
+    pub https_port: u16,
+    /// The proxy target cadence registered — `http://127.0.0.1:<port>`.
+    /// Removal only ever happens while the live mapping still equals
+    /// this, so a foreign mapping on the port is never touched.
+    pub target: String,
+}
+
+impl TailscaleOpts {
+    /// Host header values a proxied request carries — `name` and
+    /// `name:port` (browsers send the port; hand-set headers may not).
+    fn hosts(&self) -> [String; 2] {
+        [
+            self.dns_name.clone(),
+            format!("{}:{}", self.dns_name, self.https_port),
+        ]
+    }
+
+    /// The browser's write Origin through the proxy.
+    fn origins(&self) -> Vec<String> {
+        let mut v = vec![format!("https://{}:{}", self.dns_name, self.https_port)];
+        if self.https_port == 443 {
+            v.push(format!("https://{}", self.dns_name));
+        }
+        v
+    }
+
+    pub fn url(&self) -> String {
+        tailnet_url(&self.dns_name, self.https_port)
+    }
+}
+
+/// `https://<name>` for 443, else `https://<name>:<port>`.
+fn tailnet_url(dns_name: &str, https_port: u16) -> String {
+    if https_port == 443 {
+        format!("https://{dns_name}")
+    } else {
+        format!("https://{dns_name}:{https_port}")
+    }
+}
+
+/// The effective options `ui start` persists — a later plain start
+/// reuses them, `ui status` prints them, `--reset` forgets them.
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct UiOpts {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub dist: Option<PathBuf>,
+    pub allow_hosts: Vec<String>,
+    pub allow_origins: Vec<String>,
+    pub read_only: bool,
+    pub tailscale: Option<TailscaleOpts>,
+}
+
+/// Everything the running server needs, resolved.
+#[derive(Clone, Default)]
+pub struct ServeOpts {
+    pub host: String,
+    pub port: u16,
+    pub dist: Option<PathBuf>,
+    /// Operator `--allow-host` plus the tailnet-derived names.
+    pub allow_hosts: Vec<String>,
+    /// Operator `--allow-origin` plus the tailnet https origin.
+    pub allow_origins: Vec<String>,
+    pub read_only: bool,
+    /// Tailscale sharing armed: `(dns_name, https_port)` — the trust
+    /// rule for `Tailscale-User-*` headers and the `/api/meta` URL.
+    pub tailnet: Option<(String, u16)>,
+}
+
+fn opts_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("ui.json")
+}
+
+/// Does this state dir have persisted ui options — `daemon restart
+/// --ui` falls back to the running process's argv when it does not.
+pub fn opts_present(state_dir: &Path) -> bool {
+    opts_file(state_dir).is_file()
+}
+
+fn load_opts(state_dir: &Path) -> UiOpts {
+    let Ok(bytes) = std::fs::read(opts_file(state_dir)) else {
+        return UiOpts::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        eprintln!("warning: ignoring unreadable ui.json: {e}");
+        UiOpts::default()
+    })
+}
+
+fn save_opts(state_dir: &Path, opts: &UiOpts) -> Result<()> {
+    let path = opts_file(state_dir);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(opts)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    matches!(h.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+/// Merge flags over the persisted options: a given flag wins, an
+/// absent one inherits. `--tailscale` resolves the tailnet identity
+/// and ensures the serve mapping; a persisted tailscale block is kept
+/// (the detached server never re-ensures — only operator verbs do).
+fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpts)> {
+    let mut eff = UiOpts {
+        host: flags.host.clone().or_else(|| persisted.host.clone()),
+        port: flags.port.or(persisted.port),
+        dist: flags.dist.clone().or_else(|| persisted.dist.clone()),
+        allow_hosts: if flags.allow_hosts.is_empty() {
+            persisted.allow_hosts.clone()
+        } else {
+            flags.allow_hosts.clone()
+        },
+        allow_origins: if flags.allow_origins.is_empty() {
+            persisted.allow_origins.clone()
+        } else {
+            flags.allow_origins.clone()
+        },
+        read_only: if flags.no_read_only {
+            false
+        } else {
+            flags.read_only || persisted.read_only
+        },
+        tailscale: persisted.tailscale.clone(),
+    };
+    if let Some(https_port) = flags.tailscale {
+        let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+        if !is_loopback_host(&host) {
+            return Err(Error::rejected(format!(
+                "--tailscale shares the board through a proxy on this host, \
+                 but --host '{host}' is not loopback — bind 127.0.0.1"
+            )));
+        }
+        let ui_port = eff.port.unwrap_or(3010);
+        let target = format!("http://127.0.0.1:{ui_port}");
+        let me = ts_self()?;
+        ensure_mapping(https_port, &target)?;
+        eff.tailscale = Some(TailscaleOpts {
+            dns_name: me.dns_name,
+            https_port,
+            target,
+        });
+    }
+    let serve = serve_opts(&eff)?;
+    Ok((eff, serve))
+}
+
+/// Build the runtime view of effective options: tailnet-derived
+/// Host/Origin entries unioned in (deduped, case-insensitive) and the
+/// loopback rule enforced.
+fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
+    let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = eff.port.unwrap_or(3010);
+    if eff.tailscale.is_some() && !is_loopback_host(&host) {
+        return Err(Error::rejected(format!(
+            "--tailscale shares the board through a proxy on this host, \
+             but --host '{host}' is not loopback — bind 127.0.0.1"
+        )));
+    }
+    let mut allow_hosts = eff.allow_hosts.clone();
+    let mut allow_origins = eff.allow_origins.clone();
+    let mut tailnet = None;
+    if let Some(ts) = &eff.tailscale {
+        for h in ts.hosts() {
+            if !allow_hosts.iter().any(|x| x.eq_ignore_ascii_case(&h)) {
+                allow_hosts.push(h);
+            }
+        }
+        for o in ts.origins() {
+            if !allow_origins.iter().any(|x| x.eq_ignore_ascii_case(&o)) {
+                allow_origins.push(o);
+            }
+        }
+        tailnet = Some((ts.dns_name.clone(), ts.https_port));
+    }
+    Ok(ServeOpts {
+        host,
+        port,
+        dist: eff.dist.clone(),
+        allow_hosts,
+        allow_origins,
+        read_only: eff.read_only,
+        tailnet,
+    })
 }
 
 // ---------- server ----------
@@ -565,10 +802,11 @@ fn guard_fail(check: &str, msg: &str) -> HttpResp {
     resp
 }
 
-/// Allowed write origins: the allowlisted hosts over http. A same-origin
-/// browser page sends `Origin: http://<host>` — anything else, or a
-/// cross-site `Sec-Fetch-Site`, is not our board.
-fn origin_allowed(origin: &str, port: u16, hosts: &[String]) -> bool {
+/// Allowed write origins: the allowlisted hosts over http plus the
+/// explicit `--allow-origin` entries (the tailnet https origin lands
+/// there). A same-origin browser page sends `Origin: <scheme>://<host>`
+/// — anything else, or a cross-site `Sec-Fetch-Site`, is not our board.
+fn origin_allowed(origin: &str, port: u16, hosts: &[String], origins: &[String]) -> bool {
     let origin = origin.trim().to_ascii_lowercase();
     let mut allowed = vec![
         "http://cadence.localhost".to_string(),
@@ -582,6 +820,7 @@ fn origin_allowed(origin: &str, port: u16, hosts: &[String]) -> bool {
             .iter()
             .map(|h| format!("http://{}", h.trim().to_ascii_lowercase())),
     );
+    allowed.extend(origins.iter().map(|o| o.trim().to_ascii_lowercase()));
     allowed.contains(&origin)
 }
 
@@ -594,8 +833,7 @@ fn origin_allowed(origin: &str, port: u16, hosts: &[String]) -> bool {
 fn write_guard(
     request: &Request,
     want_ct: &str,
-    port: u16,
-    hosts: &[String],
+    opts: &ServeOpts,
 ) -> std::result::Result<(), HttpResp> {
     let ct = header_value(request, "Content-Type").unwrap_or_default();
     if ct.trim() != want_ct {
@@ -608,7 +846,7 @@ fn write_guard(
         return Err(guard_fail("x_cadence_board", "missing X-Cadence-Board: 1"));
     }
     if let Some(origin) = header_value(request, "Origin") {
-        if !origin_allowed(&origin, port, hosts) {
+        if !origin_allowed(&origin, opts.port, &opts.allow_hosts, &opts.allow_origins) {
             return Err(guard_fail(
                 "origin",
                 &format!("origin '{origin}' is not a board origin"),
@@ -775,6 +1013,47 @@ fn write_err(e: &Error) -> HttpResp {
     }
 }
 
+/// The actor a write commits as. `Tailscale-User-Login` is trusted
+/// only when all three hold — tailscale mode armed, the TCP peer is
+/// loopback (the proxy connects locally), and the request's Host is
+/// the tailnet name. Anything else — including a direct loopback
+/// request forging the header under a different Host — writes as the
+/// plain operator and the header is never considered.
+fn request_actor(request: &Request, opts: &ServeOpts) -> String {
+    let Some((dns, _)) = &opts.tailnet else {
+        return UI_ACTOR.to_string();
+    };
+    let peer_ok = request
+        .remote_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false);
+    if !peer_ok {
+        return UI_ACTOR.to_string();
+    }
+    let host = header_value(request, "Host").unwrap_or_default();
+    let name = host.split(':').next().unwrap_or_default();
+    if !name.eq_ignore_ascii_case(dns) {
+        return UI_ACTOR.to_string();
+    }
+    header_value(request, "Tailscale-User-Login")
+        .and_then(|l| sanitize_actor(&l))
+        .map(|l| format!("{l} (tailscale)"))
+        .unwrap_or_else(|| UI_ACTOR.to_string())
+}
+
+/// The login lands in a commit `Actor:` trailer — take the first
+/// whitespace-free token of printable ASCII, bounded, else no trust.
+fn sanitize_actor(raw: &str) -> Option<String> {
+    let tok = raw.split_whitespace().next().unwrap_or_default();
+    if tok.is_empty()
+        || tok.len() > 120
+        || !tok.chars().all(|c| c.is_ascii() && !c.is_ascii_control())
+    {
+        return None;
+    }
+    Some(tok.to_string())
+}
+
 /// Dispatch POST/PATCH/DELETE on the write routes. Every route passes
 /// `write_guard` before reading a body or touching the PM dir, and every
 /// op goes through `issue::write` — one write path for CLI and API.
@@ -786,8 +1065,7 @@ fn write_route(
     query: &dyn Fn(&str) -> Option<String>,
     state_dir: &Path,
     pm_dir: &Path,
-    port: u16,
-    hosts: &[String],
+    opts: &ServeOpts,
     send: &dyn Fn(Request, HttpResp),
 ) {
     let Some(rest) = path.strip_prefix("/api/issues") else {
@@ -823,15 +1101,23 @@ fn write_route(
         send(request, err_response(code, "no such write route"));
         return;
     }
+    if opts.read_only {
+        send(
+            request,
+            guard_fail("read_only", "board is read-only — writes are disabled"),
+        );
+        return;
+    }
     let want_ct = if sub == Some("artifacts") {
         "application/octet-stream"
     } else {
         "application/json"
     };
-    if let Err(resp) = write_guard(&request, want_ct, port, hosts) {
+    if let Err(resp) = write_guard(&request, want_ct, opts) {
         send(request, resp);
         return;
     }
+    let actor = request_actor(&request, opts);
     let pm = match Pm::at(pm_dir) {
         Ok(pm) => pm,
         Err(e) => {
@@ -868,7 +1154,7 @@ fn write_route(
             req.owner.as_deref(),
             req.component.as_deref(),
             None,
-            UI_ACTOR,
+            &actor,
         ) {
             Ok(out) => {
                 let new_id = out["id"].as_str().unwrap_or_default().to_string();
@@ -905,7 +1191,7 @@ fn write_route(
                 return;
             }
         };
-        match issue_write::attach_bytes(&pm, &id, &name, &bytes, false, UI_ACTOR) {
+        match issue_write::attach_bytes(&pm, &id, &name, &bytes, false, &actor) {
             Ok(out) => send(request, write_reply(&pm, state_dir, &id, out, false)),
             Err(e) => send(request, write_err(&e)),
         }
@@ -933,7 +1219,7 @@ fn write_route(
                     body: req.body,
                 },
                 req.if_rev.as_deref(),
-                UI_ACTOR,
+                &actor,
                 Some(state_dir),
             ),
             Err(resp) => {
@@ -949,7 +1235,7 @@ fn write_route(
                 &req.target,
                 m == &Method::Delete,
                 req.if_rev.as_deref(),
-                UI_ACTOR,
+                &actor,
                 Some(state_dir),
             ),
             Err(resp) => {
@@ -976,7 +1262,7 @@ fn write_route(
                     &target,
                     req.label.as_deref(),
                     req.if_rev.as_deref(),
-                    UI_ACTOR,
+                    &actor,
                 )
             }
             Err(resp) => {
@@ -992,7 +1278,7 @@ fn write_route(
                 Some("operator"),
                 Some("ui"),
                 req.if_rev.as_deref(),
-                UI_ACTOR,
+                &actor,
             ),
             Err(resp) => {
                 send(request, resp);
@@ -1249,14 +1535,7 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     }
 }
 
-fn handle(
-    request: Request,
-    state_dir: &Path,
-    pm_dir: &Path,
-    port: u16,
-    dist: Option<&Path>,
-    hosts: &[String],
-) {
+fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
     let method = request.method().clone();
     let head_only = method == Method::Head;
     let is_write = matches!(method, Method::Post | Method::Patch | Method::Delete);
@@ -1270,7 +1549,7 @@ fn handle(
         .find(|h| h.field.equiv("Host"))
         .map(|h| h.value.as_str().to_string())
         .unwrap_or_default();
-    if !host_allowed(&host, port, hosts) {
+    if !host_allowed(&host, opts.port, &opts.allow_hosts) {
         let _ = request.respond(err_response(421, "misdirected request — Host not allowed"));
         return;
     }
@@ -1296,15 +1575,30 @@ fn handle(
     };
 
     let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
+    let actor = request_actor(&request, opts);
 
     if is_write {
         write_route(
-            request, &method, &path, &query, state_dir, pm_dir, port, hosts, &send,
+            request, &method, &path, &query, state_dir, pm_dir, opts, &send,
         );
         return;
     }
 
     match path.as_str() {
+        // What the SPA needs to render itself correctly for this
+        // client: read-only mode, the actor this request would write
+        // as, and the tailnet URL when sharing is armed.
+        "/api/meta" => send(
+            request,
+            json_response(json!({
+                "read_only": opts.read_only,
+                "actor": actor,
+                "tailnet_url": opts
+                    .tailnet
+                    .as_ref()
+                    .map(|(dns, port)| tailnet_url(dns, *port)),
+            })),
+        ),
         "/api/health" => {
             let pm = Pm::at(pm_dir).ok();
             let (projects, issues) = match &pm {
@@ -1508,7 +1802,7 @@ fn handle(
             // Static: `/` → index.html; otherwise a file under dist or
             // the embedded build. No SPA routes exist in I1.
             let target = if path == "/" { "/index.html" } else { &path };
-            match static_file(dist, target) {
+            match static_file(opts.dist.as_deref(), target) {
                 Some((name, bytes)) => {
                     let mut resp = Response::from_data(bytes);
                     resp.add_header(
@@ -1518,7 +1812,7 @@ fn handle(
                     send(request, resp);
                 }
                 None => {
-                    if let Some((name, bytes)) = static_file(dist, "/index.html") {
+                    if let Some((name, bytes)) = static_file(opts.dist.as_deref(), "/index.html") {
                         let mut resp = Response::from_data(bytes);
                         resp.add_header(
                             Header::from_bytes("Content-Type", content_type(&name)).unwrap(),
@@ -1543,23 +1837,15 @@ fn handle(
 /// since `/api/stream`, and issue file writes must not interleave.
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub fn serve(
-    state_dir: &Path,
-    pm_dir: &Path,
-    host: &str,
-    port: u16,
-    dist: Option<PathBuf>,
-    allow_hosts: &[String],
-) -> Result<()> {
-    let server = Server::http(format!("{host}:{port}"))
-        .map_err(|e| Error::internal(format!("ui bind {host}:{port}: {e}")))?;
-    eprintln!("cadence ui listening on http://{host}:{port}");
+pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
+    let server = Server::http(format!("{}:{}", opts.host, opts.port))
+        .map_err(|e| Error::internal(format!("ui bind {}:{}: {e}", opts.host, opts.port)))?;
+    eprintln!("cadence ui listening on http://{}:{}", opts.host, opts.port);
     for request in server.incoming_requests() {
         // Thread per request: `/api/stream` holds its connection open
         // for the session's lifetime and must not starve the board.
-        let (state_dir, pm_dir, dist) =
-            (state_dir.to_path_buf(), pm_dir.to_path_buf(), dist.clone());
-        let hosts = allow_hosts.to_vec();
+        let (state_dir, pm_dir, opts) =
+            (state_dir.to_path_buf(), pm_dir.to_path_buf(), opts.clone());
         std::thread::spawn(move || {
             let is_write = matches!(
                 request.method(),
@@ -1567,9 +1853,9 @@ pub fn serve(
             );
             if is_write {
                 let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                handle(request, &state_dir, &pm_dir, port, dist.as_deref(), &hosts);
+                handle(request, &state_dir, &pm_dir, &opts);
             } else {
-                handle(request, &state_dir, &pm_dir, port, dist.as_deref(), &hosts);
+                handle(request, &state_dir, &pm_dir, &opts);
             }
         });
     }
@@ -1602,12 +1888,25 @@ fn read_pid(state_dir: &Path) -> Option<i32> {
 }
 
 /// Tiny blocking GET — enough for health checks without an HTTP client
-/// dependency. Returns `(status, body)`.
-fn http_get(host: &str, port: u16, path: &str) -> Result<(u16, String)> {
+/// dependency. `headers` are extra request lines (`Tailscale-User-Login`
+/// for the identity probe). Returns `(status, body)`.
+fn http_get(
+    host: &str,
+    port: u16,
+    path: &str,
+    req_host: &str,
+    headers: &[&str],
+) -> Result<(u16, String)> {
     let mut stream = TcpStream::connect((host, port))
         .map_err(|e| Error::internal(format!("ui not reachable at {host}:{port}: {e}")))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    write!(stream, "GET {path} HTTP/1.0\r\nHost: {host}:{port}\r\n\r\n")?;
+    let mut req = format!("GET {path} HTTP/1.0\r\nHost: {req_host}\r\n");
+    for h in headers {
+        req.push_str(h);
+        req.push_str("\r\n");
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes())?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf)?;
     let text = String::from_utf8_lossy(&buf);
@@ -1624,23 +1923,60 @@ fn http_get(host: &str, port: u16, path: &str) -> Result<(u16, String)> {
     Ok((status, body))
 }
 
-fn start(
-    state_dir: &Path,
-    host: &str,
-    port: u16,
-    dist: Option<PathBuf>,
-    allow_hosts: &[String],
-) -> Result<i32> {
+/// `ui run` — foreground. Flags merge over the persisted options but
+/// never rewrite them: `ui start` owns persistence.
+fn run(state_dir: &Path, flags: &UiFlags) -> Result<i32> {
+    let persisted = load_opts(state_dir);
+    let (_eff, so) = resolve_opts(flags, &persisted)?;
+    serve(state_dir, &crate::issue::default_dir()?, &so)?;
+    Ok(0)
+}
+
+/// `ui start` — merge flags over `ui.json`, persist the effective
+/// options, spawn a detached `ui run` that reads them back. A
+/// persisted tailscale block re-ensures its mapping (idempotent; a
+/// foreign mapping on the port is still a hard refusal, an
+/// unreachable tailscaled a warning — the board still serves
+/// loopback).
+fn start(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i32> {
+    start_inner(state_dir, flags, reset, false)
+}
+
+fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> Result<i32> {
     std::fs::create_dir_all(state_dir)?;
+    if reset {
+        let _ = std::fs::remove_file(opts_file(state_dir));
+    }
+    let persisted = load_opts(state_dir);
+    let (eff, so) = resolve_opts(flags, &persisted)?;
+    // Re-ensure a persisted mapping so `ui stop && ui start` keeps the
+    // board shared — best effort when tailscaled itself is unreachable.
+    if flags.tailscale.is_none() {
+        if let Some(ts) = &eff.tailscale {
+            match ensure_mapping(ts.https_port, &ts.target) {
+                Ok(_) => {}
+                Err(e) if is_ts_offline(&e) => {
+                    eprintln!("warning: {e} — serving loopback only this run");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    save_opts(state_dir, &eff)?;
+    let (host, port) = (so.host.clone(), so.port);
     if let Some(pid) = read_pid(state_dir) {
-        let (code, _) = http_get(host, port, "/api/health").unwrap_or((0, String::new()));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "state": "already_running", "pid": pid, "health_http": code,
-            }))
-            .unwrap_or_default()
-        );
+        let (code, _) = http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[])
+            .unwrap_or((0, String::new()));
+        if !quiet {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "state": "already_running", "pid": pid, "health_http": code,
+                    "tailnet_url": eff.tailscale.as_ref().map(|t| t.url()),
+                }))
+                .unwrap_or_default()
+            );
+        }
         return Ok(0);
     }
     let log = std::fs::OpenOptions::new()
@@ -1649,16 +1985,15 @@ fn start(
         .open(state_dir.join("ui.log"))?;
     let exe = std::env::current_exe()?;
     let mut command = Command::new(exe);
+    // The detached child re-resolves from `ui.json` — its argv only
+    // pins the bind, everything else is the persisted file's business.
     command
         .arg("--state-dir")
         .arg(state_dir)
-        .args(["ui", "run", "--host", host, "--port"])
+        .args(["ui", "run", "--host", &host, "--port"])
         .arg(port.to_string());
-    if let Some(dist) = &dist {
+    if let Some(dist) = &eff.dist {
         command.arg("--dist").arg(dist);
-    }
-    for h in allow_hosts {
-        command.arg("--allow-host").arg(h);
     }
     command
         .stdin(std::process::Stdio::null())
@@ -1676,17 +2011,21 @@ fn start(
     std::fs::write(pid_file(state_dir), child.id().to_string())?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok((200, _)) = http_get(host, port, "/api/health") {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "state": "started", "pid": child.id(),
-                    "url": format!("http://{host}:{port}"),
-                    "gateway": "http://cadence.localhost:18000",
-                    "log": state_dir.join("ui.log"),
-                }))
-                .unwrap_or_default()
-            );
+        if let Ok((200, _)) = http_get(&host, port, "/api/health", &format!("{host}:{port}"), &[]) {
+            if !quiet {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "state": "started", "pid": child.id(),
+                        "url": format!("http://{host}:{port}"),
+                        "tailnet_url": eff.tailscale.as_ref().map(|t| t.url()),
+                        "read_only": eff.read_only,
+                        "gateway": "http://cadence.localhost:18000",
+                        "log": state_dir.join("ui.log"),
+                    }))
+                    .unwrap_or_default()
+                );
+            }
             return Ok(0);
         }
         if child.try_wait()?.is_some() {
@@ -1703,42 +2042,75 @@ fn start(
     }
 }
 
-fn stop(state_dir: &Path) -> Result<i32> {
-    match read_pid(state_dir) {
-        Some(pid) => {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while unsafe { libc::kill(pid, 0) == 0 } {
-                if Instant::now() >= deadline {
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            let _ = std::fs::remove_file(pid_file(state_dir));
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({"state": "stopped", "pid": pid}))
-                    .unwrap_or_default()
-            );
+/// SIGTERM the detached server and wait for exit — no output, for
+/// callers (stop, the tailscale verbs) that print their own result.
+fn kill_detached(state_dir: &Path) -> Option<i32> {
+    let pid = read_pid(state_dir)?;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(pid, 0) == 0 } {
+        if Instant::now() >= deadline {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            break;
         }
-        None => {
-            let _ = std::fs::remove_file(pid_file(state_dir));
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({"state": "stopped", "note": "no live pid"}))
-                    .unwrap_or_default()
-            );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_file(pid_file(state_dir));
+    Some(pid)
+}
+
+fn stop(state_dir: &Path, tailscale_off: bool) -> Result<i32> {
+    let pid = kill_detached(state_dir);
+    if pid.is_none() {
+        let _ = std::fs::remove_file(pid_file(state_dir));
+    }
+    // --tailscale-off: only ever the mapping cadence recorded — a
+    // foreign one on the same port is left alone and named in the
+    // result.
+    let mut ts_result = Value::Null;
+    if tailscale_off {
+        let mut opts = load_opts(state_dir);
+        if let Some(ts) = opts.tailscale.take() {
+            ts_result = match remove_mapping(ts.https_port, &ts.target) {
+                Ok(true) => json!({"removed": ts.https_port}),
+                Ok(false) => json!({"left_alone": ts.https_port, "why": "mapping changed hands"}),
+                Err(e) => {
+                    eprintln!("warning: {e}");
+                    json!({"left_alone": ts.https_port, "why": e.to_string()})
+                }
+            };
+            opts.tailscale = None;
+            save_opts(state_dir, &opts)?;
+        } else {
+            ts_result = json!({"left_alone": Value::Null, "why": "no recorded mapping"});
         }
     }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "state": "stopped",
+            "pid": pid,
+            "note": if pid.is_none() { Some("no live pid") } else { None },
+            "tailscale_off": ts_result,
+        }))
+        .unwrap_or_default()
+    );
     Ok(0)
 }
 
 fn status(state_dir: &Path) -> Result<i32> {
     let pid = read_pid(state_dir);
+    let opts = load_opts(state_dir);
+    let port = opts.port.unwrap_or(3010);
     let health = pid.and_then(|_| {
-        // The pidfile records the pid, not the port — try the default.
-        http_get("127.0.0.1", 3010, "/api/health").ok()
+        http_get(
+            "127.0.0.1",
+            port,
+            "/api/health",
+            &format!("127.0.0.1:{port}"),
+            &[],
+        )
+        .ok()
     });
     println!(
         "{}",
@@ -1749,10 +2121,354 @@ fn status(state_dir: &Path) -> Result<i32> {
                 "http": code,
                 "body": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),
             })),
+            "options": {
+                "port": port,
+                "allow_hosts": opts.allow_hosts,
+                "allow_origins": opts.allow_origins,
+                "read_only": opts.read_only,
+            },
+            "tailnet_url": opts.tailscale.as_ref().map(|t| t.url()),
         }))
         .unwrap_or_default()
     );
     Ok(0)
+}
+
+// ---------- tailscale (serve only — never funnel) ----------
+
+/// One bounded `tailscale` invocation — the only way cadence talks to
+/// it, and `funnel` is never among the args.
+fn ts(args: &[&str]) -> Result<std::process::Output> {
+    let mut cmd = Command::new("tailscale");
+    cmd.args(args);
+    proc::run_bounded(&mut cmd, Duration::from_secs(15)).map_err(|e| match e {
+        BoundedError::Spawn(_) => Error::rejected("tailscale is not installed or not on PATH"),
+        other => Error::internal(format!("tailscale {}: {other}", args.join(" "))),
+    })
+}
+
+/// The error a dead/logged-out tailscaled produces — `ui start` warns
+/// and serves loopback rather than refuse outright.
+fn is_ts_offline(e: &Error) -> bool {
+    matches!(e, Error::Rejected(m) if m.contains("tailscale"))
+}
+
+struct TsSelf {
+    dns_name: String,
+}
+
+/// `tailscale status --json` → the node's DNS name, with the three
+/// refusal states the operator can act on named plainly.
+fn ts_self() -> Result<TsSelf> {
+    let out = ts(&["status", "--json"])?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lower = stderr.to_lowercase();
+        if lower.contains("logged out") {
+            return Err(Error::rejected(
+                "tailscale is logged out — run `tailscale up` first",
+            ));
+        }
+        return Err(Error::rejected(format!(
+            "tailscale status failed: {}",
+            stderr.trim()
+        )));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| Error::internal(format!("tailscale status --json: {e}")))?;
+    let state = v["BackendState"].as_str().unwrap_or_default();
+    if state != "Running" {
+        return Err(Error::rejected(format!(
+            "tailscale is not up (BackendState {state:?}) — run `tailscale up` first"
+        )));
+    }
+    let dns = v["Self"]["DNSName"]
+        .as_str()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_string();
+    if dns.is_empty() {
+        return Err(Error::rejected(
+            "tailscale reports no DNS name — is this node logged in?",
+        ));
+    }
+    let cert_domains = v["CertDomains"].as_array().cloned().unwrap_or_default();
+    if cert_domains.is_empty() {
+        return Err(Error::rejected(
+            "HTTPS certificates are not enabled for this tailnet — enable \
+             them in the admin console (DNS → HTTPS Certificates) first",
+        ));
+    }
+    Ok(TsSelf { dns_name: dns })
+}
+
+/// `tailscale serve status --json` → https port → proxy target.
+/// `Web` keys are `<dns>:<port>` (bare `<dns>` is port 443).
+fn serve_map() -> Result<HashMap<u16, String>> {
+    let out = ts(&["serve", "status", "--json"])?;
+    if !out.status.success() {
+        return Err(Error::rejected(format!(
+            "tailscale serve status failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| Error::internal(format!("tailscale serve status --json: {e}")))?;
+    let mut map = HashMap::new();
+    if let Some(web) = v["Web"].as_object() {
+        for (key, entry) in web {
+            let port: u16 = key
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(443);
+            if let Some(target) = entry["Handlers"]["/"]["Proxy"].as_str() {
+                map.insert(port, target.to_string());
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Ensure `https:<port>` proxies to `target`: identical mapping is
+/// left alone (returns false), a different one on that port is a hard
+/// refusal — cadence never overwrites somebody else's serve config.
+fn ensure_mapping(port: u16, target: &str) -> Result<bool> {
+    match serve_map()?.get(&port) {
+        Some(existing) if existing == target => Ok(false),
+        Some(other) => Err(Error::rejected(format!(
+            "tailscale serve :{port} already targets {other} — refusing to \
+             overwrite it; pick another port or free that mapping first"
+        ))),
+        None => {
+            let out = ts(&["serve", "--bg", &format!("--https={port}"), target])?;
+            if !out.status.success() {
+                return Err(Error::rejected(format!(
+                    "tailscale serve --https={port} failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Remove the mapping only while it still targets what cadence
+/// recorded — a foreign or absent mapping returns false.
+fn remove_mapping(port: u16, expected: &str) -> Result<bool> {
+    match serve_map()?.get(&port) {
+        Some(existing) if existing == expected => {
+            let out = ts(&["serve", &format!("--https={port}"), "off"])?;
+            if !out.status.success() {
+                return Err(Error::rejected(format!(
+                    "tailscale serve --https={port} off failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+// ---------- `ui tailscale …` ----------
+
+fn tailscale_cli(state_dir: &Path, action: &TailscaleAction) -> Result<i32> {
+    match action {
+        TailscaleAction::Start { port, read_only } => ts_start(state_dir, *port, *read_only),
+        TailscaleAction::Stop => ts_stop(state_dir),
+        TailscaleAction::Status => ts_status(state_dir),
+    }
+}
+
+/// `ui tailscale start` — the whole flow: resolve the tailnet
+/// identity, ensure the mapping, persist, (re)start the board so the
+/// new Host/Origin allowlists are live, print the URL.
+fn ts_start(state_dir: &Path, https_port: u16, read_only: bool) -> Result<i32> {
+    let me = ts_self()?;
+    let mut opts = load_opts(state_dir);
+    let ui_port = opts.port.unwrap_or(3010);
+    let target = format!("http://127.0.0.1:{ui_port}");
+    let created = ensure_mapping(https_port, &target)?;
+    opts.tailscale = Some(TailscaleOpts {
+        dns_name: me.dns_name,
+        https_port,
+        target,
+    });
+    if read_only {
+        opts.read_only = true;
+    }
+    save_opts(state_dir, &opts)?;
+    // Validate before touching a running board — a persisted
+    // non-loopback host must not kill it for a sharing mode that can
+    // never come up.
+    let _ = serve_opts(&opts)?;
+    let was_running = read_pid(state_dir).is_some();
+    if was_running {
+        eprintln!("restarting the board so the tailnet allowlists take effect — brief outage");
+        kill_detached(state_dir);
+    }
+    let code = start_inner(state_dir, &UiFlags::default(), false, true)?;
+    let ts = opts.tailscale.as_ref().expect("set above");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "state": "sharing",
+            "tailnet_url": ts.url(),
+            "mapping": format!("https:{} → {}", ts.https_port, ts.target),
+            "mapping_created": created,
+            "board": if was_running { "restarted" } else { "started" },
+            "read_only": opts.read_only,
+        }))
+        .unwrap_or_default()
+    );
+    Ok(code)
+}
+
+/// `ui tailscale stop` — remove only cadence's mapping, drop the
+/// tailnet options, restart the board local-only when it runs.
+fn ts_stop(state_dir: &Path) -> Result<i32> {
+    let mut opts = load_opts(state_dir);
+    let Some(ts) = opts.tailscale.take() else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"state": "not_sharing"})).unwrap_or_default()
+        );
+        return Ok(0);
+    };
+    let removed = match remove_mapping(ts.https_port, &ts.target) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("warning: {e}");
+            false
+        }
+    };
+    opts.tailscale = None;
+    save_opts(state_dir, &opts)?;
+    let was_running = read_pid(state_dir).is_some();
+    if was_running {
+        eprintln!("restarting the board local-only — brief outage");
+        kill_detached(state_dir);
+        start_inner(state_dir, &UiFlags::default(), false, true)?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "state": "stopped_sharing",
+            "mapping_removed": removed,
+            "board": if was_running { "restarted" } else { "not_running" },
+        }))
+        .unwrap_or_default()
+    );
+    Ok(0)
+}
+
+/// `ui tailscale status` — sharing state, the URL, the live mapping,
+/// the identity a test request resolves to, and the QR.
+fn ts_status(state_dir: &Path) -> Result<i32> {
+    let opts = load_opts(state_dir);
+    let Some(ts) = &opts.tailscale else {
+        println!("tailscale sharing: off");
+        return Ok(0);
+    };
+    let url = ts.url();
+    println!("tailscale sharing: on");
+    println!("url:      {url}");
+    match serve_map() {
+        Ok(map) => match map.get(&ts.https_port) {
+            Some(t) if t == &ts.target => {
+                println!("mapping:  https:{} → {}  (live)", ts.https_port, t)
+            }
+            Some(t) => println!(
+                "mapping:  https:{} → {}  (NOT ours — left alone)",
+                ts.https_port, t
+            ),
+            None => println!("mapping:  https:{} absent", ts.https_port),
+        },
+        Err(e) => println!("mapping:  unknown — {e}"),
+    }
+    println!(
+        "mode:     {}",
+        if opts.read_only {
+            "read-only"
+        } else {
+            "writable"
+        }
+    );
+    // The identity probe: a request shaped like the proxy's — loopback
+    // peer, tailnet Host, a login header — must resolve to
+    // `<login> (tailscale)`.
+    if read_pid(state_dir).is_some() {
+        let ui_port = opts.port.unwrap_or(3010);
+        let login = std::env::var("USER").unwrap_or_else(|_| "operator".to_string());
+        let host_hdr = format!("{}:{}", ts.dns_name, ts.https_port);
+        let login_hdr = format!("Tailscale-User-Login: {login}");
+        match http_get(
+            "127.0.0.1",
+            ui_port,
+            "/api/meta",
+            &host_hdr,
+            &[login_hdr.as_str()],
+        ) {
+            Ok((200, body)) => {
+                let actor = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v["actor"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                println!("identity: {actor}  (test request)");
+            }
+            Ok((code, _)) => println!("identity: probe answered http {code}"),
+            Err(e) => println!("identity: probe failed — {e}"),
+        }
+    } else {
+        println!("identity: board not running — probe skipped");
+    }
+    match qr_term(&url) {
+        Some(qr) => print!("{qr}"),
+        None => println!("(qr encode failed — the URL above still works)"),
+    }
+    Ok(0)
+}
+
+/// Terminal QR: the `qrcode` crate (pure Rust, no other deps) plus a
+/// two-rows-per-cell `▀` renderer using ANSI truecolor — dark modules
+/// always black on white with a two-module quiet zone, scannable from
+/// dark and light terminal themes alike.
+fn qr_term(text: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    let w = code.width();
+    let modules = code.to_colors();
+    const QUIET: usize = 2;
+    let light = |x: usize, y: usize| -> bool {
+        if x < QUIET || y < QUIET || x >= QUIET + w || y >= QUIET + w {
+            return true;
+        }
+        matches!(modules[(y - QUIET) * w + (x - QUIET)], qrcode::Color::Light)
+    };
+    let mut out = String::new();
+    let mut y = 0;
+    while y < QUIET * 2 + w {
+        let mut line = String::new();
+        let (mut fg, mut bg) = (true, true);
+        line.push_str("\x1b[38;2;255;255;255m\x1b[48;2;255;255;255m");
+        for x in 0..QUIET * 2 + w {
+            let (t, b) = (light(x, y), light(x, y + 1));
+            if (t, b) != (fg, bg) {
+                let (fv, bv) = (if t { 255 } else { 0 }, if b { 255 } else { 0 });
+                line.push_str(&format!(
+                    "\x1b[38;2;{fv};{fv};{fv}m\x1b[48;2;{bv};{bv};{bv}m"
+                ));
+                fg = t;
+                bg = b;
+            }
+            line.push('▀');
+        }
+        line.push_str("\x1b[0m");
+        out.push_str(&line);
+        out.push('\n');
+        y += 2;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
