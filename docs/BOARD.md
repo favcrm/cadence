@@ -362,6 +362,83 @@ issue's status is not touched: status follows the job or the PM.
 list in the output and a `Forced: true` trailer on the commit.
 `--keep-branch` removes only the worktree.
 
+## Project memory — `cadence memory`
+
+One reviewed fact per file at `<pm>/<project>/memory/<slug>.md`:
+YAML frontmatter (`id`, `type`, `status`, `confidence`, `scope`,
+`author`, `source`, `created`, `verified_at`, optional `supersedes`)
+plus a body contract — a fact, then `**Why:**` and `**How to apply:**`
+sections. Types are `rule | gotcha | decision | recipe`; statuses are
+`proposed | accepted | rejected | superseded`.
+
+```bash
+cadence memory propose --project demo --type gotcha \
+    --scope-path 'src/adapter/**' -m "$(cat <<'EOF'
+Retrying a wedged adapter needs daemon restart first.
+
+**Why:** the adapter holds the socket.
+
+**How to apply:** `cadence daemon stop` before the retry.
+EOF
+)"
+cadence memory accept pipe-drain [--project demo]   # curator only
+cadence memory reject <slug>    cadence memory supersede <old> <new>
+cadence memory verify <slug>    # re-stamp verified_at — curator only
+cadence memory ls [--project k] [--status s] [--type t] [--component c]
+                  [--path f] [--stale [--days 30]] [--json]
+cadence memory show <slug> [--json]
+cadence memory match --issue <ID> [--provider p] [--json]
+cadence memory lint [--project k]
+```
+
+Proposals may come from anyone (the author's `CADENCE_ALIAS` is
+stamped); accept/reject/supersede/verify are curator actions — a
+cadence worker pane is refused unless the daemon proves it is the PM
+or the group root; a missing daemon fails closed. `verify` is gated
+because `verified_at` is the curator's re-check attestation and feeds
+ranking + staleness. Every write is one tracker commit carrying
+`Memory: <slug>` and `Actor:` trailers — never `Issue:`. `issue lint`
+validates memory files with everything else (the pre-commit hook
+covers them); `memory lint` runs the same checks alone. Lint bounds a
+fact block to 5 lines and 512 bytes and a path glob to 200 chars and
+two `**` segments; a file that cannot be parsed at all is a warning —
+every read path already reports it, and an error there would let one
+stray file brick every tracker commit.
+
+Matching is a union: a memory applies when ANY scope axis intersects
+the dispatch context — `--scope-project` (every dispatch in the
+project), `--scope-component`, `--scope-path` (repo-relative globs
+matched against the issue's recorded-commit paths), `--scope-tag`
+(issue `tags:`), `--scope-provider` (the target worker's provider).
+`match --issue` prints the ranked list: `rule` > `gotcha` > `recipe` >
+`decision`, then confidence, then newest `verified_at`.
+
+Injection happens in two places:
+
+- `dispatch` renders the matched accepted set to
+  `<state>/dispatch/<message-id>-lessons.md` (≤ 12 entries, ≤ 4 KiB),
+  appends `Lessons: <file>.` to the kickoff body, records the slugs in
+  the dispatch comment (`Lessons injected: …`) and returns `lessons`
+  and `lessons_file` in the JSON. `--no-lessons` skips it; `--job`
+  kickoffs are daemon-templated and never carry the file. Memory
+  failures degrade, never sink the dispatch (the worktree already
+  exists): a file that fails matching, an unwritable lessons file, or
+  a suffix that would push the kickoff body over the pty cap all yield
+  no lessons and a `lessons_error` string naming the reason.
+- `agent bootstrap`/`join` briefings gain a
+  `## Project memory — accepted rules (<project>)` section listing the
+  project's accepted `rule`s for the worker's cwd — ≤ 8 entries and
+  ≤ 4 KiB, same bound as the dispatch lessons file.
+
+Memory readers skip files that fail to load and report them: `ls`,
+`ls --stale` and `match` warn once on stderr and include `load_errors`
+in `--json`; the API returns `memory_errors`.
+
+Staleness: `ls --stale` flags an accepted memory not verified within
+the `--days` window (30 default), or whose path globs match files
+changed in a project repo after `verified_at` — informational only;
+`verify` is the refresh.
+
 ## `cadence ui` — the reader
 
 ```bash
@@ -463,6 +540,8 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/issues/:id/artifacts/:name` | one artifact file — inline for a small safe list (`text/plain` for md/txt/logs/code, images), **`Content-Disposition: attachment` for everything else, always for html/svg/xml/js/pdf**. Every artifact response carries `Content-Security-Policy: sandbox; default-src 'none'` and `Cache-Control: no-store`; names must satisfy the write grammar (no `/`, no leading dot); symlinks → `404` |
 | `GET /api/agents` | worker agent rows enriched with the exact task/issue binding (`agent.tasks` × `jobs.issue_id`) + running/queued/fenced/parked totals and `by_issue` for card strips; `endpoint_kind: inbox` mailboxes are counted separately under `inboxes`; `daemon:"unreachable"` when the socket is down |
 | `GET /api/agents/:alias` | the agent drawer: `agent_show` + last 20 events + `tasks`/`on` bindings + `recovery`/`resume` commands; `404` on unknown alias, `400` on alias grammar |
+| `GET /api/memories?project=&status=&type=&component=&path=` | memory cards across projects — same filters as `memory ls`; `memory_errors` lists files that failed to load |
+| `GET /api/memories/:project/:slug` | one memory: frontmatter + body; `404` on unknown slug, `400` on grammar |
 | `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents` on daemon state change; `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
 
 ### API — writes
@@ -481,6 +560,8 @@ actor: `CAD-16: set status=review (operator (ui))`.
 | `POST /api/issues/:id/refs` | `{kind, url\|path, label?, if_rev?}` — exactly one of url/path | `200` |
 | `POST /api/issues/:id/comments` | `{body, if_rev?}` — author `operator`, kind `ui`, markdown stored verbatim | `200` |
 | `POST /api/issues/:id/artifacts?name=<base>` | raw bytes, create-only | `200` |
+| `POST /api/memories/:project/:slug/accept` | `{body?}` — curator-gated like `memory accept`; `body` replaces the markdown as the curator's edit | `200` |
+| `POST /api/memories/:project/:slug/reject` | `{}` — curator-gated like `memory reject` | `200` |
 
 Success bodies are `{issue, card, warnings}` — the fresh payloads, so
 the UI needs no second fetch. `warnings` notes a `ready`/`doing`/`review`
@@ -567,7 +648,10 @@ and the 30 s/focus poll stays as the fallback. The Agents screen ranks
 fenced agents first, shows the daemon's recovery text verbatim, and
 opens a drawer with identity, params, capabilities, tasks, bound
 issues, running messages, and the event tail. A fence banner on the
-board links straight to it.
+board links straight to it. The Memory tab lists every project's
+memories with status/type/component/path filters, opens a detail
+panel, and accepts or rejects proposed entries through the same
+guarded write path.
 
 A filter bar above the columns slices the board by tag, epic, owner and
 component — chips with counts, multi-select: tags narrow (all of them),

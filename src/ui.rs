@@ -1071,6 +1071,87 @@ fn write_route(
     opts: &ServeOpts,
     send: &dyn Fn(Request, HttpResp),
 ) {
+    // Memory curation: POST /api/memories/<project>/<slug>/accept|reject
+    // — same guarded write path as the CLI; the commit actor is the
+    // request-attributed one (`request_actor`), as on /api/issues.
+    if let Some(tail) = path.strip_prefix("/api/memories/") {
+        let mut segs = tail.splitn(3, '/');
+        let (key, slug, verb) = (
+            segs.next().unwrap_or_default(),
+            segs.next().unwrap_or_default(),
+            segs.next(),
+        );
+        let shape_ok = matches!(verb, Some("accept" | "reject"))
+            && *method == Method::Post
+            && !key.is_empty()
+            && crate::memory::valid_slug(slug);
+        if !shape_ok {
+            send(request, err_response(404, "no such write route"));
+            return;
+        }
+        if opts.read_only {
+            send(
+                request,
+                guard_fail("read_only", "board is read-only — writes are disabled"),
+            );
+            return;
+        }
+        if let Err(resp) = write_guard(&request, "application/json", opts) {
+            send(request, resp);
+            return;
+        }
+        let actor = request_actor(&request, opts);
+        let pm = match Pm::at(pm_dir) {
+            Ok(pm) => pm,
+            Err(e) => {
+                send(request, err_response(503, &e.to_string()));
+                return;
+            }
+        };
+        let bytes = match read_body(&mut request, JSON_CAP) {
+            Ok(b) => b,
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        };
+        let req: Value = if bytes.is_empty() {
+            json!({})
+        } else {
+            match parse_json(&bytes) {
+                Ok(r) => r,
+                Err(resp) => {
+                    send(request, resp);
+                    return;
+                }
+            }
+        };
+        let out = if verb == Some("accept") {
+            crate::memory::accept(
+                &pm,
+                Some(key),
+                slug,
+                req["body"].as_str(),
+                &actor,
+                state_dir,
+            )
+        } else {
+            crate::memory::reject(&pm, Some(key), slug, &actor, state_dir)
+        };
+        match out {
+            Ok(v) => {
+                let detail = crate::memory::find(&pm, Some(key), slug)
+                    .map(|(_, m)| crate::memory::detail_json(&m))
+                    .unwrap_or(Value::Null);
+                send(
+                    request,
+                    json_response(json!({"ok": true, "write": v, "memory": detail})),
+                );
+            }
+            Err(e) => send(request, write_err(&e)),
+        }
+        return;
+    }
     let Some(rest) = path.strip_prefix("/api/issues") else {
         send(request, err_response(404, "no such write route"));
         return;
@@ -1734,6 +1815,34 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
         "/api/agents" => send(request, json_response(agents_payload(state_dir))),
+        "/api/memories" => match Pm::at(pm_dir) {
+            Ok(pm) => {
+                let project = query("project");
+                let status = query("status");
+                let kind = query("type");
+                let (mems, errors) = crate::memory::load_all_report(&pm.dir);
+                let payload: Vec<Value> = mems
+                    .iter()
+                    .filter(|m| {
+                        project.as_deref().map(|p| m.project == p).unwrap_or(true)
+                            && status
+                                .as_deref()
+                                .map(|s| m.front.status == s)
+                                .unwrap_or(true)
+                            && kind.as_deref().map(|k| m.front.kind == k).unwrap_or(true)
+                    })
+                    .map(crate::memory::card_json)
+                    .collect();
+                send(
+                    request,
+                    json_response(json!({
+                        "memories": payload,
+                        "memory_errors": errors,
+                    })),
+                );
+            }
+            Err(e) => send(request, err_response(503, &e.to_string())),
+        },
         "/api/stream" => {
             if head_only {
                 send(request, err_response(405, "stream is GET only"));
@@ -1742,6 +1851,23 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
             }
         }
         _ => {
+            // `/api/memories/<project>/<slug>` — memory detail.
+            if let Some(tail) = path.strip_prefix("/api/memories/") {
+                let mut segs = tail.splitn(2, '/');
+                let (key, slug) = (
+                    segs.next().unwrap_or_default(),
+                    segs.next().unwrap_or_default(),
+                );
+                if !crate::memory::valid_slug(slug) || key.is_empty() || slug.contains('/') {
+                    send(request, err_response(400, "bad memory path"));
+                    return;
+                }
+                match Pm::at(pm_dir).and_then(|pm| crate::memory::find(&pm, Some(key), slug)) {
+                    Ok((_, m)) => send(request, json_response(crate::memory::detail_json(&m))),
+                    Err(e) => send(request, err_response(404, &e.to_string())),
+                }
+                return;
+            }
             // `/api/agents/<alias>` — the drawer detail endpoint.
             if let Some(alias) = path.strip_prefix("/api/agents/") {
                 if alias.is_empty()

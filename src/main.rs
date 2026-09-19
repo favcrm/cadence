@@ -374,6 +374,10 @@ enum Commands {
         /// Job spec file for --job — hashed at creation.
         #[arg(long)]
         spec: Option<PathBuf>,
+        /// Do not inject matched project-memory lessons into the
+        /// kickoff.
+        #[arg(long)]
+        no_lessons: bool,
     },
     /// Join a new worker agent to a group. `<group>` is the PM agent —
     /// its alias or provider-native id — and `<provider>` is devin,
@@ -565,6 +569,12 @@ enum Commands {
     Issue {
         #[command(subcommand)]
         action: cadence_agent::issue::cli::IssueAction,
+    },
+    /// Shared project memory: reviewed, scoped facts injected into
+    /// dispatches and briefings. This CLI is the only writer.
+    Memory {
+        #[command(subcommand)]
+        action: cadence_agent::memory::cli::MemoryAction,
     },
     /// The read-only board UI + JSON API on loopback.
     Ui {
@@ -3119,6 +3129,7 @@ fn run() -> Result<i32> {
             summary,
             job,
             spec,
+            no_lessons,
         } => {
             let pm = cadence_agent::issue::Pm::open_default()?;
             let args = cadence_agent::issue::dispatch::DispatchArgs {
@@ -3130,6 +3141,7 @@ fn run() -> Result<i32> {
                 reply_to: reply_to.clone(),
                 summary: summary.clone(),
                 job_spec: job.then(|| spec.clone().unwrap_or_default()),
+                no_lessons,
             };
             print_json(&cadence_agent::issue::dispatch::run(
                 &pm,
@@ -3141,6 +3153,7 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
+        Commands::Memory { action } => cadence_agent::memory::cli::run(&action, &state_dir),
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
         Commands::Status { group, json, watch } => {
             run_status(&state_dir, group.as_deref(), json, watch)
@@ -4528,6 +4541,46 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
     } else {
         String::new()
     };
+    // Accepted project-wide memory rules for the project the agent's
+    // cwd belongs to — PM-curated facts every worker should carry.
+    // Absent pm dir / unresolvable project / no rules → no section.
+    let memory = (|| -> Option<String> {
+        let cwd = agent["cwd"].as_str()?;
+        let pm = cadence_agent::issue::Pm::open_default().ok()?;
+        let proj = cadence_agent::issue::project::resolve(&pm.dir, None, Path::new(cwd)).ok()?;
+        let (rules, errors) = cadence_agent::memory::project_rules(&pm, &proj.key);
+        if let Some(line) = cadence_agent::memory::load_errors_line(&errors) {
+            eprintln!("{line}");
+        }
+        if rules.is_empty() {
+            return None;
+        }
+        // ≤8 entries AND ≤LESSON_MAX_BYTES total — same bound the
+        // dispatch lessons file carries.
+        let mut items = String::new();
+        for m in rules.iter().take(8) {
+            let line = format!(
+                "- `{}`: {} — {}",
+                m.front.id,
+                cadence_agent::memory::fact_line(&m.body),
+                cadence_agent::memory::apply_line(&m.body)
+            );
+            if items.len() + line.len() + 1 > cadence_agent::memory::LESSON_MAX_BYTES {
+                break;
+            }
+            if !items.is_empty() {
+                items.push('\n');
+            }
+            items.push_str(&line);
+        }
+        Some(format!(
+            "## Project memory — accepted rules ({proj_key})\n\n{items}\n\n\
+             `cadence memory match --issue <ID>` lists everything scoped to\n\
+             a task; `cadence memory propose` records a new lesson.\n\n",
+            proj_key = proj.key
+        ))
+    })()
+    .unwrap_or_default();
     format!(
         "# Cadence briefing — {alias} in group {root}\n\n\
          You are `{alias}`, a cadence-managed agent (provider `{provider}`,\n\
@@ -4542,6 +4595,7 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
          - `cadence message send <peer> --ready --text '<note>'` — reach a\n\
          \x20 peer directly (the `--ready` flag is the pty ready claim).\n\n\
          ## Group at write time\n\n{roster}\n\n\
+         {memory}\
          This file is a snapshot — `cadence self` and `cadence agent list`\n\
          are the live truth.\n\n\
          Messages must be single-line, no control characters.{pty_note} A routed\n\

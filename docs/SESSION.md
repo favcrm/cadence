@@ -241,6 +241,15 @@ In this order:
 5. Queue the worker's next message **after** the restart. A message
    queued before it starts a new turn the moment the pane idles and
    closes the restart window.
+6. Bank the lesson: a worker that learned something durable ends its
+   task with `cadence memory propose --project <key> --type
+   rule|gotcha|decision|recipe --scope-… -m "<fact> … **Why:** …
+   **How to apply:** …"` — a proposal, not a write to shared truth.
+   The PM (or the Memory tab) curates: `memory accept|reject|supersede`,
+   `memory verify` re-stamps `verified_at`, `memory ls --stale` finds
+   what drifted. Accepted memories ride the next `dispatch` kickoff as
+   a `Lessons:` file and project `rule`s appear in every briefing —
+   that is the loop closing.
 
 ## 8. When something goes wrong
 
