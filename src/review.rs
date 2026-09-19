@@ -1030,7 +1030,8 @@ pub fn run(opts: &Options) -> Result<i32> {
     report["suite_lock"] = suite_lock;
     report["full_suite"] = match &suite_step {
         Some(s) => s.to_json(),
-        None => json!({"outcome": "skipped", "reason": "--no-full"}),
+        None => json!({"outcome": "skipped", "reason": "--no-full",
+            "cmd": cfg.full_suite}),
     };
 
     // Equal-conditions compare: every failing test name, rerun alone
