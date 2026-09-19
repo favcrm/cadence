@@ -792,8 +792,16 @@ fences, cancels, or replays anything it observes.
   collapses, control characters drop, spinner/bullet glyphs and
   elapsed-time counters (`· 2m 15s`, `83%`, `12:34`) are ignored, so a
   ticking status line never reads as activity while real transcript
-  motion does. An open brokered approval request counts as activity
-  for the whole wait.
+  motion does. Screen activity is debounced: a new screen hash counts
+  as activity only when confirmed — either the next sample shows the
+  same new hash, or the screen has differed from both of the last two
+  settled hashes for two consecutive samples (so a scrolling pane,
+  whose every sample differs, still confirms). A hash seen once and
+  reverted — a capture taken mid-repaint — neither resumes a stalled
+  turn nor resets the silence clock. Confirmation costs one extra
+  sample interval of latency before `turn_resumed`; the capture bound
+  is unchanged (≤ one per interval per agent). An open brokered
+  approval request counts as activity for the whole wait.
 - **`turn_stalled`.** When silence crosses the resolved budget the
   watch emits the event once per episode — payload `{message,
   silent_secs, last_activity, task?}` — and sends one notice: a
