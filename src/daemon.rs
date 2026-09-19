@@ -137,8 +137,29 @@ struct StallWatch {
     /// The last-activity instant recorded when `turn_stalled` fired —
     /// a resume needs activity strictly newer than this.
     stalled_at: Option<Instant>,
-    /// PTY screen sample `(when, hash)` — captures are rate-limited.
-    sample: Option<(Instant, String)>,
+    /// When the last screen sample landed — the capture throttle.
+    sample_at: Option<Instant>,
+    /// The settled screen hash. Screen activity is debounced — a new
+    /// hash counts as activity only once confirmed: the next sample
+    /// shows the same new hash, or the screen has differed from both
+    /// of the last two settled hashes for two consecutive samples
+    /// (a scrolling pane churns through distinct hashes and still
+    /// confirms). A hash seen once and reverted — a capture taken
+    /// mid-repaint — can neither resume a stalled turn nor reset the
+    /// silence clock. Confirmation costs one extra sample interval
+    /// before `turn_resumed`; captures stay capped at one per
+    /// interval.
+    settled: Option<String>,
+    /// The settled value before `settled` — history for the novelty
+    /// check: a hash equal to a recent settled value must confirm by
+    /// repetition, not by merely differing again.
+    previous: Option<String>,
+    /// A hash differing from `settled` seen once, awaiting a second
+    /// consecutive sighting to confirm by repetition.
+    candidate: Option<String>,
+    /// Consecutive samples that differed from `settled` — `>= 2` with
+    /// a novel hash confirms by persistence.
+    changed: u8,
     /// A capture in flight on its own thread — at most one per agent,
     /// so a wedged pane leaks one thread and never stalls the ticker.
     sample_rx: Option<std::sync::mpsc::Receiver<String>>,
@@ -153,7 +174,11 @@ impl Default for StallWatch {
             message: None,
             activity: Instant::now(),
             stalled_at: None,
-            sample: None,
+            sample_at: None,
+            settled: None,
+            previous: None,
+            candidate: None,
+            changed: 0,
             sample_rx: None,
             episodes: 0,
         }
@@ -2403,7 +2428,11 @@ impl Shared {
                 let mut w = ctl.stall.lock().unwrap();
                 w.message = None;
                 w.stalled_at = None;
-                w.sample = None;
+                w.sample_at = None;
+                w.settled = None;
+                w.previous = None;
+                w.candidate = None;
+                w.changed = 0;
                 return;
             }
             Err(_) => return,
@@ -2460,15 +2489,36 @@ impl Shared {
                 _ => {}
             }
             if let Some(hash) = landed {
-                if w.sample.as_ref().is_some_and(|(_, h)| *h != hash) {
-                    w.activity = Instant::now();
+                if w.settled.as_deref() == Some(hash.as_str()) {
+                    // Still the settled screen — a candidate reverted
+                    // without ever confirming; drop it.
+                    w.candidate = None;
+                    w.changed = 0;
+                } else {
+                    w.changed = w.changed.saturating_add(1);
+                    let confirmed = w.candidate.as_deref() == Some(hash.as_str())
+                        || (w.changed >= 2 && w.previous.as_deref() != Some(hash.as_str()));
+                    if confirmed {
+                        // Second consecutive sighting, or a novel hash
+                        // after the screen stayed changed for two
+                        // samples — the change is real. A first-ever
+                        // settle only forms the baseline.
+                        if w.settled.is_some() {
+                            w.activity = Instant::now();
+                        }
+                        w.previous = w.settled.take();
+                        w.settled = Some(hash);
+                        w.candidate = None;
+                        w.changed = 0;
+                    } else {
+                        // First sighting of a different screen — hold
+                        // as a candidate; a lone sample proves nothing.
+                        w.candidate = Some(hash);
+                    }
                 }
-                w.sample = Some((Instant::now(), hash));
+                w.sample_at = Some(Instant::now());
             }
-            if w.sample_rx.is_none()
-                && w.sample
-                    .as_ref()
-                    .is_none_or(|(at, _)| at.elapsed() >= screen_sample())
+            if w.sample_rx.is_none() && w.sample_at.is_none_or(|at| at.elapsed() >= screen_sample())
             {
                 if let Some(ad) = ad {
                     let (tx, rx) = std::sync::mpsc::channel();

@@ -2491,6 +2491,17 @@ def sess_pid(name):
 def die(msg, code=1):
     sys.stderr.write(msg + "\n"); sys.exit(code)
 
+def awrite(path, text):
+    # Atomic write — a capture-pane reader sees whole content or none.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f: f.write(text)
+    os.rename(tmp, path)
+
+def aappend(path, text):
+    try: cur = open(path).read()
+    except OSError: cur = ""
+    awrite(path, cur + text)
+
 cmd, rest = args[0], args[1:]
 # Every invocation lands in calls.log — tests that must count a probe
 # (e.g. `cadence status` probing exactly once per pty agent) read it.
@@ -2596,14 +2607,14 @@ if cmd == "paste-buffer":
     # A `.swallow` file models a busy TUI dropping the bracketed paste:
     # the write path "works" but the text never reaches the screen.
     if not os.path.exists(sess_path(name, "swallow")):
-        with open(sess_path(name, "input"), "a") as f:
-            f.write(open(os.path.join(state, "buffer")).read())
+        aappend(sess_path(name, "input"),
+                open(os.path.join(state, "buffer")).read())
     sys.exit(0)
 if cmd == "send-keys":
     name = rest[rest.index("-t") + 1]
     key = rest[-1]
-    with open(sess_path(name, "input"), "a") as f:
-        f.write("<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
+    aappend(sess_path(name, "input"),
+            "<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
     sys.exit(0)
 if cmd == "set-option":
     # Record option writes so tests can assert pane defaults.
@@ -2650,11 +2661,20 @@ open(_env_tmp, "w").write(
         os.environ.get("CADENCE_ALIAS", ""),
         os.environ.get("CADENCE_STATE_DIR", "")))
 os.rename(_env_tmp, os.environ["FAKE_PANE"] + ".env")
-with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
-    f.write("Mock Devin TUI [%s]\n" % sid)
-    # An idle input line — the same shape the real TUI shows so the
-    # screen probe recognizes an empty prompt.
-    f.write("❭ Ask Devin to build features, fix bugs, or work on your code\n")
+def awrite(path, text):
+    # Atomic write — a capture-pane reader sees whole content or none.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f: f.write(text)
+    os.rename(tmp, path)
+def aappend(path, text):
+    try: cur = open(path).read()
+    except OSError: cur = ""
+    awrite(path, cur + text)
+aappend(os.environ["FAKE_PANE"] + ".screen",
+        "Mock Devin TUI [%s]\n" % sid +
+        # An idle input line — the same shape the real TUI shows so the
+        # screen probe recognizes an empty prompt.
+        "❭ Ask Devin to build features, fix bugs, or work on your code\n")
 while True:
     inp = os.environ["FAKE_PANE"] + ".input"
     try:
@@ -2666,16 +2686,15 @@ while True:
         if os.path.exists(os.environ["FAKE_PANE"] + ".hold-enter"):
             # Enter swallowed: the marker is consumed but the draft
             # stays staged in the input line, unsubmitted.
-            open(inp, "w").write(text + rest)
+            awrite(inp, text + rest)
         else:
-            open(inp, "w").write(rest)
+            awrite(inp, rest)
             if text.strip():
-                with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
-                    f.write("> %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()))
+                aappend(os.environ["FAKE_PANE"] + ".screen",
+                        "> %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()))
     if "<KEY:C-c>" in data:
-        open(inp, "w").write("")
-        with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
-            f.write("^C interrupt\n")
+        awrite(inp, "")
+        aappend(os.environ["FAKE_PANE"] + ".screen", "^C interrupt\n")
     time.sleep(0.05)
 "#;
 
@@ -2773,6 +2792,18 @@ impl TestDaemon {
     }
 }
 
+/// Temp-file + rename write: a concurrent `capture-pane` (or mock TUI
+/// loop) sees whole content or none — no torn mid-write reads, so the
+/// stall sampler only ever hashes a real screen.
+fn atomic_write(path: PathBuf, contents: impl AsRef<[u8]>) {
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&tmp, contents).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+}
+
 /// Panes legitimately outlive a daemon (shutdown detaches), so clean
 /// any survivors ourselves by their recorded pane pids.
 fn kill_mock_panes(dir: &Path) {
@@ -2826,10 +2857,19 @@ open(os.environ["FAKE_PANE"] + ".sid", "w").write(sid)
 # The pane's own input-line glyph — the mock tmux renders staged text
 # with it, so a staged draft reads as this TUI's prompt line.
 open(os.environ["FAKE_PANE"] + ".glyph", "w").write("»")
-with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
-    f.write("Mock Stub TUI [%s]\n" % sid)
-    # The stub profile's empty-prompt signature.
-    f.write("» stub ready\n")
+def awrite(path, text):
+    # Atomic write — a capture-pane reader sees whole content or none.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f: f.write(text)
+    os.rename(tmp, path)
+def aappend(path, text):
+    try: cur = open(path).read()
+    except OSError: cur = ""
+    awrite(path, cur + text)
+aappend(os.environ["FAKE_PANE"] + ".screen",
+        "Mock Stub TUI [%s]\n" % sid +
+        # The stub profile's empty-prompt signature.
+        "» stub ready\n")
 while True:
     inp = os.environ["FAKE_PANE"] + ".input"
     try:
@@ -2838,10 +2878,10 @@ while True:
         data = ""
     if "<ENTER>" in data:
         text, rest = data.split("<ENTER>", 1)
-        open(inp, "w").write(rest)
+        awrite(inp, rest)
         if text.strip():
-            with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
-                f.write("> %s\nSTUB_REPLY: %s\n" % (text.strip(), text.strip()))
+            aappend(os.environ["FAKE_PANE"] + ".screen",
+                    "> %s\nSTUB_REPLY: %s\n" % (text.strip(), text.strip()))
     time.sleep(0.05)
 "#;
 
@@ -2935,10 +2975,19 @@ os.rename(_env_tmp, os.environ["FAKE_PANE"] + ".env")
 # The pane's own input-line glyph + a boxed empty prompt — the shape
 # the real TUI shows so the screen probe recognizes idle.
 open(os.environ["FAKE_PANE"] + ".glyph", "w").write("❯")
-with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
-    f.write("Mock Claude TUI [%s]\n" % sid)
-    f.write("  [Opus] mock-mode on\n")
-    f.write("─" * 40 + "\n❯ \n" + "─" * 40 + "\n")
+def awrite(path, text):
+    # Atomic write — a capture-pane reader sees whole content or none.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f: f.write(text)
+    os.rename(tmp, path)
+def aappend(path, text):
+    try: cur = open(path).read()
+    except OSError: cur = ""
+    awrite(path, cur + text)
+aappend(os.environ["FAKE_PANE"] + ".screen",
+        "Mock Claude TUI [%s]\n" % sid +
+        "  [Opus] mock-mode on\n" +
+        "─" * 40 + "\n❯ \n" + "─" * 40 + "\n")
 while True:
     inp = os.environ["FAKE_PANE"] + ".input"
     try:
@@ -2947,17 +2996,16 @@ while True:
         data = ""
     if "<ENTER>" in data:
         text, rest = data.split("<ENTER>", 1)
-        open(inp, "w").write(rest)
+        awrite(inp, rest)
         if text.strip():
-            with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
-                f.write("> %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()))
-                # The submitted line echoes into the transcript and the
-                # box re-renders empty below it.
-                f.write("─" * 40 + "\n❯ \n" + "─" * 40 + "\n")
+            # The submitted line echoes into the transcript and the
+            # box re-renders empty below it.
+            aappend(os.environ["FAKE_PANE"] + ".screen",
+                    "> %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()) +
+                    "─" * 40 + "\n❯ \n" + "─" * 40 + "\n")
     if "<KEY:C-c>" in data:
-        open(inp, "w").write("")
-        with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
-            f.write("^C interrupt\n")
+        awrite(inp, "")
+        aappend(os.environ["FAKE_PANE"] + ".screen", "^C interrupt\n")
     time.sleep(0.05)
 "#;
 
@@ -3544,7 +3592,7 @@ fn pty_respond_rejected_and_mode_blocks_send() {
         .is_err());
     // pane_in_mode != 0 (copy mode etc.) keeps the message queued even
     // with a fresh claim.
-    std::fs::write(d.pane_file(&mock, "dv1", "mode"), "1").unwrap();
+    atomic_write(d.pane_file(&mock, "dv1", "mode"), "1");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
     d.rpc(
         "agent_send",
@@ -5402,11 +5450,10 @@ fn pty_auto_ready_waits_on_busy_pane_then_delivers() {
     // The TUI shows a working state — the probe must refuse the paste.
     // The busy tail is the real shape: status row directly above the
     // box, busy watermark in the input line.
-    std::fs::write(
+    atomic_write(
         d.pane_file(&mock, "dv", "tui-state"),
         "⠸ Thinking · 12s (esc twice to interrupt)\n❭ Guide Devin while it works\n",
-    )
-    .unwrap();
+    );
     d.rpc(
         "agent_send",
         json!({"alias": "dv", "text": "wait for idle", "message": "m1"}),
@@ -5447,12 +5494,11 @@ fn pty_probe_busy_markers_survive_trailing_blank_rows() {
     // leaves blank rows below the content. The probe must anchor the
     // status region at the last non-blank row or a busy pane reads
     // idle and the daemon pastes into it.
-    std::fs::write(
+    atomic_write(
         d.pane_file(&mock, "dv", "tui-state"),
         "⠸ Thinking · 12s (esc twice to interrupt)\n❭ Guide Devin while it works\n".to_string()
             + &"\n".repeat(30),
-    )
-    .unwrap();
+    );
     let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
     assert_eq!(probe["idle"], false, "{probe}");
     assert_eq!(probe["busy_marker"], true, "{probe}");
@@ -5517,7 +5563,7 @@ fn pty_unrendered_task_fences_unknown() {
     d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
     d.wait_agent("dv", "idle", 20);
     // The pane drops the paste entirely (TUI swallowed the input).
-    std::fs::write(d.pane_file(&mock, "dv", "swallow"), "1").unwrap();
+    atomic_write(d.pane_file(&mock, "dv", "swallow"), "1");
     d.rpc(
         "agent_send",
         json!({"alias": "dv", "text": "task that vanishes", "message": "m1"}),
@@ -5549,7 +5595,7 @@ fn pty_fence_detaches_pane_for_resume() {
         .parse()
         .unwrap();
     // The pane drops the paste entirely: unrendered → fence.
-    std::fs::write(d.pane_file(&mock, "dv1", "swallow"), "1").unwrap();
+    atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
     d.rpc(
         "agent_send",
@@ -5611,7 +5657,7 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
     }
     // Fence all three: each pane survives its fence for inspection.
     for alias in ["dv-stop", "dv-rm", "dv-gc"] {
-        std::fs::write(d.pane_file(&mock, alias, "swallow"), "1").unwrap();
+        atomic_write(d.pane_file(&mock, alias, "swallow"), "1");
         d.rpc("agent_ready", json!({"alias": alias})).unwrap();
         d.rpc(
             "agent_send",
@@ -5666,7 +5712,7 @@ fn pty_unfence_resume_reports_adopted_pane() {
         .parse()
         .unwrap();
     // Fence: the paste never renders; the pane is detached, not killed.
-    std::fs::write(d.pane_file(&mock, "dv1", "swallow"), "1").unwrap();
+    atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
     d.rpc(
         "agent_send",
@@ -5710,7 +5756,7 @@ fn pty_unfence_resume_reports_respawned_pane() {
         .trim()
         .parse()
         .unwrap();
-    std::fs::write(d.pane_file(&mock, "dv1", "swallow"), "1").unwrap();
+    atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
     d.rpc(
         "agent_send",
@@ -5776,7 +5822,7 @@ fn pty_unfence_resume_busy_adopted_pane_stays_gated() {
     d.register_stub("st", json!({"auto_ready": "verified"}));
     d.wait_agent("st", "idle", 20);
     // Fence; the pane survives detached.
-    std::fs::write(d.stub_pane_file(&mock, "st", "swallow"), "1").unwrap();
+    atomic_write(d.stub_pane_file(&mock, "st", "swallow"), "1");
     d.rpc("agent_ready", json!({"alias": "st"})).unwrap();
     d.rpc(
         "agent_send",
@@ -5785,7 +5831,7 @@ fn pty_unfence_resume_busy_adopted_pane_stays_gated() {
     .unwrap();
     d.wait_agent("st", "attention", 25);
     // The surviving pane is visibly busy — adoption still lands.
-    std::fs::write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n").unwrap();
+    atomic_write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n");
     let r = d
         .rpc(
             "agent_unfence",
@@ -5816,7 +5862,7 @@ fn pty_unfence_resume_busy_adopted_pane_stays_gated() {
     // the queued send delivers.
     std::fs::remove_file(d.stub_pane_file(&mock, "st", "tui-state")).unwrap();
     std::fs::remove_file(d.stub_pane_file(&mock, "st", "swallow")).unwrap();
-    std::fs::write(d.stub_pane_file(&mock, "st", "input"), "").unwrap();
+    atomic_write(d.stub_pane_file(&mock, "st", "input"), "");
     pty_token(&d, "st", "m2");
 }
 
@@ -5833,7 +5879,7 @@ fn agent_dead_and_resumable_per_endpoint_kind() {
     // the unknown still fences it — dead, not resumable.
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
-    std::fs::write(d.pane_file(&_mock, "dv1", "swallow"), "1").unwrap();
+    atomic_write(d.pane_file(&_mock, "dv1", "swallow"), "1");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
     d.rpc(
         "agent_send",
@@ -5896,7 +5942,7 @@ fn pty_ready_claim_refuses_busy_pane_unless_forced() {
     d.register_stub("st", json!({}));
     d.wait_agent("st", "idle", 20);
     // The stub's own busy marker on screen — the claim must refuse.
-    std::fs::write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n").unwrap();
+    atomic_write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n");
     let err = d.rpc("agent_ready", json!({"alias": "st"})).unwrap_err();
     assert!(err.to_string().contains("busy"), "{err}");
     // `--force` claims anyway; the busy verdict still rides the event.
@@ -5927,7 +5973,7 @@ fn pty_paste_not_rendered_carries_screen_evidence() {
     let mock = d.mock_stub();
     d.register_stub("st", json!({"auto_ready": "verified"}));
     d.wait_agent("st", "idle", 20);
-    std::fs::write(d.stub_pane_file(&mock, "st", "swallow"), "1").unwrap();
+    atomic_write(d.stub_pane_file(&mock, "st", "swallow"), "1");
     d.rpc(
         "agent_send",
         json!({"alias": "st", "text": "gone", "message": "m1"}),
@@ -5976,7 +6022,7 @@ fn pty_render_check_is_differential_not_contains() {
     d.wait_message("dv", "m1", &["running"], 20);
     // Now the pane drops the paste: the body is already on screen, so a
     // `contains` check would pass — the differential check must not.
-    std::fs::write(d.pane_file(&mock, "dv", "swallow"), "1").unwrap();
+    atomic_write(d.pane_file(&mock, "dv", "swallow"), "1");
     d.rpc(
         "agent_send",
         json!({"alias": "dv", "text": "identical notification body",
@@ -5996,7 +6042,7 @@ fn pty_rendered_but_not_submitted_is_not_running() {
     d.wait_agent("dv", "idle", 20);
     // The TUI renders the paste but swallows Enter — the body sits in
     // the input line as a staged draft. That is not a submission.
-    std::fs::write(d.pane_file(&mock, "dv", "hold-enter"), "1").unwrap();
+    atomic_write(d.pane_file(&mock, "dv", "hold-enter"), "1");
     d.rpc(
         "agent_send",
         json!({"alias": "dv", "text": "staged but unsent", "message": "m1"}),
@@ -6087,7 +6133,7 @@ fn pty_unrendered_worker_result_requeues_then_parks() {
     d.register("w1");
     d.wait_agent("w1", "idle", 10);
     // Pane swallows before the routed notification lands.
-    std::fs::write(d.pane_file(&mock, "pm", "swallow"), "1").unwrap();
+    atomic_write(d.pane_file(&mock, "pm", "swallow"), "1");
     d.rpc(
         "agent_send",
         json!({"alias": "w1", "text": "work", "message": "j1",
@@ -8285,7 +8331,7 @@ fn job_event_parks_on_unrendered_pty_pm() {
     d.wait_task("j1-t2", "review", 15);
 
     // The PM pane swallows before the verdict notification lands.
-    std::fs::write(d.pane_file(&mock, "pm", "swallow"), "1").unwrap();
+    atomic_write(d.pane_file(&mock, "pm", "swallow"), "1");
     d.job_verdict("j1-t2", SHA_A, "pass", Some("rev"), None)
         .unwrap();
 
@@ -8434,11 +8480,10 @@ fn pty_stub_profile_busy_marker_blocks_paste() {
     d.wait_agent("st", "idle", 20);
     // Devin's busy marker means nothing to the stub profile: a send
     // with it on screen still goes through.
-    std::fs::write(
+    atomic_write(
         d.stub_pane_file(&mock, "st", "tui-state"),
         "(esc twice to interrupt)\n",
-    )
-    .unwrap();
+    );
     d.rpc(
         "agent_send",
         json!({"alias": "st", "text": "devin marker is inert here",
@@ -8447,7 +8492,7 @@ fn pty_stub_profile_busy_marker_blocks_paste() {
     .unwrap();
     pty_token(&d, "st", "m1");
     // The stub's own marker must block.
-    std::fs::write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n").unwrap();
+    atomic_write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n");
     d.rpc(
         "agent_send",
         json!({"alias": "st", "text": "do not paste", "message": "m2"}),
@@ -10726,21 +10771,19 @@ fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
     d.wait_message("w1", "ms2", &["running"], 15);
     // The status line exists from the baseline sample on — only its
     // counter will move.
-    std::fs::write(
+    atomic_write(
         d.stub_pane_file(&mock, "w1", "tui-state"),
         "⠋ Working · 1s\n",
-    )
-    .unwrap();
+    );
     d.wait_event("w1", "turn_stalled", 30);
 
     // The counter ticks past several samples — normalized identically,
     // so nothing resumes.
     for i in 2..=4u64 {
-        std::fs::write(
+        atomic_write(
             d.stub_pane_file(&mock, "w1", "tui-state"),
             format!("⠋ Working · {i}s\n"),
-        )
-        .unwrap();
+        );
         thread::sleep(Duration::from_secs(2));
     }
     assert!(
@@ -10753,11 +10796,10 @@ fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
 
     // Real transcript motion resumes — same recipient gets the resolved
     // notice — and detection re-arms for the next silence.
-    std::fs::write(
+    atomic_write(
         d.stub_pane_file(&mock, "w1", "tui-state"),
         "⠋ Working · 5s\nBUILD OK\n",
-    )
-    .unwrap();
+    );
     let e = d.wait_event("w1", "turn_resumed", 15);
     assert_eq!(e["payload"]["message"], "ms2", "{e}");
     wait_event_count(&d, "w1", "turn_stalled", 2, 20);
@@ -10773,6 +10815,109 @@ fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
         .filter(|m| m["body"].as_str().unwrap_or("").contains("active again"))
         .count();
     assert_eq!((stalls, resumes), (2, 1), "{notices:?}");
+    std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
+}
+
+/// Screen activity is debounced: a hash seen for exactly one sample —
+/// a capture taken mid-repaint — can neither reset the silence clock
+/// nor resume a stalled turn. The mock `captures` counter pins the
+/// empty tail to exactly one sighting: it is written after one
+/// capture's read and reverted before the next-but-one. Real
+/// persistent motion still resumes, one interval later.
+#[test]
+fn pty_stall_transient_sample_neither_resumes_nor_resets() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    std::env::set_var("CADENCE_STALL_SAMPLE_SECS", "1");
+    d.register_inbox("pm");
+    d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 8}));
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "do work", "reply_to": "pm",
+               "message": "mtr"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "mtr", &["running"], 15);
+    atomic_write(d.stub_pane_file(&mock, "w1", "tui-state"), "⠋ Working\n");
+
+    let captures = || {
+        std::fs::read_to_string(d.stub_pane_file(&mock, "w1", "captures"))
+            .unwrap_or_default()
+            .len()
+    };
+    let wait_capture = |from: usize| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while captures() <= from {
+            assert!(Instant::now() < deadline, "no capture landed");
+            thread::sleep(Duration::from_millis(30));
+        }
+    };
+    let silent = || {
+        d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"]["silent_secs"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+    // `contents` is visible to exactly one sample: the counter ticks
+    // before the capture reads the screen, so once a capture has
+    // started its read is done — write now, and the NEXT capture is
+    // the only one that can see it. Revert before the one after that.
+    let transient = |contents: &str| {
+        let n = captures();
+        wait_capture(n);
+        atomic_write(d.stub_pane_file(&mock, "w1", "tui-state"), contents);
+        let n = captures();
+        wait_capture(n);
+        atomic_write(d.stub_pane_file(&mock, "w1", "tui-state"), "⠋ Working\n");
+    };
+
+    // Let the baseline settle — two consecutive identical samples.
+    let n0 = captures();
+    wait_capture(n0 + 1);
+    // An empty tail for one sample must not reset the silence clock.
+    let before = silent();
+    transient("");
+    let after = silent();
+    assert!(
+        after > before,
+        "one-sample transient reset the silence clock: {before} -> {after}"
+    );
+
+    // The stall fires on budget — the clock kept accruing.
+    d.wait_event("w1", "turn_stalled", 15);
+
+    // Mid-stall, the same one-sample transient cannot resume.
+    transient("");
+    let n = captures();
+    wait_capture(n); // one more sample on the restored screen
+    assert!(
+        d.events("w1")
+            .iter()
+            .all(|e| e["kind"].as_str() != Some("turn_resumed")),
+        "one-sample transient resumed the turn: {:?}",
+        d.events("w1")
+    );
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["stalled"], true, "{agent}");
+    assert_eq!(
+        messages_for(&d, "pm")
+            .iter()
+            .filter(|m| m["source"].as_str() == Some("worker_notice"))
+            .count(),
+        1,
+        "one-sample transient sent a notice"
+    );
+
+    // Real motion still resumes — two DIFFERENT consecutive samples
+    // confirm too (the scrolling-pane clause: a busy pane is never
+    // starved into a false stall) — and the same recipient hears it.
+    atomic_write(d.stub_pane_file(&mock, "w1", "tui-state"), "BUILD 1\n");
+    let n = captures();
+    wait_capture(n); // first differing sample — held as a candidate
+    atomic_write(d.stub_pane_file(&mock, "w1", "tui-state"), "BUILD 2\n");
+    let e = d.wait_event("w1", "turn_resumed", 20);
+    assert_eq!(e["payload"]["message"], "mtr", "{e}");
+    wait_source(&d, "pm", "worker_notice", 2, 10);
     std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
 }
 
