@@ -41,6 +41,7 @@ export default function Memory({
   const [kind, setKind] = useState("");
   const [open, setOpen] = useState<string | null>(null); // project/slug
   const [detail, setDetail] = useState<MemoryDetail | null>(null);
+  const [draft, setDraft] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(() => {
@@ -59,16 +60,24 @@ export default function Memory({
   const openDetail = useCallback((m: MemoryCard) => {
     const key = `${m.project}/${m.slug}`;
     setOpen((cur) => (cur === key ? null : key));
+    setDraft(null);
     api
       .memory(m.project, m.slug)
-      .then(setDetail)
+      .then((d) => {
+        setDetail(d);
+        setDraft(d.body);
+      })
       .catch(() => setDetail(null));
   }, []);
 
   const review = useCallback(
-    (m: MemoryCard, verb: "accept" | "reject") => {
+    (m: MemoryDetail, verb: "accept" | "reject") => {
       setBusy(true);
-      const call = verb === "accept" ? api.memoryAccept : api.memoryReject;
+      const edited = verb === "accept" && draft !== null && draft !== m.body;
+      const call =
+        verb === "accept"
+          ? (p: string, s: string) => api.memoryAccept(p, s, edited ? draft! : undefined)
+          : api.memoryReject;
       call(m.project, m.slug)
         .then((r) => {
           setDetail(r.memory);
@@ -77,7 +86,7 @@ export default function Memory({
         .catch((e) => onError(e as ApiError, `memory ${verb}`))
         .finally(() => setBusy(false));
     },
-    [onError, refresh],
+    [onError, refresh, draft],
   );
 
   return (
@@ -156,6 +165,16 @@ export default function Memory({
                     {detail.source ? `source ${detail.source} · ` : ""}
                     {detail.path}
                   </div>
+                  {detail.status === "proposed" && (
+                    <div className="mt-3">
+                      <textarea
+                        value={draft ?? detail.body}
+                        onChange={(e) => setDraft(e.target.value)}
+                        rows={8}
+                        className="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1.5 text-[13px] text-ink-200 font-mono focus:outline-none focus:border-accent/50"
+                      />
+                    </div>
+                  )}
                   {detail.status === "proposed" && (
                     <div className="flex gap-2 mt-3">
                       <button

@@ -12684,6 +12684,228 @@ fn dispatch_injects_project_memory_lessons() {
     assert!(!text.contains("claude-only"), "{text}");
 }
 
+/// Memory failures degrade, never sink a dispatch: a malformed memory
+/// file fails matching → no lessons + `lessons_error`; a `Lessons:`
+/// suffix that pushes the kickoff body over the pty cap is dropped
+/// (original body restored, no file written). Briefings bound their
+/// rule section to ≤8 entries and 4 KiB.
+#[test]
+fn dispatch_degrades_on_memory_failures() {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        for (alias, params, kind) in [
+            ("pm", None, "fake"),
+            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox"),
+        ] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params,
+                })
+                .unwrap();
+        }
+    }
+    let d = TestDaemon::start_on(state);
+
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {:?}", args);
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]).0);
+    // D-2's title is sized so the kickoff body sits just under the
+    // 4000-byte cap — the `Lessons:` suffix is what tips it over.
+    let long_title = "x".repeat(3720);
+    for title in ["One".to_string(), long_title] {
+        assert!(cli(&["issue", "new", &title, "--project", "demo"]).0);
+    }
+    // One good accepted rule — matching works until the broken file.
+    let body = |fact: &str| format!("{fact}\n\n**Why:** test.\n\n**How to apply:** do it.\n");
+    assert!(
+        cli(&[
+            "memory",
+            "propose",
+            "--project",
+            "demo",
+            "--type",
+            "rule",
+            "--id",
+            "good-rule",
+            "--scope-project",
+            "-m",
+            &body("a good fact"),
+        ])
+        .0
+    );
+    assert!(cli(&["memory", "accept", "good-rule", "--project", "demo"]).0);
+
+    let note = tmp.path().join("kickoff.md");
+    std::fs::write(&note, "# kickoff").unwrap();
+    let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
+
+    // Malformed memory file → match fails → degrade, dispatch lands.
+    std::fs::write(
+        pm_dir.join("demo/memory/broken.md"),
+        "---\nid: [unclosed\n---\nbody\n",
+    )
+    .unwrap();
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-1",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(ok && out["dispatched"] == true, "{out}");
+    assert_eq!(out["lessons"], json!([]), "{out}");
+    assert_eq!(out["lessons_file"], Value::Null, "{out}");
+    let err = out["lessons_error"].as_str().unwrap_or_default();
+    assert!(err.contains("memory match failed"), "{out}");
+    assert!(!out["message"].as_str().unwrap().is_empty());
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let kick = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_str() == out["message"].as_str())
+        .unwrap();
+    assert!(!kick["body"].as_str().unwrap().contains("Lessons:"));
+    assert!(!d.state.join("dispatch").exists());
+
+    // Over-cap: the good rule matches, but the `Lessons:` suffix would
+    // push the kickoff body past the 4000-byte pty cap → the suffix
+    // and the file are dropped, the original body still sends.
+    std::fs::remove_file(pm_dir.join("demo/memory/broken.md")).unwrap();
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-2",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(ok && out["dispatched"] == true, "{out}");
+    assert_eq!(out["lessons"], json!([]), "{out}");
+    assert_eq!(out["lessons_file"], Value::Null, "{out}");
+    let err = out["lessons_error"].as_str().unwrap_or_default();
+    assert!(err.contains("body limit"), "{out}");
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let kick = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_str() == out["message"].as_str())
+        .unwrap();
+    let sent = kick["body"].as_str().unwrap();
+    assert!(!sent.contains("Lessons:"), "suffix dropped: {sent}");
+    assert!(
+        sent.len() > 3900 && sent.len() <= 4000,
+        "original long body sent: {}",
+        sent.len()
+    );
+    assert!(
+        !d.state.join("dispatch").exists(),
+        "no lessons file written"
+    );
+
+    // Briefing cap: ten fat accepted rules exceed both bounds — the
+    // section keeps ≤8 entries and ≤4 KiB of items.
+    let mem_dir = pm_dir.join("demo/memory");
+    for i in 0..10 {
+        std::fs::write(
+            mem_dir.join(format!("fat-rule-{i:02}.md")),
+            format!(
+                "---\nid: fat-rule-{i:02}\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  project: true\n---\n{}\n\n**Why:** w\n\n**How to apply:** h\n",
+                "y".repeat(700)
+            ),
+        )
+        .unwrap();
+    }
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w2", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": repo, "params": json!({"upstream": "pm"}).to_string()}),
+    )
+    .unwrap();
+    d.wait_agent("w2", "idle", 15);
+    let (ok, out) = cli(&["agent", "bootstrap", "w2"]);
+    assert!(ok, "{out}");
+    let briefing = d.state.join("briefings").join("pm").join("BRIEFING-w2.md");
+    let text = std::fs::read_to_string(&briefing).unwrap();
+    let section = text.split("## Project memory").nth(1).unwrap_or_default();
+    let items = section.split("\n\n`cadence memory match").next().unwrap();
+    let listed = items.matches("- `fat-rule-").count();
+    assert!((1..=8).contains(&listed), "{listed} rules in section");
+    assert!(items.len() <= 4 * 1024 + 128, "{} bytes", items.len());
+}
+
 // ==== operator IX: cadence status, daemon restart, events tail ====
 
 /// `cadence status --json` against a daemon's socket — the JSON shape

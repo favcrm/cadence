@@ -235,7 +235,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
         }
         MemoryAction::Verify { slug, project } => {
             let pm = open_pm()?;
-            let out = memory::verify(&pm, project.as_deref(), slug, "")?;
+            let out = memory::verify(&pm, project.as_deref(), slug, "", state_dir)?;
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
@@ -251,12 +251,15 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
         } => {
             let pm = open_pm()?;
             if *stale {
-                let mut hits = memory::stale(&pm, *days);
+                let (mut hits, errors) = memory::stale(&pm, *days);
+                if let Some(line) = memory::load_errors_line(&errors) {
+                    eprintln!("{line}");
+                }
                 if let Some(key) = project {
                     hits.retain(|h| h["project"].as_str() == Some(key.as_str()));
                 }
                 if *as_json {
-                    crate::issue::cli::print_json(&json!({"stale": hits}));
+                    crate::issue::cli::print_json(&json!({"stale": hits, "load_errors": errors}));
                 } else if hits.is_empty() {
                     println!("no stale memories (window: {days} days)");
                 } else {
@@ -286,8 +289,12 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 tags: vec![],
             };
             let filtering = component.is_some() || path.is_some();
+            let (all, load_errors) = memory::load_all_report(&pm.dir);
+            if let Some(line) = memory::load_errors_line(&load_errors) {
+                eprintln!("{line}");
+            }
             let mut mems = Vec::new();
-            for m in memory::load_all(&pm.dir)? {
+            for m in all {
                 if let Some(key) = project {
                     if m.project != *key {
                         continue;
@@ -311,6 +318,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             if *as_json {
                 crate::issue::cli::print_json(&json!({
                     "memories": mems.iter().map(memory::card_json).collect::<Vec<_>>(),
+                    "load_errors": load_errors,
                 }));
             } else if mems.is_empty() {
                 println!("no memories");
@@ -353,7 +361,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             json: as_json,
         } => {
             let pm = open_pm()?;
-            let (mems, ctx) = if let Some(id) = issue {
+            let (mems, ctx, load_errors) = if let Some(id) = issue {
                 let (proj, dir) = write::issue_dir(&pm, id)?;
                 let (front, body) = write::load_front(&dir)?;
                 let issue_obj = board::Issue {
@@ -368,13 +376,8 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 ctx.components.extend(component.clone());
                 ctx.paths.extend(path.clone());
                 ctx.tags.extend(tag.clone());
-                (
-                    memory::match_memories(
-                        &memory::load_project(&pm.dir, &issue_obj.project)?,
-                        &ctx,
-                    ),
-                    ctx,
-                )
+                let (pool, errors) = memory::load_project_report(&pm.dir, &issue_obj.project);
+                (memory::match_memories(&pool, &ctx), ctx, errors)
             } else {
                 let ctx = MatchCtx {
                     components: component.clone(),
@@ -382,11 +385,12 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                     providers: provider.clone().into_iter().collect(),
                     tags: tag.clone(),
                 };
-                (
-                    memory::match_memories(&memory::load_all(&pm.dir)?, &ctx),
-                    ctx,
-                )
+                let (pool, errors) = memory::load_all_report(&pm.dir);
+                (memory::match_memories(&pool, &ctx), ctx, errors)
             };
+            if let Some(line) = memory::load_errors_line(&load_errors) {
+                eprintln!("{line}");
+            }
             if *as_json {
                 crate::issue::cli::print_json(&json!({
                     "matched": mems.iter().map(|m| json!({
@@ -403,6 +407,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                         "providers": ctx.providers,
                         "tags": ctx.tags,
                     },
+                    "load_errors": load_errors,
                 }));
             } else {
                 for m in &mems {

@@ -190,6 +190,10 @@ pub fn apply_line(body: &str) -> String {
 }
 
 /// Body-contract errors — shared by `propose`/`accept --edit` and lint.
+/// One fact stays a fact — bounded in lines AND bytes so a stuffed
+/// paragraph can't slip past the line cap.
+pub const FACT_MAX_BYTES: usize = 512;
+
 fn lint_body(slug: &str, body: &str, err: &mut dyn FnMut(String)) {
     let (fact, why, how) = body_parts(body);
     let fact_lines = fact.iter().filter(|l| !l.trim().is_empty()).count();
@@ -197,6 +201,12 @@ fn lint_body(slug: &str, body: &str, err: &mut dyn FnMut(String)) {
         err(format!("{slug}: missing fact (the lines before **Why:**)"));
     } else if fact_lines > 5 {
         err(format!("{slug}: fact is {fact_lines} lines — the cap is 5"));
+    }
+    let fact_bytes: usize = fact.iter().map(|l| l.len()).sum();
+    if fact_bytes > FACT_MAX_BYTES {
+        err(format!(
+            "{slug}: fact is {fact_bytes} bytes — the cap is {FACT_MAX_BYTES}"
+        ));
     }
     if why.trim().is_empty() {
         err(format!("{slug}: missing '**Why:**' section"));
@@ -247,6 +257,58 @@ pub fn load_all(pm_dir: &Path) -> Result<Vec<Memory>> {
         out.extend(load_project(pm_dir, &p.key)?);
     }
     Ok(out)
+}
+
+/// `load_project` that keeps going past a broken file — returns the
+/// good memories plus one `<project>/<file>: <error>` string per
+/// failure, so callers can surface instead of swallowing them.
+pub fn load_project_report(pm_dir: &Path, key: &str) -> (Vec<Memory>, Vec<String>) {
+    let dir = pm_dir.join(key).join("memory");
+    let (mut out, mut errors) = (Vec::new(), Vec::new());
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") || name.starts_with('.') {
+                continue;
+            }
+            match load_file(&entry.path(), key) {
+                Ok(Some(m)) => out.push(m),
+                Ok(None) => {}
+                Err(e) => errors.push(format!("{key}/{name}: {e}")),
+            }
+        }
+    }
+    out.sort_by(|a, b| a.front.id.cmp(&b.front.id));
+    (out, errors)
+}
+
+/// `load_all` in the same error-collecting shape.
+pub fn load_all_report(pm_dir: &Path) -> (Vec<Memory>, Vec<String>) {
+    let (mut out, mut errors) = (Vec::new(), Vec::new());
+    match project::list(pm_dir) {
+        Ok(projects) => {
+            for p in projects {
+                let (mems, errs) = load_project_report(pm_dir, &p.key);
+                out.extend(mems);
+                errors.extend(errs);
+            }
+        }
+        Err(e) => errors.push(e.to_string()),
+    }
+    (out, errors)
+}
+
+/// One-line summary of load errors for stderr: `N memory file(s)
+/// failed to load; first: <msg>` — None when clean.
+pub fn load_errors_line(errors: &[String]) -> Option<String> {
+    if errors.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "memory: {} file(s) failed to load; first: {}",
+        errors.len(),
+        errors[0]
+    ))
 }
 
 /// Resolve `<slug>` to `(project, memory)`. `--project` pins the
@@ -366,6 +428,15 @@ fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
                 "Unknown component '{c}' — {} declares: {}",
                 mem.project,
                 components.join(", ")
+            )));
+        }
+    }
+    // `**` recursion in glob_match is exponential on adversarial
+    // patterns (`**a**a**a**`) — bound the shape a scope may carry.
+    for pat in &f.scope.paths {
+        if pat.len() > 200 || pat.matches("**").count() > 2 {
+            return Err(Error::rejected(format!(
+                "path scope '{pat}' is too complex — ≤200 chars, ≤2 `**` segments"
             )));
         }
     }
@@ -564,9 +635,20 @@ pub fn supersede(
               "committed": committed}))
 }
 
-/// `memory verify <slug>` — re-stamp verified_at; workers may verify.
+/// `memory verify <slug>` — re-stamp verified_at. Curator-gated like
+/// accept/reject: verified_at is documented as the PM's re-check of a
+/// fact, and it feeds ranking and staleness — a worker verify would
+/// falsify the attestation and silently un-stale the memory. Workers
+/// propose a correction instead.
 /// A same-second re-verify changes nothing and commits nothing.
-pub fn verify(pm: &Pm, flag: Option<&str>, slug: &str, actor: &str) -> Result<Value> {
+pub fn verify(
+    pm: &Pm,
+    flag: Option<&str>,
+    slug: &str,
+    actor: &str,
+    state_dir: &Path,
+) -> Result<Value> {
+    require_curator(state_dir)?;
     let (proj, mut mem) = find(pm, flag, slug)?;
     if mem.front.status != "accepted" {
         return Err(Error::rejected(format!(
@@ -830,26 +912,32 @@ pub fn render_lessons(matched: &[Memory]) -> (String, Vec<String>) {
 }
 
 /// Accepted project-wide `rule`s — the briefing's memory section.
-pub fn project_rules(pm: &Pm, key: &str) -> Vec<Memory> {
-    let mut rules: Vec<Memory> = load_project(&pm.dir, key)
-        .unwrap_or_default()
+/// Broken files are skipped, not fatal; callers surface the errors.
+pub fn project_rules(pm: &Pm, key: &str) -> (Vec<Memory>, Vec<String>) {
+    let (mems, errors) = load_project_report(&pm.dir, key);
+    let mut rules: Vec<Memory> = mems
         .into_iter()
         .filter(|m| m.front.status == "accepted" && m.front.scope.project && m.front.kind == "rule")
         .collect();
     rules.sort_by(|a, b| a.front.id.cmp(&b.front.id));
-    rules
+    (rules, errors)
 }
 
 // ── Staleness ────────────────────────────────────────────────────
 
 /// `YYYY-MM-DD[THH:MM:SSZ]` → epoch seconds; needed to bound the
-/// staleness window without chrono.
+/// staleness window without chrono. Byte-sliced — a non-ASCII or
+/// short timestamp is "unknown" (None), never a panic.
 fn iso_epoch(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    if b.len() < 10 {
-        return None;
-    }
-    let n = |i: usize, j: usize| s[i..j].parse::<i64>().ok();
+    let n = |i: usize, j: usize| -> Option<i64> {
+        let slice = b.get(i..j)?;
+        if slice.iter().all(|c| c.is_ascii_digit()) {
+            std::str::from_utf8(slice).ok()?.parse().ok()
+        } else {
+            None
+        }
+    };
     let (y, m, d) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
     let (hh, mm, ss) = if b.len() >= 19 {
         (n(11, 13)?, n(14, 16)?, n(17, 19)?)
@@ -870,11 +958,13 @@ fn iso_epoch(s: &str) -> Option<i64> {
 /// Stale accepted memories: `verified_at` missing or older than the
 /// `days` window, or path globs matching files changed in a project
 /// repo after `verified_at` (the changed-file scan stays inside the
-/// window). Informational — `verify` is the refresh.
-pub fn stale(pm: &Pm, days: u64) -> Vec<Value> {
+/// window). Informational — `verify` is the refresh. Broken files are
+/// skipped and returned as the second tuple element.
+pub fn stale(pm: &Pm, days: u64) -> (Vec<Value>, Vec<String>) {
     let mut out = Vec::new();
+    let (mems, errors) = load_all_report(&pm.dir);
     let since_epoch = time::now_epoch() - (days as i64) * 86400;
-    for m in load_all(&pm.dir).unwrap_or_default() {
+    for m in mems {
         if m.front.status != "accepted" {
             continue;
         }
@@ -937,7 +1027,7 @@ pub fn stale(pm: &Pm, days: u64) -> Vec<Value> {
             }
         }
     }
-    out
+    (out, errors)
 }
 
 // ── Lint ─────────────────────────────────────────────────────────
@@ -986,7 +1076,12 @@ pub fn lint_dir(
                 mems.push(m);
             }
             Ok(None) => {}
-            Err(e) => err(format!("{}/memory/{name}: {e}", proj.key)),
+            // A file that cannot even be parsed is a warning, not a
+            // commit-blocking error: every read path already skips and
+            // reports it (load_errors/memory_errors/lessons_error), so
+            // erroring here would let one stray file brick every
+            // tracker commit — including `issue start` mid-dispatch.
+            Err(e) => warn(format!("{}/memory/{name}: {e}", proj.key)),
         }
     }
     for m in &mems {

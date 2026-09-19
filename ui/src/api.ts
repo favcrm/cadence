@@ -137,9 +137,10 @@ export const api = {
     get<MemoryDetail>(
       `/api/memories/${encodeURIComponent(project)}/${encodeURIComponent(slug)}`,
     ),
-  memoryAccept: (project: string, slug: string) =>
+  memoryAccept: (project: string, slug: string, body?: string) =>
     memoryWrite(
       `/api/memories/${encodeURIComponent(project)}/${encodeURIComponent(slug)}/accept`,
+      body === undefined ? undefined : { body },
     ),
   memoryReject: (project: string, slug: string) =>
     memoryWrite(

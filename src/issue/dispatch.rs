@@ -241,8 +241,13 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     // render into `<state>/dispatch/<message>-lessons.md`, written
     // before the send so the kickoff can name it. `--job`'s kickoff
     // is daemon-templated and cannot carry the path — it is skipped.
+    // Memory failures never sink the dispatch — the worktree already
+    // exists by now. A malformed file, an unwritable lessons file or a
+    // suffix that pushes the body over the cap degrades to no lessons
+    // with `lessons_error` naming the reason.
     let mut lessons: Vec<String> = vec![];
     let mut lessons_file: Option<PathBuf> = None;
+    let mut lessons_error: Option<String> = None;
     let mut message_id: Option<String> = None;
     let mut body = body;
     if !args.no_lessons {
@@ -255,19 +260,33 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
                 comments: vec![],
                 artifacts: vec![],
             };
-            let matched = memory::match_for_issue(pm, &issue_obj, Some(&provider))?;
-            let (text, slugs) = memory::render_lessons(&matched);
-            if !slugs.is_empty() {
-                let msgid = Uuid::new_v4().simple().to_string();
-                let ddir = state_dir.join("dispatch");
-                std::fs::create_dir_all(&ddir)?;
-                let file = ddir.join(format!("{msgid}-lessons.md"));
-                std::fs::write(&file, &text)?;
-                *b = format!("{b} Lessons: {}.", file.display());
-                check_body(b, &provider)?;
-                lessons = slugs;
-                lessons_file = Some(file);
-                message_id = Some(msgid);
+            match memory::match_for_issue(pm, &issue_obj, Some(&provider)) {
+                Err(e) => lessons_error = Some(format!("memory match failed: {e}")),
+                Ok(matched) => {
+                    let (text, slugs) = memory::render_lessons(&matched);
+                    if !slugs.is_empty() {
+                        let msgid = Uuid::new_v4().simple().to_string();
+                        let ddir = state_dir.join("dispatch");
+                        let file = ddir.join(format!("{msgid}-lessons.md"));
+                        let prior = b.clone();
+                        *b = format!("{prior} Lessons: {}.", file.display());
+                        if let Err(e) = check_body(b, &provider) {
+                            *b = prior;
+                            lessons_error = Some(format!(
+                                "lessons path pushed the kickoff over the body limit: {e}"
+                            ));
+                        } else if let Err(e) = std::fs::create_dir_all(&ddir)
+                            .and_then(|_| std::fs::write(&file, &text))
+                        {
+                            *b = prior;
+                            lessons_error = Some(format!("lessons file unwritable: {e}"));
+                        } else {
+                            lessons = slugs;
+                            lessons_file = Some(file);
+                            message_id = Some(msgid);
+                        }
+                    }
+                }
             }
         }
     }
@@ -332,6 +351,10 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     out["lessons_file"] = lessons_file
         .as_ref()
         .map(|p| json!(p))
+        .unwrap_or(Value::Null);
+    out["lessons_error"] = lessons_error
+        .as_ref()
+        .map(|e| json!(e))
         .unwrap_or(Value::Null);
     out["comment"] = comment["comment"].clone();
     out["job"] = started["job"].clone();

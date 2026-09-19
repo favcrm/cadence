@@ -4548,23 +4548,31 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
         let cwd = agent["cwd"].as_str()?;
         let pm = cadence_agent::issue::Pm::open_default().ok()?;
         let proj = cadence_agent::issue::project::resolve(&pm.dir, None, Path::new(cwd)).ok()?;
-        let rules = cadence_agent::memory::project_rules(&pm, &proj.key);
+        let (rules, errors) = cadence_agent::memory::project_rules(&pm, &proj.key);
+        if let Some(line) = cadence_agent::memory::load_errors_line(&errors) {
+            eprintln!("{line}");
+        }
         if rules.is_empty() {
             return None;
         }
-        let items = rules
-            .iter()
-            .take(8)
-            .map(|m| {
-                format!(
-                    "- `{}`: {} — {}",
-                    m.front.id,
-                    cadence_agent::memory::fact_line(&m.body),
-                    cadence_agent::memory::apply_line(&m.body)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // ≤8 entries AND ≤LESSON_MAX_BYTES total — same bound the
+        // dispatch lessons file carries.
+        let mut items = String::new();
+        for m in rules.iter().take(8) {
+            let line = format!(
+                "- `{}`: {} — {}",
+                m.front.id,
+                cadence_agent::memory::fact_line(&m.body),
+                cadence_agent::memory::apply_line(&m.body)
+            );
+            if items.len() + line.len() + 1 > cadence_agent::memory::LESSON_MAX_BYTES {
+                break;
+            }
+            if !items.is_empty() {
+                items.push('\n');
+            }
+            items.push_str(&line);
+        }
         Some(format!(
             "## Project memory — accepted rules ({proj_key})\n\n{items}\n\n\
              `cadence memory match --issue <ID>` lists everything scoped to\n\

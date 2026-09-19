@@ -49,7 +49,6 @@ fn cli_run<S: AsRef<str>>(
         .arg(state)
         .args(args)
         .env("CADENCE_PM_DIR", pm)
-        .env("HOME", std::env::var("HOME").unwrap())
         // The tracker's pre-commit hook runs `cadence` from PATH —
         // put the just-built binary first so its lint sees the ref
         // kinds this build writes.
@@ -64,6 +63,9 @@ fn cli_run<S: AsRef<str>>(
         // Ambient aliases would leak into Actor: trailers and comment
         // authors — remove it so every env resolves to `operator`.
         .env_remove("CADENCE_ALIAS");
+    if let Ok(home) = std::env::var("HOME") {
+        cmd.env("HOME", home);
+    }
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
@@ -98,8 +100,10 @@ fn cli_raw_env(pm: &Path, state: &Path, args: &[&str], env: &[(&str, String)]) -
         .arg(state)
         .args(args)
         .env("CADENCE_PM_DIR", pm)
-        .env("HOME", std::env::var("HOME").unwrap())
         .env_remove("CADENCE_ALIAS");
+    if let Ok(home) = std::env::var("HOME") {
+        cmd.env("HOME", home);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -5162,6 +5166,15 @@ fn read_only_board_refuses_every_write() {
             "/api/issues/CAD-2/refs",
             r#"{"kind":"commit","value":"abc"}"#,
         ),
+        // Memory curation routes refuse identically — plain, and
+        // carrying the accept-time body edit.
+        ("POST", "/api/memories/cadence/foo/accept", r#"{}"#),
+        (
+            "POST",
+            "/api/memories/cadence/foo/accept",
+            r#"{"body":"x"}"#,
+        ),
+        ("POST", "/api/memories/cadence/foo/reject", r#"{}"#),
     ] {
         let (code, _, body) = write_json(port, method, path, &host, body);
         assert_eq!(code, 403, "{method} {path}");
@@ -5407,7 +5420,10 @@ fn memory_round_trip_and_trailers() {
     assert!(text.contains("status: proposed"), "{text}");
     assert!(text.contains("author: operator"), "{text}");
 
-    // accept: status + verified_at stamped, one commit.
+    // accept: status + verified_at stamped, one commit. cli_run strips
+    // CADENCE_ALIAS, so the curator resolves to the operator — the
+    // environment-based actor model records `Actor: operator` rather
+    // than an agent alias (a pane's accept would carry its alias).
     let before = commits(&pm);
     let (ok, out) = accept(&pm, &state, "pipe-drain");
     assert!(ok, "{out}");
@@ -5415,6 +5431,8 @@ fn memory_round_trip_and_trailers() {
     assert!(text.contains("status: accepted"), "{text}");
     assert!(text.contains("verified_at:"), "{text}");
     assert_eq!(commits(&pm), before + 1);
+    let (_, log) = git(&pm, &["log", "-1", "--format=%B"]);
+    assert!(log.contains("Actor: operator"), "{log}");
 
     // verify refreshes verified_at — commit a stale stamp first so
     // the refresh is a guaranteed tracker diff (an uncommitted pin
@@ -5507,11 +5525,15 @@ fn memory_write_guards() {
     let (ok, _) = propose(&pm, &state, "curated", "rule", &["--scope-project"]);
     assert!(ok);
 
-    // A cadence worker pane cannot accept/reject/supersede — the
-    // daemon can't even prove PM status here (down) so it fails closed.
+    // A cadence worker pane cannot accept/reject/supersede/verify —
+    // the daemon can't even prove PM status here (down) so it fails
+    // closed. `verify` is gated too: verified_at feeds ranking and
+    // staleness, and it means "a curator re-checked this", not "a
+    // worker touched it".
     for args in [
         vec!["accept", "curated", "--project", "mem"],
         vec!["reject", "curated", "--project", "mem"],
+        vec!["verify", "curated", "--project", "mem"],
     ] {
         let (ok, err) = mem_cli_env(&pm, &state, &args, &[("CADENCE_ALIAS", "w1")]);
         assert!(!ok, "{args:?} should refuse: {err}");
@@ -5878,12 +5900,11 @@ impl Drop for UiProc {
 #[allow(clippy::zombie_processes)] // UiProc's Drop kills + waits.
 fn spawn_ui(pm: &Path, state: &Path) -> (u16, UiProc) {
     let port = free_port();
-    let child = Command::new(bin())
-        .arg("--state-dir")
+    let mut cmd = Command::new(bin());
+    cmd.arg("--state-dir")
         .arg(state)
         .args(["ui", "run", "--port", &port.to_string()])
         .env("CADENCE_PM_DIR", pm)
-        .env("HOME", std::env::var("HOME").unwrap())
         // The tracker's pre-commit hook runs `cadence` from PATH — same
         // PATH fix as cli_run so the hook lints with THIS build.
         .env(
@@ -5895,9 +5916,11 @@ fn spawn_ui(pm: &Path, state: &Path) -> (u16, UiProc) {
             ),
         )
         .env_remove("CADENCE_ALIAS")
-        .env_remove("CADENCE_STATE_DIR")
-        .spawn()
-        .unwrap();
+        .env_remove("CADENCE_STATE_DIR");
+    if let Ok(home) = std::env::var("HOME") {
+        cmd.env("HOME", home);
+    }
+    let child = cmd.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         // Connect-refused while the listener binds is expected — the
@@ -5968,4 +5991,139 @@ fn memory_ui_list_detail_accept() {
     assert_eq!(status, 200, "{body}");
     let resp: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(resp["memory"]["status"], "rejected");
+}
+
+/// `cadence …` returning (ok, stdout, stderr) — load warnings go to
+/// stderr while JSON stays on stdout, and cli_run merges them away.
+fn cli_out_err(pm: &Path, state: &Path, args: &[&str]) -> (bool, String, String) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--state-dir")
+        .arg(state)
+        .args(args)
+        .env("CADENCE_PM_DIR", pm)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                Path::new(bin()).parent().unwrap().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("CADENCE_ALIAS");
+    if let Ok(home) = std::env::var("HOME") {
+        cmd.env("HOME", home);
+    }
+    let out = cmd.output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// A memory file that fails to load does not sink the readers:
+/// `memory ls` still lists the good ones, warns once on stderr and
+/// reports `load_errors`; `/api/memories` carries `memory_errors`.
+#[test]
+fn memory_load_errors_surface_in_cli_and_api() {
+    let (_t, pm, state, _repo) = mem_fx();
+    let (ok, _) = propose(&pm, &state, "good-mem", "rule", &["--scope-project"]);
+    assert!(ok);
+    std::fs::write(
+        pm.join("mem/memory/broken.md"),
+        "---\nid: [unclosed\n---\nbody\n",
+    )
+    .unwrap();
+
+    // CLI: one good memory lists, stderr names the broken file.
+    let (ok, out, err) = cli_out_err(&pm, &state, &["memory", "ls", "--project", "mem", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["memories"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["load_errors"].as_array().unwrap().len(), 1, "{v}");
+    assert!(err.contains("1 file(s) failed to load"), "{err}");
+    assert!(err.contains("broken.md"), "{err}");
+
+    // `ls --stale` takes the same path.
+    let (ok, out, err) = cli_out_err(&pm, &state, &["memory", "ls", "--stale", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["load_errors"].as_array().unwrap().len(), 1, "{v}");
+
+    // API: same split — good payload, errors alongside.
+    let (port, _ui) = spawn_ui(&pm, &state);
+    let host = format!("127.0.0.1:{port}");
+    let (status, body) = http(port, "GET", "/api/memories?project=mem", &host);
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["memories"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["memory_errors"].as_array().unwrap().len(), 1, "{v}");
+    assert!(
+        v["memory_errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("broken.md"),
+        "{v}"
+    );
+}
+
+/// Lint bounds the fact block in bytes, not just lines, and refuses
+/// path scopes whose `**` recursion could backtrack exponentially.
+#[test]
+fn memory_lint_bounds_fact_bytes_and_glob() {
+    let (_t, pm, state, _repo) = mem_fx();
+    let dir = pm.join("mem/memory");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fat = "x".repeat(600);
+    std::fs::write(
+        dir.join("fat-fact.md"),
+        format!(
+            "---\nid: fat-fact\ntype: rule\nstatus: proposed\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\n---\n{fat}\n\n**Why:** w\n\n**How to apply:** h\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("evil-glob.md"),
+        "---\nid: evil-glob\ntype: rule\nstatus: proposed\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nscope:\n  paths:\n    - \"**a**a**a**\"\n---\nfact\n\n**Why:** w\n\n**How to apply:** h\n",
+    )
+    .unwrap();
+
+    let (ok, out) = mem_cli(&pm, &state, &["lint"]);
+    assert!(!ok && out["ok"] == false, "{out}");
+    let errs = out["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(errs.contains("fat-fact: fact is 600 bytes"), "{errs}");
+    assert!(errs.contains("evil-glob"), "{errs}");
+    assert!(errs.contains("too complex"), "{errs}");
+}
+
+/// A `verified_at` that isn't ASCII — e.g. `abcé-01-01` — must not
+/// panic the stale scan (the old slicer cut mid-char).
+#[test]
+fn memory_malformed_timestamp_is_safe() {
+    let (_t, pm, state, _repo) = mem_fx();
+    let (ok, _) = propose(&pm, &state, "bad-date", "rule", &["--scope-project"]);
+    assert!(ok);
+    let (ok, _) = accept(&pm, &state, "bad-date");
+    assert!(ok);
+    let file = pm.join("mem/memory/bad-date.md");
+    let text = std::fs::read_to_string(&file)
+        .unwrap()
+        .replace("verified_at:", "verified_at: abc\u{e9}-01-01 # was ");
+    std::fs::write(&file, text).unwrap();
+
+    let (ok, out) = mem_cli(&pm, &state, &["ls", "--stale", "--json"]);
+    assert!(ok, "{out}");
+    let stale = out["stale"].as_array().unwrap();
+    assert_eq!(stale.len(), 1, "{out}");
+    assert_eq!(stale[0]["slug"], "bad-date");
+    assert_eq!(
+        stale[0]["reason"].as_str().unwrap(),
+        "not verified within the window"
+    );
 }

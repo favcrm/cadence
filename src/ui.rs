@@ -1072,7 +1072,8 @@ fn write_route(
     send: &dyn Fn(Request, HttpResp),
 ) {
     // Memory curation: POST /api/memories/<project>/<slug>/accept|reject
-    // — same guarded write path as the CLI (actor "operator (ui)").
+    // — same guarded write path as the CLI; the commit actor is the
+    // request-attributed one (`request_actor`), as on /api/issues.
     if let Some(tail) = path.strip_prefix("/api/memories/") {
         let mut segs = tail.splitn(3, '/');
         let (key, slug, verb) = (
@@ -1819,7 +1820,7 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                 let project = query("project");
                 let status = query("status");
                 let kind = query("type");
-                let mems = crate::memory::load_all(&pm.dir).unwrap_or_default();
+                let (mems, errors) = crate::memory::load_all_report(&pm.dir);
                 let payload: Vec<Value> = mems
                     .iter()
                     .filter(|m| {
@@ -1832,7 +1833,13 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     })
                     .map(crate::memory::card_json)
                     .collect();
-                send(request, json_response(json!({"memories": payload})));
+                send(
+                    request,
+                    json_response(json!({
+                        "memories": payload,
+                        "memory_errors": errors,
+                    })),
+                );
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
