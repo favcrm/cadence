@@ -597,7 +597,29 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
         Ok(true)
     })?;
     let ids = commit_staged(pm, &staged, &format!("set {}", changed.join(" ")), actor)?;
-    Ok(json!({"id": ids[0], "ids": ids, "set": changed, "committed": true}))
+    // The post-merge reminder (CAD-94): when this set marks an issue
+    // done while a worktree ref is still open, the CLI prints the
+    // one-line `issue finish` hint for each of these ids.
+    let worktree_open: Vec<&String> = if pairs.iter().any(|p| {
+        p.split_once('=').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("status") && v.trim().eq_ignore_ascii_case("done")
+        })
+    }) {
+        staged
+            .iter()
+            .filter(|s| {
+                s.front
+                    .refs
+                    .iter()
+                    .any(|r| r.kind == "worktree" && r.closed != Some(true))
+            })
+            .map(|s| &s.id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(json!({"id": ids[0], "ids": ids, "set": changed,
+              "worktree_open": worktree_open, "committed": true}))
 }
 
 /// `issue tag <ID>… add|rm <tag>…` — add or remove tags on one issue or
@@ -844,12 +866,16 @@ pub fn link(
 
 /// `issue ref <ID> <kind> <url-or-path> [--label x]`. A scheme makes it
 /// `url:`; everything else is a `path:` (previews store publish paths).
+/// `worktree` scopes a `message` ref to the pair it was dispatched
+/// against; other kinds leave it `None`.
+#[allow(clippy::too_many_arguments)]
 pub fn add_ref(
     pm: &Pm,
     id: &str,
     kind: &str,
     target: &str,
     label: Option<&str>,
+    worktree: Option<&str>,
     if_rev: Option<&str>,
     actor: &str,
 ) -> Result<Value> {
@@ -867,6 +893,7 @@ pub fn add_ref(
         path: (!is_url).then(|| target.to_string()),
         label: label.map(str::to_string),
         closed: None,
+        worktree: worktree.map(str::to_string),
     };
     front.refs.push(r);
     save_front(&dir, &front, &body)?;
