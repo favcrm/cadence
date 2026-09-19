@@ -1659,6 +1659,36 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The newest `limit` events for an alias, oldest first — the
+    /// default `cadence events` page. The DESC scan is what the seq
+    /// index gives for free; reversing costs one Vec pass.
+    pub fn events_tail(&self, alias: &str, limit: i64) -> Result<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        self.agent_in(&conn, alias)?;
+        let mut stmt = conn.prepare(
+            "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
+             WHERE alias=? ORDER BY seq DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![alias, limit], row_event)?;
+        let mut events: Vec<Event> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
+    /// The newest `limit` events in the job view, oldest first —
+    /// `events_tail` for the `job events` stream.
+    pub fn job_events_tail(&self, job_id: &str, limit: i64) -> Result<Vec<Event>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
+             WHERE job_id=? ORDER BY seq DESC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![job_id, limit], row_event)?;
+        let mut events: Vec<Event> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
     pub fn messages(&self, alias: &str) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         self.agent_in(&conn, alias)?;

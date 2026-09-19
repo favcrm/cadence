@@ -469,13 +469,16 @@ enum Commands {
         /// Read the job-scoped event view instead of one alias's log.
         #[arg(long)]
         job: Option<String>,
-        /// Return events after this cursor.
-        #[arg(long, default_value_t = 0)]
-        after: i64,
+        /// Return events after this cursor. Omit for the newest page —
+        /// the default shows the latest 50 events, oldest first, with
+        /// the cursor to continue forward from.
+        #[arg(long)]
+        after: Option<i64>,
         /// Seconds to wait for new events per request (0-30).
         #[arg(long, default_value_t = 0)]
         wait: u64,
-        /// Keep streaming new events until interrupted.
+        /// Keep streaming new events until interrupted — starts from
+        /// the newest page, not the beginning of the log.
         #[arg(long)]
         follow: bool,
     },
@@ -496,6 +499,22 @@ enum Commands {
     Ui {
         #[command(subcommand)]
         action: cadence_agent::ui::UiAction,
+    },
+    /// One-screen fleet overview: one row per agent with state, the
+    /// running message's age and head, queued/unknown counts, pane
+    /// verdict for pty agents, and owned tracker issues; a footer
+    /// counts states and lists inboxes with unread messages.
+    Status {
+        /// Scope to one group root (default: the caller's group inside
+        /// a cadence pane, else every registered agent).
+        #[arg(long)]
+        group: Option<String>,
+        /// Emit the same data as JSON instead of the aligned table.
+        #[arg(long)]
+        json: bool,
+        /// Re-render every <secs> until interrupted.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        watch: Option<u64>,
     },
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
@@ -572,11 +591,13 @@ enum JobAction {
     /// verdicts.
     Show { job: String },
     /// The job-scoped event view — every event any alias row recorded
-    /// for this job.
+    /// for this job. Default page is the newest 50; `--after` pages
+    /// forward like `cadence events`.
     Events {
         job: String,
-        #[arg(long, default_value_t = 0)]
-        after: i64,
+        /// Return events after this cursor; omit for the newest page.
+        #[arg(long)]
+        after: Option<i64>,
         /// Seconds to wait for new events per request (0-30).
         #[arg(long, default_value_t = 0)]
         wait: u64,
@@ -731,8 +752,26 @@ enum DaemonAction {
     },
     /// Report daemon health.
     Status,
-    /// Ask the daemon to shut down gracefully.
+    /// Ask the daemon to shut down gracefully, then wait until the
+    /// process has actually exited and released the state-dir lock
+    /// (bounded, 30s) — `stop && start` no longer races the drain.
     Stop,
+    /// Stop, wait for exit, start, and report a before/after table of
+    /// every agent's state (and pane pid for pty agents).
+    Restart {
+        /// First wait until every pty pane probes idle and no managed
+        /// agent has a running message; on timeout nothing is changed.
+        #[arg(long)]
+        when_idle: bool,
+        /// Seconds --when-idle waits for a quiet fleet before giving
+        /// up [default: 1800].
+        #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: u64,
+        /// Also restart the detached `cadence ui` server when one is
+        /// running for this state dir.
+        #[arg(long)]
+        ui: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1146,6 +1185,574 @@ fn daemon_start(state_dir: &Path) -> Result<Value> {
             }
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
             Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Has the daemon released the state-dir singleton? `serve` holds an
+/// exclusive `flock` on `cadence.lock` for its whole life; the kernel
+/// drops it only when the process exits, so a successful non-blocking
+/// lock probe is the exact "old daemon is gone" signal `daemon stop`
+/// must wait for before a `daemon start` can win the same lock.
+fn daemon_lock_free(state_dir: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(state_dir.join("cadence.lock"))
+    else {
+        // No lock file yet — no daemon ever owned this dir.
+        return true;
+    };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    // The File drops here either way — a successful probe must not
+    // keep the lock it was only testing.
+    rc == 0
+}
+
+/// Poll until the daemon releases `cadence.lock`, bounded. Returns
+/// false on timeout.
+fn wait_daemon_exit(state_dir: &Path, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if daemon_lock_free(state_dir) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    daemon_lock_free(state_dir)
+}
+
+/// `daemon stop`: ask for shutdown, then wait until the process has
+/// actually exited — the rpc returns while the daemon is still
+/// draining actors, and an immediate `daemon start` would lose the
+/// singleton race without this wait.
+fn daemon_stop(state_dir: &Path) -> Result<i32> {
+    let result = client::rpc(state_dir, "shutdown", json!({}))?;
+    let exited = wait_daemon_exit(state_dir, 30);
+    let mut out = result;
+    out["exited"] = json!(exited);
+    print_json(&out);
+    if exited {
+        Ok(0)
+    } else {
+        Err(Error::rejected(
+            "daemon did not exit within 30s — it is still draining; \
+             retry `daemon stop` or inspect daemon.log",
+        ))
+    }
+}
+
+/// One status line for the restart wait loops: agents still holding
+/// the fleet busy — pty panes that probe busy, and actor agents with
+/// an in-flight (`running`/`submitted`) message.
+fn busy_agents(state_dir: &Path, agents: &[Value]) -> Vec<String> {
+    let mut busy = Vec::new();
+    for a in agents {
+        let alias = a["alias"].as_str().unwrap_or_default();
+        let provider = a["provider"].as_str().unwrap_or_default();
+        let kind = a["endpoint_kind"].as_str().unwrap_or_default();
+        if !registry::has_actor(provider, kind) {
+            continue;
+        }
+        if kind == "pty" && a["endpoint"].is_string() {
+            match client::rpc(state_dir, "agent_probe", json!({"alias": alias})) {
+                Ok(probe) if !probe["idle"].as_bool().unwrap_or(false) => busy.push(format!(
+                    "{alias}(busy: {})",
+                    probe["reason"].as_str().unwrap_or("pane busy")
+                )),
+                _ => {}
+            }
+        }
+        // In-flight turn on any actor endpoint — the pane probe can
+        // read idle between paste and render, so the message row is
+        // the authoritative in-flight signal.
+        if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+            let inflight = show["messages"]
+                .as_array()
+                .map(|ms| {
+                    ms.iter().any(|m| {
+                        matches!(
+                            m["state"].as_str().unwrap_or_default(),
+                            "running" | "submitted"
+                        )
+                    })
+                })
+                .unwrap_or(false);
+            if inflight {
+                busy.push(format!("{alias}(running message)"));
+            }
+        }
+    }
+    busy
+}
+
+/// The detached UI's `ui run` argv from /proc — restarting the board
+/// keeps the host/port/dist/allow-hosts it was actually started with
+/// rather than assuming the defaults.
+fn ui_run_args(pid: i32) -> (String, u16, Option<std::path::PathBuf>, Vec<String>) {
+    let mut host = "127.0.0.1".to_string();
+    let mut port = 3010u16;
+    let mut dist = None;
+    let mut allow_hosts = Vec::new();
+    let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return (host, port, dist, allow_hosts);
+    };
+    let args: Vec<String> = bytes
+        .split(|b| *b == 0)
+        .filter_map(|s| String::from_utf8(s.to_vec()).ok())
+        .collect();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" if i + 1 < args.len() => host = args[i + 1].clone(),
+            "--port" if i + 1 < args.len() => {
+                port = args[i + 1].parse().unwrap_or(3010);
+            }
+            "--dist" if i + 1 < args.len() => {
+                dist = Some(std::path::PathBuf::from(&args[i + 1]));
+            }
+            "--allow-host" if i + 1 < args.len() => allow_hosts.push(args[i + 1].clone()),
+            _ => {}
+        }
+        i += 1;
+    }
+    (host, port, dist, allow_hosts)
+}
+
+/// `daemon restart`: stop, wait for the process to exit (the
+/// singleton lock is the truth), start, wait until every agent that
+/// was live before settles out of `starting`/`offline`, then print a
+/// before/after table. `--when-idle` gates the whole thing on a
+/// quiet fleet first; `--ui` bounces the detached board server too.
+fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> Result<i32> {
+    let before = client::rpc(state_dir, "agent_list", json!({}))?["agents"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if when_idle {
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        let mut next_report = Instant::now();
+        loop {
+            let agents = client::rpc(state_dir, "agent_list", json!({}))?["agents"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let busy = busy_agents(state_dir, &agents);
+            if busy.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::rejected(format!(
+                    "fleet still busy after {timeout}s — restart aborted \
+                     before touching anything: {}",
+                    busy.join(", ")
+                )));
+            }
+            if Instant::now() >= next_report {
+                eprintln!("when-idle: waiting on {}", busy.join(", "));
+                next_report = Instant::now() + Duration::from_secs(30);
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    // --ui restarts the detached board server when one was running —
+    // snapshot before the daemon goes down so a ui that dies mid-way
+    // isn't "rediscovered".
+    let ui_was_running = ui
+        .then(|| cadence_agent::ui::detached_pid(state_dir))
+        .flatten();
+    // Stop: the shutdown rpc returns while the daemon drains; the
+    // lock probe is the real exit. A daemon that was never running
+    // (lock free, socket dead) skips straight to start.
+    let was_running = client::rpc(state_dir, "shutdown", json!({})).is_ok();
+    if was_running && !wait_daemon_exit(state_dir, 30) {
+        return Err(Error::rejected(
+            "daemon did not exit within 30s — restart aborted; the old \
+             process is still draining (see daemon.log)",
+        ));
+    }
+    if !was_running && !daemon_lock_free(state_dir) {
+        return Err(Error::rejected(
+            "daemon owns the state-dir lock but does not answer the \
+             socket — inspect daemon.log before restarting",
+        ));
+    }
+    daemon_start(state_dir)?;
+    // Wait until every agent that was live before leaves the
+    // transitional states — `starting` (actor up, endpoint not open)
+    // and `offline` (actor exited under shutdown). Stopped and fenced
+    // agents keep their state; the wait is about liveness settling.
+    let live_before: Vec<String> = before
+        .iter()
+        .filter(|a| {
+            !matches!(
+                a["state"].as_str().unwrap_or_default(),
+                "stopped" | "attention" | "offline"
+            )
+        })
+        .filter_map(|a| a["alias"].as_str().map(str::to_string))
+        .collect();
+    let settle_deadline = Instant::now() + Duration::from_secs(120);
+    let after = loop {
+        let after = client::rpc(state_dir, "agent_list", json!({}))?["agents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let unsettled = after.iter().any(|a| {
+            let alias = a["alias"].as_str().unwrap_or_default();
+            live_before.iter().any(|l| l == alias)
+                && matches!(
+                    a["state"].as_str().unwrap_or_default(),
+                    "starting" | "offline"
+                )
+        });
+        if !unsettled || Instant::now() >= settle_deadline {
+            break after;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    if let Some(ui_pid) = ui_was_running {
+        cadence_agent::ui::run_cli(state_dir, &cadence_agent::ui::UiAction::Stop)?;
+        let (host, port, dist, allow_hosts) = ui_run_args(ui_pid);
+        cadence_agent::ui::run_cli(
+            state_dir,
+            &cadence_agent::ui::UiAction::Start {
+                host,
+                port,
+                dist,
+                allow_hosts,
+            },
+        )?;
+        println!("ui: restarted");
+    }
+    // Before/after table: state then, state now, and for pty agents
+    // whether the pane pid survived. A changed pane pid or an agent
+    // that came back fenced makes the command exit non-zero.
+    let before_by_alias: std::collections::HashMap<&str, &Value> = before
+        .iter()
+        .filter_map(|a| a["alias"].as_str().map(|al| (al, a)))
+        .collect();
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    let mut bad = false;
+    for a in &after {
+        let alias = a["alias"].as_str().unwrap_or_default().to_string();
+        let b = before_by_alias.get(alias.as_str());
+        let before_state = b
+            .and_then(|b| b["state"].as_str())
+            .unwrap_or("-")
+            .to_string();
+        let after_state = a["state"].as_str().unwrap_or_default().to_string();
+        let pane = if a["endpoint_kind"].as_str() == Some("pty") {
+            let old = b.and_then(|b| b["pid"].as_u64()).unwrap_or(0);
+            let new = a["pid"].as_u64().unwrap_or(0);
+            if old == 0 && new == 0 {
+                "-".to_string()
+            } else if old == new {
+                "same".to_string()
+            } else {
+                bad = true;
+                format!("CHANGED {old}→{new}")
+            }
+        } else {
+            "-".to_string()
+        };
+        if after_state == "attention" {
+            bad = true;
+        }
+        rows.push((alias, before_state, after_state, pane));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let w = rows.iter().map(|r| r.0.len()).max().unwrap_or(5).max(5);
+    println!(
+        "{:<w$}  {:<12}  {:<12}  PANE",
+        "AGENT",
+        "BEFORE",
+        "AFTER",
+        w = w
+    );
+    for (alias, before_state, after_state, pane) in &rows {
+        println!(
+            "{alias:<w$}  {before_state:<12}  {after_state:<12}  {pane}",
+            w = w
+        );
+    }
+    if bad {
+        Err(Error::rejected(
+            "restart completed but not cleanly — see the table above \
+             (pane pid changed or agent came back fenced)",
+        ))
+    } else {
+        Ok(0)
+    }
+}
+
+/// `cadence status` — build the one-screen overview: per-agent rows
+/// (state, running message age+head, queued/unknown, dead/resumable,
+/// pane verdict, owned issues) plus the footer. `--group` scopes to
+/// one root; unset scopes like `agent list` (the caller's group inside
+/// a pane, everything otherwise).
+fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
+    let mut agents = list_agents(state_dir, group.is_some())?["agents"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(root) = group {
+        agents.retain(|a| {
+            a["alias"].as_str() == Some(root) || a["params"]["upstream"].as_str() == Some(root)
+        });
+    }
+    // Tracker issues per owner — only when a tracker is reachable.
+    // `views` gives the derived status the board shows; `load_all`
+    // stays a filesystem read, never a git walk.
+    let pm = cadence_agent::issue::Pm::open_default().ok();
+    let tracker = pm.is_some();
+    let mut owned_issues: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    if let Some(pm) = &pm {
+        let issues = cadence_agent::issue::board::load_all(&pm.dir, None).unwrap_or_default();
+        let views = cadence_agent::issue::board::views(&pm.config.notes_dir(), issues);
+        for v in views {
+            if !matches!(v.status.as_str(), "doing" | "review") {
+                continue;
+            }
+            if let Some(owner) = &v.issue.front.owner {
+                owned_issues
+                    .entry(owner.clone())
+                    .or_default()
+                    .push(v.issue.front.id.clone());
+            }
+        }
+        for ids in owned_issues.values_mut() {
+            ids.sort();
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let mut rows = Vec::new();
+    let mut unread_inboxes = Vec::new();
+    for a in &agents {
+        let alias = a["alias"].as_str().unwrap_or_default().to_string();
+        let provider = a["provider"].as_str().unwrap_or_default();
+        let kind = a["endpoint_kind"].as_str().unwrap_or_default();
+        let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
+            .unwrap_or_else(|_| json!({"messages": [], "queued": 0, "unknown": 0}));
+        let queued = show["queued"].as_i64().unwrap_or(0);
+        let unknown = show["unknown"].as_i64().unwrap_or(0);
+        if provider == registry::INBOX && queued > 0 {
+            unread_inboxes.push(alias.clone());
+        }
+        // The in-flight message: `running` (managed turn live) or
+        // `submitted` (pty paste acknowledged, report pending). Age
+        // reads from `started` — the dispatch time — falling back to
+        // `created` for a queued-claim race.
+        let running = show["messages"]
+            .as_array()
+            .and_then(|ms| {
+                ms.iter().find(|m| {
+                    matches!(
+                        m["state"].as_str().unwrap_or_default(),
+                        "running" | "submitted"
+                    )
+                })
+            })
+            .map(|m| {
+                let started = m["started"]
+                    .as_f64()
+                    .or(m["created"].as_f64())
+                    .unwrap_or(now);
+                let head = m["body"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(50)
+                    .collect::<String>();
+                json!({"id": m["id"], "age_secs": (now - started).max(0.0) as u64,
+                       "text": head})
+            });
+        // One probe per pty agent per invocation — and only for an
+        // agent that actually has a pane (a live endpoint); a stopped
+        // or paneless pty agent skips the tmux call entirely.
+        let pane = if kind == "pty" && a["endpoint"].is_string() {
+            client::rpc(state_dir, "agent_probe", json!({"alias": alias}))
+                .ok()
+                .map(|p| {
+                    json!({"idle": p["idle"], "reason": p["reason"],
+                    "verdict": if p["idle"].as_bool().unwrap_or(false) {
+                        "idle".to_string()
+                    } else {
+                        format!("busy: {}", p["reason"].as_str().unwrap_or(""))
+                    }})
+                })
+        } else {
+            None
+        };
+        let issues = owned_issues.get(&alias).cloned().unwrap_or_default();
+        rows.push(json!({
+            "alias": alias,
+            "provider": provider,
+            "endpoint_kind": kind,
+            "state": a["state"].as_str().unwrap_or_default(),
+            "dead": a["dead"].as_bool().unwrap_or(false),
+            "resumable": a["resumable"].as_bool().unwrap_or(false),
+            "running": running,
+            "queued": queued,
+            "unknown": unknown,
+            "pane": pane,
+            "issues": issues,
+        }));
+    }
+    let mut states: serde_json::Map<String, Value> = serde_json::Map::new();
+    for r in &rows {
+        let state = r["state"].as_str().unwrap_or("?");
+        let count = states.get(state).and_then(Value::as_i64).unwrap_or(0) + 1;
+        states.insert(state.to_string(), json!(count));
+    }
+    Ok(json!({
+        "agents": rows,
+        "footer": {
+            "states": states,
+            "unread_inboxes": unread_inboxes,
+        },
+        "tracker": tracker,
+    }))
+}
+
+/// Aligned-table rendering of `status_view` — the TTY default.
+fn print_status_table(view: &Value) {
+    let agents = view["agents"].as_array().cloned().unwrap_or_default();
+    let rows: Vec<[String; 9]> = agents
+        .iter()
+        .map(|a| {
+            let running = if a["running"].is_object() {
+                format!(
+                    "{}m {}",
+                    (a["running"]["age_secs"].as_u64().unwrap_or(0) + 30) / 60,
+                    a["running"]["text"].as_str().unwrap_or_default()
+                )
+            } else {
+                "-".to_string()
+            };
+            let mut flags = Vec::new();
+            if a["state"].as_str() == Some("attention") {
+                flags.push("fenced");
+            }
+            if a["dead"].as_bool().unwrap_or(false) {
+                flags.push("dead");
+            }
+            if a["resumable"].as_bool().unwrap_or(false) {
+                flags.push("resumable");
+            }
+            let pane = a["pane"]["verdict"].as_str().unwrap_or("-").to_string();
+            let issues = a["issues"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            [
+                a["alias"].as_str().unwrap_or_default().to_string(),
+                format!(
+                    "{}/{}",
+                    a["provider"].as_str().unwrap_or_default(),
+                    a["endpoint_kind"].as_str().unwrap_or_default()
+                ),
+                a["state"].as_str().unwrap_or_default().to_string(),
+                running,
+                a["queued"].as_i64().unwrap_or(0).to_string(),
+                a["unknown"].as_i64().unwrap_or(0).to_string(),
+                if flags.is_empty() {
+                    "-".to_string()
+                } else {
+                    flags.join(",")
+                },
+                pane,
+                if issues.is_empty() {
+                    "-".to_string()
+                } else {
+                    issues
+                },
+            ]
+        })
+        .collect();
+    let headers = [
+        "ALIAS", "ENDPOINT", "STATE", "RUNNING", "QUE", "UNK", "FLAGS", "PANE", "ISSUES",
+    ];
+    let mut widths = headers.map(str::len);
+    for r in &rows {
+        for (i, cell) in r.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    let line = |cells: &[String; 9]| {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let head: [String; 9] = headers.map(|h| h.to_string());
+    println!("{}", line(&head));
+    for r in &rows {
+        println!("{}", line(r));
+    }
+    // Footer: counts by state + inboxes holding unread messages.
+    let states = view["footer"]["states"]
+        .as_object()
+        .map(|m| {
+            let mut pairs: Vec<(&String, &Value)> = m.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{k}:{}", v.as_i64().unwrap_or(0)))
+                .collect::<Vec<_>>()
+                .join("  ")
+        })
+        .unwrap_or_else(|| "none".to_string());
+    println!();
+    println!("agents: {states}");
+    let unread = view["footer"]["unread_inboxes"]
+        .as_array()
+        .map(|v| v.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !unread.is_empty() {
+        println!("unread: {}", unread.join(", "));
+    }
+    if !view["tracker"].as_bool().unwrap_or(false) {
+        println!("tracker: unreachable (no pm dir) — issue column empty");
+    }
+}
+
+fn run_status(
+    state_dir: &Path,
+    group: Option<&str>,
+    json_out: bool,
+    watch: Option<u64>,
+) -> Result<i32> {
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    loop {
+        let view = status_view(state_dir, group)?;
+        if json_out {
+            print_json(&view);
+        } else {
+            print_status_table(&view);
+        }
+        let Some(secs) = watch else {
+            return Ok(0);
+        };
+        std::thread::sleep(Duration::from_secs(secs));
+        if tty {
+            // In-place refresh — a watch is one screen, not a scroll.
+            print!("\x1b[2J\x1b[H");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
     }
 }
@@ -1680,11 +2287,12 @@ fn run() -> Result<i32> {
                 print_json(&health);
                 Ok(0)
             }
-            DaemonAction::Stop => {
-                let result = client::rpc(&state_dir, "shutdown", json!({}))?;
-                print_json(&result);
-                Ok(0)
-            }
+            DaemonAction::Stop => daemon_stop(&state_dir),
+            DaemonAction::Restart {
+                when_idle,
+                timeout,
+                ui,
+            } => daemon_restart(&state_dir, when_idle, timeout, ui),
         },
         Commands::Agent { action } => {
             let result = match action {
@@ -2286,7 +2894,22 @@ fn run() -> Result<i32> {
                     return Err(Error::rejected("events needs an alias or --job <job>"))
                 }
             };
-            let mut cursor = after;
+            // No --after: the default page is the newest 50 (oldest
+            // first within it). --follow anchors there too — history
+            // below the page is a `has_older` flag, not a flood.
+            let mut cursor = match after {
+                Some(cursor) => cursor,
+                None => {
+                    let mut req = key.clone();
+                    req["tail"] = json!(true);
+                    let page = client::rpc(&state_dir, method, req)?;
+                    print_json(&page);
+                    if !follow {
+                        return Ok(0);
+                    }
+                    page.get("cursor").and_then(Value::as_i64).unwrap_or(0)
+                }
+            };
             loop {
                 let mut req = key.clone();
                 req["after"] = json!(cursor);
@@ -2340,6 +2963,9 @@ fn run() -> Result<i32> {
         }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
+        Commands::Status { group, json, watch } => {
+            run_status(&state_dir, group.as_deref(), json, watch)
+        }
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
 }
@@ -2407,7 +3033,19 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
             wait,
             follow,
         } => {
-            let mut cursor = *after;
+            // Same default as `cadence events`: no --after means the
+            // newest page, then forward paging from its cursor.
+            let mut cursor = match after {
+                Some(cursor) => *cursor,
+                None => {
+                    let page = rpc("job_events", json!({"job": job, "tail": true}))?;
+                    print_json(&page);
+                    if !*follow {
+                        return Ok(0);
+                    }
+                    page.get("cursor").and_then(Value::as_i64).unwrap_or(0)
+                }
+            };
             loop {
                 let page = rpc(
                     "job_events",

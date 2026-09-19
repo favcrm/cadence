@@ -105,6 +105,23 @@ cadence agent attach <slug>     # print the tmux attach command (--run to exec)
 cadence agent register obs --provider inbox   # durable mailbox, no process
 cadence inbox obs [--wait 30]   # drain it: one JSON object per message,
                                 #  each completed via=inbox_read (empty = silent)
+
+cadence status                  # one screen: every agent's state, running
+                                #  message age+head, queued/unknown counts,
+                                #  pane verdict, tracker issues, unread inboxes
+                                #  (--group <pm> scopes to a group, --json,
+                                #   --watch <secs> redraws; one probe per
+                                #   pty pane, none for the rest)
+cadence events <slug>           # newest 50 events (oldest first) + cursor;
+                                #  --after <n> pages forward, --follow streams
+                                #  from the tail; --job <job> same shape
+cadence daemon restart          # stop (waits for exit), start, wait for live
+                                #  agents, then a before/after table — a pty
+                                #  pane whose pid changed fails the run
+                                #  (--when-idle waits for idle panes first,
+                                #   --timeout <secs>, --ui bounces the UI)
+cadence daemon stop             # shutdown + wait for the process to release
+                                #  the state-dir lock — `stop && start` is safe
 ```
 
 The **board** tracks issues as folders of Markdown files under `~/pm`
@@ -195,7 +212,7 @@ The hot path is verb-first — `devin`, `codex`, `join`, `attach`, `send`,
 `resume`, `stop`, `inbox` — while `agent`, `message` and `daemon` hold
 the admin subcommands (register/list/show/ready/capture/probe/set/
 remove/gc/bootstrap/unfence/requests/respond, send/ask/ack/result/
-reconcile, start/run/status/stop).
+reconcile, start/run/status/stop/restart).
 Everywhere a command takes an agent name, an alias or a provider-native
 session id resolves the same way.
 
