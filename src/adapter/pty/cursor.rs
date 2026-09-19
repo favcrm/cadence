@@ -116,13 +116,21 @@ pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
 
 /// Write `contents` to `path` atomically: a same-directory temp file,
 /// fsync, then rename — a crash mid-write leaves the original bytes
-/// (or a `.cadence-tmp` leftover a later merge simply overwrites),
-/// never a torn config. `mode` is applied at creation so the
-/// auth-carrying file is never born world-readable.
+/// (or a `.cadence-tmp.*` leftover the next merge's unique name never
+/// collides with), never a torn config. The temp name carries pid +
+/// uuid so two concurrent merges sharing the config cannot truncate
+/// and rename each other's temp into a torn file. `mode` is applied
+/// after creation so the auth-carrying file is never umask-masked or
+/// born world-readable.
 fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = PathBuf::from(format!("{}.cadence-tmp", path.display()));
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let tmp = PathBuf::from(format!(
+        "{}.cadence-tmp.{}.{}",
+        path.display(),
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -130,9 +138,16 @@ fn write_atomic(path: &Path, contents: &str, mode: u32) -> Result<()> {
         .mode(mode)
         .open(&tmp)
         .map_err(|e| Error::provider(format!("cannot write {}: {e}", tmp.display())))?;
-    f.write_all(contents.as_bytes())
-        .and_then(|()| f.sync_all())
-        .map_err(|e| Error::provider(format!("cannot write {}: {e}", tmp.display())))?;
+    // mode() is umask-masked at creation — apply it explicitly.
+    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+    if let Err(e) = f.write_all(contents.as_bytes()).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::provider(format!(
+            "cannot write {}: {e}",
+            tmp.display()
+        )));
+    }
     std::fs::rename(&tmp, path)
         .map_err(|e| Error::provider(format!("cannot replace {}: {e}", path.display())))
 }
@@ -461,7 +476,20 @@ impl CursorProfile {
     /// bytes is written before every modification.
     fn ensure_cadence_allowlist(&self) -> Result<()> {
         let path = self.cli_config_path();
-        let original = match std::fs::read_to_string(&path) {
+        // A symlinked config must be written through, never replaced:
+        // resolve the link so `.bak` and the temp+rename land beside
+        // the target and the link itself survives. `read_link` also
+        // covers a dangling link — writing the (missing) target is
+        // what an ordinary write through the link would have done.
+        let write_path = match std::fs::canonicalize(&path) {
+            Ok(resolved) => resolved,
+            Err(_) => match std::fs::read_link(&path) {
+                Ok(target) if target.is_absolute() => target,
+                Ok(target) => path.parent().unwrap_or_else(|| Path::new(".")).join(target),
+                Err(_) => path.clone(),
+            },
+        };
+        let original = match std::fs::read_to_string(&write_path) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
@@ -521,16 +549,16 @@ impl CursorProfile {
         // The new file keeps the source's mode; a brand-new config is
         // born owner-only (it will hold the same auth-adjacent data).
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path)
+        let mode = std::fs::metadata(&write_path)
             .map(|m| m.permissions().mode() & 0o777)
             .unwrap_or(0o600);
         if let Some(text) = &original {
-            write_backup(&path, text, mode)?;
-        } else if let Some(parent) = path.parent() {
+            write_backup(&write_path, text, mode)?;
+        } else if let Some(parent) = write_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::provider(format!("cannot create {}: {e}", parent.display())))?;
         }
-        write_atomic(&path, &format!("{rendered}\n"), mode)
+        write_atomic(&write_path, &format!("{rendered}\n"), mode)
     }
 
     /// Every live (pid, chat) attachment on the host: the open
@@ -610,8 +638,11 @@ impl TuiProfile for CursorProfile {
             .map(|(_, chat)| chat)
     }
 
-    /// Adopt the pane's owned chat, refusing a mismatch with the
-    /// wanted one — a changed owner fails closed, never adopts.
+    /// Adopt the pane's owned chat only when a stored id already names
+    /// it — a wanted chat adopts back, a changed owner fails closed.
+    /// With no desired id there is nothing to adopt: cursor chats are
+    /// disposable, so an unrecorded pane session is refused and the
+    /// next open mints a fresh one instead.
     fn resolve_session(&self, desired: Option<&str>, found: Option<String>) -> Result<String> {
         match (desired, found) {
             (Some(want), Some(found)) if *want == found => Ok(found),
@@ -622,9 +653,19 @@ impl TuiProfile for CursorProfile {
             (Some(want), None) => Err(Error::provider(format!(
                 "pane has no live Cursor chat for '{want}'"
             ))),
-            (None, Some(found)) => Ok(found),
+            (None, Some(found)) => Err(Error::provider(format!(
+                "pane owns chat '{found}' but no chat was recorded — \
+                 refusing to adopt an unrecorded session"
+            ))),
             (None, None) => Err(Error::provider("pane exists but owns no Cursor chat")),
         }
+    }
+
+    /// Cursor chats are disposable mintable ids — when a stored chat
+    /// provably cannot resume, the daemon may drop it and let the next
+    /// open mint a fresh one.
+    fn session_is_disposable(&self) -> bool {
+        true
     }
 
     /// Refuse takeover: a live attachment to `session` outside our
@@ -874,12 +915,12 @@ mod tests {
         assert!(!p.idle && p.approval_menu);
     }
 
-    fn profile(params: serde_json::Value) -> CursorProfile {
+    fn profile(dir: &std::path::Path, params: serde_json::Value) -> CursorProfile {
         CursorProfile {
             // A real temp dir — `launch_command` merges the allowlist
             // into `<chats>/../cli-config.json`, so a bogus path would
             // write a config at the filesystem root in tests.
-            chats_dir: tempfile::tempdir().unwrap().keep().join("chats"),
+            chats_dir: dir.join("chats"),
             command: "cursor-agent".to_string(),
             model: params
                 .get("model")
@@ -894,7 +935,11 @@ mod tests {
 
     #[test]
     fn launch_argv_resume_and_flags() {
-        let p = profile(json!({"model": "grok-4", "permission_mode": "force"}));
+        let dir = tempfile::tempdir().unwrap();
+        let p = profile(
+            dir.path(),
+            json!({"model": "grok-4", "permission_mode": "force"}),
+        );
         assert_eq!(
             p.launch_command(Some("chat-1")).unwrap(),
             format!(
@@ -902,19 +947,19 @@ mod tests {
                 p.command
             )
         );
-        let p = profile(json!({"permission_mode": "auto-review"}));
+        let p = profile(dir.path(), json!({"permission_mode": "auto-review"}));
         assert_eq!(
             p.launch_command(Some("chat-2")).unwrap(),
             format!("{} --trust --auto-review --resume 'chat-2'", p.command)
         );
         // An unset mode keeps cursor's own default — no flag emitted.
-        let p = profile(json!({}));
+        let p = profile(dir.path(), json!({}));
         assert_eq!(
             p.launch_command(Some("chat-3")).unwrap(),
             format!("{} --trust --resume 'chat-3'", p.command)
         );
         // Values are shell-quoted even if hand-edited past validation.
-        let p = profile(json!({"permission_mode": "bogus; rm -rf /"}));
+        let p = profile(dir.path(), json!({"permission_mode": "bogus; rm -rf /"}));
         assert_eq!(
             p.launch_command(Some("c'hat")).unwrap(),
             format!("{} --trust --resume 'c'\\''hat'", p.command)
@@ -1091,9 +1136,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("cli-config.json");
         std::fs::write(&config, "{\"permissions\": {\"allow\": [\"Shell(ls)\"]}}").unwrap();
-        // A crash mid-write leaves the temp sibling behind and the
-        // original bytes intact — never a torn config.
-        let tmp = PathBuf::from(format!("{}.cadence-tmp", config.display()));
+        // A crash mid-write leaves a uniquely-named temp sibling behind
+        // and the original bytes intact — never a torn config.
+        let tmp = PathBuf::from(format!(
+            "{}.cadence-tmp.{}.{}",
+            config.display(),
+            std::process::id(),
+            "deadbeefdeadbeefdeadbeefdeadbeef"
+        ));
         std::fs::write(&tmp, "{\"partial json that never").unwrap();
         assert_eq!(
             std::fs::read_to_string(&config).unwrap(),
@@ -1101,9 +1151,8 @@ mod tests {
         );
         let p = profile_in(dir.path());
         p.ensure_cadence_allowlist().unwrap();
-        // The stale temp is consumed by the rename; the merged file
-        // is whole and ordered.
-        assert!(!tmp.exists());
+        // The stale temp is abandoned, not consumed — the next merge
+        // uses a fresh unique name; the merged file is whole and ordered.
         assert_eq!(allow_entries(dir.path()), ["Shell(ls)", "Shell(cadence)"]);
         // The `.bak` kept the original bytes — and its mode.
         assert_eq!(
@@ -1128,13 +1177,56 @@ mod tests {
         assert_eq!(mode(&dir.path().join("cli-config.json.bak")), 0o640);
     }
 
+    #[test]
+    fn allowlist_merge_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-config.json");
+        std::fs::write(&real, "{\"permissions\": {\"allow\": [\"Shell(ls)\"]}}").unwrap();
+        let link = dir.path().join("cli-config.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let p = profile_in(dir.path());
+        p.ensure_cadence_allowlist().unwrap();
+        // The link survived as a link — the merge landed on the
+        // target, not on a regular file that replaced the symlink.
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(allow_entries(dir.path()), ["Shell(ls)", "Shell(cadence)"]);
+        // `.bak` and the atomic temp landed beside the target.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("real-config.json.bak")).unwrap(),
+            "{\"permissions\": {\"allow\": [\"Shell(ls)\"]}}"
+        );
+    }
+
+    #[test]
+    fn unrecorded_pane_chat_is_never_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = profile_in(dir.path());
+        // (None, Some): a pane holding a chat nobody recorded — e.g.
+        // after the stored id was cleared — must not be adopted.
+        // Refusing keeps the boundary fail-closed; the next open
+        // mints a fresh chat.
+        let err = p
+            .resolve_session(None, Some("foreign-chat".to_string()))
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to adopt"), "{err}");
+        // The wanted-chat cases are unchanged.
+        assert_eq!(
+            p.resolve_session(Some("a"), Some("a".to_string())).unwrap(),
+            "a"
+        );
+        assert!(p.resolve_session(Some("a"), Some("b".to_string())).is_err());
+    }
+
     /// `prepare_session` runs `sh -c "<command> create-chat"` — a
     /// fabricated command prints whatever shape the test needs. It
     /// also merges the allowlist first, so the profile needs a real
-    /// tempdir (`<chats>/../cli-config.json`), not a bogus path.
+    /// tempdir (`<chats>/../cli-config.json`), not a bogus path. The
+    /// dir only has to outlive the call: the merge and the mint both
+    /// finish before `prepare_session` returns.
     fn mint_with(command: &str) -> crate::error::Result<Option<String>> {
+        let dir = tempfile::tempdir().unwrap();
         CursorProfile {
-            chats_dir: tempfile::tempdir().unwrap().keep().join("chats"),
+            chats_dir: dir.path().join("chats"),
             command: command.to_string(),
             model: None,
             permission_mode: None,

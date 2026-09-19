@@ -103,6 +103,12 @@ pub struct EndpointSpec {
     pub doctor_caps: &'static [&'static str],
     /// Provider binaries `doctor` probes: `(program, version-args)`.
     pub probe_bins: &'static [(&'static str, &'static [&'static str])],
+    /// Whether a stored native session id may be discarded when a
+    /// resume proves it can never come back — the daemon-side gate for
+    /// `cadence/session_resume_failed`, paired with the profile's
+    /// `session_is_disposable`. True only for cursor chats: cheap
+    /// mintable ids with no operator-chosen meaning.
+    pub session_disposable: bool,
     /// This pair is the provider's launch-verb endpoint kind
     /// (`cadence codex` → managed-ws, never managed stdio).
     pub launch_default: bool,
@@ -135,6 +141,7 @@ pub static SPECS: &[EndpointSpec] = &[
         capabilities: &["managed_codex_stdio"],
         doctor_caps: &["managed_codex_stdio"],
         probe_bins: &[("codex", &["--version"])],
+        session_disposable: false,
         launch_default: false,
         internal: false,
     },
@@ -158,6 +165,7 @@ pub static SPECS: &[EndpointSpec] = &[
         capabilities: &["managed_codex_ws"],
         doctor_caps: &["managed_codex_ws"],
         probe_bins: &[("codex", &["--version"])],
+        session_disposable: false,
         launch_default: true,
         internal: false,
     },
@@ -201,6 +209,7 @@ pub static SPECS: &[EndpointSpec] = &[
         capabilities: &["managed_claude_stream"],
         doctor_caps: &["managed_claude_stream"],
         probe_bins: &[("claude", &["--version"])],
+        session_disposable: false,
         launch_default: true,
         internal: false,
     },
@@ -235,6 +244,7 @@ pub static SPECS: &[EndpointSpec] = &[
         capabilities: &["pty_claude_tmux", "pty_verified_autoready"],
         doctor_caps: &["pty_claude_tmux"],
         probe_bins: &[("claude", &["--version"]), ("tmux", &["-V"])],
+        session_disposable: false,
         launch_default: false,
         internal: false,
     },
@@ -266,6 +276,7 @@ pub static SPECS: &[EndpointSpec] = &[
         capabilities: &["pty_devin_tmux", "pty_verified_autoready"],
         doctor_caps: &["pty_devin_tmux"],
         probe_bins: &[("devin", &["--version"]), ("tmux", &["-V"])],
+        session_disposable: false,
         launch_default: true,
         internal: false,
     },
@@ -298,6 +309,7 @@ pub static SPECS: &[EndpointSpec] = &[
         capabilities: &["pty_cursor_tmux", "pty_verified_autoready"],
         doctor_caps: &["pty_cursor_tmux"],
         probe_bins: &[("cursor-agent", &["--version"]), ("tmux", &["-V"])],
+        session_disposable: true,
         launch_default: true,
         internal: false,
     },
@@ -327,6 +339,7 @@ pub static SPECS: &[EndpointSpec] = &[
         capabilities: &[],
         doctor_caps: &[],
         probe_bins: &[],
+        session_disposable: false,
         launch_default: false,
         internal: true,
     },
@@ -350,6 +363,7 @@ pub static SPECS: &[EndpointSpec] = &[
         capabilities: &["inbox_endpoint"],
         doctor_caps: &["native_inbox_endpoint"],
         probe_bins: &[],
+        session_disposable: false,
         launch_default: false,
         internal: false,
     },
@@ -373,6 +387,7 @@ pub static SPECS: &[EndpointSpec] = &[
         capabilities: &["fake_provider_tests"],
         doctor_caps: &["fake_provider_tests"],
         probe_bins: &[],
+        session_disposable: false,
         launch_default: true,
         internal: false,
     },
