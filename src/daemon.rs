@@ -3215,9 +3215,23 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
             // fences — a sibling in-flight message swept it into
             // `unknown` — has no actor left to prove the pane.
             // Unverified `running` is just `unknown`: fence it too.
+            // Discard its adoption candidates as well — a resume after
+            // unfence must be an ordinary open (fresh generation), not
+            // an adopt of entries whose panes were never re-proven.
             let _ = shared
                 .store
                 .orphan_running(&agent.alias, "agent fenced at restart; turn never verified");
+            if let Some(entries) = shared.store.take_adoption(&agent.alias) {
+                for e in entries {
+                    let _ = shared.store.event_public(
+                        &agent.alias,
+                        "turn_adopt_refused",
+                        json!({"message": e.message_id,
+                               "turn_id": e.turn_id,
+                               "reason": "agent fenced at restart"}),
+                    );
+                }
+            }
             let (reason, error) = if unknown {
                 (
                     "unknown messages await reconcile",

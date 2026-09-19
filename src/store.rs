@@ -683,6 +683,44 @@ impl Store {
                 }
             }
         }
+        // One pane proof covers a whole alias list, so every entry in
+        // it must describe the SAME endpoint facts — `shutdown_entries`
+        // writes one tuple per alias, but a hand-built or corrupt
+        // marker can carry divergent records. Refuse the list as a
+        // unit: adopting `entries[0]`'s pane for a sibling recorded
+        // elsewhere would be an unverified open.
+        {
+            let mut by_alias: std::collections::HashMap<&str, Vec<usize>> =
+                std::collections::HashMap::new();
+            for (i, e) in kept.iter().enumerate() {
+                by_alias.entry(e.alias.as_str()).or_default().push(i);
+            }
+            let mut drop: Vec<usize> = Vec::new();
+            for idxs in by_alias.values() {
+                let first = kept[idxs[0]];
+                let divergent = idxs[1..].iter().any(|&i| {
+                    kept[i].generation != first.generation
+                        || kept[i].pane_pid != first.pane_pid
+                        || kept[i].native_session != first.native_session
+                });
+                if divergent {
+                    drop.extend_from_slice(idxs);
+                }
+            }
+            if !drop.is_empty() {
+                drop.sort_unstable();
+                for i in drop.into_iter().rev() {
+                    let e = kept.remove(i);
+                    Self::event(
+                        &tx,
+                        &e.alias,
+                        "turn_adopt_refused",
+                        json!({"message": e.message_id, "turn_id": e.turn_id,
+                               "reason": "recorded pane facts disagree across the alias"}),
+                    )?;
+                }
+            }
+        }
         {
             let mut adoptions = self.adoptions.lock().unwrap();
             for e in &kept {
@@ -749,7 +787,9 @@ impl Store {
                 &format!(
                     "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL,
                         generation=NULL
-                     WHERE alias IN ({placeholders})"
+                     WHERE alias IN ({placeholders})
+                       AND state NOT IN ('stopped','attention')
+                       AND endpoint_kind != 'inbox'"
                 ),
                 rusqlite::params_from_iter(kept_aliases.iter()),
             )?;

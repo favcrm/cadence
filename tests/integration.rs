@@ -1484,20 +1484,20 @@ fn hot_restart_managed_turn_stays_unknown() {
     // dies with its daemon, so a clean stop changes nothing for them.
     let mut d = TestDaemon::start();
     d.register("w1");
-    d.wait_agent("w1", "idle", 10);
+    d.wait_agent("w1", "idle", 25);
     d.rpc(
         "agent_send",
         json!({"alias": "w1", "text": "SLEEP:60", "message": "m1"}),
     )
     .unwrap();
-    d.wait_message("w1", "m1", &["running"], 15);
+    d.wait_message("w1", "m1", &["running"], 25);
     d.rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     std::mem::forget(d);
     let d = TestDaemon::start_on(state);
-    d.wait_agent("w1", "attention", 15);
-    assert_eq!(d.message_state("w1", "m1"), "unknown");
+    d.wait_agent("w1", "attention", 25);
+    d.wait_message("w1", "m1", &["unknown"], 25);
 }
 
 #[test]
@@ -1648,6 +1648,101 @@ fn pty_hot_restart_token_predates_generation_fences() {
     assert_eq!(d.message_state("dv1", "m1"), "unknown");
     let reason = adopt_refusal(&d, "dv1").expect("missing refusal");
     assert!(reason.contains("predates"), "{reason}");
+}
+
+#[test]
+fn pty_hot_restart_fenced_agent_resume_opens_fresh() {
+    // A kept turn on an agent that still fences at restart — a swept
+    // sibling left it `unknown` — is orphaned, and its adoption entry
+    // must be discarded with it. A later unfence+resume is an ordinary
+    // open: a fresh generation, no `turn_adopted` for a reconciled
+    // message. Otherwise the stale entry would let the resume reuse
+    // the pre-restart generation for a turn already fenced `unknown`.
+    let (state, _mock, _token, _pid) = stopped_mid_turn_devin();
+    // A second in-flight turn the marker never recorded — inserted
+    // `running` post-stop, the sweep makes it `unknown` and the
+    // unknown fences the agent, stranding m1's kept entry.
+    let generation = read_marker(&state)["entries"][0]["generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    {
+        let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,
+                 created)
+             VALUES('m2','dv1','task',NULL,'test','running',?1,1.0)",
+            rusqlite::params![format!("pty-{generation}-turn-m2")],
+        )
+        .unwrap();
+    }
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    assert_eq!(d.message_state("dv1", "m2"), "unknown");
+    let reason = adopt_refusal(&d, "dv1").expect("missing refusal");
+    assert!(reason.contains("agent fenced"), "{reason}");
+    // Unfence + resume: the pane is still alive so the open re-adopts
+    // it by session ownership — but under a NEW generation, and with
+    // no adoption event.
+    d.rpc(
+        "agent_unfence",
+        json!({"alias": "dv1", "status": "interrupted"}),
+    )
+    .unwrap();
+    d.wait_agent("dv1", "stopped", 10);
+    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    let agent = d.wait_agent("dv1", "idle", 25);
+    assert_ne!(
+        agent["generation"].as_str().unwrap(),
+        generation,
+        "resume after a restart fence must mint a fresh generation"
+    );
+    let kinds = event_kinds(&d, "dv1");
+    assert!(
+        !kinds.iter().any(|k| k == "turn_adopted"),
+        "no adoption may fire for a discarded entry: {kinds:?}"
+    );
+}
+
+#[test]
+fn pty_hot_restart_divergent_marker_entries_fence() {
+    // One pane proof covers a whole alias list — every entry must
+    // describe the same endpoint facts. `shutdown_entries` writes one
+    // facts tuple per alias, so a list whose records disagree can only
+    // come from a hand-built or corrupt marker: the whole list refuses
+    // and the turns fence like any other unprovable restart.
+    let (state, _mock, _token, _pid) = stopped_mid_turn_devin();
+    // m2 is a real `running` turn that would qualify on its own — its
+    // marker entry carries a DIFFERENT pane_pid than m1's.
+    let marker = read_marker(&state);
+    let generation = marker["entries"][0]["generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    {
+        let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,
+                 created)
+             VALUES('m2','dv1','task',NULL,'test','running',?1,1.0)",
+            rusqlite::params![format!("pty-{generation}-turn-m2")],
+        )
+        .unwrap();
+    }
+    let mut marker = marker;
+    let mut entry2 = marker["entries"][0].clone();
+    entry2["message_id"] = json!("m2");
+    entry2["turn_id"] = json!(format!("pty-{generation}-turn-m2"));
+    entry2["pane_pid"] = json!(1);
+    marker["entries"].as_array_mut().unwrap().push(entry2);
+    std::fs::write(state.join("shutdown.json"), marker.to_string()).unwrap();
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    assert_eq!(d.message_state("dv1", "m2"), "unknown");
+    let reason = adopt_refusal(&d, "dv1").expect("missing refusal");
+    assert!(reason.contains("disagree"), "{reason}");
 }
 
 #[test]

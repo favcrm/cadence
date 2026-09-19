@@ -1634,13 +1634,16 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
             // from zero could pick up an older restart's verdicts, so
             // the column stays `-` instead.
             if let Some(cursor) = event_cursors.get(alias.as_str()).copied() {
-                let mut after = cursor;
+                let mut seq = cursor;
                 let mut kinds: Vec<String> = Vec::new();
-                loop {
+                // Bounded: a restart's adopt verdicts land within a few
+                // events; 20 pages of 100 is far past any real gap and
+                // keeps a pathological event stream from looping.
+                for _ in 0..20 {
                     let page = client::rpc(
                         state_dir,
                         "agent_events",
-                        serde_json::json!({"alias": alias, "after": after}),
+                        serde_json::json!({"alias": alias, "after": seq}),
                     );
                     let Ok(v) = page else { break };
                     let events = v["events"].as_array().cloned().unwrap_or_default();
@@ -1650,7 +1653,7 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
                             kinds.push(k.to_string());
                         }
                     }
-                    after = v["cursor"].as_i64().unwrap_or(after);
+                    seq = v["cursor"].as_i64().unwrap_or(seq);
                     if n < 100 {
                         break;
                     }
@@ -1687,7 +1690,8 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
     if bad {
         Err(Error::rejected(
             "restart completed but not cleanly — see the table above \
-             (pane pid changed or agent came back fenced)",
+             (pane pid changed, a turn was fenced, or the agent came \
+             back fenced)",
         ))
     } else {
         Ok(0)
