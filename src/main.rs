@@ -37,8 +37,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Check environment, storage and provider CLIs.
-    Doctor,
+    /// Check environment, storage and provider CLIs. `--host` instead
+    /// runs the read-only host watchdog — disk free, provider store and
+    /// WAL growth, per-user pipe pressure, orphaned processes from
+    /// deleted worktrees, leaked temp dirs and stale worktrees — with
+    /// exit 0 ok, 1 warn, 2 fail.
+    Doctor {
+        /// Run the host watchdog checks instead of the environment probe.
+        #[arg(long)]
+        host: bool,
+        /// With --host, print the JSON report instead of text lines
+        /// (plain doctor already prints JSON, so this is a no-op there).
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the persistent controller.
     Daemon {
         #[command(subcommand)]
@@ -2532,7 +2544,10 @@ fn run() -> Result<i32> {
         None => client::state_dir()?,
     };
     match cli.command {
-        Commands::Doctor => {
+        Commands::Doctor { host, json } => {
+            if host {
+                return cadence_agent::doctor::host::cli(&state_dir, json);
+            }
             let report = cadence_agent::doctor::run(&state_dir)?;
             print_json(&report);
             let ok = report

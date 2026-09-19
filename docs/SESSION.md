@@ -31,6 +31,9 @@ cadence inbox pm --follow                      # blocks; one JSON object per rou
 ```bash
 export CADENCE_SUITE_LOCK="$HOME/.local/state/cadence/suite.lock"   # one path per host, in every shell and agent env
 cadence daemon start          # or: cadence doctor, if anything looks off
+cadence doctor --host         # host watchdog: disk free, provider WALs, pipe
+                              #  pressure, orphaned processes, leaked temp dirs,
+                              #  stale worktrees — read-only, exit 0/1/2
 cadence ui start              # board at http://cadence.localhost:18000 behind the dev gateway
 cadence ui tailscale start    # optional: phone/laptop access at https://<dns>:9450 — tailnet-only, loopback bind unchanged
 cadence issue doctor          # tracker: hooks ours, lint clean, ahead/behind origin
@@ -39,6 +42,11 @@ cadence agent list --all      # who exists; `resumable: true` agents can come ba
 cadence resume <pm>           # bring the group's workers back on their saved sessions
 cadence overview              # one screen: what needs a human, exact commands, deploy drift
 ```
+
+`doctor --host` never kills or deletes; each warn/fail carries a
+`remedy` — the exact command an operator would run. A non-zero exit is
+a finding, not an error: fix or dismiss before dispatching workers
+onto a host whose disk, pipes or orphans are already degrading lanes.
 
 Slice the backlog before you plan rather than scrolling it.
 `cadence issue ls --open` is everything still live; narrow it with

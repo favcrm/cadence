@@ -2,6 +2,8 @@
 //! Reports capabilities honestly — an absent optional tool is a fact,
 //! not a failure.
 
+pub mod host;
+
 use std::path::Path;
 use std::process::Command;
 
