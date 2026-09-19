@@ -8,6 +8,7 @@ import type {
   MemoryCard,
   MemoryDetail,
   Meta,
+  Overview,
   Project,
 } from "./types";
 
@@ -105,6 +106,7 @@ async function memoryWrite(
 export const api = {
   health: () => get<Health>("/api/health"),
   meta: () => get<Meta>("/api/meta"),
+  overview: () => get<Overview>("/api/overview"),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   issues: (project?: string) =>
     get<{ issues: IssueCard[] }>(

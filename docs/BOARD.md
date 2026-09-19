@@ -505,7 +505,8 @@ tailnet name, `Tailscale-User-Login` resolves the actor to
 person who wrote. The same headers on a direct loopback request
 (non-tailnet `Host`) are ignored; the default actor stays
 `operator (ui)`. `GET /api/meta` reports `{read_only, actor,
-tailnet_url}` so the SPA renders the right controls.
+tailnet_url, version, build_commit, build_time, daemon}` so the SPA
+renders the right controls and the serving binary's build identity.
 
 Threat model, unchanged in four lines:
 
@@ -529,7 +530,7 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | Route | Returns |
 |---|---|
 | `GET /api/health` | `ok`, `pm_dir`, `pm_present`, counts, `daemon`, `embedded` |
-| `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_url` |
+| `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_url`, the serving binary's `version`/`build_commit`/`build_time`, plus the daemon's `daemon_info` when reachable |
 | `GET /api/projects` | folders, prefixes, components, declared tags, repos, issue counts |
 | `GET /api/issues?project=` | card views: derived status, readiness, `tags`, counts, `rev`. The `issue ls` filters, combinable: `tag=` (repeat or comma-join — all of), `status=` (repeat or comma-join — any of), `epic=<ID>`, `owner=`, `component=`, `priority=`, `open=1`; `400` on a value that could never match (unknown status/priority, bad tag or id grammar) |
 | `GET /api/epics?project=` | issues with children — the `issue epic ls --json` payload: `total`, `counts` per status, `done_ratio`, `blocked`, `owners`, `children` |
@@ -542,6 +543,7 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/agents/:alias` | the agent drawer: `agent_show` + last 20 events + `tasks`/`on` bindings + `recovery`/`resume` commands; `404` on unknown alias, `400` on alias grammar |
 | `GET /api/memories?project=&status=&type=&component=&path=` | memory cards across projects — same filters as `memory ls`; `memory_errors` lists files that failed to load |
 | `GET /api/memories/:project/:slug` | one memory: frontmatter + body; `404` on unknown slug, `400` on grammar |
+| `GET /api/overview` | the Overview screen payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
 | `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents` on daemon state change; `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
 
 ### API — writes
@@ -623,6 +625,54 @@ machine — a local process, or a browser tab on an allowed origin — can
 write the tracker. That is the threat model: a private repo on a
 single-operator host, loopback plus the guards above. Auth is deferred
 to I3+.
+
+## Overview — needs-me + deploy drift
+
+The landing screen answers two questions at a glance: *what is waiting
+on a human or the PM right now, and with which command*, and *is what
+we merged actually running*. `GET /api/overview` derives the whole
+payload at read time — nothing is stored; `cadence overview [--json]
+[--watch <secs>]` renders the same data as an aligned terminal list.
+
+**Needs me** — one row per item, ranked by urgency then age, each with
+`{kind, title, age, project, link, command}`:
+
+| Rank | Kind | Command |
+|---|---|---|
+| 10 | `merge` — open PR with `qa-verdict=success` and green checks | `gh pr merge <n> --repo <slug> --squash --admin --match-head-commit <sha>` |
+| 20 | `approval` — a brokered permission request is open | `cadence agent respond <a> --request <h> --decision accept` (provider input requests: `--answers-file <f>`) |
+| 30 | `fenced` — agent in `attention` | `cadence agent unfence <a>` |
+| 40 | `stalled` — turn silent past the fence threshold | `cadence agent show <a>` |
+| 50 | `drift` — merged commits not running while every pane is idle | `cadence daemon restart --when-idle --ui` |
+| 60 | `pr_no_verdict` — open PR with no `qa-verdict` status | `gh pr view <n> --repo <slug>` |
+| 70 | `review_no_pr` — issue in `review` with no open `pr` ref and no `cadence/<id>-…` PR branch | `cadence issue show <id>` |
+| 80 | `blocked_ready` — every `blocked_by` target is `done` | `cadence issue set <id> status=ready` |
+| 90 | `ci_red` — default-branch commit status failing | `gh run list --repo <slug>` |
+| 100 | `inbox_unread` — unread messages on an `inbox` endpoint | `cadence inbox <a>` |
+| 110 | `tracker_behind` — tracker repo behind `@{upstream}` | `cadence issue sync` |
+
+GitHub data (open PRs, default-branch CI) comes from `gh` behind a
+60-second cache in the state dir (`overview-gh.json`, keyed by the
+slug set, written temp-then-rename); an outage serves the last good
+body as `github.state: "stale"` — or `"unavailable"` when there is no
+good body — and the screen still renders. Daemon-dependent rows
+(approvals, fenced, stalled, inbox, drift) vanish when the socket is
+down, reported as `daemon.reachable: false`. Reachability is the
+`health` RPC — a daemon that predates `daemon_info` stays reachable
+(its agent rows appear) while drift reports the build as unknown.
+
+**Deploy drift** — the daemon reports its `build_commit` via the
+`daemon_info` RPC (`build.rs` compiles `CADENCE_BUILD_COMMIT`/
+`CADENCE_BUILD_TIME`/remote/root into every binary; `cadence
+--version` prints them and `/api/meta` repeats them). The tracker
+project whose repo matches that build — normalised remote first, then
+checkout path — gets a `rev-list --count <build_commit>..<default
+branch>` walk: `drift.count` commits not yet running, subjects bounded
+at 20, squash-merged PR numbers parsed from `(#n)`. `unknown` or
+unresolvable commits are `known: false` — "cannot tell", never zero.
+
+**Projects** — one row each: open counts by derived status plus the
+oldest `review` issue's age.
 
 ## Frontend
 

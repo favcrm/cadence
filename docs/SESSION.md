@@ -36,6 +36,7 @@ cadence issue doctor          # tracker: hooks ours, lint clean, ahead/behind or
 cadence issue sync            # pull other hosts' tracker writes before you plan
 cadence agent list --all      # who exists; `resumable: true` agents can come back
 cadence resume <pm>           # bring the group's workers back on their saved sessions
+cadence overview              # one screen: what needs a human, exact commands, deploy drift
 ```
 
 Slice the backlog before you plan rather than scrolling it.
