@@ -1347,6 +1347,7 @@ fn write_route(
                     &req.kind,
                     &target,
                     req.label.as_deref(),
+                    None,
                     req.if_rev.as_deref(),
                     &actor,
                 )

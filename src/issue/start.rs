@@ -303,6 +303,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 path: Some(branch.clone()),
                 label: Some(repo_label),
                 closed: None,
+                worktree: None,
             });
         }
         if !has_ref("worktree", &wt_str) {
@@ -312,6 +313,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 path: Some(wt_str.clone()),
                 label: None,
                 closed: None,
+                worktree: None,
             });
         }
         if matches!(new_front.status.as_str(), "backlog" | "ready") {

@@ -618,30 +618,26 @@ impl ProviderAdapter for PtyAdapter {
             // deadline the spawn path gets rather than fencing a live
             // pane on one observation.
             let pane_pid = self.pane_pid(&session)?;
-            match self.wait_owned_session(&session, pane_pid) {
-                // The pane was already running — an exit mid-wait is a
-                // crash, not proof the stored chat is gone. The spawn
-                // arm re-runs the resume on the next open and reports
-                // a genuinely dead chat there.
-                Err(e) => return Err(e),
-                Ok(found) => {
-                    let found_any = found.is_some();
-                    match self.profile.resolve_session(desired.as_deref(), found) {
-                        Ok(native) => (native, pane_pid, "adopted"),
-                        Err(e) => {
-                            // found=None: the pane holds nothing for
-                            // the stored id — the resume never
-                            // materialized, the chat is gone. A
-                            // mismatch (found≠want) stays fail-closed
-                            // and never clears.
-                            let cleared = if found_any {
-                                None
-                            } else {
-                                resume_failed(&desired, &e)
-                            };
-                            return Err(cleared_err(e, cleared));
-                        }
-                    }
+            // The pane was already running — an exit mid-wait is a
+            // crash, not proof the stored chat is gone. The spawn
+            // arm re-runs the resume on the next open and reports
+            // a genuinely dead chat there.
+            let found = self.wait_owned_session(&session, pane_pid)?;
+            let found_any = found.is_some();
+            match self.profile.resolve_session(desired.as_deref(), found) {
+                Ok(native) => (native, pane_pid, "adopted"),
+                Err(e) => {
+                    // found=None: the pane holds nothing for
+                    // the stored id — the resume never
+                    // materialized, the chat is gone. A
+                    // mismatch (found≠want) stays fail-closed
+                    // and never clears.
+                    let cleared = if found_any {
+                        None
+                    } else {
+                        resume_failed(&desired, &e)
+                    };
+                    return Err(cleared_err(e, cleared));
                 }
             }
         } else {
@@ -727,15 +723,12 @@ impl ProviderAdapter for PtyAdapter {
                     return Err(cleared_err(e, cleared));
                 }
                 Ok(Some(found)) => {
-                    match self
+                    // A changed owner fails closed — never clears,
+                    // never adopts.
+                    let native = self
                         .profile
-                        .resolve_session(desired.as_deref(), Some(found))
-                    {
-                        Ok(native) => (native, pane_pid, "respawned"),
-                        // A changed owner fails closed — never clears,
-                        // never adopts.
-                        Err(e) => return Err(e),
-                    }
+                        .resolve_session(desired.as_deref(), Some(found))?;
+                    (native, pane_pid, "respawned")
                 }
             }
         };
