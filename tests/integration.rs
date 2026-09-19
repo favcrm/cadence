@@ -1410,6 +1410,8 @@ fn pty_hot_restart_submitting_never_records_running() {
     // restart then fences it like any other uncertain outcome.
     let mut d = TestDaemon::start();
     let mock = d.mock_devin();
+    // Real env, under MockDevin's ENV_LOCK: the mock tmux reads its
+    // hold knobs per call from the env it inherits from the daemon.
     std::env::set_var("MOCK_TMUX_HOLD", "5");
     std::env::set_var("MOCK_TMUX_HOLD_CMD", "capture-pane");
     d.register_devin("dv1", None);
@@ -1448,6 +1450,8 @@ fn pty_hot_restart_render_during_stop_adopts() {
     // a proven running turn and is adopted like any other.
     let mut d = TestDaemon::start();
     let _mock = d.mock_devin();
+    // Real env, under MockDevin's ENV_LOCK: the mock tmux reads its
+    // hold knobs per call from the env it inherits from the daemon.
     // 2s hold vs the 4s render deadline: comfortably inside it while
     // still spanning the stop that must land mid-render.
     std::env::set_var("MOCK_TMUX_HOLD", "2");
@@ -1509,7 +1513,9 @@ fn pty_hot_restart_report_before_adoption_rejected_stale() {
     // same token must complete once `turn_adopted` fires.
     let (state, _mock, token, _pid) = stopped_mid_turn_devin();
     // Hold the first pane check inside open_adopted so the socket is
-    // serving while the adoption is still unproven.
+    // serving while the adoption is still unproven. Real env, under
+    // MockDevin's ENV_LOCK: the mock tmux reads its hold knobs per
+    // call from the env it inherits from the daemon.
     std::env::set_var("MOCK_TMUX_HOLD", "8");
     std::env::set_var("MOCK_TMUX_HOLD_CMD", "has-session");
     let d = TestDaemon::start_on(state);
