@@ -69,7 +69,7 @@ use uuid::Uuid;
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
-use super::{AdapterHooks, Identity, Probe, ProviderAdapter, TurnResult};
+use super::{AdapterHooks, Identity, Probe, ProviderAdapter, ProviderEnv, TurnResult};
 
 /// How long an operator readiness claim stays valid for one send.
 const READY_TTL: Duration = Duration::from_secs(60);
@@ -255,9 +255,9 @@ fn activity_token(tok: &str) -> bool {
 /// agent whose pane may have survived a fence (fences detach now).
 /// Best effort: only sessions we launched exist on this socket, and a
 /// missing session or server is already the goal state.
-pub(crate) fn kill_pane(state_dir: &Path, alias: &str) {
-    let tmux = std::env::var("CADENCE_TMUX_COMMAND")
-        .ok()
+pub(crate) fn kill_pane(state_dir: &Path, alias: &str, env: &ProviderEnv) {
+    let tmux = env
+        .var("CADENCE_TMUX_COMMAND")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "tmux".to_string());
     let socket = format!("cadence-{}", short_hash(&state_dir.to_string_lossy()));
@@ -349,6 +349,7 @@ impl PtyAdapter {
         hooks: AdapterHooks,
         log_path: &Path,
         agent: &Agent,
+        env: &ProviderEnv,
         profile: impl TuiProfile + 'static,
     ) -> Result<Self> {
         let state_dir = log_path
@@ -375,8 +376,8 @@ impl PtyAdapter {
                 gate_probe: None,
             }),
             socket: format!("cadence-{}", short_hash(&state_dir.to_string_lossy())),
-            tmux: std::env::var("CADENCE_TMUX_COMMAND")
-                .ok()
+            tmux: env
+                .var("CADENCE_TMUX_COMMAND")
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "tmux".to_string()),
             desired_session,

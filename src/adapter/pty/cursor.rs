@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::adapter::Probe;
+use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 use crate::proc::run_bounded;
 use crate::store::Agent;
@@ -322,9 +322,9 @@ impl CursorProfile {
     /// tests pass `python3 mock.py <chats>` — else a `cursor-agent`
     /// found on PATH), and the model/permission params replayed on
     /// every launch exactly as registered.
-    pub fn new(agent: &Agent) -> Result<Self> {
-        let chats_dir = match std::env::var("CADENCE_CURSOR_CHATS") {
-            Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+    pub fn new(agent: &Agent, env: &ProviderEnv) -> Result<Self> {
+        let chats_dir = match env.var("CADENCE_CURSOR_CHATS") {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
             _ => match std::env::var("HOME") {
                 Ok(home) if !home.is_empty() => PathBuf::from(home).join(".cursor/chats"),
                 // A relative `.cursor/chats` would silently follow the
@@ -337,8 +337,8 @@ impl CursorProfile {
                 }
             },
         };
-        let command = match std::env::var("CADENCE_CURSOR_COMMAND") {
-            Ok(cmd) if !cmd.is_empty() => cmd,
+        let command = match env.var("CADENCE_CURSOR_COMMAND") {
+            Some(cmd) if !cmd.is_empty() => cmd,
             _ => resolve_on_path("cursor-agent").map(|p| shlex_quote(&p))?,
         };
         let params = agent.params.clone().unwrap_or(Value::Null);
