@@ -1066,9 +1066,12 @@ fn pty_restart_fence_unfence_resume_readopts_pane() {
         .trim()
         .parse()
         .unwrap();
-    // Daemon dies mid-turn — the tmux pane survives (detached).
+    // Daemon dies mid-turn — the tmux pane survives (detached). The
+    // stop itself is clean; deleting the marker makes it a crash —
+    // this test asserts the fence path, not hot-restart adoption.
     d.rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
+    drop_shutdown_marker(&d.state);
     let state = d.state.clone();
     // Leak d's TempDir — it owns both the state dir and the mock's pane
     // state, which must outlive the second daemon. forget() also keeps
@@ -1188,6 +1191,9 @@ fn pty_shutdown_straggler_detaches_pane() {
     d.wait_message("dv1", "m1", &["running"], 40);
     d.rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
+    // The straggler stop was clean; a crash leaves no marker — this
+    // test asserts the fence-then-resume path, not hot adoption.
+    drop_shutdown_marker(&d.state);
     let state = d.state.clone();
     std::env::remove_var("MOCK_TMUX_HOLD");
     std::env::remove_var("MOCK_TMUX_HOLD_FMT");
@@ -1216,6 +1222,608 @@ fn pty_shutdown_straggler_detaches_pane() {
         "straggler pane was killed, not detached"
     );
     assert_eq!(agent["thread_id"].as_str().unwrap(), native);
+}
+
+// ---- CAD-89: hot restart — a provably clean stop re-adopts running
+// pty turns (same token, same pane); every other path still fences.
+
+/// A clean stop writes `shutdown.json`; a crash leaves nothing. Tests
+/// asserting the fence path delete it to stand in for the crash.
+fn drop_shutdown_marker(state: &Path) {
+    let _ = std::fs::remove_file(state.join("shutdown.json"));
+}
+
+/// A mid-turn devin put through a clean shutdown. Returns the state
+/// dir, the mock (whose pane outlives the stop), the running turn's
+/// original token and the pane pid. The stopped TestDaemon is leaked:
+/// its TempDir owns both the state dir and the mock's pane state, and
+/// its Drop must not race the second daemon's socket.
+fn stopped_mid_turn_devin() -> (PathBuf, MockDevin, String, i32) {
+    let mut d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.register("pm");
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1",
+               "reply_to": "pm"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "m1");
+    let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    assert!(
+        state.join("shutdown.json").exists(),
+        "clean stop must leave a shutdown marker"
+    );
+    std::mem::forget(d);
+    (state, mock, token, pane_pid)
+}
+
+/// Read the marker file the stopped daemon left behind.
+fn read_marker(state: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(state.join("shutdown.json")).unwrap()).unwrap()
+}
+
+/// The single `turn_adopt_refused` event for the alias, if any.
+fn adopt_refusal(d: &TestDaemon, alias: &str) -> Option<String> {
+    d.rpc("agent_events", json!({"alias": alias})).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"].as_str() == Some("turn_adopt_refused"))
+        .map(|e| e["payload"]["reason"].as_str().unwrap_or("").to_string())
+}
+
+#[test]
+fn pty_hot_restart_adopts_running_turn() {
+    // The acceptance shape: mid-turn, `shutdown`, a new daemon on the
+    // same state — the agent never fences, the message stays running,
+    // the pane is the same, `turn_adopted` is emitted, and the
+    // ORIGINAL token still completes the turn and routes the result.
+    let (state, mock, token, pane_pid) = stopped_mid_turn_devin();
+    let d = TestDaemon::start_on(state);
+    let agent = d.wait_agent("dv1", "idle", 25);
+    assert_eq!(d.message_state("dv1", "m1"), "running");
+    let pid_now: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(pid_now, pane_pid, "adopted pane changed pid");
+    assert_eq!(agent["pid"].as_i64().unwrap() as i32, pane_pid);
+    let kinds = event_kinds(&d, "dv1");
+    assert!(kinds.iter().any(|k| k == "turn_adopted"), "{kinds:?}");
+    assert!(
+        !kinds.iter().any(|k| k == "turn_adopt_refused"),
+        "{kinds:?}"
+    );
+    // The turn's original token is still authoritative — the recorded
+    // generation was reused, so the report validates.
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m1", &["completed"], 15);
+    // ... and the result routed to reply_to as always.
+    let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    assert!(
+        pm["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["source"] == "worker_result"),
+        "adopted turn's result never routed: {pm}"
+    );
+}
+
+#[test]
+fn pty_hot_restart_no_marker_fences() {
+    // No marker == crash: the pane survives but the turn fences
+    // exactly as before — unknown, attention, no adoption events.
+    let (state, _mock, _token, _pid) = stopped_mid_turn_devin();
+    drop_shutdown_marker(&state);
+    let d = TestDaemon::start_on(state);
+    let agent = d.wait_agent("dv1", "attention", 20);
+    assert!(agent["error"].as_str().unwrap_or("").contains("Uncertain"));
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    let kinds = event_kinds(&d, "dv1");
+    assert!(!kinds.iter().any(|k| k == "turn_adopted"), "{kinds:?}");
+    assert!(
+        !kinds.iter().any(|k| k == "turn_adopt_refused"),
+        "no marker means nothing to refuse: {kinds:?}"
+    );
+}
+
+#[test]
+fn pty_hot_restart_stale_instance_fences() {
+    // A marker bound to a different daemon run is not proof this
+    // daemon stopped cleanly — every recorded entry is refused.
+    let (state, _mock, _token, _pid) = stopped_mid_turn_devin();
+    std::fs::write(state.join("daemon-instance"), "some-other-run\n").unwrap();
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    let reason = adopt_refusal(&d, "dv1").expect("missing refusal");
+    assert!(reason.contains("daemon run"), "{reason}");
+}
+
+#[test]
+fn pty_hot_restart_expired_marker_fences() {
+    // A marker older than its bound reads stale pane state as fresh —
+    // it expires into the fence path instead.
+    let (state, _mock, _token, _pid) = stopped_mid_turn_devin();
+    let path = state.join("shutdown.json");
+    let mut marker = read_marker(&state);
+    marker["at"] = json!(marker["at"].as_f64().unwrap() - 3600.0);
+    std::fs::write(&path, marker.to_string()).unwrap();
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    let reason = adopt_refusal(&d, "dv1").expect("missing refusal");
+    assert!(reason.contains("expired"), "{reason}");
+}
+
+#[test]
+fn pty_hot_restart_dead_pane_fences() {
+    // The pane died between stop and start — nothing left to adopt.
+    let (state, _mock, _token, pane_pid) = stopped_mid_turn_devin();
+    unsafe { libc::killpg(pane_pid, libc::SIGKILL) };
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    let reason = adopt_refusal(&d, "dv1").expect("missing refusal");
+    assert!(reason.contains("pane"), "{reason}");
+}
+
+#[test]
+fn pty_hot_restart_native_mismatch_fences() {
+    // The pane is alive but cannot prove it still holds the recorded
+    // native session — the recorded checks fail, the turn fences.
+    let (state, _mock, _token, _pid) = stopped_mid_turn_devin();
+    let path = state.join("shutdown.json");
+    let mut marker = read_marker(&state);
+    marker["entries"][0]["native_session"] = json!("bogus-session");
+    std::fs::write(&path, marker.to_string()).unwrap();
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    let reason = adopt_refusal(&d, "dv1").expect("missing refusal");
+    assert!(reason.contains("session"), "{reason}");
+}
+
+#[test]
+fn pty_hot_restart_submitting_never_records_running() {
+    // A paste whose render never proved must not be recorded running:
+    // held captures + a swallowed paste keep m1 `submitting` through
+    // the drain, where the render deadline resolves it `unknown` — the
+    // restart then fences it like any other uncertain outcome.
+    let mut d = TestDaemon::start();
+    let mock = d.mock_devin();
+    // Real env, under MockDevin's ENV_LOCK: the mock tmux reads its
+    // hold knobs per call from the env it inherits from the daemon.
+    std::env::set_var("MOCK_TMUX_HOLD", "5");
+    std::env::set_var("MOCK_TMUX_HOLD_CMD", "capture-pane");
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 40);
+    atomic_write(d.pane_file(&mock, "dv1", "swallow"), "1");
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m1", &["submitting"], 15);
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    std::env::remove_var("MOCK_TMUX_HOLD");
+    std::env::remove_var("MOCK_TMUX_HOLD_CMD");
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    let m1 = d.message_state("dv1", "m1");
+    assert!(
+        m1 == "unknown" || m1 == "queued",
+        "submitting survived: {m1}"
+    );
+    assert!(
+        !event_kinds(&d, "dv1").iter().any(|k| k == "turn_adopted"),
+        "an unproven paste must never be adopted"
+    );
+}
+
+#[test]
+fn pty_hot_restart_render_during_stop_adopts() {
+    // The other half of the drain rule: a paste whose render check is
+    // still in flight when the stop lands is allowed to finish — it IS
+    // a proven running turn and is adopted like any other.
+    let mut d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    // Real env, under MockDevin's ENV_LOCK: the mock tmux reads its
+    // hold knobs per call from the env it inherits from the daemon.
+    // 2s hold vs the 4s render deadline: comfortably inside it while
+    // still spanning the stop that must land mid-render.
+    std::env::set_var("MOCK_TMUX_HOLD", "2");
+    std::env::set_var("MOCK_TMUX_HOLD_CMD", "capture-pane");
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 40);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m1", &["submitting"], 15);
+    // The stop lands mid-render; the actor finishes the proof before
+    // detaching, so the marker records a genuinely running turn.
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    std::env::remove_var("MOCK_TMUX_HOLD");
+    std::env::remove_var("MOCK_TMUX_HOLD_CMD");
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "idle", 25);
+    assert_eq!(d.message_state("dv1", "m1"), "running");
+    assert!(
+        event_kinds(&d, "dv1").iter().any(|k| k == "turn_adopted"),
+        "render proven during the drain must adopt"
+    );
+}
+
+#[test]
+fn hot_restart_managed_turn_stays_unknown() {
+    // Managed endpoints are never adoptable — the provider process
+    // dies with its daemon, so a clean stop changes nothing for them.
+    let mut d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 25);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "SLEEP:60", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["running"], 25);
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("w1", "attention", 25);
+    d.wait_message("w1", "m1", &["unknown"], 25);
+}
+
+#[test]
+fn pty_hot_restart_report_before_adoption_rejected_stale() {
+    // The pre-verification window: the store keeps the message
+    // `running` but clears `generation` until `open_adopted` proves
+    // the pane. A report landing inside the window must be refused
+    // as stale — the turn is not yet known to be alive — and the
+    // same token must complete once `turn_adopted` fires.
+    let (state, _mock, token, _pid) = stopped_mid_turn_devin();
+    // Hold the first pane check inside open_adopted so the socket is
+    // serving while the adoption is still unproven. Real env, under
+    // MockDevin's ENV_LOCK: the mock tmux reads its hold knobs per
+    // call from the env it inherits from the daemon.
+    std::env::set_var("MOCK_TMUX_HOLD", "8");
+    std::env::set_var("MOCK_TMUX_HOLD_CMD", "has-session");
+    let d = TestDaemon::start_on(state);
+    let early = d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result",
+               "text": "early"}),
+    );
+    std::env::remove_var("MOCK_TMUX_HOLD");
+    std::env::remove_var("MOCK_TMUX_HOLD_CMD");
+    let err = early.expect_err("pre-proof report must be refused");
+    assert!(err.to_string().contains("stale"), "{err}");
+    let agent = d.wait_agent("dv1", "idle", 25);
+    assert!(
+        agent["generation"].as_str().is_some_and(|g| !g.is_empty()),
+        "adoption must restore the recorded generation: {agent}"
+    );
+    assert!(
+        event_kinds(&d, "dv1").iter().any(|k| k == "turn_adopted"),
+        "pane proof did not adopt the turn"
+    );
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m1", &["completed"], 15);
+}
+
+#[test]
+fn pty_hot_restart_adopts_multiple_running_turns() {
+    // Pasted pty messages stay `running` until reported and
+    // `take_queued` has no one-running-per-alias guard, so an agent
+    // can hold more than one in-flight turn. Every qualifying turn is
+    // adopted — same pane proof covers them all — not just the last
+    // one the marker listed. The mock pane reads busy through m1's
+    // turn, so the second `running` row is crafted the way the real
+    // race would leave it: a queued send flipped to running under the
+    // same generation.
+    let mut d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let generation = agent["generation"].as_str().unwrap().to_string();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    let token1 = pty_token(&d, "dv1", "m1");
+    // m2's row as a second proven turn on the same pane — inserted
+    // `running` outright so the actor never sees it `queued` and the
+    // marker records it verbatim.
+    let token2 = format!("pty-{generation}-turn-m2");
+    {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,
+                 created)
+             VALUES('m2','dv1','task',NULL,'test','running',?1,1.0)",
+            rusqlite::params![token2],
+        )
+        .unwrap();
+    }
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    let marker = read_marker(&state);
+    assert_eq!(
+        marker["entries"].as_array().unwrap().len(),
+        2,
+        "both running turns must be recorded: {marker}"
+    );
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "idle", 25);
+    wait_event_count(&d, "dv1", "turn_adopted", 2, 15);
+    assert_eq!(d.message_state("dv1", "m1"), "running");
+    assert_eq!(d.message_state("dv1", "m2"), "running");
+    for (id, token) in [("m1", token1), ("m2", token2)] {
+        d.rpc(
+            "message_report",
+            json!({"message": id, "token": token, "kind": "result",
+                   "text": "done"}),
+        )
+        .unwrap();
+        d.wait_message("dv1", id, &["completed"], 15);
+    }
+}
+
+#[test]
+fn pty_hot_restart_token_predates_generation_fences() {
+    // The facts snapshot runs at the top of shutdown while RPC
+    // threads are still live: a resume that re-opened the pane under
+    // a newer generation leaves old tokens stale forever. Recording
+    // such a turn would roll the agent back to a dead generation —
+    // `shutdown_entries` skips it and names the refusal instead.
+    // Doctoring the row is the deterministic stand-in for that race.
+    let mut d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    let _token = pty_token(&d, "dv1", "m1");
+    // A "resume" that minted a newer generation than m1's token.
+    {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE agents SET generation='gen-rewritten' WHERE alias='dv1'",
+            [],
+        )
+        .unwrap();
+    }
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    let marker = read_marker(&state);
+    assert!(
+        marker["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["message_id"].as_str() != Some("m1")),
+        "a stale-generation turn must not be recorded: {marker}"
+    );
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    let reason = adopt_refusal(&d, "dv1").expect("missing refusal");
+    assert!(reason.contains("predates"), "{reason}");
+}
+
+#[test]
+fn pty_hot_restart_fenced_agent_resume_opens_fresh() {
+    // A kept turn on an agent that still fences at restart — a swept
+    // sibling left it `unknown` — is orphaned, and its adoption entry
+    // must be discarded with it. A later unfence+resume is an ordinary
+    // open: a fresh generation, no `turn_adopted` for a reconciled
+    // message. Otherwise the stale entry would let the resume reuse
+    // the pre-restart generation for a turn already fenced `unknown`.
+    let (state, _mock, _token, _pid) = stopped_mid_turn_devin();
+    // A second in-flight turn the marker never recorded — inserted
+    // `running` post-stop, the sweep makes it `unknown` and the
+    // unknown fences the agent, stranding m1's kept entry.
+    let generation = read_marker(&state)["entries"][0]["generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    {
+        let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,
+                 created)
+             VALUES('m2','dv1','task',NULL,'test','running',?1,1.0)",
+            rusqlite::params![format!("pty-{generation}-turn-m2")],
+        )
+        .unwrap();
+    }
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    assert_eq!(d.message_state("dv1", "m2"), "unknown");
+    let reason = adopt_refusal(&d, "dv1").expect("missing refusal");
+    assert!(reason.contains("agent fenced"), "{reason}");
+    // Unfence + resume: the pane is still alive so the open re-adopts
+    // it by session ownership — but under a NEW generation, and with
+    // no adoption event.
+    d.rpc(
+        "agent_unfence",
+        json!({"alias": "dv1", "status": "interrupted"}),
+    )
+    .unwrap();
+    d.wait_agent("dv1", "stopped", 10);
+    d.rpc("agent_resume", json!({"alias": "dv1"})).unwrap();
+    let agent = d.wait_agent("dv1", "idle", 25);
+    assert_ne!(
+        agent["generation"].as_str().unwrap(),
+        generation,
+        "resume after a restart fence must mint a fresh generation"
+    );
+    let kinds = event_kinds(&d, "dv1");
+    assert!(
+        !kinds.iter().any(|k| k == "turn_adopted"),
+        "no adoption may fire for a discarded entry: {kinds:?}"
+    );
+}
+
+#[test]
+fn pty_hot_restart_divergent_marker_entries_fence() {
+    // One pane proof covers a whole alias list — every entry must
+    // describe the same endpoint facts. `shutdown_entries` writes one
+    // facts tuple per alias, so a list whose records disagree can only
+    // come from a hand-built or corrupt marker: the whole list refuses
+    // and the turns fence like any other unprovable restart.
+    let (state, _mock, _token, _pid) = stopped_mid_turn_devin();
+    // m2 is a real `running` turn that would qualify on its own — its
+    // marker entry carries a DIFFERENT pane_pid than m1's.
+    let marker = read_marker(&state);
+    let generation = marker["entries"][0]["generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    {
+        let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,
+                 created)
+             VALUES('m2','dv1','task',NULL,'test','running',?1,1.0)",
+            rusqlite::params![format!("pty-{generation}-turn-m2")],
+        )
+        .unwrap();
+    }
+    let mut marker = marker;
+    let mut entry2 = marker["entries"][0].clone();
+    entry2["message_id"] = json!("m2");
+    entry2["turn_id"] = json!(format!("pty-{generation}-turn-m2"));
+    entry2["pane_pid"] = json!(1);
+    marker["entries"].as_array_mut().unwrap().push(entry2);
+    std::fs::write(state.join("shutdown.json"), marker.to_string()).unwrap();
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    assert_eq!(d.message_state("dv1", "m2"), "unknown");
+    let reason = adopt_refusal(&d, "dv1").expect("missing refusal");
+    assert!(reason.contains("disagree"), "{reason}");
+}
+
+#[test]
+fn daemon_restart_reports_fenced_turn() {
+    // The failure half of the TURN column: a turn whose pane did not
+    // survive prints `fenced` and the command exits non-zero. The
+    // pane dies while the daemon still runs — unnoticed before the
+    // stop — so the marker records it and the new daemon's pane proof
+    // refuses it.
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    let _token = pty_token(&d, "dv1", "m1");
+    let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    unsafe { libc::killpg(pane_pid, libc::SIGKILL) };
+    let home = TempDir::new().unwrap();
+    let out = cadence_at(home.path(), &d.state, &["daemon", "restart"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a fenced turn must fail the restart: {stdout} {stderr}"
+    );
+    assert!(stdout.contains("fenced"), "{stdout} {stderr}");
+    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    assert!(stop.status.success());
+}
+
+/// `daemon restart`'s table reports what happened to an in-flight
+/// turn: `kept` when the hot restart adopted it.
+#[test]
+fn daemon_restart_reports_kept_turn() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.wait_agent("dv", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv", "m1");
+    let home = TempDir::new().unwrap();
+    let out = cadence_at(home.path(), &d.state, &["daemon", "restart"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "restart failed: {stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("TURN"), "{stdout}");
+    assert!(stdout.contains("kept"), "{stdout}");
+    // The restarted daemon adopted the turn — its token completes.
+    assert_eq!(d.message_state("dv", "m1"), "running");
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "m1", &["completed"], 15);
+    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    assert!(stop.status.success());
 }
 
 #[test]

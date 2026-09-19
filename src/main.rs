@@ -1511,6 +1511,25 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
     // Stop: the shutdown rpc returns while the daemon drains; the
     // lock probe is the real exit. A daemon that was never running
     // (lock free, socket dead) skips straight to start.
+    // Per-alias event cursors taken now bound what this restart
+    // produced — paged forward after the restart they cannot miss a
+    // `turn_adopted`/`turn_adopt_refused` to a busy agent's tail page,
+    // and an older restart's events can never masquerade as this
+    // one's.
+    let event_cursors: std::collections::HashMap<String, i64> = before
+        .iter()
+        .filter(|a| a["endpoint_kind"].as_str() == Some("pty"))
+        .filter_map(|a| a["alias"].as_str().map(str::to_string))
+        .filter_map(|alias| {
+            client::rpc(
+                state_dir,
+                "agent_events",
+                json!({"alias": alias, "tail": true}),
+            )
+            .ok()
+            .map(|v| (alias, v["cursor"].as_i64().unwrap_or(0)))
+        })
+        .collect();
     let was_running = client::rpc(state_dir, "shutdown", json!({})).is_ok();
     if was_running && !wait_daemon_exit(state_dir, 30) {
         return Err(Error::rejected(
@@ -1589,13 +1608,15 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
         println!("ui: restarted");
     }
     // Before/after table: state then, state now, and for pty agents
-    // whether the pane pid survived. A changed pane pid or an agent
-    // that came back fenced makes the command exit non-zero.
+    // whether the pane pid survived and whether an in-flight turn was
+    // re-adopted (`kept`) or fenced (`fenced`) by the hot restart. A
+    // changed pane pid, a fenced turn, or an agent that came back in
+    // `attention` makes the command exit non-zero.
     let before_by_alias: std::collections::HashMap<&str, &Value> = before
         .iter()
         .filter_map(|a| a["alias"].as_str().map(|al| (al, a)))
         .collect();
-    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     let mut bad = false;
     for a in &after {
         let alias = a["alias"].as_str().unwrap_or_default().to_string();
@@ -1605,44 +1626,84 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
             .unwrap_or("-")
             .to_string();
         let after_state = a["state"].as_str().unwrap_or_default().to_string();
-        let pane = if a["endpoint_kind"].as_str() == Some("pty") {
+        let mut pane = "-".to_string();
+        let mut turn = "-".to_string();
+        if a["endpoint_kind"].as_str() == Some("pty") {
             let old = b.and_then(|b| b["pid"].as_u64()).unwrap_or(0);
             let new = a["pid"].as_u64().unwrap_or(0);
             if old == 0 && new == 0 {
-                "-".to_string()
+                // no pane either side
             } else if old == new {
-                "same".to_string()
+                pane = "same".to_string();
             } else {
                 bad = true;
-                format!("CHANGED {old}→{new}")
+                pane = format!("CHANGED {old}→{new}");
             }
-        } else {
-            "-".to_string()
-        };
+            // The adopt verdicts are events on the agent — page
+            // forward from the cursor taken before the stop so only
+            // this restart's events count and none can be missed. A
+            // missing cursor means the pre-stop fetch failed; paging
+            // from zero could pick up an older restart's verdicts, so
+            // the column stays `-` instead.
+            if let Some(cursor) = event_cursors.get(alias.as_str()).copied() {
+                let mut seq = cursor;
+                let mut kinds: Vec<String> = Vec::new();
+                // Bounded: a restart's adopt verdicts land within a few
+                // events; 20 pages of 100 is far past any real gap and
+                // keeps a pathological event stream from looping.
+                for _ in 0..20 {
+                    let page = client::rpc(
+                        state_dir,
+                        "agent_events",
+                        serde_json::json!({"alias": alias, "after": seq}),
+                    );
+                    let Ok(v) = page else { break };
+                    let events = v["events"].as_array().cloned().unwrap_or_default();
+                    let n = events.len();
+                    for e in &events {
+                        if let Some(k) = e["kind"].as_str() {
+                            kinds.push(k.to_string());
+                        }
+                    }
+                    seq = v["cursor"].as_i64().unwrap_or(seq);
+                    if n < 100 {
+                        break;
+                    }
+                }
+                if kinds.iter().any(|k| k == "turn_adopt_refused") {
+                    bad = true;
+                    turn = "fenced".to_string();
+                } else if kinds.iter().any(|k| k == "turn_adopted") {
+                    turn = "kept".to_string();
+                }
+            }
+        }
         if after_state == "attention" {
             bad = true;
         }
-        rows.push((alias, before_state, after_state, pane));
+        rows.push((alias, before_state, after_state, pane, turn));
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     let w = rows.iter().map(|r| r.0.len()).max().unwrap_or(5).max(5);
     println!(
-        "{:<w$}  {:<12}  {:<12}  PANE",
+        "{:<w$}  {:<12}  {:<12}  {:<18}  TURN",
         "AGENT",
         "BEFORE",
         "AFTER",
+        "PANE",
         w = w
     );
-    for (alias, before_state, after_state, pane) in &rows {
+    for (alias, before_state, after_state, pane, turn) in &rows {
         println!(
-            "{alias:<w$}  {before_state:<12}  {after_state:<12}  {pane}",
+            "{alias:<w$}  {before_state:<12}  {after_state:<12}  {pane:<18}  {turn}",
             w = w
         );
     }
     if bad {
         Err(Error::rejected(
             "restart completed but not cleanly — see the table above \
-             (pane pid changed or agent came back fenced)",
+             (pane pid changed, a turn was fenced, or the agent came \
+             back fenced)",
         ))
     } else {
         Ok(0)

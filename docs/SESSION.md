@@ -264,13 +264,21 @@ In this order:
    the worktree and the local+remote branches — and refuses while
    the owner is busy, the tree is dirty, or the branch is neither
    merged nor pushed, so it is safe by default.
-4. Restart the daemon when every pane is idle. `cadence daemon stop`,
-   wait for the process to exit, `cadence daemon start`, then
-   `cadence ui stop && cadence ui start`. Panes survive a restart and
-   are re-adopted with the same pid; verify it.
+4. Restart the daemon. `cadence daemon restart` stops cleanly and
+   starts a new process on the same state; the before/after table
+   shows each agent's state, pane pid, and `TURN` — `kept` when a
+   running pty turn was re-adopted (same token, same pane, no fence),
+   `fenced` when it could not be proven and went `unknown`, `-` for
+   anything else (managed agents included). Verify the table; a
+   managed agent's in-flight turn always fences on any restart — its
+   provider process dies with the daemon — so restart while managed
+   turns are idle or accept the reconcile. Then
+   `cadence ui stop && cadence ui start`.
 5. Queue the worker's next message **after** the restart. A message
    queued before it starts a new turn the moment the pane idles and
-   closes the restart window.
+   closes the restart window. A pty turn left `running` survives the
+   restart itself — the worker keeps its token and reports against it
+   normally — so only genuinely new work needs this ordering.
 6. Bank the lesson: a worker that learned something durable ends its
    task with `cadence memory propose --project <key> --type
    rule|gotcha|decision|recipe --scope-… -m "<fact> … **Why:** …
