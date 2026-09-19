@@ -701,7 +701,11 @@ impl ProviderAdapter for PtyAdapter {
     /// missing proof means the endpoint genuinely changed, not that it
     /// is still coming up. The recorded generation is reused, which is
     /// what keeps the in-flight token valid for `message_report`.
-    fn open_adopted(&self, _agent: &Agent, adoption: &crate::store::AdoptEntry) -> Result<Identity> {
+    fn open_adopted(
+        &self,
+        _agent: &Agent,
+        adoption: &crate::store::AdoptEntry,
+    ) -> Result<Identity> {
         let session = self.session();
         if !self.has_session(&session) {
             return Err(Error::provider("pane is gone"));

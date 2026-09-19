@@ -666,10 +666,7 @@ impl Store {
         let mut kept: Vec<&AdoptEntry> = Vec::new();
         if let Some(marker) = marker {
             for e in &marker.entries {
-                let reason = marker
-                    .stale
-                    .clone()
-                    .or_else(|| self.adoption_block(&tx, e));
+                let reason = marker.stale.clone().or_else(|| self.adoption_block(&tx, e));
                 match reason {
                     None => kept.push(e),
                     Some(reason) => Self::event(
@@ -691,11 +688,7 @@ impl Store {
         // Dynamic NOT IN for the protected message ids — one UPDATE
         // either way, never string-interpolated values.
         let kept_ids: Vec<String> = kept.iter().map(|e| e.message_id.clone()).collect();
-        let placeholders = kept_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = kept_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let mut sql = String::from(
             "UPDATE messages SET state='unknown',
                 error='Runtime restarted during provider turn'
@@ -796,9 +789,7 @@ impl Store {
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
-                (unknown > 0).then(|| {
-                    format!("agent {} carries unreconciled unknowns", e.alias)
-                })
+                (unknown > 0).then(|| format!("agent {} carries unreconciled unknowns", e.alias))
             }
         }
     }
@@ -810,36 +801,75 @@ impl Store {
         self.adoptions.lock().unwrap().remove(alias)
     }
 
-    /// The shutdown marker's payload: every in-flight pty message with
-    /// the endpoint facts the next daemon needs to re-validate the pane
-    /// (recorded generation, pane pid, native session). `submitting`
-    /// rows ride along so recovery can name *why* they fenced — an
-    /// unproven paste is never adoptable; they simply cannot satisfy
-    /// the `running` check. Called only after all actors have
-    /// detached — the rows are final.
-    pub fn shutdown_entries(&self) -> Result<Vec<AdoptEntry>> {
+    /// The endpoint facts a hot restart needs per pty alias — recorded
+    /// generation, pane pid, native session — read while the endpoint
+    /// is still live on the agent row (before detach clears them).
+    /// `shutdown_entries` joins these against the final in-flight
+    /// messages.
+    pub fn pty_endpoint_facts(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (String, u32, String)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT m.alias, m.id, m.turn_id, a.generation, a.pid,
-                    a.session_id
-             FROM messages m JOIN agents a ON a.alias = m.alias
-             WHERE m.state IN ('running','submitting')
-               AND a.endpoint_kind='pty'
-               AND a.generation IS NOT NULL",
+            "SELECT alias, generation, pid, session_id FROM agents
+             WHERE endpoint_kind='pty'
+               AND generation IS NOT NULL AND pid IS NOT NULL",
         )?;
-        let entries = stmt
+        let facts = stmt
             .query_map([], |r| {
-                Ok(AdoptEntry {
-                    alias: r.get(0)?,
-                    message_id: r.get(1)?,
-                    turn_id: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    generation: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    pane_pid: r.get::<_, i64>(4)? as u32,
-                    native_session: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                })
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? as u32,
+                        r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    ),
+                ))
+            })?
+            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+        Ok(facts)
+    }
+
+    /// The shutdown marker's payload: every in-flight pty message
+    /// joined against the endpoint facts captured while the pane was
+    /// still live (`pty_endpoint_facts`). `submitting` rows ride along
+    /// so recovery can name *why* they fenced — an unproven paste is
+    /// never adoptable; it simply cannot satisfy the `running` check.
+    /// Called only after all actors have detached — the message rows
+    /// are final, while the facts come from the earlier snapshot since
+    /// detach has already cleared them from the agent rows.
+    pub fn shutdown_entries(
+        &self,
+        facts: &std::collections::HashMap<String, (String, u32, String)>,
+    ) -> Result<Vec<AdoptEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT alias, id, turn_id FROM messages
+             WHERE state IN ('running','submitting')",
+        )?;
+        let inflight = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(entries)
+        Ok(inflight
+            .into_iter()
+            .filter_map(|(alias, message_id, turn_id)| {
+                let (generation, pane_pid, native_session) = facts.get(&alias)?;
+                Some(AdoptEntry {
+                    alias,
+                    message_id,
+                    turn_id,
+                    generation: generation.clone(),
+                    pane_pid: *pane_pid,
+                    native_session: native_session.clone(),
+                })
+            })
+            .collect())
     }
 
     fn event(conn: &Connection, alias: &str, kind: &str, payload: Value) -> Result<()> {
@@ -1701,7 +1731,11 @@ impl Store {
                 error='endpoint restarted during in-flight submission',
                 completed=? WHERE alias=? AND state='running'
                 AND id != ?",
-            params![now(), alias, adopted.map(|e| e.message_id.as_str()).unwrap_or("")],
+            params![
+                now(),
+                alias,
+                adopted.map(|e| e.message_id.as_str()).unwrap_or("")
+            ],
         )?;
         tx.execute(
             "UPDATE agents SET thread_id=?,session_id=?,model=?,pid=?,

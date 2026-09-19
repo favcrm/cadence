@@ -1499,6 +1499,12 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
     // Stop: the shutdown rpc returns while the daemon drains; the
     // lock probe is the real exit. A daemon that was never running
     // (lock free, socket dead) skips straight to start.
+    // Adoption events are scored against this moment so an earlier
+    // restart's `turn_adopted` can't masquerade as this one's.
+    let restart_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
     let was_running = client::rpc(state_dir, "shutdown", json!({})).is_ok();
     if was_running && !wait_daemon_exit(state_dir, 30) {
         return Err(Error::rejected(
@@ -1608,8 +1614,9 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
                 bad = true;
                 pane = format!("CHANGED {old}→{new}");
             }
-            // The adopt verdicts are events on the agent — the newest
-            // page holds this startup's outcome.
+            // The adopt verdicts are events on the agent — count only
+            // ones this restart produced (an older restart's
+            // `turn_adopted` could still sit in the newest page).
             turn = client::rpc(
                 state_dir,
                 "agent_events",
@@ -1618,11 +1625,16 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
             .ok()
             .and_then(|v| {
                 v["events"].as_array().map(|events| {
-                    if events.iter().any(|e| e["kind"] == "turn_adopted") {
+                    let this_run =
+                        |e: &&serde_json::Value| e["at"].as_f64().unwrap_or(0.0) >= restart_epoch;
+                    if events
+                        .iter()
+                        .any(|e| this_run(&e) && e["kind"] == "turn_adopted")
+                    {
                         "kept".to_string()
                     } else if events
                         .iter()
-                        .any(|e| e["kind"] == "turn_adopt_refused")
+                        .any(|e| this_run(&e) && e["kind"] == "turn_adopt_refused")
                     {
                         "fenced".to_string()
                     } else {

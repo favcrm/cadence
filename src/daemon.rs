@@ -581,10 +581,9 @@ impl Shared {
                 Ok(identity) => identity,
                 Err(error) => {
                     let reason = error.to_string();
-                    let _ = self.store.orphan_running(
-                        alias,
-                        &format!("hot-restart adoption refused: {reason}"),
-                    );
+                    let _ = self
+                        .store
+                        .orphan_running(alias, &format!("hot-restart adoption refused: {reason}"));
                     let _ = self.store.event_public(
                         alias,
                         "turn_adopt_refused",
@@ -2861,6 +2860,10 @@ impl Shared {
     /// interrupt-and-grace path: their provider process dies with the
     /// daemon either way.
     fn shutdown(&self) {
+        // Endpoint facts must be read while the panes are still live on
+        // the agent rows — detach clears `pid`/`generation`/`endpoint`.
+        // The marker's message rows are read last, after the drain.
+        let facts = self.store.pty_endpoint_facts().unwrap_or_default();
         let owned: Vec<(String, Arc<AgentCtl>)> = self
             .lifecycle
             .lock()
@@ -2869,14 +2872,12 @@ impl Shared {
             .iter()
             .map(|(alias, ctl)| (alias.clone(), Arc::clone(ctl)))
             .collect();
-        let (pty, rest): (Vec<(String, Arc<AgentCtl>)>, Vec<(String, Arc<AgentCtl>)>) = owned
-            .into_iter()
-            .partition(|(alias, _)| {
-                self.store
-                    .agent(alias)
-                    .map(|a| a.endpoint_kind == "pty")
-                    .unwrap_or(false)
-            });
+        let (pty, rest): (Vec<_>, Vec<_>) = owned.into_iter().partition(|(alias, _)| {
+            self.store
+                .agent(alias)
+                .map(|a| a.endpoint_kind == "pty")
+                .unwrap_or(false)
+        });
         for (_, ctl) in &pty {
             ctl.wake.notify_all();
         }
@@ -2890,9 +2891,9 @@ impl Shared {
             }
         }
         // LAST: every actor has detached and written its final state,
-        // so `shutdown_entries` reads a settled view — and a marker
-        // written here can only ever describe a clean stop.
-        if let Ok(entries) = self.store.shutdown_entries() {
+        // so the message rows are settled — and a marker written here
+        // can only ever describe a clean stop.
+        if let Ok(entries) = self.store.shutdown_entries(&facts) {
             write_shutdown_marker(&self.state_dir, &self.instance, entries);
         }
     }
@@ -3032,7 +3033,6 @@ pub struct ServeOptions {
     pub stall_sample_secs: Arc<AtomicU64>,
 }
 
-/// Run the daemon in the foreground until `shutdown` or a signal.
 // ---- Hot restart (CAD-89): clean-stop marker + instance files ----
 //
 // A provably clean shutdown is the ONLY path that writes
@@ -3169,6 +3169,7 @@ fn write_shutdown_marker(state_dir: &Path, instance: &str, entries: Vec<store::A
     }
 }
 
+/// Run the daemon in the foreground until `shutdown` or a signal.
 pub fn serve(state_dir: &Path) -> Result<()> {
     serve_with(state_dir, ServeOptions::default())
 }
