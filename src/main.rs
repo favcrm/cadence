@@ -1499,12 +1499,25 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
     // Stop: the shutdown rpc returns while the daemon drains; the
     // lock probe is the real exit. A daemon that was never running
     // (lock free, socket dead) skips straight to start.
-    // Adoption events are scored against this moment so an earlier
-    // restart's `turn_adopted` can't masquerade as this one's.
-    let restart_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    // Per-alias event cursors taken now bound what this restart
+    // produced — paged forward after the restart they cannot miss a
+    // `turn_adopted`/`turn_adopt_refused` to a busy agent's tail page,
+    // and an older restart's events can never masquerade as this
+    // one's.
+    let event_cursors: std::collections::HashMap<String, i64> = before
+        .iter()
+        .filter(|a| a["endpoint_kind"].as_str() == Some("pty"))
+        .filter_map(|a| a["alias"].as_str().map(str::to_string))
+        .filter_map(|alias| {
+            client::rpc(
+                state_dir,
+                "agent_events",
+                json!({"alias": alias, "tail": true}),
+            )
+            .ok()
+            .map(|v| (alias, v["cursor"].as_i64().unwrap_or(0)))
+        })
+        .collect();
     let was_running = client::rpc(state_dir, "shutdown", json!({})).is_ok();
     if was_running && !wait_daemon_exit(state_dir, 30) {
         return Err(Error::rejected(
@@ -1614,35 +1627,41 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
                 bad = true;
                 pane = format!("CHANGED {old}→{new}");
             }
-            // The adopt verdicts are events on the agent — count only
-            // ones this restart produced (an older restart's
-            // `turn_adopted` could still sit in the newest page).
-            turn = client::rpc(
-                state_dir,
-                "agent_events",
-                serde_json::json!({"alias": alias, "tail": true}),
-            )
-            .ok()
-            .and_then(|v| {
-                v["events"].as_array().map(|events| {
-                    let this_run =
-                        |e: &&serde_json::Value| e["at"].as_f64().unwrap_or(0.0) >= restart_epoch;
-                    if events
-                        .iter()
-                        .any(|e| this_run(&e) && e["kind"] == "turn_adopted")
-                    {
-                        "kept".to_string()
-                    } else if events
-                        .iter()
-                        .any(|e| this_run(&e) && e["kind"] == "turn_adopt_refused")
-                    {
-                        "fenced".to_string()
-                    } else {
-                        "-".to_string()
+            // The adopt verdicts are events on the agent — page
+            // forward from the cursor taken before the stop so only
+            // this restart's events count and none can be missed. A
+            // missing cursor means the pre-stop fetch failed; paging
+            // from zero could pick up an older restart's verdicts, so
+            // the column stays `-` instead.
+            if let Some(cursor) = event_cursors.get(alias.as_str()).copied() {
+                let mut after = cursor;
+                let mut kinds: Vec<String> = Vec::new();
+                loop {
+                    let page = client::rpc(
+                        state_dir,
+                        "agent_events",
+                        serde_json::json!({"alias": alias, "after": after}),
+                    );
+                    let Ok(v) = page else { break };
+                    let events = v["events"].as_array().cloned().unwrap_or_default();
+                    let n = events.len();
+                    for e in &events {
+                        if let Some(k) = e["kind"].as_str() {
+                            kinds.push(k.to_string());
+                        }
                     }
-                })
-            })
-            .unwrap_or_else(|| "-".to_string());
+                    after = v["cursor"].as_i64().unwrap_or(after);
+                    if n < 100 {
+                        break;
+                    }
+                }
+                if kinds.iter().any(|k| k == "turn_adopt_refused") {
+                    bad = true;
+                    turn = "fenced".to_string();
+                } else if kinds.iter().any(|k| k == "turn_adopted") {
+                    turn = "kept".to_string();
+                }
+            }
         }
         if after_state == "attention" {
             bad = true;

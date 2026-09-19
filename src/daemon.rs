@@ -577,20 +577,24 @@ impl Shared {
         // failed.
         let adoption = self.store.take_adoption(alias);
         let identity = match &adoption {
-            Some(entry) => match adapter.open_adopted(&agent, entry) {
+            // One pane proof covers the whole list — every entry for
+            // an alias shares the marker's generation/pane/session.
+            Some(entries) => match adapter.open_adopted(&agent, &entries[0]) {
                 Ok(identity) => identity,
                 Err(error) => {
                     let reason = error.to_string();
                     let _ = self
                         .store
                         .orphan_running(alias, &format!("hot-restart adoption refused: {reason}"));
-                    let _ = self.store.event_public(
-                        alias,
-                        "turn_adopt_refused",
-                        json!({"message": entry.message_id,
-                               "turn_id": entry.turn_id,
-                               "reason": reason}),
-                    );
+                    for e in entries {
+                        let _ = self.store.event_public(
+                            alias,
+                            "turn_adopt_refused",
+                            json!({"message": e.message_id,
+                                   "turn_id": e.turn_id,
+                                   "reason": reason}),
+                        );
+                    }
                     return Err(error);
                 }
             },
@@ -606,7 +610,7 @@ impl Shared {
                 .insert(alias.to_string(), attach);
         }
         match &adoption {
-            Some(entry) => self.store.set_identity_adopted(alias, &identity, entry)?,
+            Some(entries) => self.store.set_identity_adopted(alias, &identity, entries)?,
             None => self.store.set_identity(alias, &identity)?,
         }
         self.wake();
@@ -3207,6 +3211,13 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
         // is emitted instead of a launch.
         let unknown = shared.store.has_unknown(&agent.alias)?;
         if agent.state == "attention" || unknown {
+            // A kept-for-adoption `running` message whose agent still
+            // fences — a sibling in-flight message swept it into
+            // `unknown` — has no actor left to prove the pane.
+            // Unverified `running` is just `unknown`: fence it too.
+            let _ = shared
+                .store
+                .orphan_running(&agent.alias, "agent fenced at restart; turn never verified");
             let (reason, error) = if unknown {
                 (
                     "unknown messages await reconcile",

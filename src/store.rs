@@ -207,9 +207,11 @@ pub struct NewAgent<'a> {
 pub struct Store {
     conn: Mutex<Connection>,
     /// Adoption candidates that survived `recover()`'s store-level
-    /// checks, keyed by alias — each consumed exactly once by the
-    /// agent's actor at open (`take_adoption`).
-    adoptions: Mutex<std::collections::HashMap<String, AdoptEntry>>,
+    /// checks, keyed by alias — an agent may hold more than one
+    /// in-flight turn, so every qualifying entry is kept; each list is
+    /// consumed exactly once by the agent's actor at open
+    /// (`take_adoption`).
+    adoptions: Mutex<std::collections::HashMap<String, Vec<AdoptEntry>>>,
 }
 
 fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
@@ -652,11 +654,13 @@ impl Store {
     ///
     /// The exception is the hot restart (CAD-89): a provably clean
     /// shutdown recorded each pty agent's `running` turn. An entry whose
-    /// store-level checks still pass stays `running` and keeps its
-    /// generation — the token remains valid for `message_report` — and
-    /// the actor re-validates the pane itself at open. Anything else
-    /// falls back to the fence below, one `turn_adopt_refused` event per
-    /// rejected entry.
+    /// store-level checks still pass stays `running` — its `generation`
+    /// is cleared like every other runtime field, so a report landing
+    /// before the pane proof is refused as stale — and the actor
+    /// re-validates the pane itself at open; `set_identity_adopted`
+    /// then restores the recorded generation and the token validates
+    /// again. Anything else falls back to the fence below, one
+    /// `turn_adopt_refused` event per rejected entry.
     fn recover(&self, marker: Option<&ConsumedMarker>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
@@ -682,7 +686,10 @@ impl Store {
         {
             let mut adoptions = self.adoptions.lock().unwrap();
             for e in &kept {
-                adoptions.insert(e.alias.clone(), (*e).clone());
+                adoptions
+                    .entry(e.alias.clone())
+                    .or_default()
+                    .push((*e).clone());
             }
         }
         // Dynamic NOT IN for the protected message ids — one UPDATE
@@ -710,9 +717,13 @@ impl Store {
              WHERE state='attention' AND endpoint_kind != 'inbox'",
             [],
         )?;
-        // Adopted agents keep `generation` (the token must still
-        // validate) but lose the stale runtime fields — endpoint and
-        // pane pid are republished by `set_identity` at adopt.
+        // Adopted agents lose `generation` with every other runtime
+        // field — the token gate treats NULL as stale, so a report
+        // landing between store open and the actor's pane proof is
+        // rejected rather than finishing a turn whose pane may be
+        // gone. `set_identity_adopted` writes the recorded generation
+        // back once `open_adopted` has verified the pane, restoring
+        // token validity.
         let mut sql = String::from(
             "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL,
                 generation=NULL
@@ -736,7 +747,8 @@ impl Store {
                 .join(",");
             tx.execute(
                 &format!(
-                    "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL
+                    "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL,
+                        generation=NULL
                      WHERE alias IN ({placeholders})"
                 ),
                 rusqlite::params_from_iter(kept_aliases.iter()),
@@ -767,6 +779,15 @@ impl Store {
         if turn_id.as_deref() != Some(e.turn_id.as_str()) {
             return Some(format!("turn id for {} changed", e.message_id));
         }
+        // Marker-internal consistency: a token that does not embed the
+        // recorded generation can never validate again — a marker this
+        // inconsistent is corrupt or hand-built, so the turn fences.
+        if !e.turn_id.starts_with(&format!("pty-{}-", e.generation)) {
+            return Some(format!(
+                "turn {} does not match recorded generation",
+                e.message_id
+            ));
+        }
         let agent = tx
             .query_row(
                 "SELECT enabled, state FROM agents WHERE alias=?",
@@ -794,11 +815,15 @@ impl Store {
         }
     }
 
-    /// The adoption candidate `recover()` kept for this alias — consumed
-    /// once by the actor at open; a second actor generation can never
-    /// see it.
-    pub fn take_adoption(&self, alias: &str) -> Option<AdoptEntry> {
-        self.adoptions.lock().unwrap().remove(alias)
+    /// The adoption candidates `recover()` kept for this alias — every
+    /// in-flight turn that qualified — consumed once by the actor at
+    /// open; a second actor generation can never see them.
+    pub fn take_adoption(&self, alias: &str) -> Option<Vec<AdoptEntry>> {
+        self.adoptions
+            .lock()
+            .unwrap()
+            .remove(alias)
+            .filter(|v| !v.is_empty())
     }
 
     /// The endpoint facts a hot restart needs per pty alias — recorded
@@ -838,13 +863,22 @@ impl Store {
     /// Called only after all actors have detached — the message rows
     /// are final, while the facts come from the earlier snapshot since
     /// detach has already cleared them from the agent rows.
+    ///
+    /// A `running` row whose token does not embed the snapshot
+    /// generation is skipped and named: the facts were captured at the
+    /// top of shutdown while RPC threads were still live, so a resume
+    /// racing the stop could re-open the pane under a newer generation
+    /// and leave this token stale forever. Recording it would roll the
+    /// agent row back to the old generation — instead the row is
+    /// refused now and fences on restart like any other refusal.
     pub fn shutdown_entries(
         &self,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
     ) -> Result<Vec<AdoptEntry>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT alias, id, turn_id FROM messages
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT alias, id, turn_id, state FROM messages
              WHERE state IN ('running','submitting')",
         )?;
         let inflight = stmt
@@ -853,23 +887,37 @@ impl Store {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    r.get::<_, String>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(inflight
-            .into_iter()
-            .filter_map(|(alias, message_id, turn_id)| {
-                let (generation, pane_pid, native_session) = facts.get(&alias)?;
-                Some(AdoptEntry {
-                    alias,
-                    message_id,
-                    turn_id,
-                    generation: generation.clone(),
-                    pane_pid: *pane_pid,
-                    native_session: native_session.clone(),
-                })
-            })
-            .collect())
+        drop(stmt);
+        let mut entries = Vec::new();
+        for (alias, message_id, turn_id, state) in inflight {
+            let Some((generation, pane_pid, native_session)) = facts.get(&alias) else {
+                continue;
+            };
+            if state == "running" && !turn_id.starts_with(&format!("pty-{generation}-")) {
+                Self::event(
+                    &tx,
+                    &alias,
+                    "turn_adopt_refused",
+                    json!({"message": message_id, "turn_id": turn_id,
+                           "reason": "turn token predates endpoint generation"}),
+                )?;
+                continue;
+            }
+            entries.push(AdoptEntry {
+                alias,
+                message_id,
+                turn_id,
+                generation: generation.clone(),
+                pane_pid: *pane_pid,
+                native_session: native_session.clone(),
+            });
+        }
+        tx.commit()?;
+        Ok(entries)
     }
 
     fn event(conn: &Connection, alias: &str, kind: &str, payload: Value) -> Result<()> {
@@ -1704,39 +1752,47 @@ impl Store {
 
     /// `set_identity` after a hot-restart adoption: the endpoint was
     /// re-verified against the shutdown record — the same pane, the
-    /// same generation — so the recorded turn stays `running` and its
-    /// token remains valid. Any *other* in-flight message for the
+    /// same generation — so every recorded turn stays `running` and
+    /// its token remains valid. Any *other* in-flight message for the
     /// alias still takes the generation-fence.
     pub fn set_identity_adopted(
         &self,
         alias: &str,
         id: &crate::adapter::Identity,
-        entry: &AdoptEntry,
+        entries: &[AdoptEntry],
     ) -> Result<()> {
-        self.set_identity_inner(alias, id, Some(entry))
+        self.set_identity_inner(alias, id, Some(entries))
     }
 
     fn set_identity_inner(
         &self,
         alias: &str,
         id: &crate::adapter::Identity,
-        adopted: Option<&AdoptEntry>,
+        adopted: Option<&[AdoptEntry]>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         // A fresh endpoint generation cannot claim reports for turns
         // submitted through the previous one — fence them as unknown.
-        tx.execute(
+        // Every adopted entry stays `running`; a plain open protects
+        // none.
+        let kept_ids: Vec<&str> = adopted
+            .unwrap_or_default()
+            .iter()
+            .map(|e| e.message_id.as_str())
+            .collect();
+        let mut sql = String::from(
             "UPDATE messages SET state='unknown',
                 error='endpoint restarted during in-flight submission',
-                completed=? WHERE alias=? AND state='running'
-                AND id != ?",
-            params![
-                now(),
-                alias,
-                adopted.map(|e| e.message_id.as_str()).unwrap_or("")
-            ],
-        )?;
+                completed=? WHERE alias=? AND state='running'",
+        );
+        if !kept_ids.is_empty() {
+            let placeholders = kept_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND id NOT IN ({placeholders})"));
+        }
+        let mut params: Vec<rusqlite::types::Value> = vec![now().into(), alias.to_string().into()];
+        params.extend(kept_ids.iter().map(|k| k.to_string().into()));
+        tx.execute(&sql, rusqlite::params_from_iter(params))?;
         tx.execute(
             "UPDATE agents SET thread_id=?,session_id=?,model=?,pid=?,
                 endpoint=?,generation=?,state='idle',updated=? WHERE alias=?",
@@ -1759,7 +1815,7 @@ impl Store {
                    "model": id.model, "pid": id.pid, "endpoint": id.endpoint,
                    "generation": id.generation}),
         )?;
-        if let Some(e) = adopted {
+        for e in adopted.unwrap_or_default() {
             Self::event(
                 &tx,
                 alias,

@@ -947,35 +947,50 @@ one. A pane that adopted a *different* session fails closed and the
 hint is `agent remove` + `join -r` — retrying resume mints a new
 provider session each time.
 
-**Hot restart.** The one exception to fence-on-start is a *provably
-clean* stop. A graceful shutdown — `shutdown`, `daemon
-stop`/`restart`, or a handled SIGTERM/SIGINT — finishes actor cleanup
-and then, as its last act, writes `shutdown.json` into the state dir:
-the daemon's instance id (recorded at start in `daemon-instance`),
-the stop time, and every pty turn still `running` or `submitting`
-with its message id, turn id, endpoint generation, pane pid and
-native session. A pty pane is never interrupted during the drain — a
-Ctrl-C could kill the very turn being preserved — while a
+**Hot restart.** The one exception to fence-on-start is a stop the
+next daemon can *recognize* as clean. A graceful shutdown —
+`shutdown`, `daemon stop`/`restart`, or a handled SIGTERM/SIGINT —
+finishes actor cleanup and then, as its last act, writes
+`shutdown.json` into the state dir: the daemon's instance id
+(recorded at start in `daemon-instance`), the stop time, and every
+pty message still `running` **or** `submitting` with its message id,
+turn id, endpoint generation, pane pid and native session.
+`submitting` rows are recorded so the restart can name why they
+fenced — an unproven paste is never adopted, it simply fails the
+`running` check. A pty pane is never interrupted during the drain —
+a Ctrl-C could kill the very turn being preserved — while a
 `submitting` paste finishes its render check or times out inside the
-bounded wait, so the marker only ever records `running` turns whose
-paste already proved it rendered. On the next start the marker is
-consumed exactly once, and only when it matches the immediately
-preceding recorded run and is younger than its bound (~15 minutes):
-missing, mismatched, stale or unreadable markers all take the crash
-path above.
+bounded wait, so a row that reaches `running` before the marker is
+written is adopted like any other proven turn. On the next start the
+marker is consumed exactly once, and only when it matches the
+immediately preceding recorded run and is younger than its bound
+(~15 minutes): missing, mismatched, stale or unreadable markers all
+take the crash path above.
+
+"Provably clean" is a statement about ordering, not authenticity:
+the instance stamp is an unauthenticated file with exactly the trust
+level of the sqlite file beside it. It proves *this* daemon finished
+its own drain before writing the marker — nothing more — and the
+pane checks below are what make adoption safe even if the marker
+itself were doctored.
 
 For each recorded entry the store-level checks run first — the
-message must still be `running` with the same `turn_id`, the agent
-still enabled and unfenced — then the actor re-validates the pane
-itself: alive, the same pid, still holding the recorded
-native-session lock. When every check passes the message stays
-`running`, the agent is never fenced, the endpoint and the recorded
-generation are republished (so the original token still validates
-`message_report`), `turn_adopted` is emitted, and the stall watch
-arms from the new daemon's start. Any failed check falls back for
-that agent alone — message `unknown`, agent `attention`, and
-`turn_adopt_refused` naming the check — alongside healthy agents
-that adopt or relaunch normally.
+message must still be `running` with the same `turn_id`, the token
+must embed the recorded generation, the agent still enabled and
+unfenced — then the actor re-validates the pane itself: alive, the
+same pid, still holding the recorded native-session lock. Until that
+proof completes the agent's `generation` stays cleared, so a report
+landing in the window is refused as stale rather than finishing a
+turn that may be gone; a `running` row whose token predates the
+snapshot generation is refused at marker-write time, never recorded.
+When every check passes the messages stay `running` — all of the
+agent's recorded turns, not one — the agent is never fenced, the
+endpoint and the recorded generation are republished (so the
+original tokens still validate `message_report`), `turn_adopted` is
+emitted per turn, and the stall watch arms from the new daemon's
+start. Any failed check falls back for that agent alone — message
+`unknown`, agent `attention`, and `turn_adopt_refused` naming the
+check — alongside healthy agents that adopt or relaunch normally.
 
 The safety argument: an uncertain outcome is a paste that never
 proved it rendered, or a provider process whose survival cannot be
@@ -986,7 +1001,7 @@ no double submission. Managed endpoints are never adopted: the
 provider process dies with the daemon either way, so a managed
 in-flight turn stays `unknown` across any restart. `daemon restart`'s
 before/after table reports the outcome per agent under `TURN`:
-`kept`, `fenced`, or `-`.
+`kept`, `fenced`, or `-` — a fenced turn exits non-zero.
 
 ## Agent skill
 
