@@ -618,6 +618,10 @@ enum Commands {
         /// Skip the full-suite run.
         #[arg(long)]
         no_full: bool,
+        /// Run the full suite without the host-wide slot even though
+        /// `CADENCE_SUITE_LOCK` is unset (refused otherwise).
+        #[arg(long)]
+        no_suite_lock: bool,
         /// Isolated stress runs per matched new test [default 5].
         #[arg(long, default_value_t = 5)]
         stress: u32,
@@ -3327,6 +3331,7 @@ fn run() -> Result<i32> {
             repo,
             full,
             no_full,
+            no_suite_lock,
             stress,
             keep,
             json,
@@ -3334,6 +3339,7 @@ fn run() -> Result<i32> {
             pr,
             repo,
             full: full || !no_full,
+            no_suite_lock,
             stress,
             keep,
             json,

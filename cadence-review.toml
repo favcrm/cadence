@@ -18,7 +18,11 @@ gates = [
     "cargo test --lib --bins --test board",
 ]
 
-# The one full-suite run (about 8 minutes; skipped with --no-full).
+# The one full-suite run (about 12 minutes; skipped with --no-full).
+# It runs inside the host-wide slot (CADENCE_SUITE_LOCK, required unless
+# --no-suite-lock); the suite binary sees the variable empty so it does
+# not queue behind its own parent. Worst case is two full_secs: up to
+# full_secs waiting for the slot, then up to full_secs for the run.
 full_suite = "cargo test --test integration"
 
 # Diff paths that count as test files — `fn` items added under these

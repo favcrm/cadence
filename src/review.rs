@@ -183,6 +183,131 @@ impl ReviewConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Flake ledger and host load
+// ---------------------------------------------------------------------------
+
+/// `<state>/reviews/flakes.jsonl` — one line per sighting of a test that
+/// failed in the full run but passed alone on the gated tree and on the
+/// base. The ledger is the quarantine: no attribute in the code.
+pub const FLAKE_LEDGER: &str = "flakes.jsonl";
+/// Distinct PR heads a flake needs sightings on before it stops
+/// blocking — repeated reviews of one head never qualify on their own.
+pub const KNOWN_FLAKE_HEADS: usize = 3;
+
+/// What the ledger holds for one `(repo, test)` after a sighting.
+#[derive(Debug, PartialEq)]
+pub struct Sightings {
+    /// Every sighting, this one included.
+    pub total: u64,
+    /// Distinct heads among them — the current head counts once.
+    pub heads: usize,
+}
+
+impl Sightings {
+    pub fn known_flake(&self) -> bool {
+        self.heads >= KNOWN_FLAKE_HEADS
+    }
+}
+
+/// Append `entry` (`repo`, `test`, `head`, …) and return the sightings
+/// of its `(repo, test)` now on record. The read and the append happen
+/// under an exclusive `flock` on the ledger, so concurrent reviews see
+/// exact counts; each line is one `write_all`, so appends never fuse.
+/// Malformed lines are skipped.
+pub fn record_flake(ledger: &Path, entry: &Value) -> Result<Sightings> {
+    use std::io::{Read, Write};
+    use std::os::unix::io::AsRawFd;
+    if let Some(dir) = ledger.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(ledger)?;
+    // Released when `f` closes at return.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut text = String::new();
+    f.read_to_string(&mut text)?;
+    let prior: Vec<Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["repo"] == entry["repo"] && v["test"] == entry["test"])
+        .collect();
+    let mut heads: std::collections::HashSet<&str> = prior
+        .iter()
+        .map(|v| v["head"].as_str().unwrap_or_default())
+        .collect();
+    heads.insert(entry["head"].as_str().unwrap_or_default());
+    let seen = Sightings {
+        total: prior.len() as u64 + 1,
+        heads: heads.len(),
+    };
+    f.write_all(format!("{}\n", serde_json::to_string(entry)?).as_bytes())?;
+    Ok(seen)
+}
+
+/// The first lines of `test`'s panic in a full-suite output — enough to
+/// tell two sightings apart without storing the whole log.
+fn panic_head(output: &str, test: &str) -> String {
+    let marker = format!("thread '{test}'");
+    let mut lines = output.lines().skip_while(|l| !l.starts_with(&marker));
+    lines.by_ref().take(4).collect::<Vec<_>>().join("\n")
+}
+
+/// Host facts at suite start, so a load flake is explainable later:
+/// cores, the 1-minute load average, and live `cargo test` processes.
+fn host_load() -> Value {
+    let nproc = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    let load1 = std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| {
+        s.split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+    });
+    // This review and its ancestors (a `cargo test` that launched it)
+    // are not load on the suite about to run.
+    use std::os::unix::ffi::OsStrExt;
+    let mut own = vec![std::process::id()];
+    while let Some(ppid) = std::fs::read_to_string(format!("/proc/{}/stat", own[own.len() - 1]))
+        .ok()
+        .and_then(|s| {
+            // `pid (comm) state ppid …` — comm may hold spaces; split after `)`.
+            s.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok())
+        })
+        .filter(|p| *p > 1 && !own.contains(p))
+    {
+        own.push(ppid);
+    }
+    let cargo_tests = std::fs::read_dir("/proc")
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|p| p.parse::<u32>().ok())
+                        .is_some_and(|pid| !own.contains(&pid))
+                })
+                .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+                .filter(|raw| {
+                    let argv: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+                    let is_cargo = argv.first().is_some_and(|a0| {
+                        Path::new(std::ffi::OsStr::from_bytes(a0)).file_name()
+                            == Some(std::ffi::OsStr::new("cargo"))
+                    });
+                    is_cargo && argv.iter().skip(1).any(|a| *a == b"test")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    json!({"nproc": nproc, "load1": load1, "cargo_test_processes": cargo_tests})
+}
+
+// ---------------------------------------------------------------------------
 // Locks
 // ---------------------------------------------------------------------------
 
@@ -888,6 +1013,8 @@ pub struct Options {
     pub repo: Option<String>,
     /// Run the full suite (`--no-full` clears this).
     pub full: bool,
+    /// Allow the full suite without `CADENCE_SUITE_LOCK` set.
+    pub no_suite_lock: bool,
     /// Stress repetitions per matched new test [default 5].
     pub stress: u32,
     /// Keep the review worktree(s) for inspection.
@@ -904,6 +1031,19 @@ pub struct Options {
 /// written, whatever the verdict).
 pub fn run(opts: &Options) -> Result<i32> {
     let started = Instant::now();
+    // Concurrent ten-minute suites on one host starve each other into
+    // load flakes — the full run takes the host-wide slot or says why not.
+    let suite_lock_path = std::env::var("CADENCE_SUITE_LOCK")
+        .ok()
+        .filter(|p| !p.is_empty());
+    if opts.full && suite_lock_path.is_none() && !opts.no_suite_lock {
+        return Err(Error::rejected(
+            "CADENCE_SUITE_LOCK is unset — the full suite would run beside \
+             every other suite on this host. Set it (see docs/SESSION.md: \
+             export CADENCE_SUITE_LOCK=~/.local/state/cadence/suite.lock), \
+             or pass --no-full or --no-suite-lock",
+        ));
+    }
     let root = worktree::main_root(&opts.cwd)?;
     let cfg = ReviewConfig::load(&root)?;
     let t = &cfg.timeouts;
@@ -1131,20 +1271,24 @@ pub fn run(opts: &Options) -> Result<i32> {
         // The full suite, once — optionally serialized host-wide.
         if opts.full {
             let mut _suite_guard = None;
-            if let Ok(path) = std::env::var("CADENCE_SUITE_LOCK") {
-                if !path.is_empty() {
-                    let path = PathBuf::from(path);
-                    let wait = Instant::now();
-                    _suite_guard = Some(Flock::lock_deadline(&path, t.full_secs)?);
-                    suite_lock = json!({"path": path,
-                        "waited_ms": wait.elapsed().as_millis()});
-                }
+            if let Some(path) = &suite_lock_path {
+                let path = PathBuf::from(path);
+                let wait = Instant::now();
+                _suite_guard = Some(Flock::lock_deadline(&path, t.full_secs)?);
+                suite_lock = json!({"path": path,
+                    "waited_ms": wait.elapsed().as_millis()});
             }
+            report["host_load"] = host_load();
+            // The slot is already held here: the suite's own harness
+            // prelude must not queue behind its parent, so it sees the
+            // variable empty.
+            let mut suite_env = env(gated_tree);
+            suite_env.push(("CADENCE_SUITE_LOCK".into(), String::new()));
             suite_step = Some(run_step(
                 "full-suite",
                 &cfg.full_suite,
                 &tree.dir,
-                &env(gated_tree),
+                &suite_env,
                 t.full_secs,
             )?);
         }
@@ -1271,6 +1415,28 @@ pub fn run(opts: &Options) -> Result<i32> {
                 ("unknown", _) | (_, "unknown") => "inconclusive",
                 _ => "flake-under-load",
             };
+            // Passing alone on both trees is a flake sighting: record it
+            // once, with evidence, so the next review reads the count
+            // instead of re-diagnosing by hand.
+            let mut sighting = Value::Null;
+            if (gated, base) == ("pass", "pass") {
+                let entry = json!({
+                    "at": time::iso(time::now_epoch()),
+                    "repo": slug,
+                    "test": name,
+                    "pr": pr.number,
+                    "head": head_sha,
+                    "base": base_sha,
+                    "panic_head": suite_step
+                        .as_ref()
+                        .map(|s| panic_head(&s.output, name))
+                        .unwrap_or_default(),
+                    "host_load": report["host_load"].clone(),
+                });
+                let seen = record_flake(&reviews_dir.join(FLAKE_LEDGER), &entry)?;
+                sighting = json!({"sightings": seen.total, "heads": seen.heads,
+                    "known_flake": seen.known_flake()});
+            }
             let mut gated_side = json!({"outcome": gated, "tail": on_gated.tail});
             if let Some(r) = gated_reason {
                 gated_side["reason"] = json!(r);
@@ -1279,13 +1445,17 @@ pub fn run(opts: &Options) -> Result<i32> {
             if let Some(r) = base_reason {
                 base_side["reason"] = json!(r);
             }
-            comparisons.push(json!({
+            let mut row = json!({
                 "test": name, "cmd": cmd,
                 "in_run": "fail",
                 "isolated_gated": gated_side,
                 "isolated_base": base_side,
                 "verdict": verdict,
-            }));
+            });
+            if !sighting.is_null() {
+                row["flake"] = sighting;
+            }
+            comparisons.push(row);
         }
         drop(base_tree);
     }
@@ -1505,6 +1675,16 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
                 &mut reasons,
                 1,
                 format!("`{name}` fails on the base too — pre-existing, not this PR"),
+            ),
+            // A ledger-known flake is listed, not blocking.
+            Some("flake-under-load") if f["flake"]["known_flake"] == true => push_reason(
+                &mut level,
+                &mut reasons,
+                0,
+                format!(
+                    "`{name}` is a known flake ({} sightings on {} heads) — not blocking",
+                    f["flake"]["sightings"], f["flake"]["heads"]
+                ),
             ),
             Some("flake-under-load") => push_reason(
                 &mut level,
@@ -1757,18 +1937,48 @@ fn render_markdown(r: &Value) -> String {
     if failures.is_empty() {
         md.push_str("none — nothing failed\n\n");
     } else {
-        md.push_str("| test | in run | alone on gated tree | alone on base | verdict |\n|---|---|---|---|---|\n");
+        md.push_str("| test | in run | alone on gated tree | alone on base | verdict | flake sightings |\n|---|---|---|---|---|---|\n");
         for f in &failures {
             md.push_str(&format!(
-                "| `{}` | {} | {} | {} | {} |\n",
+                "| `{}` | {} | {} | {} | {} | {} |\n",
                 f["test"].as_str().unwrap_or(""),
                 f["in_run"].as_str().unwrap_or(""),
                 f["isolated_gated"]["outcome"].as_str().unwrap_or(""),
                 f["isolated_base"]["outcome"].as_str().unwrap_or(""),
-                f["verdict"].as_str().unwrap_or("")
+                f["verdict"].as_str().unwrap_or(""),
+                f["flake"]["sightings"]
+                    .as_u64()
+                    .map(|n| format!("{n} ({} heads)", f["flake"]["heads"]))
+                    .unwrap_or_else(|| "-".into())
             ));
         }
         md.push('\n');
+        let known: Vec<&Value> = failures
+            .iter()
+            .filter(|f| f["flake"]["known_flake"] == true)
+            .collect();
+        if !known.is_empty() {
+            md.push_str(&format!(
+                "## Known flakes\n\nLedger sightings on {KNOWN_FLAKE_HEADS}+ distinct heads — listed, not blocking:\n\n"
+            ));
+            for f in known {
+                md.push_str(&format!(
+                    "- `{}` — {} sightings on {} heads\n",
+                    f["test"].as_str().unwrap_or(""),
+                    f["flake"]["sightings"],
+                    f["flake"]["heads"]
+                ));
+            }
+            md.push('\n');
+        }
+    }
+    if let Some(h) = r["host_load"].as_object() {
+        md.push_str(&format!(
+            "Host at suite start: nproc {}, load1 {}, {} `cargo test` processes\n\n",
+            h.get("nproc").cloned().unwrap_or_default(),
+            h.get("load1").cloned().unwrap_or_default(),
+            h.get("cargo_test_processes").cloned().unwrap_or_default()
+        ));
     }
 
     let base_prepare = r["base_prepare"].as_array().cloned().unwrap_or_default();
@@ -2052,5 +2262,104 @@ gate_secs = 42
         r["open_pr_conflicts"] = json!([]);
         r["base_prepare"] = json!([{"outcome": "fail"}]);
         assert_eq!(suggest(&r, false).0, "blocked");
+    }
+
+    #[test]
+    fn flake_ledger_needs_three_distinct_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("reviews").join(FLAKE_LEDGER);
+        let entry = |repo: &str, test: &str, head: &str| json!({"at": "t", "repo": repo, "test": test, "pr": 1, "head": head});
+        let seen = |e: Value| record_flake(&ledger, &e).unwrap();
+        // First sighting: one head, not known.
+        let first = seen(entry("o/r", "a", "h1"));
+        assert_eq!(first, Sightings { total: 1, heads: 1 });
+        assert!(!first.known_flake());
+        // Three sightings on one head never qualify.
+        seen(entry("o/r", "a", "h1"));
+        let same_head = seen(entry("o/r", "a", "h1"));
+        assert_eq!(same_head, Sightings { total: 3, heads: 1 });
+        assert!(!same_head.known_flake());
+        // Another repo and another test never count toward (o/r, a).
+        assert_eq!(seen(entry("x/y", "a", "h2")).heads, 1);
+        assert_eq!(seen(entry("o/r", "b", "h2")).heads, 1);
+        // Malformed lines are skipped.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger)
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"{not json\n\n{\"test\": 7}\n").unwrap();
+        assert_eq!(seen(entry("o/r", "a", "h2")).heads, 2);
+        let third = seen(entry("o/r", "a", "h3"));
+        assert_eq!(third, Sightings { total: 5, heads: 3 });
+        assert!(third.known_flake());
+        // A fourth review of an already-seen head adds no qualifying head.
+        let again = seen(entry("o/r", "a", "h3"));
+        assert_eq!(again, Sightings { total: 6, heads: 3 });
+    }
+
+    #[test]
+    fn flake_ledger_appends_stay_whole_under_concurrency() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join(FLAKE_LEDGER);
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let ledger = ledger.clone();
+                std::thread::spawn(move || {
+                    for n in 0..25 {
+                        record_flake(
+                            &ledger,
+                            &json!({"repo": "o/r", "test": "t", "head": format!("h{i}-{n}"),
+                                    "pad": "x".repeat(8000)}),
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&ledger).unwrap();
+        assert_eq!(text.lines().count(), 200);
+        assert!(text
+            .lines()
+            .all(|l| serde_json::from_str::<Value>(l).is_ok()));
+        // The locked read makes the count exact.
+        let last =
+            record_flake(&ledger, &json!({"repo": "o/r", "test": "t", "head": "z"})).unwrap();
+        assert_eq!(
+            last,
+            Sightings {
+                total: 201,
+                heads: 201
+            }
+        );
+    }
+
+    #[test]
+    fn known_flake_does_not_block_the_verdict() {
+        let mut r = json!({"merge": {}, "prepare": [], "gates": [], "stress": [],
+            "open_pr_conflicts": [], "full_suite": {"outcome": "fail"}});
+        r["failures"] = json!([{"test": "x", "verdict": "flake-under-load",
+            "flake": {"sightings": 4, "heads": 2, "known_flake": false}}]);
+        assert_eq!(suggest(&r, false).0, "needs-hands-on");
+        r["failures"] = json!([{"test": "x", "verdict": "flake-under-load",
+            "flake": {"sightings": 4, "heads": 3, "known_flake": true}}]);
+        let (verdict, reasons) = suggest(&r, false);
+        assert_eq!(verdict, "pass", "{reasons:?}");
+        assert!(
+            reasons.iter().any(|m| m.contains("known flake")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn panic_head_takes_the_named_threads_lines() {
+        let out = "noise\nthread 'other' panicked\nx\nthread 'mine' (12) panicked at t.rs:1:2:\nboom\nmore\nand\ncut";
+        assert_eq!(
+            panic_head(out, "mine"),
+            "thread 'mine' (12) panicked at t.rs:1:2:\nboom\nmore\nand"
+        );
+        assert_eq!(panic_head(out, "absent"), "");
     }
 }
