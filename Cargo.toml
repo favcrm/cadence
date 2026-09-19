@@ -36,5 +36,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tungstenite = "0.26"
 tempfile = "3"
+toml = "0.8"
 
 [dev-dependencies]

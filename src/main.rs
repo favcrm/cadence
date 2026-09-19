@@ -524,6 +524,35 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         watch: Option<u64>,
     },
+    /// Review a PR end-to-end: detached checkout under
+    /// `.cadence/wt/review-<pr>` (the merge result when the base moved),
+    /// config-driven gates from `cadence-review.toml`, new-test stress,
+    /// one full-suite run, and an equal-conditions compare of every
+    /// failure on the gated tree and the base head. Writes a
+    /// Markdown+JSON report under the state dir — never posts a
+    /// status, never merges, never pushes.
+    Review {
+        /// PR number (or anything `gh pr view` accepts).
+        pr: String,
+        /// owner/name — else resolved through `gh repo view`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Run the full suite once (default).
+        #[arg(long, conflicts_with = "no_full")]
+        full: bool,
+        /// Skip the full-suite run.
+        #[arg(long)]
+        no_full: bool,
+        /// Isolated stress runs per matched new test [default 5].
+        #[arg(long, default_value_t = 5)]
+        stress: u32,
+        /// Keep the review worktree(s) for inspection.
+        #[arg(long)]
+        keep: bool,
+        /// Print the JSON report on stdout.
+        #[arg(long)]
+        json: bool,
+    },
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
     /// generated `--mcp-config`, never by hand.
@@ -3005,6 +3034,24 @@ fn run() -> Result<i32> {
         Commands::Status { group, json, watch } => {
             run_status(&state_dir, group.as_deref(), json, watch)
         }
+        Commands::Review {
+            pr,
+            repo,
+            full,
+            no_full,
+            stress,
+            keep,
+            json,
+        } => cadence_agent::review::run(&cadence_agent::review::Options {
+            pr,
+            repo,
+            full: full || !no_full,
+            stress,
+            keep,
+            json,
+            cwd: std::env::current_dir()?,
+            state_dir,
+        }),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
 }

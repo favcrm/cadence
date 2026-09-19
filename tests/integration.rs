@@ -12277,3 +12277,456 @@ fn events_follow_starts_at_tail() {
         .any(|e| e["payload"]["message"].as_str() == Some("mf"));
     assert!(streamed, "no post-follow event streamed: {text}");
 }
+
+// ---------------------------------------------------------------------------
+// `cadence review` — the mechanical review routine against a temp repo
+// with a fake `gh` and trivial gate commands.
+// ---------------------------------------------------------------------------
+
+fn review_git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn review_git_sha(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A fixture repo: `origin` (bare) + `repo` (clone) whose main moved
+/// after the PR branches cut, four open PR heads under refs/pull/N/head
+/// (7 = clean merge + a new wait-test, 8 = pairwise conflict with 7,
+/// 9 = clean, 10 = merge conflict with main), a `cadence-review.toml`
+/// driving trivial commands, and a fake `gh` answering from fixtures.
+struct ReviewFixture {
+    repo: PathBuf,
+    state: PathBuf,
+    fakebin: PathBuf,
+    fakedir: PathBuf,
+    gate_log: PathBuf,
+    suite_ran: PathBuf,
+    suite_lock: PathBuf,
+    head7: String,
+}
+
+fn review_fixture(base: &Path) -> ReviewFixture {
+    let origin = base.join("origin.git");
+    let repo = base.join("repo");
+    let state = base.join("state");
+    let fakedir = base.join("gh-fixtures");
+    let fakebin = base.join("bin");
+    std::fs::create_dir_all(&fakedir).unwrap();
+    std::fs::create_dir_all(&fakebin).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    review_git(base, &["init", "-q", "--bare", &origin.to_string_lossy()]);
+    review_git(
+        base,
+        &[
+            "clone",
+            "-q",
+            &origin.to_string_lossy(),
+            &repo.to_string_lossy(),
+        ],
+    );
+    review_git(&repo, &["config", "user.email", "t@t"]);
+    review_git(&repo, &["config", "user.name", "t"]);
+    review_git(&repo, &["checkout", "-qb", "main"]);
+
+    let put = |rel: &str, text: &str| {
+        let p = repo.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+
+    put("marker.txt", "a");
+    put("shared.txt", "a");
+    put("shared2.txt", "a");
+    put("other.txt", "a");
+    put("tests/test_old.rs", "#[test]\nfn old_test() {}\n");
+    put(
+        "cadence-review.toml",
+        r#"prepare = ["echo prepared >> \"$GATE_LOG\""]
+gates = [
+    "echo gate1 >> \"$GATE_LOG\"",
+    "echo gate2 >> \"$GATE_LOG\"",
+    "sh gate_fail.sh",
+    "echo gate4-never >> \"$GATE_LOG\"",
+]
+full_suite = "sh suite.sh"
+test_globs = ["tests/**"]
+test_command = "sh one_test.sh {test}"
+stress_pattern = ["wait_"]
+"#,
+    );
+    put(
+        "gate_fail.sh",
+        "echo gate3-output-line1\n\
+         echo \"test new_flaky ... FAILED\"\n\
+         echo \"\"\n\
+         echo \"failures:\"\n\
+         echo \"\"\n\
+         echo \"    new_flaky\"\n\
+         echo \"\"\n\
+         echo \"test result: FAILED. 0 passed; 1 failed\"\n\
+         exit 1\n",
+    );
+    put(
+        "suite.sh",
+        "touch \"$SUITE_RAN\"\necho \"test result: ok. 5 passed\"\nexit 0\n",
+    );
+    put(
+        "one_test.sh",
+        "case \"$1\" in\n\
+         \x20 new_flaky) [ \"$(cat shared.txt)\" = \"a\" ] && exit 0 || exit 1 ;;\n\
+         \x20 *) exit 0 ;;\n\
+         esac\n",
+    );
+    review_git(&repo, &["add", "-A"]);
+    review_git(&repo, &["commit", "-qm", "base A"]);
+    let sha_a = review_git_sha(&repo, &["rev-parse", "HEAD"]);
+
+    // PR 7: touches shared.txt and adds a test that waits — merges
+    // cleanly with the moved base.
+    review_git(&repo, &["checkout", "-qb", "pr-7", "main"]);
+    put("shared.txt", "pr7");
+    put(
+        "tests/test_new.rs",
+        "#[test]\nfn new_daemon_wait() {\n    let _ = wait_agent;\n}\n",
+    );
+    review_git(&repo, &["add", "-A"]);
+    review_git(&repo, &["commit", "-qm", "pr7"]);
+    let head7 = review_git_sha(&repo, &["rev-parse", "HEAD"]);
+    review_git(&repo, &["push", "-q", "origin", "HEAD:refs/pull/7/head"]);
+
+    // PR 8: same file, other content — pairwise conflict with PR 7.
+    review_git(&repo, &["checkout", "-qb", "pr-8", "main"]);
+    put("shared.txt", "pr8");
+    review_git(&repo, &["commit", "-qam", "pr8"]);
+    let head8 = review_git_sha(&repo, &["rev-parse", "HEAD"]);
+    review_git(&repo, &["push", "-q", "origin", "HEAD:refs/pull/8/head"]);
+
+    // PR 9: adds a file — clean against everything.
+    review_git(&repo, &["checkout", "-qb", "pr-9", "main"]);
+    put("extra9.txt", "nine");
+    review_git(&repo, &["add", "-A"]);
+    review_git(&repo, &["commit", "-qm", "pr9"]);
+    let head9 = review_git_sha(&repo, &["rev-parse", "HEAD"]);
+    review_git(&repo, &["push", "-q", "origin", "HEAD:refs/pull/9/head"]);
+
+    // PR 10: touches shared2.txt, which main is about to change too —
+    // a merge-result conflict. Also adds a wait-test.
+    review_git(&repo, &["checkout", "-qb", "pr-10", "main"]);
+    put("shared2.txt", "pr10");
+    put(
+        "tests/test_wait10.rs",
+        "#[test]\nfn wait_thing() {\n    let _ = wait_agent;\n}\n",
+    );
+    review_git(&repo, &["add", "-A"]);
+    review_git(&repo, &["commit", "-qm", "pr10"]);
+    let head10 = review_git_sha(&repo, &["rev-parse", "HEAD"]);
+    review_git(&repo, &["push", "-q", "origin", "HEAD:refs/pull/10/head"]);
+
+    // main moves past every merge-base (commit B on disjoint files for
+    // PR 7's clean merge; shared2.txt for PR 10's conflict).
+    review_git(&repo, &["checkout", "-q", "main"]);
+    put("other.txt", "b");
+    put("shared2.txt", "b");
+    review_git(&repo, &["commit", "-qam", "base B"]);
+    review_git(&repo, &["push", "-q", "origin", "main"]);
+    let _ = sha_a;
+
+    // Fake gh + fixtures.
+    let gh = fakebin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\n\
+         case \"$1 $2\" in\n\
+         \x20 \"pr view\") cat \"$FAKE_GH_DIR/pr-view-$3.json\" ;;\n\
+         \x20 \"pr list\") cat \"$FAKE_GH_DIR/pr-list.json\" ;;\n\
+         \x20 \"repo view\") echo \"o/r\" ;;\n\
+         \x20 *) echo \"fake gh unhandled: $*\" >&2; exit 1 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let view = |n: i64, sha: &str, branch: &str| {
+        serde_json::json!({
+            "number": n, "title": format!("PR {n}"),
+            "url": format!("https://example/{n}"),
+            "headRefName": branch, "headRefOid": sha,
+            "baseRefName": "main",
+            "files": [{"path": "shared.txt"}, {"path": "tests/test_new.rs"}],
+            "state": "OPEN",
+        })
+    };
+    std::fs::write(
+        fakedir.join("pr-view-7.json"),
+        serde_json::to_string(&view(7, &head7, "pr-7")).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        fakedir.join("pr-view-10.json"),
+        serde_json::to_string(&view(10, &head10, "pr-10")).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        fakedir.join("pr-list.json"),
+        serde_json::to_string(&serde_json::json!([
+            {"number": 7, "title": "PR 7", "headRefOid": head7},
+            {"number": 8, "title": "PR 8", "headRefOid": head8},
+            {"number": 9, "title": "PR 9", "headRefOid": head9},
+            {"number": 10, "title": "PR 10", "headRefOid": head10},
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    ReviewFixture {
+        gate_log: base.join("gate.log"),
+        suite_ran: base.join("suite.ran"),
+        suite_lock: base.join("suite.lock"),
+        repo,
+        state,
+        fakebin,
+        fakedir,
+        head7,
+    }
+}
+
+fn review_cmd(f: &ReviewFixture) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
+        .arg(&f.state)
+        .arg("review")
+        .arg("--repo")
+        .arg("o/r")
+        .current_dir(&f.repo)
+        .env(
+            "PATH",
+            format!("{}:{}", f.fakebin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("FAKE_GH_DIR", &f.fakedir)
+        .env("GATE_LOG", &f.gate_log)
+        .env("SUITE_RAN", &f.suite_ran)
+        .env("CADENCE_SUITE_LOCK", &f.suite_lock);
+    cmd
+}
+
+fn review_report(f: &ReviewFixture, pr: i64) -> Value {
+    let dir = f.state.join("reviews");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&format!("review-o_r-pr{pr}-")) && n.ends_with(".json"))
+        .collect();
+    names.sort();
+    let last = names
+        .last()
+        .unwrap_or_else(|| panic!("no review report for pr {pr} in {}", dir.display()));
+    serde_json::from_str(&std::fs::read_to_string(dir.join(last)).unwrap()).unwrap()
+}
+
+#[test]
+fn review_verb_end_to_end() {
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    let out = review_cmd(&f).arg("7").output().unwrap();
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Gates ran in order; the failing gate stopped the sequence. The
+    // second "prepared" is the base-head checkout prepared for the
+    // equal-conditions compare.
+    let log = std::fs::read_to_string(&f.gate_log).unwrap();
+    assert_eq!(log, "prepared\ngate1\ngate2\nprepared\n", "{log}");
+    // The full suite ran once.
+    assert!(f.suite_ran.exists());
+    // Both checkouts are gone afterwards.
+    assert!(!f.repo.join(".cadence/wt/review-7").exists());
+    assert!(!f.repo.join(".cadence/wt/review-7-base").exists());
+    let wts = review_git_sha(&f.repo, &["worktree", "list"]);
+    assert!(!wts.contains("review-7"), "{wts}");
+
+    let r = review_report(&f, 7);
+    assert_eq!(r["pr"], 7);
+    assert_eq!(r["head"], json!(f.head7));
+    assert_eq!(r["base"]["moved_since_merge_base"], true);
+    assert_eq!(r["gated_tree"], json!("merge-result"));
+    assert_eq!(r["merge"]["result"], json!("clean"));
+
+    let gates = r["gates"].as_array().unwrap();
+    let outcomes: Vec<&str> = gates
+        .iter()
+        .map(|g| g["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes, vec!["ok", "ok", "fail", "skipped"], "{gates:?}");
+    // The failing gate's tail is kept.
+    assert!(
+        gates[2]["tail"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap_or("").contains("new_flaky")),
+        "{:?}",
+        gates[2]["tail"]
+    );
+
+    // New test detected and stressed 5 times.
+    let stress = r["stress"].as_array().unwrap();
+    assert_eq!(stress.len(), 1);
+    assert_eq!(stress[0]["test"], json!("new_daemon_wait"));
+    assert_eq!(stress[0]["runs"], 5);
+    assert_eq!(stress[0]["failures"], 0);
+    assert_eq!(stress[0]["detail"].as_array().unwrap().len(), 5);
+
+    assert_eq!(r["full_suite"]["outcome"], json!("ok"));
+    assert!(r["suite_lock"]["path"].is_string(), "{:?}", r["suite_lock"]);
+
+    // Equal-conditions compare: new_flaky fails the gated tree, passes
+    // on the base head → regression.
+    let fails = r["failures"].as_array().unwrap();
+    assert_eq!(fails.len(), 1, "{fails:?}");
+    assert_eq!(fails[0]["test"], json!("new_flaky"));
+    assert_eq!(fails[0]["isolated_gated"]["outcome"], json!("fail"));
+    assert_eq!(fails[0]["isolated_base"]["outcome"], json!("pass"));
+    assert_eq!(fails[0]["verdict"], json!("regression"));
+
+    // Pairwise open-PR conflicts: PR 8 conflicts on shared.txt; PR 9
+    // and PR 10 merge clean.
+    let conflicts = r["open_pr_conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    assert_eq!(conflicts[0]["pr"], 8);
+    assert_eq!(conflicts[0]["files"], json!(["shared.txt"]));
+
+    assert_eq!(r["schema_migration"], false);
+    assert_eq!(r["suggested_verdict"], json!("blocked"));
+    assert!(r["report_md"].as_str().unwrap().ends_with(".md"));
+
+    // The Markdown report exists and names the verdict.
+    let md_path = PathBuf::from(r["report_md"].as_str().unwrap());
+    let md = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md.contains("suggested verdict: blocked"), "{md}");
+    assert!(md.contains("regression"), "{md}");
+}
+
+#[test]
+fn review_verb_merge_conflict_blocks() {
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    let out = review_cmd(&f).arg("10").output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = review_report(&f, 10);
+    assert_eq!(r["base"]["moved_since_merge_base"], true);
+    assert_eq!(r["merge"]["result"], json!("conflict"));
+    assert_eq!(r["merge"]["conflict_files"], json!(["shared2.txt"]));
+    // The gates still ran, on the bare PR head.
+    assert_eq!(r["gated_tree"], json!("pr-head"));
+    let outcomes: Vec<&str> = r["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes, vec!["ok", "ok", "fail", "skipped"]);
+    // Its wait-test was stressed too.
+    assert_eq!(r["stress"][0]["test"], json!("wait_thing"));
+    assert_eq!(r["suggested_verdict"], json!("blocked"));
+    assert!(
+        r["verdict_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("does not merge")),
+        "{:?}",
+        r["verdict_reasons"]
+    );
+}
+
+#[test]
+fn review_verb_lock_refuses_a_second_run() {
+    use std::os::unix::io::AsRawFd;
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    let reviews = f.state.join("reviews");
+    std::fs::create_dir_all(&reviews).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(reviews.join("o_r.review.lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let out = review_cmd(&f).arg("7").output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already running"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(held);
+}
+
+#[test]
+fn review_verb_suite_lock_serializes() {
+    use std::os::unix::io::AsRawFd;
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    // Hold the suite slot: the run must wait on it before `full_suite`.
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&f.suite_lock)
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    let mut child = review_cmd(&f).arg("7").spawn().unwrap();
+    // Everything before the suite takes well under 4s here; a still-
+    // running child with no suite marker is waiting on the lock.
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "review finished while the suite lock was held"
+    );
+    assert!(!f.suite_ran.exists(), "suite ran while its lock was held");
+    drop(held);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(f.suite_ran.exists());
+}
