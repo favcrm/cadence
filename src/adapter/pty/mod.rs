@@ -487,11 +487,14 @@ impl PtyAdapter {
 
     /// Gate evaluation before any paste: the pane must be live, not in a
     /// tmux mode, and still the session owner — else the endpoint is
-    /// dead. Then readiness: a fresh unconsumed operator claim always
-    /// wins; without one, `auto_ready=verified` agents get a daemon-run
-    /// screen probe (idle pane → self-claim, recorded as a
-    /// `ready_claimed` event by `"daemon"`); anything else requeues for
-    /// a retry.
+    /// dead. Then the screen probe — run before any claim is consumed,
+    /// because an open approval menu is never idle and no claim may
+    /// carry a paste past one (the refusal also costs nothing: no
+    /// claim eaten). Readiness last: a fresh unconsumed operator claim
+    /// always wins; without one, `auto_ready=verified` agents get the
+    /// probe verdict (idle pane → self-claim, recorded as a
+    /// `ready_claimed` event by `"daemon"`); anything else requeues
+    /// for a retry.
     fn check_gate(&self, message_id: &str) -> Result<()> {
         let (session, native) = self.session_and_native();
         if !self.has_session(&session) {
@@ -503,6 +506,14 @@ impl PtyAdapter {
         self.verify_ownership(&session, &native)?;
         if self.pane_value(&session, "#{pane_in_mode}")? != "0" {
             return Err(Error::gate("pane is in a tmux mode (copy/view)"));
+        }
+        let probe = self.probe()?;
+        if probe.approval_menu {
+            return Err(Error::gate(format!(
+                "approval menu is open: {} — answer it in the pane or with \
+                 `cadence agent answer {} <choice>`",
+                probe.reason, session
+            )));
         }
         let claimed = {
             // Claims stack FIFO: drop expired heads, consume the oldest
@@ -538,7 +549,6 @@ impl PtyAdapter {
                  terminal is idle with an empty input before submission",
             ));
         }
-        let probe = self.probe()?;
         if probe.idle {
             self.state.lock().unwrap().gate_probe = Some(probe.clone());
             (self.hooks.on_event)(
@@ -1027,6 +1037,39 @@ impl ProviderAdapter for PtyAdapter {
         let session = self.session();
         let cursor = self.cursor_pos(&session);
         Ok(self.profile.analyze(&self.capture_visible()?, cursor))
+    }
+
+    /// `agent answer`: the only input a menu accepts is its own choice
+    /// key — never a paste. The fresh probe must still see the menu;
+    /// anything else refuses so the keystroke cannot land in a prompt,
+    /// a draft, or a running turn.
+    fn answer_approval(&self, choice: &str) -> Result<Probe> {
+        let (session, native) = self.session_and_native();
+        if !self.has_session(&session) {
+            return Err(Error::provider("cannot answer: pane is gone"));
+        }
+        self.verify_ownership(&session, &native)?;
+        let screen = self.capture_visible()?;
+        let probe = self.profile.analyze(&screen, self.cursor_pos(&session));
+        if !probe.approval_menu {
+            return Err(Error::rejected(format!(
+                "refusing menu answer — the pane shows no approval menu \
+                 ({}) (inspect with `agent capture`)",
+                probe.reason
+            )));
+        }
+        let keys = self.profile.approval_answer(&screen, choice)?;
+        let mut args = vec!["send-keys", "-t", session.as_str()];
+        args.extend(keys.iter().map(String::as_str));
+        self.tmux_ok(&args)?;
+        Ok(probe)
+    }
+
+    fn sample_screen(&self) -> Result<(String, Probe)> {
+        let session = self.session();
+        let screen = self.capture_visible()?;
+        let probe = self.profile.analyze(&screen, self.cursor_pos(&session));
+        Ok((activity_hash(&screen), probe))
     }
 
     fn update_params(&self, params: &Value) {

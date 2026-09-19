@@ -20,13 +20,15 @@ use super::{descends_from, lock_holders, resolve_on_path, shlex_quote};
 
 /// Bounded wait for the launched Devin TUI to take a native session lock.
 const OPEN_DEADLINE: Duration = Duration::from_secs(30);
-/// How much of the screen bottom counts as the status region: input
-/// line, divider, status bar and a menu tall enough for Devin's
-/// approval select. Approval markers only match inside it — the
-/// transcript above can legitimately show these strings as text.
+/// How much of the screen bottom counts as the menu region: a
+/// numbered approval menu (~12 rows) plus the busy input box and
+/// status bar that can stay visible below it, so the menu's own
+/// chrome sits up to ~18 rows above the frame's end. Only the
+/// menu-exclusive anchors below match inside it — transcript text
+/// quoting a lone option label or legend fragment never counts.
 /// (Busy is anchored tighter still: the status row directly above the
 /// input box — see `analyze_devin`.)
-const STATUS_LINES: usize = 14;
+const MENU_LINES: usize = 24;
 
 /// Devin TUI screen signatures — THE one place they live. A provider
 /// TUI update means editing this table, never the gate logic. Every
@@ -53,18 +55,24 @@ mod devin_screen {
         "(esc twice to interrupt)",
         "Cancel agent (esc twice)",
     ];
-    /// An open select/permission menu — the hint-bar fragments plus the
-    /// option labels only a menu renders. `↑↓ select · ↵ confirm ·
-    /// esc cancel` is the verbatim approval footer; `↓↑ to select` is
-    /// the same control on the directory-trust prompt.
-    pub const APPROVAL: &[&str] = &[
+    /// An open select/permission menu — the anchors below are
+    /// menu-exclusive and a single match decides alone: the
+    /// selection footer's legend, which only ever renders on a menu
+    /// (`↑↓ select · ↵ confirm · esc cancel` verbatim on the approval
+    /// select, `↓↑ to select` on the directory-trust prompt). Anchors
+    /// match on the trimmed row's leading glyph, so a transcript row
+    /// quoting `↵ confirm` mid-sentence stays inert.
+    pub const ANCHOR: &[&str] = &["↑↓ select", "↓↑ to select", "↵ confirm"];
+    /// Option labels and lone legend fragments — quotable inside a
+    /// long transcript, so they only count as a cluster alongside real
+    /// menu structure (a second hint, or numbered option rows).
+    pub const HINT: &[&str] = &[
         "(Approve",
         " to select",
-        "↑↓ select",
-        "↵ confirm",
         "esc cancel",
         "Yes, switch to bypass mode",
         "No, keep",
+        "always allow",
     ];
     /// TUI-side staged queue while busy (A26 sibling: text was staged,
     /// not dropped — still not safe to add to).
@@ -76,6 +84,47 @@ mod devin_screen {
 /// command menu, `!` switches to bash mode, `@` opens the file-picker.
 /// `#` stays a literal draft and is deliberately absent.
 pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
+
+/// A numbered menu option row: `· 3 Yes, …` or the `❭`-led selected
+/// row. Returns the printed number so `approval_answer` can validate a
+/// choice against the rows actually on screen.
+fn option_line(line: &str) -> Option<u32> {
+    let t = line.trim_start();
+    let t = t
+        .strip_prefix('·')
+        .or_else(|| t.strip_prefix('❭'))?
+        .trim_start();
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || !t[digits.len()..].starts_with(char::is_whitespace) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The line naming what the menu asks: the last non-blank row above
+/// the option list — a `└`-led command detail (`$ printenv FOO`) or a
+/// bare header (`Allow this tool call?`).
+fn menu_subject(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.trim_end().lines().collect();
+    let last_opt = lines.iter().rposition(|l| option_line(l).is_some())?;
+    let mut first_opt = last_opt;
+    while first_opt > 0 && option_line(lines[first_opt - 1]).is_some() {
+        first_opt -= 1;
+    }
+    lines[..first_opt]
+        .iter()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| {
+            l.trim()
+                .trim_start_matches('└')
+                .trim_start_matches('⏺')
+                .trim()
+                .chars()
+                .take(100)
+                .collect()
+        })
+}
 
 /// Reduce a captured Devin screen to gate facts. The last `❭` line is
 /// the input line; text after it that is not the placeholder is a
@@ -92,16 +141,28 @@ pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
 /// blank rows below the real content.
 pub fn analyze_devin(screen: &str) -> Probe {
     let content = screen.trim_end();
-    let tail: String = content
-        .lines()
-        .rev()
-        .take(STATUS_LINES)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let approval_menu = devin_screen::APPROVAL.iter().any(|m| tail.contains(m));
+    // The menu region is wider than the busy anchor: a numbered
+    // approval menu can sit ABOVE a still-visible busy input box, so
+    // its option rows and footer land up to ~18 rows above the frame
+    // end. Anchors (the selection footer's legend, matched on the
+    // trimmed row's leading glyph) decide alone; hints (option labels,
+    // lone legend fragments) need real menu structure beside them —
+    // numbered option rows or a second hint — because transcript text
+    // can legitimately quote one.
+    let menu_lines: Vec<&str> = content.lines().rev().take(MENU_LINES).collect();
+    let footer = menu_lines.iter().any(|l| {
+        let t = l.trim_start();
+        devin_screen::ANCHOR.iter().any(|a| t.starts_with(a))
+    });
+    let options = menu_lines
+        .iter()
+        .filter(|l| option_line(l).is_some())
+        .count();
+    let hints = devin_screen::HINT
+        .iter()
+        .filter(|h| menu_lines.iter().any(|l| l.contains(**h)))
+        .count();
+    let approval_menu = footer || (options >= 2 && hints >= 1) || hints >= 2;
     let lines: Vec<&str> = screen.lines().collect();
     let prompt_idx = lines
         .iter()
@@ -144,21 +205,30 @@ pub fn analyze_devin(screen: &str) -> Probe {
     let watermark_busy = draft.starts_with(devin_screen::BUSY_PLACEHOLDER);
     let busy_marker = status_busy || watermark_busy;
     let (idle, reason) = if approval_menu {
-        (false, "approval menu is open")
+        (
+            false,
+            menu_subject(content).unwrap_or_else(|| "approval menu is open".to_string()),
+        )
     } else if watermark_busy {
-        (false, "tui is busy (guide watermark in the input line)")
+        (
+            false,
+            "tui is busy (guide watermark in the input line)".to_string(),
+        )
     } else if status_busy {
-        (false, "tui is busy (status row above the input box)")
+        (
+            false,
+            "tui is busy (status row above the input box)".to_string(),
+        )
     } else if !prompt_visible {
-        (false, "no prompt line visible")
+        (false, "no prompt line visible".to_string())
     } else if input_nonempty {
-        (false, "unsubmitted text in the input line")
+        (false, "unsubmitted text in the input line".to_string())
     } else {
-        (true, "idle")
+        (true, "idle".to_string())
     };
     Probe {
         idle,
-        reason: reason.to_string(),
+        reason,
         input_nonempty,
         prompt_visible,
         busy_marker,
@@ -315,6 +385,47 @@ impl TuiProfile for DevinProfile {
          permission prompts in the terminal itself"
     }
 
+    /// Numbered menus take the option's digit key (verified live:
+    /// `8` dismisses the permission select as `No` in one keystroke);
+    /// an unnumbered select falls back to arrows + Enter.
+    fn approval_answer(&self, screen: &str, choice: &str) -> Result<Vec<String>> {
+        let options: Vec<u32> = screen
+            .trim_end()
+            .lines()
+            .rev()
+            .take(MENU_LINES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .filter_map(option_line)
+            .collect();
+        let n: u32 = choice.parse().map_err(|_| {
+            Error::rejected(format!(
+                "'{choice}' is not a menu index — Devin menus take the \
+                 option's printed number"
+            ))
+        })?;
+        if options.is_empty() {
+            if n == 0 {
+                return Err(Error::rejected("menu indices start at 1"));
+            }
+            let mut keys = vec!["Down".to_string(); (n - 1) as usize];
+            keys.push("Enter".to_string());
+            return Ok(keys);
+        }
+        if options.contains(&n) {
+            return Ok(vec![n.to_string()]);
+        }
+        Err(Error::rejected(format!(
+            "no option {n} on this menu — it lists {}",
+            options
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+
     fn forbidden_prefixes(&self) -> &'static [char] {
         FORBIDDEN_PREFIXES
     }
@@ -322,7 +433,7 @@ impl TuiProfile for DevinProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze_devin, DevinProfile, STATUS_LINES};
+    use super::{analyze_devin, DevinProfile, MENU_LINES};
     use crate::adapter::pty::profile::TuiProfile;
     use crate::adapter::registry::DEVIN_PERMISSION_MODES;
     use std::path::PathBuf;
@@ -436,7 +547,9 @@ Allow this tool call?
         let p = analyze_devin(APPROVAL);
         assert!(!p.idle);
         assert!(p.approval_menu);
-        assert_eq!(p.reason, "approval menu is open");
+        // The reason names what the menu asks — the line above the
+        // option list.
+        assert_eq!(p.reason, "Allow this tool call?");
     }
 
     #[test]
@@ -568,7 +681,7 @@ SWE-2 Max                                      Alt+Enter for multiline prompts";
         ] {
             screen.push_str(&format!("transcript line: {marker}\n"));
         }
-        for i in 0..STATUS_LINES {
+        for i in 0..MENU_LINES {
             screen.push_str(&format!("ordinary output row {i}\n"));
         }
         screen.push_str(IDLE);
@@ -618,7 +731,53 @@ SWE-2 Max                                      Alt+Enter for multiline prompts";
         let screen = format!("{APPROVAL}{}", "\n".repeat(30));
         let p = analyze_devin(&screen);
         assert!(!p.idle && p.approval_menu, "{:?}", p);
-        assert_eq!(p.reason, "approval menu is open");
+        assert_eq!(p.reason, "Allow this tool call?");
+    }
+
+    #[test]
+    fn approval_menu_above_the_busy_box_is_still_a_menu() {
+        // CAD-102: the incident layout — the numbered menu renders
+        // ABOVE a still-visible busy input box, so its option rows and
+        // footer land ~18 rows above the frame end, outside the busy
+        // anchor. Reading it as "busy (guide watermark)" is the bug:
+        // a menu is not ordinary busy — it needs an operator answer.
+        let screen = "\
+❭ run the shell command: printenv FOO
+ ⏺ Running command
+ └ $ printenv FOO
+
+❭ 1 Yes  (Approve once)
+· 2 Yes, allow `printenv` commands
+· 3 Yes, always allow `printenv` commands in `tmp`
+· 4 Yes, always allow `printenv` commands in all projects
+· 5 Yes, switch to bypass mode
+· 6 Edit command
+· 7 Describe change to command
+· 8 No
+↑↓ select · ↵ confirm · esc cancel
+
+──────────────────────────────────────────────────────────────────
+❭ Guide Devin while it works
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                      Alt+Enter for multiline prompts";
+        let p = analyze_devin(screen);
+        assert!(!p.idle && p.approval_menu, "{:?}", p);
+        // The menu wins over the watermark busy below it — and the
+        // reason names the command being approved, not generic busy.
+        assert_eq!(p.reason, "$ printenv FOO");
+    }
+
+    #[test]
+    fn numbered_options_need_menu_structure() {
+        // Transcript text quoting a lone option label or legend word
+        // stays inert — hints only count beside real menu structure.
+        let screen = "\
+earlier the menu offered `No, keep` as the last choice
+❭ Ask Devin to build features
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                      Alt+Enter for multiline prompts";
+        let p = analyze_devin(screen);
+        assert!(p.idle && !p.approval_menu, "{:?}", p);
     }
 
     #[test]

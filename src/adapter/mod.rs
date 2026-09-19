@@ -208,6 +208,28 @@ pub trait ProviderAdapter: Send + Sync {
             "this endpoint kind has no screen probe",
         ))
     }
+    /// `agent answer`: send one menu-choice keystroke to a pane that
+    /// currently probes `approval_menu` (pty only). The adapter
+    /// re-probes first and refuses anything that isn't a live menu —
+    /// the key can never land in a prompt or a running turn. `choice`
+    /// is the option's printed index; the profile's own keymap maps it
+    /// to keystrokes. Returns the probe the answer was admitted under
+    /// (the menu line rides on `reason`).
+    fn answer_approval(&self, _choice: &str) -> Result<Probe> {
+        Err(crate::error::Error::rejected(
+            "this endpoint kind has no approval-menu channel",
+        ))
+    }
+    /// One bounded liveness sample for the stall watch: the activity
+    /// hash and the probe verdict from a single screen capture (pty
+    /// only). A menu or an idle frame both carry information a plain
+    /// hash cannot — the hash alone cannot tell "ended at the prompt"
+    /// from "busy churning".
+    fn sample_screen(&self) -> Result<(String, Probe)> {
+        Err(crate::error::Error::rejected(
+            "this endpoint kind has no screen sample",
+        ))
+    }
     /// A merged params patch landed in the store — live adapters that
     /// cache endpoint options (pty's `auto_ready`) refresh here. Stored
     /// params remain authoritative for the next `open` regardless.

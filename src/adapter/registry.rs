@@ -238,7 +238,7 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "claude --resume <session>",
-        live_settable_params: &["auto_ready", "stall_secs"],
+        live_settable_params: &["auto_ready", "stall_secs", "silent_end_secs"],
         launch_params: &[
             "model",
             "effort",
@@ -248,6 +248,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "session",
             "upstream",
             "auto_ready",
+            "silent_end_secs",
             "agents_md",
             "stall_secs",
         ],
@@ -273,11 +274,12 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "devin -r <slug>",
-        live_settable_params: &["auto_ready", "stall_secs"],
+        live_settable_params: &["auto_ready", "stall_secs", "silent_end_secs"],
         launch_params: &[
             "session",
             "upstream",
             "auto_ready",
+            "silent_end_secs",
             "permission_mode",
             "bypass",
             "agents_md",
@@ -305,7 +307,7 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "cursor-agent --resume <session>",
-        live_settable_params: &["auto_ready", "stall_secs"],
+        live_settable_params: &["auto_ready", "stall_secs", "silent_end_secs"],
         launch_params: &[
             "model",
             "permission_mode",
@@ -313,6 +315,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "session",
             "upstream",
             "auto_ready",
+            "silent_end_secs",
             "agents_md",
             "stall_secs",
         ],
@@ -338,11 +341,12 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: true,
         resume_label: "stub -r <session>",
-        live_settable_params: &["auto_ready", "stall_secs"],
+        live_settable_params: &["auto_ready", "stall_secs", "silent_end_secs"],
         launch_params: &[
             "session",
             "upstream",
             "auto_ready",
+            "silent_end_secs",
             "agents_md",
             "stall_secs",
         ],
@@ -634,10 +638,26 @@ pub fn validate_live_param(provider: &str, kind: &str, key: &str, value: &Value)
             }
             Ok(())
         }
+        "silent_end_secs" => {
+            if !screen_probe(provider, kind) {
+                return Err(Error::rejected(
+                    "'silent_end_secs' only applies to pty endpoints — \
+                     idle-pane detection needs a screen probe",
+                ));
+            }
+            if !check_stall_secs(value) {
+                return Err(Error::rejected(
+                    "'silent_end_secs' must be a non-negative integer (0 \
+                     disables silent-end detection) or a bare key removal",
+                ));
+            }
+            Ok(())
+        }
         other => Err(Error::rejected(format!(
             "'{other}' is not live-settable — allowed keys: auto_ready \
-             (pty only), stall_secs. Recreate the agent to change \
-             wiring params like upstream or session"
+             (pty only), stall_secs, silent_end_secs (pty only). \
+             Recreate the agent to change wiring params like upstream \
+             or session"
         ))),
     }
 }
@@ -764,6 +784,20 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
             return Err(Error::rejected(
                 "'stall_secs' must be a non-negative integer (0 disables \
                  stall detection) or a bare key removal",
+            ));
+        }
+    }
+    if let Some(v) = params.get("silent_end_secs") {
+        if !screen_probe(provider, kind) {
+            return Err(Error::rejected(
+                "'silent_end_secs' only applies to pty endpoints — \
+                 idle-pane detection needs a screen probe",
+            ));
+        }
+        if !check_stall_secs(v) {
+            return Err(Error::rejected(
+                "'silent_end_secs' must be a non-negative integer (0 \
+                 disables silent-end detection) or a bare key removal",
             ));
         }
     }

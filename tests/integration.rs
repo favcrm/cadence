@@ -3531,9 +3531,9 @@ if cmd == "paste-buffer":
     sys.exit(0)
 if cmd == "send-keys":
     name = rest[rest.index("-t") + 1]
-    key = rest[-1]
-    aappend(sess_path(name, "input"),
-            "<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
+    for key in rest[rest.index("-t") + 2:]:
+        aappend(sess_path(name, "input"),
+                "<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
     sys.exit(0)
 if cmd == "set-option":
     # Record option writes so tests can assert pane defaults.
@@ -13284,6 +13284,241 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
         "capture-pane ran while nothing was running"
     );
     stall_sample(0);
+}
+
+// ---- CAD-102: approval menus are a probe state, not busy churn ----
+
+/// The real Devin permission menu — option rows and the selection
+/// footer ABOVE a still-visible busy input box (the CAD-102 incident
+/// layout): everything the analyzer must see sits ~11 rows above the
+/// frame end.
+const DEVIN_MENU: &str = "\
+❭ run the shell command: printenv FOO
+ ⏺ Running command
+ └ $ printenv FOO
+
+❭ 1 Yes  (Approve once)
+· 2 Yes, allow `printenv` commands
+· 3 Yes, always allow `printenv` commands in `tmp`
+· 4 Yes, always allow `printenv` commands in all projects
+· 5 Yes, switch to bypass mode
+· 6 Edit command
+· 7 Describe change to command
+· 8 No
+↑↓ select · ↵ confirm · esc cancel
+⠸ Thinking · 5s (esc twice to interrupt)
+❭ Guide Devin while it works
+";
+
+/// A numbered menu over the busy box is `approval_menu`, never busy:
+/// the gate refuses pastes under it (the claim survives untouched),
+/// `agent answer` sends the option's one keystroke and records
+/// `approval_answered`, and the sampled rise lands an `approval_menu`
+/// event with the menu line.
+#[test]
+fn pty_approval_menu_blocks_pastes_and_answers() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "do work", "message": "m1"}),
+    )
+    .unwrap();
+    let token1 = pty_token(&d, "dv", "m1");
+
+    // The menu appears mid-turn.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let rise = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(rise["payload"]["message"], "m1", "{rise}");
+    assert_eq!(rise["payload"]["line"], "$ printenv FOO", "{rise}");
+
+    // The probe reads the menu line, not busy churn.
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["approval_menu"], true, "{probe}");
+    assert_eq!(probe["reason"], "$ printenv FOO", "{probe}");
+    // The views carry the menu line while the turn runs.
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(show["pane_menu"], "$ printenv FOO", "{show}");
+
+    // A paste under the menu is refused: m2 queues behind a gate_wait
+    // naming the menu, and no claim is eaten by the refusal.
+    d.rpc("agent_ready", json!({"alias": "dv", "force": true}))
+        .unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "wait for idle", "message": "m2"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("dv", "gate_wait", 15);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("approval menu"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("dv", "m2"), "queued");
+
+    // `agent answer` validates the choice against the visible menu —
+    // 9 is not on it — then sends the one digit key.
+    assert!(d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "9"}))
+        .is_err());
+    let answered = d
+        .rpc(
+            "agent_answer",
+            json!({"alias": "dv", "choice": "8", "by": "test-op"}),
+        )
+        .unwrap();
+    assert_eq!(answered["state"], "answered", "{answered}");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap();
+    assert!(
+        input.ends_with("<KEY:8>"),
+        "the digit key, never a paste: {input}"
+    );
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["choice"], "8", "{ev}");
+    assert_eq!(ev["payload"]["line"], "$ printenv FOO", "{ev}");
+    assert_eq!(ev["payload"]["by"], "test-op", "{ev}");
+    assert_eq!(ev["payload"]["probe"]["approval_menu"], true, "{ev}");
+
+    // With the menu cleared (operator closed it), the surviving claim
+    // delivers m2 — no second `agent ready` needed: the refusal ate
+    // nothing. And an answer on a non-menu pane refuses.
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    assert!(d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "8"}))
+        .is_err());
+    d.wait_message("dv", "m2", &["running"], 20);
+    let token2 = pty_token(&d, "dv", "m2");
+    for (id, token) in [("m1", &token1), ("m2", &token2)] {
+        d.rpc(
+            "message_report",
+            json!({"message": id, "token": token, "kind": "result",
+                   "text": "done"}),
+        )
+        .unwrap();
+        d.wait_message("dv", id, &["completed"], 10);
+    }
+    stall_sample(0);
+}
+
+/// A turn that ends at the idle prompt without reporting is detected
+/// by the sampled probe: `turn_silent_end` fires once per message
+/// carrying the age and the admitting probe, the views flag it
+/// (`silent_ended`, `ended_secs`, `ended?:` in status, an overview
+/// needs-me row), and a `--ready` send is the one-command recovery.
+/// The message itself is never auto-resolved.
+#[test]
+fn pty_silent_end_fires_once_and_recovers() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    stall_sample(1);
+    d.register_stub(
+        "w1",
+        json!({"auto_ready": "verified", "silent_end_secs": 4}),
+    );
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "do work", "message": "ms9"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "w1", "ms9");
+
+    // The stub pane returns to `» stub ready` after the submission —
+    // the message still runs but the probe reads idle.
+    let e = d.wait_event("w1", "turn_silent_end", 40);
+    assert_eq!(e["payload"]["message"], "ms9", "{e}");
+    assert!(e["payload"]["age_secs"].as_u64().unwrap_or(0) >= 4, "{e}");
+    assert_eq!(e["payload"]["probe"]["idle"], true, "{e}");
+    assert!(
+        e["payload"]["last_activity"].as_f64().unwrap_or(0.0) > 0.0,
+        "{e}"
+    );
+
+    // Once per message: the pane stays idle but no second event fires.
+    thread::sleep(Duration::from_secs(6));
+    assert_eq!(wait_event_count(&d, "w1", "turn_silent_end", 1, 2).len(), 1);
+
+    // The views flag it: show/list carry silent_ended + ended_secs,
+    // status renders `ended?:`, and the overview needs-me row names
+    // the ready-gated recovery command.
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(show["silent_ended"], true, "{show}");
+    assert!(show["ended_secs"].as_u64().unwrap_or(0) >= 4, "{show}");
+    let row = d.rpc("agent_list", json!({})).unwrap()["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"].as_str() == Some("w1"))
+        .cloned()
+        .unwrap();
+    assert_eq!(row["silent_ended"], true, "{row}");
+    let table = status_table(&d.state, &[]);
+    assert!(table.contains("ended?:"), "{table}");
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    let ended = needs
+        .iter()
+        .find(|n| n["kind"] == "silent_end")
+        .expect("silent_end row");
+    assert_eq!(
+        ended["command"],
+        "cadence send w1 --ready --text \"continue …\""
+    );
+    assert!(ended["title"].as_str().unwrap().contains("w1"));
+
+    // The message is flagged, never auto-resolved — and the remedy is
+    // the documented ready-gated follow-up verbatim: the idle pane
+    // passes the claim probe and the new turn proceeds normally.
+    assert_eq!(d.message_state("w1", "ms9"), "running");
+    let (ok, sent) = cadence_cli(
+        &d.state,
+        &["send", "w1", "--ready", "--text", "continue"],
+        &[],
+    );
+    assert!(ok, "{sent}");
+    let ms10 = sent["message"].as_str().unwrap().to_string();
+    let token2 = pty_token(&d, "w1", &ms10);
+    for (id, t) in [("ms9", &token), (ms10.as_str(), &token2)] {
+        d.rpc(
+            "message_report",
+            json!({"message": id, "token": t, "kind": "result",
+                   "text": "done"}),
+        )
+        .unwrap();
+        d.wait_message("w1", id, &["completed"], 10);
+    }
+    stall_sample(0);
+}
+
+/// `agent answer` is a menu channel only: a pane with no menu refuses
+/// (idle, busy or fenced alike), and a non-pty endpoint has no such
+/// channel at all.
+#[test]
+fn pty_answer_refuses_without_a_menu() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register_stub("w1", json!({}));
+    d.register("fx");
+    d.wait_agent("w1", "idle", 20);
+    d.wait_agent("fx", "idle", 10);
+    let err = d
+        .rpc("agent_answer", json!({"alias": "w1", "choice": "1"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("no approval menu"), "{err}");
+    let err = d
+        .rpc("agent_answer", json!({"alias": "fx", "choice": "1"}))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no approval-menu channel"),
+        "{err}"
+    );
 }
 
 // ---- CAD-55: `cadence dispatch` + `cadence issue finish` against a live daemon ----

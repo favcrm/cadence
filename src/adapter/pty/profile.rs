@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use crate::adapter::Probe;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// One provider terminal UI, for a generic owned tmux pane.
 pub trait TuiProfile: Send + Sync {
@@ -89,6 +89,19 @@ pub trait TuiProfile: Send + Sync {
     /// `agent respond` rejection text — approvals are answered in the
     /// terminal itself; the message names the provider's prompt.
     fn respond_rejection(&self) -> &'static str;
+
+    /// `agent answer`: translate a menu `choice` (the option's printed
+    /// index) into the keystrokes this TUI's open approval menu
+    /// accepts, validated against the rows on `screen` — a numbered
+    /// menu takes its digit key, a lettered one its hotkey, an
+    /// unnumbered select arrows + Enter. The default refuses: a TUI
+    /// with no menu-answer keymap is answered in the terminal itself.
+    fn approval_answer(&self, _screen: &str, choice: &str) -> Result<Vec<String>> {
+        let _ = choice;
+        Err(Error::rejected(
+            "this TUI has no approval-menu keymap — answer it in the terminal itself",
+        ))
+    }
 
     /// First non-space characters that must never be pasted verbatim.
     /// Terminal UIs commonly treat a leading `/` or `!` as a command or

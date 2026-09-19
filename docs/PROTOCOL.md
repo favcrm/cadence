@@ -51,7 +51,8 @@ Error kinds:
 | `agent_ready` | `alias, by?, force?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; probes the pane first and refuses a visibly busy one unless `force`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
-| `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`; `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; null clears to the provider default) or `approval_policy` (codex; `never|on-request|on-failure|untrusted`, null clears) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
+| `agent_answer` | `alias, choice, by?, note?` | `{state:"answered"}` — sends one menu-choice keystroke to a `pty` pane probing `approval_menu` (CLI: `cadence agent answer <alias> <choice> [--reason <text>]`); re-probes and refuses any other pane state, so the key can never land in a prompt or a running turn. `choice` is the option's printed index (or hotkey position); the profile's keymap turns it into tmux keys — numbered menus take the digit, unnumbered selects arrows + Enter. Records `approval_answered` with `by`/`choice`/`line`/`note` |
+| `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`, `silent_end_secs` (pty only); `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; null clears to the provider default) or `approval_policy` (codex; `never|on-request|on-failure|untrusted`, null clears) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit PTY ack/result; `sha` names the produced commit for task-attached kickoffs |
 | `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?, sha?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice. A `sha` on `completed` binds like a worker `--sha` |
@@ -383,23 +384,44 @@ worker's `cadence self`/`message result` then runs without an
 approval menu.
 
 **Submission gates.** `run_turn` requires all of: pane alive,
-`pane_dead=0`, `pane_in_mode=0`, native ownership still held, and a
-fresh unconsumed claim — either an operator claim from `agent ready`
-(60s TTL) or, under `auto_ready=verified`, a daemon-minted claim. Claims
-are single-use (consumed atomically by exactly one send), FIFO, and
-capped; every consumption emits a `claim_used` event recording the
-message id and the claimer (`agent ready <alias>` records
-`CADENCE_ALIAS` when set, else `"operator"`; daemon-minted claims
-record `"daemon"` on the `ready_claimed` event itself).
+`pane_dead=0`, `pane_in_mode=0`, native ownership still held, a screen
+probe showing no approval menu, and a fresh unconsumed claim — either
+an operator claim from `agent ready` (60s TTL) or, under
+`auto_ready=verified`, a daemon-minted claim. The probe runs *before*
+any claim is consumed, so an open menu refuses every paste — claimed
+or self-claimed — and the refusal eats nothing: the claim survives to
+deliver once the menu closes. Claims are single-use (consumed
+atomically by exactly one send), FIFO, and capped; every consumption
+emits a `claim_used` event recording the message id and the claimer
+(`agent ready <alias>` records `CADENCE_ALIAS` when set, else
+`"operator"`; daemon-minted claims record `"daemon"` on the
+`ready_claimed` event itself). The remedy for a menu is
+`cadence agent answer <alias> <choice>` (`agent_answer` RPC): the
+adapter re-probes, requires `approval_menu`, validates `choice`
+against the option rows on screen, and sends the profile's keymap —
+a numbered menu's digit key, a lettered option's hotkey, arrows +
+Enter on an unnumbered select — never a paste. It refuses anything
+else (idle, busy, draft) with the probe's reason, so the keystroke
+can never land in a prompt or a running turn, and records
+`approval_answered` (`by`, `choice`, the menu line, the probe).
 
 With `auto_ready=verified` the daemon mints a claim only after a pane
 probe verifies idle: the screen must show the `❭` prompt with an empty
 input line, and none of the observed busy signatures or an approval
 menu — an approval screen's `❭` option marker can mimic a prompt, so
-menu detection wins over prompt shape. Menu markers are matched only
-in the status region (the ~14 lines ending at the last non-blank row —
-`capture-pane` pads short content with blank rows, so the region is
-not the pane's literal bottom), and busy is anchored tighter still:
+menu detection wins over prompt shape. Menu evidence is matched in a
+wider window than busy (the ~24 lines ending at the last non-blank
+row — `capture-pane` pads short content with blank rows, so the
+region is not the pane's literal bottom): a numbered approval menu
+can stay open *above* a still-visible busy input box, which pushes
+its option rows and selection footer well above the busy anchor.
+Menu-exclusive anchors (the `↑↓ select · ↵ confirm · esc cancel`
+legend, the permission prompt's title) decide alone on the trimmed
+row's leading glyph; option labels and lone legend fragments only
+count as a cluster beside real menu structure (a second hint, or
+numbered option rows) — transcript text quoting one stays inert. When
+a menu is open the probe's reason is the menu line itself — the
+command being approved — and busy is anchored tighter still:
 the `Guide Devin while it works` input watermark, or the status row
 directly above the input box — the spinner label (`Thinking`,
 `Typing`, `Running tools`) or an `esc to interrupt`/`Cancel agent`
@@ -848,6 +870,7 @@ gate_wait, submitted, session_minted, session_resume_failed,
 session_persist_failed,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
 params_updated, reconciled, relaunch_skipped, attention,
+approval_menu, approval_answered, turn_silent_end,
 turn_stalled, turn_resumed, monitor_registered, monitor_alert,
 monitor_alert_ack, monitor_degraded, monitor_dispatch, monitor_off,
 stop_requested`. `wait>0` long-polls
@@ -905,20 +928,52 @@ fences, cancels, or replays anything it observes.
   to the same recipient, then re-arms — a later silence raises a new
   `turn_stalled` episode with its own notice. A turn that ends while
   stalled just ends; no recovery event is owed.
+- **Probe verdicts ride the samples (pty).** Every landed screen sample
+  carries the analyzer's verdict beside the hash, so the watch sees
+  pane states a bare hash cannot name. A menu frame is never activity —
+  the wait is a human's, not the provider's: it neither confirms a
+  screen change nor feeds the idle streak. An idle frame extends the
+  silent-end streak; anything else resets it.
+- **`approval_menu`.** The first sampled frame probing
+  `approval_menu` while a message runs emits `{message, line}` once —
+  the rising edge, never per sample — carrying the menu line (the
+  command being approved) so the row names what's asked. `agent_list`/
+  `agent_show` expose it as `pane_menu` while it stays open; the
+  `status` PANE column renders `approval: <line>`; the overview
+  needs-me row (`kind: approval_menu`) gives the remedy
+  `cadence agent answer <alias> <choice>`.
+- **`turn_silent_end`.** A still-`running` message whose pane probes
+  idle for `silent_end_secs` over at least three consecutive samples —
+  never one capture, never while a menu or a brokered request explains
+  the wait — emits `{message, age_secs, last_activity, probe}` once
+  per message: the provider ended without reporting. The flag is
+  evidence, not resolution — the message stays `running` until an
+  explicit report or reconcile. `agent_list`/`agent_show` expose
+  `silent_ended` + `ended_secs` (the idle streak's age), `status`
+  renders `ended?: <age>` beside an idle pane on a running message,
+  and the overview needs-me row (`kind: silent_end`) gives the remedy
+  `cadence send <alias> --ready --text "continue …"` — a ready-gated
+  follow-up that claims the provably-idle pane and pastes in one step.
 - **Budget resolution.** `jobs.stall_secs` (set at `job new
   --stall-secs`) wins for task-attached deliveries; otherwise the
   agent's `params.stall_secs` (launch param or live `agent set alias
   stall_secs=<n>`); otherwise the daemon default of 1800s. `0`
   disables firing — silence is still measured. Values accept an
   unsigned integer or digit string; negatives are rejected at
-  `job_new` and both `agent` param validators.
+  `job_new` and both `agent` param validators. `silent_end_secs`
+  resolves the same way minus the job layer — the agent's launch or
+  live-set param, else the 600s default; `0` disables silent-end
+  detection (idle-pane silence is then only ever a stall
+  observation).
 - **Views.** `agent_list`/`agent_show` add `silent_secs` and `stalled`
-  while a turn runs; `job show`/`task show` add the same pair to a
-  task row whose kickoff is running. Idle agents sample nothing and
-  carry neither field.
+  while a turn runs — plus `pane_menu`, `ended_secs` and
+  `silent_ended` when the sampled pane verdict warrants them; `job
+  show`/`task show` add the same set to a task row whose kickoff is
+  running. Idle agents sample nothing and carry none of the fields.
 - **Restart.** Watch state is in memory only: after a daemon restart
-  the silence clock for a still-`running` message starts from the
-  restart — no stall survives across it, and no episode replays.
+  the silence and idle-streak clocks for a still-`running` message
+  start from the restart — no stall or silent end survives across
+  it, and no episode replays.
 
 ## Jobs and tasks
 

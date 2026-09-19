@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::adapter::{
-    self, registry, AdapterHooks, ProviderAdapter, ProviderEnv, ProviderRequest, TurnResult,
+    self, registry, AdapterHooks, Probe, ProviderAdapter, ProviderEnv, ProviderRequest, TurnResult,
 };
 use crate::client;
 use crate::error::{Error, Result};
@@ -84,6 +84,11 @@ const MONITOR_TICK: Duration = Duration::from_secs(1);
 const DAEMON_ALIAS: &str = Store::DAEMON_STREAM;
 /// `stall_secs` when neither the job nor the agent sets one.
 const DEFAULT_STALL_SECS: u64 = 1800;
+/// `silent_end_secs` when the agent doesn't set one: ten minutes of
+/// probe-verified idle pane on a running message before
+/// `turn_silent_end` fires — long enough that a between-tools quiet
+/// spell never trips it.
+const DEFAULT_SILENT_END_SECS: u64 = 600;
 /// PTY screens are sampled at most this often while a turn runs — the
 /// bound is one capture per running pty agent per minute.
 const SCREEN_SAMPLE: Duration = Duration::from_secs(60);
@@ -182,7 +187,26 @@ struct StallWatch {
     changed: u8,
     /// A capture in flight on its own thread — at most one per agent,
     /// so a wedged pane leaks one thread and never stalls the ticker.
-    sample_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// The sample carries the probe verdict beside the hash: a menu
+    /// frame is a human wait (never activity), an idle frame builds
+    /// the silent-end streak.
+    sample_rx: Option<std::sync::mpsc::Receiver<(String, Probe)>>,
+    /// Consecutive landed samples whose probe read the pane idle — a
+    /// silent end is proven by a streak, never one capture.
+    idle_samples: u8,
+    /// When the current idle streak began — `silent_end_secs`
+    /// measures from here.
+    idle_since: Option<Instant>,
+    /// The menu line while the sampled probe shows an approval menu —
+    /// `Some` is the menu-open flag: the rising edge fires
+    /// `approval_menu` once per menu, and the views read the line.
+    menu_line: Option<String>,
+    /// `turn_silent_end` already fired for this message — the event
+    /// is once per message, never twice.
+    silent_end_sent: bool,
+    /// The last landed probe verdict — rides `turn_silent_end`'s
+    /// payload as evidence.
+    last_probe: Option<Probe>,
     /// Stall episodes seen for `message`; each mints a distinct notice
     /// dedupe so a resume + re-stall notifies again.
     episodes: u64,
@@ -200,7 +224,41 @@ impl Default for StallWatch {
             candidate: None,
             changed: 0,
             sample_rx: None,
+            idle_samples: 0,
+            idle_since: None,
+            menu_line: None,
+            silent_end_sent: false,
+            last_probe: None,
             episodes: 0,
+        }
+    }
+}
+
+/// What `stall_view` hands a view: the silence age, the open stall
+/// episode, and the sampled pane verdict (menu line, idle-streak age,
+/// once-fired silent-end flag).
+struct StallView {
+    silent_secs: u64,
+    stalled: bool,
+    menu: Option<String>,
+    ended_secs: Option<u64>,
+    silent_ended: bool,
+}
+
+impl StallView {
+    /// Write the view fields onto an agent/task JSON row — the same
+    /// keys `agent_list`/`agent_show`/`job show` consumers read.
+    fn apply(&self, j: &mut Value) {
+        j["silent_secs"] = json!(self.silent_secs);
+        j["stalled"] = json!(self.stalled);
+        if let Some(line) = &self.menu {
+            j["pane_menu"] = json!(line);
+        }
+        if let Some(secs) = self.ended_secs {
+            j["ended_secs"] = json!(secs);
+        }
+        if self.silent_ended {
+            j["silent_ended"] = json!(true);
         }
     }
 }
@@ -981,9 +1039,8 @@ impl Shared {
                     let (dead, resumable) = self.agent_liveness(&agent);
                     j["dead"] = json!(dead);
                     j["resumable"] = json!(resumable);
-                    if let Some((silent_secs, stalled)) = self.stall_view(&agent.alias) {
-                        j["silent_secs"] = json!(silent_secs);
-                        j["stalled"] = json!(stalled);
+                    if let Some(view) = self.stall_view(&agent.alias) {
+                        view.apply(&mut j);
                     }
                     agents.push(j);
                 }
@@ -999,9 +1056,8 @@ impl Shared {
                 let (dead, resumable) = self.agent_liveness(&agent);
                 agent_json["dead"] = json!(dead);
                 agent_json["resumable"] = json!(resumable);
-                if let Some((silent_secs, stalled)) = self.stall_view(&alias) {
-                    agent_json["silent_secs"] = json!(silent_secs);
-                    agent_json["stalled"] = json!(stalled);
+                if let Some(view) = self.stall_view(&alias) {
+                    view.apply(&mut agent_json);
                 }
                 // The briefing lives under the state dir — actors read
                 // it there, never inside their cwd repository.
@@ -1050,6 +1106,7 @@ impl Shared {
             "agent_ready" => self.rpc_ready(params),
             "agent_capture" => self.rpc_capture(params),
             "agent_probe" => self.rpc_probe(params),
+            "agent_answer" => self.rpc_answer(params),
             "agent_set" => self.rpc_set(params),
             "agent_inbox" => self.rpc_inbox(params),
             "message_report" => self.rpc_message_report(params),
@@ -1678,6 +1735,31 @@ impl Shared {
         Ok(out)
     }
 
+    /// `agent answer`: one menu-choice keystroke to a pane currently
+    /// probing `approval_menu` — the adapter re-probes and refuses
+    /// anything else, so the key can never land in a prompt or a
+    /// running turn. Records `approval_answered` with who answered
+    /// and the menu line the answer went to.
+    fn rpc_answer(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let choice = required_str(params, "choice")?;
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let note = optional_str(params, "note");
+        let probe = self.adapter_for(&alias)?.answer_approval(choice)?;
+        let mut detail = json!({
+            "by": by,
+            "choice": choice,
+            "line": probe.reason.clone(),
+            "probe": probe.to_json(),
+        });
+        if let Some(n) = note {
+            detail["note"] = json!(n);
+        }
+        let _ = self.store.event_public(&alias, "approval_answered", detail);
+        self.wake();
+        Ok(json!({"alias": alias, "state": "answered", "choice": choice}))
+    }
+
     /// Merge key=value pairs into an agent's stored params — how an
     /// existing agent opts into `auto_ready=verified` post-launch.
     fn rpc_set(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -2134,9 +2216,8 @@ impl Shared {
                     j["kickoff"] = json!({"id": m.id, "state": m.state, "turn_id": m.turn_id});
                     if m.state == "running" {
                         if let Some(assignee) = &task.assignee {
-                            if let Some((silent_secs, stalled)) = self.stall_view(assignee) {
-                                j["silent_secs"] = json!(silent_secs);
-                                j["stalled"] = json!(stalled);
+                            if let Some(view) = self.stall_view(assignee) {
+                                view.apply(&mut j);
                             }
                         }
                     }
@@ -2951,13 +3032,13 @@ impl Shared {
         }
         // An open brokered request means the provider is silent by
         // design — a human is thinking. That wait is activity.
-        if self
+        let pending_req = self
             .pending
             .lock()
             .unwrap()
             .values()
-            .any(|req| req.alias == alias)
-        {
+            .any(|req| req.alias == alias);
+        if pending_req {
             w.activity = Instant::now();
         }
         // The adapter's own clock when it keeps one — managed
@@ -2970,12 +3051,17 @@ impl Shared {
         // PTY screens have no transport clock: captures run on their
         // own threads, one in flight per agent at most, so a slow or
         // wedged pane can never block the ticker (or any view that
-        // touches this lock). A finished sample lands here.
+        // touches this lock). A finished sample lands here carrying
+        // the probe verdict beside the hash — a menu frame is a human
+        // wait (never activity), an idle frame builds the silent-end
+        // streak.
+        let mut menu_rise: Option<String> = None;
+        let mut end_fire: Option<(u64, f64, Probe)> = None;
         if agent.endpoint_kind == "pty" {
             let mut landed = None;
             match w.sample_rx.as_ref().map(|rx| rx.try_recv()) {
-                Some(Ok(hash)) => {
-                    landed = Some(hash);
+                Some(Ok(sample)) => {
+                    landed = Some(sample);
                     w.sample_rx = None;
                 }
                 // The sender is gone (capture failed) — release the
@@ -2986,7 +3072,30 @@ impl Shared {
                 }
                 _ => {}
             }
-            if let Some(hash) = landed {
+            if let Some((hash, probe)) = landed {
+                // The verdict first: an open menu clears the idle
+                // streak and fires `approval_menu` on the rising edge
+                // only; an idle frame extends the streak; anything
+                // else (busy, draft) resets both clocks.
+                if probe.approval_menu {
+                    w.idle_samples = 0;
+                    w.idle_since = None;
+                    if w.menu_line.is_none() {
+                        menu_rise = Some(probe.reason.clone());
+                    }
+                    w.menu_line = Some(probe.reason.clone());
+                } else {
+                    w.menu_line = None;
+                    if probe.idle {
+                        w.idle_samples = w.idle_samples.saturating_add(1);
+                        if w.idle_since.is_none() {
+                            w.idle_since = Some(Instant::now());
+                        }
+                    } else {
+                        w.idle_samples = 0;
+                        w.idle_since = None;
+                    }
+                }
                 if w.settled.as_deref() == Some(hash.as_str()) {
                     // Still the settled screen — a candidate reverted
                     // without ever confirming; drop it.
@@ -3000,8 +3109,10 @@ impl Shared {
                         // Second consecutive sighting, or a novel hash
                         // after the screen stayed changed for two
                         // samples — the change is real. A first-ever
-                        // settle only forms the baseline.
-                        if w.settled.is_some() {
+                        // settle only forms the baseline. A menu frame
+                        // never counts as turn activity: the wait is a
+                        // human's, and the silence clock must see it.
+                        if w.settled.is_some() && !probe.approval_menu {
                             w.activity = Instant::now();
                         }
                         w.previous = w.settled.take();
@@ -3014,6 +3125,7 @@ impl Shared {
                         w.candidate = Some(hash);
                     }
                 }
+                w.last_probe = Some(probe);
                 w.sample_at = Some(Instant::now());
             }
             if w.sample_rx.is_none()
@@ -3023,30 +3135,72 @@ impl Shared {
                 if let Some(ad) = ad {
                     let (tx, rx) = std::sync::mpsc::channel();
                     thread::spawn(move || {
-                        if let Ok(screen) = ad.capture() {
-                            let _ = tx.send(adapter::pty::activity_hash(&screen));
+                        if let Ok(sample) = ad.sample_screen() {
+                            let _ = tx.send(sample);
                         }
                     });
                     w.sample_rx = Some(rx);
                 }
             }
+            // The silent end: the durable message still runs but the
+            // pane probes idle — verified for `silent_end_secs` over
+            // at least three consecutive samples, never one capture,
+            // never while a menu or a brokered request explains the
+            // wait. The event fires once per message and flags it —
+            // the message itself is never auto-resolved.
+            let end_budget = self.silent_end_budget(&agent);
+            if !w.silent_end_sent
+                && end_budget > 0
+                && !pending_req
+                && w.menu_line.is_none()
+                && w.idle_samples >= 3
+                && w.idle_since
+                    .is_some_and(|t| t.elapsed() >= Duration::from_secs(end_budget))
+            {
+                w.silent_end_sent = true;
+                if let Some(p) = w.last_probe.clone() {
+                    let age = w.idle_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                    let last_activity = epoch_secs() - w.activity.elapsed().as_secs_f64();
+                    end_fire = Some((age, last_activity, p));
+                }
+            }
         }
         let silent = w.activity.elapsed();
-        if let Some(stalled_at) = w.stalled_at {
+        // Everything the lock decided, applied after it's dropped —
+        // event writes take the store mutex and never run under `w`.
+        enum After {
+            Resume(Instant, u64),
+            Stall(u64, Duration),
+            Emit,
+        }
+        let after = if let Some(stalled_at) = w.stalled_at {
             if w.activity > stalled_at {
                 let episode = w.episodes;
                 w.stalled_at = None;
-                drop(w);
-                self.stall_resumed(&agent, &running, stalled_at.elapsed(), episode);
+                After::Resume(stalled_at, episode)
+            } else {
+                After::Emit
             }
-            return;
-        }
-        if budget > 0 && silent >= Duration::from_secs(budget) {
+        } else if budget > 0 && silent >= Duration::from_secs(budget) {
             w.episodes += 1;
             w.stalled_at = Some(w.activity);
-            let episode = w.episodes;
-            drop(w);
-            self.stall_fired(&agent, &running, silent, episode);
+            After::Stall(w.episodes, silent)
+        } else {
+            After::Emit
+        };
+        drop(w);
+        if let Some(line) = menu_rise {
+            self.approval_menu_fired(&agent, &running, &line);
+        }
+        if let Some((age, last_activity, probe)) = end_fire {
+            self.silent_end_fired(&agent, &running, age, last_activity, &probe);
+        }
+        match after {
+            After::Resume(at, episode) => {
+                self.stall_resumed(&agent, &running, at.elapsed(), episode)
+            }
+            After::Stall(episode, silent) => self.stall_fired(&agent, &running, silent, episode),
+            After::Emit => {}
         }
     }
 
@@ -3073,6 +3227,22 @@ impl Shared {
                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             })
             .unwrap_or(DEFAULT_STALL_SECS)
+    }
+
+    /// The idle-pane budget for `turn_silent_end`: the agent's
+    /// `silent_end_secs` param, else the default. `0` disables — a
+    /// still-running message on an idle pane is then only ever a
+    /// stall observation, never a silent-end verdict.
+    fn silent_end_budget(&self, agent: &Agent) -> u64 {
+        agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("silent_end_secs"))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(DEFAULT_SILENT_END_SECS)
     }
 
     /// `(job_id, task_id)` scope for a message's stall events — the
@@ -3125,6 +3295,57 @@ impl Shared {
         );
         self.wake();
         self.stall_notice(agent, message, episode, false, silent_secs);
+    }
+
+    /// `approval_menu`: the sampled pane just showed an approval menu
+    /// — recorded once per menu (the rising edge), carrying the menu
+    /// line so the row names what's being asked.
+    fn approval_menu_fired(&self, agent: &Agent, message: &Message, line: &str) {
+        let (job_id, task_id) = self.message_scope(message);
+        let mut payload = json!({"message": message.id, "line": line});
+        if let Some(t) = task_id {
+            payload["task"] = json!(t);
+        }
+        let _ = self.store.event_public_scoped(
+            &agent.alias,
+            "approval_menu",
+            payload,
+            job_id.as_deref(),
+            task_id,
+        );
+        self.wake();
+    }
+
+    /// `turn_silent_end`: the durable message still runs but the pane
+    /// has probed idle for `silent_end_secs` — the provider ended
+    /// without reporting. Records the age and the admitting probe as
+    /// evidence; the message is flagged, never auto-resolved.
+    fn silent_end_fired(
+        &self,
+        agent: &Agent,
+        message: &Message,
+        age_secs: u64,
+        last_activity: f64,
+        probe: &Probe,
+    ) {
+        let (job_id, task_id) = self.message_scope(message);
+        let mut payload = json!({
+            "message": message.id,
+            "age_secs": age_secs,
+            "last_activity": last_activity,
+            "probe": probe.to_json(),
+        });
+        if let Some(t) = task_id {
+            payload["task"] = json!(t);
+        }
+        let _ = self.store.event_public_scoped(
+            &agent.alias,
+            "turn_silent_end",
+            payload,
+            job_id.as_deref(),
+            task_id,
+        );
+        self.wake();
     }
 
     /// The one notice an episode sends: a `job_event` to the PM for a
@@ -3209,15 +3430,23 @@ impl Shared {
         }
     }
 
-    /// The view-side snapshot for `agent show`/`agent list`/`job show`:
-    /// `(silent_secs, stalled)` while a message is running — `None`
-    /// when the agent has no in-flight turn.
-    fn stall_view(&self, alias: &str) -> Option<(u64, bool)> {
+    /// The live stall-watch facts a view renders while a message runs:
+    /// silence age, the open `turn_stalled` episode, and the sampled
+    /// pane verdict — the menu line while one's open, the idle
+    /// streak's age, and the once-fired silent-end flag. `None` when
+    /// the agent has no in-flight turn.
+    fn stall_view(&self, alias: &str) -> Option<StallView> {
         let running = self.store.running_message(alias).ok()??;
         let ctl = self.lifecycle.lock().unwrap().agents.get(alias)?.clone();
         let w = ctl.stall.lock().unwrap();
         if w.message.as_deref() == Some(running.id.as_str()) {
-            return Some((w.activity.elapsed().as_secs(), w.stalled_at.is_some()));
+            return Some(StallView {
+                silent_secs: w.activity.elapsed().as_secs(),
+                stalled: w.stalled_at.is_some(),
+                menu: w.menu_line.clone(),
+                ended_secs: w.idle_since.map(|t| t.elapsed().as_secs()),
+                silent_ended: w.silent_end_sent,
+            });
         }
         // The watch hasn't ticked over this message yet — report
         // silence from its recorded start.
@@ -3225,7 +3454,13 @@ impl Shared {
             .started
             .map(|s| (epoch_secs() - s).max(0.0) as u64)
             .unwrap_or(0);
-        Some((silent, false))
+        Some(StallView {
+            silent_secs: silent,
+            stalled: false,
+            menu: None,
+            ended_secs: None,
+            silent_ended: false,
+        })
     }
 
     fn notify_agent(&self, alias: &str) {

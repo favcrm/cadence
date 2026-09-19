@@ -44,6 +44,11 @@ const MINT_DEADLINE: Duration = Duration::from_secs(20);
 /// text. (Busy is anchored tighter still: the input line's interrupt
 /// hint or the status row directly above it — see `analyze_cursor`.)
 const STATUS_LINES: usize = 16;
+/// The wider window a menu may occupy: the permission select (~8
+/// rows) plus the input box, status chips and model/cwd bar that can
+/// stay visible below it — its own chrome can sit above the busy
+/// anchor. Menu evidence only matches inside it.
+const MENU_LINES: usize = 24;
 
 /// Cursor TUI screen signatures — THE one place they live. A provider
 /// TUI update means editing this table, never the gate logic. Every
@@ -224,12 +229,50 @@ fn spinner_row(row: &str) -> bool {
 /// neutral. The region is anchored at the last NON-BLANK row —
 /// `capture-pane` pads to pane height, so a young session on a tall
 /// pane has blank rows below the real content.
+/// The line naming what the menu asks: the furthest row of the menu
+/// block above the option list — ` $ whoami in .` names the command
+/// being approved.
+fn menu_subject(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.trim_end().lines().collect();
+    let menu_top = lines.len().saturating_sub(MENU_LINES);
+    let sel = lines
+        .iter()
+        .rposition(|l| {
+            let t = l.trim_start();
+            t.starts_with('→') && t.contains('(')
+        })
+        .filter(|i| *i >= menu_top)?;
+    // Walk up over non-blank rows and single blank gaps; a double
+    // blank or a border row ends the menu's block.
+    let mut subject: Option<String> = None;
+    let mut blanks = 0;
+    for l in lines[..sel].iter().rev() {
+        let t = l.trim();
+        if t.is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                break;
+            }
+            continue;
+        }
+        if t.chars().filter(|c| matches!(c, '─' | '═')).count() >= 8 {
+            break;
+        }
+        subject = Some(t.split_whitespace().collect::<Vec<_>>().join(" "));
+        blanks = 0;
+    }
+    subject.map(|s| s.chars().take(100).collect())
+}
+
 pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
     let content = screen.trim_end();
+    // Menu evidence lives in the wider menu window — the permission
+    // select plus still-visible status chrome can push its rows above
+    // the busy anchor. Anchors decide alone; hints cluster.
     let tail: String = content
         .lines()
         .rev()
-        .take(STATUS_LINES)
+        .take(MENU_LINES)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -281,21 +324,30 @@ pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
     let input_nonempty =
         !draft.is_empty() && !cursor_screen::PLACEHOLDERS.contains(&draft.as_str());
     let (idle, reason) = if approval_menu {
-        (false, "approval menu is open")
+        (
+            false,
+            menu_subject(content).unwrap_or_else(|| "approval menu is open".to_string()),
+        )
     } else if interrupt_hint {
-        (false, "tui is busy (interrupt hint on the input line)")
+        (
+            false,
+            "tui is busy (interrupt hint on the input line)".to_string(),
+        )
     } else if status_busy {
-        (false, "tui is busy (status row above the input line)")
+        (
+            false,
+            "tui is busy (status row above the input line)".to_string(),
+        )
     } else if !prompt_visible {
-        (false, "no prompt line visible")
+        (false, "no prompt line visible".to_string())
     } else if input_nonempty {
-        (false, "unsubmitted text in the input line")
+        (false, "unsubmitted text in the input line".to_string())
     } else {
-        (true, "idle")
+        (true, "idle".to_string())
     };
     Probe {
         idle,
-        reason: reason.to_string(),
+        reason,
         input_nonempty,
         prompt_visible,
         busy_marker,
@@ -722,6 +774,68 @@ impl TuiProfile for CursorProfile {
          permission prompts in the terminal itself"
     }
 
+    /// The permission select's options carry their own hotkeys —
+    /// `(y)`, `(tab)`, `(shift+tab)`, `(esc or n)`. A choice is the
+    /// option's 1-based index; its trailing key hint is sent
+    /// verbatim, or arrows + Enter when no hint prints.
+    fn approval_answer(&self, screen: &str, choice: &str) -> Result<Vec<String>> {
+        let n: u32 = choice.parse().map_err(|_| {
+            Error::rejected(format!(
+                "'{choice}' is not a menu index — Cursor menus take the \
+                 option's position (1 is the `→` row)"
+            ))
+        })?;
+        if n == 0 {
+            return Err(Error::rejected("menu indices start at 1"));
+        }
+        let lines: Vec<&str> = screen.trim_end().lines().collect();
+        let menu_top = lines.len().saturating_sub(MENU_LINES);
+        // The option block opens at the `→`-led selected row and runs
+        // over contiguous non-blank rows.
+        let options: Vec<&str> = lines
+            .iter()
+            .rposition(|l| l.trim_start().starts_with('→') && l.contains('('))
+            .filter(|i| *i >= menu_top)
+            .map(|sel| {
+                lines[sel..]
+                    .iter()
+                    .take_while(|l| !l.trim().is_empty())
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !options.is_empty() && n as usize > options.len() {
+            return Err(Error::rejected(format!(
+                "no option {n} on this menu — it lists {}",
+                options.len()
+            )));
+        }
+        if let Some(row) = options.get((n - 1) as usize) {
+            if let Some((_, hint)) = row.trim_end().rsplit_once('(') {
+                let hint = hint.trim_end_matches(')').trim();
+                // `(esc or n)` lists alternatives — take the last.
+                let hint = hint.rsplit(" or ").next().unwrap_or(hint);
+                let key = match hint {
+                    "esc" => "Escape",
+                    "tab" => "Tab",
+                    "shift+tab" => "BTab",
+                    "enter" => "Enter",
+                    k => k,
+                };
+                if !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '_'))
+                {
+                    return Ok(vec![key.to_string()]);
+                }
+            }
+        }
+        let mut keys = vec!["Down".to_string(); (n - 1) as usize];
+        keys.push("Enter".to_string());
+        Ok(keys)
+    }
+
     fn forbidden_prefixes(&self) -> &'static [char] {
         FORBIDDEN_PREFIXES
     }
@@ -788,7 +902,9 @@ mod tests {
         // must outrank prompt parsing or it reads as a draft.
         let p = analyze_cursor(&fixture("approval.txt"), None);
         assert!(!p.idle && p.approval_menu);
-        assert_eq!(p.reason, "approval menu is open");
+        // The reason names what the menu asks — the menu block's
+        // furthest row above the option list.
+        assert_eq!(p.reason, "$ whoami in .");
     }
 
     #[test]

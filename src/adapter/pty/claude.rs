@@ -39,6 +39,11 @@ const OPEN_DEADLINE: Duration = Duration::from_secs(30);
 /// select. Busy/approval markers only match inside it — the transcript
 /// above can legitimately show these strings as text.
 const STATUS_LINES: usize = 16;
+/// The wider window a menu may occupy: a permission prompt (~10 rows)
+/// plus the input box and status bar that can stay visible below it.
+/// Menu anchors only match inside it — the transcript above can
+/// legitimately quote the same strings.
+const MENU_LINES: usize = 24;
 
 /// Claude TUI screen signatures — THE one place they live. A provider
 /// TUI update means editing this table, never the gate logic. Every
@@ -55,17 +60,19 @@ mod claude_screen {
     /// On-screen markers while a turn is running: the spinner line's
     /// interrupt hint and a tool call's pending marker.
     pub const BUSY: &[&str] = &["esc to interrupt", "Waiting…"];
-    /// An open select/permission menu — the permission prompt's title
-    /// and footer, plus the workspace-trust dialog (both its observed
-    /// 2.1.x wording and the older prompt shape).
-    pub const APPROVAL: &[&str] = &[
+    /// An open select/permission menu — the anchors are menu-exclusive
+    /// (the permission prompt's title, plus the workspace-trust dialog
+    /// in both its observed 2.1.x wordings) and a single match decides
+    /// alone. The hints are footer fragments — quotable in a long
+    /// transcript, so they only count as a cluster alongside real menu
+    /// structure (a second hint, or numbered option rows).
+    pub const ANCHOR: &[&str] = &[
         "Do you want to proceed?",
-        "Esc to cancel",
-        "Tab to amend",
         "Quick safety check",
         "Yes, I trust this folder",
         "Do you trust the files in this folder?",
     ];
+    pub const HINT: &[&str] = &["Esc to cancel", "Tab to amend", "Enter to confirm"];
 }
 
 /// Leading characters Claude's TUI interprets before the prompt text —
@@ -73,6 +80,61 @@ mod claude_screen {
 /// mode, `/` opens the command menu, `@` opens the agent/file picker.
 /// `#` stays a literal draft and is deliberately absent.
 pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
+
+/// A numbered menu option row: `❯ 1. Yes` or `   2. …` — returns the
+/// printed number so `approval_answer` can validate a choice against
+/// the rows actually on screen.
+fn option_line(line: &str) -> Option<u32> {
+    let t = line.trim_start().trim_start_matches('❯').trim_start();
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || !t[digits.len()..].starts_with('.') {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The line naming what the menu asks. A `Do you want to proceed?`
+/// prompt carries its detail rows above the question — the command
+/// first, then its description — so the furthest row inside the block
+/// names the command. Trust dialogs name themselves by the anchor
+/// row (`Quick safety check: …`).
+fn menu_subject(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.trim_end().lines().collect();
+    let q = lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with("Do you want to proceed?"));
+    if let Some(q) = q {
+        let mut subject = None;
+        let mut blanks = 0;
+        for l in lines[..q].iter().rev() {
+            let t = l.trim();
+            if t.is_empty() {
+                blanks += 1;
+                if blanks > 1 {
+                    break;
+                }
+                continue;
+            }
+            if t.starts_with("Tip:") || t.chars().all(|c| c == claude_screen::BORDER) {
+                break;
+            }
+            subject = Some(t.chars().take(100).collect());
+            blanks = 0;
+        }
+        if subject.is_some() {
+            return subject;
+        }
+    }
+    lines
+        .iter()
+        .rev()
+        .take(MENU_LINES)
+        .find(|l| {
+            let t = l.trim_start();
+            t.starts_with("Quick safety check") || t.starts_with("Do you trust")
+        })
+        .map(|l| l.trim().chars().take(100).collect())
+}
 
 /// Reduce a captured Claude screen to gate facts. The last boxed `❯`
 /// line is the input box; text after it is a draft — except ghost
@@ -96,7 +158,23 @@ pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
-    let approval_menu = claude_screen::APPROVAL.iter().any(|m| tail.contains(m));
+    // Menu evidence lives in the wider menu window — a permission
+    // prompt plus a still-visible input box can push its rows above
+    // the busy anchor. Anchors decide alone; hints need real menu
+    // structure beside them (numbered options or a second hint).
+    let menu_lines: Vec<&str> = content.lines().rev().take(MENU_LINES).collect();
+    let anchor = menu_lines
+        .iter()
+        .any(|l| claude_screen::ANCHOR.iter().any(|a| l.contains(a)));
+    let options = menu_lines
+        .iter()
+        .filter(|l| option_line(l).is_some())
+        .count();
+    let hints = claude_screen::HINT
+        .iter()
+        .filter(|h| menu_lines.iter().any(|l| l.contains(**h)))
+        .count();
+    let approval_menu = anchor || (options >= 2 && hints >= 1) || hints >= 2;
     let busy_marker = claude_screen::BUSY.iter().any(|m| tail.contains(m));
     // The input box is a `❯`-leading line whose previous row is the
     // `─` border — menu option lists lead with `❯` too but are never
@@ -131,19 +209,25 @@ pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         };
     let input_nonempty = !draft.is_empty() && !ghost;
     let (idle, reason) = if approval_menu {
-        (false, "approval menu is open")
+        (
+            false,
+            menu_subject(content).unwrap_or_else(|| "approval menu is open".to_string()),
+        )
     } else if busy_marker {
-        (false, "tui is busy (interrupt marker on screen)")
+        (
+            false,
+            "tui is busy (interrupt marker on screen)".to_string(),
+        )
     } else if !prompt_visible {
-        (false, "no prompt line visible")
+        (false, "no prompt line visible".to_string())
     } else if input_nonempty {
-        (false, "unsubmitted text in the input line")
+        (false, "unsubmitted text in the input line".to_string())
     } else {
-        (true, "idle")
+        (true, "idle".to_string())
     };
     Probe {
         idle,
-        reason: reason.to_string(),
+        reason,
         input_nonempty,
         prompt_visible,
         busy_marker,
@@ -464,6 +548,70 @@ impl TuiProfile for ClaudeProfile {
          permission prompts in the terminal itself"
     }
 
+    /// Numbered permission menus take the option's digit key; an
+    /// unnumbered select (the trust dialog) falls back to arrows +
+    /// Enter, bounded by the option rows on screen.
+    fn approval_answer(&self, screen: &str, choice: &str) -> Result<Vec<String>> {
+        let region: Vec<&str> = screen
+            .trim_end()
+            .lines()
+            .rev()
+            .take(MENU_LINES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let numbered: Vec<u32> = region.iter().filter_map(|l| option_line(l)).collect();
+        let n: u32 = choice.parse().map_err(|_| {
+            Error::rejected(format!(
+                "'{choice}' is not a menu index — Claude menus take the \
+                 option's printed number"
+            ))
+        })?;
+        if !numbered.is_empty() {
+            if numbered.contains(&n) {
+                return Ok(vec![n.to_string()]);
+            }
+            return Err(Error::rejected(format!(
+                "no option {n} on this menu — it lists {}",
+                numbered
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        // Unnumbered select: option rows sit between the first
+        // `❯`-led row (skipping a boxed input line — its previous row
+        // is the `─` border) and the footer (hint-bearing) row.
+        let sel = region
+            .iter()
+            .enumerate()
+            .position(|(i, l)| {
+                l.trim_start().starts_with('❯')
+                    && !(i > 0
+                        && region[i - 1]
+                            .trim()
+                            .chars()
+                            .all(|c| c == claude_screen::BORDER)
+                        && !region[i - 1].trim().is_empty())
+            })
+            .ok_or_else(|| Error::rejected("no menu options on screen"))?;
+        let count = region[sel..]
+            .iter()
+            .take_while(|l| !claude_screen::HINT.iter().any(|h| l.contains(*h)))
+            .filter(|l| !l.trim().is_empty())
+            .count() as u32;
+        if n == 0 || n > count {
+            return Err(Error::rejected(format!(
+                "no option {n} on this menu — it lists {count}"
+            )));
+        }
+        let mut keys = vec!["Down".to_string(); (n - 1) as usize];
+        keys.push("Enter".to_string());
+        Ok(keys)
+    }
+
     fn forbidden_prefixes(&self) -> &'static [char] {
         FORBIDDEN_PREFIXES
     }
@@ -547,7 +695,9 @@ mod tests {
         let p = analyze_claude(&fixture("approval.txt"), None);
         assert!(!p.idle);
         assert!(p.approval_menu);
-        assert_eq!(p.reason, "approval menu is open");
+        // The reason names the command being approved — the furthest
+        // detail row above the proceed question.
+        assert_eq!(p.reason, "touch /tmp/claude-obs-marker-7");
     }
 
     #[test]
