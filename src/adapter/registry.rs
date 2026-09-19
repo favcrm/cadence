@@ -165,7 +165,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: false,
         reports: Reporting::TurnResult,
         report_hint: Reporting::TurnResult,
-        brokers_requests: false,
+        brokers_requests: true,
         resumable: true,
         resume_label: "claude --resume <session>",
         live_settable_params: &[],
@@ -175,17 +175,20 @@ pub static SPECS: &[EndpointSpec] = &[
             "allowed_tools",
             "turn_idle_secs",
             "turn_max_secs",
+            "broker_approvals",
+            "permission_timeout_secs",
             "session",
             "upstream",
             "agents_md",
         ],
         session_id_label: "Claude session",
         respond_rejection: Some(
-            "managed claude endpoints broker no requests — widen \
-             permissions by relaunching or rejoining with \
-             `--permission-mode <mode>` or `--allow \"<pattern>\"` \
-             (or `--bypass`); denials are recorded as \
-             permission_denied events on the agent",
+            "no request is pending for this managed claude endpoint — \
+             permission prompts are brokered only when launched with \
+             `--broker-approvals`; otherwise widen permissions by \
+             relaunching or rejoining with `--permission-mode <mode>` \
+             or `--allow \"<pattern>\"` (or `--bypass`); denials are \
+             recorded as permission_denied events on the agent",
         ),
         capabilities: &["managed_claude_stream"],
         doctor_caps: &["managed_claude_stream"],
@@ -577,6 +580,35 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
                     )))
                 }
             }
+        }
+    }
+    if provider == "claude" && kind == "managed" {
+        if let Some(v) = params.get("broker_approvals") {
+            if !v.is_boolean() {
+                return Err(Error::rejected(
+                    "claude broker_approvals must be a boolean (set by --broker-approvals)",
+                ));
+            }
+        }
+        if let Some(v) = params.get("permission_timeout_secs") {
+            if v.as_u64().is_none_or(|s| s < 1) {
+                return Err(Error::rejected(
+                    "claude permission_timeout_secs must be a positive integer \
+                     (set by --permission-timeout-secs)",
+                ));
+            }
+        }
+        let brokered = params
+            .get("broker_approvals")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let bypassed =
+            params.get("permission_mode").and_then(Value::as_str) == Some("bypassPermissions");
+        if brokered && bypassed {
+            return Err(Error::rejected(
+                "broker_approvals and bypassPermissions are incompatible — \
+                 bypass makes every prompt moot",
+            ));
         }
     }
     Ok(())

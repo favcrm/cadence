@@ -44,7 +44,10 @@ Error kinds:
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
-| `agent_respond` | `alias, request, decision?|answers?` | `{state:"answered"}` |
+| `agent_respond` | `alias, request, decision?|answers?, reason?` | `{state:"answered"}` — `reason` rides a brokered decline as the provider's denial message |
+| `request_open` | `alias, kind?, tool, input_summary?, input?, request?` | `{request,state:"waiting_input",existing?}` — registers a brokered request (caller-named `request` dedupes retries); `rejected` unless the agent's params carry `broker_approvals` |
+| `request_wait` | `request, wait?(<=120)` | `{state:"waiting"}` on slice expiry, `{state:"answered",answer}` after `agent_respond`, `{state:"closed",reason}` once the handle is gone (actor exit, daemon restart, `request_close`) |
+| `request_close` | `request` | `{state:"closed"}` or `{state:"answered",answer}` — retires the handle a waiter abandoned (local deadline); a boundary-parked answer still lands |
 | `agent_ready` | `alias, by?, force?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; probes the pane first and refuses a visibly busy one unless `force`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
@@ -534,13 +537,39 @@ waits a bounded 60s grace for the interrupted `result`, then fails
 closed `unknown`. `close` ends stdin first (clean EOF exit) before the
 TERM→KILL fallback. There is no attachable surface — `agent attach`
 prints an explanation naming `cadence events --follow` and manual
-`claude --resume` after `agent stop`. Phase A brokers no provider
-requests: `agent respond` is `rejected` naming the real opt-ups —
+`claude --resume` after `agent stop`. Provider stderr lands in
+`providers/<alias>.provider.log` and each `result` emits a
+`claude_result` event carrying `total_cost_usd`/`num_turns`/`session_id`
+for audit.
+
+**Brokered approvals.** `--broker-approvals` (launch flag; `join …
+claude` too) adds `--permission-prompt-tool mcp__cadence__approve` plus
+a generated `--mcp-config <state>/agents/<alias>.mcp.json` and
+`--strict-mcp-config` to the launch line — replayed on resume like
+every stored param. The config names the hidden `cadence
+mcp-permission` stdio server (newline-delimited JSON-RPC 2.0:
+`initialize` → `notifications/initialized` → `tools/list` →
+`tools/call`, verified against claude 2.1.277) with `CADENCE_ALIAS` /
+`CADENCE_STATE_DIR` / `CADENCE_PERMISSION_TIMEOUT_SECS` in its env.
+Every prompt the permission mode can't pre-decide arrives as a
+`tools/call` on the single `approve` tool; the server `request_open`s
+it (method `cadence/approval`, deduped on a caller-named handle) and
+blocks in `request_wait` for the operator's `agent_respond`: `accept`
+→ `{"behavior":"allow","updatedInput":<input>}`, `decline` →
+`{"behavior":"deny","message":<reason>}` (`--reason` sets the message).
+While a request is open the agent holds `waiting_input`, a
+`request_opened` event lands, one `worker_notice` reaches the upstream
+PM naming the exact respond command, and the open wait stamps provider
+activity so the human's thinking time is never an idle fence. The
+server denies on its own `permission_timeout_secs` deadline (default
+900 — `request_close` then retires the handle so the agent isn't stuck)
+and denies cleanly `closed` when the daemon restarts mid-wait — the
+pending map is in-memory, never replayed. Without the flag nothing is
+brokered: `agent respond` is `rejected` naming the real opt-ups —
 relaunch or rejoin with `--permission-mode <mode>` / `--allow "<pat>"`
-/ `--bypass`, and watch `permission_denied` events. Provider stderr
-lands in `providers/<alias>.provider.log` and
-each `result` emits a `claude_result` event carrying
-`total_cost_usd`/`num_turns`/`session_id` for audit.
+/ `--bypass`, and watch `permission_denied` events. Broker mode refuses
+`--bypass`/`bypassPermissions` (prompts are moot) and `--tui` (the pane
+answers its own).
 
 ## inbox endpoints (provider `inbox`)
 
@@ -725,6 +754,7 @@ endpoint kinds without a readiness gate. `message ask` accepts
 `agent_events` pages the durable log: `{seq, alias, kind, payload, at}`.
 Kinds: `registered, queued, submitting, turn_started, turn_finished,
 provider_event, input_required, input_answered, input_resolved,
+request_opened, request_closed,
 result_routed, notice_routed, ready, ready_claimed, claim_used,
 gate_wait, submitted,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
@@ -773,6 +803,18 @@ resolved outside Cadence — an attached TUI answering the approval makes
 the provider emit `serverRequest/resolved`, which drops the pending
 handle (`input_resolved`); a late `agent_respond` is then `rejected`.
 The agent stays `waiting_input` while other requests remain pending.
+
+Brokered requests share the same model through a second entry point:
+`request_open` registers one (method `cadence/<kind>`), `request_wait`
+blocks the caller until the answer is parked or the handle is gone, and
+`request_close` retires a handle the caller abandoned. `agent_respond`
+branches on the method — `cadence/*` requests accept `--decision
+accept|decline` (with an optional `--reason` on decline) and park the
+answer for the waiter instead of calling `adapter.respond`; provider
+methods keep the per-type responses above. Pending entries are
+in-memory: an actor exit or daemon restart reads as `closed` to any
+waiter. Today the only producer is the `mcp-permission` server backing
+brokered claude approvals (see the managed claude section).
 
 ## Recovery
 

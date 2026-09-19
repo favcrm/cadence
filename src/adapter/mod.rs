@@ -155,6 +155,12 @@ pub trait ProviderAdapter: Send + Sync {
     /// cache endpoint options (pty's `auto_ready`) refresh here. Stored
     /// params remain authoritative for the next `open` regardless.
     fn update_params(&self, _params: &Value) {}
+    /// External proof of life: a brokered permission request is open
+    /// and waiting on a human — the provider is silent by design, so
+    /// activity-based liveness must count the wait or the turn fences
+    /// `unknown` while the operator thinks. No-op where liveness isn't
+    /// activity-derived (pty watches its pane instead).
+    fn note_activity(&self) {}
 }
 
 /// Build the adapter for an agent's `provider`/`endpoint_kind`.

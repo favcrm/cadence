@@ -117,6 +117,11 @@ pub struct Shared {
     /// Broadcast on any queue/event change.
     changed: Notify,
     pending: Mutex<HashMap<String, PendingRequest>>,
+    /// Brokered requests answered by `agent respond` but not yet
+    /// collected by their `request_wait` caller: handle → (alias,
+    /// answer). In-memory like `pending` — a daemon restart drops both
+    /// and the waiter hears `closed`, by design.
+    answered: Mutex<HashMap<String, (String, Value)>>,
     lifecycle: Mutex<Lifecycle>,
     closing: AtomicBool,
     provider_log_dir: PathBuf,
@@ -136,6 +141,7 @@ impl Shared {
             store,
             changed: Notify::new(),
             pending: Mutex::new(HashMap::new()),
+            answered: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(Lifecycle::default()),
             closing: AtomicBool::new(false),
             provider_log_dir,
@@ -322,7 +328,12 @@ impl Shared {
         {
             let mut pending = self.pending.lock().unwrap();
             pending.retain(|_, req| req.alias != alias);
+            // Uncollected brokered answers die with the actor too — a
+            // `request_wait` still blocked sees the handle gone and
+            // reports `closed` to its caller.
+            self.answered.lock().unwrap().retain(|_, (a, _)| a != alias);
         }
+        self.wake();
         let closing = self.closing.load(Ordering::SeqCst);
         let _ = self.store.clear_runtime(alias);
         match outcome {
@@ -760,6 +771,9 @@ impl Shared {
                 Ok(json!({"requests": requests}))
             }
             "agent_respond" => self.rpc_respond(params),
+            "request_open" => self.rpc_request_open(params),
+            "request_wait" => self.rpc_request_wait(params),
+            "request_close" => self.rpc_request_close(params),
             "agent_ready" => self.rpc_ready(params),
             "agent_capture" => self.rpc_capture(params),
             "agent_probe" => self.rpc_probe(params),
@@ -987,91 +1001,301 @@ impl Shared {
 
     fn rpc_respond(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        // Managed Claude brokers no provider requests in phase A — the
-        // spec's rejection names the real opt-ups rather than hunting
-        // the pending map.
-        let agent = self.store.agent(&alias)?;
-        if let Some(rejection) = registry::respond_rejection(&agent.provider, &agent.endpoint_kind)
-        {
-            return Err(Error::rejected(rejection));
-        }
         let handle = required_str(params, "request")?;
         let decision = optional_str(params, "decision");
         // Explicit JSON null means "not provided".
         let answers = params.get("answers").filter(|a| !a.is_null()).cloned();
+        // Operator note carried on a brokered decline — the MCP server
+        // hands it to the provider as the denial message.
+        let reason = optional_str(params, "reason").map(str::to_string);
         // Claim the handle atomically: whichever path removes it first
-        // — this respond or an external `serverRequest/resolved` — owns
-        // the answer, and every other path sees "no longer pending".
-        // Validation runs under the same lock so a malformed respond
-        // leaves the request pending instead of consuming it. No I/O
-        // happens while the lock is held.
-        let (request_id, response) = {
+        // — this respond, an external `serverRequest/resolved`, or the
+        // actor's exit sweep — owns the answer, and every other path
+        // sees "no longer pending". Validation runs under the same
+        // lock so a malformed respond leaves the request pending
+        // instead of consuming it. No I/O happens while the lock is
+        // held. A miss falls to the spec's rejection hint where one is
+        // configured (managed claude without --broker-approvals).
+        enum Claim {
+            /// A provider-originated request: answer over the adapter.
+            Provider(Value, Value),
+            /// A `request_open` brokered request: the answer is parked
+            /// for the blocked `request_wait` caller instead.
+            Brokered,
+        }
+        let claim = {
             let mut map = self.pending.lock().unwrap();
-            let req = map
-                .get(handle)
-                .filter(|req| req.alias == alias)
-                .ok_or_else(|| Error::rejected("Request is no longer pending for this agent"))?;
-            let request_id = req.id.clone();
+            let req = map.get(handle).filter(|req| req.alias == alias);
+            let Some(req) = req else {
+                drop(map);
+                let agent = self.store.agent(&alias)?;
+                return Err(Error::rejected(
+                    registry::respond_rejection(&agent.provider, &agent.endpoint_kind)
+                        .unwrap_or("Request is no longer pending for this agent"),
+                ));
+            };
             let method = req.method.clone();
-            let request_params = req.params.clone();
-            let response = match method.as_str() {
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-                match decision {
-                    Some("accept") | Some("decline") if answers.is_none() => {
-                        json!({"decision": decision.unwrap()})
+            if method.starts_with("cadence/") {
+                let answer = match decision {
+                    Some("accept") if answers.is_none() => json!({"decision": "accept"}),
+                    Some("decline") if answers.is_none() => {
+                        json!({"decision": "decline", "reason": reason})
                     }
                     _ => return Err(Error::rejected("Respond with decision accept or decline")),
+                };
+                // Park the answer before dropping the pending entry —
+                // `request_wait` treats a missing handle as closed, so
+                // the mailbox must be filled first or an accept could
+                // surface as a denial.
+                self.answered
+                    .lock()
+                    .unwrap()
+                    .insert(handle.to_string(), (alias.clone(), answer));
+                map.remove(handle);
+                Claim::Brokered
+            } else {
+                let request_id = req.id.clone();
+                let request_params = req.params.clone();
+                let response = match method.as_str() {
+                "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                    match decision {
+                        Some("accept") | Some("decline") if answers.is_none() => {
+                            json!({"decision": decision.unwrap()})
+                        }
+                        _ => return Err(Error::rejected("Respond with decision accept or decline")),
+                    }
                 }
-            }
-            "item/tool/requestUserInput" => {
-                if decision.is_some() || !answers.as_ref().is_some_and(Value::is_object) {
-                    return Err(Error::rejected("Respond with an answers object"));
+                "item/tool/requestUserInput" => {
+                    if decision.is_some() || !answers.as_ref().is_some_and(Value::is_object) {
+                        return Err(Error::rejected("Respond with an answers object"));
+                    }
+                    json!({"answers": answers.unwrap()})
                 }
-                json!({"answers": answers.unwrap()})
-            }
-            "session/request_permission" => match decision {
-                Some("decline") if answers.is_none() => {
-                    json!({"outcome": {"outcome": "cancelled"}})
-                }
-                Some("accept") if answers.is_none() => {
-                    let option = request_params
-                        .get("options")
-                        .and_then(Value::as_array)
-                        .and_then(|options| {
-                            options.iter().find(|o| {
-                                o.get("kind").and_then(Value::as_str) == Some("allow_once")
+                "session/request_permission" => match decision {
+                    Some("decline") if answers.is_none() => {
+                        json!({"outcome": {"outcome": "cancelled"}})
+                    }
+                    Some("accept") if answers.is_none() => {
+                        let option = request_params
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .and_then(|options| {
+                                options.iter().find(|o| {
+                                    o.get("kind").and_then(Value::as_str) == Some("allow_once")
+                                })
                             })
-                        })
-                        .ok_or_else(|| {
-                            Error::rejected("Provider did not offer an allow-once option")
-                        })?;
-                    json!({"outcome": {"outcome": "selected", "optionId": option["optionId"]}})
-                }
-                _ => return Err(Error::rejected("Respond with decision accept or decline")),
-            },
-            _ => return Err(Error::rejected(
-                "This request type is not supported; stop the agent or use the provider directly",
-            )),
-            };
-            map.remove(handle);
-            (request_id, response)
+                            .ok_or_else(|| {
+                                Error::rejected("Provider did not offer an allow-once option")
+                            })?;
+                        json!({"outcome": {"outcome": "selected", "optionId": option["optionId"]}})
+                    }
+                    _ => return Err(Error::rejected("Respond with decision accept or decline")),
+                },
+                _ => return Err(Error::rejected(
+                    "This request type is not supported; stop the agent or use the provider directly",
+                )),
+                };
+                map.remove(handle);
+                Claim::Provider(request_id, response)
+            }
         };
-        let adapter = self
-            .lifecycle
-            .lock()
-            .unwrap()
-            .agents
-            .get(&alias)
-            .and_then(|ctl| ctl.adapter.lock().unwrap().clone());
-        let adapter = adapter
-            .ok_or_else(|| Error::internal("Agent adapter is not available for this request"))?;
-        adapter.respond(&request_id, response)?;
+        match claim {
+            Claim::Brokered => {}
+            Claim::Provider(request_id, response) => {
+                let adapter = self
+                    .lifecycle
+                    .lock()
+                    .unwrap()
+                    .agents
+                    .get(&alias)
+                    .and_then(|ctl| ctl.adapter.lock().unwrap().clone());
+                let adapter = adapter.ok_or_else(|| {
+                    Error::internal("Agent adapter is not available for this request")
+                })?;
+                adapter.respond(&request_id, response)?;
+            }
+        }
         self.relax_waiting(&alias);
         let _ = self
             .store
             .event_public(&alias, "input_answered", json!({"request": handle}));
         self.wake();
         Ok(json!({"state": "answered"}))
+    }
+
+    /// `request_open` — a brokered request raised by an external
+    /// requester (the `cadence mcp-permission` server a brokered
+    /// claude launches) rather than by the provider adapter itself.
+    /// Same model as `on_provider_request`: durable through the event
+    /// log, visible via `agent_requests`, and holding the agent in
+    /// `waiting_input` until `agent respond` answers it.
+    fn rpc_request_open(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let agent = self.store.agent(&alias)?;
+        let brokered = agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("broker_approvals"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !brokered {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' was not launched with --broker-approvals — \
+                 its permission prompts are not brokered"
+            )));
+        }
+        let kind = optional_str(params, "kind").unwrap_or("approval");
+        proto::identifier(kind, "Request kind")?;
+        let tool = required_str(params, "tool")?;
+        let input_summary = optional_str(params, "input_summary").unwrap_or_default();
+        let input = params.get("input").cloned().unwrap_or(Value::Null);
+        // The caller may name the handle (the mcp-permission server
+        // mints one per tool call): a retry after a lost response then
+        // re-opens the SAME request — no duplicate pending entry, no
+        // second event, no second PM notice.
+        let handle = match optional_str(params, "request") {
+            Some(h) => proto::identifier(h, "Request handle")?,
+            None => Uuid::new_v4().simple().to_string(),
+        };
+        {
+            let pending = self.pending.lock().unwrap();
+            if let Some(req) = pending.get(&handle) {
+                if req.alias == alias {
+                    return Ok(json!({"request": handle, "state": "waiting_input",
+                                     "existing": true}));
+                }
+                return Err(Error::rejected(
+                    "Request handle is already pending for another agent",
+                ));
+            }
+        }
+        self.pending.lock().unwrap().insert(
+            handle.clone(),
+            PendingRequest {
+                alias: alias.clone(),
+                // No provider request id — the answer parks in
+                // `answered` for `request_wait`, never `adapter.respond`.
+                id: Value::Null,
+                method: format!("cadence/{kind}"),
+                params: json!({"kind": kind, "tool": tool,
+                               "input_summary": input_summary, "input": input}),
+            },
+        );
+        // Requests only arrive mid-turn; relax/stop may have moved the
+        // agent on already — never clobber a non-busy state.
+        let _ = self
+            .store
+            .set_agent_state_if(&alias, "waiting_input", "busy");
+        let _ = self.store.event_public(
+            &alias,
+            "request_opened",
+            json!({"request": handle, "kind": kind, "tool": tool,
+                   "input_summary": input_summary}),
+        );
+        // An upstream PM gets exactly one notice naming the agent and
+        // the respond command — deterministic id, so a retried open
+        // can never double-notify.
+        if let Some(pm) = self.upstream_of(&alias) {
+            let delivery = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("cadence-notice:request:{handle}").as_bytes(),
+            )
+            .simple()
+            .to_string();
+            let payload = json!({"request": handle, "worker": alias,
+                                 "tool": tool, "input_summary": input_summary});
+            let body = format!(
+                "A managed worker is waiting on a tool-permission decision. This is an \
+                 informational notice, not a result; do not treat it as worker output. \
+                 Answer it with `cadence agent respond {alias} --request {handle} \
+                 --decision accept|decline [--reason \"why\"]` — `cadence agent requests \
+                 {alias}` shows the full input. {payload}"
+            );
+            if self
+                .store
+                .enqueue_task(&pm, &body, None, &delivery, "worker_notice", None)
+                .is_ok()
+            {
+                self.notify_agent(&pm);
+            }
+        }
+        // An open request counts as provider activity — a worker
+        // waiting on a human is not idle.
+        if let Ok(adapter) = self.adapter_for(&alias) {
+            adapter.note_activity();
+        }
+        self.wake();
+        Ok(json!({"request": handle, "state": "waiting_input"}))
+    }
+
+    /// `request_wait` — block until a brokered request is answered,
+    /// closed, or the caller's slice expires. `request_wait` callers
+    /// re-issue until their own deadline; each pass stamps provider
+    /// activity so a human's thinking time is never an idle fence.
+    fn rpc_request_wait(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let handle = required_str(params, "request")?;
+        let wait = optional_u64(params, "wait").unwrap_or(60).min(120);
+        let deadline = Instant::now() + Duration::from_secs(wait);
+        loop {
+            let alias = self
+                .pending
+                .lock()
+                .unwrap()
+                .get(handle)
+                .map(|req| req.alias.clone());
+            let Some(alias) = alias else {
+                // The handle is gone — `agent respond` parks the
+                // answer before dropping it, so the mailbox is
+                // authoritative here; an actor exit sweep or a daemon
+                // restart leaves it empty, which reads as closed.
+                if let Some((_, answer)) = self.answered.lock().unwrap().remove(handle) {
+                    return Ok(json!({"state": "answered", "answer": answer}));
+                }
+                return Ok(json!({"state": "closed",
+                                 "reason": "request is not pending"}));
+            };
+            if let Ok(adapter) = self.adapter_for(&alias) {
+                adapter.note_activity();
+            }
+            if self.closing.load(Ordering::SeqCst) {
+                return Ok(json!({"state": "closed", "reason": "daemon shutting down"}));
+            }
+            if Instant::now() >= deadline {
+                return Ok(json!({"state": "waiting"}));
+            }
+            self.changed
+                .wait_until(Instant::now() + Duration::from_millis(250));
+        }
+    }
+
+    /// `request_close` — the requester's local deadline fired: retire
+    /// the pending handle so the agent leaves `waiting_input` and
+    /// `agent_requests` drains. An answer parked at the boundary still
+    /// lands — `agent respond` fills the mailbox before dropping the
+    /// pending entry, so a close that finds it returns `answered`.
+    fn rpc_request_close(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let handle = required_str(params, "request")?;
+        let alias = {
+            let mut pending = self.pending.lock().unwrap();
+            // Same lock order as respond (pending → answered): a
+            // respond mid-flight holds pending through its mailbox
+            // insert, so whichever we observe here is final.
+            if let Some((alias, answer)) = self.answered.lock().unwrap().remove(handle) {
+                pending.remove(handle);
+                drop(pending);
+                self.relax_waiting(&alias);
+                return Ok(json!({"state": "answered", "answer": answer}));
+            }
+            pending.remove(handle).map(|req| req.alias)
+        };
+        if let Some(alias) = alias {
+            self.relax_waiting(&alias);
+            let _ = self
+                .store
+                .event_public(&alias, "request_closed", json!({"request": handle}));
+        }
+        self.wake();
+        Ok(json!({"state": "closed"}))
     }
 
     /// The live adapter for an alias, when an actor owns one.

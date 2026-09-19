@@ -45,6 +45,11 @@ cadence claude                  # headless managed Claude (stream-json) — each
                                 #  turn fences unknown (default 900; liveness is
                                 #  activity-based) — --turn-max-secs <n> adds an
                                 #  absolute cap
+                                #  --broker-approvals routes permission prompts
+                                #  to `agent requests`/`agent respond` via the
+                                #  mcp-permission server (--permission-timeout-secs
+                                #  bounds the wait, default 900; refused with
+                                #  --bypass/--tui)
 cadence claude --tui            # interactive Claude in an owned tmux pane —
                                 #  pty rules: ready-gated literal paste, explicit
                                 #  `message result` reporting, -r <session-id>
@@ -178,8 +183,8 @@ the reviewer is never the assignee.
 The hot path is verb-first — `devin`, `codex`, `join`, `attach`, `send`,
 `resume`, `stop`, `inbox` — while `agent`, `message` and `daemon` hold
 the admin subcommands (register/list/show/ready/capture/probe/set/
-remove/gc/bootstrap/unfence, send/ask/ack/result/reconcile,
-start/run/status/stop).
+remove/gc/bootstrap/unfence/requests/respond, send/ask/ack/result/
+reconcile, start/run/status/stop).
 Everywhere a command takes an agent name, an alias or a provider-native
 session id resolves the same way.
 
