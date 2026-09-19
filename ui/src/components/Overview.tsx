@@ -158,6 +158,9 @@ export default function OverviewView({ data }: { data: Overview | null }) {
                     </li>
                   ))}
                 </ul>
+                {drift.held && (
+                  <div className="text-micro text-ink-500 mt-2">{drift.held}</div>
+                )}
               </div>
             )
           ) : (

@@ -6294,7 +6294,8 @@ fn overview_merge_ready_pr_first_with_exact_command() {
     // The merge-ready PR leads: exact command, link, project, age.
     assert_eq!(needs[0]["kind"], "merge", "{needs:?}");
     assert_eq!(
-        needs[0]["command"], "gh pr merge 7 --repo acme/widgets --squash --admin",
+        needs[0]["command"],
+        "gh pr merge 7 --repo acme/widgets --squash --admin --match-head-commit abc",
         "{needs:?}"
     );
     assert_eq!(needs[0]["link"], "https://github.com/acme/widgets/pull/7");
@@ -6457,7 +6458,7 @@ fn overview_tracker_items_and_tracker_behind() {
     let review = kind("review_no_pr").expect("review item");
     assert_eq!(review["command"], "cadence issue show CAD-3");
     let unblocked = kind("blocked_ready").expect("unblocked item");
-    assert_eq!(unblocked["command"], "cadence issue set CAD-5 status ready");
+    assert_eq!(unblocked["command"], "cadence issue set CAD-5 status=ready");
     let behind = kind("tracker_behind").expect("behind item");
     assert_eq!(behind["command"], "cadence issue sync");
     // No github remotes declared → no gh work attempted, state "ok".
@@ -6508,4 +6509,215 @@ fn version_reports_build_identity() {
         ),
         "{text}"
     );
+}
+
+/// A fake daemon on `<state>/cadence.sock` — answers `health`,
+/// `agent_list`, `agent_show`, `agent_requests`, `agent_probe`, and
+/// rejects `daemon_info` like a build that predates the RPC. Returns
+/// the listener thread's stop flag + join handle.
+fn fake_daemon_no_info(
+    state: &Path,
+    agents: Value,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread::JoinHandle<()>,
+) {
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    std::fs::create_dir_all(state).unwrap();
+    let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let handle = thread::spawn(move || {
+        while !flag.load(Ordering::Relaxed) {
+            let Ok((mut conn, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            let mut line = String::new();
+            std::io::BufReader::new(&conn)
+                .read_line(&mut line)
+                .unwrap_or_default();
+            let method = serde_json::from_str::<Value>(&line)
+                .ok()
+                .and_then(|r| r["method"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            let result = match method.as_str() {
+                "health" => json!({"ok": true, "result": {"pid": 1}}),
+                "daemon_info" => json!({
+                    "ok": false,
+                    "error": {"kind": "rejected", "message": "Unknown method 'daemon_info'"}
+                }),
+                "agent_list" => {
+                    json!({"ok": true, "result": {"agents": agents.clone()}})
+                }
+                "agent_show" => json!({"ok": true, "result": {"messages": [], "queued": 0}}),
+                "agent_requests" => json!({"ok": true, "result": {"requests": []}}),
+                "agent_probe" => json!({"ok": true, "result": {"idle": true}}),
+                _ => json!({
+                    "ok": false,
+                    "error": {"kind": "rejected", "message": "Unknown method"}
+                }),
+            };
+            let _ = writeln!(conn, "{result}");
+        }
+    });
+    (stop, handle)
+}
+
+#[test]
+fn overview_daemon_without_daemon_info_stays_reachable() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    // A fenced worker agent — reachable daemon rows must still appear
+    // even though `daemon_info` is unknown to this old build.
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        - 300.0;
+    let agents = json!([{
+        "alias": "w1", "state": "attention", "provider": "devin",
+        "endpoint_kind": "ws", "updated": epoch
+    }]);
+    let (stop, handle) = fake_daemon_no_info(state.path(), agents);
+    let (ok, v) = cli(pm.path(), state.path(), &["overview", "--json"]);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = handle.join();
+    assert!(ok, "{v}");
+    assert_eq!(v["daemon"]["reachable"], true, "{v}");
+    let needs = v["needs_me"].as_array().unwrap();
+    let fenced = needs
+        .iter()
+        .find(|n| n["kind"] == "fenced")
+        .expect("fenced row from a reachable old daemon");
+    assert_eq!(fenced["command"], "cadence agent unfence w1");
+    // Build identity unreadable → drift explains instead of guessing.
+    let reason = v["drift"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("predates daemon_info"), "{v}");
+    assert_eq!(v["drift"]["matched"], false, "{v}");
+}
+
+#[test]
+fn overview_review_suppressed_by_branch_match() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let repo = repo_with_remote("https://github.com/acme/widgets.git");
+    assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
+    let repo_s = repo.path().to_str().unwrap().to_string();
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "project", "add", "cadence", "--prefix", "CAD", "--repo", &repo_s]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "new", "review me", "--project", "cadence"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "set", "CAD-1", "status=review"]
+        )
+        .0
+    );
+    // CAD-1 has no `pr` ref — but an open PR on `cadence/cad-1-…`
+    // branch counts as its PR.
+    let gh = fake_gh();
+    let prs = format!(
+        r#"[{{"number": 9, "title": "cad-1 work",
+           "url": "https://github.com/acme/widgets/pull/9",
+           "headRefOid": "def", "headRefName": "cadence/cad-1-review",
+           "updatedAt": "{}", "statusCheckRollup": []}}]"#,
+        iso_ago(300)
+    );
+    let path = gh_path(&gh);
+    let log = gh.log.to_str().unwrap().to_string();
+    let (ok, v) = cli_env(
+        pm.path(),
+        state.path(),
+        &["overview", "--json"],
+        &[
+            ("PATH", path.as_str()),
+            ("FAKE_GH_LOG", log.as_str()),
+            ("FAKE_GH_PRS", prs.as_str()),
+            ("FAKE_GH_CI", r#"{"state":"success","statuses":[]}"#),
+        ],
+    );
+    assert!(ok, "{v}");
+    let needs = v["needs_me"].as_array().unwrap();
+    assert!(
+        !needs.iter().any(|n| n["kind"] == "review_no_pr"),
+        "{needs:?}"
+    );
+}
+
+#[test]
+fn overview_empty_slug_set_keeps_cached_rows() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let repo = repo_with_remote("https://github.com/acme/widgets.git");
+    assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
+    let repo_s = repo.path().to_str().unwrap().to_string();
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "project", "add", "cadence", "--prefix", "CAD", "--repo", &repo_s]
+        )
+        .0
+    );
+    // Run 1: a good fetch writes the slug-keyed cache.
+    let gh = fake_gh();
+    let prs = format!(
+        r#"[{{"number": 9, "title": "wip thing",
+           "url": "https://github.com/acme/widgets/pull/9",
+           "headRefOid": "def", "headRefName": "wip",
+           "updatedAt": "{}", "statusCheckRollup": []}}]"#,
+        iso_ago(300)
+    );
+    let path = gh_path(&gh);
+    let log = gh.log.to_str().unwrap().to_string();
+    let (ok, v) = cli_env(
+        pm.path(),
+        state.path(),
+        &["overview", "--json"],
+        &[
+            ("PATH", path.as_str()),
+            ("FAKE_GH_LOG", log.as_str()),
+            ("FAKE_GH_PRS", prs.as_str()),
+            ("FAKE_GH_CI", r#"{"state":"success","statuses":[]}"#),
+        ],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["github"]["state"], "ok");
+    let cache = state.path().join("overview-gh.json");
+    let body: Value = serde_json::from_str(&std::fs::read_to_string(&cache).unwrap()).unwrap();
+    assert_eq!(body["slugs"], json!(["acme/widgets"]), "{body}");
+    // Run 2: a tracker with no remotes must not stamp over the cache.
+    let empty_pm = TempDir::new().unwrap();
+    assert!(cli(empty_pm.path(), state.path(), &["issue", "init"]).0);
+    let (ok, v) = cli_env(
+        empty_pm.path(),
+        state.path(),
+        &["overview", "--json"],
+        &[("PATH", path.as_str()), ("FAKE_GH_LOG", log.as_str())],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["github"]["state"], "ok", "{v}");
+    let body2: Value = serde_json::from_str(&std::fs::read_to_string(&cache).unwrap()).unwrap();
+    assert_eq!(body2["slugs"], json!(["acme/widgets"]), "{body2}");
+    assert!(body2["repos"]["acme/widgets"]["prs"].is_array(), "{body2}");
 }

@@ -66,6 +66,12 @@ export default function App() {
     history.replaceState(null, "", location.pathname + (s ? `?${s}` : ""));
   }, [project, openId, filters]);
 
+  // The tab readable inside refresh's stable callback — the overview
+  // payload costs a daemon probe + gh cache read, so it only fetches
+  // while the tab is on screen.
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
     api.meta().then(setMeta).catch(() => setMeta(null));
@@ -81,7 +87,9 @@ export default function App() {
       })
       .catch((e) => setFailed(String(e.message ?? e)));
     api.agents().then(setAgents).catch(() => setAgents(null));
-    api.overview().then(setOverview).catch(() => setOverview(null));
+    if (tabRef.current === "overview") {
+      api.overview().then(setOverview).catch(() => setOverview(null));
+    }
     if (openId) {
       api
         .issue(openId)
@@ -89,6 +97,13 @@ export default function App() {
         .catch(() => {});
     }
   }, [openId]);
+
+  // And whenever it becomes the visible tab.
+  useEffect(() => {
+    if (tab === "overview") {
+      api.overview().then(setOverview).catch(() => setOverview(null));
+    }
+  }, [tab]);
 
   useEffect(refresh, [refresh]);
 

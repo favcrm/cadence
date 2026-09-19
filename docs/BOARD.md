@@ -639,24 +639,27 @@ payload at read time — nothing is stored; `cadence overview [--json]
 
 | Rank | Kind | Command |
 |---|---|---|
-| 10 | `merge` — open PR with `qa-verdict=success` and green checks | `gh pr merge <n> --repo <slug> --squash --admin` |
-| 20 | `approval` — a brokered permission request is open | `cadence agent respond <a> --request <h> --decision accept` |
+| 10 | `merge` — open PR with `qa-verdict=success` and green checks | `gh pr merge <n> --repo <slug> --squash --admin --match-head-commit <sha>` |
+| 20 | `approval` — a brokered permission request is open | `cadence agent respond <a> --request <h> --decision accept` (provider input requests: `--answers-file <f>`) |
 | 30 | `fenced` — agent in `attention` | `cadence agent unfence <a>` |
 | 40 | `stalled` — turn silent past the fence threshold | `cadence agent show <a>` |
 | 50 | `drift` — merged commits not running while every pane is idle | `cadence daemon restart --when-idle --ui` |
 | 60 | `pr_no_verdict` — open PR with no `qa-verdict` status | `gh pr view <n> --repo <slug>` |
-| 70 | `review_no_pr` — issue in `review` with no open `pr` ref | `cadence issue show <id>` |
-| 80 | `blocked_ready` — every `blocked_by` target is `done` | `cadence issue set <id> status ready` |
+| 70 | `review_no_pr` — issue in `review` with no open `pr` ref and no `cadence/<id>-…` PR branch | `cadence issue show <id>` |
+| 80 | `blocked_ready` — every `blocked_by` target is `done` | `cadence issue set <id> status=ready` |
 | 90 | `ci_red` — default-branch commit status failing | `gh run list --repo <slug>` |
 | 100 | `inbox_unread` — unread messages on an `inbox` endpoint | `cadence inbox <a>` |
 | 110 | `tracker_behind` — tracker repo behind `@{upstream}` | `cadence issue sync` |
 
 GitHub data (open PRs, default-branch CI) comes from `gh` behind a
-60-second cache in the state dir (`overview-gh.json`); an outage
-degrades to `github.state: "unavailable"` — the rows disappear, the
-screen still renders. Daemon-dependent rows (approvals, fenced,
-stalled, inbox, drift) vanish when the socket is down, reported as
-`daemon.reachable: false`.
+60-second cache in the state dir (`overview-gh.json`, keyed by the
+slug set, written temp-then-rename); an outage serves the last good
+body as `github.state: "stale"` — or `"unavailable"` when there is no
+good body — and the screen still renders. Daemon-dependent rows
+(approvals, fenced, stalled, inbox, drift) vanish when the socket is
+down, reported as `daemon.reachable: false`. Reachability is the
+`health` RPC — a daemon that predates `daemon_info` stays reachable
+(its agent rows appear) while drift reports the build as unknown.
 
 **Deploy drift** — the daemon reports its `build_commit` via the
 `daemon_info` RPC (`build.rs` compiles `CADENCE_BUILD_COMMIT`/

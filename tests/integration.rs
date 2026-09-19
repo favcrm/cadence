@@ -14287,6 +14287,11 @@ fn overview_drift_reports_commits_after_build() {
     if env!("CADENCE_BUILD_REMOTE") == "unknown" || env!("CADENCE_BUILD_COMMIT") == "unknown" {
         return;
     }
+    // The build root can vanish between build and test (a removed
+    // worktree) — skip rather than fail on the missing clone source.
+    if !Path::new(env!("CADENCE_BUILD_ROOT")).join(".git").exists() {
+        return;
+    }
     let d = TestDaemon::start();
     let home = TempDir::new().unwrap();
     let pm = TempDir::new().unwrap();

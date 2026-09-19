@@ -157,6 +157,8 @@ export interface Drift {
   count?: number;
   commits?: { subject: string; pr?: number | null }[];
   reason?: string;
+  /** Present when drift exists but the restart row is held back. */
+  held?: string;
 }
 
 export interface OverviewProject {
@@ -170,8 +172,8 @@ export interface Overview {
   needs_me: NeedsMe[];
   drift: Drift;
   projects: OverviewProject[];
-  github: { state: "ok" | "cached" | "unavailable"; error?: string | null; at?: number };
-  daemon: { reachable: boolean; build_commit?: string; build_time?: string; started_at?: number };
+  github: { state: "ok" | "cached" | "stale" | "unavailable"; error?: string | null; at?: number };
+  daemon: { reachable: boolean; build_commit?: string; build_time?: string; started_at?: number; info?: string };
   generated_at: number;
 }
 

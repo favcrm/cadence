@@ -114,6 +114,53 @@ fn verdict_state(rollup: &[Value]) -> Option<String> {
     None
 }
 
+/// Command templates for needs-me rows — every `cadence …` shape the
+/// screen can emit. The Cli-parse test in main.rs runs each through
+/// `Cli::try_parse_from`, so a row can never carry a command the CLI
+/// rejects.
+pub fn cmd_agent_unfence(alias: &str) -> String {
+    format!("cadence agent unfence {alias}")
+}
+
+pub fn cmd_agent_show(alias: &str) -> String {
+    format!("cadence agent show {alias}")
+}
+
+pub fn cmd_inbox(alias: &str) -> String {
+    format!("cadence inbox {alias}")
+}
+
+/// The respond command for a pending request, by request method:
+/// provider input requests want an answers file, the approval shapes
+/// (provider `*requestApproval`, `session/request_permission`, and
+/// brokered `cadence/*`) take a decision, and anything else gets the
+/// inspect command — the daemon rejects a respond it cannot map.
+pub fn cmd_agent_respond(alias: &str, handle: &str, method: &str) -> String {
+    if method == "item/tool/requestUserInput" {
+        format!(
+            "cadence agent respond {alias} --request {handle} --answers-file answers-{handle}.json"
+        )
+    } else if method.starts_with("cadence/")
+        || method.ends_with("requestApproval")
+        || method == "session/request_permission"
+    {
+        format!("cadence agent respond {alias} --request {handle} --decision accept")
+    } else {
+        format!("cadence agent requests {alias}")
+    }
+}
+
+pub fn cmd_issue_show(id: &str) -> String {
+    format!("cadence issue show {id}")
+}
+
+pub fn cmd_issue_set_ready(id: &str) -> String {
+    format!("cadence issue set {id} status=ready")
+}
+
+pub const CMD_ISSUE_SYNC: &str = "cadence issue sync";
+pub const CMD_RESTART_WHEN_IDLE: &str = "cadence daemon restart --when-idle --ui";
+
 /// A needs-me row before the urgency sort.
 struct Item {
     rank: u8,
@@ -281,23 +328,64 @@ fn cache_file(state_dir: &Path) -> PathBuf {
     state_dir.join("overview-gh.json")
 }
 
+/// The cache body on disk: the slug set the rows were fetched for
+/// plus the repo payloads. A body only serves a request for the same
+/// slug set — a tracker with no GitHub remotes must not blank the
+/// board's rows, and a different tracker must not inherit them.
+struct GhCache {
+    at: i64,
+    slugs: Vec<String>,
+    repos: HashMap<String, Value>,
+}
+
+fn read_cache(file: &Path) -> Option<GhCache> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let cached: Value = serde_json::from_str(&text).ok()?;
+    let at = cached["at"].as_i64()?;
+    let slugs = cached["slugs"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let repos = cached["repos"]
+        .as_object()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    Some(GhCache { at, slugs, repos })
+}
+
+/// Temp-write then rename — a crashed reader never sees half a body.
+fn write_cache(file: &Path, slugs: &[String], repos: &HashMap<String, Value>, at: i64) {
+    let tmp = file.with_extension("tmp");
+    let body = serde_json::to_string(&json!({
+        "at": at, "slugs": slugs, "repos": repos,
+    }))
+    .unwrap_or_default();
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, file);
+    }
+}
+
 /// The GitHub block, 60 s-cached under the state dir. Returns the
-/// repos map plus `{state: ok|cached|unavailable, error?}` — a `gh`
-/// failure degrades to an empty map, never an error for the screen.
+/// repos map plus `{state: ok|cached|stale|unavailable, error?}` —
+/// `stale` serves the last good body through a `gh` outage, and the
+/// screen narrows instead of failing either way.
 fn github(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Value>, Value) {
     let file = cache_file(state_dir);
     let now = now_epoch();
-    if let Ok(text) = std::fs::read_to_string(&file) {
-        if let Ok(cached) = serde_json::from_str::<Value>(&text) {
-            let at = cached["at"].as_i64().unwrap_or(0);
-            if now - at < GH_CACHE_SECS {
-                let repos = cached["repos"]
-                    .as_object()
-                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default();
-                return (repos, json!({"state": "cached", "at": at}));
-            }
+    let cached = read_cache(&file);
+    if let Some(c) = &cached {
+        if now - c.at < GH_CACHE_SECS && c.slugs == slugs {
+            return (c.repos.clone(), json!({"state": "cached", "at": c.at}));
         }
+    }
+    if slugs.is_empty() {
+        // Nothing to fetch — and nothing to write: an empty slug set
+        // must never stamp over a good cache.
+        return (HashMap::new(), json!({"state": "ok"}));
     }
     let mut repos = HashMap::new();
     let mut first_err = None;
@@ -313,17 +401,38 @@ fn github(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Value>, Value)
             }
         }
     }
-    let state = if repos.is_empty() && !slugs.is_empty() {
-        "unavailable"
-    } else {
-        "ok"
-    };
+    if repos.is_empty() {
+        // Every call failed: keep the last good rows for this slug
+        // set, untimed — better stale rows than blank ones.
+        let stale: HashMap<String, Value> = cached
+            .map(|c| {
+                c.repos
+                    .into_iter()
+                    .filter(|(k, _)| slugs.contains(k))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let state = if stale.is_empty() {
+            "unavailable"
+        } else {
+            "stale"
+        };
+        return (stale, json!({"state": state, "error": first_err}));
+    }
+    // Partial failure: stale rows fill the missing slugs when the
+    // cache covered them, so one flaky repo can't blank its PRs.
+    if let Some(c) = cached {
+        for slug in slugs {
+            if !repos.contains_key(slug) {
+                if let Some(v) = c.repos.get(slug) {
+                    repos.insert(slug.clone(), v.clone());
+                }
+            }
+        }
+    }
     let _ = std::fs::create_dir_all(state_dir);
-    let _ = std::fs::write(
-        &file,
-        serde_json::to_string(&json!({"at": now, "repos": repos})).unwrap_or_default(),
-    );
-    (repos, json!({"state": state, "error": first_err}))
+    write_cache(&file, slugs, &repos, now);
+    (repos, json!({"state": "ok", "error": first_err}))
 }
 
 /// The tracker project matching the repo this binary was built from:
@@ -378,13 +487,19 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
     let mut needs: Vec<Item> = Vec::new();
 
     // ---- daemon: agents, approvals, drift identity ----
+    // Reachability comes from `health` — a pre-daemon_info daemon
+    // answers it, so an old build never reads as "unreachable" while
+    // `agent list` works. `daemon_info` only carries the build id.
+    let daemon_reachable = client::rpc(state_dir, "health", json!({})).is_ok();
     let info = client::rpc(state_dir, "daemon_info", json!({})).ok();
-    let daemon_reachable = info.is_some();
     let agents = client::rpc(state_dir, "agent_list", json!({}))
         .ok()
         .and_then(|v| v["agents"].as_array().cloned())
         .unwrap_or_default();
     let mut panes_idle = daemon_reachable;
+    // An old daemon without `agent_probe` cannot confirm a pane is
+    // idle — the drift row must say so instead of vanishing quietly.
+    let mut probes_unknown = false;
     for a in &agents {
         let alias = a["alias"].as_str().unwrap_or_default();
         let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
@@ -399,7 +514,7 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
                 age,
                 "",
                 None,
-                &format!("cadence agent unfence {alias}"),
+                &cmd_agent_unfence(alias),
             ));
         }
         if a["stalled"].as_bool().unwrap_or(false) {
@@ -410,7 +525,7 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
                 a["silent_secs"].as_f64().unwrap_or(age as f64) as i64,
                 "",
                 None,
-                &format!("cadence agent show {alias}"),
+                &cmd_agent_show(alias),
             ));
         }
         if a["provider"].as_str() == Some(registry::INBOX) && queued > 0 {
@@ -421,21 +536,26 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
                 age,
                 "",
                 None,
-                &format!("cadence inbox {alias}"),
+                &cmd_inbox(alias),
             ));
         }
         if let Ok(reqs) = client::rpc(state_dir, "agent_requests", json!({"alias": alias})) {
             for req in reqs["requests"].as_array().cloned().unwrap_or_default() {
                 let handle = req["request"].as_str().unwrap_or_default();
                 let method = req["method"].as_str().unwrap_or("request");
+                let what = if method == "item/tool/requestUserInput" {
+                    "input request"
+                } else {
+                    "approval"
+                };
                 needs.push(item(
                     20,
                     "approval",
-                    &format!("{method} approval for {alias}"),
+                    &format!("{method} {what} for {alias}"),
                     age,
                     "",
                     None,
-                    &format!("cadence agent respond {alias} --request {handle} --decision accept"),
+                    &cmd_agent_respond(alias, handle, method),
                 ));
             }
         }
@@ -455,18 +575,52 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
         if busy_turn {
             panes_idle = false;
         } else if a["endpoint_kind"].as_str() == Some("pty") && a["endpoint"].is_string() {
-            let idle = client::rpc(state_dir, "agent_probe", json!({"alias": alias}))
-                .ok()
-                .and_then(|p| p["idle"].as_bool())
-                .unwrap_or(false);
-            if !idle {
-                panes_idle = false;
+            match client::rpc(state_dir, "agent_probe", json!({"alias": alias})) {
+                Ok(p) if p["idle"].as_bool().unwrap_or(false) => {}
+                Ok(_) => panes_idle = false,
+                // "Unknown method" — a daemon that predates the RPC;
+                // any other failure reads as busy, conservatively.
+                Err(e) if e.to_string().contains("Unknown method") => probes_unknown = true,
+                Err(_) => panes_idle = false,
             }
         }
     }
 
-    // ---- tracker ----
+    // ---- tracker + GitHub ----
+    // The GitHub read happens first: the tracker's review rows need
+    // the open-PR list for the branch-name match (`refs` alone misses
+    // PRs nobody linked).
     let pm = issue::Pm::at(pm_dir).ok();
+    let mut slugs = Vec::new();
+    let mut slug_project: HashMap<String, String> = HashMap::new();
+    if let Some(pm) = &pm {
+        for p in project::list(&pm.dir).unwrap_or_default() {
+            for r in &p.repos {
+                if let Some(remote) = &r.remote {
+                    let norm = project::normalize_remote(remote);
+                    if let Some(slug) = norm.strip_prefix("github.com/") {
+                        let slug = slug.to_string();
+                        slug_project.insert(slug.clone(), p.key.clone());
+                        slugs.push(slug);
+                    }
+                }
+            }
+        }
+    }
+    slugs.sort();
+    slugs.dedup();
+    let (gh_repos, gh_state) = github(state_dir, &slugs);
+    // Lowercased headRefName of every open PR — an issue in review
+    // counts as "has a PR" when a `cadence/<id-lowercase>-…` branch is
+    // open, even without an explicit `pr` ref.
+    let mut open_pr_branches: Vec<String> = Vec::new();
+    for data in gh_repos.values() {
+        for pr in data["prs"].as_array().cloned().unwrap_or_default() {
+            if let Some(head) = pr["headRefName"].as_str() {
+                open_pr_branches.push(head.to_lowercase());
+            }
+        }
+    }
     let mut projects_out = Vec::new();
     if let Some(pm) = &pm {
         let issues = board::load_all(&pm.dir, None).unwrap_or_default();
@@ -481,12 +635,16 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
             let age = parse_iso(&v.issue.front.created)
                 .map(|c| now - c)
                 .unwrap_or(0);
+            let branch_prefix = format!("cadence/{}-", id.to_lowercase());
             let open_pr = v
                 .issue
                 .front
                 .refs
                 .iter()
-                .any(|r| r.kind == "pr" && r.closed != Some(true));
+                .any(|r| r.kind == "pr" && r.closed != Some(true))
+                || open_pr_branches
+                    .iter()
+                    .any(|b| b.starts_with(&branch_prefix));
             if v.status == "review" && !open_pr {
                 needs.push(item(
                     70,
@@ -495,7 +653,7 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
                     age,
                     project,
                     None,
-                    &format!("cadence issue show {id}"),
+                    &cmd_issue_show(id),
                 ));
             }
             let unblocked = !v.issue.front.blocked_by.is_empty()
@@ -512,7 +670,7 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
                     age,
                     project,
                     None,
-                    &format!("cadence issue set {id} status ready"),
+                    &cmd_issue_set_ready(id),
                 ));
             }
         }
@@ -559,33 +717,14 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
                         0,
                         "",
                         None,
-                        "cadence issue sync",
+                        CMD_ISSUE_SYNC,
                     ));
                 }
             }
         }
     }
 
-    // ---- GitHub: open PRs + default-branch CI, 60 s cache ----
-    let mut slugs = Vec::new();
-    let mut slug_project: HashMap<String, String> = HashMap::new();
-    if let Some(pm) = &pm {
-        for p in project::list(&pm.dir).unwrap_or_default() {
-            for r in &p.repos {
-                if let Some(remote) = &r.remote {
-                    let norm = project::normalize_remote(remote);
-                    if let Some(slug) = norm.strip_prefix("github.com/") {
-                        let slug = slug.to_string();
-                        slug_project.insert(slug.clone(), p.key.clone());
-                        slugs.push(slug);
-                    }
-                }
-            }
-        }
-    }
-    slugs.sort();
-    slugs.dedup();
-    let (gh_repos, gh_state) = github(state_dir, &slugs);
+    // ---- GitHub rows: merge-ready, verdict-less, red CI ----
     for (slug, data) in &gh_repos {
         let project = slug_project.get(slug).cloned().unwrap_or_default();
         for pr in data["prs"].as_array().cloned().unwrap_or_default() {
@@ -602,15 +741,23 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
                 .map(|u| now - u)
                 .unwrap_or(0);
             match verdict_state(&rollup).as_deref() {
-                Some("SUCCESS") if checks_green(&rollup) => needs.push(item(
-                    10,
-                    "merge",
-                    &format!("PR #{n} {title} — verdict pass, checks green"),
-                    age,
-                    &project,
-                    url.as_deref(),
-                    &format!("gh pr merge {n} --repo {slug} --squash --admin"),
-                )),
+                Some("SUCCESS") if checks_green(&rollup) => {
+                    // The verdict binds this head — a push after it
+                    // makes the copied command refuse instead of
+                    // merging an unreviewed head.
+                    let head = pr["headRefOid"].as_str().unwrap_or("");
+                    needs.push(item(
+                        10,
+                        "merge",
+                        &format!("PR #{n} {title} — verdict pass, checks green"),
+                        age,
+                        &project,
+                        url.as_deref(),
+                        &format!(
+                            "gh pr merge {n} --repo {slug} --squash --admin --match-head-commit {head}"
+                        ),
+                    ));
+                }
                 Some("SUCCESS") | Some("FAILURE") | Some("ERROR") => {}
                 _ => needs.push(item(
                     60,
@@ -641,8 +788,15 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
         .as_ref()
         .map(|pm| project::list(&pm.dir).unwrap_or_default())
         .unwrap_or_default();
-    let drift = if !daemon_reachable {
+    let mut drift = if !daemon_reachable {
         json!({"matched": false, "reason": "daemon unreachable — cannot tell"})
+    } else if info.is_none() {
+        // Reachable but predates `daemon_info` — the build commit is
+        // unreadable, so drift is unknowable, never zero.
+        json!({
+            "matched": false,
+            "reason": "daemon build unknown (daemon predates daemon_info) — restart to enable drift",
+        })
     } else {
         match build_repo_match(&projects) {
             None => json!({
@@ -662,28 +816,39 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
             }
         }
     };
-    if drift["known"].as_bool().unwrap_or(false)
-        && drift["count"].as_i64().unwrap_or(0) > 0
-        && panes_idle
-    {
-        let n = drift["count"].as_i64().unwrap_or(0);
-        needs.push(item(
-            50,
-            "drift",
-            &format!("{n} merged commit(s) not running — all panes idle"),
-            0,
-            drift["project"].as_str().unwrap_or(""),
-            None,
-            "cadence daemon restart --when-idle --ui",
-        ));
+    if drift["known"].as_bool().unwrap_or(false) && drift["count"].as_i64().unwrap_or(0) > 0 {
+        if panes_idle {
+            let n = drift["count"].as_i64().unwrap_or(0);
+            needs.push(item(
+                50,
+                "drift",
+                &format!("{n} merged commit(s) not running — all panes idle"),
+                0,
+                drift["project"].as_str().unwrap_or(""),
+                None,
+                CMD_RESTART_WHEN_IDLE,
+            ));
+        } else {
+            // Held back, but say why — a busy pane is different from
+            // a daemon that cannot answer `agent_probe` at all.
+            drift["held"] = json!(if probes_unknown {
+                "cannot tell whether panes are idle — daemon predates agent_probe"
+            } else {
+                "a pane is busy — restart only when idle"
+            });
+        }
     }
 
     sort_needs(&mut needs);
     let daemon = match info {
         Some(mut i) => {
-            i["reachable"] = json!(true);
+            i["reachable"] = json!(daemon_reachable);
             i
         }
+        None if daemon_reachable => json!({
+            "reachable": true,
+            "info": "daemon predates daemon_info — build identity unreadable",
+        }),
         None => json!({"reachable": false}),
     };
     json!({

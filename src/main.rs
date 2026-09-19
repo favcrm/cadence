@@ -1896,8 +1896,9 @@ fn run_status(
             return Ok(0);
         };
         std::thread::sleep(Duration::from_secs(secs));
-        if tty {
+        if tty && !json_out {
             // In-place refresh — a watch is one screen, not a scroll.
+            // JSON output must stay a clean stream of documents.
             print!("\x1b[2J\x1b[H");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
@@ -1922,7 +1923,7 @@ fn run_overview(state_dir: &Path, json_out: bool, watch: Option<u64>) -> Result<
             return Ok(0);
         };
         std::thread::sleep(Duration::from_secs(secs));
-        if tty {
+        if tty && !json_out {
             print!("\x1b[2J\x1b[H");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
@@ -5579,5 +5580,94 @@ mod tests {
         assert_eq!(parse_duration("1d").unwrap(), 86400.0);
         assert!(parse_duration("bogus").is_err());
         assert!(parse_duration("-1h").is_err());
+    }
+
+    /// Every `cadence …` command the overview can emit must parse —
+    /// a row carrying a command the CLI rejects is worse than no row.
+    #[test]
+    fn overview_commands_all_parse() {
+        use cadence_agent::issue::{self, write};
+        use cadence_agent::overview as ov;
+
+        let assert_parses = |cmd: &str| {
+            let argv = shlex::split(cmd).unwrap_or_else(|| panic!("'{cmd}' does not split"));
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("'{cmd}' does not parse: {e}"));
+        };
+
+        // Every command template, with realistic substitutions.
+        for cmd in [
+            ov::cmd_agent_unfence("w1"),
+            ov::cmd_agent_show("w1"),
+            ov::cmd_inbox("pm"),
+            ov::cmd_agent_respond("w1", "abc123", "cadence/approval"),
+            ov::cmd_agent_respond("w1", "abc123", "item/commandExecution/requestApproval"),
+            ov::cmd_agent_respond("w1", "abc123", "item/tool/requestUserInput"),
+            ov::cmd_agent_respond("w1", "abc123", "session/request_permission"),
+            ov::cmd_agent_respond("w1", "abc123", "totally/unknownMethod"),
+            ov::cmd_issue_show("CAD-3"),
+            ov::cmd_issue_set_ready("CAD-5"),
+            ov::CMD_ISSUE_SYNC.to_string(),
+            ov::CMD_RESTART_WHEN_IDLE.to_string(),
+        ] {
+            assert_parses(&cmd);
+        }
+
+        // Rows emitted against a real tracker parse with real ids.
+        let dir = tempfile::tempdir().unwrap();
+        let pm_dir = dir.path().join("pm");
+        let pm = issue::Pm::init(&pm_dir).unwrap();
+        write::project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
+        write::new_issue(
+            &pm,
+            dir.path(),
+            Some("cadence"),
+            "blocker",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            "t",
+        )
+        .unwrap();
+        write::new_issue(
+            &pm,
+            dir.path(),
+            Some("cadence"),
+            "blocked work",
+            None,
+            None,
+            &["CAD-1".to_string()],
+            None,
+            None,
+            &[],
+            None,
+            "t",
+        )
+        .unwrap();
+        write::set_fields(
+            &pm,
+            &["CAD-1".to_string()],
+            &["status=done".to_string()],
+            "t",
+        )
+        .unwrap();
+        let view = ov::overview(&dir.path().join("state"), &pm_dir);
+        let emitted: Vec<String> = view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["command"].as_str().map(str::to_string))
+            .filter(|c| c.starts_with("cadence "))
+            .collect();
+        assert!(
+            emitted.iter().any(|c| c.contains("status=ready")),
+            "{emitted:?}"
+        );
+        for cmd in emitted {
+            assert_parses(&cmd);
+        }
     }
 }
