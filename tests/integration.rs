@@ -3728,7 +3728,11 @@ entry = {"pid": pid, "sessionId": sid, "cwd": os.getcwd(),
          "procStart": proc_start, "kind": "interactive"}
 if os.environ.get("MOCK_CLAUDE_SWAP"):
     entry["sessionId"] = "swapped-" + sid
-open(os.path.join(sessions, "%d.json" % pid), "w").write(json.dumps(entry))
+# MOCK_CLAUDE_NO_REGISTRY keeps the pane alive but never publishes the
+# session — the adapter's open wait then runs to its deadline, the
+# transient-proof-timeout shape a Claude resume must survive.
+if not os.environ.get("MOCK_CLAUDE_NO_REGISTRY"):
+    open(os.path.join(sessions, "%d.json" % pid), "w").write(json.dumps(entry))
 # Record the pane env the adapter exported via tmux -e.
 _env_tmp = os.environ["FAKE_PANE"] + ".env.tmp"
 open(_env_tmp, "w").write(
@@ -3843,6 +3847,7 @@ impl Drop for MockClaudeTui {
         test_env().remove("CADENCE_CLAUDE_TUI_COMMAND");
         test_env().remove("CADENCE_CLAUDE_SESSIONS");
         std::env::remove_var("MOCK_CLAUDE_SWAP");
+        std::env::remove_var("MOCK_CLAUDE_NO_REGISTRY");
         std::env::remove_var("MOCK_TMUX_STATE");
     }
 }
@@ -3884,6 +3889,10 @@ sid = sys.argv[sys.argv.index("--resume") + 1] if "--resume" in sys.argv \
     else "missing-resume"
 if os.environ.get("MOCK_CURSOR_SWAP"):
     sid = "swapped-" + sid
+# A chat named by MOCK_CURSOR_DIE_ON is unresumable — the real TUI
+# exits on a deleted/foreign chat, so the mock does too.
+if sid == os.environ.get("MOCK_CURSOR_DIE_ON"):
+    sys.exit(1)
 chat_dir = os.path.join(chats, "mockhash", sid)
 os.makedirs(chat_dir, exist_ok=True)
 # The real TUI holds an fd on the chat's store.db for its whole life —
@@ -3935,12 +3944,25 @@ struct MockCursorTui {
     _guard: std::sync::MutexGuard<'static, ()>,
     dir: PathBuf,
     chats: PathBuf,
+    /// The owning daemon's state dir, when the mock was installed
+    /// through `TestDaemon::mock_cursor_tui`. Drop shuts the daemon
+    /// down BEFORE clearing the env overrides: an in-process daemon
+    /// that outlives the mock could still rebuild a profile in its
+    /// teardown window, and a profile built without
+    /// `CADENCE_CURSOR_CHATS` resolves the real `~/.cursor` — scans
+    /// the user's real chats, and would merge `Shell(cadence)` into
+    /// the real `cli-config.json`.
+    state: Option<PathBuf>,
 }
 
 /// Install the mock tmux/cursor pair — the same private-tmux harness
 /// as `install_mock_devin`, pointing the adapter at the cursor
 /// profile's env overrides instead.
 fn install_mock_cursor_tui(dir: &Path) -> MockCursorTui {
+    install_mock_cursor_tui_inner(dir, None)
+}
+
+fn install_mock_cursor_tui_inner(dir: &Path, state: Option<PathBuf>) -> MockCursorTui {
     let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let chats = dir.join("cursor-chats");
     let tmux_state = dir.join("tmux-state");
@@ -3976,18 +3998,21 @@ fn install_mock_cursor_tui(dir: &Path) -> MockCursorTui {
         ),
     );
     test_env().set("CADENCE_CURSOR_CHATS", chats.display().to_string());
-    // A swap set by an earlier test must not leak into this install.
+    // A swap/die-on set by an earlier test must not leak into this
+    // install.
     std::env::remove_var("MOCK_CURSOR_SWAP");
+    std::env::remove_var("MOCK_CURSOR_DIE_ON");
     MockCursorTui {
         _guard: guard,
         dir: dir.to_path_buf(),
         chats,
+        state,
     }
 }
 
 impl TestDaemon {
     fn mock_cursor_tui(&self) -> MockCursorTui {
-        install_mock_cursor_tui(self.dir.path())
+        install_mock_cursor_tui_inner(self.dir.path(), Some(self.state.clone()))
     }
 
     /// Register a pty agent on the cursor profile.
@@ -4013,11 +4038,25 @@ impl TestDaemon {
 
 impl Drop for MockCursorTui {
     fn drop(&mut self) {
+        // The daemon goes first: while it lives, a rebuilt profile
+        // must still see the overrides. `TestDaemon::drop` re-runs
+        // shutdown idempotently and only joins the thread.
+        if let Some(state) = &self.state {
+            let _ = client::rpc(state, "shutdown", json!({}));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while client::rpc(state, "health", json!({})).is_ok() {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
         kill_mock_panes(&self.dir);
         test_env().remove("CADENCE_TMUX_COMMAND");
         test_env().remove("CADENCE_CURSOR_COMMAND");
         test_env().remove("CADENCE_CURSOR_CHATS");
         std::env::remove_var("MOCK_CURSOR_SWAP");
+        std::env::remove_var("MOCK_CURSOR_DIE_ON");
         std::env::remove_var("MOCK_TMUX_STATE");
     }
 }
@@ -10446,6 +10485,149 @@ fn pty_cursor_session_mismatch_fences_closed() {
     let agent = d.wait_agent("cu", "attention", 20);
     let err = agent["error"].as_str().unwrap_or("");
     assert!(err.contains("changed owner fails closed"), "{err}");
+}
+
+/// A stored chat the TUI cannot resume (exits on it — the real CLI
+/// dies on a deleted chat) must not wedge the alias: the failed
+/// resume clears `params.session`, and the next open mints fresh.
+#[test]
+fn pty_cursor_unresumable_chat_clears_and_mints_fresh() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_cursor_tui();
+    std::env::set_var("MOCK_CURSOR_DIE_ON", "dead-chat");
+    d.register_cursor_pty("cu", json!({"session": "dead-chat"}));
+    let agent = d.wait_agent("cu", "attention", 20);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("pane exited during TUI startup"), "{err}");
+    // The failure is operator-visible until the next open: the error
+    // names the cleared id and says what happens next.
+    assert!(err.contains("'dead-chat'"), "{err}");
+    assert!(err.contains("was cleared"), "{err}");
+    let ev = d.wait_event("cu", "session_resume_failed", 5);
+    assert_eq!(ev["payload"]["session"], "dead-chat", "{ev}");
+    // The stored session is cleared — a resume attempt must not find
+    // the dead id again.
+    let show = d.rpc("agent_show", json!({"alias": "cu"})).unwrap();
+    assert!(
+        show["agent"]["params"]["session"].is_null(),
+        "session not cleared: {show}"
+    );
+    // `agent resume` mints a fresh chat — the alias unwedges instead
+    // of retrying the dead id forever.
+    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    let agent = d.wait_agent("cu", "idle", 20);
+    let native = agent["thread_id"].as_str().unwrap();
+    assert_ne!(native, "dead-chat");
+    let minted = d.wait_event("cu", "session_minted", 5);
+    assert_eq!(minted["payload"]["session"], native, "{minted}");
+}
+
+/// A chat that WAS proven once and then dies still unwedges: the
+/// clear drops `thread_id` alongside `params.session` — both feed the
+/// adapter's `desired_session`, so dropping only params would keep
+/// resuming the dead id through the thread fallback.
+#[test]
+fn pty_cursor_proven_chat_deleted_mints_fresh() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_cursor_tui();
+    d.register_cursor_pty("cu", json!({}));
+    let agent = d.wait_agent("cu", "idle", 20);
+    let proven = agent["thread_id"].as_str().unwrap().to_string();
+    // The proven chat is gone from the host: a TUI asked to resume it
+    // exits, the deleted-chat shape.
+    std::env::set_var("MOCK_CURSOR_DIE_ON", &proven);
+    d.rpc("agent_stop", json!({"alias": "cu"})).unwrap();
+    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    let agent = d.wait_agent("cu", "attention", 20);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("pane exited during TUI startup"), "{err}");
+    assert!(err.contains(&format!("'{proven}'")), "{err}");
+    let ev = d.wait_event("cu", "session_resume_failed", 5);
+    assert_eq!(ev["payload"]["session"], proven.as_str(), "{ev}");
+    let show = d.rpc("agent_show", json!({"alias": "cu"})).unwrap();
+    assert!(
+        show["agent"]["params"]["session"].is_null(),
+        "session not cleared: {show}"
+    );
+    assert!(
+        show["agent"]["thread_id"].is_null(),
+        "thread_id not cleared: {show}"
+    );
+    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    let agent = d.wait_agent("cu", "idle", 20);
+    let native = agent["thread_id"].as_str().unwrap();
+    assert_ne!(native, proven);
+}
+
+/// A foreign session on the host is never adopted: once the stored id
+/// is cleared, the next open mints a fresh chat and leaves the
+/// foreign-owned one alone.
+#[test]
+fn pty_cursor_cleared_session_leaves_foreign_chat() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    // A foreign live process holds "foreign-chat"'s store.db — the
+    // same proof shape as another cursor-agent TUI.
+    let held = mock.chats.join("mockhash").join("foreign-chat");
+    std::fs::create_dir_all(&held).unwrap();
+    let db = held.join("store.db");
+    std::fs::write(&db, "").unwrap();
+    let mut holder = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                "import time; f=open('{}','a'); time.sleep(60)",
+                db.display()
+            ),
+        ])
+        .spawn()
+        .unwrap();
+    std::env::set_var("MOCK_CURSOR_DIE_ON", "dead-chat");
+    d.register_cursor_pty("cu", json!({"session": "dead-chat"}));
+    d.wait_agent("cu", "attention", 20);
+    let show = d.rpc("agent_show", json!({"alias": "cu"})).unwrap();
+    assert!(
+        show["agent"]["params"]["session"].is_null(),
+        "session not cleared: {show}"
+    );
+    // The next open mints fresh — it neither resumes the dead id nor
+    // adopts the foreign chat.
+    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    let agent = d.wait_agent("cu", "idle", 20);
+    let native = agent["thread_id"].as_str().unwrap();
+    assert_ne!(native, "dead-chat");
+    assert_ne!(native, "foreign-chat");
+    holder.kill().unwrap();
+    let _ = holder.wait();
+}
+
+/// The unresumable-session escape is opt-in for disposable sessions
+/// only: a Claude TUI resume whose session proof times out keeps
+/// `params.session` and lands `attention` — an operator-supplied
+/// Claude session must never be dropped on a transient failure.
+#[test]
+fn pty_claude_resume_timeout_keeps_session() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude_tui();
+    // The pane stays alive but never publishes its session — the open
+    // wait runs to the claude profile's deadline.
+    std::env::set_var("MOCK_CLAUDE_NO_REGISTRY", "1");
+    d.register_claude_pty("cl", json!({"session": "claude-session-1"}));
+    let agent = d.wait_agent("cl", "attention", 60);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("timed out"), "{err}");
+    assert!(
+        d.events("cl")
+            .iter()
+            .all(|e| e["kind"].as_str() != Some("session_resume_failed")),
+        "session_resume_failed must not fire for a non-disposable profile"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "cl"})).unwrap();
+    assert_eq!(
+        show["agent"]["params"]["session"].as_str(),
+        Some("claude-session-1"),
+        "session must survive a transient proof timeout: {show}"
+    );
 }
 
 /// A pane that survives a daemon restart is re-adopted under the same

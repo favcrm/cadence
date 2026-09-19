@@ -575,6 +575,38 @@ impl ProviderAdapter for PtyAdapter {
         };
         let generation = Uuid::new_v4().simple().to_string();
 
+        // A stored session id means this open is a resume attempt, and
+        // some failures prove the stored id can never resume: the pane
+        // exits on the dead chat, or stays up but never acquires it.
+        // The event lets the daemon drop the stored id so the next
+        // open mints fresh — but only for profiles whose sessions are
+        // disposable (a transient proof failure must never drop an
+        // operator-supplied Claude/Devin session), and never on a
+        // mismatch, where the pane's session could be a foreign one
+        // the alias must keep refusing. Returns the reported id so the
+        // caller can name it in the failure it hands back.
+        let resume_failed = |desired: &Option<String>, reason: &Error| -> Option<String> {
+            if !self.profile.session_is_disposable() {
+                return None;
+            }
+            let session = desired.clone()?;
+            (self.hooks.on_event)(
+                "cadence/session_resume_failed",
+                serde_json::json!({"session": session, "reason": reason.to_string()}),
+            );
+            Some(session)
+        };
+        // The clear lands silently in `params` — the operator-visible
+        // copy is the returned error, which `agent.error` keeps until
+        // the next successful open.
+        let cleared_err = |e: Error, cleared: Option<String>| match cleared {
+            Some(old) => Error::provider(format!(
+                "{e} — stored session '{old}' was cleared; \
+                 the next open mints a fresh chat"
+            )),
+            None => e,
+        };
+
         let (native, pane_pid, attach) = if self.has_session(&session) {
             // Reattach: verify the pane still owns a native session.
             // When one was recorded it must match; a pane left by a
@@ -586,18 +618,39 @@ impl ProviderAdapter for PtyAdapter {
             // deadline the spawn path gets rather than fencing a live
             // pane on one observation.
             let pane_pid = self.pane_pid(&session)?;
-            let found = self.wait_owned_session(&session, pane_pid)?;
-            (
-                self.profile.resolve_session(desired.as_deref(), found)?,
-                pane_pid,
-                "adopted",
-            )
+            match self.wait_owned_session(&session, pane_pid) {
+                // The pane was already running — an exit mid-wait is a
+                // crash, not proof the stored chat is gone. The spawn
+                // arm re-runs the resume on the next open and reports
+                // a genuinely dead chat there.
+                Err(e) => return Err(e),
+                Ok(found) => {
+                    let found_any = found.is_some();
+                    match self.profile.resolve_session(desired.as_deref(), found) {
+                        Ok(native) => (native, pane_pid, "adopted"),
+                        Err(e) => {
+                            // found=None: the pane holds nothing for
+                            // the stored id — the resume never
+                            // materialized, the chat is gone. A
+                            // mismatch (found≠want) stays fail-closed
+                            // and never clears.
+                            let cleared = if found_any {
+                                None
+                            } else {
+                                resume_failed(&desired, &e)
+                            };
+                            return Err(cleared_err(e, cleared));
+                        }
+                    }
+                }
+            }
         } else {
             // Mint once: a profile with a prepare step mints its native
             // session id *before* the pane exists, and the event folds
             // it into `params.session` — a respawn after a failed launch
             // resumes the same id instead of abandoning a mint per
             // retry. `desired` is the adapter's copy for this open.
+            let resuming = desired.is_some();
             let desired = match desired {
                 Some(want) => Some(want),
                 None => {
@@ -646,18 +699,45 @@ impl ProviderAdapter for PtyAdapter {
             ])?;
             let pane_pid = self.pane_pid(&session)?;
             // Bound the wait for the TUI to acquire its native session.
-            let native = match self.wait_owned_session(&session, pane_pid)? {
-                Some(found) => self
-                    .profile
-                    .resolve_session(desired.as_deref(), Some(found))?,
-                None => {
-                    return Err(Error::provider(format!(
+            match self.wait_owned_session(&session, pane_pid) {
+                // The TUI exited on the chat it was told to resume —
+                // the stored id is dead; report it so the next open
+                // mints fresh. A freshly-minted id was never resumed,
+                // so mint failures never trigger the clear.
+                Err(e) => {
+                    let cleared = if resuming {
+                        resume_failed(&desired, &e)
+                    } else {
+                        None
+                    };
+                    return Err(cleared_err(e, cleared));
+                }
+                // The pane stayed up but never acquired the chat —
+                // the resume never materialized, the chat is gone.
+                Ok(None) => {
+                    let e = Error::provider(format!(
                         "timed out waiting for the {} TUI to acquire its session",
                         self.profile.name()
-                    )))
+                    ));
+                    let cleared = if resuming {
+                        resume_failed(&desired, &e)
+                    } else {
+                        None
+                    };
+                    return Err(cleared_err(e, cleared));
                 }
-            };
-            (native, pane_pid, "respawned")
+                Ok(Some(found)) => {
+                    match self
+                        .profile
+                        .resolve_session(desired.as_deref(), Some(found))
+                    {
+                        Ok(native) => (native, pane_pid, "respawned"),
+                        // A changed owner fails closed — never clears,
+                        // never adopts.
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
         };
 
         // Pane defaults for cadence-owned sessions, scoped to this

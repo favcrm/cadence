@@ -330,7 +330,19 @@ failed open resumes the same id rather than abandoning a chat per
 retry. The same three rules follow: a live foreign attachment to the
 wanted chat refuses takeover, a pane owning a different chat fails
 closed, and a dead pane relaunches with `cursor-agent --resume
-<stored>`.
+<stored>`; a pane holding a chat nobody recorded is refused, never
+adopted — the next open mints instead. Cursor chats are disposable
+ids, and only for cursor does a resume that provably cannot complete
+unwedge the alias: when the pane exits on the stored chat or stays up
+but never acquires it (a mismatch never counts — the pane's chat could
+be a foreign one), the adapter emits `cadence/session_resume_failed`
+and the daemon clears `params.session` and `thread_id` in one write —
+both feed `desired_session`, so dropping only params would resume the
+dead id through the thread fallback — so the next open mints a fresh
+chat. Other pty profiles opt out (`session_disposable`), and the
+daemon refuses the clear for them independently: an operator-supplied
+Claude/Devin session survives a transient proof timeout. A lost
+`set_params` on either arm records `session_persist_failed`.
 
 Cursor also has no per-launch allow flag for the worker's own
 `cadence` calls — where claude's argv carries
@@ -340,9 +352,12 @@ like `Shell(ls)`). At every launch the profile merges
 `Shell(cadence)` into that array idempotently: the file is parsed
 first, rewritten only when the entry is absent, a `.bak` of the
 original bytes is kept on modification, and an unparseable or
-non-array config refuses the launch rather than clobbering it. In
-every permission mode a worker's `cadence self`/`message result`
-then runs without an approval menu.
+non-array config refuses the launch rather than clobbering it. The
+rewrite is atomic — a same-directory `.cadence-tmp`, fsync, rename —
+and both the config and its `.bak` are created with the source
+file's mode, never born world-readable. In every permission mode a
+worker's `cadence self`/`message result` then runs without an
+approval menu.
 
 **Submission gates.** `run_turn` requires all of: pane alive,
 `pane_dead=0`, `pane_in_mode=0`, native ownership still held, and a
@@ -805,7 +820,8 @@ Kinds: `registered, queued, submitting, turn_started, turn_finished,
 provider_event, input_required, input_answered, input_resolved,
 request_opened, request_closed,
 result_routed, notice_routed, ready, ready_claimed, claim_used,
-gate_wait, submitted, session_minted,
+gate_wait, submitted, session_minted, session_resume_failed,
+session_persist_failed,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
 params_updated, reconciled, relaunch_skipped, attention,
 turn_stalled, turn_resumed, stop_requested`. `wait>0` long-polls
