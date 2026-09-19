@@ -64,7 +64,7 @@ cadence claude --tui            # interactive Claude in an owned tmux pane —
                                 #  resumes a native session
 cadence cursor                  # Cursor Agent TUI in an owned tmux pane —
                                 #  same pty rules; the chat id is minted via
-                                #  `cursor-agent create-chat`, -r <chat-id>
+                                #  `cursor-agent create-chat`, --resume <chat-id>
                                 #  resumes one (--model, --permission-mode
                                 #  auto-review|force / --bypass are stored
                                 #  and replayed on every launch). Launch also

@@ -1884,6 +1884,40 @@ impl Store {
         Ok(())
     }
 
+    /// Forget every remembered native-session handle in one write.
+    /// `params.session` AND `thread_id` both feed the adapter's
+    /// `desired_session`, so clearing only params would keep resuming
+    /// the dead id through the thread fallback. Called when a
+    /// disposable-session endpoint proves its stored id can never
+    /// resume; the next open mints a fresh session instead.
+    pub fn clear_native_session(&self, alias: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let agent = self.agent_in(&tx, alias)?;
+        let old = agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("session"))
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        let mut merged = agent.params.unwrap_or_else(|| json!({}));
+        if let Some(target) = merged.as_object_mut() {
+            target.remove("session");
+        }
+        tx.execute(
+            "UPDATE agents SET params=?,thread_id=NULL,updated=? WHERE alias=?",
+            params![merged.to_string(), now(), alias],
+        )?;
+        Self::event(
+            &tx,
+            alias,
+            "session_cleared",
+            json!({"session": old, "thread_id": agent.thread_id}),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Drain an inbox agent's queue: every `queued` message with
     /// `seq > after`, oldest first, is completed `via=inbox_read` in one
     /// transaction — including `reply_to` routing, so consuming a direct
