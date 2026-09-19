@@ -189,6 +189,33 @@ fn check_component(project: &project::Project, component: &str) -> Result<()> {
     Ok(())
 }
 
+/// The same rule for tags: well-formed, sorted, de-duplicated, capped —
+/// and, when the project declares a `tags:` list, drawn from it.
+fn check_tags(project: &project::Project, tags: &[String]) -> Result<Vec<String>> {
+    let tags = model::normalize_tags(tags)?;
+    if !project.tags.is_empty() {
+        if let Some(unknown) = tags.iter().find(|t| !project.tags.contains(t)) {
+            return Err(Error::rejected(format!(
+                "Unknown tag '{unknown}' — {} declares: {}",
+                project.key,
+                project.tags.join(", ")
+            )));
+        }
+    }
+    Ok(tags)
+}
+
+/// `a,b` → `[a, b]`; blanks between commas are dropped, so `tags=`
+/// clears.
+fn split_tags(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub(crate) fn save_front(dir: &Path, front: &Front, body: &str) -> Result<()> {
     atomic_write(&dir.join("issue.md"), &parse::render(front, body)?)
 }
@@ -201,9 +228,11 @@ pub fn project_add(
     prefix: &str,
     repos: &[String],
     components: &[String],
+    tags: &[String],
     owner: Option<&str>,
 ) -> Result<Value> {
     model::check_key(key)?;
+    let tags = model::normalize_tags(tags)?;
     let prefix = prefix.to_ascii_uppercase();
     if prefix.is_empty()
         || prefix.len() > 8
@@ -252,6 +281,7 @@ pub fn project_add(
         prefix,
         repos: repo_entries,
         components: components.to_vec(),
+        tags,
         default_owner: owner.map(str::to_string),
     };
     let dir = pm.dir.join(key);
@@ -296,6 +326,7 @@ pub fn new_issue(
     blocked_by: &[String],
     owner: Option<&str>,
     component: Option<&str>,
+    tags: &[String],
     explicit_id: Option<&str>,
     actor: &str,
 ) -> Result<Value> {
@@ -314,6 +345,7 @@ pub fn new_issue(
     if let Some(component) = component {
         check_component(&project, component)?;
     }
+    let tags = check_tags(&project, tags)?;
     let _lock = pm.lock()?;
     let id = match explicit_id {
         Some(id) => id.to_string(),
@@ -336,6 +368,7 @@ pub fn new_issue(
     // later dispatch; it is never stamped onto new issues.
     front.owner = owner.map(str::to_string);
     front.component = component.map(str::to_string);
+    front.tags = tags;
     front.blocked_by = blocked_by.to_vec();
     for dep in &front.blocked_by {
         model::check_id(dep)?;
@@ -441,16 +474,14 @@ fn check_parent(by_id: &HashMap<&str, &board::Issue>, this: &board::Issue) -> Re
     Ok(())
 }
 
-/// `issue set <ID> key=value…` — the writable frontmatter fields.
-pub fn set_fields(pm: &Pm, id: &str, pairs: &[String], actor: &str) -> Result<Value> {
-    if pairs.is_empty() {
-        return Err(Error::rejected(
-            "set needs key=value pairs — e.g. `cadence issue set CAD-16 status=doing`",
-        ));
-    }
-    let (project, dir) = issue_dir(pm, id)?;
-    let _lock = pm.lock()?;
-    let (mut front, body) = load_front(&dir)?;
+/// Apply `key=value` pairs to one front in memory; returns the
+/// `key=value` summary tokens. Nothing is written here, so a bulk edit
+/// can validate every issue before it touches a file.
+fn apply_pairs(
+    project: &project::Project,
+    front: &mut Front,
+    pairs: &[String],
+) -> Result<Vec<String>> {
     let mut changed = Vec::new();
     for kv in pairs {
         let (key, value) = kv
@@ -480,22 +511,136 @@ pub fn set_fields(pm: &Pm, id: &str, pairs: &[String], actor: &str) -> Result<Va
             "owner" => front.owner = (!value.is_empty()).then(|| value.to_string()),
             "component" => {
                 if !value.is_empty() {
-                    check_component(&project, value)?;
+                    check_component(project, value)?;
                 }
                 front.component = (!value.is_empty()).then(|| value.to_string());
+            }
+            "tags" => {
+                front.tags = check_tags(project, &split_tags(value))?;
+                changed.push(format!("tags={}", front.tags.join(",")));
+                continue;
             }
             _ => unreachable!(),
         }
         changed.push(format!("{key}={value}"));
     }
-    save_front(&dir, &front, &body)?;
-    commit(
+    Ok(changed)
+}
+
+/// One issue of a bulk edit, loaded and edited in memory.
+struct Staged {
+    id: String,
+    dir: PathBuf,
+    front: Front,
+    body: String,
+}
+
+/// Load every id (each once, in the order given) and run `edit` on its
+/// front; `edit` answers whether it changed anything, and unchanged
+/// issues drop out of the batch. Any unknown id or rejected edit fails
+/// the whole batch before a single file is written. Call under the PM
+/// lock.
+fn stage(
+    pm: &Pm,
+    ids: &[String],
+    mut edit: impl FnMut(&project::Project, &mut Front) -> Result<bool>,
+) -> Result<Vec<Staged>> {
+    let mut staged: Vec<Staged> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            continue;
+        }
+        let (project, dir) = issue_dir(pm, id)?;
+        let (mut front, body) = load_front(&dir)?;
+        let changed = edit(&project, &mut front).map_err(|e| match e {
+            Error::Rejected(m) if ids.len() > 1 => Error::rejected(format!("{id}: {m}")),
+            other => other,
+        })?;
+        if !changed {
+            continue;
+        }
+        staged.push(Staged {
+            id: id.clone(),
+            dir,
+            front,
+            body,
+        });
+    }
+    Ok(staged)
+}
+
+/// Write the staged fronts and make the one commit that names them all
+/// — subject `<ID>[, <ID>…]: <summary>`, one `Issue:` trailer per id.
+fn commit_staged(pm: &Pm, staged: &[Staged], summary: &str, actor: &str) -> Result<Vec<String>> {
+    for s in staged {
+        save_front(&s.dir, &s.front, &s.body)?;
+    }
+    let ids: Vec<&str> = staged.iter().map(|s| s.id.as_str()).collect();
+    commit(pm, &format!("{}: {summary}", ids.join(", ")), &ids, actor)?;
+    Ok(ids.iter().map(|i| i.to_string()).collect())
+}
+
+/// `issue set <ID>… key=value…` — the writable frontmatter fields, on
+/// one issue or several. All-or-nothing: every id and every pair is
+/// validated before any file changes, and the batch is one commit.
+pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Result<Value> {
+    if ids.is_empty() || pairs.is_empty() {
+        return Err(Error::rejected(
+            "set needs an id and key=value pairs — e.g. `cadence issue set CAD-16 status=doing`",
+        ));
+    }
+    let _lock = pm.lock()?;
+    let mut changed = Vec::new();
+    let staged = stage(pm, ids, |project, front| {
+        changed = apply_pairs(project, front, pairs)?;
+        Ok(true)
+    })?;
+    let ids = commit_staged(pm, &staged, &format!("set {}", changed.join(" ")), actor)?;
+    Ok(json!({"id": ids[0], "ids": ids, "set": changed, "committed": true}))
+}
+
+/// `issue tag <ID>… add|rm <tag>…` — add or remove tags on one issue or
+/// several, same all-or-nothing batch as `set`. Adding a tag an issue
+/// already has, or removing one it lacks, leaves that issue unchanged;
+/// a batch that changes nothing is refused.
+pub fn tag_edit(pm: &Pm, ids: &[String], add: bool, tags: &[String], actor: &str) -> Result<Value> {
+    let verb = if add { "add" } else { "rm" };
+    if ids.is_empty() || tags.is_empty() {
+        return Err(Error::rejected(
+            "tag needs ids, add|rm and tags — e.g. `cadence issue tag CAD-16 CAD-17 add ui`",
+        ));
+    }
+    let tags = model::normalize_tags(tags)?;
+    let _lock = pm.lock()?;
+    let staged = stage(pm, ids, |project, front| {
+        let before = front.tags.clone();
+        if add {
+            let mut all = before.clone();
+            all.extend(tags.iter().cloned());
+            front.tags = check_tags(project, &all)?;
+        } else {
+            front.tags.retain(|t| !tags.contains(t));
+        }
+        Ok(front.tags != before)
+    })?;
+    if staged.is_empty() {
+        return Err(Error::rejected(format!(
+            "tag {verb} {} changes nothing — `cadence issue show <ID>` lists tags",
+            tags.join(" ")
+        )));
+    }
+    let tagged: Vec<Value> = staged
+        .iter()
+        .map(|s| json!({"id": s.id, "tags": s.front.tags}))
+        .collect();
+    let ids = commit_staged(
         pm,
-        &format!("{id}: set {}", changed.join(" ")),
-        &[id],
+        &staged,
+        &format!("tag {verb} {}", tags.join(" ")),
         actor,
     )?;
-    Ok(json!({"id": id, "set": changed, "committed": true}))
+    Ok(json!({"ids": ids, "tag": verb, "tags": tags, "issues": tagged, "committed": true}))
 }
 
 /// The HTTP PATCH surface: typed fields instead of `key=value` pairs,
@@ -510,6 +655,8 @@ pub struct IssuePatch {
     pub component: Option<String>,
     pub title: Option<String>,
     pub body: Option<String>,
+    /// Replaces the tag list; `Some([])` clears it.
+    pub tags: Option<Vec<String>>,
 }
 
 pub fn patch_issue(
@@ -576,6 +723,10 @@ pub fn patch_issue(
         }
         front.component = (!v.is_empty()).then(|| v.clone());
         changed.push(format!("component={v}"));
+    }
+    if let Some(v) = &patch.tags {
+        front.tags = check_tags(&project, v)?;
+        changed.push(format!("tags={}", front.tags.join(",")));
     }
     if let Some(v) = &patch.body {
         body = v.clone();

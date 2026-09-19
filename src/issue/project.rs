@@ -23,6 +23,9 @@ pub struct Project {
     pub repos: Vec<Repo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<String>,
+    /// Declared tag vocabulary — empty accepts any well-formed tag.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_owner: Option<String>,
 }

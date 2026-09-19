@@ -104,6 +104,7 @@ export const api = {
     priority?: string;
     owner?: string;
     component?: string;
+    tags?: string[];
     parent?: string;
     blocked_by?: string[];
   }) => write("POST", "/api/issues", req),
@@ -117,6 +118,8 @@ export const api = {
       component?: string;
       title?: string;
       body?: string;
+      /** Replaces the tag list; `[]` clears it. */
+      tags?: string[];
     },
     ifRev?: string,
   ) => write("PATCH", `/api/issues/${id}`, { ...patch, if_rev: ifRev }),

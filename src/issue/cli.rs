@@ -40,6 +40,13 @@ pub enum IssueAction {
         /// Parent issue id (sub-issue; depth is two levels).
         #[arg(long)]
         parent: Option<String>,
+        /// The epic this issue belongs to — an alias of `--parent`.
+        #[arg(long, conflicts_with = "parent")]
+        epic: Option<String>,
+        /// A tag; repeatable. Checked against the project's `tags:`
+        /// list when it declares one.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
         /// blocked_by target; repeatable.
         #[arg(long = "blocked-by")]
         blocked_by: Vec<String>,
@@ -55,12 +62,30 @@ pub enum IssueAction {
         id: Option<String>,
     },
     /// List issues — a compact table on a TTY, `--json` for agents.
+    /// Filters combine (AND).
     Ls {
         #[arg(long)]
         project: Option<String>,
-        /// Filter by status (backlog ready doing review done dropped).
+        /// Filter by status (backlog ready doing review done dropped);
+        /// repeatable — any of them.
         #[arg(long)]
-        status: Option<String>,
+        status: Vec<String>,
+        /// Only issues carrying this tag; repeatable — all of them.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Only the children of this epic.
+        #[arg(long)]
+        epic: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        component: Option<String>,
+        /// P0..P3.
+        #[arg(long)]
+        priority: Option<String>,
+        /// Only open issues — not done, not dropped.
+        #[arg(long)]
+        open: bool,
         /// Only computed-ready leaves.
         #[arg(long)]
         ready: bool,
@@ -73,7 +98,7 @@ pub enum IssueAction {
     },
     /// `git log` for the issue folder, parsed: `sha`, `at`, `by`
     /// (the ` (actor)` suffix, else the commit author), `kind`
-    /// (`created|set|link|unlink|ref|comment|attach|other`), `summary`
+    /// (`created|set|tag|link|unlink|ref|comment|attach|other`), `summary`
     /// and a `fields` map for `set` entries. Read-only.
     Log {
         /// Issue id (CAD-16).
@@ -166,11 +191,26 @@ pub enum IssueAction {
         #[arg(long)]
         json: bool,
     },
-    /// Set writable fields: `status priority owner component title`.
+    /// Set writable fields: `status priority owner component title
+    /// tags`. Several ids make a bulk edit: one commit, and nothing is
+    /// written unless every id and pair is valid.
     Set {
-        id: String,
-        /// key=value pairs; empty value clears owner/component.
-        pairs: Vec<String>,
+        /// `<ID>… key=value…` — ids first; an empty value clears
+        /// owner/component/tags, `tags=a,b` replaces the tag list.
+        #[arg(required = true)]
+        args: Vec<String>,
+    },
+    /// Add or remove tags: `issue tag <ID>… add|rm <tag>…`. Bulk like
+    /// `set`: one commit, all-or-nothing.
+    Tag {
+        /// `<ID>… add|rm <tag>…`
+        #[arg(required = true)]
+        args: Vec<String>,
+    },
+    /// Epics — issues with children — and their progress.
+    Epic {
+        #[command(subcommand)]
+        action: EpicAction,
     },
     /// Add a link: `blocked_by|relates|parent|duplicate_of`.
     Link {
@@ -241,6 +281,24 @@ pub enum IssueAction {
 }
 
 #[derive(Subcommand)]
+pub enum EpicAction {
+    /// List epics with `total`, per-status counts, `done_ratio`,
+    /// `blocked` and the distinct owners of their children.
+    Ls {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One epic and its children: status, owner, priority, tags.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ProjectAction {
     /// Register a project.
     Add {
@@ -256,6 +314,10 @@ pub enum ProjectAction {
         /// A component label (repeatable).
         #[arg(long = "component")]
         components: Vec<String>,
+        /// A declared tag (repeatable) — with any declared, issues may
+        /// only carry tags from the list.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
         /// Default owner applied by `issue new`.
         #[arg(long)]
         owner: Option<String>,
@@ -307,11 +369,19 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 prefix,
                 repos,
                 components,
+                tags,
                 owner,
             } => {
                 let pm = open_pm()?;
-                let out =
-                    write::project_add(&pm, key, prefix, repos, components, owner.as_deref())?;
+                let out = write::project_add(
+                    &pm,
+                    key,
+                    prefix,
+                    repos,
+                    components,
+                    tags,
+                    owner.as_deref(),
+                )?;
                 print_json(&out);
                 Ok(0)
             }
@@ -322,6 +392,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     "projects": projects.iter().map(|p| json!({
                         "key": p.key, "prefix": p.prefix,
                         "components": p.components,
+                        "tags": p.tags,
                         "default_owner": p.default_owner,
                         "repos": p.repos.iter().map(|r| json!({
                             "path": r.path, "remote": r.remote,
@@ -336,6 +407,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             project,
             priority,
             parent,
+            epic,
+            tags,
             blocked_by,
             owner,
             component,
@@ -349,10 +422,11 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 project.as_deref(),
                 title,
                 priority.as_deref(),
-                parent.as_deref(),
+                parent.as_deref().or(epic.as_deref()),
                 blocked_by,
                 owner.as_deref(),
                 component.as_deref(),
+                tags,
                 id.as_deref(),
                 "",
             )?;
@@ -362,10 +436,26 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         IssueAction::Ls {
             project,
             status,
+            tags,
+            epic,
+            owner,
+            component,
+            priority,
+            open,
             ready,
             at,
             json: json_flag,
         } => {
+            let filter = board::Filter {
+                tags: tags.clone(),
+                epic: epic.clone(),
+                owner: owner.clone(),
+                statuses: status.clone(),
+                component: component.clone(),
+                priority: priority.clone(),
+                open: *open,
+            };
+            filter.validate()?;
             let pm = open_pm()?;
             let (views, at_meta) = match at {
                 Some(rev) => {
@@ -384,10 +474,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 }
             };
             let mut views: Vec<&board::View> = views.iter().collect();
-            if let Some(status) = status {
-                model::check_status(status)?;
-                views.retain(|v| v.status == *status);
-            }
+            views.retain(|v| filter.matches(v));
             if *ready {
                 views.retain(|v| v.ready);
             }
@@ -515,9 +602,94 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             }
             Ok(0)
         }
-        IssueAction::Set { id, pairs } => {
+        IssueAction::Set { args } => {
+            // Ids never contain `=`, pairs always do.
+            let split = args
+                .iter()
+                .position(|a| a.contains('='))
+                .unwrap_or(args.len());
+            let (ids, pairs) = args.split_at(split);
+            if let Some(stray) = pairs.iter().find(|p| !p.contains('=')) {
+                return Err(Error::rejected(format!(
+                    "'{stray}' after a key=value pair — ids come first: \
+                     `cadence issue set CAD-16 CAD-17 status=ready`"
+                )));
+            }
             let pm = open_pm()?;
-            print_json(&write::set_fields(&pm, id, pairs, "")?);
+            print_json(&write::set_fields(&pm, ids, pairs, "")?);
+            Ok(0)
+        }
+        IssueAction::Tag { args } => {
+            let Some(split) = args.iter().position(|a| a == "add" || a == "rm") else {
+                return Err(Error::rejected(
+                    "tag needs add or rm — `cadence issue tag CAD-16 CAD-17 add ui`",
+                ));
+            };
+            let (ids, rest) = args.split_at(split);
+            let pm = open_pm()?;
+            print_json(&write::tag_edit(
+                &pm,
+                ids,
+                rest[0] == "add",
+                &rest[1..],
+                "",
+            )?);
+            Ok(0)
+        }
+        IssueAction::Epic { action } => {
+            let pm = open_pm()?;
+            let project = match action {
+                EpicAction::Ls { project, .. } => project.as_deref(),
+                EpicAction::Show { .. } => None,
+            };
+            // Every project loads so cross-project children count.
+            let issues = board::load_all(&pm.dir, None)?;
+            let jobs = crate::client::state_dir()
+                .map(|d| board::fetch_job_outcomes(&d))
+                .unwrap_or_default();
+            let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+            match action {
+                EpicAction::Ls { json, .. } => {
+                    let epics = board::epics_json(&views, project);
+                    if *json {
+                        print_json(&json!({"epics": epics}));
+                    } else {
+                        print_epics_table(&epics);
+                    }
+                }
+                EpicAction::Show { id, json } => {
+                    model::check_id(id)?;
+                    let by_id: std::collections::HashMap<String, &board::View> = views
+                        .iter()
+                        .map(|v| (v.issue.front.id.clone(), v))
+                        .collect();
+                    let epic = by_id.get(id).ok_or_else(|| {
+                        Error::rejected(format!(
+                            "Unknown issue '{id}' — `cadence issue epic ls` lists epics"
+                        ))
+                    })?;
+                    if !epic.container {
+                        return Err(Error::rejected(format!(
+                            "{id} has no children — `cadence issue new --epic {id} \"title\"` \
+                             makes it an epic"
+                        )));
+                    }
+                    let kids: Vec<&board::View> = epic
+                        .children
+                        .iter()
+                        .filter_map(|k| by_id.get(k).copied())
+                        .collect();
+                    if *json {
+                        let mut out = board::epic_json(epic, &by_id);
+                        out["issues"] = kids.iter().map(|v| board::card_json(v)).collect();
+                        print_json(&out);
+                    } else {
+                        print_epics_table(&[board::epic_json(epic, &by_id)]);
+                        println!();
+                        print_ls_table(&kids);
+                    }
+                }
+            }
             Ok(0)
         }
         IssueAction::Link { id, kind, target } => {
@@ -647,13 +819,43 @@ fn atty_stdin() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
+/// Print rows as an aligned table — every column padded to its widest
+/// cell except the last, which runs free.
+fn print_table(rows: &[Vec<String>]) {
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..cols)
+        .map(|i| {
+            rows.iter()
+                .filter_map(|r| r.get(i))
+                .map(|c| c.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    for row in rows {
+        let mut line = String::new();
+        for (i, cell) in row.iter().enumerate() {
+            if i + 1 == row.len() {
+                line.push_str(cell);
+            } else {
+                let pad = widths[i] - cell.chars().count() + 2;
+                line.push_str(cell);
+                line.push_str(&" ".repeat(pad));
+            }
+        }
+        println!("{}", line.trim_end());
+    }
+}
+
 /// Compact human table for `issue ls` on a TTY.
 fn print_ls_table(views: &[&board::View]) {
     if views.is_empty() {
         eprintln!("no issues — `cadence issue new \"title\"` creates one");
         return;
     }
-    let mut rows: Vec<[String; 6]> = Vec::new();
+    let mut rows = vec![["ID", "STATUS", "PRI", "FLAGS", "OWNER", "TAGS", "TITLE"]
+        .map(str::to_string)
+        .to_vec()];
     for v in views {
         let f = &v.issue.front;
         let mut flags = String::new();
@@ -666,36 +868,59 @@ fn print_ls_table(views: &[&board::View]) {
         if v.container {
             flags.push('C');
         }
-        rows.push([
+        rows.push(vec![
             f.id.clone(),
             v.status.clone(),
             f.priority.clone(),
             flags,
             f.owner.clone().unwrap_or_default(),
+            f.tags.join(","),
             f.title.clone(),
         ]);
     }
-    let widths = |i: usize| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
-    for row in &rows {
-        println!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {}",
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-            row[4],
-            row[5],
-            w0 = widths(0),
-            w1 = widths(1),
-            w2 = widths(2),
-            w3 = widths(3),
-            w4 = widths(4),
-        );
-    }
+    print_table(&rows);
     eprintln!(
         "{} issues · B=blocked ~=derived-status C=container",
-        rows.len()
+        views.len()
     );
+}
+
+/// `issue epic ls` table — one row per epic from `board::epic_json`.
+fn print_epics_table(epics: &[Value]) {
+    if epics.is_empty() {
+        eprintln!("no epics — `cadence issue new --epic <ID> \"title\"` gives an issue children");
+        return;
+    }
+    let mut rows = vec![[
+        "EPIC", "STATUS", "DONE", "OPEN", "DOING", "REVIEW", "BLOCKED", "OWNERS", "TITLE",
+    ]
+    .map(str::to_string)
+    .to_vec()];
+    for e in epics {
+        let n = |k: &str| e["counts"][k].as_u64().unwrap_or(0);
+        let live = e["total"].as_u64().unwrap_or(0) - n("dropped");
+        let owners: Vec<&str> = e["owners"]
+            .as_array()
+            .map(|o| o.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        rows.push(vec![
+            e["id"].as_str().unwrap_or_default().to_string(),
+            e["status"].as_str().unwrap_or_default().to_string(),
+            format!(
+                "{}/{} {:.0}%",
+                n("done"),
+                live,
+                e["done_ratio"].as_f64().unwrap_or(0.0) * 100.0
+            ),
+            (n("backlog") + n("ready")).to_string(),
+            n("doing").to_string(),
+            n("review").to_string(),
+            e["blocked"].as_u64().unwrap_or(0).to_string(),
+            owners.join(","),
+            e["title"].as_str().unwrap_or_default().to_string(),
+        ]);
+    }
+    print_table(&rows);
 }
 
 fn print_show(view: &board::View, by_id: &std::collections::HashMap<String, &board::View>) {
@@ -710,6 +935,9 @@ fn print_show(view: &board::View, by_id: &std::collections::HashMap<String, &boa
     }
     if let Some(c) = &f.component {
         println!("component: {c}");
+    }
+    if !f.tags.is_empty() {
+        println!("tags: {}", f.tags.join(", "));
     }
     if view.ready {
         println!("ready: yes");
