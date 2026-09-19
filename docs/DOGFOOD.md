@@ -479,6 +479,38 @@ will not guess), while the worktree is dirty, and while the branch is
 unmerged and unpushed — then removes both and closes the refs in one
 commit. `--force` overrides each guard and is recorded on the commit.
 
+## A daemon restart was a hand-rolled race
+
+**What happened.** Restarting the daemon meant `daemon stop`, a hopeful
+`sleep`, then `daemon start` — because `shutdown` returns the moment the
+RPC lands, while the drain (actors, socket, singleton lock) kept running
+for a while after. An unlucky `start` raced the old process's drain and
+lost with "already owns this state directory". And when the restart did
+land, there was no way to see what it had done: did the Devin pane come
+back as the same process, or did the resume spawn a fresh session with a
+new pane pid? Nobody looked until something misbehaved.
+
+**What landed.** `daemon stop` now waits for the process to exit and the
+state-dir flock to be released (bounded at 30s), so `stop && start` is
+safe to script back to back. `daemon restart` wraps the whole sequence:
+stop, wait, start, wait for the agents that were live to settle out of
+`starting`/`offline`, then print a before/after table — agent, state
+before, state after, and whether a pty pane kept its pid. A pane whose
+pid changed, or an agent that comes back `attention`, exits nonzero so
+the damage is loud instead of discovered later. `--when-idle` gates the
+stop on every pty pane probing idle plus no managed agent holding a
+running message (`--timeout`, default 1800s; progress names busy agents
+every 30s; a timeout leaves the daemon untouched). `--ui` bounces the
+detached UI only if it was running. `cadence status` answers the
+companion question — what is everyone doing right now — one row per
+agent: state, running message age + head, queued/unknown counts,
+fenced/dead/resumable flags, pane verdict for pty agents (exactly one
+probe each, none for the rest), and the tracker issues they own;
+`--group` scopes it, `--json` scripts it, `--watch` refreshes it.
+`cadence events` without `--after` now returns the newest 50 with the
+cursor — the page you actually wanted — and `--follow` anchors at that
+tail instead of replaying the log first.
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not

@@ -1582,6 +1582,13 @@ fn pid_file(state_dir: &Path) -> PathBuf {
     state_dir.join("ui.pid")
 }
 
+/// Is a detached `cadence ui` server alive for this state dir — the
+/// pidfile's pid, alive-checked. `daemon restart --ui` reads this to
+/// decide whether to bounce the board.
+pub fn detached_pid(state_dir: &Path) -> Option<i32> {
+    read_pid(state_dir)
+}
+
 fn read_pid(state_dir: &Path) -> Option<i32> {
     std::fs::read_to_string(pid_file(state_dir))
         .ok()?

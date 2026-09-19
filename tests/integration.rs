@@ -2492,6 +2492,13 @@ def die(msg, code=1):
     sys.stderr.write(msg + "\n"); sys.exit(code)
 
 cmd, rest = args[0], args[1:]
+# Every invocation lands in calls.log — tests that must count a probe
+# (e.g. `cadence status` probing exactly once per pty agent) read it.
+try:
+    with open(os.path.join(state, "calls.log"), "a") as f:
+        f.write(cmd + " " + " ".join(rest) + "\n")
+except Exception:
+    pass
 # Deterministic latency injection: MOCK_TMUX_HOLD=<secs> delays the
 # command named by MOCK_TMUX_HOLD_CMD (default display-message) — the
 # harness's way to make an adapter probe straggle past the daemon's
@@ -11346,4 +11353,588 @@ fn dispatch_kickoff_and_finish_guards() {
             .all(|r| r["kind"] != "worktree" || r["closed"] == true),
         "{issue}"
     );
+}
+
+// ==== operator IX: cadence status, daemon restart, events tail ====
+
+/// `cadence status --json` against a daemon's socket — the JSON shape
+/// is the contract; extra args (`--group`) and env (`CADENCE_PM_DIR`)
+/// thread through.
+fn status_json(state: &Path, extra: &[&str], envs: &[(&str, &Path)]) -> Value {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
+        .arg(state)
+        .arg("status")
+        .arg("--json")
+        .args(extra)
+        .env_remove("CADENCE_ALIAS")
+        .env_remove("CADENCE_PM_DIR");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "status output not json: {e}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
+}
+
+/// `cadence status` table form — same invocation, no --json.
+fn status_table(state: &Path, envs: &[(&str, &Path)]) -> String {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
+        .arg(state)
+        .arg("status")
+        .env_remove("CADENCE_ALIAS")
+        .env_remove("CADENCE_PM_DIR");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// `cadence issue …` with the tracker pointed at `pm`.
+fn issue_cli(home: &Path, state: &Path, pm: &Path, args: &[&str]) {
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(state)
+        .args(args)
+        .env("HOME", home)
+        .env("CADENCE_PM_DIR", pm)
+        // The tracker's pre-commit hook runs `cadence` from PATH —
+        // put the just-built binary first so a stale ambient install
+        // can't answer `issue lint` (the board harness does the same).
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                std::path::Path::new(bin).parent().unwrap().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "issue {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `capture-pane` calls recorded by the mock tmux — the probe's
+/// signature invocation, counted for the one-probe-per-pane rule.
+fn tmux_call_count(mock: &MockDevin, state: &Path, cmd: &str) -> usize {
+    let log = mock
+        .dir
+        .join("tmux-state")
+        .join(socket_for(state))
+        .join("calls.log");
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with(cmd))
+        .count()
+}
+
+#[test]
+fn status_rows_probe_once_and_footer() {
+    let d = TestDaemon::start();
+    // MockDevin holds ENV_LOCK for the test — the claude mock must
+    // install through the locked variant or the second lock() deadlocks.
+    let mock = d.mock_devin();
+    let _chatty = d.mock_claude_locked("chatty");
+    d.register_devin("dv1", None);
+    d.register_devin("dv2", None);
+    d.register_inbox("pm");
+    d.register_claude("w1", json!({}));
+    d.register("fx");
+    d.wait_agent("dv1", "idle", 20);
+    d.wait_agent("dv2", "idle", 20);
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 15);
+    d.wait_agent("fx", "idle", 10);
+    // dv2's pane shows the busy watermark — its row must read busy.
+    std::fs::write(
+        d.pane_file(&mock, "dv2", "tui-state"),
+        "⠸ Thinking · 12s (esc twice to interrupt)\n❭ Guide Devin while it works\n",
+    )
+    .unwrap();
+    // w1 mid-turn: chatty never completes, so m1 stays running.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "draft the migration plan", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["running"], 15);
+    // pm holds an undrained message — unread inbox in the footer.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "pm", "text": "note for the operator", "message": "pm1"}),
+    )
+    .unwrap();
+    // fx is fenced: one unknown message, attention state.
+    fence_agent(&d, "fx", "mf1");
+    // Tracker: one doing and one review issue owned by agents, plus a
+    // backlog issue that must NOT appear.
+    let home = d.dir.path().join("home");
+    let pm_dir = d.dir.path().join("pm");
+    std::fs::create_dir_all(&home).unwrap();
+    issue_cli(&home, &d.state, &pm_dir, &["issue", "init"]);
+    issue_cli(
+        &home,
+        &d.state,
+        &pm_dir,
+        &["issue", "project", "add", "cadence", "--prefix", "CAD"],
+    );
+    for title in ["one", "two", "three"] {
+        issue_cli(
+            &home,
+            &d.state,
+            &pm_dir,
+            &["issue", "new", title, "--project", "cadence"],
+        );
+    }
+    issue_cli(
+        &home,
+        &d.state,
+        &pm_dir,
+        &["issue", "set", "CAD-1", "status=doing", "owner=w1"],
+    );
+    issue_cli(
+        &home,
+        &d.state,
+        &pm_dir,
+        &["issue", "set", "CAD-2", "status=review", "owner=dv1"],
+    );
+    issue_cli(
+        &home,
+        &d.state,
+        &pm_dir,
+        &["issue", "set", "CAD-3", "owner=w1"],
+    );
+    let captures_before = tmux_call_count(&mock, &d.state, "capture-pane");
+    let view = status_json(&d.state, &[], &[("CADENCE_PM_DIR", &pm_dir)]);
+    let agents = view["agents"].as_array().unwrap();
+    let row = |alias: &str| {
+        agents
+            .iter()
+            .find(|a| a["alias"].as_str() == Some(alias))
+            .unwrap_or_else(|| panic!("no row for {alias}: {view}"))
+            .clone()
+    };
+    // w1: running message with age + head, owned doing issue.
+    let w1 = row("w1");
+    assert_eq!(w1["running"]["text"], "draft the migration plan", "{w1}");
+    assert!(w1["running"]["age_secs"].as_u64().is_some(), "{w1}");
+    assert_eq!(w1["issues"], json!(["CAD-1"]), "{w1}");
+    // dv1 idle pane verdict + review issue; dv2 busy verdict.
+    let dv1 = row("dv1");
+    assert_eq!(dv1["pane"]["verdict"], "idle", "{dv1}");
+    assert_eq!(dv1["issues"], json!(["CAD-2"]), "{dv1}");
+    let dv2 = row("dv2");
+    assert!(
+        dv2["pane"]["verdict"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("busy"),
+        "{dv2}"
+    );
+    // fx fenced: attention state, one unknown.
+    let fx = row("fx");
+    assert_eq!(fx["state"], "attention", "{fx}");
+    assert_eq!(fx["unknown"], 1, "{fx}");
+    // pm inbox: no probe, unread lands in the footer.
+    let pm = row("pm");
+    assert!(pm["pane"].is_null(), "{pm}");
+    assert!(view["footer"]["unread_inboxes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("pm")));
+    assert_eq!(view["footer"]["states"]["idle"], 3, "{view}");
+    assert_eq!(view["footer"]["states"]["busy"], 1, "{view}");
+    assert_eq!(view["footer"]["states"]["attention"], 1, "{view}");
+    // Exactly one capture-pane per pty agent with a pane — no probe
+    // for the managed, fake or inbox rows.
+    let captures_after = tmux_call_count(&mock, &d.state, "capture-pane");
+    assert_eq!(
+        captures_after - captures_before,
+        2,
+        "status must probe each pty pane exactly once"
+    );
+    // Table form renders the same rows.
+    let table = status_table(&d.state, &[("CADENCE_PM_DIR", &pm_dir)]);
+    assert!(table.contains("w1"), "{table}");
+    assert!(table.contains("draft the migration plan"), "{table}");
+    assert!(table.contains("busy:"), "{table}");
+    assert!(table.contains("unread: pm"), "{table}");
+    // --group scopes to the root + its upstream members.
+    d.rpc("agent_set", json!({"alias": "w1", "patch": {}})).ok();
+}
+
+/// --group filters to the named root plus agents naming it upstream.
+#[test]
+fn status_group_scopes_rows() {
+    let d = TestDaemon::start();
+    d.register_inbox("pm");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "params": "{\"upstream\":\"pm\"}"}),
+    )
+    .unwrap();
+    d.register("other");
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    d.wait_agent("other", "idle", 10);
+    let view = status_json(&d.state, &["--group", "pm"], &[]);
+    let aliases: Vec<&str> = view["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["alias"].as_str())
+        .collect();
+    assert_eq!(aliases, vec!["pm", "w1"], "{view}");
+}
+
+/// `daemon restart` through the real binary: a thread-daemon seeded
+/// with a pty pane hands the lock to a fresh detached daemon, which
+/// re-adopts the pane — the table must say the pid is the same.
+#[test]
+fn daemon_restart_keeps_pane_pid_and_reports_table() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.register("w1");
+    d.wait_agent("dv", "idle", 20);
+    d.wait_agent("w1", "idle", 15);
+    let pane_pid_before = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"]["pid"]
+        .as_u64()
+        .unwrap();
+    assert!(pane_pid_before > 0);
+    let home = TempDir::new().unwrap();
+    let out = cadence_at(home.path(), &d.state, &["daemon", "restart"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "restart failed: {stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("AGENT"), "{stdout}");
+    assert!(stdout.contains("dv"), "{stdout}");
+    assert!(stdout.contains("same"), "{stdout}");
+    // The new daemon owns the state and reports the same pane pid.
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["idle"], true, "{probe}");
+    let pane_pid_after = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"]["pid"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(pane_pid_before, pane_pid_after);
+    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "stop after restart failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// --when-idle refuses to touch a busy fleet, then proceeds once the
+/// pane clears.
+#[test]
+fn daemon_restart_when_idle_gates_and_proceeds() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv", None);
+    d.wait_agent("dv", "idle", 20);
+    std::fs::write(
+        d.pane_file(&mock, "dv", "tui-state"),
+        "⠸ Thinking · 12s (esc twice to interrupt)\n❭ Guide Devin while it works\n",
+    )
+    .unwrap();
+    let home = TempDir::new().unwrap();
+    // Busy pane → timeout exits non-zero and the daemon is untouched.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["daemon", "restart", "--when-idle", "--timeout", "3"],
+    );
+    assert!(
+        !out.status.success(),
+        "when-idle restart ran on a busy pane: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        d.rpc("agent_probe", json!({"alias": "dv"})).is_ok(),
+        "daemon must be untouched after a when-idle timeout"
+    );
+    // Pane goes idle — the same command now completes the restart.
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["daemon", "restart", "--when-idle", "--timeout", "30"],
+    );
+    assert!(
+        out.status.success(),
+        "when-idle restart failed on an idle pane: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    assert!(stop.status.success());
+}
+
+/// `daemon stop` waits for the process to release the state-dir lock,
+/// so `stop && start` no longer races the drain. Ten iterations — the
+/// old code lost this race whenever the drain outlived a millisecond.
+#[test]
+fn daemon_stop_then_start_never_races_lock() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap().path().join("state");
+    let start = cadence_at(home.path(), &state, &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "initial start: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    for i in 0..10 {
+        let stop = cadence_at(home.path(), &state, &["daemon", "stop"]);
+        assert!(
+            stop.status.success(),
+            "stop #{i}: {}",
+            String::from_utf8_lossy(&stop.stderr)
+        );
+        let start = cadence_at(home.path(), &state, &["daemon", "start"]);
+        assert!(
+            start.status.success(),
+            "start #{i} raced the drain: {}",
+            String::from_utf8_lossy(&start.stderr)
+        );
+    }
+    let stop = cadence_at(home.path(), &state, &["daemon", "stop"]);
+    assert!(stop.status.success());
+}
+
+/// Events: the default page is the newest 50 (oldest first inside
+/// it) with the forward cursor; --after keeps forward paging.
+#[test]
+fn events_default_page_is_newest_with_continue_cursor() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    // >50 events: each completed send writes several lifecycle events.
+    for i in 0..20 {
+        let id = format!("m{i}");
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w1", "text": format!("task {i}"), "message": id}),
+        )
+        .unwrap();
+        d.wait_message("w1", &id, &["completed"], 10);
+    }
+    assert!(d.events("w1").len() > 50, "need >50 events to page");
+    // RPC tail: 50 rows, ascending, ending at the latest seq.
+    let page = d
+        .rpc("agent_events", json!({"alias": "w1", "tail": true}))
+        .unwrap();
+    let events = page["events"].as_array().unwrap();
+    assert_eq!(events.len(), 50, "{page}");
+    assert_eq!(page["has_older"], true, "{page}");
+    let seqs: Vec<i64> = events.iter().map(|e| e["seq"].as_i64().unwrap()).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "tail page not ascending"
+    );
+    let cursor = page["cursor"].as_i64().unwrap();
+    assert_eq!(cursor, *seqs.last().unwrap());
+    // Continuing forward from the cursor yields only newer events:
+    // one more send lands strictly above it.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "epilogue", "message": "ep"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "ep", &["completed"], 10);
+    let next = d
+        .rpc("agent_events", json!({"alias": "w1", "after": cursor}))
+        .unwrap();
+    let next_seqs: Vec<i64> = next["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["seq"].as_i64().unwrap())
+        .collect();
+    assert!(!next_seqs.is_empty(), "post-cursor events missing");
+    assert!(next_seqs.iter().all(|s| *s > cursor), "{next_seqs:?}");
+    // CLI default page = the same tail.
+    let home = TempDir::new().unwrap();
+    let out = cadence_at(home.path(), &d.state, &["events", "w1"]);
+    assert!(out.status.success());
+    let cli_page: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let cli_events = cli_page["events"].as_array().unwrap();
+    assert_eq!(cli_events.len(), 50);
+    assert_eq!(
+        cli_page["cursor"].as_i64().unwrap(),
+        cli_events.last().unwrap()["seq"].as_i64().unwrap()
+    );
+    assert_eq!(cli_page["has_older"], true);
+    // --after 0 keeps today's forward paging — the whole log.
+    let out = cadence_at(home.path(), &d.state, &["events", "w1", "--after", "0"]);
+    let full: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        full["events"].as_array().unwrap().len(),
+        d.events("w1").len()
+    );
+    // The job view takes the same default page.
+    let spec = d.dir.path().join("spec.md");
+    std::fs::write(&spec, "spec").unwrap();
+    d.register_inbox("pmj");
+    d.job_new("pmj", "j1", spec.to_str().unwrap(), "a".repeat(40).as_str());
+    let job_page = d
+        .rpc("job_events", json!({"job": "j1", "tail": true}))
+        .unwrap();
+    assert!(
+        !job_page["events"].as_array().unwrap().is_empty(),
+        "job tail page must show the newest job events"
+    );
+    assert!(job_page.get("has_older").is_some(), "{job_page}");
+}
+
+/// `--follow` anchors at the tail: the first page is the newest 50,
+/// then new events stream — it must not replay the whole log first.
+#[test]
+fn events_follow_starts_at_tail() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    for i in 0..15 {
+        let id = format!("m{i}");
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w1", "text": format!("task {i}"), "message": id}),
+        )
+        .unwrap();
+        d.wait_message("w1", &id, &["completed"], 10);
+    }
+    let total = d.events("w1").len();
+    assert!(total > 50, "need >50 events, got {total}");
+    let home = TempDir::new().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["events", "w1", "--follow"])
+        .env("HOME", home.path())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Drain stdout concurrently — the tail page alone can exceed the
+    // pipe capacity, and a blocked writer means no stream at all.
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = std::sync::Arc::clone(&captured);
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    // Wait for the tail page to land, then generate one more event and
+    // wait for it to stream through a following page.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !captured.lock().unwrap().contains("\"has_older\"") {
+        assert!(Instant::now() < deadline, "tail page never printed");
+        thread::sleep(Duration::from_millis(50));
+    }
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "post-follow", "message": "mf"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "mf", &["completed"], 10);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !captured.lock().unwrap().contains("\"message\": \"mf\"") {
+        assert!(
+            Instant::now() < deadline,
+            "post-follow event never streamed"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    let text = captured.lock().unwrap().clone();
+    // Pages are pretty-printed JSON back to back — a `{` at column 0
+    // starts each page.
+    let mut pages: Vec<Value> = Vec::new();
+    let mut depth = 0i32;
+    let mut start = None;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, c) in text.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start.take() {
+                        if let Ok(v) = serde_json::from_str::<Value>(&text[s..=i]) {
+                            pages.push(v);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        pages.len() >= 2,
+        "follow emitted {} page(s): {text}",
+        pages.len()
+    );
+    // First page = the tail: newest 50, not the whole log.
+    let first = &pages[0];
+    assert_eq!(first["events"].as_array().unwrap().len(), 50, "{first}");
+    assert_eq!(first["has_older"], true, "{first}");
+    // A later page carries the post-follow event.
+    let streamed = pages[1..]
+        .iter()
+        .flat_map(|p| p["events"].as_array().unwrap().clone())
+        .any(|e| e["payload"]["message"].as_str() == Some("mf"));
+    assert!(streamed, "no post-follow event streamed: {text}");
 }

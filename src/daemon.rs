@@ -1089,6 +1089,20 @@ impl Shared {
             return Err(Error::rejected("Event cursor must be nonnegative"));
         }
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
+        // `tail` is the newest-first default `cadence events` uses
+        // when no --after cursor is given: one bounded page ending at
+        // the latest seq, oldest first within it, plus the forward
+        // cursor and whether older history exists below the page.
+        if params.get("tail").and_then(Value::as_bool).unwrap_or(false) {
+            let mut events = self.store.events_tail(&alias, 51)?;
+            let has_older = events.len() > 50;
+            events.truncate(50);
+            return Ok(json!({
+                "events": events.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                "cursor": events.last().map(|e| e.seq).unwrap_or(0),
+                "has_older": has_older,
+            }));
+        }
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
             let events = self.store.events(&alias, after, 100)?;
@@ -2014,6 +2028,18 @@ impl Shared {
             return Err(Error::rejected("Event cursor must be nonnegative"));
         }
         let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
+        // Same `tail` contract as agent_events — the job view's
+        // default page is the newest too.
+        if params.get("tail").and_then(Value::as_bool).unwrap_or(false) {
+            let mut events = self.store.job_events_tail(&job.id, 51)?;
+            let has_older = events.len() > 50;
+            events.truncate(50);
+            return Ok(json!({
+                "events": events.iter().map(store::Event::to_json).collect::<Vec<_>>(),
+                "cursor": events.last().map(|e| e.seq).unwrap_or(0),
+                "has_older": has_older,
+            }));
+        }
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
             let events = self.store.job_events(&job.id, after, 200)?;
@@ -2882,7 +2908,16 @@ pub fn serve(state_dir: &Path) -> Result<()> {
                 let shared = Arc::clone(&shared);
                 thread::spawn(move || handle_conn(shared, stream));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            // WouldBlock is the idle nonblocking poll; ConnectionAborted
+            // is the listener race — a queued connection reset before
+            // accept (a client exiting mid-handshake) must not kill the
+            // daemon.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => return Err(e.into()),

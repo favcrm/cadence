@@ -42,7 +42,7 @@ Error kinds:
 | `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown}` — `unknown` counts unreconciled unknowns fencing the agent; `agent.capabilities` is the registry descriptor |
 | `agent_send` | `alias, text, message?, reply_to?, source?, task?` | `{message,state,duplicate}` — `task` attaches the delivery to a task for indexing |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
-| `agent_events` | `alias, after, wait(<=30)` | `{events:[Event], cursor}` |
+| `agent_events` | `alias, after?, wait(<=30), tail?` | `{events:[Event], cursor, has_older}` — `tail:true` returns the newest page (50) in ascending order instead of paging forward from `after` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
 | `agent_respond` | `alias, request, decision?|answers?, reason?` | `{state:"answered"}` — `reason` rides a brokered decline as the provider's denial message |
 | `request_open` | `alias, kind?, tool, input_summary?, input?, request?` | `{request,state:"waiting_input",existing?}` — registers a brokered request (caller-named `request` dedupes retries); `rejected` unless the agent's params carry `broker_approvals` |
@@ -59,7 +59,7 @@ Error kinds:
 | `job_new` | `pm, spec, spec_sha256, job?, title?, issue?, repo?, base_ref?, max_revisions?, task_title?` | `{job, duplicate}` — bookkeeping only; creates the `open` job + default `<job>-t1` draft task |
 | `job_list` | `state?, all?` | `{jobs:[Job+task counts]}` |
 | `job_show` | `job` | `{job:{...,tasks:[Task+kickoff+attention+latest_verdict]}}` — lazily flags drift |
-| `job_events` | `job, after?, limit?` | `{events:[Event], cursor}` — the `job_id`-scoped view |
+| `job_events` | `job, after?, limit?, tail?` | `{events:[Event], cursor, has_older}` — the `job_id`-scoped view; `tail` matches `agent_events` |
 | `task_new` | `job, task?, title?, assignee?, spec?, acceptance?, worktree?, branch?, base_sha?` | `{task}` — draft task in an open job |
 | `task_show` | `task` | `{task:{...,messages,verdicts}}` |
 | `task_dispatch` | `task, to?, message?, by?` | `{task, message, duplicate, queued_behind_dead}` — enqueues the kickoff at a new revision, or returns the live kickoff (`duplicate:true`) |
@@ -762,12 +762,20 @@ params_updated, reconciled, relaunch_skipped, attention,
 turn_stalled, turn_resumed, stop_requested`. `wait>0` long-polls
 up to 30s.
 
+Two page shapes. Forward paging sends `after` — rows above the cursor,
+oldest first, up to the page limit. `tail:true` (what `cadence events`
+sends when no `--after` is given) returns the newest 50 rows instead —
+still oldest first inside the page — plus `has_older` marking whether
+history sits below it; `cursor` continues forward in both shapes, so
+`--follow` anchors at the tail and streams from there.
+
 Job operations emit the same rows with `job_id`/`task_id` set —
 `job_created, task_created, task_dispatched, task_running,
 task_reported, verdict_recorded, task_revising, task_blocked,
 task_reopened, task_failed, task_cancelled, task_sha_recorded,
 task_done, job_closed, job_cancelled` — and `job_events` pages them
-across aliases (`{job, after?, limit?}` → `{events, cursor}`).
+across aliases with the same `after`/`tail` contract
+(`{job, after?, tail?}` → `{events, cursor, has_older}`).
 
 ## Stall detection
 
