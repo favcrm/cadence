@@ -38,6 +38,17 @@ cadence agent list --all      # who exists; `resumable: true` agents can come ba
 cadence resume <pm>           # bring the group's workers back on their saved sessions
 ```
 
+Slice the backlog before you plan rather than scrolling it.
+`cadence issue ls --open` is everything still live; narrow it with
+`--tag`, `--owner`, `--component`, `--priority` or `--status` (repeat
+`--tag` to require several, `--status` to allow several), and
+`cadence issue epic ls` shows each epic's progress, blocked count and
+owners, with `issue epic show <ID>` or `issue ls --epic <ID> --open`
+for what is left inside one. Tag as you triage — `cadence issue tag
+CAD-70 CAD-71 add flaky` and `cadence issue set CAD-70 CAD-71
+status=ready` edit several issues in one commit — and send a filtered
+board as a link: the filter bar keeps its state in the URL.
+
 Join workers into the PM's group so results route back without any
 `--reply-to`:
 

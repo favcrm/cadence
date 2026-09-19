@@ -518,6 +518,7 @@ pub fn card_json(view: &View) -> Value {
         "priority": f.priority,
         "owner": f.owner,
         "component": f.component,
+        "tags": f.tags,
         "parent": f.parent,
         "blocked_by": f.blocked_by,
         "relates": f.relates,
@@ -536,6 +537,127 @@ pub fn card_json(view: &View) -> Value {
         },
         "checks": {"done": view.checks_done, "total": view.checks_total},
     })
+}
+
+/// The slices `issue ls` and `GET /api/issues` share. Every set field
+/// must match (AND); `tags` must all be present, `statuses` is any-of
+/// and compares the derived status.
+#[derive(Clone, Debug, Default)]
+pub struct Filter {
+    pub tags: Vec<String>,
+    /// Children of this issue.
+    pub epic: Option<String>,
+    pub owner: Option<String>,
+    pub statuses: Vec<String>,
+    pub component: Option<String>,
+    pub priority: Option<String>,
+    /// Not done and not dropped.
+    pub open: bool,
+}
+
+impl Filter {
+    /// Reject values that could never match — a typo is an error, not
+    /// an empty list.
+    pub fn validate(&self) -> Result<()> {
+        for tag in &self.tags {
+            if !model::valid_tag(tag) {
+                return Err(Error::rejected(format!("Invalid tag filter '{tag}'")));
+            }
+        }
+        for status in &self.statuses {
+            model::check_status(status)?;
+        }
+        if let Some(priority) = &self.priority {
+            model::check_priority(priority)?;
+        }
+        if let Some(epic) = &self.epic {
+            model::check_id(epic)?;
+        }
+        Ok(())
+    }
+
+    pub fn matches(&self, view: &View) -> bool {
+        let f = &view.issue.front;
+        let open = !matches!(view.status.as_str(), "done" | "dropped");
+        self.tags.iter().all(|t| f.tags.contains(t))
+            && self
+                .epic
+                .as_ref()
+                .is_none_or(|e| f.parent.as_ref() == Some(e))
+            && self
+                .owner
+                .as_ref()
+                .is_none_or(|o| f.owner.as_ref() == Some(o))
+            && (self.statuses.is_empty() || self.statuses.contains(&view.status))
+            && self
+                .component
+                .as_ref()
+                .is_none_or(|c| f.component.as_ref() == Some(c))
+            && self.priority.as_ref().is_none_or(|p| &f.priority == p)
+            && (!self.open || open)
+    }
+}
+
+/// One epic — an issue with children — with its children's progress:
+/// `total`, a count per status (derived statuses), `done_ratio` =
+/// done ÷ (total − dropped), how many open children are blocked, and
+/// the distinct owners. Children outside `views` are not counted.
+pub fn epic_json(epic: &View, views_by_id: &HashMap<String, &View>) -> Value {
+    let kids: Vec<&&View> = epic
+        .children
+        .iter()
+        .filter_map(|id| views_by_id.get(id))
+        .collect();
+    let count = |status: &str| kids.iter().filter(|k| k.status == status).count();
+    let counts: serde_json::Map<String, Value> = model::STATUSES
+        .iter()
+        .map(|s| (s.to_string(), json!(count(s))))
+        .collect();
+    let live = kids.len() - count("dropped");
+    let done_ratio = if live == 0 {
+        0.0
+    } else {
+        (count("done") as f64 / live as f64 * 100.0).round() / 100.0
+    };
+    let blocked = kids
+        .iter()
+        .filter(|k| k.blocked && !matches!(k.status.as_str(), "done" | "dropped"))
+        .count();
+    let mut owners: Vec<&str> = kids
+        .iter()
+        .filter_map(|k| k.issue.front.owner.as_deref())
+        .collect();
+    owners.sort_unstable();
+    owners.dedup();
+    let f = &epic.issue.front;
+    json!({
+        "id": f.id,
+        "project": epic.issue.project,
+        "title": f.title,
+        "status": epic.status,
+        "priority": f.priority,
+        "owner": f.owner,
+        "tags": f.tags,
+        "total": kids.len(),
+        "counts": counts,
+        "done_ratio": done_ratio,
+        "blocked": blocked,
+        "owners": owners,
+        "children": epic.children,
+    })
+}
+
+/// Every epic in `views`, optionally one project's, in id order.
+pub fn epics_json(views: &[View], project_key: Option<&str>) -> Vec<Value> {
+    let by_id: HashMap<String, &View> = views
+        .iter()
+        .map(|v| (v.issue.front.id.clone(), v))
+        .collect();
+    views
+        .iter()
+        .filter(|v| v.container && project_key.is_none_or(|p| v.issue.project == p))
+        .map(|v| epic_json(v, &by_id))
+        .collect()
 }
 
 fn link_ref(views_by_id: &HashMap<String, &View>, id: &str) -> Value {
@@ -597,6 +719,7 @@ pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &Vi
         "priority": f.priority,
         "owner": f.owner,
         "component": f.component,
+        "tags": f.tags,
         "parent": f.parent,
         "container": view.container,
         "ready": view.ready,

@@ -22,7 +22,7 @@ serving a board + JSON API on loopback.
 ├── pm.yaml                 # schema, statuses, link types, artifact cap, notes_dir
 ├── README.md               # the rules, for agents and humans
 ├── cadence/
-│   ├── project.yaml        # key, prefix: CAD, repos, components, default_owner
+│   ├── project.yaml        # key, prefix: CAD, repos, components, tags, default_owner
 │   │                       #   (dispatch hint only — never stamped on new issues)
 │   ├── CAD-16/
 │   │   ├── issue.md        # YAML frontmatter + body; ## Acceptance checkboxes
@@ -45,7 +45,11 @@ status: backlog             # file status; notes/rollup can override it
 priority: P1                # P0..P3
 owner: cookie-cesium        # optional
 component: adapter          # optional, must be declared by the project
-parent: CAD-30              # optional, one level of sub-issues
+tags: [claude, provider]    # optional; [a-z0-9][a-z0-9-]{0,31}, ≤12, stored
+                            # sorted + de-duplicated; from project.yaml's
+                            # `tags:` list when the project declares one
+parent: CAD-30              # optional, one level of sub-issues — an issue
+                            # with children is an epic
 blocked_by: [CAD-12, CAD-14]
 relates: [CAD-18]
 duplicate_of: CAD-7         # optional
@@ -86,11 +90,26 @@ cadence issue doctor                        # read-only health: root, git repo,
                                             # failing check
 cadence issue project add cadence --prefix CAD --repo ~/Project/cadence \
     --component adapter --owner cookie-cesium
+                                            # --tag t (repeatable) declares the
+                                            # project's tag vocabulary
 cadence issue new "title"                   # --project wins, else CADENCE_PROJECT,
                                             # else the cwd repo's remote/path; no
                                             # match fails closed. --parent, --priority,
-                                            # --blocked-by, --owner, --component, --id
-cadence issue ls [--project p] [--status s] [--ready] [--json]
+                                            # --blocked-by, --owner, --component, --id,
+                                            # --tag t (repeatable), --epic <ID>
+                                            # (= --parent)
+cadence issue ls [--project p] [--ready] [--json]
+    [--tag t]... [--status s]... [--epic <ID>]  # filters combine (AND): every --tag
+    [--owner o] [--component c]             # must be present, any --status may
+    [--priority P1] [--open]                # match (derived status), --epic lists
+                                            # its children, --open = not done or
+                                            # dropped; an aligned table without --json
+cadence issue epic ls [--project p] [--json]
+                                            # epics = issues with children: total,
+                                            # counts per status, done_ratio (done ÷
+                                            # total − dropped), blocked, owners
+cadence issue epic show CAD-38 [--json]     # the epic's row + its children:
+                                            # status, owner, priority, tags
 cadence issue ls --at <rev> [--project p] [--json]
                                             # the board as it was at <rev> —
                                             # cards report status_source: file
@@ -112,6 +131,17 @@ cadence issue start CAD-16                  # mints .cadence/wt/cad-16-<slug> on
      [--assignee <alias>]]                  # the trailer; --job also opens the M3
                                             # job + scoped task (daemon required)
 cadence issue set CAD-16 status=doing owner=fable-cc
+cadence issue set CAD-16 tags=claude,provider
+                                            # replaces the tag list; `tags=` clears
+cadence issue set CAD-16 CAD-17 CAD-18 status=ready priority=P1
+                                            # bulk: ids first, then pairs — one
+                                            # commit, nothing written unless every
+                                            # id and value is valid
+cadence issue tag CAD-16 CAD-17 add ui      # add|rm tags on one issue or several;
+cadence issue tag CAD-16 rm ui api          # same one-commit, all-or-nothing batch.
+                                            # Issues the edit leaves unchanged stay
+                                            # out of the commit; a batch that
+                                            # changes nothing is refused
 cadence issue link CAD-16 blocked_by CAD-12 # also relates|parent|duplicate_of
 cadence issue unlink CAD-16 blocked_by CAD-12
 cadence issue ref CAD-16 pr https://… --label "PR #16"
@@ -130,10 +160,16 @@ file (`~/pm/.lock`) with atomic `issue.md` replacement. Field values are
 validated inside `issue::write` itself — on `new`, `set` and the HTTP
 PATCH alike — so a bad value can never be committed and lint stays the
 safety net: `status` is one of the six, `priority` is P0–P3, `component`
-must be declared by the issue's project (`""` clears it), and every
-link target must exist — on `link`/`unlink` and on the `--blocked-by`/
+must be declared by the issue's project (`""` clears it), `tags` are
+well-formed, at most 12, stored sorted and de-duplicated — and drawn
+from the project's `tags:` list when `project.yaml` declares one (no
+list accepts any well-formed tag; an absent `tags` means none) — and
+every link target must exist — on `link`/`unlink` and on the `--blocked-by`/
 `--parent` create fields alike. Writes also validate what lint would
 catch: `blocked_by`/parent cycles, depth > 2, oversize artifacts.
+A bulk `set`/`tag` is still one commit: its subject names every id
+(`CAD-16, CAD-17: set status=ready`) and carries one `Issue:` trailer
+per id, so each issue's `log` and `blame` read it as their own.
 Symlinks inside the tracker are never followed — a linked folder or
 `issue.md` is invisible to reads, an error in lint, and refused by
 writes.
@@ -183,7 +219,7 @@ PM dir that is not a git repository refuses cleanly.
   entry: `sha` (short), `at` (RFC 3339 UTC), `by` (the `Actor:`
   trailer, else the ` (actor)` suffix, else `comment by <name>`, else
   the commit author), `kind`
-  (`created|set|link|unlink|ref|comment|attach|other`), `summary`
+  (`created|set|tag|link|unlink|ref|comment|attach|other`), `summary`
   (subject minus the id prefix and actor), and a `fields` map for
   `set` entries. Commits that are not cadence-shaped — hand edits,
   reverts, sync replays with foreign subjects — appear as `other`
@@ -417,8 +453,9 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 |---|---|
 | `GET /api/health` | `ok`, `pm_dir`, `pm_present`, counts, `daemon`, `embedded` |
 | `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_url` |
-| `GET /api/projects` | folders, prefixes, components, repos, issue counts |
-| `GET /api/issues?project=` | card views: derived status, readiness, counts, `rev` |
+| `GET /api/projects` | folders, prefixes, components, declared tags, repos, issue counts |
+| `GET /api/issues?project=` | card views: derived status, readiness, `tags`, counts, `rev`. The `issue ls` filters, combinable: `tag=` (repeat or comma-join — all of), `status=` (repeat or comma-join — any of), `epic=<ID>`, `owner=`, `component=`, `priority=`, `open=1`; `400` on a value that could never match (unknown status/priority, bad tag or id grammar) |
+| `GET /api/epics?project=` | issues with children — the `issue epic ls --json` payload: `total`, `counts` per status, `done_ratio`, `blocked`, `owners`, `children` |
 | `GET /api/issues/:id` | the drawer payload: frontmatter, body, links both ways, refs, files, comments, notes chain, merged activity |
 | `GET /api/issues/:id/file` | raw `issue.md`, `text/markdown` |
 | `GET /api/issues/:id/activity` | the merged activity stream only |
@@ -437,8 +474,8 @@ actor: `CAD-16: set status=review (operator (ui))`.
 
 | Route | Body | Returns |
 |---|---|---|
-| `POST /api/issues` | `{project, title, priority?, owner?, component?, parent?, blocked_by?}` | `201` |
-| `PATCH /api/issues/:id` | `{status?, priority?, owner?, component?, title?, body?, if_rev?}` — `""` clears owner/component; `body` replaces the markdown only | `200` |
+| `POST /api/issues` | `{project, title, priority?, owner?, component?, tags?, parent?, blocked_by?}` | `201` |
+| `PATCH /api/issues/:id` | `{status?, priority?, owner?, component?, tags?, title?, body?, if_rev?}` — `""` clears owner/component; `tags` replaces the list (`[]` clears) under the CLI's validation; `body` replaces the markdown only | `200` |
 | `POST /api/issues/:id/links` | `{type: blocked_by\|relates\|parent\|duplicate_of, target, if_rev?}` | `200` |
 | `DELETE /api/issues/:id/links` | same shape | `200` |
 | `POST /api/issues/:id/refs` | `{kind, url\|path, label?, if_rev?}` — exactly one of url/path | `200` |
@@ -531,6 +568,17 @@ fenced agents first, shows the daemon's recovery text verbatim, and
 opens a drawer with identity, params, capabilities, tasks, bound
 issues, running messages, and the event tail. A fence banner on the
 board links straight to it.
+
+A filter bar above the columns slices the board by tag, epic, owner and
+component — chips with counts, multi-select: tags narrow (all of them),
+the other three widen within themselves (any of them). The selection
+lives in the URL (`?project=cadence&tag=ui,api&epic=CAD-38&owner=ann&
+component=adapter&group=epic`), so a filtered view is a link. "group by
+epic" renders one swimlane per epic with its progress bar (done ÷
+children, dropped excluded — over all children, not only the visible
+ones) and a last lane for issues with no epic. Cards show their tags;
+the drawer edits them through the same PATCH, `if_rev` included, with
+the project's declared tags as toggle chips.
 
 ## Seeding
 

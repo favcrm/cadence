@@ -20,6 +20,9 @@ const NOTE_CHIP: Record<string, string> = {
 const STATUSES = ["backlog", "ready", "doing", "review", "done", "dropped"];
 const PRIORITIES = ["P0", "P1", "P2", "P3"];
 const LINK_KINDS = ["blocked_by", "relates", "parent", "duplicate_of"];
+/// `ui, api  infra` → `["ui", "api", "infra"]`.
+const splitTags = (text: string) => text.split(/[\s,]+/).filter(Boolean);
+
 const REF_KINDS = ["pr", "commit", "note", "preview", "message", "url"];
 const IMG_EXT = /\.(png|jpe?g|gif|webp)$/i;
 
@@ -121,6 +124,8 @@ export default function Drawer({
     priority: string;
     owner: string;
     component: string;
+    /** Comma- or space-separated while editing. */
+    tags: string;
     body: string;
   } | null>(null);
   const [bodyPreview, setBodyPreview] = useState(false);
@@ -219,6 +224,7 @@ export default function Drawer({
       priority: detail.priority,
       owner: detail.owner ?? "",
       component: detail.component ?? "",
+      tags: (detail.tags ?? []).join(", "),
       body: detail.body,
     });
     setBodyPreview(false);
@@ -234,6 +240,11 @@ export default function Drawer({
     if (edit.owner !== (detail.owner ?? "")) patch.owner = edit.owner;
     if (edit.component !== (detail.component ?? ""))
       patch.component = edit.component;
+    // The server sorts, de-duplicates and validates; compare as sets
+    // so retyping the same tags in another order is not a write.
+    const tags = [...new Set(splitTags(edit.tags))].sort();
+    if (tags.join(",") !== [...(detail.tags ?? [])].sort().join(","))
+      patch.tags = tags;
     if (edit.body !== detail.body) patch.body = edit.body;
     if (Object.keys(patch).length === 0) {
       setEdit(null);
@@ -405,6 +416,49 @@ export default function Drawer({
                         </datalist>
                       )}
                     </label>
+                    <label className="block col-span-2">
+                      <span className="slabel">tags</span>
+                      <input
+                        value={edit.tags}
+                        onChange={(e) =>
+                          setEdit({ ...edit, tags: e.target.value })
+                        }
+                        className="field w-full mt-1"
+                        placeholder="comma separated — empty clears"
+                      />
+                      {(project?.tags?.length ?? 0) > 0 && (
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                          <span className="kicker">declared</span>
+                          {project!.tags!.map((tag) => {
+                            const cur = splitTags(edit.tags);
+                            const on = cur.includes(tag);
+                            return (
+                              <button
+                                key={tag}
+                                type="button"
+                                aria-pressed={on}
+                                onClick={() =>
+                                  setEdit({
+                                    ...edit,
+                                    tags: (on
+                                      ? cur.filter((t) => t !== tag)
+                                      : [...cur, tag]
+                                    ).join(", "),
+                                  })
+                                }
+                                className={`chip !py-[.1rem] ${
+                                  on
+                                    ? "bg-accent/10 text-accent"
+                                    : "bg-ink-800 text-ink-400 hover:text-ink-200"
+                                }`}
+                              >
+                                {tag}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </label>
                     <div className="col-span-2">
                       <div className="flex items-baseline gap-2">
                         <span className="slabel">body (markdown)</span>
@@ -452,6 +506,11 @@ export default function Drawer({
                         {detail.component}
                       </span>
                     )}
+                    {(detail.tags ?? []).map((tag) => (
+                      <span key={tag} className="chip bg-ink-800 text-ink-400">
+                        #{tag}
+                      </span>
+                    ))}
                   </div>
                 )}
                 {statusLocked && (

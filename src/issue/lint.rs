@@ -141,6 +141,26 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
                     lint.err(format!("{id}: unknown component '{comp}'"));
                 }
             }
+            for tag in &front.tags {
+                if !model::valid_tag(tag) {
+                    lint.err(format!("{id}: bad tag grammar '{tag}'"));
+                } else if !project.tags.is_empty() && !project.tags.contains(tag) {
+                    lint.err(format!("{id}: unknown tag '{tag}'"));
+                }
+            }
+        }
+        let mut seen_tags = HashSet::new();
+        for tag in &front.tags {
+            if !seen_tags.insert(tag.as_str()) {
+                lint.err(format!("{id}: duplicated tag '{tag}'"));
+            }
+        }
+        if front.tags.len() > model::TAG_MAX {
+            lint.err(format!(
+                "{id}: {} tags (cap {})",
+                front.tags.len(),
+                model::TAG_MAX
+            ));
         }
         if !model::STATUSES.contains(&front.status.as_str()) {
             lint.err(format!("{id}: unknown status '{}'", front.status));

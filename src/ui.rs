@@ -893,6 +893,7 @@ struct NewIssueReq {
     priority: Option<String>,
     owner: Option<String>,
     component: Option<String>,
+    tags: Option<Vec<String>>,
     parent: Option<String>,
     blocked_by: Option<Vec<String>>,
 }
@@ -908,6 +909,8 @@ struct PatchReq {
     component: Option<String>,
     title: Option<String>,
     body: Option<String>,
+    /// Replaces the tag list; `[]` clears it.
+    tags: Option<Vec<String>>,
     if_rev: Option<String>,
 }
 
@@ -1153,6 +1156,7 @@ fn write_route(
             &blocked_by,
             req.owner.as_deref(),
             req.component.as_deref(),
+            &req.tags.unwrap_or_default(),
             None,
             &actor,
         ) {
@@ -1217,6 +1221,7 @@ fn write_route(
                     component: req.component,
                     title: req.title,
                     body: req.body,
+                    tags: req.tags,
                 },
                 req.if_rev.as_deref(),
                 &actor,
@@ -1574,6 +1579,23 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
         })
     };
 
+    // Every value of a repeatable key — `tag=a&tag=b` and `tag=a,b` agree.
+    let query_all = |key: &str| -> Vec<String> {
+        raw_query
+            .split('&')
+            .filter_map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+                (k == key).then(|| pct_decode(v)).flatten()
+            })
+            .flat_map(|v| {
+                v.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+
     let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
     let actor = request_actor(&request, opts);
 
@@ -1636,6 +1658,7 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                         json!({
                             "key": p.key, "prefix": p.prefix,
                             "components": p.components,
+                            "tags": p.tags,
                             "default_owner": p.default_owner,
                             "repos": p.repos.iter().map(|r| json!({
                                 "path": r.path, "remote": r.remote})).collect::<Vec<_>>(),
@@ -1656,6 +1679,21 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                         return;
                     }
                 }
+                // The same slices as `issue ls`: tag (all of), status
+                // (any of), epic, owner, component, priority, open=1.
+                let slice = board::Filter {
+                    tags: query_all("tag"),
+                    epic: query("epic").filter(|s| !s.is_empty()),
+                    owner: query("owner").filter(|s| !s.is_empty()),
+                    statuses: query_all("status"),
+                    component: query("component").filter(|s| !s.is_empty()),
+                    priority: query("priority").filter(|s| !s.is_empty()),
+                    open: query("open").is_some_and(|v| v == "1" || v == "true"),
+                };
+                if let Err(e) = slice.validate() {
+                    send(request, err_response(400, &e.to_string()));
+                    return;
+                }
                 let issues = board::load_all(&pm.dir, filter.as_deref()).unwrap_or_default();
                 let jobs = board::fetch_job_outcomes(state_dir);
                 let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
@@ -1665,8 +1703,31 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     json_response(json!({
                         "issues": views
                             .iter()
+                            .filter(|v| slice.matches(v))
                             .map(|v| with_agents(board::card_json(v), &by_issue, &v.issue.front.id))
                             .collect::<Vec<_>>(),
+                    })),
+                );
+            }
+            Err(e) => send(request, err_response(503, &e.to_string())),
+        },
+        // `GET /api/epics?project=` — issues with children and their
+        // children's progress; the payload `issue epic ls --json` prints.
+        "/api/epics" => match Pm::at(pm_dir) {
+            Ok(pm) => {
+                let filter = query("project");
+                if filter.as_ref().is_some_and(|p| !model::valid_key(p)) {
+                    send(request, err_response(400, "bad project key"));
+                    return;
+                }
+                // Every project loads so cross-project children count.
+                let issues = board::load_all(&pm.dir, None).unwrap_or_default();
+                let jobs = board::fetch_job_outcomes(state_dir);
+                let views = board::views_with_jobs(&pm.config.notes_dir(), issues, &jobs);
+                send(
+                    request,
+                    json_response(json!({
+                        "epics": board::epics_json(&views, filter.as_deref()),
                     })),
                 );
             }

@@ -7,6 +7,7 @@ import Plan from "./components/Plan";
 import Sidebar from "./components/Sidebar";
 import Toast, { type ToastMsg } from "./components/Toast";
 import { Logo } from "./components/Logo";
+import { NO_FILTERS, readFilters, writeFilters, type BoardFilters } from "./filters";
 import type {
   AgentsPayload,
   Health,
@@ -20,6 +21,7 @@ export default function App() {
   const [tab, setTab] = useState<"board" | "plan" | "agents">("board");
   const [project, setProject] = useState("all");
   const [query, setQuery] = useState("");
+  const [filters, setFilters] = useState<BoardFilters>(NO_FILTERS);
   const [issues, setIssues] = useState<IssueCard[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<AgentsPayload | null>(null);
@@ -42,6 +44,7 @@ export default function App() {
       const q = new URLSearchParams(location.search);
       setProject(q.get("project") ?? "all");
       setOpenId(q.get("issue"));
+      setFilters(readFilters(q));
     };
     read();
     addEventListener("popstate", read);
@@ -52,9 +55,10 @@ export default function App() {
     const q = new URLSearchParams();
     if (project !== "all") q.set("project", project);
     if (openId) q.set("issue", openId);
+    writeFilters(q, filters);
     const s = q.toString();
     history.replaceState(null, "", location.pathname + (s ? `?${s}` : ""));
-  }, [project, openId]);
+  }, [project, openId, filters]);
 
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
@@ -347,6 +351,8 @@ export default function App() {
             readOnly={readOnly}
             actor={actor}
             onQuery={setQuery}
+            filters={filters}
+            onFilters={setFilters}
             onOpen={openIssue}
             onMove={moveIssue}
             onCreated={applyWrite}

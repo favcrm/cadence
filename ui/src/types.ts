@@ -30,6 +30,8 @@ export interface IssueCard {
   priority: string;
   owner?: string;
   component?: string;
+  /** Sorted, de-duplicated slicing labels. */
+  tags?: string[];
   parent?: string;
   blocked_by: string[];
   relates: string[];
@@ -94,6 +96,7 @@ export interface IssueHistoryEntry {
     | "ref"
     | "comment"
     | "attach"
+    | "tag"
     | "other";
   summary: string;
   fields?: Record<string, string | null>;
@@ -124,6 +127,8 @@ export interface Project {
   key: string;
   prefix: string;
   components: string[];
+  /** Declared tag vocabulary — empty accepts any well-formed tag. */
+  tags?: string[];
   default_owner?: string;
   repos: { path?: string; remote?: string }[];
   issues: number;
