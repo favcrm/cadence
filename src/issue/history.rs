@@ -7,13 +7,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front};
 use crate::issue::{board, git, hooks, parse, project, time};
+use crate::proc::BoundedError;
 
 /// Front keys in file order — the union over `Front` is fixed, so
 /// diff/blame output is stable instead of map-ordered.
@@ -588,33 +589,13 @@ fn git_bounded(
     args: &[&str],
     timeout: Duration,
 ) -> std::result::Result<String, String> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn: {e}"))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let out = child.wait_with_output().map_err(|e| e.to_string())?;
-                return if out.status.success() {
-                    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-                } else {
-                    Err("git log failed".to_string())
-                };
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("timed out".to_string());
-            }
-            Err(e) => return Err(e.to_string()),
-        }
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    match crate::proc::run_bounded(&mut cmd, timeout) {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
+        Ok(_) => Err("git log failed".to_string()),
+        Err(BoundedError::Spawn(e)) => Err(format!("spawn: {e}")),
+        Err(e) => Err(e.to_string()),
     }
 }
 
