@@ -134,6 +134,49 @@ export interface Project {
   issues: number;
 }
 
+/** One `needs_me` row — what is waiting on a human, with the command. */
+export interface NeedsMe {
+  kind: string;
+  title: string;
+  /** Seconds in this state. */
+  age: number;
+  project: string;
+  link?: string | null;
+  command: string;
+}
+
+/** Deploy drift — merged commits on the default branch past the
+ *  running daemon's build commit. */
+export interface Drift {
+  matched: boolean;
+  project?: string;
+  repo?: string;
+  ref?: string;
+  build_commit?: string;
+  known?: boolean;
+  count?: number;
+  commits?: { subject: string; pr?: number | null }[];
+  reason?: string;
+  /** Present when drift exists but the restart row is held back. */
+  held?: string;
+}
+
+export interface OverviewProject {
+  key: string;
+  open_by_status: Record<string, number>;
+  oldest_review_age?: number | null;
+}
+
+/** `GET /api/overview` — everything derived, nothing stored. */
+export interface Overview {
+  needs_me: NeedsMe[];
+  drift: Drift;
+  projects: OverviewProject[];
+  github: { state: "ok" | "cached" | "stale" | "unavailable"; error?: string | null; at?: number };
+  daemon: { reachable: boolean; build_commit?: string; build_time?: string; started_at?: number; info?: string };
+  generated_at: number;
+}
+
 /** A task assignment an agent is bound to through its job. */
 export interface AgentTask {
   task: string;
@@ -235,13 +278,22 @@ export interface AgentDetail {
   on?: string[];
 }
 
-/** GET /api/meta — what this client may do and who writes credit to.
- *  Tailnet-shared boards resolve the actor from Tailscale identity
- *  headers; `read_only` boards refuse every write. */
+/** GET /api/meta — what this client may do and who writes credit to,
+ *  plus the build identity of the serving binary and the daemon's when
+ *  reachable. Tailnet-shared boards resolve the actor from Tailscale
+ *  identity headers; `read_only` boards refuse every write. */
 export interface Meta {
   read_only: boolean;
   actor: string;
   tailnet_url: string | null;
+  version: string;
+  build_commit: string;
+  build_time: string;
+  daemon?: {
+    build_commit: string;
+    build_time: string;
+    started_at: number;
+  } | null;
 }
 
 export interface Health {

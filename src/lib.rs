@@ -11,6 +11,7 @@ pub mod error;
 pub mod issue;
 pub mod mcp;
 pub mod memory;
+pub mod overview;
 pub mod proc;
 pub mod proto;
 pub mod review;

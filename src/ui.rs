@@ -1690,18 +1690,28 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
     match path.as_str() {
         // What the SPA needs to render itself correctly for this
         // client: read-only mode, the actor this request would write
-        // as, and the tailnet URL when sharing is armed.
-        "/api/meta" => send(
-            request,
-            json_response(json!({
-                "read_only": opts.read_only,
-                "actor": actor,
-                "tailnet_url": opts
-                    .tailnet
-                    .as_ref()
-                    .map(|(dns, port)| tailnet_url(dns, *port)),
-            })),
-        ),
+        // as, and the tailnet URL when sharing is armed. Build identity
+        // rides too — the serving binary's, plus the daemon's when
+        // reachable (`daemon_info` carries the running build, which is
+        // the one deploy drift measures).
+        "/api/meta" => {
+            let daemon = client::rpc(state_dir, "daemon_info", json!({})).ok();
+            send(
+                request,
+                json_response(json!({
+                    "read_only": opts.read_only,
+                    "actor": actor,
+                    "tailnet_url": opts
+                        .tailnet
+                        .as_ref()
+                        .map(|(dns, port)| tailnet_url(dns, *port)),
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "build_commit": crate::overview::BUILD_COMMIT,
+                    "build_time": crate::overview::BUILD_TIME,
+                    "daemon": daemon,
+                })),
+            );
+        }
         "/api/health" => {
             let pm = Pm::at(pm_dir).ok();
             let (projects, issues) = match &pm {
@@ -1729,6 +1739,10 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                 })),
             );
         }
+        "/api/overview" => send(
+            request,
+            json_response(crate::overview::overview(state_dir, pm_dir)),
+        ),
         "/api/projects" => match Pm::at(pm_dir) {
             Ok(pm) => {
                 let projects = project::list(&pm.dir).unwrap_or_default();

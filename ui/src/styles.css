@@ -134,13 +134,15 @@ body {
   border-color: #2dd4bf;
   box-shadow: 0 0 0 3px rgba(45, 212, 191, .1);
 }
-.chip {
-  display: inline-flex;
-  align-items: center;
-  gap: .3rem;
-  border-radius: .25rem;
-  padding: .05rem .4rem;
-  font: 500 .6875rem "IBM Plex Mono", monospace;
+@layer components {
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: .3rem;
+    border-radius: .25rem;
+    padding: .05rem .4rem;
+    font: 500 .6875rem "IBM Plex Mono", monospace;
+  }
 }
 .reveal {
   animation: reveal .45s cubic-bezier(.2, .8, .2, 1) both;

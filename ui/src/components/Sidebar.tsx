@@ -3,7 +3,7 @@ import { Logo } from "./Logo";
 
 interface Props {
   tab: string;
-  onTab: (tab: "board" | "plan" | "agents" | "memory") => void;
+  onTab: (tab: "overview" | "board" | "plan" | "agents" | "memory") => void;
   project: string;
   onProject: (key: string) => void;
   projects: Project[];
@@ -31,6 +31,12 @@ const loopsIcon = (
     <path d="M5 7.2l6-3M5 8.8l6 3" />
   </svg>
 );
+const overviewIcon = (
+  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
+    <circle cx="8" cy="8" r="5.5" />
+    <path d="M8 5.5v3l2 1.4" />
+  </svg>
+);
 const agentsIcon = (
   <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
     <rect x="2" y="3" width="12" height="8.5" rx="1.2" />
@@ -56,6 +62,13 @@ export default function Sidebar({ tab, onTab, project, onProject, projects, tota
         </span>
       </div>
       <nav className="grid gap-[3px]">
+        <button
+          onClick={() => onTab("overview")}
+          className="navlink"
+          aria-current={tab === "overview" ? "page" : undefined}
+        >
+          {overviewIcon}Overview
+        </button>
         <button
           onClick={() => onTab("board")}
           className="navlink"
