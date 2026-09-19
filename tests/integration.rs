@@ -3099,6 +3099,161 @@ fn claude_sessions(dir: &Path) -> Vec<(u32, String)> {
     out
 }
 
+/// Fake `cursor-agent` TUI — the Cursor profile's endpoint. The real
+/// TUI holds an open fd on `~/.cursor/chats/<hash>/<chat>/store.db`
+/// for the session's whole life, so the mock opens the same file and
+/// keeps it — the profile's ownership scan finds it under
+/// `<chats>/mockhash/<chat>/store.db`. `create-chat` mints the id a
+/// fresh launch resumes; `--resume` arrives as argv (the profile
+/// appends it to the verbatim override); MOCK_CURSOR_SWAP makes the
+/// pane open a different chat than asked — a changed-owner fence.
+/// `$FAKE_PANE` (set by the mock tmux) points at the session state.
+const MOCK_CURSOR_TUI_PY: &str = r#"
+import os, sys, time, uuid
+
+chats = sys.argv[1]
+if "create-chat" in sys.argv:
+    print(uuid.uuid4()); sys.exit(0)
+sid = sys.argv[sys.argv.index("--resume") + 1] if "--resume" in sys.argv \
+    else "missing-resume"
+if os.environ.get("MOCK_CURSOR_SWAP"):
+    sid = "swapped-" + sid
+chat_dir = os.path.join(chats, "mockhash", sid)
+os.makedirs(chat_dir, exist_ok=True)
+# The real TUI holds an fd on the chat's store.db for its whole life —
+# the profile's ownership proof scans /proc fds for exactly this.
+db = open(os.path.join(chat_dir, "store.db"), "a")
+# Record the launch argv so tests can assert the profile's flags —
+# temp + rename so a reader never sees the file torn mid-write.
+_argv_tmp = os.environ["FAKE_PANE"] + ".argv.tmp"
+open(_argv_tmp, "w").write(" ".join(sys.argv[1:]))
+os.rename(_argv_tmp, os.environ["FAKE_PANE"] + ".argv")
+# Record the pane env the adapter exported via tmux -e.
+_env_tmp = os.environ["FAKE_PANE"] + ".env.tmp"
+open(_env_tmp, "w").write(
+    "CADENCE_ALIAS=%s\nCADENCE_STATE_DIR=%s\n" % (
+        os.environ.get("CADENCE_ALIAS", ""),
+        os.environ.get("CADENCE_STATE_DIR", "")))
+os.rename(_env_tmp, os.environ["FAKE_PANE"] + ".env")
+# The pane's own input-line glyph + the idle frame — the shape the real
+# TUI shows so the screen probe recognizes idle.
+open(os.environ["FAKE_PANE"] + ".glyph", "w").write("→")
+with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+    f.write("Mock Cursor TUI [%s]\n" % sid)
+    f.write("  → Plan, search, build anything\n")
+    f.write("  Cursor Grok 4.6 High\n  /mock · main\n")
+while True:
+    inp = os.environ["FAKE_PANE"] + ".input"
+    try:
+        data = open(inp).read()
+    except FileNotFoundError:
+        data = ""
+    if "<ENTER>" in data:
+        text, rest = data.split("<ENTER>", 1)
+        open(inp, "w").write(rest)
+        if text.strip():
+            with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+                f.write("  %s\nMOCK_REPLY: %s\n" % (text.strip(), text.strip()))
+                # The submitted line echoes into the transcript and the
+                # input's watermark flips to the follow-up form.
+                f.write("  → Add a follow-up\n")
+                f.write("  Cursor Grok 4.6 High\n  /mock · main\n")
+    if "<KEY:C-c>" in data:
+        open(inp, "w").write("")
+        with open(os.environ["FAKE_PANE"] + ".screen", "a") as f:
+            f.write("^C interrupt\n")
+    time.sleep(0.05)
+"#;
+
+struct MockCursorTui {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    dir: PathBuf,
+    chats: PathBuf,
+}
+
+/// Install the mock tmux/cursor pair — the same private-tmux harness
+/// as `install_mock_devin`, pointing the adapter at the cursor
+/// profile's env overrides instead.
+fn install_mock_cursor_tui(dir: &Path) -> MockCursorTui {
+    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let chats = dir.join("cursor-chats");
+    let tmux_state = dir.join("tmux-state");
+    std::fs::create_dir_all(&chats).unwrap();
+    std::fs::create_dir_all(&tmux_state).unwrap();
+    let tmux = dir.join("tmux");
+    let cursor_py = dir.join("mock-cursor.py");
+    std::fs::write(&tmux, MOCK_TMUX_PY).unwrap();
+    std::fs::write(&cursor_py, MOCK_CURSOR_TUI_PY).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A `cursor-agent`-named symlink onto python3: the pane's argv[0]
+    // then names the real binary, so the profile's `--resume` argv
+    // proof (not only the store.db fd) is exercised in integration.
+    let out = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    let python = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    let cursor_bin = dir.join("cursor-agent");
+    std::os::unix::fs::symlink(&python, &cursor_bin).unwrap();
+    std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
+    std::env::set_var("CADENCE_TMUX_COMMAND", &tmux);
+    std::env::set_var(
+        "CADENCE_CURSOR_COMMAND",
+        format!(
+            "{} {} {}",
+            cursor_bin.display(),
+            cursor_py.display(),
+            chats.display()
+        ),
+    );
+    std::env::set_var("CADENCE_CURSOR_CHATS", &chats);
+    // A swap set by an earlier test must not leak into this install.
+    std::env::remove_var("MOCK_CURSOR_SWAP");
+    MockCursorTui {
+        _guard: guard,
+        dir: dir.to_path_buf(),
+        chats,
+    }
+}
+
+impl TestDaemon {
+    fn mock_cursor_tui(&self) -> MockCursorTui {
+        install_mock_cursor_tui(self.dir.path())
+    }
+
+    /// Register a pty agent on the cursor profile.
+    fn register_cursor_pty(&self, alias: &str, params: Value) {
+        let cwd = self.dir.path().to_str().unwrap().to_string();
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "cursor",
+                   "endpoint_kind": "pty", "cwd": cwd,
+                   "params": params.to_string()}),
+        )
+        .unwrap();
+    }
+
+    /// The tmux-side state dir for a cursor-pane agent session name.
+    fn cursor_pane_file(&self, mock: &MockCursorTui, alias: &str, ext: &str) -> PathBuf {
+        mock.dir
+            .join("tmux-state")
+            .join(socket_for(&self.state))
+            .join(format!("{alias}.{ext}"))
+    }
+}
+
+impl Drop for MockCursorTui {
+    fn drop(&mut self) {
+        kill_mock_panes(&self.dir);
+        std::env::remove_var("CADENCE_TMUX_COMMAND");
+        std::env::remove_var("CADENCE_CURSOR_COMMAND");
+        std::env::remove_var("CADENCE_CURSOR_CHATS");
+        std::env::remove_var("MOCK_CURSOR_SWAP");
+        std::env::remove_var("MOCK_TMUX_STATE");
+    }
+}
+
 /// Mirror of the adapter's `cadence-<fnv64(state_dir)>` socket name.
 fn socket_for(state_dir: &Path) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -9247,6 +9402,562 @@ fn cli_join_claude_tui_briefs_prefixes() {
         assert!(text.contains(want), "briefing missing {want}:\n{text}");
     }
     // The group upstream is in params so results route to the PM.
+    assert_eq!(agent["params"]["upstream"], "pm", "{agent}");
+}
+
+// ── Cursor TUI profile through the generic adapter (CAD-56) ────────
+
+/// A fresh `cursor` pty launch mints a chat id via `create-chat`,
+/// resumes it in the pane argv, and proves ownership through the
+/// `store.db` fd the pane holds under the chats dir.
+#[test]
+fn pty_cursor_launch_mints_chat_and_proves_ownership() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    d.register_cursor_pty("cu", json!({"auto_ready": "verified"}));
+    let agent = d.wait_agent("cu", "idle", 20);
+    // The TUI paint that makes the probe read idle happens after the
+    // mock's argv/env dumps — the cause ordered after them.
+    wait_probe_idle(&d, "cu", 15);
+    let session = agent["session_id"].as_str().unwrap().to_string();
+    assert!(uuid::Uuid::parse_str(&session).is_ok(), "{session}");
+    // The profile minted the chat then resumed it — the pane's own
+    // argv names its session.
+    let argv = std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "argv")).unwrap();
+    assert!(
+        argv.contains(&format!("--resume {session}")),
+        "argv: {argv} / session: {session}"
+    );
+    assert!(argv.contains("--trust"), "{argv}");
+    // The chat's store.db sits under the chats dir, held open by the
+    // pane — the same proof the real TUI's fd gives.
+    let db = mock.chats.join("mockhash").join(&session).join("store.db");
+    assert!(db.exists(), "{db:?}");
+    // tmux -e exports reached the pane (cadence self inside the TUI).
+    let env = std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "env")).unwrap();
+    assert!(env.contains("CADENCE_ALIAS=cu"), "{env}");
+    // The registry row advertises the tmux endpoint.
+    let show = d.rpc("agent_show", json!({"alias": "cu"})).unwrap();
+    let caps = &show["agent"]["capabilities"];
+    assert_eq!(caps["attach"], "tmux", "{caps}");
+    assert_eq!(caps["ready_gate"], true, "{caps}");
+    assert_eq!(caps["reports"], "explicit", "{caps}");
+    assert_eq!(caps["session_id_label"], "Cursor chat", "{caps}");
+}
+
+/// `-r <chatId>` resumes an existing chat: the pane argv carries
+/// `--resume <id>` and the store the pane opens names the same chat.
+#[test]
+fn pty_cursor_resume_passes_resume_flag() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    // A random id: the ownership scan is host-wide, so a fixed uuid
+    // could collide with a real `cursor-agent --resume` left running.
+    let chat = format!("test-resume-{}", uuid::Uuid::new_v4().simple());
+    d.register_cursor_pty("cu", json!({"session": chat}));
+    let agent = d.wait_agent("cu", "idle", 20);
+    assert_eq!(agent["session_id"].as_str().unwrap(), chat);
+    // Idle probe ⇒ the mock painted its TUI ⇒ its argv dump is on disk.
+    wait_probe_idle(&d, "cu", 15);
+    let argv = std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "argv")).unwrap();
+    assert!(argv.contains(&format!("--resume {chat}")), "{argv}");
+    assert!(mock
+        .chats
+        .join("mockhash")
+        .join(&chat)
+        .join("store.db")
+        .exists());
+}
+
+/// A live store.db held by a process outside the pane refuses
+/// takeover — the chat is already attached elsewhere.
+#[test]
+fn pty_cursor_foreign_session_refuses_takeover() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    // A foreign live process holds "held-chat"'s store.db — the same
+    // proof shape as another cursor-agent TUI.
+    let held = mock.chats.join("mockhash").join("held-chat");
+    std::fs::create_dir_all(&held).unwrap();
+    let db = held.join("store.db");
+    std::fs::write(&db, "").unwrap();
+    let mut holder = std::process::Command::new("python3")
+        .args([
+            "-c",
+            &format!(
+                "import time; f=open('{}','a'); time.sleep(30)",
+                db.display()
+            ),
+        ])
+        .spawn()
+        .unwrap();
+    d.register_cursor_pty("cu", json!({"session": "held-chat"}));
+    let agent = d.wait_agent("cu", "attention", 20);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("owned by another terminal"), "{err}");
+    holder.kill().unwrap();
+    let _ = holder.wait();
+}
+
+/// A foreign `cursor-agent` argv carrying `--resume <chat>` is the
+/// same ownership proof as the store.db fd — a fabricated argv with
+/// no chat-store fd at all still refuses takeover.
+#[test]
+fn pty_cursor_foreign_argv_refuses_takeover() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_cursor_tui();
+    // `exec -a` fabricates argv[0]=cursor-agent; python keeps the
+    // `--resume argv-held` tail on its cmdline while it sleeps.
+    let mut holder = std::process::Command::new("bash")
+        .args([
+            "-c",
+            "exec -a cursor-agent python3 -c 'import time; time.sleep(60)' --resume argv-held",
+        ])
+        .spawn()
+        .unwrap();
+    // The exec is async — wait until the fabricated argv is visible
+    // in /proc before registering.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", holder.id())).unwrap_or_default();
+        if cmdline.windows(8).any(|w| w == b"--resume") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fabricated argv never appeared");
+        thread::sleep(Duration::from_millis(20));
+    }
+    d.register_cursor_pty("cu", json!({"session": "argv-held"}));
+    let agent = d.wait_agent("cu", "attention", 20);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("owned by another terminal"), "{err}");
+    holder.kill().unwrap();
+    let _ = holder.wait();
+}
+
+/// A fresh open mints once: the id is folded into `params.session`
+/// before the pane exists (`cadence/session_minted`), so the respawn
+/// after a stop resumes the same chat rather than minting a new one.
+/// `agent set --next-launch model=…` is legal for a pty endpoint and
+/// replays verbatim on the next open.
+#[test]
+fn pty_cursor_minted_session_persists_and_model_replays() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    d.register_cursor_pty("cu", json!({"model": "grok-one"}));
+    let agent = d.wait_agent("cu", "idle", 20);
+    wait_probe_idle(&d, "cu", 15);
+    let sid = agent["session_id"].as_str().unwrap().to_string();
+    let argv_file = d.cursor_pane_file(&mock, "cu", "argv");
+    let argv1 = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv1.contains("--model grok-one"), "{argv1}");
+    assert!(argv1.contains(&format!("--resume {sid}")), "{argv1}");
+    // The mint landed in params.session at open — not only in
+    // thread_id after it — so even an unproven launch keeps its id.
+    let show = d.rpc("agent_show", json!({"alias": "cu"})).unwrap();
+    assert_eq!(
+        show["agent"]["params"]["session"].as_str().unwrap(),
+        sid,
+        "{show}"
+    );
+    d.rpc(
+        "agent_set",
+        json!({"alias": "cu", "patch": {"model": "grok-two"},
+               "next_launch": true}),
+    )
+    .unwrap();
+    d.rpc("agent_stop", json!({"alias": "cu"})).unwrap();
+    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    let agent = d.wait_agent("cu", "idle", 20);
+    // Same chat — the respawn resumed the minted id, never re-minted.
+    assert_eq!(agent["session_id"].as_str().unwrap(), sid);
+    wait_probe_idle(&d, "cu", 15);
+    let argv2 = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv2.contains("--model grok-two"), "{argv2}");
+    assert!(!argv2.contains("--model grok-one"), "{argv2}");
+    assert!(argv2.contains(&format!("--resume {sid}")), "{argv2}");
+}
+
+/// Launch merges `Shell(cadence)` into the CLI's allowlist
+/// (`<chats>/../cli-config.json`), preserving the document and
+/// dropping a `.bak`; a second launch leaves the file untouched.
+#[test]
+fn pty_cursor_allowlist_merged_into_cli_config() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    let config = mock.dir.join("cli-config.json");
+    std::fs::write(
+        &config,
+        "{\n  \"permissions\": {\n    \"allow\": [\"Shell(ls)\"],\n    \"deny\": []\n  },\n  \"display\": {\"mode\": \"zen\"}\n}\n",
+    )
+    .unwrap();
+    d.register_cursor_pty("cu", json!({}));
+    d.wait_agent("cu", "idle", 20);
+    let text = std::fs::read_to_string(&config).unwrap();
+    let doc: Value = serde_json::from_str(&text).unwrap();
+    let allow = doc["permissions"]["allow"].as_array().unwrap();
+    assert!(allow.iter().any(|e| e == "Shell(cadence)"), "{text}");
+    assert!(allow.iter().any(|e| e == "Shell(ls)"), "{text}");
+    assert_eq!(doc["display"]["mode"].as_str().unwrap(), "zen", "{text}");
+    let bak = std::fs::read_to_string(mock.dir.join("cli-config.json.bak")).unwrap();
+    assert!(bak.contains("Shell(ls)"), "{bak}");
+    // A resume leaves an already-merged config byte-identical.
+    let before = std::fs::read_to_string(&config).unwrap();
+    d.rpc("agent_stop", json!({"alias": "cu"})).unwrap();
+    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    d.wait_agent("cu", "idle", 20);
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+}
+
+/// An unparseable `cli-config.json` refuses the launch with a clear
+/// error rather than clobbering the user's settings.
+#[test]
+fn pty_cursor_malformed_cli_config_refuses_launch() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    let config = mock.dir.join("cli-config.json");
+    std::fs::write(&config, "{ not json").unwrap();
+    d.register_cursor_pty("cu", json!({}));
+    let agent = d.wait_agent("cu", "attention", 20);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("not valid JSON"), "{err}");
+    assert!(err.contains("refusing to launch"), "{err}");
+    // The malformed file is left exactly as found.
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "{ not json");
+}
+
+/// The pane opening a different chat than the one we asked for is a
+/// changed-owner fence, never an adoption.
+#[test]
+fn pty_cursor_session_mismatch_fences_closed() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_cursor_tui();
+    std::env::set_var("MOCK_CURSOR_SWAP", "1");
+    d.register_cursor_pty("cu", json!({"session": "want-chat"}));
+    let agent = d.wait_agent("cu", "attention", 20);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("changed owner fails closed"), "{err}");
+}
+
+/// A pane that survives a daemon restart is re-adopted under the same
+/// chat — the surviving store.db fd is the ownership proof again.
+#[test]
+fn pty_cursor_restart_readopts_pane() {
+    let dir = TempDir::new().unwrap();
+    let seeded = dir.path().join("state");
+    std::fs::create_dir_all(&seeded).unwrap();
+    let fixtures = TempDir::new().unwrap();
+    {
+        let _mock = install_mock_cursor_tui(fixtures.path());
+        let d = TestDaemon::start_on(seeded.clone());
+        d.register_cursor_pty("cu", json!({}));
+        let agent = d.wait_agent("cu", "idle", 20);
+        let native = agent["thread_id"].as_str().unwrap().to_string();
+        let pane_pid = agent["pid"].as_i64().unwrap();
+        // Daemon restart: the mock tmux server (fixture dir) outlives
+        // it, so the pane is still alive and must be reattached, not
+        // relaunched.
+        drop(d);
+        let d2 = TestDaemon::start_on(seeded.clone());
+        let agent2 = d2.wait_agent("cu", "idle", 25);
+        assert_eq!(agent2["thread_id"].as_str().unwrap(), native);
+        assert_eq!(agent2["pid"].as_i64().unwrap(), pane_pid);
+    }
+}
+
+/// Send → paste → echo → explicit report, under the cursor profile.
+/// `auto_ready=verified` self-claims on the empty `→` prompt.
+#[test]
+fn pty_cursor_send_pastes_and_completes_via_report() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    d.register_cursor_pty("cu", json!({"auto_ready": "verified"}));
+    d.wait_agent("cu", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cu", "text": "say hi cursor", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "cu", "m1");
+    assert!(token.starts_with("pty-"), "{token}");
+    let claim = d.wait_event("cu", "ready_claimed", 5);
+    assert_eq!(claim["payload"]["by"], "daemon", "{claim}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen =
+            std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "screen")).unwrap_or_default();
+        if screen.contains("MOCK_REPLY: say hi cursor") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no reply: {screen}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("cu", "m1", &["completed"], 10);
+}
+
+/// Cursor's forbidden prefixes — `/` command menu, `!` shell mode,
+/// `@` file picker — observed live — reject pre-write and keep the
+/// claim; `#` is a literal draft char.
+#[test]
+fn pty_cursor_forbidden_prefixes_reject_prewrite() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    d.register_cursor_pty("cu", json!({}));
+    d.wait_agent("cu", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "cu"})).unwrap();
+    for (id, body, prefix) in [
+        ("m1", "/skills", '/'),
+        ("m2", "!git status", '!'),
+        ("m3", "@file", '@'),
+        ("m4", "  /indented also forbidden", '/'),
+    ] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "cu", "text": body, "message": id}),
+        )
+        .unwrap();
+        d.wait_message("cu", id, &["failed"], 15);
+        let failed = d.rpc("agent_show", json!({"alias": "cu"})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap()
+            .clone();
+        let err = failed["result"]["error"].as_str().unwrap_or("").to_string();
+        assert!(err.contains(&format!("'{prefix}'")), "{err}");
+        assert!(err.contains("command or mode switch"), "{err}");
+    }
+    // No bytes reached the pane for any rejection.
+    assert!(
+        std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "input"))
+            .unwrap_or_default()
+            .is_empty()
+    );
+    // The claim survived: `#` pastes on it without a second ready.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cu", "text": "# literal tag", "message": "m5"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "cu", "m5");
+    assert!(token.starts_with("pty-"), "{token}");
+}
+
+/// Cursor's own busy line — the interrupt hint on the input row or
+/// the spinner above it — holds the gate, and its permission menu
+/// (answered in the terminal, never via respond) blocks sends until
+/// the worker resolves it.
+#[test]
+fn pty_cursor_busy_and_approval_gate_sends() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    d.register_cursor_pty("cu", json!({"auto_ready": "verified"}));
+    d.wait_agent("cu", "idle", 20);
+    let state = d.cursor_pane_file(&mock, "cu", "tui-state");
+    // Devin's marker is inert under this profile.
+    std::fs::write(&state, "stub working\n").unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cu", "text": "stub marker is inert", "message": "m1"}),
+    )
+    .unwrap();
+    pty_token(&d, "cu", "m1");
+    // The cursor spinner's own shape holds the gate — status row
+    // above the input line plus the interrupt hint on it. (The
+    // model/cwd bar renders below the input row on real frames.)
+    std::fs::write(
+        &state,
+        " ⠠⠛ Running  30 tokens\n  → Add a follow-up     ctrl+c to stop\n  /mock · main\n",
+    )
+    .unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cu", "text": "do not paste", "message": "m2"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("cu", "gate_wait", 10);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("busy"),
+        "{wait}"
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "cu"})).unwrap();
+    assert_eq!(probe["busy_marker"], true, "{probe}");
+    std::fs::remove_file(&state).unwrap();
+    pty_token(&d, "cu", "m2");
+    // A permission select holds the next send; the pane answers it.
+    std::fs::write(
+        &state,
+        " Run this command?\n Not in allowlist: whoami\n  → Run (once) (y)\n    Skip & tell the agent what to do instead (esc or n)\n",
+    )
+    .unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cu", "text": "queued behind menu", "message": "m3"}),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let wait = loop {
+        let e = d
+            .events("cu")
+            .into_iter()
+            .find(|e| {
+                e["kind"].as_str() == Some("gate_wait")
+                    && e["payload"]["message"].as_str() == Some("m3")
+            })
+            .unwrap_or_default();
+        if !e.is_null() {
+            break e;
+        }
+        assert!(Instant::now() < deadline, "m3 never hit the gate");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("approval menu"),
+        "{wait}"
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "cu"})).unwrap();
+    assert_eq!(probe["approval_menu"], true, "{probe}");
+    std::fs::remove_file(&state).unwrap();
+    pty_token(&d, "cu", "m3");
+}
+
+/// `cadence cursor` launches the pty endpoint through the CLI — the
+/// pane mints a chat, resumes it with `--trust`, and the endpoint
+/// opens as cursor/pty.
+#[test]
+fn cli_cursor_launch_opens_pty_endpoint() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["cursor", "--alias", "cu", "--cwd"])
+        .arg(d.dir.path())
+        .args(["--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let agent = d.wait_agent("cu", "idle", 20);
+    assert_eq!(agent["provider"], "cursor");
+    assert_eq!(agent["endpoint_kind"], "pty");
+    wait_probe_idle(&d, "cu", 15);
+    let argv = std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "argv")).unwrap();
+    assert!(
+        argv.contains("--trust") && argv.contains("--resume"),
+        "{argv}"
+    );
+}
+
+/// `cadence cursor -r <chatId>` forwards the resume flag to the pane.
+#[test]
+fn cli_cursor_resume_passes_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    // Random like the pty resume test — a real `cursor-agent --resume`
+    // holding the same chat id would (correctly) refuse the takeover.
+    let chat = format!("test-resume-{}", uuid::Uuid::new_v4().simple());
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["cursor", "-r", &chat, "--alias", "cu", "--cwd"])
+        .arg(d.dir.path())
+        .args(["--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("cu", "idle", 20);
+    wait_probe_idle(&d, "cu", 15);
+    let argv = std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "argv")).unwrap();
+    assert!(argv.contains(&format!("--resume {chat}")), "{argv}");
+}
+
+/// `cadence cursor --permission-mode bogus` names the two accepted
+/// values and registers nothing.
+#[test]
+fn cli_cursor_permission_mode_validated() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_cursor_tui();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["cursor", "--permission-mode", "bogus", "--detach"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    for accepted in ["auto-review", "force"] {
+        assert!(err.contains(accepted), "missing '{accepted}': {err}");
+    }
+    let list = d.rpc("agent_list", json!({})).unwrap();
+    assert_eq!(
+        list["agents"].as_array().unwrap().len(),
+        0,
+        "rejected launch left an agent behind"
+    );
+}
+
+/// `cadence join <pm> cursor` opens the worker on the pty endpoint
+/// and its briefing names the forbidden input prefixes.
+#[test]
+fn cli_join_cursor_briefs_prefixes() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    let pm_repo = d.dir.path().join("pmrepo");
+    git_repo(&pm_repo);
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": pm_repo}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 10);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["join", "pm", "cursor", "--alias", "wj", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let agent = d.wait_agent("wj", "idle", 20);
+    assert_eq!(agent["provider"], "cursor");
+    assert_eq!(agent["endpoint_kind"], "pty");
+    wait_probe_idle(&d, "wj", 15);
+    let argv = std::fs::read_to_string(d.cursor_pane_file(&mock, "wj", "argv")).unwrap();
+    assert!(argv.contains("--resume"), "{argv}");
+    // The briefing tells the worker which leading chars never paste.
+    let briefing = d.state.join("briefings/pm/BRIEFING-wj.md");
+    let text = std::fs::read_to_string(&briefing).unwrap();
+    for want in ["`/`", "`!`", "`@`", "refused"] {
+        assert!(text.contains(want), "briefing missing {want}:\n{text}");
+    }
     assert_eq!(agent["params"]["upstream"], "pm", "{agent}");
 }
 

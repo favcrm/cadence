@@ -342,6 +342,14 @@ impl Shared {
                     let _ = self.store.set_model_reported(alias, model);
                 }
             }
+            if kind == "session_minted" {
+                // A pty profile minted its native session id before
+                // spawning — persist it so the next open resumes it
+                // even if this launch dies before session proof.
+                if let Some(session) = params.get("session").and_then(Value::as_str) {
+                    let _ = self.store.set_params(alias, &json!({"session": session}));
+                }
+            }
             let _ = self.store.event_public(alias, kind, params);
             self.wake();
             return;

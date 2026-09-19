@@ -19,6 +19,17 @@ pub trait TuiProfile: Send + Sync {
     /// ("Devin").
     fn name(&self) -> &'static str;
 
+    /// Mint a fresh native session id before the pane spawns, called
+    /// only when the agent has no stored session. A returned id is
+    /// recorded (`cadence/session_minted` → `params.session`) *before*
+    /// the launch runs, so a failed or later open resumes the same id
+    /// instead of abandoning a mint per respawn. Profiles whose TUI
+    /// registers its own session (the pane's owned-session discovery
+    /// adopts whatever it gets) return `None` — the default.
+    fn prepare_session(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Shell command the pane runs: a fresh launch, or a resume of the
     /// native `session` — the resume flag's shape is the profile's own
     /// (Devin: `-r <session>`).

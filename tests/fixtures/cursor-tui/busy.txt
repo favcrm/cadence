@@ -1,0 +1,50 @@
+
+ubuntu@ip-172-31-1-32 c56 $ cd /tmp/c56 && cursor-agent --trust --resume 31cb46a2-8ea4-40f5-9681-c099b6553724
+
+
+  Cursor Agent
+  v2026.09.15-d2fe57e
+  Tip: Use /skills to give Cursor specialized knowledge for tasks.
+
+
+  run: sleep 20 then say done
+
+
+  I'll sleep for 20 seconds, then confirm when it finishes.
+
+  $ sleep 20 17s
+    ctrl+b twice to send to background
+
+ ⠠⠛ Running  43 tokens
+    Tip: Try Cursor Grok 4.6 via /model, frontier intelligence at a fraction of the cost.
+
+
+  → Add a follow-up                                                                                                                                                                     ctrl+c to stop
+
+
+  1 task
+  Cursor Grok 4.6 High                                                                                                                                                                  Run Everything
+  /tmp/c56 · main
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
