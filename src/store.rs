@@ -166,6 +166,31 @@ pub enum Take {
     Message(Box<Message>),
 }
 
+/// A pty turn recorded by a provably clean daemon shutdown (CAD-89).
+/// `recover()` protects the message while the store-level checks pass;
+/// the actor re-validates the pane (`pane_pid` still owns
+/// `native_session`) before the turn is truly re-adopted.
+#[derive(Debug, Clone)]
+pub struct AdoptEntry {
+    pub alias: String,
+    pub message_id: String,
+    pub turn_id: String,
+    /// Endpoint generation the turn's token embeds — preserved across
+    /// the restart so a later report still validates.
+    pub generation: String,
+    pub pane_pid: u32,
+    pub native_session: String,
+}
+
+/// What `serve()` consumed from the state-dir shutdown marker before
+/// opening the store: the recorded entries plus a staleness reason when
+/// the marker itself failed validation (wrong instance, expired) —
+/// entries in a stale marker are refused one by one in `recover()`.
+pub struct ConsumedMarker {
+    pub entries: Vec<AdoptEntry>,
+    pub stale: Option<String>,
+}
+
 /// Parameters for [`Store::register_agent`].
 pub struct NewAgent<'a> {
     pub alias: &'a str,
@@ -181,6 +206,10 @@ pub struct NewAgent<'a> {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Adoption candidates that survived `recover()`'s store-level
+    /// checks, keyed by alias — each consumed exactly once by the
+    /// agent's actor at open (`take_adoption`).
+    adoptions: Mutex<std::collections::HashMap<String, AdoptEntry>>,
 }
 
 fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
@@ -411,6 +440,19 @@ impl Verdict {
 impl Store {
     /// Open (creating if needed), migrate, and recover in-flight state.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_adopting(path, None)
+    }
+
+    /// `open` with the consumed hot-restart marker (CAD-89): `serve()`
+    /// reads and validates `shutdown.json` before this — the store only
+    /// sees the candidate entries and a staleness reason. Every other
+    /// caller passes `None` and gets the historical fence-everything
+    /// recovery.
+    pub fn open_adopting(path: &Path, marker: Option<ConsumedMarker>) -> Result<Self> {
+        Self::open_inner(path, marker)
+    }
+
+    fn open_inner(path: &Path, marker: Option<ConsumedMarker>) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(
@@ -597,8 +639,9 @@ impl Store {
         }
         let store = Self {
             conn: Mutex::new(conn),
+            adoptions: Mutex::new(std::collections::HashMap::new()),
         };
-        store.recover()?;
+        store.recover(marker.as_ref())?;
         Ok(store)
     }
 
@@ -606,33 +649,197 @@ impl Store {
     /// Mark those attempts `unknown` and fence the owning actor; do not
     /// silently relaunch it. Inbox rows are durable mailboxes, not
     /// processes — their pseudo-endpoint and `idle` state survive.
-    fn recover(&self) -> Result<()> {
+    ///
+    /// The exception is the hot restart (CAD-89): a provably clean
+    /// shutdown recorded each pty agent's `running` turn. An entry whose
+    /// store-level checks still pass stays `running` and keeps its
+    /// generation — the token remains valid for `message_report` — and
+    /// the actor re-validates the pane itself at open. Anything else
+    /// falls back to the fence below, one `turn_adopt_refused` event per
+    /// rejected entry.
+    fn recover(&self, marker: Option<&ConsumedMarker>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        // Store-level qualification of every recorded entry. A refused
+        // entry still lands in the sweep below — the refusal only means
+        // "not protected", never a state skip.
+        let mut kept: Vec<&AdoptEntry> = Vec::new();
+        if let Some(marker) = marker {
+            for e in &marker.entries {
+                let reason = marker
+                    .stale
+                    .clone()
+                    .or_else(|| self.adoption_block(&tx, e));
+                match reason {
+                    None => kept.push(e),
+                    Some(reason) => Self::event(
+                        &tx,
+                        &e.alias,
+                        "turn_adopt_refused",
+                        json!({"message": e.message_id, "turn_id": e.turn_id,
+                               "reason": reason}),
+                    )?,
+                }
+            }
+        }
+        {
+            let mut adoptions = self.adoptions.lock().unwrap();
+            for e in &kept {
+                adoptions.insert(e.alias.clone(), (*e).clone());
+            }
+        }
+        // Dynamic NOT IN for the protected message ids — one UPDATE
+        // either way, never string-interpolated values.
+        let kept_ids: Vec<String> = kept.iter().map(|e| e.message_id.clone()).collect();
+        let placeholders = kept_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut sql = String::from(
             "UPDATE messages SET state='unknown',
                 error='Runtime restarted during provider turn'
              WHERE state IN ('submitting','running')",
-            [],
-        )?;
+        );
+        if !kept_ids.is_empty() {
+            sql.push_str(&format!(" AND id NOT IN ({placeholders})"));
+        }
+        tx.execute(&sql, rusqlite::params_from_iter(kept_ids.iter()))?;
+        let kept_aliases: Vec<String> = kept.iter().map(|e| e.alias.clone()).collect();
         // An `attention` row is a fence, not a liveness state — keep the
         // state and its recorded error intact (they are the operator's
         // recovery context) and clear only the dead runtime fields.
         // Rewriting it to `offline` here would hide the fence from the
         // serve loop's relaunch skip and retry a provider session the
         // operator has not cleared.
-        conn.execute(
+        tx.execute(
             "UPDATE agents SET pid=NULL, endpoint=NULL, generation=NULL
              WHERE state='attention' AND endpoint_kind != 'inbox'",
             [],
         )?;
-        conn.execute(
+        // Adopted agents keep `generation` (the token must still
+        // validate) but lose the stale runtime fields — endpoint and
+        // pane pid are republished by `set_identity` at adopt.
+        let mut sql = String::from(
             "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL,
                 generation=NULL
              WHERE state NOT IN ('stopped','attention')
                AND endpoint_kind != 'inbox'",
-            [],
-        )?;
+        );
+        if !kept_aliases.is_empty() {
+            let placeholders = kept_aliases
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            sql.push_str(&format!(" AND alias NOT IN ({placeholders})"));
+        }
+        tx.execute(&sql, rusqlite::params_from_iter(kept_aliases.iter()))?;
+        if !kept_aliases.is_empty() {
+            let placeholders = kept_aliases
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            tx.execute(
+                &format!(
+                    "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL
+                     WHERE alias IN ({placeholders})"
+                ),
+                rusqlite::params_from_iter(kept_aliases.iter()),
+            )?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Why a recorded shutdown entry cannot be adopted at the store
+    /// level — `None` means the message may stay `running` for the
+    /// actor's pane checks. Every failure maps to the plain recovery
+    /// path (message `unknown`, agent fenced) for that agent only.
+    fn adoption_block(&self, tx: &Connection, e: &AdoptEntry) -> Option<String> {
+        let msg = tx
+            .query_row(
+                "SELECT state, turn_id FROM messages WHERE id=?",
+                [&e.message_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .ok();
+        let Some((state, turn_id)) = msg else {
+            return Some(format!("message {} no longer exists", e.message_id));
+        };
+        if state != "running" {
+            return Some(format!("message {} is {state}, not running", e.message_id));
+        }
+        if turn_id.as_deref() != Some(e.turn_id.as_str()) {
+            return Some(format!("turn id for {} changed", e.message_id));
+        }
+        let agent = tx
+            .query_row(
+                "SELECT enabled, state FROM agents WHERE alias=?",
+                [&e.alias],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        match agent {
+            None => Some(format!("agent {} is gone", e.alias)),
+            Some((0, _)) => Some(format!("agent {} was disabled at shutdown", e.alias)),
+            Some((_, s)) if s == "attention" => {
+                Some(format!("agent {} was already fenced", e.alias))
+            }
+            Some(_) => {
+                let unknown: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM messages
+                         WHERE alias=? AND state='unknown'",
+                        [&e.alias],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                (unknown > 0).then(|| {
+                    format!("agent {} carries unreconciled unknowns", e.alias)
+                })
+            }
+        }
+    }
+
+    /// The adoption candidate `recover()` kept for this alias — consumed
+    /// once by the actor at open; a second actor generation can never
+    /// see it.
+    pub fn take_adoption(&self, alias: &str) -> Option<AdoptEntry> {
+        self.adoptions.lock().unwrap().remove(alias)
+    }
+
+    /// The shutdown marker's payload: every in-flight pty message with
+    /// the endpoint facts the next daemon needs to re-validate the pane
+    /// (recorded generation, pane pid, native session). `submitting`
+    /// rows ride along so recovery can name *why* they fenced — an
+    /// unproven paste is never adoptable; they simply cannot satisfy
+    /// the `running` check. Called only after all actors have
+    /// detached — the rows are final.
+    pub fn shutdown_entries(&self) -> Result<Vec<AdoptEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.alias, m.id, m.turn_id, a.generation, a.pid,
+                    a.session_id
+             FROM messages m JOIN agents a ON a.alias = m.alias
+             WHERE m.state IN ('running','submitting')
+               AND a.endpoint_kind='pty'
+               AND a.generation IS NOT NULL",
+        )?;
+        let entries = stmt
+            .query_map([], |r| {
+                Ok(AdoptEntry {
+                    alias: r.get(0)?,
+                    message_id: r.get(1)?,
+                    turn_id: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    generation: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    pane_pid: r.get::<_, i64>(4)? as u32,
+                    native_session: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(entries)
     }
 
     fn event(conn: &Connection, alias: &str, kind: &str, payload: Value) -> Result<()> {
@@ -1462,6 +1669,29 @@ impl Store {
     /// `tmux://…`) when the endpoint kind exposes one; `generation`
     /// partitions submission tokens per endpoint life.
     pub fn set_identity(&self, alias: &str, id: &crate::adapter::Identity) -> Result<()> {
+        self.set_identity_inner(alias, id, None)
+    }
+
+    /// `set_identity` after a hot-restart adoption: the endpoint was
+    /// re-verified against the shutdown record — the same pane, the
+    /// same generation — so the recorded turn stays `running` and its
+    /// token remains valid. Any *other* in-flight message for the
+    /// alias still takes the generation-fence.
+    pub fn set_identity_adopted(
+        &self,
+        alias: &str,
+        id: &crate::adapter::Identity,
+        entry: &AdoptEntry,
+    ) -> Result<()> {
+        self.set_identity_inner(alias, id, Some(entry))
+    }
+
+    fn set_identity_inner(
+        &self,
+        alias: &str,
+        id: &crate::adapter::Identity,
+        adopted: Option<&AdoptEntry>,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         // A fresh endpoint generation cannot claim reports for turns
@@ -1469,8 +1699,9 @@ impl Store {
         tx.execute(
             "UPDATE messages SET state='unknown',
                 error='endpoint restarted during in-flight submission',
-                completed=? WHERE alias=? AND state='running'",
-            params![now(), alias],
+                completed=? WHERE alias=? AND state='running'
+                AND id != ?",
+            params![now(), alias, adopted.map(|e| e.message_id.as_str()).unwrap_or("")],
         )?;
         tx.execute(
             "UPDATE agents SET thread_id=?,session_id=?,model=?,pid=?,
@@ -1494,6 +1725,15 @@ impl Store {
                    "model": id.model, "pid": id.pid, "endpoint": id.endpoint,
                    "generation": id.generation}),
         )?;
+        if let Some(e) = adopted {
+            Self::event(
+                &tx,
+                alias,
+                "turn_adopted",
+                json!({"message": e.message_id, "turn_id": e.turn_id,
+                       "pane_pid": e.pane_pid}),
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }

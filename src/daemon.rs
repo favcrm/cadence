@@ -255,11 +255,22 @@ pub struct Shared {
     started_at: f64,
     /// Stall screen-sample seconds for this daemon (0 = unset).
     stall_sample_secs: Arc<AtomicU64>,
+    /// This run's instance id — recorded at start and stamped on the
+    /// shutdown marker, so the next daemon can prove a marker belongs
+    /// to the immediately preceding run (CAD-89).
+    instance: String,
 }
 
 impl Shared {
     pub fn new(state_dir: &Path, opts: &ServeOptions) -> Result<Arc<Self>> {
-        let store = Store::open(&state_dir.join("cadence.sqlite3"))?;
+        Self::new_hot(state_dir, opts, HotStart::fresh())
+    }
+
+    /// `new` with the consumed hot-restart context: the adoption
+    /// candidates the marker carried plus this run's instance id.
+    pub fn new_hot(state_dir: &Path, opts: &ServeOptions, hot: HotStart) -> Result<Arc<Self>> {
+        let HotStart { instance, marker } = hot;
+        let store = Store::open_adopting(&state_dir.join("cadence.sqlite3"), marker)?;
         let provider_log_dir = state_dir.join("agents");
         std::fs::create_dir_all(&provider_log_dir)?;
         Ok(Arc::new(Self {
@@ -275,6 +286,7 @@ impl Shared {
             provider_env: opts.provider_env.clone(),
             started_at: epoch_secs(),
             stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
+            instance,
         }))
     }
 
@@ -554,7 +566,37 @@ impl Shared {
         // any error, which still closes owned provider processes
         // (detach defaults to close) while leaving a pty pane visible
         // for inspection.
-        let identity = adapter.open(&agent)?;
+        //
+        // Hot restart: a candidate the shutdown marker recorded is
+        // opened in adopt mode — the pane is re-validated against the
+        // record (same pid, same native session) and the recorded
+        // generation is reused so the turn's token stays valid. A
+        // refused adoption falls back to the plain fence for this
+        // agent only: the message goes `unknown`, the actor exits into
+        // `attention`, and `turn_adopt_refused` names the check that
+        // failed.
+        let adoption = self.store.take_adoption(alias);
+        let identity = match &adoption {
+            Some(entry) => match adapter.open_adopted(&agent, entry) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let reason = error.to_string();
+                    let _ = self.store.orphan_running(
+                        alias,
+                        &format!("hot-restart adoption refused: {reason}"),
+                    );
+                    let _ = self.store.event_public(
+                        alias,
+                        "turn_adopt_refused",
+                        json!({"message": entry.message_id,
+                               "turn_id": entry.turn_id,
+                               "reason": reason}),
+                    );
+                    return Err(error);
+                }
+            },
+            None => adapter.open(&agent)?,
+        };
         // Record how the endpoint came up *before* set_identity makes
         // it visible — a resume report polling the agent row must find
         // the outcome already written.
@@ -564,7 +606,10 @@ impl Shared {
                 .unwrap()
                 .insert(alias.to_string(), attach);
         }
-        self.store.set_identity(alias, &identity)?;
+        match &adoption {
+            Some(entry) => self.store.set_identity_adopted(alias, &identity, entry)?,
+            None => self.store.set_identity(alias, &identity)?,
+        }
         self.wake();
         let mut gate_notice: Option<String> = None;
         let mut gate_waits: u32 = 0;
@@ -2804,17 +2849,52 @@ impl Shared {
         }
     }
 
-    /// Cooperative shutdown: bounded stop for every actor.
+    /// Graceful daemon stop: the only path that may write the
+    /// hot-restart marker. Pty actors are never interrupted here —
+    /// `interrupt()` sends C-c into the pane, which could cancel the
+    /// provider work a clean restart is meant to re-adopt; waking the
+    /// idle loop is enough. A mid-`submitting` paste finishes its
+    /// render check inside the actor's own deadline and the join waits
+    /// it out — a rendered paste is recorded `running` (adoptable), an
+    /// unrendered one falls back to `queued`/`unknown`, never
+    /// `running` without proof. Managed endpoints keep the
+    /// interrupt-and-grace path: their provider process dies with the
+    /// daemon either way.
     fn shutdown(&self) {
-        let ctls: Vec<Arc<AgentCtl>> = self
+        let owned: Vec<(String, Arc<AgentCtl>)> = self
             .lifecycle
             .lock()
             .unwrap()
             .agents
-            .values()
-            .cloned()
+            .iter()
+            .map(|(alias, ctl)| (alias.clone(), Arc::clone(ctl)))
             .collect();
-        self.stop_ctls(&ctls);
+        let (pty, rest): (Vec<(String, Arc<AgentCtl>)>, Vec<(String, Arc<AgentCtl>)>) = owned
+            .into_iter()
+            .partition(|(alias, _)| {
+                self.store
+                    .agent(alias)
+                    .map(|a| a.endpoint_kind == "pty")
+                    .unwrap_or(false)
+            });
+        for (_, ctl) in &pty {
+            ctl.wake.notify_all();
+        }
+        let rest: Vec<Arc<AgentCtl>> = rest.into_iter().map(|(_, ctl)| ctl).collect();
+        self.stop_ctls(&rest);
+        // The pty join is the bounded `submitting` wait (decision 4):
+        // the render check's own deadline caps it — no extra timer.
+        for (_, ctl) in pty {
+            if let Some(handle) = ctl.thread.lock().unwrap().take() {
+                let _ = handle.join();
+            }
+        }
+        // LAST: every actor has detached and written its final state,
+        // so `shutdown_entries` reads a settled view — and a marker
+        // written here can only ever describe a clean stop.
+        if let Ok(entries) = self.store.shutdown_entries() {
+            write_shutdown_marker(&self.state_dir, &self.instance, entries);
+        }
     }
 }
 
@@ -2953,6 +3033,142 @@ pub struct ServeOptions {
 }
 
 /// Run the daemon in the foreground until `shutdown` or a signal.
+// ---- Hot restart (CAD-89): clean-stop marker + instance files ----
+//
+// A provably clean shutdown is the ONLY path that writes
+// `shutdown.json`: it is the daemon's last act, after every actor has
+// detached. The marker names the daemon run that wrote it
+// (`daemon-instance`, recorded at serve start) and each pty turn still
+// `running`. On the next start the marker is consumed exactly once —
+// it is valid only against the immediately preceding recorded run and
+// only within MARKER_TTL; anything else takes the historical fence
+// path for the recorded agents.
+
+/// The last recorded serve() run's instance id.
+const INSTANCE_FILE: &str = "daemon-instance";
+/// The clean-shutdown marker: running pty turns awaiting re-adoption.
+const SHUTDOWN_FILE: &str = "shutdown.json";
+/// How long a shutdown marker stays adoptable — a bound on pane
+/// longevity, not on restart speed. Past it the recorded checks would
+/// read stale pane state as fresh; the turns fence instead.
+const MARKER_TTL_SECS: f64 = 900.0;
+
+/// What `serve()` carries into `Shared`: this run's instance id plus
+/// the consumed marker (entries and a staleness reason when the marker
+/// itself failed validation).
+pub struct HotStart {
+    pub instance: String,
+    marker: Option<store::ConsumedMarker>,
+}
+
+impl HotStart {
+    /// No marker — tests and every non-serve `Shared::new`.
+    pub fn fresh() -> Self {
+        Self {
+            instance: Uuid::new_v4().simple().to_string(),
+            marker: None,
+        }
+    }
+}
+
+/// Small-string atomic write: tmp file in the same directory, then
+/// rename — a reader never sees a torn marker.
+fn write_file_atomic(path: &Path, contents: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn read_instance(state_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(state_dir.join(INSTANCE_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Read, validate and DELETE the shutdown marker — consume-once: a
+/// daemon that crashes after this point leaves nothing to adopt, which
+/// is exactly the crash path. The new run's instance id is recorded
+/// immediately after, so `marker.instance` must equal the PREVIOUS
+/// recorded start to count as provably clean.
+fn hot_restart_begin(state_dir: &Path) -> HotStart {
+    let previous = read_instance(state_dir);
+    let path = state_dir.join(SHUTDOWN_FILE);
+    let raw = std::fs::read_to_string(&path).ok();
+    // Consume-once regardless of what the marker says — a stale or
+    // unreadable marker must never be adopted twice.
+    let _ = std::fs::remove_file(&path);
+    let marker = raw.and_then(|raw| match serde_json::from_str::<Value>(&raw) {
+        Ok(v) => {
+            let instance = v["instance"].as_str().unwrap_or_default().to_string();
+            let at = v["at"].as_f64().unwrap_or(0.0);
+            let entries = v["entries"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|r| {
+                            Some(store::AdoptEntry {
+                                alias: r["alias"].as_str()?.to_string(),
+                                message_id: r["message_id"].as_str()?.to_string(),
+                                turn_id: r["turn_id"].as_str()?.to_string(),
+                                generation: r["generation"].as_str()?.to_string(),
+                                pane_pid: r["pane_pid"].as_u64()? as u32,
+                                native_session: r["native_session"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let stale = if instance.is_empty() || Some(instance.as_str()) != previous.as_deref() {
+                Some("shutdown marker does not match the last recorded daemon run".to_string())
+            } else if epoch_secs() - at > MARKER_TTL_SECS {
+                Some(format!(
+                    "shutdown marker expired ({:.0}s old, bound {:.0}s)",
+                    epoch_secs() - at,
+                    MARKER_TTL_SECS
+                ))
+            } else {
+                None
+            };
+            Some(store::ConsumedMarker { entries, stale })
+        }
+        Err(_) => {
+            eprintln!("hot-restart: unreadable shutdown marker discarded");
+            None
+        }
+    });
+    let instance = Uuid::new_v4().simple().to_string();
+    if let Err(e) = write_file_atomic(&state_dir.join(INSTANCE_FILE), &instance) {
+        eprintln!("hot-restart: could not record daemon instance: {e}");
+    }
+    HotStart { instance, marker }
+}
+
+/// The last write of a clean shutdown — after this the daemon exits.
+/// Never fails the stop itself: a marker that can't be written is a
+/// crash-equivalent state dir, which the next start already handles.
+fn write_shutdown_marker(state_dir: &Path, instance: &str, entries: Vec<store::AdoptEntry>) {
+    let marker = json!({
+        "instance": instance,
+        "at": epoch_secs(),
+        "entries": entries.iter().map(|e| json!({
+            "alias": e.alias,
+            "message_id": e.message_id,
+            "turn_id": e.turn_id,
+            "generation": e.generation,
+            "pane_pid": e.pane_pid,
+            "native_session": e.native_session,
+        })).collect::<Vec<_>>(),
+    });
+    if let Err(e) = write_file_atomic(&state_dir.join(SHUTDOWN_FILE), &marker.to_string()) {
+        eprintln!("hot-restart: could not write shutdown marker: {e}");
+    }
+}
+
 pub fn serve(state_dir: &Path) -> Result<()> {
     serve_with(state_dir, ServeOptions::default())
 }
@@ -2962,7 +3178,12 @@ pub fn serve(state_dir: &Path) -> Result<()> {
 pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let _singleton = acquire_singleton(state_dir)?;
-    let shared = Shared::new(state_dir, &opts)?;
+    // Consume the shutdown marker and record this run's instance BEFORE
+    // the store opens — recover() protects the candidate entries as it
+    // sweeps, and a crash between here and open simply leaves nothing
+    // to adopt.
+    let hot = hot_restart_begin(state_dir);
+    let shared = Shared::new_hot(state_dir, &opts, hot)?;
     let socket_path = state_dir.join("cadence.sock");
     if socket_path.exists() {
         // Safe while the singleton is held: no live owner can exist.

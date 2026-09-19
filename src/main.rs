@@ -1577,13 +1577,15 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
         println!("ui: restarted");
     }
     // Before/after table: state then, state now, and for pty agents
-    // whether the pane pid survived. A changed pane pid or an agent
-    // that came back fenced makes the command exit non-zero.
+    // whether the pane pid survived and whether an in-flight turn was
+    // re-adopted (`kept`) or fenced (`fenced`) by the hot restart. A
+    // changed pane pid, a fenced turn, or an agent that came back in
+    // `attention` makes the command exit non-zero.
     let before_by_alias: std::collections::HashMap<&str, &Value> = before
         .iter()
         .filter_map(|a| a["alias"].as_str().map(|al| (al, a)))
         .collect();
-    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     let mut bad = false;
     for a in &after {
         let alias = a["alias"].as_str().unwrap_or_default().to_string();
@@ -1593,37 +1595,61 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
             .unwrap_or("-")
             .to_string();
         let after_state = a["state"].as_str().unwrap_or_default().to_string();
-        let pane = if a["endpoint_kind"].as_str() == Some("pty") {
+        let mut pane = "-".to_string();
+        let mut turn = "-".to_string();
+        if a["endpoint_kind"].as_str() == Some("pty") {
             let old = b.and_then(|b| b["pid"].as_u64()).unwrap_or(0);
             let new = a["pid"].as_u64().unwrap_or(0);
             if old == 0 && new == 0 {
-                "-".to_string()
+                // no pane either side
             } else if old == new {
-                "same".to_string()
+                pane = "same".to_string();
             } else {
                 bad = true;
-                format!("CHANGED {old}→{new}")
+                pane = format!("CHANGED {old}→{new}");
             }
-        } else {
-            "-".to_string()
-        };
+            // The adopt verdicts are events on the agent — the newest
+            // page holds this startup's outcome.
+            turn = client::rpc(
+                state_dir,
+                "agent_events",
+                serde_json::json!({"alias": alias, "tail": true}),
+            )
+            .ok()
+            .and_then(|v| {
+                v["events"].as_array().map(|events| {
+                    if events.iter().any(|e| e["kind"] == "turn_adopted") {
+                        "kept".to_string()
+                    } else if events
+                        .iter()
+                        .any(|e| e["kind"] == "turn_adopt_refused")
+                    {
+                        "fenced".to_string()
+                    } else {
+                        "-".to_string()
+                    }
+                })
+            })
+            .unwrap_or_else(|| "-".to_string());
+        }
         if after_state == "attention" {
             bad = true;
         }
-        rows.push((alias, before_state, after_state, pane));
+        rows.push((alias, before_state, after_state, pane, turn));
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     let w = rows.iter().map(|r| r.0.len()).max().unwrap_or(5).max(5);
     println!(
-        "{:<w$}  {:<12}  {:<12}  PANE",
+        "{:<w$}  {:<12}  {:<12}  {:<18}  TURN",
         "AGENT",
         "BEFORE",
         "AFTER",
+        "PANE",
         w = w
     );
-    for (alias, before_state, after_state, pane) in &rows {
+    for (alias, before_state, after_state, pane, turn) in &rows {
         println!(
-            "{alias:<w$}  {before_state:<12}  {after_state:<12}  {pane}",
+            "{alias:<w$}  {before_state:<12}  {after_state:<12}  {pane:<18}  {turn}",
             w = w
         );
     }

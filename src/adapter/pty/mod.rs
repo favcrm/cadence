@@ -694,6 +694,50 @@ impl ProviderAdapter for PtyAdapter {
         })
     }
 
+    /// Adopt a turn that survived a provably clean daemon stop (CAD-89):
+    /// the pane must still be the recorded one — alive, same pid,
+    /// holding the same native-session lock. Unlike the plain reattach
+    /// there is no wait: the pane has been running all along, so a
+    /// missing proof means the endpoint genuinely changed, not that it
+    /// is still coming up. The recorded generation is reused, which is
+    /// what keeps the in-flight token valid for `message_report`.
+    fn open_adopted(&self, _agent: &Agent, adoption: &crate::store::AdoptEntry) -> Result<Identity> {
+        let session = self.session();
+        if !self.has_session(&session) {
+            return Err(Error::provider("pane is gone"));
+        }
+        if self.pane_value(&session, "#{pane_dead}")? == "1" {
+            return Err(Error::provider("pane process has exited"));
+        }
+        let pane_pid = self.pane_pid(&session)?;
+        if pane_pid != adoption.pane_pid {
+            return Err(Error::provider(format!(
+                "pane pid changed (recorded {}, now {pane_pid})",
+                adoption.pane_pid
+            )));
+        }
+        self.profile
+            .verify_ownership(&adoption.native_session, pane_pid)?;
+
+        let endpoint = format!("tmux://{}/{session}", self.socket);
+        {
+            let mut s = self.state.lock().unwrap();
+            s.native_session = adoption.native_session.clone();
+            s.pane_pid = pane_pid;
+            s.generation = adoption.generation.clone();
+            s.claims.clear(); // claims never survive a daemon restart
+        }
+        Ok(Identity {
+            thread_id: adoption.native_session.clone(),
+            session_id: adoption.native_session.clone(),
+            model: None,
+            pid: pane_pid,
+            endpoint: Some(endpoint),
+            generation: Some(adoption.generation.clone()),
+            attach: Some("adopted"),
+        })
+    }
+
     fn run_turn(
         &self,
         prompt: &str,
