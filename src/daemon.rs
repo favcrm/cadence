@@ -244,6 +244,9 @@ pub struct Shared {
     open_attach: Mutex<HashMap<String, &'static str>>,
     /// Provider launch overrides for this daemon instance.
     provider_env: ProviderEnv,
+    /// Unix epoch seconds when this daemon process came up — the
+    /// `started_at` half of `daemon_info`'s build/uptime report.
+    started_at: f64,
 }
 
 impl Shared {
@@ -262,6 +265,7 @@ impl Shared {
             state_dir: state_dir.to_path_buf(),
             open_attach: Mutex::new(HashMap::new()),
             provider_env,
+            started_at: epoch_secs(),
         }))
     }
 
@@ -834,6 +838,13 @@ impl Shared {
                 "state": "ready",
                 "protocol": proto::PROTOCOL_VERSION,
                 "capabilities": proto::capabilities(),
+            })),
+            // Build identity + process start — the deploy-drift check
+            // measures merged commits against *this* binary's commit.
+            "daemon_info" => Ok(json!({
+                "build_commit": crate::overview::BUILD_COMMIT,
+                "build_time": crate::overview::BUILD_TIME,
+                "started_at": self.started_at,
             })),
             "shutdown" => {
                 self.closing.store(true, Ordering::SeqCst);

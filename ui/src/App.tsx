@@ -4,6 +4,7 @@ import Agents from "./components/Agents";
 import Board from "./components/Board";
 import Drawer from "./components/Drawer";
 import Memory from "./components/Memory";
+import OverviewView from "./components/Overview";
 import Plan from "./components/Plan";
 import Sidebar from "./components/Sidebar";
 import Toast, { type ToastMsg } from "./components/Toast";
@@ -15,17 +16,21 @@ import type {
   IssueCard,
   IssueDetail,
   Meta,
+  Overview,
   Project,
 } from "./types";
 
 export default function App() {
-  const [tab, setTab] = useState<"board" | "plan" | "agents" | "memory">("board");
+  const [tab, setTab] = useState<
+    "overview" | "board" | "plan" | "agents" | "memory"
+  >("overview");
   const [project, setProject] = useState("all");
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<BoardFilters>(NO_FILTERS);
   const [issues, setIssues] = useState<IssueCard[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<AgentsPayload | null>(null);
+  const [overview, setOverview] = useState<Overview | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
@@ -76,6 +81,7 @@ export default function App() {
       })
       .catch((e) => setFailed(String(e.message ?? e)));
     api.agents().then(setAgents).catch(() => setAgents(null));
+    api.overview().then(setOverview).catch(() => setOverview(null));
     if (openId) {
       api
         .issue(openId)
@@ -273,23 +279,25 @@ export default function App() {
 
         {menuOpen && (
           <nav className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
-            <div className="grid grid-cols-4 gap-1.5">
-              {(["board", "plan", "agents", "memory"] as const).map((t) => (
-                <button
-                  key={t}
-                  onClick={() => {
-                    setTab(t);
-                    setMenuOpen(false);
-                  }}
-                  className={`h-9 rounded text-secondary capitalize ${
-                    tab === t
-                      ? "bg-accent/15 text-accent font-medium"
-                      : "bg-ink-800 text-ink-300"
-                  }`}
-                >
-                  {t}
-                </button>
-              ))}
+            <div className="grid grid-cols-5 gap-1.5">
+              {(["overview", "board", "plan", "agents", "memory"] as const).map(
+                (t) => (
+                  <button
+                    key={t}
+                    onClick={() => {
+                      setTab(t);
+                      setMenuOpen(false);
+                    }}
+                    className={`h-9 rounded text-secondary capitalize ${
+                      tab === t
+                        ? "bg-accent/15 text-accent font-medium"
+                        : "bg-ink-800 text-ink-300"
+                    }`}
+                  >
+                    {t}
+                  </button>
+                ),
+              )}
             </div>
             <div className="slabel pt-2">projects</div>
             <div className="grid gap-1">
@@ -342,6 +350,7 @@ export default function App() {
           </div>
         )}
 
+        {tab === "overview" && <OverviewView data={overview} />}
         {tab === "board" && (
           <Board
             issues={issues}

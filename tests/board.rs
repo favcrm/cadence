@@ -6127,3 +6127,385 @@ fn memory_malformed_timestamp_is_safe() {
         "not verified within the window"
     );
 }
+// ==== CAD-83: `cadence overview` + /api/meta + /api/overview ====
+
+/// A fake `gh` binary dir: `pr` calls answer $FAKE_GH_PRS, `api` calls
+/// answer $FAKE_GH_CI, FAKE_GH_FAIL=1 makes every call exit 1. The call
+/// log records argv lines.
+const FAKE_GH: &str = r#"#!/bin/sh
+echo "$*" >> "$FAKE_GH_LOG"
+if [ "$FAKE_GH_FAIL" = "1" ]; then echo "gh: simulated outage" >&2; exit 1; fi
+case "$1" in
+  pr) printf '%s' "$FAKE_GH_PRS" ;;
+  api) printf '%s' "$FAKE_GH_CI" ;;
+  *) exit 1 ;;
+esac
+"#;
+
+/// Fake-gh dir + call log; drop keeps the tempdir alive for the test.
+struct FakeGh {
+    _tmp: TempDir,
+    bin: PathBuf,
+    log: PathBuf,
+}
+
+fn fake_gh() -> FakeGh {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, FAKE_GH).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let log = tmp.path().join("gh.log");
+    std::fs::write(&log, "").unwrap();
+    FakeGh {
+        _tmp: tmp,
+        bin,
+        log,
+    }
+}
+
+/// PATH overlay: fake gh first, the just-built cadence second (the
+/// tracker's pre-commit hook resolves `cadence` from PATH).
+fn gh_path(gh: &FakeGh) -> String {
+    format!(
+        "{}:{}:{}",
+        gh.bin.display(),
+        Path::new(bin()).parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// A temp git repo carrying `remote.origin.url` — `issue project add`
+/// records the remote for cwd/drift matching.
+fn repo_with_remote(remote: &str) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    assert!(git(dir.path(), &["init", "-q"]).0);
+    assert!(git(dir.path(), &["config", "user.email", "t@t"]).0);
+    assert!(git(dir.path(), &["config", "user.name", "t"]).0);
+    std::fs::write(dir.path().join("f"), "x").unwrap();
+    assert!(git(dir.path(), &["add", "f"]).0);
+    assert!(git(dir.path(), &["commit", "-qm", "init"]).0);
+    assert!(git(dir.path(), &["remote", "add", "origin", remote]).0);
+    dir
+}
+
+/// ISO `<n> seconds ago` — for `updatedAt` fixtures.
+fn iso_ago(secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    cadence_agent::issue::time::iso(now - secs)
+}
+
+#[test]
+fn overview_meta_and_shell_routes() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+
+    // /api/meta carries the serving binary's build identity.
+    let (code, body) = http(port, "GET", "/api/meta", &host);
+    assert_eq!(code, 200, "{body}");
+    let meta: Value = serde_json::from_str(&body).unwrap();
+    assert!(!meta["build_commit"].as_str().unwrap_or("").is_empty());
+    assert!(!meta["build_time"].as_str().unwrap_or("").is_empty());
+    assert!(!meta["version"].as_str().unwrap_or("").is_empty());
+
+    // /api/overview — the whole derived screen, daemon unreachable is
+    // honest but never fatal.
+    let (code, body) = http(port, "GET", "/api/overview", &host);
+    assert_eq!(code, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["needs_me"].is_array(), "{v}");
+    assert!(v["drift"].is_object(), "{v}");
+    assert!(v["projects"].is_array(), "{v}");
+    assert!(v["generated_at"].as_i64().unwrap_or(0) > 0, "{v}");
+    assert_eq!(v["daemon"]["reachable"], false, "{v}");
+    assert_eq!(v["drift"]["matched"], false, "{v}");
+    assert!(
+        v["drift"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unreachable"),
+        "{v}"
+    );
+}
+
+#[test]
+fn overview_merge_ready_pr_first_with_exact_command() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let repo = repo_with_remote("https://github.com/acme/widgets.git");
+    assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
+    let repo_s = repo.path().to_str().unwrap().to_string();
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "project", "add", "cadence", "--prefix", "CAD", "--repo", &repo_s]
+        )
+        .0
+    );
+    let gh = fake_gh();
+    let prs = format!(
+        r#"[
+        {{"number": 7, "title": "widgets: the fix",
+          "url": "https://github.com/acme/widgets/pull/7",
+          "headRefOid": "abc", "headRefName": "fix",
+          "updatedAt": "{}",
+          "statusCheckRollup": [
+            {{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS"}},
+            {{"__typename":"StatusContext","context":"qa-verdict","state":"SUCCESS"}}
+          ]}},
+        {{"number": 9, "title": "wip thing",
+          "url": "https://github.com/acme/widgets/pull/9",
+          "headRefOid": "def", "headRefName": "wip",
+          "updatedAt": "{}",
+          "statusCheckRollup": [
+            {{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS"}}
+          ]}}
+        ]"#,
+        iso_ago(7200),
+        iso_ago(3 * 3600)
+    );
+    let path = gh_path(&gh);
+    let log = gh.log.to_str().unwrap().to_string();
+    let (ok, v) = cli_env(
+        pm.path(),
+        state.path(),
+        &["overview", "--json"],
+        &[
+            ("PATH", path.as_str()),
+            ("FAKE_GH_LOG", log.as_str()),
+            ("FAKE_GH_PRS", prs.as_str()),
+            ("FAKE_GH_CI", r#"{"state":"success","statuses":[]}"#),
+        ],
+    );
+    assert!(ok, "{v}");
+    let needs = v["needs_me"].as_array().unwrap();
+    // The merge-ready PR leads: exact command, link, project, age.
+    assert_eq!(needs[0]["kind"], "merge", "{needs:?}");
+    assert_eq!(
+        needs[0]["command"], "gh pr merge 7 --repo acme/widgets --squash --admin",
+        "{needs:?}"
+    );
+    assert_eq!(needs[0]["link"], "https://github.com/acme/widgets/pull/7");
+    assert_eq!(needs[0]["project"], "cadence");
+    assert!(needs[0]["age"].as_i64().unwrap_or(0) >= 7000);
+    // The verdict-less PR follows with its age and the view command.
+    assert_eq!(needs[1]["kind"], "pr_no_verdict", "{needs:?}");
+    assert_eq!(needs[1]["command"], "gh pr view 9 --repo acme/widgets");
+    assert!(needs[1]["age"].as_i64().unwrap_or(0) >= 10000);
+    assert_eq!(v["github"]["state"], "ok");
+    // gh was asked exactly once per repo for each of the two queries.
+    let calls = std::fs::read_to_string(&gh.log).unwrap();
+    assert_eq!(calls.lines().count(), 2, "{calls}");
+}
+
+#[test]
+fn overview_github_failure_degrades_not_fails() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let repo = repo_with_remote("https://github.com/acme/widgets.git");
+    assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
+    let repo_s = repo.path().to_str().unwrap().to_string();
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "project", "add", "cadence", "--prefix", "CAD", "--repo", &repo_s]
+        )
+        .0
+    );
+    // A review issue still surfaces when GitHub is out.
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "new", "review me", "--project", "cadence"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "set", "CAD-1", "status=review"]
+        )
+        .0
+    );
+    let gh = fake_gh();
+    let path = gh_path(&gh);
+    let log = gh.log.to_str().unwrap().to_string();
+    let (ok, v) = cli_env(
+        pm.path(),
+        state.path(),
+        &["overview", "--json"],
+        &[
+            ("PATH", path.as_str()),
+            ("FAKE_GH_LOG", log.as_str()),
+            ("FAKE_GH_FAIL", "1"),
+            ("FAKE_GH_PRS", "[]"),
+            ("FAKE_GH_CI", "{}"),
+        ],
+    );
+    assert!(ok, "{v}");
+    assert_eq!(v["github"]["state"], "unavailable", "{v}");
+    let needs = v["needs_me"].as_array().unwrap();
+    assert!(!needs.iter().any(|n| n["kind"] == "merge"));
+    assert!(
+        needs.iter().any(|n| n["kind"] == "review_no_pr"),
+        "{needs:?}"
+    );
+}
+
+#[test]
+fn overview_tracker_items_and_tracker_behind() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    // seed: CAD-1 container (derived doing via child CAD-2 doing),
+    // CAD-3 sibling leaf. Review must go on a leaf — container status
+    // rolls up from children.
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "set", "CAD-3", "status=review"]
+        )
+        .0
+    );
+    // blocked_ready: CAD-5 blocked_by CAD-4, and CAD-4 is done.
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "new", "blocker", "--project", "cadence"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "new", "blocked work", "--project", "cadence"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "link", "CAD-5", "blocked_by", "CAD-4"]
+        )
+        .0
+    );
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "set", "CAD-4", "status=done"]
+        )
+        .0
+    );
+    // tracker_behind: an upstream clone with one extra commit.
+    let upstream = TempDir::new().unwrap();
+    let (ok, _) = git(
+        upstream.path(),
+        &["clone", "-q", pm.path().to_str().unwrap(), "."],
+    );
+    assert!(ok);
+    assert!(git(upstream.path(), &["config", "user.email", "t@t"]).0);
+    assert!(git(upstream.path(), &["config", "user.name", "t"]).0);
+    std::fs::write(upstream.path().join("extra.md"), "x").unwrap();
+    assert!(git(upstream.path(), &["add", "extra.md"]).0);
+    assert!(git(upstream.path(), &["commit", "-qm", "upstream commit"]).0);
+    let branch = git(pm.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).1;
+    assert!(
+        git(
+            pm.path(),
+            &["remote", "add", "origin", upstream.path().to_str().unwrap()]
+        )
+        .0
+    );
+    assert!(git(pm.path(), &["fetch", "-q", "origin"]).0);
+    assert!(
+        git(
+            pm.path(),
+            &[
+                "branch",
+                "--set-upstream-to",
+                &format!("origin/{branch}"),
+                &branch
+            ]
+        )
+        .0
+    );
+
+    let (ok, v) = cli(pm.path(), state.path(), &["overview", "--json"]);
+    assert!(ok, "{v}");
+    let needs = v["needs_me"].as_array().unwrap();
+    let kind = |k: &str| needs.iter().find(|n| n["kind"] == k);
+    let review = kind("review_no_pr").expect("review item");
+    assert_eq!(review["command"], "cadence issue show CAD-3");
+    let unblocked = kind("blocked_ready").expect("unblocked item");
+    assert_eq!(unblocked["command"], "cadence issue set CAD-5 status ready");
+    let behind = kind("tracker_behind").expect("behind item");
+    assert_eq!(behind["command"], "cadence issue sync");
+    // No github remotes declared → no gh work attempted, state "ok".
+    assert_eq!(v["github"]["state"], "ok");
+    // projects summary counts + oldest review age.
+    let proj = v["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["key"] == "cadence")
+        .expect("cadence project row");
+    assert!(proj["oldest_review_age"].as_i64().is_some(), "{proj}");
+    assert_eq!(proj["open_by_status"]["review"], 1, "{proj}");
+}
+
+#[test]
+fn overview_plain_render_shows_sections() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    assert!(
+        cli(
+            pm.path(),
+            state.path(),
+            &["issue", "set", "CAD-3", "status=review"]
+        )
+        .0
+    );
+    let (ok, out) = cli_raw(pm.path(), state.path(), &["overview"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("NEEDS ME"), "{out}");
+    assert!(out.contains("DRIFT"), "{out}");
+    assert!(out.contains("PROJECTS"), "{out}");
+    assert!(out.contains("review_no_pr"), "{out}");
+    assert!(out.contains("cadence issue show CAD-3"), "{out}");
+}
+
+#[test]
+fn version_reports_build_identity() {
+    let out = Command::new(bin()).arg("--version").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(
+        text,
+        format!(
+            "cadence {}+{}",
+            env!("CARGO_PKG_VERSION"),
+            env!("CADENCE_BUILD_COMMIT")
+        ),
+        "{text}"
+    );
+}

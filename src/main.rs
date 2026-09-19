@@ -23,7 +23,9 @@ use cadence_agent::proc::BoundedError;
 #[command(
     name = "cadence",
     about = "Local controller for coding agents",
-    version
+    // `0.1.0+<build commit>` — semver build metadata, `unknown` when
+    // the build ran outside a git checkout.
+    version = concat!(env!("CARGO_PKG_VERSION"), "+", env!("CADENCE_BUILD_COMMIT"))
 )]
 struct Cli {
     /// Runtime state directory (socket, database, logs).
@@ -625,6 +627,18 @@ enum Commands {
         /// Print the JSON report on stdout.
         #[arg(long)]
         json: bool,
+    },
+    /// What needs a human right now: merge-ready PRs, open approvals,
+    /// fenced or stalled agents, review/unblocked issues, unread
+    /// inboxes, a behind-tracker, deploy drift — each with the exact
+    /// command. The same payload as the board's Overview screen.
+    Overview {
+        /// Emit the payload as JSON instead of the aligned list.
+        #[arg(long)]
+        json: bool,
+        /// Re-render every <secs> until interrupted.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        watch: Option<u64>,
     },
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
@@ -1887,6 +1901,155 @@ fn run_status(
             print!("\x1b[2J\x1b[H");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
+    }
+}
+
+/// `cadence overview` — the needs-me list, deploy drift and per-project
+/// summary, rendered as an aligned list (or the raw payload with
+/// `--json`). Read-only: every source degrades rather than failing the
+/// screen.
+fn run_overview(state_dir: &Path, json_out: bool, watch: Option<u64>) -> Result<i32> {
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let pm_dir = cadence_agent::issue::default_dir().unwrap_or_default();
+    loop {
+        let view = cadence_agent::overview::overview(state_dir, &pm_dir);
+        if json_out {
+            print_json(&view);
+        } else {
+            print_overview(&view);
+        }
+        let Some(secs) = watch else {
+            return Ok(0);
+        };
+        std::thread::sleep(Duration::from_secs(secs));
+        if tty {
+            print!("\x1b[2J\x1b[H");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    }
+}
+
+/// Age formatting — `42s`, `13m`, `5h`, `2d`.
+fn fmt_age(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86400)
+    }
+}
+
+/// Aligned-list rendering of the overview payload — the TTY default.
+fn print_overview(view: &Value) {
+    let needs = view["needs_me"].as_array().cloned().unwrap_or_default();
+    println!("NEEDS ME");
+    if needs.is_empty() {
+        println!("  nothing waiting on a human");
+    } else {
+        let mut widths = [0usize; 4];
+        let mut rows = Vec::new();
+        for n in &needs {
+            let title = n["title"].as_str().unwrap_or_default();
+            let title: String = title.chars().take(52).collect();
+            let row = [
+                n["kind"].as_str().unwrap_or_default().to_string(),
+                fmt_age(n["age"].as_i64().unwrap_or(0)),
+                n["project"].as_str().unwrap_or_default().to_string(),
+                title,
+                n["command"].as_str().unwrap_or_default().to_string(),
+            ];
+            for (i, c) in row[..4].iter().enumerate() {
+                widths[i] = widths[i].max(c.chars().count());
+            }
+            rows.push(row);
+        }
+        for r in &rows {
+            println!(
+                "  {:<w0$}  {:>w1$}  {:<w2$}  {:<w3$}  {}",
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                r[4],
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2],
+                w3 = widths[3],
+            );
+        }
+    }
+    let drift = &view["drift"];
+    println!();
+    println!("DRIFT");
+    if drift["known"].as_bool().unwrap_or(false) {
+        let n = drift["count"].as_i64().unwrap_or(0);
+        let commit = drift["build_commit"]
+            .as_str()
+            .map(|c| c.chars().take(10).collect::<String>())
+            .unwrap_or_else(|| "?".to_string());
+        if n == 0 {
+            println!(
+                "  {} is running the latest on {}",
+                drift["project"].as_str().unwrap_or("?"),
+                drift["ref"].as_str().unwrap_or("?")
+            );
+        } else {
+            println!(
+                "  {}: {n} commit(s) past build {} on {}",
+                drift["project"].as_str().unwrap_or("?"),
+                commit,
+                drift["ref"].as_str().unwrap_or("?")
+            );
+            for c in drift["commits"].as_array().cloned().unwrap_or_default() {
+                let pr = c["pr"]
+                    .as_u64()
+                    .map(|n| format!(" (#{n})"))
+                    .unwrap_or_default();
+                println!("    · {}{}", c["subject"].as_str().unwrap_or(""), pr);
+            }
+        }
+    } else {
+        println!("  {}", drift["reason"].as_str().unwrap_or("cannot tell"));
+    }
+    let projects = view["projects"].as_array().cloned().unwrap_or_default();
+    if !projects.is_empty() {
+        println!();
+        println!("PROJECTS");
+        for p in &projects {
+            let counts = p["open_by_status"]
+                .as_object()
+                .map(|m| {
+                    let mut pairs: Vec<(&String, &Value)> = m.iter().collect();
+                    pairs.sort_by(|a, b| a.0.cmp(b.0));
+                    pairs
+                        .iter()
+                        .map(|(k, v)| format!("{k}:{}", v.as_i64().unwrap_or(0)))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|| "-".to_string());
+            let review = p["oldest_review_age"]
+                .as_i64()
+                .map(|a| format!("  oldest review {}", fmt_age(a)))
+                .unwrap_or_default();
+            println!(
+                "  {:<14} {:<40}{}",
+                p["key"].as_str().unwrap_or(""),
+                counts,
+                review
+            );
+        }
+    }
+    if view["github"]["state"].as_str() == Some("unavailable") {
+        println!();
+        println!("github: unavailable — PR and CI rows absent");
+    }
+    if !view["daemon"]["reachable"].as_bool().unwrap_or(false) {
+        println!("daemon: unreachable — agent, approval and drift rows absent");
     }
 }
 
@@ -3176,6 +3339,7 @@ fn run() -> Result<i32> {
             cwd: std::env::current_dir()?,
             state_dir,
         }),
+        Commands::Overview { json, watch } => run_overview(&state_dir, json, watch),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
 }

@@ -14155,3 +14155,240 @@ stress_pattern = ["wait_"]
     assert_eq!(nf["isolated_gated"]["outcome"], json!("fail"));
     assert_eq!(r["suggested_verdict"], json!("blocked"));
 }
+// ==== CAD-83: `cadence overview` — daemon-dependent rows ====
+
+/// `cadence overview --json` against a scratch daemon's state dir;
+/// `pm` binds a tracker dir via CADENCE_PM_DIR, `envs` add PATH etc.
+fn overview_at(home: &Path, state: &Path, pm: Option<&Path>, envs: &[(&str, String)]) -> Value {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
+        .arg(state)
+        .args(["overview", "--json"])
+        .env("HOME", home)
+        .env_remove("CADENCE_ALIAS");
+    if let Some(pm) = pm {
+        cmd.env("CADENCE_PM_DIR", pm);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "overview: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn git_at(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn overview_daemon_info_fenced_and_inbox_rows() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+
+    // daemon_info carries the compiled-in build identity + start time.
+    let info = d.rpc("daemon_info", json!({})).unwrap();
+    assert_eq!(
+        info["build_commit"].as_str().unwrap(),
+        env!("CADENCE_BUILD_COMMIT")
+    );
+    assert_eq!(
+        info["build_time"].as_str().unwrap(),
+        env!("CADENCE_BUILD_TIME")
+    );
+    assert!(info["started_at"].as_f64().unwrap_or(0.0) > 0.0);
+
+    // A fenced agent and unread inbox surface as needs-me rows with
+    // their exact operator commands.
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    fence_agent(&d, "w1", "x1");
+    d.register_inbox("pm");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "pm", "text": "ping", "message": "n1"}),
+    )
+    .unwrap();
+
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    let fenced = needs
+        .iter()
+        .find(|n| n["kind"] == "fenced")
+        .expect("fenced row");
+    assert_eq!(fenced["command"], "cadence agent unfence w1");
+    let inbox = needs
+        .iter()
+        .find(|n| n["kind"] == "inbox_unread")
+        .expect("inbox row");
+    assert_eq!(inbox["command"], "cadence inbox pm");
+    assert!(inbox["title"].as_str().unwrap().contains("pm"));
+    // The daemon block carries identity through to the board payload.
+    assert_eq!(view["daemon"]["reachable"], true);
+    assert_eq!(
+        view["daemon"]["build_commit"].as_str().unwrap(),
+        env!("CADENCE_BUILD_COMMIT")
+    );
+    assert!(view["daemon"]["started_at"].as_f64().unwrap_or(0.0) > 0.0);
+    // No tracker under the fake home → no repo can match the build.
+    assert_eq!(view["drift"]["matched"], false);
+}
+
+#[test]
+fn overview_approval_row_for_brokered_request() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let _mock = d.mock_claude("permit", None);
+    broker_command();
+    d.register_inbox("pm");
+    d.register_claude("w1", json!({"upstream": "pm", "broker_approvals": true}));
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "run ls", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 15);
+    let req = d.wait_request("w1", 15);
+    let handle = req["request"].as_str().unwrap().to_string();
+
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    let approval = needs
+        .iter()
+        .find(|n| n["kind"] == "approval")
+        .expect("approval row");
+    assert_eq!(
+        approval["command"],
+        format!("cadence agent respond w1 --request {handle} --decision accept")
+    );
+    assert!(approval["title"].as_str().unwrap().contains("w1"));
+}
+
+#[test]
+fn overview_drift_reports_commits_after_build() {
+    // Needs the compiled-in repo identity — absent only when the crate
+    // was built outside a git checkout.
+    if env!("CADENCE_BUILD_REMOTE") == "unknown" || env!("CADENCE_BUILD_COMMIT") == "unknown" {
+        return;
+    }
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let pm = TempDir::new().unwrap();
+
+    // A clone of the build repo carrying the same remote string (the
+    // remote match) but refs we control, so the drift count is exact.
+    let clone = TempDir::new().unwrap();
+    git_at(
+        clone.path(),
+        &["clone", "-q", env!("CADENCE_BUILD_ROOT"), "."],
+    );
+    git_at(
+        clone.path(),
+        &["remote", "set-url", "origin", env!("CADENCE_BUILD_REMOTE")],
+    );
+    // Drop every remote-tracking ref so local `main` is the default.
+    let refs = git_at(
+        clone.path(),
+        &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+    );
+    for r in refs.lines() {
+        git_at(clone.path(), &["update-ref", "-d", r]);
+    }
+    git_at(
+        clone.path(),
+        &["checkout", "-qB", "main", env!("CADENCE_BUILD_COMMIT")],
+    );
+    git_at(clone.path(), &["config", "user.email", "t@t"]);
+    git_at(clone.path(), &["config", "user.name", "t"]);
+    for (i, msg) in ["drift one (#11)", "drift two", "drift three (#13)"]
+        .iter()
+        .enumerate()
+    {
+        std::fs::write(clone.path().join("f"), format!("{i}")).unwrap();
+        git_at(clone.path(), &["add", "f"]);
+        git_at(clone.path(), &["commit", "-qm", msg]);
+    }
+
+    // The tracker declares that clone as cadence's repo.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["issue", "init"])
+        .env("HOME", home.path())
+        .env("CADENCE_PM_DIR", pm.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let repo = clone.path().to_str().unwrap().to_string();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "issue", "project", "add", "cadence", "--prefix", "CAD", "--repo", &repo,
+        ])
+        .env("HOME", home.path())
+        .env("CADENCE_PM_DIR", pm.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A stub `gh` keeps the GitHub section off the network entirely.
+    let ghbin = TempDir::new().unwrap();
+    let gh = ghbin.path().join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\nif [ \"$1\" = pr ]; then echo '[]'; else echo '{\"state\":\"success\"}'; fi\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        ghbin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let view = overview_at(home.path(), &d.state, Some(pm.path()), &[("PATH", path)]);
+    let drift = &view["drift"];
+    assert_eq!(drift["matched"], true, "{view}");
+    assert_eq!(drift["project"], "cadence", "{view}");
+    assert_eq!(drift["known"], true, "{view}");
+    assert_eq!(drift["count"], 3, "{view}");
+    let prs: Vec<Option<u64>> = drift["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["pr"].as_u64())
+        .collect();
+    assert_eq!(prs, vec![Some(13), None, Some(11)], "{view}");
+    // All panes idle (no agents) → the drift row offers the restart.
+    let needs = view["needs_me"].as_array().unwrap();
+    let row = needs
+        .iter()
+        .find(|n| n["kind"] == "drift")
+        .expect("drift row");
+    assert_eq!(row["command"], "cadence daemon restart --when-idle --ui");
+}
