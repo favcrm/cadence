@@ -283,6 +283,7 @@ pub fn project_add(
         components: components.to_vec(),
         tags,
         default_owner: owner.map(str::to_string),
+        build: None,
     };
     let dir = pm.dir.join(key);
     if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
@@ -894,6 +895,7 @@ pub fn add_ref(
         label: label.map(str::to_string),
         closed: None,
         worktree: worktree.map(str::to_string),
+        cargo_target: None,
     };
     front.refs.push(r);
     save_front(&dir, &front, &body)?;

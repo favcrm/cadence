@@ -191,6 +191,7 @@ struct Target {
     branch: String,
     root: PathBuf,
     msg_refs: std::collections::HashSet<String>,
+    cargo_target: Option<String>,
 }
 
 /// The three ref states an issue can be in for finishing.
@@ -213,12 +214,12 @@ enum Resolve {
 fn resolve(pm: &Pm, id: &str) -> Result<Resolve> {
     let (_project, dir) = write::issue_dir(pm, id)?;
     let (front, body) = write::load_front(&dir)?;
-    let open_wt = front
+    let open_wt_ref = front
         .refs
         .iter()
-        .find(|r| r.kind == "worktree" && r.closed != Some(true))
-        .and_then(|r| r.path.clone())
-        .map(PathBuf::from);
+        .find(|r| r.kind == "worktree" && r.closed != Some(true));
+    let open_wt = open_wt_ref.and_then(|r| r.path.clone()).map(PathBuf::from);
+    let cargo_target = open_wt_ref.and_then(|r| r.cargo_target.clone());
     let wt_name = open_wt
         .as_deref()
         .and_then(|d| d.file_name())
@@ -306,6 +307,7 @@ fn resolve(pm: &Pm, id: &str) -> Result<Resolve> {
         branch,
         root,
         msg_refs,
+        cargo_target,
     })))
 }
 
@@ -615,6 +617,7 @@ pub fn run(
     let wt_name = t.wt_name.clone();
     let branch = t.branch.clone();
     let root = t.root.clone();
+    let cargo_target = t.cargo_target.clone();
 
     // The per-worktree guard + dirty + survivability, evaluated once.
     // `--force` records every block it bypasses; without it the first
@@ -694,11 +697,24 @@ pub fn run(
     }
     pm.commit(&format!("{subject}\n\n{trailers}"))?;
 
+    // Accounting only — `git worktree remove` takes the worktree dir
+    // and nothing else, so a cargo target outside it (the shared
+    // cache, or wherever an operator pointed `build.target-dir`) is
+    // never deleted here.
+    let cargo_target_kept = cargo_target.as_deref().is_some_and(|p| {
+        !removed_worktree
+            || wt_dir
+                .as_deref()
+                .is_none_or(|d| !Path::new(p).starts_with(d))
+    });
+
     Ok(json!({
         "issue": t.front.id,
         "finished": true,
         "worktree": wt_dir,
         "branch": branch,
+        "cargo_target": cargo_target,
+        "cargo_target_kept": cargo_target_kept,
         "removed_worktree": removed_worktree,
         "deleted_branch": deleted_branch,
         "kept_branch": keep_branch,

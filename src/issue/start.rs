@@ -253,6 +253,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     .is_ok();
 
     let mut created = false;
+    let cargo_target: Option<PathBuf>;
     if ours_recorded && branch_exists {
         if !dir_exists {
             // Refs still accurate — re-attach the existing branch.
@@ -267,6 +268,10 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 branch
             )));
         }
+        cargo_target = Some(worktree::configure_cargo_target(
+            &wt_dir,
+            &worktree::target_dir_for(&project, &root, &wt_dir)?,
+        )?);
         // Idempotent: same issue, same names — no commit.
     } else {
         if branch_exists {
@@ -286,6 +291,10 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         }
         worktree::add(&root, &wt_dir, Some(&branch), &base_sha)?;
         worktree::ensure_cadence_ignored(&root)?;
+        cargo_target = Some(worktree::configure_cargo_target(
+            &wt_dir,
+            &worktree::target_dir_for(&project, &root, &wt_dir)?,
+        )?);
         created = true;
 
         let repo_label = root
@@ -304,6 +313,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 label: Some(repo_label),
                 closed: None,
                 worktree: None,
+                cargo_target: None,
             });
         }
         if !has_ref("worktree", &wt_str) {
@@ -314,6 +324,9 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 label: None,
                 closed: None,
                 worktree: None,
+                cargo_target: cargo_target
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
             });
         }
         if matches!(new_front.status.as_str(), "backlog" | "ready") {
@@ -358,6 +371,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "base": {"ref": base, "sha": base_sha},
         "trailer": format!("Issue: {}", front.id),
         "created": created,
+        "target_dir": cargo_target,
     });
     if let (Some(job), Some((state_dir, spec, spec_sha256))) = (&args.job, job_probe) {
         let created_job = client::rpc(

@@ -313,8 +313,21 @@ pub fn render(report: &Value) -> String {
 }
 
 /// `doctor --host` end to end: scan this host, print the report, exit
-/// with the worst level. The single call `main.rs` makes.
-pub fn cli(state_dir: &Path, json_out: bool) -> Result<i32> {
+/// with the worst level. `--reclaim-plan` instead prints what could
+/// be freed — a listing, never a deletion — and always exits 0.
+pub fn cli(state_dir: &Path, json_out: bool, reclaim: bool) -> Result<i32> {
+    if reclaim {
+        let plan = reclaim_plan(&Scan::host(state_dir));
+        if json_out {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan).unwrap_or_default()
+            );
+        } else {
+            print!("{}", render_reclaim(&plan));
+        }
+        return Ok(0);
+    }
     let report = run(&Scan::host(state_dir));
     if json_out {
         println!(
@@ -1567,37 +1580,15 @@ fn tracker_closed(scan: &Scan, wt_path: &Path, id: Option<&str>) -> Option<bool>
     }))
 }
 
-fn check_worktrees(scan: &Scan) -> Check {
-    let name = "worktrees";
-    let threshold =
-        json!("warn: any worktree whose branch is merged or whose tracker ref is closed");
-    let Some(root) = repo_root(&scan.cwd) else {
-        return check(
-            name,
-            Level::Ok,
-            json!({"skipped": true}),
-            threshold,
-            format!("{} is not inside a git repo", scan.cwd.display()),
-            String::new(),
-        );
-    };
-    let wt_root = root.join(".cadence/wt");
-    if !wt_root.is_dir() {
-        return check(
-            name,
-            Level::Ok,
-            json!({"skipped": true}),
-            threshold,
-            format!("no .cadence/wt under {}", root.display()),
-            String::new(),
-        );
-    }
-    let branches = worktree_branches(&root);
-    let base = default_base(&root);
+/// The worktree staleness scan shared by the `worktrees` check and
+/// `--reclaim-plan`: `(<stale rows>, <remedy per row>, <dirs scanned>)`.
+fn stale_worktrees(scan: &Scan, root: &Path, wt_root: &Path) -> (Vec<Value>, Vec<String>, usize) {
+    let branches = worktree_branches(root);
+    let base = default_base(root);
     let mut stale: Vec<Value> = Vec::new();
     let mut remedies: Vec<String> = Vec::new();
     let mut scanned = 0_usize;
-    if let Ok(entries) = std::fs::read_dir(&wt_root) {
+    if let Ok(entries) = std::fs::read_dir(wt_root) {
         for ent in entries.flatten() {
             let Ok(meta) = ent.metadata() else {
                 continue;
@@ -1617,7 +1608,7 @@ fn check_worktrees(scan: &Scan) -> Check {
                 .as_deref()
                 .zip(base.as_deref())
                 .is_some_and(|(b, base)| {
-                    git_out(&root, &["merge-base", "--is-ancestor", b, base])
+                    git_out(root, &["merge-base", "--is-ancestor", b, base])
                         .is_some_and(|o| o.status.success())
                 });
             let id = issue_id_from_name(&wt_name);
@@ -1666,16 +1657,61 @@ fn check_worktrees(scan: &Scan) -> Check {
             });
         }
     }
+    (stale, remedies, scanned)
+}
+
+fn check_worktrees(scan: &Scan) -> Check {
+    let name = "worktrees";
+    let threshold =
+        json!("warn: any worktree whose branch is merged or whose tracker ref is closed");
+    let Some(root) = repo_root(&scan.cwd) else {
+        return check(
+            name,
+            Level::Ok,
+            json!({"skipped": true}),
+            threshold,
+            format!("{} is not inside a git repo", scan.cwd.display()),
+            String::new(),
+        );
+    };
+    let wt_root = root.join(".cadence/wt");
+    if !wt_root.is_dir() {
+        return check(
+            name,
+            Level::Ok,
+            json!({"skipped": true}),
+            threshold,
+            format!("no .cadence/wt under {}", root.display()),
+            String::new(),
+        );
+    }
+    let (stale, remedies, scanned) = stale_worktrees(scan, &root, &wt_root);
+    // The shared cargo cache counts once, at the repo level — it is
+    // not part of any worktree's own footprint.
+    let shared = crate::worktree::shared_target_dir(&root);
+    let shared_size = shared.is_dir().then(|| {
+        let (bytes, truncated) = dir_size(&shared);
+        json!({"path": shared, "bytes": bytes, "bytes_truncated": truncated})
+    });
     let level = if stale.is_empty() {
         Level::Ok
     } else {
         Level::Warn
     };
+    let shared_note = shared_size
+        .as_ref()
+        .map(|s| {
+            format!(
+                "; shared cargo cache {}",
+                human(s["bytes"].as_u64().unwrap_or(0))
+            )
+        })
+        .unwrap_or_default();
     let detail = if stale.is_empty() {
-        format!("{scanned} worktrees, none stale")
+        format!("{scanned} worktrees, none stale{shared_note}")
     } else {
         format!(
-            "{} of {} worktrees stale ({}{})",
+            "{} of {} worktrees stale ({}{}{})",
             stale.len(),
             scanned,
             if stale
@@ -1686,7 +1722,8 @@ fn check_worktrees(scan: &Scan) -> Check {
             } else {
                 ""
             },
-            human(stale.iter().map(|s| s["bytes"].as_u64().unwrap_or(0)).sum())
+            human(stale.iter().map(|s| s["bytes"].as_u64().unwrap_or(0)).sum()),
+            shared_note
         )
     };
     check(
@@ -1695,11 +1732,106 @@ fn check_worktrees(scan: &Scan) -> Check {
         json!({
             "scanned": scanned,
             "stale": stale,
+            "shared_cargo_target": shared_size,
         }),
         threshold,
         detail,
         remedies.into_iter().take(4).collect::<Vec<_>>().join("; "),
     )
+}
+
+// ---------- reclaim plan ----------
+
+/// What `--reclaim-plan` lists: a per-lane `target/` that pre-dates
+/// the shared cache, the shared cache itself (rebuilt lazily, freeing
+/// real bytes when every lane is done with it), and stale worktrees.
+/// Listing only — nothing here deletes or signals anything.
+pub fn reclaim_plan(scan: &Scan) -> Value {
+    let mut rows: Vec<Value> = Vec::new();
+    let Some(root) = repo_root(&scan.cwd) else {
+        return json!({"rows": rows, "reclaimable_bytes": 0,
+                      "skipped": format!("{} is not inside a git repo", scan.cwd.display())});
+    };
+    let wt_root = root.join(".cadence/wt");
+    if let Ok(entries) = std::fs::read_dir(&wt_root) {
+        for ent in entries.flatten() {
+            if !ent.metadata().is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            let target = ent.path().join("target");
+            if target.is_dir() {
+                let (bytes, truncated) = dir_size(&target);
+                let name = ent.file_name().to_string_lossy().to_string();
+                rows.push(json!({
+                    "kind": "worktree-target",
+                    "path": target,
+                    "bytes": bytes,
+                    "bytes_truncated": truncated,
+                    "action": match issue_id_from_name(&name) {
+                        Some(id) => format!("cadence issue finish {id}  # removes the worktree and its target/"),
+                        None => format!("git -C {} worktree remove {}", root.display(), ent.path().display()),
+                    },
+                }));
+            }
+        }
+    }
+    let shared = crate::worktree::shared_target_dir(&root);
+    if shared.is_dir() {
+        let (bytes, truncated) = dir_size(&shared);
+        rows.push(json!({
+            "kind": "shared-cargo-cache",
+            "path": shared,
+            "bytes": bytes,
+            "bytes_truncated": truncated,
+            "action": format!("rm -rf {}  # every lane rebuilds lazily; issue finish never touches it", shared.display()),
+        }));
+    }
+    if wt_root.is_dir() {
+        let (stale, _remedies, _scanned) = stale_worktrees(scan, &root, &wt_root);
+        for s in stale {
+            rows.push(json!({
+                "kind": "stale-worktree",
+                "path": s["path"],
+                "bytes": s["bytes"],
+                "bytes_truncated": s["bytes_truncated"],
+                "action": match s["issue"].as_str() {
+                    Some(id) => format!("cadence issue finish {id}"),
+                    None => format!("git -C {} worktree remove {}", root.display(), s["path"].as_str().unwrap_or("?")),
+                },
+                "why": s["why"],
+            }));
+        }
+    }
+    let reclaimable: u64 = rows.iter().map(|r| r["bytes"].as_u64().unwrap_or(0)).sum();
+    json!({
+        "rows": rows,
+        "reclaimable_bytes": reclaimable,
+    })
+}
+
+/// Text form of the plan: one line per reclaimable row, then the total.
+pub fn render_reclaim(plan: &Value) -> String {
+    let mut out = String::from("cadence doctor --host --reclaim-plan — nothing here is deleted\n");
+    if let Some(skipped) = plan["skipped"].as_str() {
+        out.push_str(&format!("skipped: {skipped}\n"));
+        return out;
+    }
+    if let Some(rows) = plan["rows"].as_array() {
+        for r in rows {
+            out.push_str(&format!(
+                "{:<20} {:>10}  {}\n       {}\n",
+                r["kind"].as_str().unwrap_or("?"),
+                human(r["bytes"].as_u64().unwrap_or(0)),
+                r["path"].as_str().unwrap_or("?"),
+                r["action"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "total reclaimable: {}\n",
+        human(plan["reclaimable_bytes"].as_u64().unwrap_or(0))
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -2671,6 +2803,111 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["cad-1-x", "cad-2-y", "feat-a"]);
+    }
+
+    #[test]
+    fn worktrees_count_shared_target_once() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = scan.cwd.clone();
+        init_repo(&repo);
+        // Two live lanes, one shared cache — the cache's bytes land
+        // once in `shared_cargo_target`, never inside a lane's row.
+        for name in ["cad-1-a", "cad-2-b"] {
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    &format!(".cadence/wt/{name}"),
+                    "-b",
+                    &format!("cadence/{name}"),
+                ],
+            );
+        }
+        let shared = repo.join(".cadence/target/shared");
+        sparse(&shared.join("dep.rlib"), 4 * 1024 * 1024);
+        let c = check_worktrees(&scan);
+        let st = &c.value["shared_cargo_target"];
+        assert_eq!(
+            st["path"].as_str().unwrap(),
+            shared.to_string_lossy(),
+            "{st}"
+        );
+        assert_eq!(st["bytes"].as_u64().unwrap(), 4 * 1024 * 1024);
+        // Exactly one shared entry — a `stale` row per lane never
+        // carries the shared bytes with it.
+        assert!(c.value["stale"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["path"].as_str().unwrap() != shared.to_string_lossy()));
+        assert!(c.detail.contains("shared cargo cache"), "{}", c.detail);
+    }
+
+    #[test]
+    fn reclaim_plan_lists_without_deleting() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = scan.cwd.clone();
+        init_repo(&repo);
+        // A live lane with a per-lane target/, the shared cache, and
+        // a stale lane — all listed, none deleted.
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                ".cadence/wt/cad-1-live",
+                "-b",
+                "cadence/cad-1-live",
+            ],
+        );
+        let lane_target = repo.join(".cadence/wt/cad-1-live/target");
+        sparse(&lane_target.join("dep.rlib"), 1024 * 1024);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                ".cadence/wt/feat-gone",
+                "-b",
+                "feat-gone",
+            ],
+        );
+        git(&repo, &["merge", "-q", "feat-gone"]);
+        let shared = repo.join(".cadence/target/shared");
+        sparse(&shared.join("dep.rlib"), 2 * 1024 * 1024);
+
+        let plan = reclaim_plan(&scan);
+        let rows = plan["rows"].as_array().unwrap();
+        let kinds: Vec<&str> = rows.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+        assert!(
+            kinds.contains(&"worktree-target")
+                && kinds.contains(&"shared-cargo-cache")
+                && kinds.contains(&"stale-worktree"),
+            "{kinds:?}"
+        );
+        assert_eq!(
+            plan["reclaimable_bytes"].as_u64().unwrap(),
+            rows.iter()
+                .map(|r| r["bytes"].as_u64().unwrap())
+                .sum::<u64>()
+        );
+        // Every row names its action; nothing was deleted.
+        assert!(rows
+            .iter()
+            .all(|r| !r["action"].as_str().unwrap().is_empty()));
+        assert!(lane_target.is_dir() && shared.is_dir());
+        assert!(repo.join(".cadence/wt/feat-gone").is_dir());
+        let text = render_reclaim(&plan);
+        assert!(
+            text.contains("total reclaimable") && text.contains("shared-cargo-cache"),
+            "{text}"
+        );
     }
 
     #[test]

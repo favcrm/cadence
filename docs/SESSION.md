@@ -35,7 +35,12 @@ export CADENCE_SUITE_LOCK="$HOME/.local/state/cadence/suite.lock"   # one path p
 cadence daemon start          # or: cadence doctor, if anything looks off
 cadence doctor --host         # host watchdog: disk free, provider WALs, pipe
                               #  pressure, orphaned processes, leaked temp dirs,
-                              #  stale worktrees — read-only, exit 0/1/2
+                              #  stale worktrees (shared cargo cache counted
+                              #  once) — read-only, exit 0/1/2
+cadence doctor --host --reclaim-plan
+                              # what could be freed — stale worktrees, per-lane
+                              #  target dirs, the shared cache — sizes + commands,
+                              #  never deletes
 cadence ui start              # board at http://cadence.localhost:18000 behind the dev gateway
 cadence ui tailscale start    # optional: phone/laptop access at https://<dns>:9450 — tailnet-only, loopback bind unchanged
 cadence issue doctor          # tracker: hooks ours, lint clean, ahead/behind origin

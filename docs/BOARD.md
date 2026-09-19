@@ -279,6 +279,17 @@ the `Issue: <ID>` trailer — as JSON.
 - The worktree is minted through the same helper as
   `cadence devin --worktree` (shared `src/worktree.rs`), including the
   `.gitignore` `.cadence/` rule — added only when missing.
+- The worktree's cargo builds share one cache: `issue start` writes
+  `build.target-dir = <repo>/.cadence/target/shared` into the
+  worktree's `.cargo/config.toml`, so every lane's dependency
+  artifacts compile once per host instead of once per worktree and
+  concurrent builds queue on cargo's own lock. A `build:
+  {target_dir: per-worktree}` section in `project.yaml` opts a lane
+  back onto its own `target/`; a `target-dir` the operator already
+  wrote in that file always wins. `.cargo/` is excluded through the repo's common
+  `info/exclude` (never `.gitignore`), so the generated config leaves
+  `git status` clean. The effective dir is recorded as `cargo_target`
+  on the `worktree` ref and printed as `target_dir`.
 - One tracker commit records a `branch` ref (label = repo basename)
   and a `worktree` ref (absolute path), the status/owner updates and
   the CAD-42 `Issue:`/`Actor:` trailers under subject
@@ -356,7 +367,11 @@ worktree+branch pair. It refuses, naming what it found, while:
 Then it runs `git worktree remove`, deletes the local branch (with
 `--remote` the remote one too), and lands one tracker commit
 `<ID>: finish <branch>` that marks both refs `closed: true` — kept as
-history, so a later `issue log` still shows where the work lived. The
+history, so a later `issue log` still shows where the work lived.
+`git worktree remove` takes the worktree dir and nothing else, so a
+recorded `cargo_target` outside it — the shared cache, or wherever an
+operator pointed `build.target-dir` — is never deleted; the output
+reports it as `cargo_target` with `cargo_target_kept: true`. The
 issue's status is not touched: status follows the job or the PM.
 `--force` overrides each refusal and is recorded — the `overrode`
 list in the output and a `Forced: true` trailer on the commit.
