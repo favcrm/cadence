@@ -35,6 +35,13 @@ function stateLabel(a: Agent): string {
   return a.state;
 }
 
+/// Compact silence label for the badge — "45s", "34m", "1h 5m".
+function fmtSilence(secs: number): string {
+  if (secs < 60) return `${Math.floor(secs)}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+}
+
 /// A fence's recovery path — the daemon's own error text already names
 /// `agent unfence` / `message reconcile`; render it verbatim as code.
 function RecoveryBlock({ text }: { text: string }) {
@@ -456,6 +463,17 @@ export default function Agents({
                     <span className="num text-ink-400">
                       {a.last_activity ? fmtTime(a.last_activity) : "—"}
                     </span>
+                    {a.stalled ? (
+                      <div>
+                        <span className="chip bg-warn/10 text-warn mt-1">
+                          stalled {fmtSilence(a.silent_secs ?? 0)}
+                        </span>
+                      </div>
+                    ) : (a.silent_secs ?? 0) >= 60 ? (
+                      <div className="num text-micro text-ink-500 mt-0.5">
+                        silent {fmtSilence(a.silent_secs!)}
+                      </div>
+                    ) : null}
                   </td>
                   <td className="px-3 py-2.5 align-top">
                     {a.fenced ? (

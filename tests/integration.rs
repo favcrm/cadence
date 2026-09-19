@@ -2559,6 +2559,11 @@ if cmd == "display-message":
     sys.exit(0)
 if cmd == "capture-pane":
     name = rest[rest.index("-t") + 1]
+    # Count captures so tests can prove the stall ticker only samples
+    # panes while a turn is running.
+    try:
+        with open(sess_path(name, "captures"), "a") as f: f.write("c")
+    except OSError: pass
     out = ""
     try: out += open(sess_path(name, "screen")).read()
     except FileNotFoundError: die("no such session")
@@ -8149,6 +8154,7 @@ fn restart_fences_task_kickoff_and_job_show_reports_drift() {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -10550,4 +10556,418 @@ fn job_verdict_unscoped_task_is_unchanged() {
         "{out}"
     );
     assert_eq!(d.task_state("j1-t2"), "verified");
+}
+
+// ---------- CAD-52: stall detection ----------
+
+/// Poll until `alias` has at least `want` events of `kind`.
+fn wait_event_count(d: &TestDaemon, alias: &str, kind: &str, want: usize, secs: u64) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let found: Vec<Value> = d
+            .events(alias)
+            .into_iter()
+            .filter(|e| e["kind"].as_str() == Some(kind))
+            .collect();
+        if found.len() >= want {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{alias}: wanted {want} {kind} events, got {}: {:?}",
+            found.len(),
+            d.events(alias)
+                .iter()
+                .map(|e| e["kind"].as_str().unwrap_or("?").to_string())
+                .collect::<Vec<_>>()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The stored message list for `alias` — notices land here for both
+/// actor and inbox recipients.
+fn messages_for(d: &TestDaemon, alias: &str) -> Vec<Value> {
+    d.rpc("agent_show", json!({"alias": alias})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// Poll until `alias` stores a message whose `source` matches.
+fn wait_source(d: &TestDaemon, alias: &str, source: &str, want: usize, secs: u64) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let found: Vec<Value> = messages_for(d, alias)
+            .into_iter()
+            .filter(|m| m["source"].as_str() == Some(source))
+            .collect();
+        if found.len() >= want {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{alias}: wanted {want} '{source}' messages, got {:?}",
+            messages_for(d, alias)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A fake actor with explicit launch params — `stall_secs` included.
+fn register_fake_opts(d: &TestDaemon, alias: &str, params: Value) {
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": alias, "provider": "fake",
+               "endpoint_kind": "fake", "cwd": cwd,
+               "params": params.to_string()}),
+    )
+    .unwrap();
+}
+
+/// A running turn on a static pty screen raises `turn_stalled` exactly
+/// once, flags the agent views, and sends one `worker_notice` to the
+/// message's `reply_to` — the turn itself is never touched.
+#[test]
+fn pty_stall_static_screen_fires_once_and_notices() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    std::env::set_var("CADENCE_STALL_SAMPLE_SECS", "2");
+    d.register_inbox("pm");
+    d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 2}));
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "do work", "reply_to": "pm",
+               "message": "ms1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "ms1", &["running"], 15);
+
+    let e = d.wait_event("w1", "turn_stalled", 30);
+    assert_eq!(e["payload"]["message"], "ms1", "{e}");
+    assert!(
+        e["payload"]["silent_secs"].as_u64().unwrap_or(0) >= 2,
+        "{e}"
+    );
+    assert!(
+        e["payload"]["last_activity"].as_f64().unwrap_or(0.0) > 0.0,
+        "{e}"
+    );
+
+    // Once per episode: the silence continues but no second event fires.
+    thread::sleep(Duration::from_secs(7));
+    assert_eq!(wait_event_count(&d, "w1", "turn_stalled", 1, 2).len(), 1);
+
+    // One `worker_notice` went to reply_to — fire-and-forget, so the
+    // mailbox holds it with no reply path of its own.
+    let notices = wait_source(&d, "pm", "worker_notice", 1, 10);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0]["reply_to"].is_null(), "{notices:?}");
+    let body = notices[0]["body"].as_str().unwrap_or("");
+    assert!(
+        body.contains("w1") && body.contains("no activity"),
+        "{body}"
+    );
+
+    // The views carry the flag — and the turn is still running:
+    // stalling is informational, never an interruption.
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["stalled"], true, "{agent}");
+    assert!(agent["silent_secs"].as_u64().unwrap_or(0) >= 2, "{agent}");
+    assert_eq!(d.message_state("w1", "ms1"), "running");
+    let list = d.rpc("agent_list", json!({})).unwrap()["agents"].clone();
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"].as_str() == Some("w1"))
+        .cloned()
+        .unwrap();
+    assert_eq!(row["stalled"], true, "{row}");
+
+    // A real result still lands normally after the notice.
+    let token = pty_token(&d, "w1", "ms1");
+    d.rpc(
+        "message_report",
+        json!({"message": "ms1", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "ms1", &["completed"], 10);
+    std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
+}
+
+/// A stalled turn resumes on real screen motion and re-arms: a second
+/// silence raises a second `turn_stalled`. A ticking status counter
+/// (`· Ns`) alone is not activity — it must never resume.
+#[test]
+fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    std::env::set_var("CADENCE_STALL_SAMPLE_SECS", "2");
+    d.register_inbox("pm");
+    d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 2}));
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "do work", "reply_to": "pm",
+               "message": "ms2"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "ms2", &["running"], 15);
+    // The status line exists from the baseline sample on — only its
+    // counter will move.
+    std::fs::write(
+        d.stub_pane_file(&mock, "w1", "tui-state"),
+        "⠋ Working · 1s\n",
+    )
+    .unwrap();
+    d.wait_event("w1", "turn_stalled", 30);
+
+    // The counter ticks past several samples — normalized identically,
+    // so nothing resumes.
+    for i in 2..=4u64 {
+        std::fs::write(
+            d.stub_pane_file(&mock, "w1", "tui-state"),
+            format!("⠋ Working · {i}s\n"),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_secs(2));
+    }
+    assert!(
+        d.events("w1")
+            .iter()
+            .all(|e| e["kind"].as_str() != Some("turn_resumed")),
+        "spinner ticking resumed the turn: {:?}",
+        d.events("w1")
+    );
+
+    // Real transcript motion resumes — same recipient gets the resolved
+    // notice — and detection re-arms for the next silence.
+    std::fs::write(
+        d.stub_pane_file(&mock, "w1", "tui-state"),
+        "⠋ Working · 5s\nBUILD OK\n",
+    )
+    .unwrap();
+    let e = d.wait_event("w1", "turn_resumed", 15);
+    assert_eq!(e["payload"]["message"], "ms2", "{e}");
+    wait_event_count(&d, "w1", "turn_stalled", 2, 20);
+    assert_eq!(d.message_state("w1", "ms2"), "running");
+
+    let notices = wait_source(&d, "pm", "worker_notice", 3, 10);
+    let stalls = notices
+        .iter()
+        .filter(|m| m["body"].as_str().unwrap_or("").contains("no activity"))
+        .count();
+    let resumes = notices
+        .iter()
+        .filter(|m| m["body"].as_str().unwrap_or("").contains("active again"))
+        .count();
+    assert_eq!((stalls, resumes), (2, 1), "{notices:?}");
+    std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
+}
+
+/// A job kickoff's stall goes to the PM as a `job_event`, the event is
+/// job/task-scoped, and the task row carries the flag while it lasts.
+#[test]
+fn job_kickoff_stall_flags_task_and_notifies_pm() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    std::env::set_var("CADENCE_STALL_SAMPLE_SECS", "2");
+    d.register_inbox("pm");
+    d.register_stub("w1", json!({"upstream": "pm", "auto_ready": "verified"}));
+    d.wait_agent("w1", "idle", 20);
+    let (spec, sha) = d.spec_file("spec.md", "stall me");
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
+               "stall_secs": 3, "task_assignee": "w1"}),
+    )
+    .unwrap();
+    d.job_dispatch("j1-t1", json!({})).unwrap();
+    d.wait_task("j1-t1", "running", 15);
+
+    let e = d.wait_event("w1", "turn_stalled", 30);
+    assert_eq!(e["payload"]["task"], "j1-t1", "{e}");
+    // Job-scoped: the job event stream sees it too.
+    let ev = d.rpc("job_events", json!({"job": "j1"})).unwrap();
+    assert!(
+        ev["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"].as_str() == Some("turn_stalled")),
+        "{ev}"
+    );
+    // The PM notice is a `job_event` — one per episode.
+    let notices = wait_source(&d, "pm", "job_event", 1, 10);
+    let stalled = notices
+        .iter()
+        .filter(|m| m["body"].as_str().unwrap_or("").contains("no activity"))
+        .count();
+    assert_eq!(stalled, 1, "{notices:?}");
+    // The task row is flagged while the kickoff is stalled.
+    let show = d.rpc("job_show", json!({"job": "j1"})).unwrap();
+    let task = &show["job"]["tasks"][0];
+    assert_eq!(task["stalled"], true, "{task}");
+    assert!(task["silent_secs"].as_u64().unwrap_or(0) >= 3, "{task}");
+    assert_eq!(d.task_state("j1-t1"), "running");
+    std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
+}
+
+/// The managed path (the fake's `SLEEP` is the managed mock) stalls on
+/// silence and just ends if the turn finishes while stalled. An open
+/// brokered approval wait is activity — it can never stall.
+#[test]
+fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
+    let d = TestDaemon::start();
+    d.register_inbox("pm");
+    register_fake_opts(&d, "w1", json!({"stall_secs": 2}));
+    d.wait_agent("w1", "idle", 10);
+
+    // A brokered wait outlasts the budget without stalling.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "NEED_INPUT:hold",
+               "reply_to": "pm", "message": "m-need"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "waiting_input", 10);
+    thread::sleep(Duration::from_secs(7));
+    assert!(
+        d.events("w1")
+            .iter()
+            .all(|e| e["kind"].as_str() != Some("turn_stalled")),
+        "brokered wait stalled: {:?}",
+        d.events("w1")
+    );
+    let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
+    let handle = requests["requests"][0]["request"].as_str().unwrap();
+    d.rpc(
+        "agent_respond",
+        json!({"alias": "w1", "request": handle, "decision": "accept"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-need", &["completed"], 15);
+
+    // A genuinely silent turn stalls once — then simply ends; no
+    // recovery event is owed for a finished message.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "SLEEP:12", "reply_to": "pm",
+               "message": "m-sleep"}),
+    )
+    .unwrap();
+    let e = d.wait_event("w1", "turn_stalled", 20);
+    assert_eq!(e["payload"]["message"], "m-sleep", "{e}");
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["stalled"], true, "{agent}");
+    d.wait_message("w1", "m-sleep", &["completed"], 20);
+    assert!(
+        d.events("w1")
+            .iter()
+            .all(|e| e["kind"].as_str() != Some("turn_resumed")),
+        "finished turn reported resumed"
+    );
+    let notices = wait_source(&d, "pm", "worker_notice", 1, 5);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+}
+
+/// `stall_secs=0` disables detection entirely while `silent_secs` keeps
+/// accruing for the views; a live `agent set` re-budgets the same
+/// running turn (string values, as `agent set` sends them).
+#[test]
+fn stall_secs_zero_disables_and_live_set_rearms() {
+    let d = TestDaemon::start();
+    d.register_inbox("pm");
+    register_fake_opts(&d, "w1", json!({"stall_secs": 0}));
+    d.wait_agent("w1", "idle", 10);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "SLEEP:14", "reply_to": "pm",
+               "message": "m-zero"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-zero", &["running"], 10);
+    thread::sleep(Duration::from_secs(7));
+    assert!(
+        d.events("w1")
+            .iter()
+            .all(|e| e["kind"].as_str() != Some("turn_stalled")),
+        "stall_secs=0 still fired"
+    );
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["stalled"], false, "{agent}");
+    assert!(agent["silent_secs"].as_u64().unwrap_or(0) > 0, "{agent}");
+
+    // Live-set to a real budget — silence already past it fires on the
+    // next tick; the string form proves `agent set` parsing.
+    d.rpc(
+        "agent_set",
+        json!({"alias": "w1", "patch": {"stall_secs": "3"}}),
+    )
+    .unwrap();
+    let e = d.wait_event("w1", "turn_stalled", 15);
+    assert_eq!(e["payload"]["message"], "m-zero", "{e}");
+}
+
+/// The ticker only samples panes while a turn runs: captures stop when
+/// nothing is in flight.
+#[test]
+fn pty_stall_sampling_stops_when_nothing_runs() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    std::env::set_var("CADENCE_STALL_SAMPLE_SECS", "1");
+    // A high budget keeps this test out of stall semantics entirely —
+    // it only measures the sampling clock.
+    d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 600}));
+    d.wait_agent("w1", "idle", 20);
+    let captures = || {
+        std::fs::read_to_string(d.stub_pane_file(&mock, "w1", "captures"))
+            .unwrap_or_default()
+            .len()
+    };
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "do work", "message": "ms6"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "ms6", &["running"], 15);
+    // While the turn runs, captures grow — poll, don't assume a tick
+    // landed inside a fixed sleep.
+    let baseline = captures();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut grew = false;
+    while Instant::now() < deadline {
+        if captures() > baseline {
+            grew = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(grew, "no samples while a turn runs: {baseline}");
+
+    // Stopping the pane mid-sampling returns promptly — the ticker
+    // never holds the adapter across a capture.
+    let stop_at = Instant::now();
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    assert!(
+        stop_at.elapsed() < Duration::from_secs(10),
+        "agent stop delayed by sampling: {:?}",
+        stop_at.elapsed()
+    );
+    // The actor is gone — sampling stops with it. Settle first so a
+    // sample already in flight at the stop lands in the baseline.
+    d.wait_agent("w1", "stopped", 15);
+    thread::sleep(Duration::from_secs(4));
+    let idle_count = captures();
+    thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        captures(),
+        idle_count,
+        "capture-pane ran while nothing was running"
+    );
+    std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
 }

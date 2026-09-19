@@ -188,6 +188,66 @@ fn screen_tail(text: &str, rows: usize) -> Vec<String> {
     lines.into_iter().skip(skip).collect()
 }
 
+/// Lines of normalized tail the stall hash covers — recent content
+/// only, so scrollback shifting identical text never reads as change.
+const ACTIVITY_LINES: usize = 24;
+
+/// A capture that differs only in ticking status artifacts hashes
+/// identically: control characters are stripped, whitespace
+/// collapses, spinner/bullet glyphs and elapsed-time counters
+/// (`· 2m 15s`, `(1m 2s)`, `83%`, `12:34`) drop out, and only the
+/// newest `ACTIVITY_LINES` lines count. The daemon's stall watch
+/// samples this on a bounded interval — a "still working" footer
+/// re-rendering its clock is not provider activity.
+pub fn activity_hash(screen: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let lines: Vec<String> = screen
+        .lines()
+        .map(|l| {
+            l.chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+                .split_whitespace()
+                .filter(|tok| activity_token(tok))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|l| !l.is_empty())
+        .collect();
+    let skip = lines.len().saturating_sub(ACTIVITY_LINES);
+    let mut h = Sha256::new();
+    for l in &lines[skip..] {
+        h.update(l.as_bytes());
+        h.update(b"\n");
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// Keep a screen word unless it is a ticking artifact: tokens with no
+/// letter or digit (spinner/braille glyphs, box rules, a bare `·`),
+/// clock faces (`12:34`, `12:34:56`), and elapsed-time/counter forms
+/// (`2m`, `15s`, `150ms`, `3h`, `83%`, `128k`). The words around a
+/// spinner still count, so a status line that actually changes reads
+/// as activity.
+fn activity_token(tok: &str) -> bool {
+    if !tok.chars().any(|c| c.is_alphanumeric()) {
+        return false;
+    }
+    let t = tok.trim_matches(|c: char| !c.is_alphanumeric());
+    if t.contains(':')
+        && t.split(':')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    for suffix in ["ms", "s", "m", "h", "%", "k"] {
+        if let Some(body) = t.strip_suffix(suffix) {
+            return body.is_empty() || !body.chars().all(|c| c.is_ascii_digit() || c == '.');
+        }
+    }
+    true
+}
+
 /// Kill `alias`'s session on this state dir's private tmux socket —
 /// the explicit kill path for `agent stop`/`remove`/`gc` on a pty
 /// agent whose pane may have survived a fence (fences detach now).

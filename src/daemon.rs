@@ -65,6 +65,45 @@ impl Notify {
 
 /// Grace period for a cooperative stop before the transport is force-closed.
 const STOP_GRACE: Duration = Duration::from_secs(3);
+/// Stall watch cadence — `silent_secs` stays live without a store read
+/// per agent becoming pressure.
+const STALL_TICK: Duration = Duration::from_secs(2);
+/// `stall_secs` when neither the job nor the agent sets one.
+const DEFAULT_STALL_SECS: u64 = 1800;
+/// PTY screens are sampled at most this often while a turn runs — the
+/// bound is one capture per running pty agent per minute.
+const SCREEN_SAMPLE: Duration = Duration::from_secs(60);
+
+/// Screen sampling interval — tests shrink it through env, the way
+/// `MOCK_TMUX_HOLD` shrinks probe latency; production keeps the
+/// kickoff's one-minute bound.
+fn screen_sample() -> Duration {
+    std::env::var("CADENCE_STALL_SAMPLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(SCREEN_SAMPLE)
+}
+
+/// Unix epoch seconds — for `last_activity` in stall events.
+fn epoch_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// Human silence duration for stall notices — `42s`, `12m 3s`, `1h 4m`.
+fn fmt_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
 
 struct PendingRequest {
     alias: String,
@@ -80,6 +119,52 @@ struct AgentCtl {
     adapter: Mutex<Option<Arc<dyn ProviderAdapter>>>,
     wake: Notify,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Stall-watch state for the in-flight turn — updated by provider
+    /// events, the turn-start hook and the watch's own sampling.
+    stall: Mutex<StallWatch>,
+}
+
+/// What the stall watch knows about the agent's in-flight turn.
+/// `activity` is the freshest proof of life the daemon has folded in:
+/// the turn start, a provider event, a pty screen change, or an open
+/// brokered request. `stalled_at` marks a `turn_stalled` episode —
+/// `turn_resumed` requires strictly newer activity than it.
+struct StallWatch {
+    /// Running message this state covers; `None` when idle.
+    message: Option<String>,
+    /// Freshest activity instant observed for `message`.
+    activity: Instant,
+    /// The last-activity instant recorded when `turn_stalled` fired —
+    /// a resume needs activity strictly newer than this.
+    stalled_at: Option<Instant>,
+    /// PTY screen sample `(when, hash)` — captures are rate-limited.
+    sample: Option<(Instant, String)>,
+    /// A capture in flight on its own thread — at most one per agent,
+    /// so a wedged pane leaks one thread and never stalls the ticker.
+    sample_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// Stall episodes seen for `message`; each mints a distinct notice
+    /// dedupe so a resume + re-stall notifies again.
+    episodes: u64,
+}
+
+impl Default for StallWatch {
+    fn default() -> Self {
+        Self {
+            message: None,
+            activity: Instant::now(),
+            stalled_at: None,
+            sample: None,
+            sample_rx: None,
+            episodes: 0,
+        }
+    }
+}
+
+impl AgentCtl {
+    /// Fold a fresh proof of life into the watch's clock.
+    fn bump_activity(&self) {
+        self.stall.lock().unwrap().activity = Instant::now();
+    }
 }
 
 /// Alias ownership: an alias is owned while an actor ctl exists OR while
@@ -208,6 +293,7 @@ impl Shared {
             adapter: Mutex::new(None),
             wake: Notify::new(),
             thread: Mutex::new(None),
+            stall: Mutex::new(StallWatch::default()),
         });
         let shared = Arc::clone(self);
         let owned = alias.to_string();
@@ -219,6 +305,10 @@ impl Shared {
     }
 
     fn on_provider_event(&self, alias: &str, method: &str, params: Value) {
+        // Every adapter event is proof of life for the stall watch —
+        // provider lifecycle traffic and the explicit `cadence/*`
+        // channel (ack, tool_use, message_report) alike.
+        self.bump_activity(alias);
         // `cadence/<kind>` is the adapter's own bookkeeping channel —
         // recorded verbatim, not provider traffic.
         if let Some(kind) = method.strip_prefix("cadence/") {
@@ -445,8 +535,10 @@ impl Shared {
                 Take::Message(message) => {
                     let started_id = message.id.clone();
                     let shared = Arc::clone(self);
+                    let watch = Arc::clone(ctl);
                     let outcome = adapter.run_turn(&message.body, &message.id, &move |turn| {
                         let _ = shared.store.mark_running(&started_id, turn);
+                        watch.bump_activity();
                         shared.wake();
                     });
                     match outcome {
@@ -724,6 +816,10 @@ impl Shared {
                     let (dead, resumable) = self.agent_liveness(&agent);
                     j["dead"] = json!(dead);
                     j["resumable"] = json!(resumable);
+                    if let Some((silent_secs, stalled)) = self.stall_view(&agent.alias) {
+                        j["silent_secs"] = json!(silent_secs);
+                        j["stalled"] = json!(stalled);
+                    }
                     agents.push(j);
                 }
                 Ok(json!({"agents": agents}))
@@ -738,6 +834,10 @@ impl Shared {
                 let (dead, resumable) = self.agent_liveness(&agent);
                 agent_json["dead"] = json!(dead);
                 agent_json["resumable"] = json!(resumable);
+                if let Some((silent_secs, stalled)) = self.stall_view(&alias) {
+                    agent_json["silent_secs"] = json!(silent_secs);
+                    agent_json["stalled"] = json!(stalled);
+                }
                 // The briefing lives under the state dir — actors read
                 // it there, never inside their cwd repository.
                 if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
@@ -1473,6 +1573,9 @@ impl Shared {
                 "Submission token belongs to a stale endpoint generation",
             ));
         }
+        // A valid ack/result report is explicit agent activity — it
+        // feeds the stall clock for every endpoint kind.
+        self.bump_activity(&message.alias);
         match kind {
             "ack" => {
                 self.store.mark_ack(&message, text)?;
@@ -1751,6 +1854,7 @@ impl Shared {
             optional_str(params, "repo"),
             optional_str(params, "base_ref"),
             optional_i64(params, "max_revisions").unwrap_or(2),
+            optional_i64(params, "stall_secs"),
             optional_str(params, "task_title"),
             optional_str(params, "task_worktree"),
             optional_str(params, "task_branch"),
@@ -1819,6 +1923,14 @@ impl Shared {
             match self.store.message(mid)? {
                 Some(m) => {
                     j["kickoff"] = json!({"id": m.id, "state": m.state, "turn_id": m.turn_id});
+                    if m.state == "running" {
+                        if let Some(assignee) = &task.assignee {
+                            if let Some((silent_secs, stalled)) = self.stall_view(assignee) {
+                                j["silent_secs"] = json!(silent_secs);
+                                j["stalled"] = json!(stalled);
+                            }
+                        }
+                    }
                     if matches!(task.state.as_str(), "dispatched" | "running")
                         && is_terminal(&m.state)
                         && m.state != "completed"
@@ -2227,9 +2339,330 @@ impl Shared {
             .map(str::to_string)
     }
 
+    // ---- Stall watch: report silent turns, never touch them (CAD-52) ----
+
+    /// Sample owned agents on a slow cadence until shutdown. The watch
+    /// only ever emits events and notices — it never interrupts,
+    /// re-dispatches or fences anything it observes.
+    fn run_stall_watch(self: &Arc<Self>) {
+        while !self.closing.load(Ordering::SeqCst) {
+            self.stall_tick();
+            std::thread::sleep(STALL_TICK);
+        }
+    }
+
+    /// One watch pass: refresh every owned agent's activity evidence,
+    /// then compare its silence against the resolved budget.
+    fn stall_tick(&self) {
+        let agents: Vec<(String, Arc<AgentCtl>)> = self
+            .lifecycle
+            .lock()
+            .unwrap()
+            .agents
+            .iter()
+            .map(|(a, c)| (a.clone(), Arc::clone(c)))
+            .collect();
+        for (alias, ctl) in agents {
+            self.stall_check(&alias, &ctl);
+        }
+    }
+
+    /// Refresh one agent's activity evidence and fire the episode
+    /// transition, if any. A turn that ends while stalled just ends —
+    /// no recovery event is owed for a message that stopped running.
+    fn stall_check(&self, alias: &str, ctl: &Arc<AgentCtl>) {
+        let running = match self.store.running_message(alias) {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                let mut w = ctl.stall.lock().unwrap();
+                w.message = None;
+                w.stalled_at = None;
+                w.sample = None;
+                return;
+            }
+            Err(_) => return,
+        };
+        let Ok(agent) = self.store.agent(alias) else {
+            return;
+        };
+        // Store reads stay outside the stall lock — `stall_budget`
+        // takes the conn mutex and no other path holds it in reverse.
+        let budget = self.stall_budget(&agent, &running);
+        let ad = ctl.adapter.lock().unwrap().clone();
+        let mut w = ctl.stall.lock().unwrap();
+        if w.message.as_deref() != Some(running.id.as_str()) {
+            *w = StallWatch {
+                message: Some(running.id.clone()),
+                ..StallWatch::default()
+            };
+        }
+        // An open brokered request means the provider is silent by
+        // design — a human is thinking. That wait is activity.
+        if self
+            .pending
+            .lock()
+            .unwrap()
+            .values()
+            .any(|req| req.alias == alias)
+        {
+            w.activity = Instant::now();
+        }
+        // The adapter's own clock when it keeps one — managed
+        // transcripts stamp every provider notification.
+        if let Some(at) = ad.as_ref().and_then(|a| a.activity_at()) {
+            if at > w.activity {
+                w.activity = at;
+            }
+        }
+        // PTY screens have no transport clock: captures run on their
+        // own threads, one in flight per agent at most, so a slow or
+        // wedged pane can never block the ticker (or any view that
+        // touches this lock). A finished sample lands here.
+        if agent.endpoint_kind == "pty" {
+            let mut landed = None;
+            match w.sample_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(hash)) => {
+                    landed = Some(hash);
+                    w.sample_rx = None;
+                }
+                // The sender is gone (capture failed) — release the
+                // slot so the next due tick spawns another. `Empty`
+                // leaves the slot held: a sample is still in flight.
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    w.sample_rx = None;
+                }
+                _ => {}
+            }
+            if let Some(hash) = landed {
+                if w.sample.as_ref().is_some_and(|(_, h)| *h != hash) {
+                    w.activity = Instant::now();
+                }
+                w.sample = Some((Instant::now(), hash));
+            }
+            if w.sample_rx.is_none()
+                && w.sample
+                    .as_ref()
+                    .is_none_or(|(at, _)| at.elapsed() >= screen_sample())
+            {
+                if let Some(ad) = ad {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    thread::spawn(move || {
+                        if let Ok(screen) = ad.capture() {
+                            let _ = tx.send(adapter::pty::activity_hash(&screen));
+                        }
+                    });
+                    w.sample_rx = Some(rx);
+                }
+            }
+        }
+        let silent = w.activity.elapsed();
+        if let Some(stalled_at) = w.stalled_at {
+            if w.activity > stalled_at {
+                let episode = w.episodes;
+                w.stalled_at = None;
+                drop(w);
+                self.stall_resumed(&agent, &running, stalled_at.elapsed(), episode);
+            }
+            return;
+        }
+        if budget > 0 && silent >= Duration::from_secs(budget) {
+            w.episodes += 1;
+            w.stalled_at = Some(w.activity);
+            let episode = w.episodes;
+            drop(w);
+            self.stall_fired(&agent, &running, silent, episode);
+        }
+    }
+
+    /// The silence budget for a running message: the job's
+    /// `stall_secs` for task-attached deliveries, else the agent's
+    /// `stall_secs` param, else the default. `0` disables the episode
+    /// (silence is still measured for the views).
+    fn stall_budget(&self, agent: &Agent, message: &Message) -> u64 {
+        if let Some(task_id) = &message.task_id {
+            if let Ok(task) = self.store.task(task_id) {
+                if let Ok(job) = self.store.job(&task.job_id) {
+                    if let Some(s) = job.stall_secs {
+                        return s.max(0) as u64;
+                    }
+                }
+            }
+        }
+        agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("stall_secs"))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(DEFAULT_STALL_SECS)
+    }
+
+    /// `(job_id, task_id)` scope for a message's stall events — the
+    /// `job events` view is one query over those columns.
+    fn message_scope<'m>(&self, message: &'m Message) -> (Option<String>, Option<&'m str>) {
+        let task_id = message.task_id.as_deref();
+        let job_id = task_id.and_then(|t| self.store.task(t).ok().map(|t| t.job_id));
+        (job_id, task_id)
+    }
+
+    /// `turn_stalled`: record the event and send the one notice this
+    /// episode gets. Fires once per silence episode.
+    fn stall_fired(&self, agent: &Agent, message: &Message, silent: Duration, episode: u64) {
+        let silent_secs = silent.as_secs();
+        let (job_id, task_id) = self.message_scope(message);
+        let mut payload = json!({
+            "message": message.id,
+            "silent_secs": silent_secs,
+            "last_activity": epoch_secs() - silent_secs as f64,
+        });
+        if let Some(t) = task_id {
+            payload["task"] = json!(t);
+        }
+        let _ = self.store.event_public_scoped(
+            &agent.alias,
+            "turn_stalled",
+            payload,
+            job_id.as_deref(),
+            task_id,
+        );
+        self.wake();
+        self.stall_notice(agent, message, episode, true, silent_secs);
+    }
+
+    /// `turn_resumed`: the first activity after a stall closes the
+    /// episode — same event/notice pair to the same recipients.
+    fn stall_resumed(&self, agent: &Agent, message: &Message, silent: Duration, episode: u64) {
+        let silent_secs = silent.as_secs();
+        let (job_id, task_id) = self.message_scope(message);
+        let mut payload = json!({"message": message.id, "silent_secs": silent_secs});
+        if let Some(t) = task_id {
+            payload["task"] = json!(t);
+        }
+        let _ = self.store.event_public_scoped(
+            &agent.alias,
+            "turn_resumed",
+            payload,
+            job_id.as_deref(),
+            task_id,
+        );
+        self.wake();
+        self.stall_notice(agent, message, episode, false, silent_secs);
+    }
+
+    /// The one notice an episode sends: a `job_event` to the PM for a
+    /// job kickoff, a `worker_notice` to `reply_to` for any other
+    /// delivery, nothing when the turn answers to nobody.
+    fn stall_notice(
+        &self,
+        agent: &Agent,
+        message: &Message,
+        episode: u64,
+        stalled: bool,
+        silent_secs: u64,
+    ) {
+        let what = message.task_id.as_deref().unwrap_or(&message.id);
+        let body = if stalled {
+            let cursor = self.store.event_cursor(&agent.alias).unwrap_or(0);
+            format!(
+                "Worker {} has shown no activity for {} on {} — this is \
+                 informational; nothing was changed or interrupted. \
+                 Look with: `cadence agent capture {}`, \
+                 `cadence agent probe {}`, `cadence events {} --after {}`.",
+                agent.alias,
+                fmt_duration(silent_secs),
+                what,
+                agent.alias,
+                agent.alias,
+                agent.alias,
+                cursor
+            )
+        } else {
+            format!(
+                "Worker {} is active again on {} after {} of silence — \
+                 the earlier stall notice is resolved; nothing was changed.",
+                agent.alias,
+                what,
+                fmt_duration(silent_secs)
+            )
+        };
+        let kind = if stalled { "stalled" } else { "resumed" };
+        if message.source == "job_dispatch" && message.task_id.is_some() {
+            let task_id = message.task_id.as_deref().unwrap();
+            let state = if stalled { "stalled" } else { "running" };
+            if self
+                .store
+                .job_notice(
+                    task_id,
+                    state,
+                    &format!("turn_{kind}:{}:{episode}", message.id),
+                    &body,
+                )
+                .is_ok()
+            {
+                if let Ok(task) = self.store.task(task_id) {
+                    if let Ok(job) = self.store.job(&task.job_id) {
+                        self.notify_agent(&job.pm_alias);
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(reply_to) = &message.reply_to {
+            let delivery = Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!("cadence-notice:{kind}:{}:{episode}", message.id).as_bytes(),
+            )
+            .simple()
+            .to_string();
+            if self
+                .store
+                .enqueue_task(
+                    reply_to,
+                    &body,
+                    None,
+                    &delivery,
+                    "worker_notice",
+                    message.task_id.as_deref(),
+                )
+                .is_ok()
+            {
+                self.notify_agent(reply_to);
+            }
+        }
+    }
+
+    /// The view-side snapshot for `agent show`/`agent list`/`job show`:
+    /// `(silent_secs, stalled)` while a message is running — `None`
+    /// when the agent has no in-flight turn.
+    fn stall_view(&self, alias: &str) -> Option<(u64, bool)> {
+        let running = self.store.running_message(alias).ok()??;
+        let ctl = self.lifecycle.lock().unwrap().agents.get(alias)?.clone();
+        let w = ctl.stall.lock().unwrap();
+        if w.message.as_deref() == Some(running.id.as_str()) {
+            return Some((w.activity.elapsed().as_secs(), w.stalled_at.is_some()));
+        }
+        // The watch hasn't ticked over this message yet — report
+        // silence from its recorded start.
+        let silent = running
+            .started
+            .map(|s| (epoch_secs() - s).max(0.0) as u64)
+            .unwrap_or(0);
+        Some((silent, false))
+    }
+
     fn notify_agent(&self, alias: &str) {
         if let Some(ctl) = self.lifecycle.lock().unwrap().agents.get(alias) {
             ctl.wake.notify_all();
+        }
+    }
+
+    /// Provider-side proof of life for the stall watch — any adapter
+    /// event or request channel activity refreshes the agent's clock.
+    fn bump_activity(&self, alias: &str) {
+        if let Some(ctl) = self.lifecycle.lock().unwrap().agents.get(alias) {
+            ctl.bump_activity();
         }
     }
 
@@ -2436,6 +2869,12 @@ pub fn serve(state_dir: &Path) -> Result<()> {
                 shared.wake();
             }
         });
+    }
+    // Stall watch: a running turn that goes silent is reported to
+    // whoever waits on it — never interrupted, never replayed.
+    {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_stall_watch());
     }
     while !shared.closing.load(Ordering::SeqCst) {
         match listener.accept() {

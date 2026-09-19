@@ -759,7 +759,8 @@ result_routed, notice_routed, ready, ready_claimed, claim_used,
 gate_wait, submitted,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
 params_updated, reconciled, relaunch_skipped, attention,
-stop_requested`. `wait>0` long-polls up to 30s.
+turn_stalled, turn_resumed, stop_requested`. `wait>0` long-polls
+up to 30s.
 
 Job operations emit the same rows with `job_id`/`task_id` set —
 `job_created, task_created, task_dispatched, task_running,
@@ -767,6 +768,50 @@ task_reported, verdict_recorded, task_revising, task_blocked,
 task_reopened, task_failed, task_cancelled, task_sha_recorded,
 task_done, job_closed, job_cancelled` — and `job_events` pages them
 across aliases (`{job, after?, limit?}` → `{events, cursor}`).
+
+## Stall detection
+
+A daemon-side watch measures how long each `running` message has gone
+without proof of life and reports crossings — it never interrupts,
+fences, cancels, or replays anything it observes.
+
+- **Activity clocks.** Managed adapters stamp every incoming provider
+  transport message (`activity_at`); the daemon also folds in every
+  adapter event, the turn start, and every valid `message_report`
+  token. Pty endpoints have no transport clock: the watch samples the
+  pane on a bounded interval (≤ one `capture-pane` per running pty
+  agent per minute) and hashes the normalized tail — whitespace
+  collapses, control characters drop, spinner/bullet glyphs and
+  elapsed-time counters (`· 2m 15s`, `83%`, `12:34`) are ignored, so a
+  ticking status line never reads as activity while real transcript
+  motion does. An open brokered approval request counts as activity
+  for the whole wait.
+- **`turn_stalled`.** When silence crosses the resolved budget the
+  watch emits the event once per episode — payload `{message,
+  silent_secs, last_activity, task?}` — and sends one notice: a
+  `job_event` to the job's PM for a `job_dispatch` kickoff, else a
+  `worker_notice` to the message's `reply_to`, else nothing. The event
+  carries `job_id`/`task_id` scope so `job_events` pages it. The
+  message stays `running`; the watch never touches the turn.
+- **`turn_resumed`.** The first activity after a stall emits the
+  closing event `{message, silent_secs, task?}` and a matching notice
+  to the same recipient, then re-arms — a later silence raises a new
+  `turn_stalled` episode with its own notice. A turn that ends while
+  stalled just ends; no recovery event is owed.
+- **Budget resolution.** `jobs.stall_secs` (set at `job new
+  --stall-secs`) wins for task-attached deliveries; otherwise the
+  agent's `params.stall_secs` (launch param or live `agent set alias
+  stall_secs=<n>`); otherwise the daemon default of 1800s. `0`
+  disables firing — silence is still measured. Values accept an
+  unsigned integer or digit string; negatives are rejected at
+  `job_new` and both `agent` param validators.
+- **Views.** `agent_list`/`agent_show` add `silent_secs` and `stalled`
+  while a turn runs; `job show`/`task show` add the same pair to a
+  task row whose kickoff is running. Idle agents sample nothing and
+  carry neither field.
+- **Restart.** Watch state is in memory only: after a daemon restart
+  the silence clock for a still-`running` message starts from the
+  restart — no stall survives across it, and no episode replays.
 
 ## Jobs and tasks
 

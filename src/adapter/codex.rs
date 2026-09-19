@@ -152,6 +152,9 @@ struct Shared {
     turn_cv: Condvar,
     thread_id: Mutex<Option<String>>,
     active_turn: Mutex<Option<String>>,
+    /// Every transport message bumps this — the raw activity clock the
+    /// daemon's stall watch reads (`ProviderAdapter::activity_at`).
+    last_activity: Mutex<Instant>,
 }
 
 fn shared_state(hooks: AdapterHooks) -> Arc<Shared> {
@@ -162,6 +165,7 @@ fn shared_state(hooks: AdapterHooks) -> Arc<Shared> {
         turn_cv: Condvar::new(),
         thread_id: Mutex::new(None),
         active_turn: Mutex::new(None),
+        last_activity: Mutex::new(Instant::now()),
     })
 }
 
@@ -250,6 +254,7 @@ impl CodexAdapter {
 
 impl Shared {
     fn dispatch(&self, incoming: Incoming) {
+        *self.last_activity.lock().unwrap() = Instant::now();
         match incoming {
             Incoming::Request { id, method, params } => {
                 (self.hooks.on_request)(ProviderRequest { id, method, params });
@@ -306,6 +311,13 @@ impl Shared {
 }
 
 impl ProviderAdapter for CodexAdapter {
+    /// The raw transport clock — `Shared::dispatch` stamps every
+    /// incoming message, so the daemon's stall watch reads true
+    /// provider traffic, not only the curated event stream.
+    fn activity_at(&self) -> Option<Instant> {
+        Some(*self.shared.last_activity.lock().unwrap())
+    }
+
     fn open(&self, agent: &Agent) -> Result<Identity> {
         let launched = self.transport.launch(&agent.cwd, &self.log_path)?;
         // Everything after launch is guarded: any failure closes the
