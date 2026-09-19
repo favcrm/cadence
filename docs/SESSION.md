@@ -29,6 +29,7 @@ cadence inbox pm --follow                      # blocks; one JSON object per rou
 ## 2. Start of session checklist
 
 ```bash
+export CADENCE_SUITE_LOCK=~/.local/state/cadence/suite.lock   # one path per host, in every shell and agent env
 cadence daemon start          # or: cadence doctor, if anything looks off
 cadence ui start              # board at http://cadence.localhost:18000 behind the dev gateway
 cadence ui tailscale start    # optional: phone/laptop access at https://<dns>:9450 — tailnet-only, loopback bind unchanged
@@ -173,10 +174,26 @@ out — is `unknown`, the comparison `inconclusive`, and the suggestion
 `blocked`; it never launders "could not run" into "pre-existing".
 
 Two guards keep it from colliding with the fleet: one review at a time
-per repo (a lock under `<state>/reviews/`), and — when
-`CADENCE_SUITE_LOCK` names a path — an exclusive `flock` around the
-full suite so a reviewer and workers never run the ten-minute suite
-concurrently.
+per repo (a lock under `<state>/reviews/`), and the host-wide suite
+slot. `CADENCE_SUITE_LOCK` names one path per host
+(`~/.local/state/cadence/suite.lock`); every full
+`cargo test --test integration` — a worker's, a reviewer's, `cadence
+review`'s — takes that exclusive `flock` for its whole run, so
+ten-minute suites on one host take turns instead of starving each other
+into load flakes. A filtered run (`cargo test --test integration
+claude_`) never queues. A waiting suite prints `suite slot … busy` and
+gives up after `CADENCE_SUITE_LOCK_WAIT_SECS` (default 3600).
+`cadence review` refuses its full run while the variable is unset
+(`--no-suite-lock` overrides, `--no-full` skips the suite).
+
+A test that fails in the full run but passes alone on both trees is a
+flake sighting: `cadence review` appends it to
+`<state>/reviews/flakes.jsonl` (test, PR, head, base, panic head, host
+load) and prints the sighting count. At three sightings it is listed
+under "Known flakes" and stops blocking the suggested verdict — the
+ledger is the quarantine; there is no attribute in the code. The report
+also records the host's cores, 1-minute load and live `cargo test`
+processes at suite start.
 
 Then do one thing the tests do not: drive the feature by hand on a
 scratch daemon (`CADENCE_STATE_DIR=/tmp/short-path`), a temp repo or a
