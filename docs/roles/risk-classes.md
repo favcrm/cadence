@@ -8,7 +8,9 @@ Goal: autonomous delivery. Routine PRs merge without a human; only substantial c
 3. **Security:** fixes for a leak or vulnerability, secret handling, redaction logic.
 4. **Supply chain and CI:** new or upgraded dependencies (`Cargo.toml`, `Cargo.lock`, `ui/package.json`), `.github/workflows/*`, scripts that post statuses.
 5. **Size or contention:** more than 1500 changed lines (excluding fixtures and lockfile churn), a third review round, or an unresolved reviewer–author disagreement.
-6. **Outward or fleet-wide actions:** releases, tags, repo settings, anything posted publicly other than the PR merge itself; a `daemon restart` that is not `--when-idle`; killing processes cadence did not start; any `--force`.
+6. **Outward or fleet-wide actions** (see also `docs/CHARTER.md` non-goals): releases, tags, repo settings, anything posted publicly other than the PR merge itself; a `daemon restart` that is not `--when-idle`; killing processes cadence did not start; any `--force`.
+
+7. **The rules and the gates themselves:** `docs/roles/*`, `docs/TEAM.md`, `docs/CHARTER.md`, `cadence-review.toml`, `src/review.rs`, `scripts/*`, and any change to who approves what, to a gate, or to this file. A PR that rewrites the rules can never approve itself.
 
 ## Class `auto` — ops-1 merges on its own
 Everything else, provided ALL hold: qa-1 verdict `pass` on the exact head SHA; CI green on that head; the combined-tree gate (train) green including one full integration suite under the suite lock; net-deletion check clean; the author is frozen; no secret-looking string in the PR body or diff.

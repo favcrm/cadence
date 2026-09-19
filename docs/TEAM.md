@@ -14,7 +14,7 @@ standing instruction set.
 | Researcher | `rsch-1` | managed Claude, Opus, effort high | Answers with sources: prior art, library and API facts, feasibility, cost | Write product code, decide |
 | Architect | `arch-1` | managed Claude, Opus, effort high | Options and trade-offs, ADRs, specs with runnable acceptance checks, ticket breakdown | Merge, implement beyond a spike |
 | Developer | `dev-<n>` (and existing Devin aliases) | Devin pty in bypass mode; Claude, Cursor or Codex as alternates | One issue per worktree: code, tests, docs, PR, qa note, review rounds | Touch another lane, merge, review |
-| QA reviewer | `qa-1` | managed Claude, Opus, effort high | Independent review, verdict pinned to a SHA, risk class, round-N kickoffs, residue issues, security flags; curator of project memory | Merge, push to an author's branch |
+| QA reviewer and memory curator | `qa-1` | managed Claude, Opus, effort high | Independent review, verdict pinned to a SHA, risk class, round-N kickoffs, residue issues, security flags; accepts or rejects memory lessons | Merge, push to an author's branch |
 | DevOps | `ops-1` | managed Claude, Opus, effort medium | Merge queue, combined gates, auto merges, post-merge ops, daemon restarts, host care | Merge class `human` without approval |
 
 Names for new agents follow `<role>-<n>`. Existing Devin workers keep
@@ -28,7 +28,7 @@ goal (operator) ──► research question ──► rsch-1: research note (sou
                     PM ranks ◄── arch-1: ADR/spec + acceptance checks + proposed tickets
                       │
                       ▼
-            cadence dispatch <ISSUE> --to dev-n --reply-to qa-1
+            cadence dispatch <ISSUE> --to dev-n --note <kickoff> --reply-to qa-1
                       │
                       ▼
       dev-n: branch, code, tests, PR, qa note ──► qa-1 (automatic: result routes to qa-1)
@@ -70,7 +70,8 @@ message of their turn; pty developers report with `cadence message result`.
 | Artifact | Location | Written by |
 |---|---|---|
 | Goal, roadmap, principles | `docs/CHARTER.md` | PM |
-| Roles and briefings | `docs/TEAM.md`, `docs/roles/*.md` | PM |
+| Roles and briefings (canonical) | `docs/TEAM.md`, `docs/roles/*.md` | PM |
+| Briefings the agents load at runtime | `~/.local/state/cadence/roles/*.md`, a copy of the canonical files | PM syncs them after every merge that changes `docs/roles/`; CAD-76 replaces the copy with `team.yaml` |
 | Merge risk classes | `docs/roles/risk-classes.md` | PM, operator decides changes |
 | Issues, epics, comments | tracker `~/pm/<project>/<ID>/` via `cadence issue` | everyone through the CLI |
 | Research notes | tracker artifact on the issue (`cadence issue attach`) | Researcher |
@@ -83,7 +84,7 @@ message of their turn; pty developers report with `cadence message result`.
 
 1. Review happens in a detached checkout, never in the author's worktree.
 2. Net-deletion check before anything else on a rebased PR.
-3. Verdicts name the exact head SHA; merges use `--match-head-commit`.
+3. Verdicts name the exact head SHA and are void once the head moves; `scripts/qa-verdict.sh` refuses a stale head and merges use `--match-head-commit`, so a push after the verdict cannot land unreviewed.
 4. A PR entering the merge queue is frozen by message naming the exact SHA.
 5. When main moved, gate the merge result, or one combined tree for several PRs, and check that main's tree equals the gated tree after merging.
 6. A failing test is rerun isolated on the PR tree and on main before anyone blames the PR.
@@ -92,6 +93,8 @@ message of their turn; pty developers report with `cadence message result`.
 9. A pty pane that probes idle while its message is still running has stopped; a numbered menu is an approval prompt, not work.
 10. Git commands that may open an editor run with `GIT_EDITOR=true`.
 11. Nobody kills processes they did not start, and nobody uses `--force`, without operator approval.
+12. A read-only or `--dry-run` command writes nothing at all, including handoff and report files.
+13. A destructive sweep is scoped by the flags it was given: `--project` and friends are forwarded to everything the command calls.
 
 ## Capacity
 
