@@ -11145,8 +11145,9 @@ fn dispatch_kickoff_and_finish_guards() {
         let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
         let cwd = state.to_str().unwrap().to_string();
         // w1/w2 are `inbox` endpoints — no actor drains their queue,
-        // so a queued kickoff stays live for the duplicate/owner-busy
-        // checks. The others are fake.
+        // so a queued kickoff stays live for the duplicate checks and
+        // exercises the CAD-64 inbox-owner exemption in finish. The
+        // others are fake.
         for (alias, params, kind) in [
             ("pm", None, "fake"),
             ("w1", Some("{\"upstream\":\"pm\"}"), "inbox"),
@@ -11436,16 +11437,57 @@ fn dispatch_kickoff_and_finish_guards() {
         .to_string();
     assert_eq!(ref_msg, out["message"].as_str().unwrap());
 
-    // `issue finish` while the owner has a live kickoff: refused,
-    // naming w1 and the message.
+    // `issue finish` with w1's kickoff still queued: w1 is an `inbox`
+    // — a durable mailbox, not an actor — so it never blocks. The
+    // remaining guard is survivability: give the branch a commit and
+    // the unmerged+unpushed check refuses.
+    std::fs::write(wt1.join("work.txt"), "x").unwrap();
+    git(&wt1, &["add", "-A"]);
+    git(&wt1, &["commit", "-qm", "d-1 work"]);
     let (ok, err) = cli(&["issue", "finish", "D-1"]);
     assert!(!ok, "{err}");
-    let msg = err["error"].as_str().unwrap();
-    assert!(msg.contains("w1") && msg.contains("queued"), "{msg}");
+    assert!(
+        err["error"].as_str().unwrap().contains("neither merged"),
+        "{err}"
+    );
     assert!(wt1.is_dir());
 
-    // --force overrides and records it.
-    let (ok, out) = cli(&["issue", "finish", "D-1", "--force"]);
+    // Merge the branch → finish succeeds without --force even though
+    // the kickoff is still queued on the inbox owner — and finish
+    // never consumes the mail.
+    git(&repo, &["merge", "-q", "cadence/d-1-one"]);
+    let (ok, out) = cli(&["issue", "finish", "D-1"]);
+    assert!(
+        ok && out["finished"] == true && out["overrode"] == json!([]),
+        "{out}"
+    );
+    assert_eq!(out["merged_by"], "ancestry", "{out}");
+    assert!(!wt1.exists());
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["messages"].as_array().unwrap()[0]["state"], "queued");
+
+    // A non-inbox owner still blocks: a mock-devin pty pane holding a
+    // RUNNING message makes finish refuse naming the owner, and
+    // --force records the override.
+    let _mock = d.mock_devin();
+    d.register_devin("dvb", None);
+    d.wait_agent("dvb", "idle", 15);
+    let (ok, _) = cli(&["issue", "start", "D-3", "--owner", "dvb"]);
+    assert!(ok);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dvb", "text": "keep working", "message": "mk1"}),
+    )
+    .unwrap();
+    d.rpc("agent_ready", json!({"alias": "dvb"})).unwrap();
+    d.wait_message("dvb", "mk1", &["running"], 10);
+    let wt3 = repo.join(".cadence/wt/d-3-three");
+    let (ok, err) = cli(&["issue", "finish", "D-3"]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("dvb") && msg.contains("running"), "{msg}");
+    assert!(wt3.is_dir());
+    let (ok, out) = cli(&["issue", "finish", "D-3", "--force"]);
     assert!(ok && out["finished"] == true, "{out}");
     assert!(
         out["overrode"]
@@ -11455,7 +11497,7 @@ fn dispatch_kickoff_and_finish_guards() {
             .any(|o| o == "owner-busy"),
         "{out}"
     );
-    assert!(!wt1.exists());
+    assert!(!wt3.exists());
 
     // D-4: owner w2 idle (its kickoff went to D-2's task, and w2's
     // queued message is the dispatch on D-2 — wait, w2 HAS a live
@@ -11484,7 +11526,9 @@ fn dispatch_kickoff_and_finish_guards() {
     let before = tracker_commits();
     let (ok, out) = cli(&["issue", "finish", "D-4"]);
     assert!(
-        ok && out["finished"] == true && out["overrode"] == json!([]),
+        ok && out["finished"] == true
+            && out["overrode"] == json!([])
+            && out["merged_by"] == "ancestry",
         "{out}"
     );
     assert!(!wt4.exists());

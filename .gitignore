@@ -1,7 +1,7 @@
 /target/
 /.worktrees/
 .state/
-/ui/node_modules/
+/ui/node_modules
 /ui/dist/
 .env
 *.log
