@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use super::link::Incoming;
 use super::stdio::{EnvScrub, StdioAdapter};
 use super::ws::WsAdapter;
-use super::{AdapterHooks, Identity, ProviderAdapter, ProviderRequest, TurnResult};
+use super::{AdapterHooks, Identity, ProviderAdapter, ProviderEnv, ProviderRequest, TurnResult};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
@@ -31,8 +31,8 @@ const ENV_SCRUB: &[&str] = &[
 ];
 
 /// Provider command; `CADENCE_CODEX_COMMAND` overrides it (test/mock use).
-fn codex_command() -> Vec<String> {
-    if let Ok(cmd) = std::env::var("CADENCE_CODEX_COMMAND") {
+fn codex_command(env: &ProviderEnv) -> Vec<String> {
+    if let Some(cmd) = env.var("CADENCE_CODEX_COMMAND") {
         let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
         if !parts.is_empty() {
             return parts;
@@ -46,8 +46,8 @@ fn codex_command() -> Vec<String> {
 
 /// Command prefix for the WebSocket app-server; `--listen <url>` is
 /// appended by the transport. `CADENCE_CODEX_WS_COMMAND` overrides it.
-fn codex_ws_command() -> Vec<String> {
-    if let Ok(cmd) = std::env::var("CADENCE_CODEX_WS_COMMAND") {
+fn codex_ws_command(env: &ProviderEnv) -> Vec<String> {
+    if let Some(cmd) = env.var("CADENCE_CODEX_WS_COMMAND") {
         let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
         if !parts.is_empty() {
             return parts;
@@ -192,10 +192,10 @@ impl CodexAdapter {
     }
 
     /// stdio endpoint: `codex app-server --listen stdio://`.
-    pub fn new(hooks: AdapterHooks, log_path: &Path) -> Self {
+    pub fn new(hooks: AdapterHooks, log_path: &Path, env: &ProviderEnv) -> Self {
         let shared = shared_state(hooks);
         Self {
-            transport: Self::build_transport(&codex_command(), false, &shared),
+            transport: Self::build_transport(&codex_command(env), false, &shared),
             shared,
             log_path: log_path.to_path_buf(),
         }
@@ -203,10 +203,10 @@ impl CodexAdapter {
 
     /// WebSocket endpoint: `codex app-server --listen ws://127.0.0.1:PORT`,
     /// attachable by an official TUI via `codex resume --remote`.
-    pub fn new_ws(hooks: AdapterHooks, log_path: &Path) -> Self {
+    pub fn new_ws(hooks: AdapterHooks, log_path: &Path, env: &ProviderEnv) -> Self {
         let shared = shared_state(hooks);
         Self {
-            transport: Self::build_transport(&codex_ws_command(), true, &shared),
+            transport: Self::build_transport(&codex_ws_command(env), true, &shared),
             shared,
             log_path: log_path.to_path_buf(),
         }

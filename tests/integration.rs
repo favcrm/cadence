@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use cadence_agent::adapter::ProviderEnv;
 use cadence_agent::client;
 use cadence_agent::daemon;
 use cadence_agent::store::{NewAgent, Store, Take};
@@ -24,7 +25,8 @@ impl TestDaemon {
         let state = dir.path().to_path_buf();
         std::fs::create_dir_all(&state).unwrap();
         let owned = state.clone();
-        let handle = thread::spawn(move || daemon::serve(&owned));
+        let opts = daemon_opts();
+        let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
         let daemon = Self {
             dir,
             state,
@@ -38,7 +40,8 @@ impl TestDaemon {
     fn start_on(state: PathBuf) -> Self {
         let dir = TempDir::new().unwrap(); // keeps lifetime uniform
         let owned = state.clone();
-        let handle = thread::spawn(move || daemon::serve(&owned));
+        let opts = daemon_opts();
+        let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
         let daemon = Self {
             dir,
             state,
@@ -1397,8 +1400,28 @@ fn unclassifiable_completion_fences_agent() {
 
 // ---- mock Codex provider over real stdio (no model calls) ----
 
-/// Serialize tests that override the process-wide provider command.
+/// Serialize tests that set real process environment variables — the
+/// mock-side knobs a provider child inherits (`MOCK_TMUX_STATE`, …).
+/// Provider launch commands never go through the environment: see
+/// `test_env`.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    static TEST_ENV: ProviderEnv = ProviderEnv::default();
+}
+
+/// This test's provider launch overrides (mock commands). Each test
+/// runs on its own thread, so every daemon it starts — restarts
+/// included — shares them, and no other test's daemon ever sees them.
+fn test_env() -> ProviderEnv {
+    TEST_ENV.with(ProviderEnv::clone)
+}
+
+fn daemon_opts() -> daemon::ServeOptions {
+    daemon::ServeOptions {
+        provider_env: test_env(),
+    }
+}
 
 /// A stdio JSON-RPC provider speaking just enough of the app-server wire
 /// to reach each failure mode. Writes its pid to a file for leak checks.
@@ -1440,7 +1463,6 @@ for line in sys.stdin:
 "#;
 
 struct MockCodex {
-    _guard: std::sync::MutexGuard<'static, ()>,
     pidfile: PathBuf,
 }
 
@@ -1728,11 +1750,10 @@ while True:
 impl TestDaemon {
     /// Install a mock codex command for `mode`, returning its pidfile.
     fn mock_codex(&self, mode: &str) -> MockCodex {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pidfile = self.dir.path().join(format!("mock-{mode}.pid"));
         let script = self.dir.path().join(format!("mock-{mode}.py"));
         std::fs::write(&script, MOCK_PY).unwrap();
-        std::env::set_var(
+        test_env().set(
             "CADENCE_CODEX_COMMAND",
             format!(
                 "python3 {} {} {}",
@@ -1741,21 +1762,17 @@ impl TestDaemon {
                 mode
             ),
         );
-        MockCodex {
-            _guard: guard,
-            pidfile,
-        }
+        MockCodex { pidfile }
     }
 
     /// Install a mock WebSocket app-server command for `mode`. `dir`
     /// hosts the script + pidfile and must outlive every daemon that
     /// will spawn it (restart tests use the seeded state dir).
     fn mock_codex_ws_at(&self, dir: &Path, mode: &str) -> MockCodex {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pidfile = dir.join(format!("mock-ws-{mode}.pid"));
         let script = dir.join(format!("mock-ws-{mode}.py"));
         std::fs::write(&script, MOCK_WS_PY).unwrap();
-        std::env::set_var(
+        test_env().set(
             "CADENCE_CODEX_WS_COMMAND",
             format!(
                 "python3 {} {} {}",
@@ -1764,10 +1781,7 @@ impl TestDaemon {
                 mode
             ),
         );
-        MockCodex {
-            _guard: guard,
-            pidfile,
-        }
+        MockCodex { pidfile }
     }
 
     fn mock_codex_ws(&self, mode: &str) -> MockCodex {
@@ -1795,8 +1809,8 @@ impl TestDaemon {
 
 impl Drop for MockCodex {
     fn drop(&mut self) {
-        std::env::remove_var("CADENCE_CODEX_COMMAND");
-        std::env::remove_var("CADENCE_CODEX_WS_COMMAND");
+        test_env().remove("CADENCE_CODEX_COMMAND");
+        test_env().remove("CADENCE_CODEX_WS_COMMAND");
     }
 }
 
@@ -2721,12 +2735,12 @@ fn install_mock_devin(dir: &Path) -> MockDevin {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
-    std::env::set_var("CADENCE_TMUX_COMMAND", &tmux);
-    std::env::set_var(
+    test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
+    test_env().set(
         "CADENCE_DEVIN_COMMAND",
         format!("python3 {} {}", devin_py.display(), locks.display()),
     );
-    std::env::set_var("CADENCE_DEVIN_LOCKS", &locks);
+    test_env().set("CADENCE_DEVIN_LOCKS", locks.display().to_string());
     MockDevin {
         _guard: guard,
         dir: dir.to_path_buf(),
@@ -2829,9 +2843,9 @@ fn kill_mock_panes(dir: &Path) {
 impl Drop for MockDevin {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        std::env::remove_var("CADENCE_TMUX_COMMAND");
-        std::env::remove_var("CADENCE_DEVIN_COMMAND");
-        std::env::remove_var("CADENCE_DEVIN_LOCKS");
+        test_env().remove("CADENCE_TMUX_COMMAND");
+        test_env().remove("CADENCE_DEVIN_COMMAND");
+        test_env().remove("CADENCE_DEVIN_LOCKS");
         std::env::remove_var("MOCK_TMUX_STATE");
     }
 }
@@ -2907,12 +2921,12 @@ fn install_mock_stub(dir: &Path) -> MockStub {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
-    std::env::set_var("CADENCE_TMUX_COMMAND", &tmux);
-    std::env::set_var(
+    test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
+    test_env().set(
         "CADENCE_STUB_COMMAND",
         format!("python3 {} {}", stub_py.display(), locks.display()),
     );
-    std::env::set_var("CADENCE_STUB_LOCKS", &locks);
+    test_env().set("CADENCE_STUB_LOCKS", locks.display().to_string());
     MockStub {
         _guard: guard,
         dir: dir.to_path_buf(),
@@ -2923,9 +2937,9 @@ fn install_mock_stub(dir: &Path) -> MockStub {
 impl Drop for MockStub {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        std::env::remove_var("CADENCE_TMUX_COMMAND");
-        std::env::remove_var("CADENCE_STUB_COMMAND");
-        std::env::remove_var("CADENCE_STUB_LOCKS");
+        test_env().remove("CADENCE_TMUX_COMMAND");
+        test_env().remove("CADENCE_STUB_COMMAND");
+        test_env().remove("CADENCE_STUB_LOCKS");
         std::env::remove_var("MOCK_TMUX_STATE");
     }
 }
@@ -3031,12 +3045,12 @@ fn install_mock_claude_tui(dir: &Path) -> MockClaudeTui {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
-    std::env::set_var("CADENCE_TMUX_COMMAND", &tmux);
-    std::env::set_var(
+    test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
+    test_env().set(
         "CADENCE_CLAUDE_TUI_COMMAND",
         format!("python3 {} {}", claude_py.display(), sessions.display()),
     );
-    std::env::set_var("CADENCE_CLAUDE_SESSIONS", &sessions);
+    test_env().set("CADENCE_CLAUDE_SESSIONS", sessions.display().to_string());
     MockClaudeTui {
         _guard: guard,
         dir: dir.to_path_buf(),
@@ -3073,9 +3087,9 @@ impl TestDaemon {
 impl Drop for MockClaudeTui {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        std::env::remove_var("CADENCE_TMUX_COMMAND");
-        std::env::remove_var("CADENCE_CLAUDE_TUI_COMMAND");
-        std::env::remove_var("CADENCE_CLAUDE_SESSIONS");
+        test_env().remove("CADENCE_TMUX_COMMAND");
+        test_env().remove("CADENCE_CLAUDE_TUI_COMMAND");
+        test_env().remove("CADENCE_CLAUDE_SESSIONS");
         std::env::remove_var("MOCK_CLAUDE_SWAP");
         std::env::remove_var("MOCK_TMUX_STATE");
     }
@@ -3197,8 +3211,8 @@ fn install_mock_cursor_tui(dir: &Path) -> MockCursorTui {
     let cursor_bin = dir.join("cursor-agent");
     std::os::unix::fs::symlink(&python, &cursor_bin).unwrap();
     std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
-    std::env::set_var("CADENCE_TMUX_COMMAND", &tmux);
-    std::env::set_var(
+    test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
+    test_env().set(
         "CADENCE_CURSOR_COMMAND",
         format!(
             "{} {} {}",
@@ -3207,7 +3221,7 @@ fn install_mock_cursor_tui(dir: &Path) -> MockCursorTui {
             chats.display()
         ),
     );
-    std::env::set_var("CADENCE_CURSOR_CHATS", &chats);
+    test_env().set("CADENCE_CURSOR_CHATS", chats.display().to_string());
     // A swap set by an earlier test must not leak into this install.
     std::env::remove_var("MOCK_CURSOR_SWAP");
     MockCursorTui {
@@ -3246,9 +3260,9 @@ impl TestDaemon {
 impl Drop for MockCursorTui {
     fn drop(&mut self) {
         kill_mock_panes(&self.dir);
-        std::env::remove_var("CADENCE_TMUX_COMMAND");
-        std::env::remove_var("CADENCE_CURSOR_COMMAND");
-        std::env::remove_var("CADENCE_CURSOR_CHATS");
+        test_env().remove("CADENCE_TMUX_COMMAND");
+        test_env().remove("CADENCE_CURSOR_COMMAND");
+        test_env().remove("CADENCE_CURSOR_CHATS");
         std::env::remove_var("MOCK_CURSOR_SWAP");
         std::env::remove_var("MOCK_TMUX_STATE");
     }
@@ -4410,6 +4424,9 @@ fn cadence_at(home: &Path, state: &Path, args: &[&str]) -> std::process::Output 
         .arg(state)
         .args(args)
         .env("HOME", home)
+        // A `daemon restart` child daemon is a separate process: it
+        // gets this test's mock commands as its own env, and only it.
+        .envs(test_env().vars())
         .output()
         .unwrap()
 }
@@ -6392,7 +6409,7 @@ fn agent_set_opts_live_agent_into_auto_ready() {
 ///   die              — exits on the first user message (mid-turn death)
 ///   bad-session      — init reports a session id that is not argv's
 ///   await-interrupt  — no result until SIGINT, then an interrupted one
-///   replay           — replays $MOCK_CLAUDE_FIXTURE events verbatim,
+///   replay           — replays the `<pidfile>.fixture` events verbatim,
 ///                      rewriting session_id fields to the argv id
 ///   heartbeat        — activity every ~0.3s for ~3.6s, then success —
 ///                      a turn longer than a short idle window
@@ -6458,7 +6475,9 @@ def on_sigint(signum, frame):
 
 signal.signal(signal.SIGINT, on_sigint)
 
-fixture = os.environ.get("MOCK_CLAUDE_FIXTURE")
+# The fixture path rides a sidecar like `.mode` — never the env, which
+# every concurrent test's mock child would inherit.
+fixture = open(pidfile + ".fixture").read().strip() if os.path.exists(pidfile + ".fixture") else None
 fixture_lines = open(fixture).read().splitlines() if fixture else []
 
 def current_mode():
@@ -6626,9 +6645,6 @@ for line in sys.stdin:
 "#;
 
 struct MockClaude {
-    /// Held when the claude mock installed ENV_LOCK itself; `None` when
-    /// another mock (devin) already holds it — the guard is shared.
-    _guard: Option<std::sync::MutexGuard<'static, ()>>,
     pidfile: PathBuf,
 }
 
@@ -6636,47 +6652,17 @@ impl TestDaemon {
     /// Install a mock claude command for `mode` (optionally replaying
     /// `fixture`), returning its pidfile path.
     fn mock_claude(&self, mode: &str, fixture: Option<&Path>) -> MockClaude {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        self.install_mock_claude(mode, fixture, guard)
-    }
-
-    /// Install without taking ENV_LOCK — for tests that already hold it
-    /// via another provider mock (one guard serializes the whole test).
-    fn install_mock_claude(
-        &self,
-        mode: &str,
-        fixture: Option<&Path>,
-        guard: std::sync::MutexGuard<'static, ()>,
-    ) -> MockClaude {
         let pidfile = self.dir.path().join(format!("claude-{mode}.pid"));
         let script = self.dir.path().join(format!("claude-{mode}.py"));
         std::fs::write(&script, MOCK_CLAUDE_PY).unwrap();
-        std::env::set_var(
+        test_env().set(
             "CADENCE_CLAUDE_COMMAND",
             format!("python3 {} {}", script.display(), pidfile.display()),
         );
         if let Some(f) = fixture {
-            std::env::set_var("MOCK_CLAUDE_FIXTURE", f);
+            std::fs::write(pidfile.with_extension("pid.fixture"), f.to_str().unwrap()).unwrap();
         }
-        MockClaude {
-            _guard: Some(guard),
-            pidfile,
-        }
-    }
-
-    /// Same, when the caller already holds ENV_LOCK (MockDevin).
-    fn mock_claude_locked(&self, mode: &str) -> MockClaude {
-        let pidfile = self.dir.path().join(format!("claude-{mode}.pid"));
-        let script = self.dir.path().join(format!("claude-{mode}.py"));
-        std::fs::write(&script, MOCK_CLAUDE_PY).unwrap();
-        std::env::set_var(
-            "CADENCE_CLAUDE_COMMAND",
-            format!("python3 {} {}", script.display(), pidfile.display()),
-        );
-        MockClaude {
-            _guard: None,
-            pidfile,
-        }
+        MockClaude { pidfile }
     }
 
     fn register_claude(&self, alias: &str, params: Value) {
@@ -6721,10 +6707,8 @@ impl TestDaemon {
 
 impl Drop for MockClaude {
     fn drop(&mut self) {
-        std::env::remove_var("CADENCE_CLAUDE_COMMAND");
-        std::env::remove_var("CADENCE_CLAUDE_MODE");
-        std::env::remove_var("MOCK_CLAUDE_FIXTURE");
-        std::env::remove_var("CADENCE_MCP_PERMISSION_COMMAND");
+        test_env().remove("CADENCE_CLAUDE_COMMAND");
+        test_env().remove("CADENCE_MCP_PERMISSION_COMMAND");
     }
 }
 
@@ -6773,10 +6757,8 @@ fn claude_turn_completes_and_routes_to_inbox_pm() {
 #[test]
 fn claude_result_routes_to_pty_pm() {
     let d = TestDaemon::start();
-    // MockDevin holds ENV_LOCK for the whole test — the claude mock
-    // installs under it without re-locking.
     let pm_mock = d.mock_devin();
-    let _worker_mock = d.mock_claude_locked("ok");
+    let _worker_mock = d.mock_claude("ok", None);
     d.register_devin("pm", None);
     d.wait_agent("pm", "idle", 20);
     d.register_claude("w1", json!({"upstream": "pm"}));
@@ -6949,9 +6931,8 @@ fn claude_denials_complete_with_event() {
 #[test]
 fn claude_env_injected_and_scrubbed() {
     let d = TestDaemon::start();
-    // Hold ENV_LOCK across the whole env mutation + install + spawn:
-    // another test's MockClaude drop could otherwise remove
-    // CADENCE_CLAUDE_COMMAND mid-registration.
+    // Real process env is mutated here — hold ENV_LOCK across the
+    // mutation + spawn so no other env-setting test interleaves.
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Scrub by rule: every CLAUDE_*/CLAUDECODE/CODEX_*/CADENCE_* name a
     // parent session (or a test override) could leak is removed — except
@@ -6964,6 +6945,7 @@ fn claude_env_injected_and_scrubbed() {
         ("CLAUDE_PID", "4242"),
         ("CLAUDE_CODE_SESSION_ID", "stale-parent-sid"),
         ("CODEX_THREAD_ID", "stale-thread"),
+        ("CADENCE_CLAUDE_MODE", "leak"),
         // keep-list: operator-set on purpose, must survive
         ("CLAUDE_CONFIG_DIR", "/tmp/claude-cfg"),
         ("CLAUDE_CODE_OAUTH_TOKEN", "tok-keep"),
@@ -6971,7 +6953,7 @@ fn claude_env_injected_and_scrubbed() {
     ] {
         std::env::set_var(k, v);
     }
-    let mock = d.mock_claude_locked("ok");
+    let mock = d.mock_claude("ok", None);
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
     for k in [
@@ -6982,6 +6964,7 @@ fn claude_env_injected_and_scrubbed() {
         "CLAUDE_PID",
         "CLAUDE_CODE_SESSION_ID",
         "CODEX_THREAD_ID",
+        "CADENCE_CLAUDE_MODE",
         "CLAUDE_CONFIG_DIR",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "ANTHROPIC_API_KEY",
@@ -7390,9 +7373,8 @@ fn claude_max_turn_fences_chatty() {
 
 /// Point the daemon's generated `--mcp-config` at the real cadence
 /// binary — `current_exe` is the test binary without the override.
-/// Must run while a mock holds ENV_LOCK.
 fn broker_command() {
-    std::env::set_var(
+    test_env().set(
         "CADENCE_MCP_PERMISSION_COMMAND",
         env!("CARGO_BIN_EXE_cadence"),
     );
@@ -7456,6 +7438,21 @@ impl Drop for Mcp {
     }
 }
 
+/// CAD-62 diagnosis: the mock's `.env` identity lines beside this
+/// test's own alias and state dir — a foreign pair means another
+/// test's daemon ran this test's mock and overwrote the dump.
+fn argv_origin(d: &TestDaemon, mock: &MockClaude, alias: &str) -> String {
+    let env = std::fs::read_to_string(mock.pidfile.with_extension("pid.env")).unwrap_or_default();
+    let dump: Vec<&str> = env
+        .lines()
+        .filter(|l| l.starts_with("CADENCE_ALIAS=") || l.starts_with("CADENCE_STATE_DIR="))
+        .collect();
+    format!(
+        "dump: {dump:?}; this test: CADENCE_ALIAS={alias} CADENCE_STATE_DIR={}",
+        d.state.display()
+    )
+}
+
 #[test]
 fn claude_brokered_permission_accept() {
     let d = TestDaemon::start();
@@ -7493,10 +7490,22 @@ fn claude_brokered_permission_accept() {
     let argv = std::fs::read_to_string(mock.pidfile.with_extension("pid.argv")).unwrap();
     assert!(
         argv.contains("--permission-prompt-tool\nmcp__cadence__approve"),
-        "{argv}"
+        "{} {}",
+        argv,
+        argv_origin(&d, &mock, "w1")
     );
-    assert!(argv.contains("--strict-mcp-config"), "{argv}");
-    assert!(argv.contains("--mcp-config\n"), "{argv}");
+    assert!(
+        argv.contains("--strict-mcp-config"),
+        "{} {}",
+        argv,
+        argv_origin(&d, &mock, "w1")
+    );
+    assert!(
+        argv.contains("--mcp-config\n"),
+        "{} {}",
+        argv,
+        argv_origin(&d, &mock, "w1")
+    );
     // The generated config names the mcp-permission server with the
     // identity env it needs independent of provider propagation.
     let cfg: Value =
@@ -7723,12 +7732,29 @@ fn claude_brokered_params_replayed_on_resume() {
     d.wait_message("w1", "m-boot", &["completed"], 20);
     let argv_file = mock.pidfile.with_extension("pid.argv");
     let argv1 = std::fs::read_to_string(&argv_file).unwrap();
-    assert!(argv1.contains("--session-id"), "{argv1}");
-    assert!(argv1.contains("--mcp-config\n"), "{argv1}");
-    assert!(argv1.contains("--strict-mcp-config"), "{argv1}");
+    assert!(
+        argv1.contains("--session-id"),
+        "{} {}",
+        argv1,
+        argv_origin(&d, &mock, "w1")
+    );
+    assert!(
+        argv1.contains("--mcp-config\n"),
+        "{} {}",
+        argv1,
+        argv_origin(&d, &mock, "w1")
+    );
+    assert!(
+        argv1.contains("--strict-mcp-config"),
+        "{} {}",
+        argv1,
+        argv_origin(&d, &mock, "w1")
+    );
     assert!(
         argv1.contains("--permission-prompt-tool\nmcp__cadence__approve"),
-        "{argv1}"
+        "{} {}",
+        argv1,
+        argv_origin(&d, &mock, "w1")
     );
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(agent["params"]["broker_approvals"], true, "{agent}");
@@ -7752,11 +7778,23 @@ fn claude_brokered_params_replayed_on_resume() {
     .unwrap();
     d.wait_message("w1", "m-boot2", &["completed"], 20);
     let argv2 = std::fs::read_to_string(&argv_file).unwrap();
-    assert!(argv2.contains("--resume\n"), "{argv2}");
-    assert!(argv2.contains("--mcp-config\n"), "{argv2}");
+    assert!(
+        argv2.contains("--resume\n"),
+        "{} {}",
+        argv2,
+        argv_origin(&d, &mock, "w1")
+    );
+    assert!(
+        argv2.contains("--mcp-config\n"),
+        "{} {}",
+        argv2,
+        argv_origin(&d, &mock, "w1")
+    );
     assert!(
         argv2.contains("--permission-prompt-tool\nmcp__cadence__approve"),
-        "{argv2}"
+        "{} {}",
+        argv2,
+        argv_origin(&d, &mock, "w1")
     );
 }
 
@@ -8926,6 +8964,20 @@ fn pty_forbidden_prefix_is_prewrite_and_keeps_claim() {
 #[test]
 fn agent_capabilities_match_the_registry_table() {
     use cadence_agent::adapter::registry;
+    // Registering every spec launches every provider: point them all
+    // at `false` so nothing real (or another test's mock) is spawned.
+    for name in [
+        "CADENCE_CLAUDE_COMMAND",
+        "CADENCE_CODEX_COMMAND",
+        "CADENCE_CODEX_WS_COMMAND",
+        "CADENCE_DEVIN_COMMAND",
+        "CADENCE_CLAUDE_TUI_COMMAND",
+        "CADENCE_STUB_COMMAND",
+        "CADENCE_CURSOR_COMMAND",
+        "CADENCE_TMUX_COMMAND",
+    ] {
+        test_env().set(name, "false");
+    }
     let d = TestDaemon::start();
     let cwd = d.dir.path().to_str().unwrap().to_string();
     for spec in registry::SPECS {
@@ -10024,8 +10076,7 @@ fn failed_open_writes_nothing() {
     let repo = d.dir.path().join("repo");
     git_repo(&repo);
     // The managed claude spawn fails outright — a bad command.
-    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("CADENCE_CLAUDE_COMMAND", "/definitely-not-a-claude");
+    test_env().set("CADENCE_CLAUDE_COMMAND", "/definitely-not-a-claude");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .arg("--state-dir")
         .arg(&d.state)
@@ -10041,8 +10092,7 @@ fn failed_open_writes_nothing() {
         String::from_utf8_lossy(&out.stderr)
     );
     d.wait_agent("w-bad", "attention", 15);
-    std::env::remove_var("CADENCE_CLAUDE_COMMAND");
-    drop(guard);
+    test_env().remove("CADENCE_CLAUDE_COMMAND");
 
     assert_eq!(git_porcelain(&repo), "", "failed open touched the repo");
     assert!(!repo.join(".cadence").exists());
@@ -10459,7 +10509,7 @@ fn long_result_bounded_only_for_pty_paste() {
     // only the paste is bounded, with a pointer to the full record.
     let d = TestDaemon::start();
     let pm_mock = d.mock_devin();
-    let _worker_mock = d.mock_claude_locked("ok");
+    let _worker_mock = d.mock_claude("ok", None);
     d.register_devin("pm", None);
     d.wait_agent("pm", "idle", 20);
     d.register_claude("w1", json!({"upstream": "pm"}));
@@ -12504,10 +12554,8 @@ fn tmux_call_count(mock: &MockDevin, state: &Path, cmd: &str) -> usize {
 #[test]
 fn status_rows_probe_once_and_footer() {
     let d = TestDaemon::start();
-    // MockDevin holds ENV_LOCK for the test — the claude mock must
-    // install through the locked variant or the second lock() deadlocks.
     let mock = d.mock_devin();
-    let _chatty = d.mock_claude_locked("chatty");
+    let _chatty = d.mock_claude("chatty", None);
     d.register_devin("dv1", None);
     d.register_devin("dv2", None);
     d.register_inbox("pm");
@@ -12662,6 +12710,27 @@ fn status_group_scopes_rows() {
     assert_eq!(aliases, vec!["pm", "w1"], "{view}");
 }
 
+/// Why a restarted daemon fenced `alias`: its recorded error and the
+/// newest events, read from the child daemon that now owns the state.
+fn restart_diag(d: &TestDaemon, alias: &str) -> String {
+    let error = d
+        .rpc("agent_show", json!({"alias": alias}))
+        .map(|v| v["agent"]["error"].clone())
+        .unwrap_or_default();
+    let events = d
+        .rpc("events", json!({"alias": alias, "after": 0}))
+        .map(|v| v["events"].clone())
+        .unwrap_or_default();
+    let tail: Vec<&Value> = events
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+        .take(6)
+        .collect();
+    format!("{alias} error: {error}\nnewest events: {tail:?}")
+}
+
 /// `daemon restart` through the real binary: a thread-daemon seeded
 /// with a pty pane hands the lock to a fresh detached daemon, which
 /// re-adopts the pane — the table must say the pid is the same.
@@ -12682,8 +12751,9 @@ fn daemon_restart_keeps_pane_pid_and_reports_table() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
-        "restart failed: {stdout} {}",
-        String::from_utf8_lossy(&out.stderr)
+        "restart failed: {stdout} {}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        restart_diag(&d, "dv")
     );
     assert!(stdout.contains("AGENT"), "{stdout}");
     assert!(stdout.contains("dv"), "{stdout}");
@@ -12741,8 +12811,9 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
     );
     assert!(
         out.status.success(),
-        "when-idle restart failed on an idle pane: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "when-idle restart failed on an idle pane: {}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        restart_diag(&d, "dv")
     );
     let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
     assert!(stop.status.success());

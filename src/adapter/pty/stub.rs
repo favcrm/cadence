@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::adapter::Probe;
+use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 
 use super::profile::TuiProfile;
@@ -130,12 +130,13 @@ impl StubProfile {
     /// session locks and `CADENCE_STUB_COMMAND` used verbatim as the
     /// launch argv — both required; there is no real `stub` binary to
     /// fall back to.
-    pub fn new() -> Result<Self> {
-        let locks_dir = std::env::var("CADENCE_STUB_LOCKS")
+    pub fn new(env: &ProviderEnv) -> Result<Self> {
+        let locks_dir = env
+            .var("CADENCE_STUB_LOCKS")
             .map(PathBuf::from)
-            .map_err(|_| Error::rejected("CADENCE_STUB_LOCKS is not set"))?;
-        let command = std::env::var("CADENCE_STUB_COMMAND")
-            .ok()
+            .ok_or_else(|| Error::rejected("CADENCE_STUB_LOCKS is not set"))?;
+        let command = env
+            .var("CADENCE_STUB_COMMAND")
             .filter(|v| !v.is_empty())
             .ok_or_else(|| Error::rejected("CADENCE_STUB_COMMAND is not set"))?;
         Ok(Self { locks_dir, command })

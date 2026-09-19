@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::adapter::Probe;
+use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 
 use super::profile::TuiProfile;
@@ -184,15 +184,16 @@ impl DevinProfile {
     /// launch command (`CADENCE_DEVIN_COMMAND` used verbatim — tests
     /// pass `python3 mock.py <dir>` — else a `devin` found on PATH,
     /// shell-quoted for the pane shell).
-    pub fn new() -> Result<Self> {
-        let locks_dir = std::env::var("CADENCE_DEVIN_LOCKS")
+    pub fn new(env: &ProviderEnv) -> Result<Self> {
+        let locks_dir = env
+            .var("CADENCE_DEVIN_LOCKS")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|| {
                 PathBuf::from(std::env::var("HOME").unwrap_or_default())
                     .join(".local/share/devin/cli/session_locks")
             });
-        let command = match std::env::var("CADENCE_DEVIN_COMMAND") {
-            Ok(cmd) if !cmd.is_empty() => cmd,
+        let command = match env.var("CADENCE_DEVIN_COMMAND") {
+            Some(cmd) if !cmd.is_empty() => cmd,
             _ => resolve_on_path("devin").map(|p| shlex_quote(&p))?,
         };
         Ok(Self {
