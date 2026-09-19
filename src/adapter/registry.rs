@@ -171,6 +171,7 @@ pub static SPECS: &[EndpointSpec] = &[
         live_settable_params: &["stall_secs"],
         launch_params: &[
             "model",
+            "effort",
             "permission_mode",
             "allowed_tools",
             "turn_idle_secs",
@@ -213,6 +214,7 @@ pub static SPECS: &[EndpointSpec] = &[
         live_settable_params: &["auto_ready", "stall_secs"],
         launch_params: &[
             "model",
+            "effort",
             "permission_mode",
             "bypass",
             "allowed_tools",
@@ -575,6 +577,55 @@ pub fn validate_live_param(provider: &str, kind: &str, key: &str, value: &Value)
     }
 }
 
+/// The Claude CLI's `--effort` levels.
+pub const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Reject an effort level the Claude CLI does not accept — the launch
+/// verbs, `agent_register` and `agent set --next-launch` share this.
+pub fn claude_effort(level: &str) -> Result<()> {
+    if CLAUDE_EFFORTS.contains(&level) {
+        Ok(())
+    } else {
+        Err(Error::rejected(format!(
+            "unknown claude effort '{level}' — expected one of: {}",
+            CLAUDE_EFFORTS.join(", ")
+        )))
+    }
+}
+
+/// Launch params `agent set --next-launch` may change: stored for the
+/// next open, never pushed to the live process.
+const NEXT_LAUNCH_PARAMS: &[&str] = &["model", "effort"];
+
+/// Validate one `agent set --next-launch` key: `model`/`effort` only,
+/// and only where the endpoint launches with that param. A null value
+/// (bare key) clears it back to the provider default.
+pub fn validate_next_launch_param(
+    provider: &str,
+    kind: &str,
+    key: &str,
+    value: &Value,
+) -> Result<()> {
+    let launches = spec(provider, kind)
+        .map(|s| s.launch_params.contains(&key))
+        .unwrap_or(false);
+    if !NEXT_LAUNCH_PARAMS.contains(&key) || !launches {
+        return Err(Error::rejected(format!(
+            "'{key}' cannot be set for the next launch of a {provider}/{kind} \
+             agent — --next-launch takes model and effort (claude). Recreate \
+             the agent to change wiring params like upstream or session"
+        )));
+    }
+    match (key, value) {
+        (_, Value::Null) => Ok(()),
+        ("effort", Value::String(level)) => claude_effort(level),
+        ("model", Value::String(m)) if !m.trim().is_empty() => Ok(()),
+        _ => Err(Error::rejected(format!(
+            "'{key}' needs a non-empty string value, or a bare key to clear it"
+        ))),
+    }
+}
+
 /// Reject a Devin permission mode outside the four-value vocabulary —
 /// the launch verbs and `agent_register` share this check, and the
 /// error always names every accepted value.
@@ -624,6 +675,19 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
                     return Err(Error::rejected(format!(
                         "devin permission_mode must be a string, one of: {}",
                         DEVIN_PERMISSION_MODES.join(", ")
+                    )))
+                }
+            }
+        }
+    }
+    if provider == "claude" {
+        if let Some(v) = params.get("effort") {
+            match v.as_str() {
+                Some(level) => claude_effort(level)?,
+                None => {
+                    return Err(Error::rejected(format!(
+                        "claude effort must be a string, one of: {}",
+                        CLAUDE_EFFORTS.join(", ")
                     )))
                 }
             }

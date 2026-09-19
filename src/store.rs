@@ -299,6 +299,10 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
 }
 
 impl Agent {
+    fn param_str(&self, key: &str) -> Option<&str> {
+        self.params.as_ref()?.get(key)?.as_str()
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "alias": self.alias, "provider": self.provider,
@@ -306,6 +310,17 @@ impl Agent {
             "cwd": self.cwd, "sandbox": self.sandbox,
             "thread_id": self.thread_id, "session_id": self.session_id,
             "model": self.model, "pid": self.pid, "state": self.state,
+            // What the endpoint runs vs what it was told: the reported
+            // model beside the configured launch params, with an
+            // unconfigured model named as the provider's default.
+            "model_reported": self.model,
+            "model_configured": self.param_str("model"),
+            "model_source": if self.param_str("model").is_some() {
+                "configured"
+            } else {
+                "provider default"
+            },
+            "effort": self.param_str("effort"),
             "enabled": self.enabled, "error": self.error,
             "endpoint": self.endpoint, "params": self.params,
             "generation": self.generation,
@@ -1486,6 +1501,17 @@ impl Store {
     /// Merge `patch` (a JSON object of string keys/values) into the
     /// agent's `params` — the endpoint-option bag (`auto_ready`,
     /// `upstream`, `session`). Existing keys not in the patch survive.
+    /// Record the model the provider reports it is running (claude's
+    /// stream `system/init`) — the `model` column, never a launch param.
+    pub fn set_model_reported(&self, alias: &str, model: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET model=?,updated=? WHERE alias=?",
+            params![model, now(), alias],
+        )?;
+        Ok(())
+    }
+
     pub fn set_params(&self, alias: &str, patch: &Value) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;

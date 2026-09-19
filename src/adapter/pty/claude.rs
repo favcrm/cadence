@@ -244,6 +244,7 @@ pub struct ClaudeProfile {
     /// override verbatim, else a PATH-resolved `claude`.
     command: String,
     model: Option<String>,
+    effort: Option<String>,
     permission_mode: Option<String>,
     /// `--allowedTools` replayed verbatim; `Bash(cadence *)` always
     /// heads the list so the agent can call the CLI unimpeded.
@@ -276,6 +277,10 @@ impl ClaudeProfile {
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| agent.model.clone());
+        let effort = params
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let permission_mode = params
             .get("permission_mode")
             .and_then(Value::as_str)
@@ -288,6 +293,7 @@ impl ClaudeProfile {
             sessions_dir,
             command,
             model,
+            effort,
             permission_mode,
             allowed_tools,
             real,
@@ -345,6 +351,9 @@ impl TuiProfile for ClaudeProfile {
         }
         if let Some(model) = &self.model {
             argv.push_str(&format!(" --model {}", shlex_quote(model)));
+        }
+        if let Some(effort) = &self.effort {
+            argv.push_str(&format!(" --effort {}", shlex_quote(effort)));
         }
         // `bypassPermissions` rides in the stored permission_mode param
         // (the CLI folds --bypass into it). It maps to the mode flag,
