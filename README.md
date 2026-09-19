@@ -11,6 +11,8 @@ Devin workers on one host, including terminals accessed over SSH.
 **Development stage:** implementation in progress. Provider support is an
 acceptance-tested capability, not a promise of universal session attachment.
 
+Running a session as PM: [docs/SESSION.md](docs/SESSION.md) — roles, lanes, dispatch, review, verdict, merge, restart.
+
 See [the implementation plan](docs/IMPLEMENTATION-PLAN.md) and the
 [dogfooding retrospective](docs/DOGFOOD.md) for what running Cadence on
 itself taught us.
