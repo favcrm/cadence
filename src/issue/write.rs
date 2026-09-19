@@ -597,7 +597,25 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
         Ok(true)
     })?;
     let ids = commit_staged(pm, &staged, &format!("set {}", changed.join(" ")), actor)?;
-    Ok(json!({"id": ids[0], "ids": ids, "set": changed, "committed": true}))
+    // The post-merge reminder (CAD-94): when this set marks an issue
+    // done while a worktree ref is still open, the CLI prints the
+    // one-line `issue finish` hint for each of these ids.
+    let worktree_open: Vec<&String> = if pairs.iter().any(|p| p == "status=done") {
+        staged
+            .iter()
+            .filter(|s| {
+                s.front
+                    .refs
+                    .iter()
+                    .any(|r| r.kind == "worktree" && r.closed != Some(true))
+            })
+            .map(|s| &s.id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(json!({"id": ids[0], "ids": ids, "set": changed,
+              "worktree_open": worktree_open, "committed": true}))
 }
 
 /// `issue tag <ID>… add|rm <tag>…` — add or remove tags on one issue or
