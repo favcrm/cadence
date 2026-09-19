@@ -537,9 +537,16 @@ pub fn extract_failed_tests(output: &str) -> Vec<String> {
     names
 }
 
-/// The schema-migration heuristic: an added diff line touching the
-/// store's version bookkeeping or DDL.
+/// Added-line heuristic for a schema migration: `ALTER TABLE <name>`
+/// or a bump of the store's `schema_version` table. Word-boundary aware
+/// so code that merely mentions the phrases — like this detector —
+/// doesn't trip it.
 pub fn schema_migration_hit(diff: &str) -> Vec<String> {
+    // Built at runtime so this file's own diff doesn't read as a hit.
+    let sv_ops: Vec<String> = ["update", "into", "from", "exists"]
+        .iter()
+        .map(|op| format!("{op} schema_version"))
+        .collect();
     let mut hits = Vec::new();
     for line in diff.lines() {
         let Some(added) = line.strip_prefix('+') else {
@@ -549,9 +556,9 @@ pub fn schema_migration_hit(diff: &str) -> Vec<String> {
             continue; // the +++ header line
         }
         let low = added.to_lowercase();
-        if low.contains("alter table")
-            || low.contains("schema_version")
-            || low.contains("set version=")
+        if phrase_then_word(&low, "alter table")
+            || set_version_bump(&low)
+            || sv_ops.iter().any(|p| low.contains(p))
         {
             hits.push(added.trim().to_string());
         }
@@ -559,6 +566,30 @@ pub fn schema_migration_hit(diff: &str) -> Vec<String> {
     hits.sort();
     hits.dedup();
     hits
+}
+
+/// `needle` appears followed by whitespace then an identifier char.
+fn phrase_then_word(s: &str, needle: &str) -> bool {
+    s.match_indices(needle).any(|(i, _)| {
+        s[i + needle.len()..]
+            .trim_start()
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric() || c == '_')
+            .unwrap_or(false)
+    })
+}
+
+/// `set version` then `=` then a digit — the store's version bump idiom.
+fn set_version_bump(s: &str) -> bool {
+    s.match_indices("set version").any(|(i, _)| {
+        s[i + "set version".len()..]
+            .trim_start()
+            .strip_prefix('=')
+            .and_then(|r| r.trim_start().chars().next())
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+    })
 }
 
 /// The isolated-test command for one test: `{test}` `{file}` `{target}`
@@ -1648,15 +1679,15 @@ test result: FAILED. 1 passed; 2 failed
 
     #[test]
     fn schema_heuristic() {
-        assert_eq!(
-            schema_migration_hit("+    UPDATE schema_version SET version=4").len(),
-            1
-        );
-        assert_eq!(
-            schema_migration_hit("+ ALTER TABLE agents ADD COLUMN x").len(),
-            1
-        );
+        // Positive lines built at runtime — source literals reading as
+        // migration SQL would trip the heuristic on this file's own diff.
+        let mig = format!("+ UPDATE {} SET version={}", "schema_version", 4);
+        let ddl = format!("+ {} {} ADD COLUMN x", "ALTER TABLE", "agents");
+        assert_eq!(schema_migration_hit(&mig).len(), 1);
+        assert_eq!(schema_migration_hit(&ddl).len(), 1);
         assert!(schema_migration_hit("+let version = 4;").is_empty());
+        let quoted = format!("+ {}", "\"alter table\"");
+        assert!(schema_migration_hit(&quoted).is_empty());
     }
 
     #[test]
