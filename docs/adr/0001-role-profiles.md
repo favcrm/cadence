@@ -315,9 +315,10 @@ schema: 1
 defaults:                       # every role inherits, then overrides
   provider: claude
   kind: managed
-  model: opus
-  effort: high
+  model: claude-opus-5          # a FAMILY, never a slug carrying an effort
+  effort: high                  # composed into the slug for cursor/devin — §5.1.1
   permission_mode: bypassPermissions
+  sandbox: read-only
   worktree: none
   max_concurrent: 1
 
@@ -344,12 +345,13 @@ roles:
   dev:
     provider: devin
     kind: pty
-    permission_mode: dangerous
+    permission_mode: dangerous   # devin's own vocabulary, not an effort
     alias: dev-{n}
     briefing: docs/roles/dev.md
     worktree: own
     max_concurrent: 5
     capabilities: [pr-open, issue-comment]
+    provider_args: []            # verbatim, unvalidated escape hatch (§5.1.1)
 
   qa:
     alias: qa-{project}
@@ -378,14 +380,14 @@ does not map to an accepted key is a refusal, not a silent drop:
   (`main.rs:4224-4237`). `kind: pty` in a profile therefore expands to
   `--tui`, and `kind: managed` to its absence. Likewise `provider` is a
   **positional** argument to `join`, not `--provider`.
-- **`effort` is a Claude-only parameter today.** It appears in
-  `launch_params` for `claude managed` and `claude pty` only; `codex` has
-  neither `effort` nor `model`, and `devin` has neither. So
+- **`effort` is Claude-only *inside cadence*, but not outside it.** In
+  `launch_params` it appears for `claude managed` and `claude pty` only;
+  `codex` has neither `effort` nor `model`, and `devin` has neither. So
   `defaults.effort: high` inherited by a `devin` role would be *rejected
-  at register*. A profile must therefore drop provider-inapplicable keys
-  at expansion and say so, or refuse — §8.1 decides which after `rsch-1`
-  reports. Legal Claude values are `low|medium|high|xhigh|max`
-  (`registry.rs:633`).
+  at register* today. Legal Claude values are `low|medium|high|xhigh|max`
+  (`registry.rs:633`). What the providers themselves support is a
+  different and messier story — §5.1.1, from `rsch-1`'s note, and it
+  changes the schema.
 - **`sandbox` must be a profile field.** `join` hardcodes
   `sandbox: "read-only"` (`main.rs:4406`), and `sandbox` is one of the
   very few fields that *is* read back — `adapter/codex.rs:334` passes it
@@ -413,12 +415,8 @@ does not map to an accepted key is a refusal, not a silent drop:
   is a **refusal at `team up`** with the missing names listed, not a
   silent degradation. (A role that silently lost `code-review` would
   review worse and nobody would know: fail closed, charter principle 3.)
-- **`effort` stays a portable three-to-five-value field.** `managed`
-  Claude maps it to the CLI's `--effort` (`low|medium|high|xhigh|max`,
-  already validated at register per `docs/PROTOCOL.md`). Mappings for
-  Codex (`model_reasoning_effort`) and Devin (`mode`) are an open
-  question with `rsch-1` (§8); until answered, an `effort` on a provider
-  with no mapping is a refusal at parse, not a silent drop.
+- **`effort` is *not* a portable scalar.** See §5.1.1 — this was the
+  assumption the research killed.
 - **`worktree: detached`** encodes guardrail 1 (review in a detached
   checkout, never the author's worktree) as data instead of as a habit.
 - **`decorrelate: model`** is CAD-78's "prefer a different provider or
@@ -426,6 +424,60 @@ does not map to an accepted key is a refusal, not a silent drop:
   refusal — a single-provider host must still be able to run a team.
 - **`alias`** is a pattern (`dev-{n}`, `qa-{project}`) so `join --role`
   can allocate; the PM's alias is fixed because it is an inbox.
+
+### 5.1.1 `effort` is a triple, not a scalar
+
+The draft of this ADR assumed `effort: low|medium|high` was one portable
+field that each provider maps. `rsch-1`'s note
+(`~/pm/cadence/CAD-76/artifacts/cad-76-effort-knobs-and-sod-prior-art.md`,
+read off the CLIs installed on this host rather than from docs) shows that
+is wrong, and the correction changes the schema. Reported findings:
+
+| Provider | Where effort lives | Values | Mid-session? |
+|---|---|---|---|
+| Claude Code 2.1.278 | a real field: `--effort`, settings key `effortLevel`, env `CLAUDE_CODE_EFFORT_LEVEL`; thinking budget separately via `MAX_THINKING_TOKENS` | `low\|medium\|high\|xhigh\|max` | yes — `/effort` and an `apply_flag_settings` control request |
+| Codex 0.154.0 | `model_reasoning_effort` in `~/.codex/config.toml` or `-c`, plus `plan_mode_reasoning_effort` | `low…max` **plus `ultra`**, and **per model** — `gpt-5.5` stops at `xhigh`, `minimal` is gone | per process |
+| Cursor | **no effort field** — a suffix inside the model slug (`claude-opus-5-high`), or bracket params (`claude-opus-4-8[context=1m,effort=high,fast=false]`) | slug-dependent | TUI only |
+| Devin | **no effort field** — also a slug suffix (`claude-opus-5-{low…max}`). Devin's "mode" is `--permission-mode auto\|accept-edits\|smart\|dangerous`, which is a different axis entirely | slug-dependent | only at a resume boundary |
+
+Four consequences for the schema, in decreasing order of how much they
+change it:
+
+1. **Resolution is `(provider, model, effort)`, never `effort` alone.**
+   Claude carries an `effortUnsupportedModels` list and Codex's legal set
+   differs per model, so no table keyed on provider alone is correct.
+2. **A profile names a model *family* plus an effort, never a full slug.**
+   For Cursor and Devin the effort *is* part of the slug, so
+   `model: claude-opus-5-high` together with `effort: low` is a
+   contradiction the file can express and the expansion cannot resolve.
+   Naming the family (`claude-opus-5`) and composing the slug at `join`
+   keeps one source of truth. This is a change from the §5.1 sketch, where
+   `model: opus` sat beside `effort: high` with no statement about which
+   wins.
+3. **Cadence must validate the pair itself.** Codex 0.154.0 accepted
+   `model_reasoning_effort = bogus` and printed `reasoning effort: bogus`
+   without complaint. A committed team file whose typo reaches a provider
+   that shrugs is exactly the silent failure the charter forbids, so
+   validation belongs at `cadence join` — this is not optional politeness.
+4. **A verbatim `provider_args` escape hatch is needed**, because the
+   portable five-value field cannot express `ultra`, `-fast`, bracket
+   params or `MAX_THINKING_TOKENS`. Keep it explicitly unvalidated and
+   provider-scoped, so the common path stays declarative and the long tail
+   is still reachable without widening the enum every quarter.
+
+`team show`'s drift semantics also have to differ per provider, since
+Claude can change effort mid-session while Devin can only change it at a
+resume boundary — a Claude agent whose effort no longer matches the file
+is *drifted*, a Devin agent's is *pending relaunch*.
+
+Two items in the note are flagged unverified and should be probed before
+`team.yaml` hard-validates `(model, effort)` pairs: whether Cursor's
+bracket `effort=` accepts `max`/`ultra`, and whether Claude's
+`effortUnsupportedModels` is static or served. Until then, validation
+should warn on an unknown pair rather than refuse, so a new model does not
+brick `team up` — the one place in this design where fail-closed is the
+wrong default, because the cost of a false refusal is a team that cannot
+start.
 
 ### 5.2 Source of truth, and what happens on disagreement
 
@@ -481,6 +533,41 @@ reviewer (§1.4, item 1): from the pane identity the daemon assigns, with a
 *claimed* identity refused rather than trusted. `CADENCE_ALIAS` alone is
 acceptable only for verbs that are not consequential.
 
+**Why capability-binding rather than identity-binding — the prior art
+agrees, for a reason worth stating.** `rsch-1`'s note surveyed the four
+obvious models. GitHub branch protection
+(`required_approving_review_count`, `require_last_push_approval`),
+CODEOWNERS, GitLab approval rules and Kubernetes RBAC
+(`subjects[].kind`, `roleRef`) all bind to **actor identity**; only AWS
+permission boundaries bind to the **credential**
+(`PutRolePermissionsBoundary`), granting nothing alone and capping
+effective permissions to an intersection.
+
+The decisive observation is *why* the first four are nonetheless safe: a
+**remote** authority mints and verifies the token that carries the
+identity. Cadence has no such authority — an alias is a self-declared
+string any local process can pass (§1.4). So a straight port of the
+GitHub/GitLab/RBAC model **fails open** here, while the capability model
+fails safer. That is an argument the draft made from taste; it now has a
+reason.
+
+Three things to borrow, none of which need a remote authority:
+
+- **`locked` / `inherited_from`** (GitLab returns every approval setting as
+  `{value, locked, inherited_from}`) — so a project's `team.yaml` cannot
+  *loosen* a rule set above it. Cheap now, and the thing that makes
+  multi-level groups (CAD-77) safe later rather than a way to escape
+  policy by editing a nearer file.
+- **`bypass_actors` / `bypass_mode`** (GitHub) with the operator as the
+  sole legal bypass — this is precisely the approval record of §5.4,
+  and it is better to name the escape hatch in the schema than to leave
+  it implicit.
+- **Alias demoted to a display name**, with permissions bound to a
+  daemon-minted per-agent credential. Note the gap honestly: cadence's
+  existing tokens are per-*message* (`messages.turn_id`), so a per-agent
+  credential is new work, not a rename. It is the right end state and it
+  should not block phases 1–2.
+
 ### 5.4 Separation of duties as a predicate over artifacts
 
 **The most important correction in this ADR: the rule already exists in
@@ -528,7 +615,7 @@ That reframes phase 3 and makes it much cheaper than it looked:
 | Rule | Status today | Work |
 |---|---|---|
 | An author may not pass its own work | **enforced** against `tasks.assignee` (`store.rs:2662`) | route qa-1's verdict through `job verdict` instead of a note |
-| …including when the author is not the assignee | **gap**: the check compares aliases, not git authorship, so an alias that wrote the commits but is not the assignee passes | also compare against the PR head's author/pusher |
+| …including when the author is not the assignee | **gap**: the check compares aliases, not git authorship, so an alias that wrote the commits but is not the assignee passes | also compare against the PR head's author/pusher. GitLab splits this into two booleans — `allow_author_approval` and `allow_committer_approval` — which is the right shape: authorship and having-pushed are different disqualifications |
 | Only a `review`-capable role may verdict | not expressible — `agents.role` is dead (§1.1) | capability check (§5.3) |
 | A reviewer may not land | no `land` verb exists at all | CAD-79 owns the `gh` call; then `land.actor != verdict.reviewer`, using the `verdicts.reviewer` column that already exists (`store.rs:581-591`) |
 | A class-`human` merge needs operator approval | not enforced; the phrase is prose in a queue | approval records, below |
@@ -539,6 +626,14 @@ caller allowed, by role?" and, lacking a role field, approximated it with
 *"does this agent have an upstream"*. It fails closed when the daemon is
 unreachable, which is the right instinct. `team.yaml` exists to retire
 exactly that kind of proxy.
+
+Worth noting from the prior art (§5.3): author≠approver is a **relational**
+rule, and of the four models surveyed only GitLab states it as a
+first-class boolean. Kubernetes RBAC and AWS IAM cannot express it at all
+— in K8s it takes a `ValidatingAdmissionPolicy` reading
+`request.userInfo`. So the predicate table above is the right
+representation, and any attempt to encode these rules as a pure
+permission matrix will fail on this row specifically.
 
 **Approval records** replace phrase-matching (Option G): `cadence approve
 <pr> --sha <full-sha>` writes a durable record, refused when the caller
@@ -712,21 +807,22 @@ CADENCE_ALIAS=ops-1 cadence approve <pr> --sha <head>; test $? -ne 0
 
 ## 8. Open questions
 
-1. **Effort mapping per provider.** Cadence plumbs `effort` for Claude
-   only; codex and devin endpoints do not accept the key at all
-   (`adapter/registry.rs:122-388`), and codex accepts no `model` either.
-   So the question is not just "what is the knob called" but "should
-   cadence plumb it": exact knob names and legal values for Codex
-   (`model_reasoning_effort`), Cursor and Devin (`mode`), and whether each
-   is launch-time only. Sent to `rsch-1` on 2026-09-19 against CAD-76.
-   Until answered, a profile carrying `effort` for a provider with no
-   mapping is refused at parse rather than dropped. Blocks freezing the
-   phase-2 schema, not phase 1.
-2. **Prior art for declarative duty separation** — whether GitLab's
-   `prevent_author_approval`, GitHub required reviewers, or Kubernetes
-   RBAC bind the rule to the actor identity or to a held capability, and
-   which fails safer under §1.4. Same question to `rsch-1`. May change
-   §5.3's choice of binding.
+1. ~~**Effort mapping per provider.**~~ **Answered** by `rsch-1` on
+   2026-09-19 (note attached to CAD-76). It invalidated the portable-scalar
+   assumption; the schema consequences are folded into §5.1.1. Two items
+   remain worth a probe before `(model, effort)` pairs are hard-validated:
+   whether Cursor's bracket `effort=` accepts `max`/`ultra`, and whether
+   Claude's `effortUnsupportedModels` is static or served. Proposed as
+   CAD-130 (the probes) and CAD-131 (plumbing effort for the other three
+   providers). Does not block phase 1.
+2. ~~**Prior art for declarative duty separation.**~~ **Answered** by the
+   same note and folded into §5.3 and §5.4. Outcome: it *confirmed* the
+   capability binding rather than changing it — identity-bound models are
+   safe only because a remote authority mints the identity, which cadence
+   has not got, so an identity-bound port fails open. Adds three borrowings
+   (`locked`/`inherited_from`, `bypass_actors`/`bypass_mode`, alias as
+   display name over a per-agent credential) and one warning: author≠approver
+   is relational and cannot be expressed as a permission matrix.
 3. **Operator decision:** does `team.yaml` live in the tracker
    (recommended, §5.1) or in the product repo? A team spanning repos and
    a `project.yaml` sibling argue for the tracker; "committed with the
@@ -782,6 +878,17 @@ PM to rank. Order below is dependency order, not priority.
 | — | CAD-126 | `join` hardcodes `sandbox=read-only`, so a joined codex worker cannot be `workspace-write` |
 | — | CAD-127 | `require_curator` fakes roles with "has an upstream" — replace with a capability |
 | — | CAD-128 | `serde_yaml 0.9` is deprecated upstream; decide deliberately |
+| 2 | CAD-130 | Probe Cursor's bracket `effort=` range and whether Claude's `effortUnsupportedModels` is served (blocks hard validation of `(model, effort)`) |
+| 2 | CAD-131 | Plumb `effort` for codex/cursor/devin: resolve `(provider, model, effort)`, compose slug suffixes, validate what the providers don't |
 
 Findings were also commented back onto CAD-75, CAD-78, CAD-79 and
 CAD-110, since three of them change those tickets' scope.
+
+## 11. References
+
+- `rsch-1`, research note on CAD-76, 2026-09-19:
+  `~/pm/cadence/CAD-76/artifacts/cad-76-effort-knobs-and-sod-prior-art.md`
+  — provider effort knobs read off the CLIs installed on this host, and
+  separation-of-duties prior art (GitHub, CODEOWNERS, GitLab, Kubernetes
+  RBAC, AWS permission boundaries). Feeds §5.1.1, §5.3 and §5.4. Its
+  unverified items are tracked as CAD-130.
