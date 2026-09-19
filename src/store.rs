@@ -695,7 +695,7 @@ impl Store {
             for (i, e) in kept.iter().enumerate() {
                 by_alias.entry(e.alias.as_str()).or_default().push(i);
             }
-            let mut drop: Vec<usize> = Vec::new();
+            let mut dropped: Vec<usize> = Vec::new();
             for idxs in by_alias.values() {
                 let first = kept[idxs[0]];
                 let divergent = idxs[1..].iter().any(|&i| {
@@ -704,12 +704,12 @@ impl Store {
                         || kept[i].native_session != first.native_session
                 });
                 if divergent {
-                    drop.extend_from_slice(idxs);
+                    dropped.extend_from_slice(idxs);
                 }
             }
-            if !drop.is_empty() {
-                drop.sort_unstable();
-                for i in drop.into_iter().rev() {
+            if !dropped.is_empty() {
+                dropped.sort_unstable();
+                for i in dropped.into_iter().rev() {
                     let e = kept.remove(i);
                     Self::event(
                         &tx,
@@ -743,7 +743,6 @@ impl Store {
             sql.push_str(&format!(" AND id NOT IN ({placeholders})"));
         }
         tx.execute(&sql, rusqlite::params_from_iter(kept_ids.iter()))?;
-        let kept_aliases: Vec<String> = kept.iter().map(|e| e.alias.clone()).collect();
         // An `attention` row is a fence, not a liveness state — keep the
         // state and its recorded error intact (they are the operator's
         // recovery context) and clear only the dead runtime fields.
@@ -761,39 +760,15 @@ impl Store {
         // rejected rather than finishing a turn whose pane may be
         // gone. `set_identity_adopted` writes the recorded generation
         // back once `open_adopted` has verified the pane, restoring
-        // token validity.
-        let mut sql = String::from(
+        // token validity. Kept aliases need the same clearing, so this
+        // is one unconditional UPDATE — the crash path's exact shape.
+        tx.execute(
             "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL,
                 generation=NULL
              WHERE state NOT IN ('stopped','attention')
                AND endpoint_kind != 'inbox'",
-        );
-        if !kept_aliases.is_empty() {
-            let placeholders = kept_aliases
-                .iter()
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(",");
-            sql.push_str(&format!(" AND alias NOT IN ({placeholders})"));
-        }
-        tx.execute(&sql, rusqlite::params_from_iter(kept_aliases.iter()))?;
-        if !kept_aliases.is_empty() {
-            let placeholders = kept_aliases
-                .iter()
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(",");
-            tx.execute(
-                &format!(
-                    "UPDATE agents SET state='offline', pid=NULL, endpoint=NULL,
-                        generation=NULL
-                     WHERE alias IN ({placeholders})
-                       AND state NOT IN ('stopped','attention')
-                       AND endpoint_kind != 'inbox'"
-                ),
-                rusqlite::params_from_iter(kept_aliases.iter()),
-            )?;
-        }
+            [],
+        )?;
         tx.commit()?;
         Ok(())
     }
