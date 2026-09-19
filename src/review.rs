@@ -1502,10 +1502,11 @@ fn render_markdown(r: &Value) -> String {
     section(&mut md, "Full suite", &[r["full_suite"].clone()]);
 
     let stress = r["stress"].as_array().cloned().unwrap_or_default();
-    if !stress.is_empty() {
-        md.push_str(
-            "## New tests stressed\n\n| test | file | runs | failures |\n|---|---|---|---|\n",
-        );
+    md.push_str("## New tests stressed\n\n");
+    if stress.is_empty() {
+        md.push_str("none — no new tests matched the stress pattern\n\n");
+    } else {
+        md.push_str("| test | file | runs | failures |\n|---|---|---|---|\n");
         for s in &stress {
             md.push_str(&format!(
                 "| `{}` | {} | {} | {} |\n",
@@ -1519,8 +1520,11 @@ fn render_markdown(r: &Value) -> String {
     }
 
     let failures = r["failures"].as_array().cloned().unwrap_or_default();
-    if !failures.is_empty() {
-        md.push_str("## Failures — equal-conditions compare\n\n| test | in run | alone on gated tree | alone on base | verdict |\n|---|---|---|---|---|\n");
+    md.push_str("## Failures — equal-conditions compare\n\n");
+    if failures.is_empty() {
+        md.push_str("none — nothing failed\n\n");
+    } else {
+        md.push_str("| test | in run | alone on gated tree | alone on base | verdict |\n|---|---|---|---|---|\n");
         for f in &failures {
             md.push_str(&format!(
                 "| `{}` | {} | {} | {} | {} |\n",
@@ -1538,8 +1542,12 @@ fn render_markdown(r: &Value) -> String {
         .as_array()
         .cloned()
         .unwrap_or_default();
-    if !conflicts.is_empty() {
-        md.push_str("## Other open PRs\n\n");
+    md.push_str("## Other open PRs\n\n");
+    if let Some(err) = r["open_pr_conflicts_error"].as_str() {
+        md.push_str(&format!("scan failed: {err}\n\n"));
+    } else if conflicts.is_empty() {
+        md.push_str("none — no conflicting open PRs\n\n");
+    } else {
         for c in &conflicts {
             if let Some(files) = c["files"].as_array() {
                 md.push_str(&format!(
@@ -1564,12 +1572,15 @@ fn render_markdown(r: &Value) -> String {
         md.push('\n');
     }
 
+    md.push_str("## Schema migration\n\n");
     if r["schema_migration"].as_bool().unwrap_or(false) {
-        md.push_str("## Schema migration\n\nHeuristic hit — rehearse the migration on a copied live DB:\n\n```\n");
+        md.push_str("Heuristic hit — rehearse the migration on a copied live DB:\n\n```\n");
         for h in r["schema_hits"].as_array().cloned().unwrap_or_default() {
             md.push_str(&format!("{}\n", h.as_str().unwrap_or("")));
         }
         md.push_str("```\n\n");
+    } else {
+        md.push_str("no schema-migration signal in the diff\n\n");
     }
     md
 }
