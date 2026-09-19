@@ -894,22 +894,156 @@ fn pid_age_secs(pid_dir: &Path, uptime: Option<f64>) -> Option<u64> {
     Some((uptime? as u64).saturating_sub(started))
 }
 
-/// argv[0] plus the first ~100 chars of the full command line —
-/// test-binary detection needs the untruncated argv0.
+/// The only text a secret value is ever replaced by.
+const REDACTED: &str = "[REDACTED]";
+
+/// Argument names that conventionally carry a credential —
+/// `--figma-api-key`, `GITHUB_TOKEN`, `--aws-secret-access-key`,
+/// `PGPASSWORD`, `--bearer`. Unanchored on purpose: `--x-api-key`
+/// and `aws_access_key_id` both trip it. (The spec alternation
+/// `(key|token|secret|pass(word)?|auth|bearer|cred|api[-_]?key|access)`
+/// collapses to substrings — `password` ⊃ `pass`, `api-key` ⊃ `key`.)
+fn secret_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    [
+        "key", "token", "secret", "pass", "auth", "bearer", "cred", "access",
+    ]
+    .iter()
+    .any(|p| n.contains(p))
+}
+
+/// `NAME=value` env-name shape — `FOO_1` yes, `x?y` no.
+fn env_name(name: &str) -> bool {
+    let mut c = name.chars();
+    matches!(c.next(), Some(f) if f.is_ascii_alphabetic() || f == '_')
+        && c.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Standalone credential shapes — provider prefixes (Figma `figd_`,
+/// GitHub `ghp_`/`gho_`/`github_pat_`, `sk-`, Slack `xox[abpr]-`),
+/// AWS `AKIA…`, JWTs, and 32+ char high-entropy tokens.
+fn looks_like_credential(arg: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "figd_",
+        "ghp_",
+        "gho_",
+        "github_pat_",
+        "sk-",
+        "xoxa-",
+        "xoxb-",
+        "xoxp-",
+        "xoxr-",
+    ];
+    if PREFIXES.iter().any(|p| arg.starts_with(p)) {
+        return true;
+    }
+    // AWS access key id: `AKIA` + 16 uppercase/digits, exactly.
+    if arg.len() == 20
+        && arg.starts_with("AKIA")
+        && arg[4..]
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        return true;
+    }
+    // JWT: `eyJ…`.`…`.`…` — three non-empty base64url segments.
+    if arg.starts_with("eyJ") {
+        let segs: Vec<&str> = arg.split('.').collect();
+        if segs.len() == 3
+            && segs.iter().all(|s| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            })
+        {
+            return true;
+        }
+    }
+    // 32+ char high-entropy token: token charset with no `/` (that is
+    // a path), at least one letter and one digit.
+    arg.len() >= 32
+        && !arg.starts_with('-')
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '~' | '+' | '='))
+        && arg.chars().any(|c| c.is_ascii_alphabetic())
+        && arg.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Redact credential material from an argv, returning it joined with
+/// spaces — the one place argv becomes display text. The executable
+/// and ordinary arguments pass through; secret *values* become
+/// `[REDACTED]`: the value of any `--flag=value` or `--flag value`
+/// whose flag name looks credential-bearing, any `NAME=value`
+/// env-style argument with such a name, and any standalone argument
+/// matching a known credential shape or the 32+ char high-entropy
+/// token shape. Public because `src/session.rs` (and anywhere else
+/// argv is turned into text) must share it rather than re-implement.
+pub fn redact_argv<S: AsRef<str>>(argv: &[S]) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = argv[i].as_ref();
+        if arg.starts_with('-') && arg.len() > 1 {
+            // A flag: `--name=value`, `--name value`, or a bare switch.
+            let body = arg.trim_start_matches('-');
+            match body.split_once('=') {
+                Some((name, value)) => {
+                    if secret_name(name) || looks_like_credential(value) {
+                        out.push(format!(
+                            "{}={REDACTED}",
+                            &arg[..arg.len() - value.len() - 1]
+                        ));
+                    } else {
+                        out.push(arg.to_string());
+                    }
+                }
+                None => {
+                    out.push(arg.to_string());
+                    // `--flag value` — the next arg is the value when
+                    // the flag names a secret and it is not a flag.
+                    if secret_name(body)
+                        && argv
+                            .get(i + 1)
+                            .is_some_and(|v| !v.as_ref().starts_with('-'))
+                    {
+                        out.push(REDACTED.to_string());
+                        i += 1;
+                    }
+                }
+            }
+        } else if let Some((name, value)) = arg.split_once('=') {
+            // `NAME=value` env-style, or any `x=y` whose value is a
+            // credential shape.
+            if (env_name(name) && secret_name(name)) || looks_like_credential(value) {
+                out.push(format!("{name}={REDACTED}"));
+            } else {
+                out.push(arg.to_string());
+            }
+        } else if looks_like_credential(arg) {
+            out.push(REDACTED.to_string());
+        } else {
+            out.push(arg.to_string());
+        }
+        i += 1;
+    }
+    out.join(" ")
+}
+
+/// argv[0] plus a redacted, ~120-char head of the full command line —
+/// test-binary detection needs the untruncated argv0, and the head is
+/// display text so `redact_argv` scrubs it before anything stores it.
 fn cmdline(pid_dir: &Path) -> (Option<PathBuf>, Option<String>) {
     let Ok(raw) = std::fs::read(pid_dir.join("cmdline")) else {
         return (None, None);
     };
-    let parts: Vec<&[u8]> = raw.split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
-    let argv0 = parts
-        .first()
-        .map(|p| PathBuf::from(String::from_utf8_lossy(p).into_owned()));
-    let text = parts
-        .iter()
-        .map(|p| String::from_utf8_lossy(p))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let head = (!text.is_empty()).then(|| text.chars().take(100).collect());
+    let parts: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    let argv0 = parts.first().map(PathBuf::from);
+    let head = (!parts.is_empty()).then(|| redact_argv(&parts).chars().take(120).collect());
     (argv0, head)
 }
 
@@ -1738,6 +1872,125 @@ mod tests {
         std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Nothing else flags → ok.
         assert_eq!(c.level, Level::Ok);
+    }
+
+    // ---------- argv redaction (CAD-108) ----------
+
+    #[test]
+    fn redact_argv_flag_and_env_forms() {
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            // `--flag=value`
+            (
+                vec![
+                    "npm",
+                    "exec",
+                    "figma-developer-mcp",
+                    "--figma-api-key=figd_TESTKEY0001",
+                    "--stdio",
+                ],
+                "npm exec figma-developer-mcp --figma-api-key=[REDACTED] --stdio",
+            ),
+            // `--flag value`
+            (
+                vec!["tool", "--token", "s3cr3t", "--verbose"],
+                "tool --token [REDACTED] --verbose",
+            ),
+            (
+                vec!["aws", "sso", "--aws-secret-access-key", "wJalrXUtnFEMI"],
+                "aws sso --aws-secret-access-key [REDACTED]",
+            ),
+            // a flag-shaped next arg is not consumed as the value
+            (vec!["t", "--token", "--verbose"], "t --token --verbose"),
+            // trailing flag with no value — nothing to redact
+            (vec!["t", "--verbose", "--api-key"], "t --verbose --api-key"),
+            // `NAME=value` env-style
+            (
+                vec!["env", "GITHUB_TOKEN=ghp_TEST", "cmd"],
+                "env GITHUB_TOKEN=[REDACTED] cmd",
+            ),
+            (
+                vec!["env", "PGPASSWORD=hunter2", "psql"],
+                "env PGPASSWORD=[REDACTED] psql",
+            ),
+            // value shaped like a credential under a plain flag/env name
+            (vec!["t", "--header=xoxb-TEST"], "t --header=[REDACTED]"),
+            (vec!["t", "URL=sk-TEST"], "t URL=[REDACTED]"),
+            // ordinary arguments pass through untouched
+            (
+                vec!["cargo", "test", "--", "--port", "3010", "/tmp/x"],
+                "cargo test -- --port 3010 /tmp/x",
+            ),
+            (
+                vec!["t", "--config=/etc/app.conf", "verbose"],
+                "t --config=/etc/app.conf verbose",
+            ),
+            (
+                vec!["env", "EDITOR=vim", "URL=https://x/?q=1"],
+                "env EDITOR=vim URL=https://x/?q=1",
+            ),
+        ];
+        for (argv, want) in cases {
+            assert_eq!(redact_argv(&argv), want, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn redact_argv_credential_shapes() {
+        for token in [
+            "figd_TESTTOKEN",
+            "ghp_TESTTOKEN",
+            "gho_TESTTOKEN",
+            "github_pat_TESTTOKEN",
+            "sk-TESTTOKEN",
+            "xoxb-TESTTOKEN",
+            "xoxp-TESTTOKEN",
+            // AKIA + 16 uppercase/digits is the whole shape — the
+            // fixture is AWS's documented example key.
+            "AKIAIOSFODNN7EXAMPLE",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5t_Q",
+            // 32+ char high-entropy token
+            "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c",
+        ] {
+            assert_eq!(
+                redact_argv(&["tool", token]),
+                format!("tool {REDACTED}"),
+                "{token}"
+            );
+        }
+        // …but ordinary long args survive: a path (`/` excluded), an
+        // all-alpha run (no digit), a short token-looking arg.
+        for arg in [
+            "/usr/lib/x86_64-linux-gnu/libsomethingverylongname.so",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "short-token",
+        ] {
+            assert_eq!(redact_argv(&["tool", arg]), format!("tool {arg}"), "{arg}");
+        }
+    }
+
+    #[test]
+    fn orphans_redact_secret_argv() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = scan.cwd.clone();
+        add_pid(
+            &scan.proc_root,
+            40,
+            Some(&repo.join(".cadence/wt/gone")),
+            None,
+            Some("npm exec figma-developer-mcp --figma-api-key=figd_TESTKEY0002 --stdio"),
+            7_200,
+            &[],
+        );
+        let c = check_orphans(&scan);
+        // detail, remedy and the serialised JSON all carry `head` —
+        // none may contain the credential.
+        let blob = serde_json::to_string(&c.to_json()).unwrap();
+        for text in [&blob, &c.detail, &c.remedy] {
+            assert!(!text.contains("figd_TESTKEY0002"), "{text}");
+        }
+        assert!(blob.contains("--figma-api-key=[REDACTED]"));
+        assert!(blob.contains("figma-developer-mcp"));
     }
 
     #[test]
