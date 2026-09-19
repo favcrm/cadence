@@ -2,7 +2,10 @@
 //! These exercise the observable contract — queue order, idempotency,
 //! restart fencing, approval brokering, serialization — without model calls.
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16771,4 +16774,417 @@ fn issue_start_honours_cargo_target_dir_env() {
         wt_ref["cargo_target"].as_str().unwrap(),
         envdir.to_string_lossy()
     );
+}
+
+// ---- session start|end: stub daemon socket, fixture pm + repo (CAD-92) ----
+
+/// Canned `agent_show` data for one alias.
+struct StubAgent {
+    row: Value,
+    messages: Vec<Value>,
+    queued: i64,
+    unknown: i64,
+}
+
+fn stub_agent(
+    alias: &str,
+    provider: &str,
+    kind: &str,
+    state: &str,
+    idle_for_secs: i64,
+    messages: Vec<Value>,
+    queued: i64,
+    unknown: i64,
+) -> StubAgent {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    StubAgent {
+        row: json!({
+            "alias": alias, "provider": provider, "endpoint_kind": kind,
+            "role": "", "cwd": "/", "state": state, "enabled": true,
+            "dead": false, "endpoint": if state == "stopped" { Value::Null } else { json!("ep") },
+            "created": now - 86_400.0, "updated": now - idle_for_secs as f64,
+        }),
+        messages,
+        queued,
+        unknown,
+    }
+}
+
+/// The daemon wire protocol on `<state>/cadence.sock` with canned
+/// answers — the session verbs under test connect exactly like they
+/// would to the real daemon. `calls` records every method seen so a
+/// test can prove `--dry-run` mutated nothing.
+struct StubDaemon {
+    calls: Arc<Mutex<Vec<String>>>,
+    _thread: JoinHandle<()>,
+}
+
+fn stub_daemon(state: &Path, build_commit: &str, agents: Vec<StubAgent>) -> StubDaemon {
+    std::fs::create_dir_all(state).unwrap();
+    let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let calls_t = Arc::clone(&calls);
+    let rows: Vec<Value> = agents.iter().map(|a| a.row.clone()).collect();
+    let shows: std::collections::HashMap<String, Value> = agents
+        .into_iter()
+        .map(|a| {
+            let alias = a.row["alias"].as_str().unwrap().to_string();
+            (
+                alias.clone(),
+                json!({
+                    "agent": a.row, "messages": a.messages,
+                    "queued": a.queued, "unknown": a.unknown,
+                    "event_cursor": 0,
+                }),
+            )
+        })
+        .collect();
+    let info = json!({
+        "build_commit": build_commit,
+        "build_time": "2026-01-01T00:00:00Z",
+        "started_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - 600,
+    });
+    let thread = thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                continue;
+            }
+            let req: Value = serde_json::from_str(&line).unwrap_or_default();
+            let method = req["method"].as_str().unwrap_or_default().to_string();
+            calls_t.lock().unwrap().push(method.clone());
+            let params = &req["params"];
+            let result = match method.as_str() {
+                "health" => json!({"ok": true, "version": 1}),
+                "daemon_info" => info.clone(),
+                "agent_list" => json!({"agents": rows}),
+                "agent_show" => shows
+                    .get(params["alias"].as_str().unwrap_or_default())
+                    .cloned()
+                    .unwrap_or_else(|| json!({"messages": [], "queued": 0, "unknown": 0})),
+                "agent_requests" => json!({"requests": []}),
+                "agent_probe" => json!({"idle": true}),
+                "agent_stop" => json!({"alias": params["alias"], "state": "stopped"}),
+                "agent_gc" => json!({"removed": []}),
+                _ => {
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"ok": false, "error": {"kind": "rejected",
+                              "message": format!("Unknown method {method}")}})
+                    );
+                    continue;
+                }
+            };
+            let _ = writeln!(stream, "{}", json!({"ok": true, "result": result}));
+        }
+    });
+    StubDaemon {
+        calls,
+        _thread: thread,
+    }
+}
+
+fn stub_calls(sd: &StubDaemon) -> Vec<String> {
+    sd.calls.lock().unwrap().clone()
+}
+
+/// `<pm>` with one project pointing at `repo`, one `doing` issue
+/// owned by an alias the stub does not serve, and an empty notes dir.
+fn seed_pm(pm: &Path, repo: &Path, notes: &Path) {
+    std::fs::create_dir_all(pm.join("tst")).unwrap();
+    std::fs::create_dir_all(notes).unwrap();
+    std::fs::write(
+        pm.join("pm.yaml"),
+        format!(
+            "schema: 1\nnotes_dir: {}\nstatuses:\n- backlog\n- ready\n- doing\n- review\n- done\n- dropped\n",
+            notes.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pm.join("tst/project.yaml"),
+        format!(
+            "key: tst\nprefix: TST\nrepos:\n- path: {}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    let issue = pm.join("tst/TST-9");
+    std::fs::create_dir_all(&issue).unwrap();
+    std::fs::write(
+        issue.join("issue.md"),
+        "---\nid: TST-9\ntitle: ghost-owned doing issue\nstatus: doing\n\
+         priority: P2\nowner: ghost-agent\ncreated: 2026-01-01T00:00:00Z\n---\n\nbody\n",
+    )
+    .unwrap();
+}
+
+/// A git repo with a merged `cadence/tst-7-done` worktree and a plain
+/// `.cadence/wt/tst-88-ghost` dir — one merge candidate, one orphan.
+fn seed_repo(repo: &Path) {
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    std::fs::create_dir_all(repo).unwrap();
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@x"]);
+    git(&["config", "user.name", "test"]);
+    std::fs::write(repo.join("f.txt"), "x").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "init"]);
+    git(&["branch", "cadence/tst-7-done"]);
+    git(&[
+        "worktree",
+        "add",
+        ".cadence/wt/tst-7-done",
+        "cadence/tst-7-done",
+    ]);
+    std::fs::create_dir_all(repo.join(".cadence/wt/tst-88-ghost")).unwrap();
+}
+
+/// `cadence <args>` against the fixture state dir + pm dir, cwd at the
+/// fixture repo. Output captured; the stub answers daemon RPCs.
+fn run_session(state: &Path, pm: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state)
+        .args(args)
+        .env("CADENCE_PM_DIR", pm)
+        .current_dir(cwd)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn session_start_reports_failures_and_fix_only_starts_ui() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    let repo = dir.path().join("repo");
+    seed_pm(&pm, &repo, &dir.path().join("notes"));
+    seed_repo(&repo);
+    let sd = stub_daemon(
+        &state,
+        "stale-build-000",
+        vec![
+            stub_agent(
+                "w1",
+                "fake",
+                "fake",
+                "attention",
+                700,
+                vec![json!({"id": "m-unk", "state": "unknown", "body": "lost turn"})],
+                0,
+                1,
+            ),
+            stub_agent(
+                "pm-inbox",
+                "inbox",
+                "inbox",
+                "idle",
+                700,
+                vec![json!({"id": "k1", "state": "queued", "body": "kickoff"})],
+                2,
+                0,
+            ),
+        ],
+    );
+
+    let out = run_session(&state, &pm, &repo, &["session", "start"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "expected no-go exit 2:\n{text}");
+    assert!(
+        text.contains("stale-build-000"),
+        "stale daemon build:\n{text}"
+    );
+    assert!(text.contains("m-unk"), "unknown message named:\n{text}");
+    assert!(text.contains("tst-88-ghost"), "orphan worktree:\n{text}");
+    assert!(text.contains("pm-inbox"), "unread inbox:\n{text}");
+    assert!(
+        text.contains("TST-9"),
+        "doing issue with dead owner:\n{text}"
+    );
+    // Nothing was fixed or mutated without --fix.
+    assert!(!state.join("ui.pid").exists());
+    for m in stub_calls(&sd) {
+        assert!(
+            !matches!(m.as_str(), "agent_stop" | "agent_gc"),
+            "read-only start mutated: {m}"
+        );
+    }
+
+    // --fix: a free port persisted in ui.json lets the real binary
+    // spawn `ui run`; the stub daemon must be left untouched.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    std::fs::write(state.join("ui.json"), format!("{{\"port\": {port}}}")).unwrap();
+    let out = run_session(&state, &pm, &repo, &["session", "start", "--fix"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !state.join("ui.pid").exists() {
+        assert!(Instant::now() < deadline, "ui never started:\n{text}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Nothing else: the daemon was reachable, so no daemon start (the
+    // log file it would create is absent) and no mutating RPCs.
+    assert!(
+        !state.join("daemon.log").exists(),
+        "daemon was started:\n{text}"
+    );
+    for m in stub_calls(&sd) {
+        assert!(
+            !matches!(m.as_str(), "agent_stop" | "agent_gc" | "agent_send"),
+            "--fix mutated: {m}"
+        );
+    }
+    let stop = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["ui", "stop"])
+        .output()
+        .unwrap();
+    assert!(stop.status.success());
+}
+
+#[test]
+fn session_end_dry_run_plans_real_run_stops_only_idle() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    let repo = dir.path().join("repo");
+    seed_pm(&pm, &repo, &dir.path().join("notes"));
+    seed_repo(&repo);
+    let sd = stub_daemon(
+        &state,
+        cadence_agent::overview::BUILD_COMMIT,
+        vec![
+            stub_agent("old-idle", "fake", "fake", "idle", 7200, vec![], 0, 0),
+            stub_agent("fresh-idle", "fake", "fake", "idle", 60, vec![], 0, 0),
+            stub_agent(
+                "busy-one",
+                "fake",
+                "fake",
+                "busy",
+                7200,
+                vec![json!({"id": "m-run", "state": "running",
+                       "body": "long turn", "started": 1.0})],
+                0,
+                0,
+            ),
+            stub_agent(
+                "queued-one",
+                "fake",
+                "fake",
+                "idle",
+                7200,
+                vec![json!({"id": "m-q", "state": "queued", "body": "queued"})],
+                1,
+                0,
+            ),
+            stub_agent("pm-inbox", "inbox", "inbox", "idle", 7200, vec![], 2, 0),
+        ],
+    );
+
+    // Dry run: names the stop candidates and the merged worktree,
+    // changes nothing.
+    let out = run_session(&state, &pm, &repo, &["session", "end", "--dry-run"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("old-idle"),
+        "dry-run names idle agent:\n{text}"
+    );
+    assert!(
+        text.contains("tst-7-done"),
+        "dry-run names merged worktree:\n{text}"
+    );
+    assert!(
+        !text.contains("fresh-idle"),
+        "dry-run must not list a still-active agent:\n{text}"
+    );
+    for m in stub_calls(&sd) {
+        assert!(
+            !matches!(m.as_str(), "agent_stop" | "agent_gc"),
+            "dry-run mutated: {m}"
+        );
+    }
+
+    // Real run: only the agent idle past --idle-secs is stopped.
+    let out = run_session(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--idle-secs", "1800"],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stops: Vec<String> = stub_calls(&sd)
+        .into_iter()
+        .filter(|m| m == "agent_stop")
+        .collect();
+    assert_eq!(
+        stops,
+        vec!["agent_stop".to_string()],
+        "exactly one stop:\n{text}"
+    );
+    assert!(
+        stub_calls(&sd).iter().any(|m| m == "agent_gc"),
+        "agent gc ran:\n{text}"
+    );
+    assert!(text.contains("old-idle"));
+
+    // The handoff note landed with the required sections.
+    let sessions = state.join("sessions");
+    let notes: Vec<PathBuf> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(notes.len(), 1, "one handoff file: {notes:?}");
+    let md = std::fs::read_to_string(&notes[0]).unwrap();
+    for section in [
+        "## open PRs",
+        "## running turns",
+        "## queued kickoffs",
+        "## issues in review",
+        "## done this run",
+        "## next session first",
+    ] {
+        assert!(md.contains(section), "handoff missing {section}:\n{md}");
+    }
+    assert!(md.contains("old-idle"), "stopped agent recorded:\n{md}");
 }

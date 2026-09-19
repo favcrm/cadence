@@ -865,10 +865,7 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
 
 /// `session`'s reconcile/handoff share the gh fetch (and its cache)
 /// rather than re-running `gh pr list` — same slug set, same data.
-pub(crate) fn github_repos(
-    state_dir: &Path,
-    slugs: &[String],
-) -> (HashMap<String, Value>, Value) {
+pub(crate) fn github_repos(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Value>, Value) {
     github(state_dir, slugs)
 }
 

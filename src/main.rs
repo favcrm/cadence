@@ -3449,17 +3449,15 @@ fn run() -> Result<i32> {
             state_dir,
         }),
         Commands::Session { action } => match action {
-            SessionAction::Start {
-                project,
-                json,
-                fix,
-            } => cadence_agent::session::run_start(&cadence_agent::session::StartOptions {
-                project,
-                json,
-                fix,
-                cwd: std::env::current_dir()?,
-                state_dir,
-            }),
+            SessionAction::Start { project, json, fix } => {
+                cadence_agent::session::run_start(&cadence_agent::session::StartOptions {
+                    project,
+                    json,
+                    fix,
+                    cwd: std::env::current_dir()?,
+                    state_dir,
+                })
+            }
             SessionAction::End {
                 project,
                 json,

@@ -25,8 +25,6 @@
 //! [`crate::proc::run_bounded`].
 
 use std::collections::HashMap;
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -35,6 +33,7 @@ use serde_json::{json, Value};
 
 use crate::adapter::registry;
 use crate::client;
+use crate::doctor;
 use crate::error::{Error, Result};
 use crate::issue::{self, board, project, time as itime};
 use crate::overview;
@@ -42,9 +41,6 @@ use crate::proc::run_bounded;
 use crate::ui;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Disk thresholds: warn under 20 GiB, fail under 5 GiB.
-const DISK_WARN: u64 = 20 << 30;
-const DISK_FAIL: u64 = 5 << 30;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Sev {
@@ -122,6 +118,59 @@ impl Row {
     }
 }
 
+/// The host scan with the command's cwd — `Scan::host` defaults to
+/// the process cwd, which is the same thing in practice but the
+/// explicit override keeps the option field honest.
+fn host_scan_for(state_dir: PathBuf, cwd: PathBuf) -> doctor::host::Scan {
+    let mut scan = doctor::host::Scan::host(&state_dir);
+    scan.cwd = cwd;
+    scan
+}
+
+/// A `doctor --host` report as one Row: worst level wins, each non-ok
+/// check becomes an item with its remedy.
+fn host_row(name: &'static str, report: &Value) -> Row {
+    let mut row = Row::new(name);
+    let level = match report["level"].as_str() {
+        Some("fail") => Sev::Fail,
+        Some("warn") => Sev::Warn,
+        _ => Sev::Ok,
+    };
+    let checks = report["checks"].as_array().cloned().unwrap_or_default();
+    let mut worst_detail = String::new();
+    let mut worst_remedy = None;
+    for c in &checks {
+        let cl = c["level"].as_str().unwrap_or("ok");
+        if cl == "ok" {
+            continue;
+        }
+        let cname = c["name"].as_str().unwrap_or("?");
+        let detail = c["detail"].as_str().unwrap_or_default();
+        let remedy = c["remedy"].as_str().unwrap_or_default();
+        row.items.push(if remedy.is_empty() {
+            format!("{cname}: {detail}")
+        } else {
+            format!("{cname}: {detail} — {remedy}")
+        });
+        if worst_detail.is_empty() || (cl == "fail" && level == Sev::Fail) {
+            worst_detail = format!("{cname}: {detail}");
+            worst_remedy = if remedy.is_empty() {
+                None
+            } else {
+                Some(remedy.to_string())
+            };
+        }
+    }
+    row.sev = level;
+    row.detail = if worst_detail.is_empty() {
+        "host clean".to_string()
+    } else {
+        worst_detail
+    };
+    row.remedy = worst_remedy;
+    row
+}
+
 fn print_row(r: &Row) {
     let mut line = format!("{:<9} {:<4} {}", r.name, r.sev.name(), r.detail);
     if let Some(rem) = &r.remedy {
@@ -141,8 +190,9 @@ fn print_row(r: &Row) {
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args(args);
-    let out = run_bounded(&mut cmd, GIT_TIMEOUT)
-        .map_err(|e| Error::internal(format!("git {} in {}: {e}", args.join(" "), repo.display())))?;
+    let out = run_bounded(&mut cmd, GIT_TIMEOUT).map_err(|e| {
+        Error::internal(format!("git {} in {}: {e}", args.join(" "), repo.display()))
+    })?;
     if !out.status.success() {
         return Err(Error::internal(format!(
             "git {} in {}: {}",
@@ -152,23 +202,6 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// Bytes free for an unprivileged writer on `path`'s filesystem —
-/// `f_bavail`, not `f_bfree`, so root-reserved blocks don't flatter it.
-fn disk_free(path: &Path) -> Option<u64> {
-    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    unsafe {
-        let mut st: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
-            return None;
-        }
-        Some(st.f_bavail as u64 * st.f_frsize as u64)
-    }
-}
-
-fn gib(b: u64) -> String {
-    format!("{:.0}G", b as f64 / (1u64 << 30) as f64)
 }
 
 /// Agent rows plus each one's `agent_show` — the snapshot both verbs
@@ -213,7 +246,10 @@ fn running_msg(show: &Value, now: i64) -> Option<(String, String, i64)> {
         ) {
             return None;
         }
-        let started = m["started"].as_f64().or(m["created"].as_f64()).unwrap_or(now as f64) as i64;
+        let started = m["started"]
+            .as_f64()
+            .or(m["created"].as_f64())
+            .unwrap_or(now as f64) as i64;
         let head = m["body"]
             .as_str()
             .unwrap_or_default()
@@ -290,11 +326,7 @@ fn scope(project: Option<&str>) -> Scope {
 /// full per-slug `prs` payload for the handoff — one `gh` fetch shared
 /// with the overview cache.
 fn gh_open(state_dir: &Path, sc: &Scope) -> (Vec<String>, HashMap<String, Value>) {
-    let mut slugs: Vec<String> = sc
-        .repos
-        .iter()
-        .filter_map(|(_, s, _)| s.clone())
-        .collect();
+    let mut slugs: Vec<String> = sc.repos.iter().filter_map(|(_, s, _)| s.clone()).collect();
     slugs.sort();
     slugs.dedup();
     let (repos, _state) = overview::github_repos(state_dir, &slugs);
@@ -361,91 +393,11 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
     let mut rows: Vec<Row> = Vec::new();
     let mut fixes: Vec<String> = Vec::new();
 
-    // ---- host: doctor + disk free ----
-    let mut host = Row::new("host");
-    match crate::doctor::run(&opts.state_dir) {
-        Ok(rep) => {
-            let checks = &rep["checks"];
-            if checks["storage"]["ok"].as_bool() != Some(true) {
-                host = host.fail(
-                    format!(
-                        "store probe failed: {}",
-                        checks["storage"]["error"].as_str().unwrap_or("?")
-                    ),
-                    "cadence doctor",
-                );
-            } else if checks["state_dir"]["writable"].as_bool() != Some(true) {
-                host = host.fail("state dir not writable", "check CADENCE_STATE_DIR");
-            }
-            let missing: Vec<&str> = checks
-                .as_object()
-                .map(|m| {
-                    m.iter()
-                        .filter(|(k, v)| {
-                            *k != "state_dir"
-                                && *k != "storage"
-                                && *k != "pm"
-                                && v["present"].as_bool() == Some(false)
-                        })
-                        .map(|(k, _)| k.as_str())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !missing.is_empty() && host.sev == Sev::Ok {
-                host = host.ok(format!("provider CLIs absent: {}", missing.join(", ")));
-            }
-        }
-        Err(e) => host = host.fail(format!("doctor failed: {e}"), "run `cadence doctor`"),
-    }
-    // Disk on the state dir, each scoped repo, /tmp, $HOME.
+    // ---- host: the CAD-72 watchdog — disk, WAL, pipes, orphans,
+    // temp dirs, stale worktrees in one read-only scan ----
     let sc = scope(opts.project.as_deref());
-    let mut disks: Vec<PathBuf> = vec![
-        opts.state_dir.clone(),
-        PathBuf::from("/tmp"),
-        std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/")),
-    ];
-    for (_, _, r) in &sc.repos {
-        disks.push(r.clone());
-    }
-    if let Ok(root) = crate::worktree::main_root(&opts.cwd) {
-        disks.push(root);
-    }
-    disks.sort();
-    disks.dedup();
-    let mut disk_parts = Vec::new();
-    let mut disk_sev = Sev::Ok;
-    for d in &disks {
-        match disk_free(d) {
-            Some(free) => {
-                let sev = if free < DISK_FAIL {
-                    Sev::Fail
-                } else if free < DISK_WARN {
-                    Sev::Warn
-                } else {
-                    Sev::Ok
-                };
-                disk_sev = disk_sev.max(sev);
-                disk_parts.push(format!("{} {}", d.display(), gib(free)));
-            }
-            None => disk_parts.push(format!("{} unreadable", d.display())),
-        }
-    }
-    let disk_detail = disk_parts.join(", ");
-    host.items.push(format!("disk: {disk_detail}"));
-    if disk_sev > host.sev {
-        host.sev = disk_sev;
-        if host.detail.is_empty() {
-            host.detail = format!("disk low: {disk_detail}");
-        }
-        if disk_sev == Sev::Fail {
-            host.remedy = Some("free disk space before starting work (<5G)".to_string());
-        } else {
-            host.remedy = Some("disk under 20G — clean up soon".to_string());
-        }
-    }
-    if host.detail.is_empty() {
-        host.detail = "storage ok".to_string();
-    }
+    let host_scan = doctor::host::run(&host_scan_for(opts.state_dir.clone(), opts.cwd.clone()));
+    let host = host_row("host", &host_scan);
     rows.push(host);
 
     // ---- binary vs main ----
@@ -461,11 +413,17 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                 let n = d["count"].as_i64().unwrap_or(0);
                 bin = if n > 0 {
                     bin.warn(
-                        format!("binary is {n} commit(s) behind {}", d["ref"].as_str().unwrap_or("main")),
+                        format!(
+                            "binary is {n} commit(s) behind {}",
+                            d["ref"].as_str().unwrap_or("main")
+                        ),
                         "git pull && cargo build --release --features ui",
                     )
                 } else {
-                    bin.ok(format!("at {}", &overview::BUILD_COMMIT[..10.min(overview::BUILD_COMMIT.len())]))
+                    bin.ok(format!(
+                        "at {}",
+                        &overview::BUILD_COMMIT[..10.min(overview::BUILD_COMMIT.len())]
+                    ))
                 };
             } else {
                 bin = bin.ok(d["reason"].as_str().unwrap_or("cannot tell").to_string());
@@ -480,7 +438,10 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
     if !fl.reachable && opts.fix {
         match client::daemon_start(&opts.state_dir) {
             Ok(v) => {
-                fixes.push(format!("daemon start → {}", v["state"].as_str().unwrap_or("?")));
+                fixes.push(format!(
+                    "daemon start → {}",
+                    v["state"].as_str().unwrap_or("?")
+                ));
                 fl = fleet(&opts.state_dir);
             }
             Err(e) => fixes.push(format!("daemon start failed: {e}")),
@@ -604,6 +565,10 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
         let pm_dir = issue::default_dir().unwrap_or_default();
         let view = overview::overview(&opts.state_dir, &pm_dir);
         let needs = view["needs_me"].as_array().cloned().unwrap_or_default();
+        // Hard failures: a fenced agent and an unknown message both
+        // mean a turn's outcome is unaccounted for — the gate refuses
+        // go until a human reconciles them. Everything else warns.
+        let mut recon_fail = false;
         for n in &needs {
             let kind = n["kind"].as_str().unwrap_or_default();
             let line = format!(
@@ -614,6 +579,9 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
             if kind == "inbox_unread" {
                 inbox_warns.push(line);
             } else {
+                if kind == "fenced" {
+                    recon_fail = true;
+                }
                 recon.items.push(line);
             }
         }
@@ -625,6 +593,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
             for m in show["messages"].as_array().cloned().unwrap_or_default() {
                 if m["state"].as_str() == Some("unknown") {
                     named = true;
+                    recon_fail = true;
                     let head = m["body"]
                         .as_str()
                         .unwrap_or_default()
@@ -642,6 +611,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                 }
             }
             if !named && show["unknown"].as_i64().unwrap_or(0) > 0 {
+                recon_fail = true;
                 recon.items.push(format!(
                     "agent {alias}: unknown message(s) — cadence agent show {alias}"
                 ));
@@ -718,7 +688,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
             }
         }
         if !recon.items.is_empty() {
-            recon.sev = Sev::Warn;
+            recon.sev = if recon_fail { Sev::Fail } else { Sev::Warn };
             recon.detail = format!("{} item(s)", recon.items.len());
         } else {
             recon = recon.ok("nothing stale");
@@ -895,7 +865,10 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     if !fl.reachable {
         idle_row = idle_row.warn("daemon unreachable — nothing stopped", "");
     } else if stop_candidates.is_empty() {
-        idle_row = idle_row.ok(format!("nothing idle past {}s ({busy} busy)", opts.idle_secs));
+        idle_row = idle_row.ok(format!(
+            "nothing idle past {}s ({busy} busy)",
+            opts.idle_secs
+        ));
     } else {
         idle_row = Row {
             name: "agents",
@@ -915,9 +888,7 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
                 match client::rpc(&opts.state_dir, "agent_stop", json!({"alias": alias})) {
                     Ok(_) => done.stopped.push(alias.clone()),
                     Err(e) => {
-                        idle_row
-                            .items
-                            .push(format!("stop {alias} failed: {e}"));
+                        idle_row.items.push(format!("stop {alias} failed: {e}"));
                         failures += 1;
                     }
                 }
@@ -963,60 +934,40 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     }
     rows.push(gc_row);
 
-    // ---- host sweep: orphan test processes + disk ----
-    let mut sweep_row = Row::new("sweep");
-    let orphans = orphan_test_procs();
-    for o in &orphans {
-        sweep_row.items.push(format!(
-            "orphan test process pid {} — {} (cwd {})",
-            o["pid"], o["cmd"], o["cwd"]
-        ));
-    }
-    let mut disks = vec![
-        opts.state_dir.clone(),
-        PathBuf::from("/tmp"),
-        std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/")),
-    ];
-    for (_, _, r) in &sc.repos {
-        disks.push(r.clone());
-    }
-    if let Ok(root) = crate::worktree::main_root(&opts.cwd) {
-        disks.push(root);
-    }
-    disks.sort();
-    disks.dedup();
-    let mut disk_parts = Vec::new();
-    let mut disk_sev = Sev::Ok;
-    for d in &disks {
-        if let Some(free) = disk_free(d) {
-            let sev = if free < DISK_FAIL {
-                Sev::Fail
-            } else if free < DISK_WARN {
-                Sev::Warn
-            } else {
-                Sev::Ok
-            };
-            disk_sev = disk_sev.max(sev);
-            disk_parts.push(format!("{} {}", d.display(), gib(free)));
-        }
-    }
-    sweep_row.items.push(format!("disk: {}", disk_parts.join(", ")));
-    sweep_row.sev = disk_sev.max(if orphans.is_empty() {
-        Sev::Ok
-    } else {
-        Sev::Warn
-    });
-    if sweep_row.sev == Sev::Ok {
+    // ---- host sweep: the CAD-72 watchdog again — orphans are
+    // reported, never killed; disk state rides along ----
+    let host_scan = doctor::host::run(&host_scan_for(opts.state_dir.clone(), opts.cwd.clone()));
+    let mut sweep_row = host_row("sweep", &host_scan);
+    if sweep_row.detail == "host clean" {
         sweep_row.detail = "clean".to_string();
-    } else {
-        sweep_row.detail = format!("{} orphan process(es)", orphans.len());
+    }
+    // Orphan pids deserve their own lines — the checklist's "five hung
+    // test binaries" are named, not counted.
+    for c in host_scan["checks"].as_array().cloned().unwrap_or_default() {
+        if c["name"].as_str() != Some("orphans") {
+            continue;
+        }
+        for o in c["value"]["pids"].as_array().cloned().unwrap_or_default() {
+            sweep_row.items.push(format!(
+                "orphan pid {} — {} ({})",
+                o["pid"],
+                o["head"].as_str().unwrap_or_default(),
+                o["reasons"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
     rows.push(sweep_row);
 
     // ---- handoff ----
     let (_, gh_repos) = gh_open(&opts.state_dir, &sc);
-    let handoff_path = match write_handoff(opts, &fl, &sc, &gh_repos, &done, now)
-    {
+    let handoff_path = match write_handoff(opts, &fl, &sc, &gh_repos, &done, now) {
         Ok(p) => p,
         Err(e) => {
             rows.push(Row::new("handoff").fail(format!("{e}"), ""));
@@ -1072,9 +1023,12 @@ fn merged_worktree_candidates(repos: &[(String, Option<String>, PathBuf)]) -> Ve
         let Ok(list) = git(root, &["worktree", "list", "--porcelain"]) else {
             continue;
         };
-        let default = git(root, &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
-            .ok()
-            .or_else(|| git(root, &["symbolic-ref", "--short", "HEAD"]).ok());
+        let default = git(
+            root,
+            &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
+        )
+        .ok()
+        .or_else(|| git(root, &["symbolic-ref", "--short", "HEAD"]).ok());
         let Some(default) = default else { continue };
         let mut cur_path = String::new();
         let mut cur_branch = String::new();
@@ -1089,15 +1043,18 @@ fn merged_worktree_candidates(repos: &[(String, Option<String>, PathBuf)]) -> Ve
                     && !cur_branch.is_empty()
                     && !Path::new(&cur_path).join(".cadence-review-tree").is_file()
                 {
-                    let merged = git(root, &["merge-base", "--is-ancestor", &cur_branch, &default])
-                        .is_ok()
-                        .then_some("ancestry")
-                        .or_else(|| {
-                            git(root, &["cherry", &default, &cur_branch])
-                                .ok()
-                                .filter(|m| !m.lines().any(|l| l.starts_with('+')))
-                                .map(|_| "cherry")
-                        });
+                    let merged = git(
+                        root,
+                        &["merge-base", "--is-ancestor", &cur_branch, &default],
+                    )
+                    .is_ok()
+                    .then_some("ancestry")
+                    .or_else(|| {
+                        git(root, &["cherry", &default, &cur_branch])
+                            .ok()
+                            .filter(|m| !m.lines().any(|l| l.starts_with('+')))
+                            .map(|_| "cherry")
+                    });
                     if let Some(how) = merged {
                         out.push(json!({
                             "repo": root, "worktree": cur_path, "branch": cur_branch,
@@ -1115,56 +1072,6 @@ fn merged_worktree_candidates(repos: &[(String, Option<String>, PathBuf)]) -> Ve
             } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
                 cur_branch = b.to_string();
             }
-        }
-    }
-    out
-}
-
-/// Test-runner processes whose working directory no longer exists —
-/// the "five hung test binaries" the morning checklist lost. Reported,
-/// never killed.
-fn orphan_test_procs() -> Vec<Value> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let dir = e.path();
-        let cmdline = std::fs::read(dir.join("cmdline")).unwrap_or_default();
-        let cmd = String::from_utf8_lossy(&cmdline)
-            .replace('\0', " ")
-            .trim()
-            .to_string();
-        if cmd.is_empty() {
-            continue;
-        }
-        let looks_test = cmd.contains("cargo test")
-            || cmd.contains("/target/debug/deps/")
-            || cmd.contains("cargo-nextest");
-        if !looks_test {
-            continue;
-        }
-        let gone = match std::fs::read_link(dir.join("cwd")) {
-            Ok(cwd) => {
-                let s = cwd.to_string_lossy();
-                s.ends_with(" (deleted)")
-                    || (s.contains(".cadence/wt/") && !Path::new(s.as_ref()).exists())
-            }
-            Err(_) => true,
-        };
-        if gone {
-            out.push(json!({
-                "pid": name,
-                "cmd": cmd.chars().take(80).collect::<String>(),
-                "cwd": std::fs::read_link(dir.join("cwd"))
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "deleted".to_string()),
-            }));
         }
     }
     out
@@ -1196,7 +1103,10 @@ fn write_handoff(
     for (slug, data) in gh_repos {
         for pr in data["prs"].as_array().cloned().unwrap_or_default() {
             any_pr = true;
-            let rollup = pr["statusCheckRollup"].as_array().cloned().unwrap_or_default();
+            let rollup = pr["statusCheckRollup"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             let verdict = overview::verdict_state_pub(&rollup).unwrap_or_else(|| "none".into());
             let checks = if overview::checks_green_pub(&rollup) {
                 "green"
@@ -1207,7 +1117,12 @@ fn write_handoff(
                 "- {slug}#{} {} — head {}, verdict {}, checks {}\n",
                 pr["number"].as_i64().unwrap_or(0),
                 pr["title"].as_str().unwrap_or(""),
-                pr["headRefOid"].as_str().unwrap_or("?").chars().take(10).collect::<String>(),
+                pr["headRefOid"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .chars()
+                    .take(10)
+                    .collect::<String>(),
                 verdict,
                 checks,
             ));
@@ -1258,9 +1173,30 @@ fn write_handoff(
     }
 
     md.push_str("\n## done this run\n");
-    md.push_str(&format!("- stopped: {}\n", if done.stopped.is_empty() { "none".into() } else { done.stopped.join(", ") }));
-    md.push_str(&format!("- gc removed: {}\n", if done.gc_removed.is_empty() { "none".into() } else { done.gc_removed.join(", ") }));
-    md.push_str(&format!("- worktrees finished: {}\n", if done.finished.is_empty() { "none".into() } else { done.finished.join(", ") }));
+    md.push_str(&format!(
+        "- stopped: {}\n",
+        if done.stopped.is_empty() {
+            "none".into()
+        } else {
+            done.stopped.join(", ")
+        }
+    ));
+    md.push_str(&format!(
+        "- gc removed: {}\n",
+        if done.gc_removed.is_empty() {
+            "none".into()
+        } else {
+            done.gc_removed.join(", ")
+        }
+    ));
+    md.push_str(&format!(
+        "- worktrees finished: {}\n",
+        if done.finished.is_empty() {
+            "none".into()
+        } else {
+            done.finished.join(", ")
+        }
+    ));
     if opts.force_finish {
         md.push_str("- finish ran with --force (recorded)\n");
     }
@@ -1290,7 +1226,11 @@ fn write_handoff(
         .count();
     md.push_str(&format!(
         "\n## fleet\n- daemon {}: {} agent(s) live\n",
-        if fl.reachable { "reachable" } else { "unreachable" },
+        if fl.reachable {
+            "reachable"
+        } else {
+            "unreachable"
+        },
         live
     ));
     if fl.reachable && live == 0 {

@@ -28,10 +28,39 @@ cadence agent register pm --provider inbox     # the PM seat
 cadence inbox pm --follow                      # blocks; one JSON object per routed result
 ```
 
-## 2. Start of session checklist
+## 2. Start of session
 
 ```bash
 export CADENCE_SUITE_LOCK="$HOME/.local/state/cadence/suite.lock"   # one path per host, in every shell and agent env
+cadence session start         # the gate below as one verb — exit 0 go / 1 warnings / 2 no-go
+cadence session start --fix   # same, plus the reversible fixes only:
+                              #  daemon start, ui start, ui tailscale start
+```
+
+`session start` runs, in order: `host` (`doctor --host`), `binary`
+(the running build's commit vs the repo's default ref), `daemon`
+(reachable, and its build matches the binary's), `board` (the detached
+UI, plus the persisted tailscale mapping when there is one),
+`reconcile` (unknown messages, fenced agents, `doing` issues with no
+live owner, open PRs on `cadence/` branches with no local worktree,
+`.cadence/wt/*` dirs with neither an open PR nor an open issue) and
+`inbox` (unread mailbox queues). Every line prints `ok`/`warn`/`fail`
+with a one-line remedy; `--fix` only ever starts things, never
+restarts a running daemon, never removes anything.
+
+Then bring the workers back:
+
+```bash
+cadence issue sync            # pull other hosts' tracker writes before you plan
+cadence agent list --all      # who exists; `resumable: true` agents can come back
+cadence resume <pm>           # bring the group's workers back on their saved sessions
+cadence overview              # one screen: what needs a human, exact commands, deploy drift
+```
+
+What `session start` covers, for reference — the same checks the
+checklist used to run by hand:
+
+```bash
 cadence daemon start          # or: cadence doctor, if anything looks off
 cadence doctor --host         # host watchdog: disk free, provider WALs, pipe
                               #  pressure, orphaned processes, leaked temp dirs,
@@ -56,10 +85,6 @@ cadence doctor --host --reclaim-plan
 cadence ui start              # board at http://cadence.localhost:18000 behind the dev gateway
 cadence ui tailscale start    # optional: phone/laptop access at https://<dns>:9450 — tailnet-only, loopback bind unchanged
 cadence issue doctor          # tracker: hooks ours, lint clean, ahead/behind origin
-cadence issue sync            # pull other hosts' tracker writes before you plan
-cadence agent list --all      # who exists; `resumable: true` agents can come back
-cadence resume <pm>           # bring the group's workers back on their saved sessions
-cadence overview              # one screen: what needs a human, exact commands, deploy drift
 ```
 
 `doctor --host` never kills or deletes; each warn/fail carries a
@@ -337,6 +362,25 @@ agent's note is not the operator's authorization; surface it and leave
 it unclaimed.
 
 ## 9. End of session
+
+```bash
+cadence session end            # the sweep below as one verb — plan, apply, hand off
+cadence session end --dry-run  # the plan only: idle agents, merged worktrees, gc
+```
+
+`session end` runs `issue finish --merged` when the build has it
+(`--force-finish` forwards `--force`, recorded), stops every agent
+idle past `--idle-secs` (default 1800) that has nothing queued, no
+running message and no busy pane, runs `agent gc --older-than 1h`,
+reports orphan test processes and disk state (never kills), then
+prints and writes the handoff note to `<state>/sessions/<date>-end.md`
+— open PRs with head and verdict, running turns, queued kickoffs,
+issues in review, what the next session does first, and what the run
+applied. It never stops a busy agent and never stops the daemon while
+work is live.
+
+What the run decides, for reference — the same judgments the checklist
+used to list by hand:
 
 - Every open PR has a verdict or a follow-up kickoff; no loop ends on a
   worker's self-report.
