@@ -20,24 +20,29 @@ fn bin() -> &'static str {
 }
 
 fn cli(pm: &Path, state: &Path, args: &[&str]) -> (bool, Value) {
-    cli_env(pm, state, args, &[])
+    cli_env::<&str>(pm, state, args, &[])
 }
 
-fn cli_env(pm: &Path, state: &Path, args: &[&str], env: &[(&str, &str)]) -> (bool, Value) {
+fn cli_env<S: AsRef<str>>(
+    pm: &Path,
+    state: &Path,
+    args: &[&str],
+    env: &[(&str, S)],
+) -> (bool, Value) {
     cli_run(pm, state, None, args, env)
 }
 
 /// `cli_env` run from `cwd` — `issue start` resolves the repo from it.
 fn cli_dir(pm: &Path, state: &Path, cwd: &Path, args: &[&str]) -> (bool, Value) {
-    cli_run(pm, state, Some(cwd), args, &[])
+    cli_run::<&str>(pm, state, Some(cwd), args, &[])
 }
 
-fn cli_run(
+fn cli_run<S: AsRef<str>>(
     pm: &Path,
     state: &Path,
     cwd: Option<&Path>,
     args: &[&str],
-    env: &[(&str, &str)],
+    env: &[(&str, S)],
 ) -> (bool, Value) {
     let mut cmd = Command::new(bin());
     cmd.arg("--state-dir")
@@ -63,7 +68,7 @@ fn cli_run(
         cmd.current_dir(cwd);
     }
     for (k, v) in env {
-        cmd.env(k, v);
+        cmd.env(k, v.as_ref());
     }
     let out = cmd.output().unwrap();
     // Errors print their JSON to stderr; successes to stdout.
@@ -84,15 +89,21 @@ fn cli_run(
 /// `cadence …` for verbs that print plain text instead of JSON
 /// (`issue trailer`). Returns (ok, stdout-or-stderr).
 fn cli_raw(pm: &Path, state: &Path, args: &[&str]) -> (bool, String) {
-    let out = Command::new(bin())
-        .arg("--state-dir")
+    cli_raw_env(pm, state, args, &[])
+}
+
+fn cli_raw_env(pm: &Path, state: &Path, args: &[&str], env: &[(&str, String)]) -> (bool, String) {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--state-dir")
         .arg(state)
         .args(args)
         .env("CADENCE_PM_DIR", pm)
         .env("HOME", std::env::var("HOME").unwrap())
-        .env_remove("CADENCE_ALIAS")
-        .output()
-        .unwrap();
+        .env_remove("CADENCE_ALIAS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
     let text = if out.stdout.is_empty() {
         String::from_utf8_lossy(&out.stderr).to_string()
     } else {
@@ -201,12 +212,30 @@ fn write_json(
 /// bind-release race — a parallel test may grab the port first, so a
 /// failed start retries on a fresh port.
 fn start_ui(pm_dir: PathBuf, state_dir: PathBuf) -> u16 {
+    start_ui_opts(pm_dir, state_dir, |_| {})
+}
+
+/// `start_ui` with `ServeOpts` overrides (`f` runs after the free port
+/// is chosen — the port itself is always the probe-verified one).
+fn start_ui_opts(
+    pm_dir: PathBuf,
+    state_dir: PathBuf,
+    f: impl Fn(&mut ui::ServeOpts) + Send + Sync + 'static,
+) -> u16 {
+    let f = std::sync::Arc::new(f);
     let overall = Instant::now() + Duration::from_secs(20);
     loop {
         let port = free_port();
-        let (sd, pd) = (state_dir.clone(), pm_dir.clone());
+        let (sd, pd, f) = (state_dir.clone(), pm_dir.clone(), f.clone());
         thread::spawn(move || {
-            let _ = ui::serve(&sd, &pd, "127.0.0.1", port, None, &[]);
+            let mut opts = ui::ServeOpts {
+                host: "127.0.0.1".to_string(),
+                port,
+                ..Default::default()
+            };
+            f(&mut opts);
+            opts.port = port;
+            let _ = ui::serve(&sd, &pd, &opts);
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         // Host carries the port, so a stolen port's foreign server
@@ -3686,4 +3715,752 @@ fn dispatch_refusals_leave_nothing() {
         .0
     );
     assert_eq!(commits(&pm), before);
+}
+
+// ---------- CAD-69: board over Tailscale ----------
+
+const TS_DNS: &str = "node.tail1234.ts.net";
+
+/// A fake `tailscale` first on PATH: `status` answers from
+/// `status.json` (+ optional `status.rc`/`status.err`), `serve` keeps a
+/// `key→target` map in `serve.map` and reports it as
+/// `serve status --json`. Every argv lands in `calls.log`. The map is
+/// keyed `<dns>:<port>` like the real `Web` object.
+fn fake_ts() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let d = &dir.path().to_path_buf();
+    std::fs::write(d.join("dns"), TS_DNS).unwrap();
+    std::fs::write(d.join("calls.log"), "").unwrap();
+    std::fs::write(
+        d.join("status.json"),
+        format!(
+            r#"{{"BackendState":"Running","Self":{{"DNSName":"{TS_DNS}."}},"CertDomains":["{TS_DNS}"]}}"#
+        ),
+    )
+    .unwrap();
+    let script = r#"#!/usr/bin/env bash
+d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "$*" >> "$d/calls.log"
+case "${1:-}" in
+status)
+  [ -f "$d/status.err" ] && cat "$d/status.err" >&2
+  [ -f "$d/status.json" ] && cat "$d/status.json"
+  exit "$(cat "$d/status.rc" 2>/dev/null || echo 0)"
+  ;;
+serve)
+  case "${2:-}" in
+  status)
+    printf '{"Web":{'
+    first=1
+    if [ -f "$d/serve.map" ]; then
+      while IFS=$'\t' read -r key target; do
+        [ -n "$key" ] || continue
+        [ "$first" -eq 0 ] && printf ','
+        first=0
+        printf '"%s":{"Handlers":{"/":{"Proxy":"%s"}}}' "$key" "$target"
+      done < "$d/serve.map"
+    fi
+    printf '}}'
+    ;;
+  --bg)
+    port="${3#--https=}"
+    printf '%s:%s\t%s\n' "$(cat "$d/dns")" "$port" "$4" >> "$d/serve.map"
+    ;;
+  --https=*)
+    if [ "${3:-}" = "off" ]; then
+      key="$(cat "$d/dns"):${2#--https=}"
+      grep -v "^$key" "$d/serve.map" > "$d/.sm" 2>/dev/null || true
+      mv "$d/.sm" "$d/serve.map"
+    fi
+    ;;
+  esac
+  ;;
+esac
+exit 0
+"#;
+    let path = d.join("tailscale");
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (dir, d.to_path_buf())
+}
+
+/// PATH with the fake `tailscale` dir first, then the built binary,
+/// then ambient — `cli_env`'s env overrides its own PATH default.
+fn ts_env(fake: &Path) -> [(&'static str, String); 1] {
+    [(
+        "PATH",
+        format!(
+            "{}:{}:{}",
+            fake.display(),
+            Path::new(bin()).parent().unwrap().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    )]
+}
+
+fn calls(fake: &Path) -> String {
+    std::fs::read_to_string(fake.join("calls.log")).unwrap_or_default()
+}
+
+/// Stop a detached `cadence ui` for `state` — best effort, ignores
+/// output. Tests that spawn the detached server hold this so a
+/// panicking assert doesn't leak a setsid'd server.
+struct DetachedUi(PathBuf);
+
+impl Drop for DetachedUi {
+    fn drop(&mut self) {
+        let _ = Command::new(bin())
+            .arg("--state-dir")
+            .arg(&self.0)
+            .args(["ui", "stop"])
+            .env("CADENCE_PM_DIR", &self.0)
+            .output();
+    }
+}
+
+/// Write a `ui.json` carrying just the port — the "board not running"
+/// path of `ui tailscale start` picks its target from it.
+fn seed_ui_port(state: &Path, port: u16) {
+    std::fs::write(state.join("ui.json"), format!(r#"{{"port":{port}}}"#)).unwrap();
+}
+
+fn ui_opts(state: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(state.join("ui.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn ui_tailscale_start_shares_and_persists() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    let port = free_port();
+    seed_ui_port(state.path(), port);
+    let _ui = DetachedUi(state.path().to_path_buf());
+
+    let (ok, out) = cli_env(
+        pm.path(),
+        state.path(),
+        &["ui", "tailscale", "start", "--port", "9450"],
+        &env,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["state"], "sharing");
+    assert_eq!(out["tailnet_url"], format!("https://{TS_DNS}:9450"));
+    assert_eq!(out["board"], "started");
+    assert_eq!(out["mapping_created"], true);
+
+    // The mapping was created exactly once; funnel never invoked.
+    let c = calls(&fake);
+    assert_eq!(c.matches("serve --bg --https=9450").count(), 1, "{c}");
+    assert!(!c.contains("funnel"), "{c}");
+
+    // Options persisted: tailnet block + derived names resolvable.
+    let o = ui_opts(state.path());
+    assert_eq!(o["tailscale"]["dns_name"], TS_DNS);
+    assert_eq!(o["tailscale"]["https_port"], 9450);
+    assert_eq!(o["tailscale"]["target"], format!("http://127.0.0.1:{port}"));
+
+    // `ui status` reports the tailnet URL and the running board.
+    let (ok, out) = cli_env(pm.path(), state.path(), &["ui", "status"], &env);
+    assert!(ok, "{out}");
+    assert_eq!(out["state"], "running");
+    assert_eq!(out["tailnet_url"], format!("https://{TS_DNS}:9450"));
+
+    // `ui tailscale status` prints the URL, the live mapping, and the
+    // identity probe resolving to `<login> (tailscale)`.
+    let (ok, text) = cli_raw_env(
+        pm.path(),
+        state.path(),
+        &["ui", "tailscale", "status"],
+        &env,
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains(&format!("https://{TS_DNS}:9450")), "{text}");
+    assert!(text.contains("(live)"), "{text}");
+    assert!(text.contains("(tailscale)"), "{text}");
+
+    // Second start is idempotent: no new mapping, board restarted.
+    let (ok, out) = cli_env(
+        pm.path(),
+        state.path(),
+        &["ui", "tailscale", "start", "--port", "9450"],
+        &env,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["mapping_created"], false);
+    assert_eq!(out["board"], "restarted");
+    assert_eq!(
+        calls(&fake).matches("serve --bg").count(),
+        1,
+        "{}",
+        calls(&fake)
+    );
+}
+
+#[test]
+fn ui_tailscale_start_while_board_runs_restarts() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    let _ui = DetachedUi(state.path().to_path_buf());
+
+    // Plain `ui start --port` first — the board is already running
+    // local-only when the operator shares it.
+    let port = free_port();
+    let (ok, out) = cli_env(
+        pm.path(),
+        state.path(),
+        &["ui", "start", "--port", &port.to_string()],
+        &env,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["state"], "started");
+
+    let (ok, out) = cli_env(pm.path(), state.path(), &["ui", "tailscale", "start"], &env);
+    assert!(ok, "{out}");
+    assert_eq!(out["board"], "restarted");
+    // Default https port is 9450; the target uses the persisted port.
+    let o = ui_opts(state.path());
+    assert_eq!(o["tailscale"]["https_port"], 9450);
+    assert_eq!(o["tailscale"]["target"], format!("http://127.0.0.1:{port}"));
+}
+
+#[test]
+fn ui_tailscale_conflicting_mapping_refused() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    // A foreign mapping already owns :9450.
+    std::fs::write(
+        fake.join("serve.map"),
+        format!("{TS_DNS}:9450\thttp://127.0.0.1:9999\n"),
+    )
+    .unwrap();
+
+    let (ok, err) = cli_env(pm.path(), state.path(), &["ui", "tailscale", "start"], &env);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("refusing to overwrite"), "{msg}");
+    assert!(msg.contains("http://127.0.0.1:9999"), "{msg}");
+    // The foreign mapping is untouched; no ui.json was written.
+    assert_eq!(
+        std::fs::read_to_string(fake.join("serve.map")).unwrap(),
+        format!("{TS_DNS}:9450\thttp://127.0.0.1:9999\n")
+    );
+    assert!(!state.path().join("ui.json").exists());
+    // And no board got started.
+    let (_, out) = cli_env(pm.path(), state.path(), &["ui", "status"], &env);
+    assert_eq!(out["state"], "stopped");
+}
+
+#[test]
+fn ui_tailscale_logged_out_refused() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    std::fs::write(fake.join("status.rc"), "1").unwrap();
+    std::fs::write(fake.join("status.err"), "Logged out.\n").unwrap();
+    std::fs::remove_file(fake.join("status.json")).unwrap();
+
+    let (ok, err) = cli_env(pm.path(), state.path(), &["ui", "tailscale", "start"], &env);
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains("logged out"),
+        "{err}"
+    );
+    assert!(!state.path().join("ui.json").exists());
+}
+
+#[test]
+fn ui_tailscale_no_https_certs_refused() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    std::fs::write(
+        fake.join("status.json"),
+        format!(
+            r#"{{"BackendState":"Running","Self":{{"DNSName":"{TS_DNS}."}},"CertDomains":[]}}"#
+        ),
+    )
+    .unwrap();
+
+    let (ok, err) = cli_env(pm.path(), state.path(), &["ui", "tailscale", "start"], &env);
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("HTTPS certificates"),
+        "{err}"
+    );
+}
+
+#[test]
+fn ui_tailscale_not_running_refused() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    std::fs::write(
+        fake.join("status.json"),
+        r#"{"BackendState":"Stopped","Self":{"DNSName":"node.tail1234.ts.net."},"CertDomains":["node.tail1234.ts.net"]}"#,
+    )
+    .unwrap();
+
+    let (ok, err) = cli_env(pm.path(), state.path(), &["ui", "tailscale", "start"], &env);
+    assert!(!ok, "{err}");
+    assert!(err["error"].as_str().unwrap().contains("not up"), "{err}");
+}
+
+#[test]
+fn ui_start_tailscale_requires_loopback() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+
+    // The refusal must precede any tailscale subprocess call.
+    let (ok, err) = cli_env(
+        pm.path(),
+        state.path(),
+        &["ui", "start", "--host", "0.0.0.0", "--tailscale"],
+        &env,
+    );
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains("not loopback"),
+        "{err}"
+    );
+    assert!(
+        calls(&fake).is_empty(),
+        "tailscale never ran: {}",
+        calls(&fake)
+    );
+}
+
+#[test]
+fn ui_start_tailscale_flag_alias() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    let _ui = DetachedUi(state.path().to_path_buf());
+    let port = free_port();
+
+    let (ok, out) = cli_env(
+        pm.path(),
+        state.path(),
+        &[
+            "ui",
+            "start",
+            "--port",
+            &port.to_string(),
+            "--tailscale",
+            "--read-only",
+        ],
+        &env,
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["tailnet_url"], format!("https://{TS_DNS}:9450"));
+    let o = ui_opts(state.path());
+    assert_eq!(o["tailscale"]["https_port"], 9450);
+    assert_eq!(o["read_only"], true);
+}
+
+#[test]
+fn ui_tailscale_survives_stop_start_cycle() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    let _ui = DetachedUi(state.path().to_path_buf());
+    let port = free_port();
+    seed_ui_port(state.path(), port);
+
+    assert!(cli_env(pm.path(), state.path(), &["ui", "tailscale", "start"], &env).0);
+
+    // `ui stop` leaves the mapping; `ui start` re-ensures (no new
+    // --bg) and the board comes back shared.
+    assert!(cli_env(pm.path(), state.path(), &["ui", "stop"], &env).0);
+    let (ok, out) = cli_env(pm.path(), state.path(), &["ui", "start"], &env);
+    assert!(ok, "{out}");
+    assert_eq!(out["tailnet_url"], format!("https://{TS_DNS}:9450"));
+    assert_eq!(
+        calls(&fake).matches("serve --bg").count(),
+        1,
+        "{}",
+        calls(&fake)
+    );
+    let o = ui_opts(state.path());
+    assert_eq!(o["tailscale"]["https_port"], 9450);
+}
+
+#[test]
+fn ui_stop_tailscale_off_removes_only_cadences_mapping() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    let _ui = DetachedUi(state.path().to_path_buf());
+    let port = free_port();
+    seed_ui_port(state.path(), port);
+    assert!(cli_env(pm.path(), state.path(), &["ui", "tailscale", "start"], &env).0);
+    // A foreign mapping on another port must survive --tailscale-off.
+    std::fs::write(
+        fake.join("serve.map"),
+        format!(
+            "{TS_DNS}:9450\thttp://127.0.0.1:{port}\nother.host.ts.net:8443\thttp://127.0.0.1:9999\n"
+        ),
+    )
+    .unwrap();
+
+    let (ok, out) = cli_env(
+        pm.path(),
+        state.path(),
+        &["ui", "stop", "--tailscale-off"],
+        &env,
+    );
+    assert!(ok, "{out}");
+    let map = std::fs::read_to_string(fake.join("serve.map")).unwrap();
+    assert!(!map.contains(":9450"), "{map}");
+    assert!(map.contains("other.host.ts.net:8443"), "{map}");
+    assert_eq!(ui_opts(state.path())["tailscale"], Value::Null);
+    assert!(
+        calls(&fake).contains("serve --https=9450 off"),
+        "{}",
+        calls(&fake)
+    );
+}
+
+#[test]
+fn ui_tailscale_stop_foreign_mapping_left_alone() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    let _ui = DetachedUi(state.path().to_path_buf());
+    seed_ui_port(state.path(), free_port());
+    assert!(cli_env(pm.path(), state.path(), &["ui", "tailscale", "start"], &env).0);
+    // Someone else claimed :9450 after us — stop must not remove it.
+    std::fs::write(
+        fake.join("serve.map"),
+        format!("{TS_DNS}:9450\thttp://127.0.0.1:9999\n"),
+    )
+    .unwrap();
+
+    let (ok, out) = cli_env(pm.path(), state.path(), &["ui", "tailscale", "stop"], &env);
+    assert!(ok, "{out}");
+    assert_eq!(out["mapping_removed"], false);
+    let map = std::fs::read_to_string(fake.join("serve.map")).unwrap();
+    assert!(map.contains("http://127.0.0.1:9999"), "{map}");
+    assert!(!calls(&fake).contains("off"), "{}", calls(&fake));
+    assert_eq!(ui_opts(state.path())["tailscale"], Value::Null);
+}
+
+#[test]
+fn ui_tailscale_stop_when_not_sharing() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (_ts_dir, fake) = fake_ts();
+    let env = ts_env(&fake);
+    let (ok, out) = cli_env(pm.path(), state.path(), &["ui", "tailscale", "stop"], &env);
+    assert!(ok, "{out}");
+    assert_eq!(out["state"], "not_sharing");
+}
+
+// --- request-level: identity, origins, read-only ---
+
+/// The headers a proxied tailnet write carries — the tailnet Host,
+/// the https Origin, and Tailscale's identity headers.
+fn ts_write_headers(origin: &str, login: &str) -> Vec<String> {
+    vec![
+        "Content-Type: application/json".to_string(),
+        "X-Cadence-Board: 1".to_string(),
+        "Sec-Fetch-Site: same-origin".to_string(),
+        format!("Origin: {origin}"),
+        format!("Tailscale-User-Login: {login}"),
+        "Tailscale-User-Name: Some User".to_string(),
+    ]
+}
+
+fn tailnet_opts() -> impl Fn(&mut ui::ServeOpts) {
+    |o| {
+        o.tailnet = Some((TS_DNS.to_string(), 9450));
+        o.allow_hosts = vec![TS_DNS.to_string(), format!("{TS_DNS}:9450")];
+        o.allow_origins = vec![format!("https://{TS_DNS}:9450")];
+    }
+}
+
+#[test]
+fn tailnet_write_is_attributed() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(),
+    );
+    let ts_host = format!("{TS_DNS}:9450");
+    let origin = format!("https://{TS_DNS}:9450");
+
+    // A write shaped exactly like the proxy's: tailnet Host, https
+    // Origin, identity headers — attributed to the tailnet user.
+    let headers = ts_write_headers(&origin, "fable@example.com");
+    let href: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let (code, _, _) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-2",
+        &ts_host,
+        &href,
+        br#"{"status":"done"}"#,
+    );
+    assert_eq!(code, 200);
+    let sha = sha_of(pm.path(), "cadence/CAD-2", "status=done");
+    assert!(
+        trailers_of(pm.path(), &sha).contains("Actor: fable@example.com (tailscale)"),
+        "{}",
+        trailers_of(pm.path(), &sha)
+    );
+
+    // /api/meta reports the same identity + tailnet URL.
+    let (code, _, body) = http_write(
+        port,
+        "GET",
+        "/api/meta",
+        &ts_host,
+        &[
+            "Tailscale-User-Login: fable@example.com",
+            "Tailscale-User-Name: Some User",
+        ],
+        b"",
+    );
+    assert_eq!(code, 200);
+    let meta: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(meta["actor"], "fable@example.com (tailscale)");
+    assert_eq!(meta["tailnet_url"], origin);
+    assert_eq!(meta["read_only"], false);
+}
+
+#[test]
+fn forged_tailscale_headers_not_attributed() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(),
+    );
+    let host = format!("127.0.0.1:{port}");
+
+    // Same headers, but the Host is direct loopback — the identity
+    // headers must be ignored (the proxy only sets them on the
+    // tailnet name).
+    let headers = ts_write_headers(&format!("http://127.0.0.1:{port}"), "mallory@evil.example");
+    let href: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let (code, _, _) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-2",
+        &host,
+        &href,
+        br#"{"status":"done"}"#,
+    );
+    assert_eq!(code, 200);
+    let sha = sha_of(pm.path(), "cadence/CAD-2", "status=done");
+    let t = trailers_of(pm.path(), &sha);
+    assert!(t.contains("Actor: operator (ui)"), "{t}");
+    assert!(!t.contains("mallory"), "{t}");
+
+    // And meta agrees: the forged header never resolves.
+    let (code, _, body) = http_write(
+        port,
+        "GET",
+        "/api/meta",
+        &host,
+        &["Tailscale-User-Login: mallory@evil.example"],
+        b"",
+    );
+    assert_eq!(code, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["actor"],
+        "operator (ui)"
+    );
+}
+
+#[test]
+fn tailnet_write_wrong_origin_refused() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(),
+    );
+    // Tailnet Host but a foreign Origin — still refused.
+    let headers = ts_write_headers("https://evil.example", "fable@example.com");
+    let href: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let (code, _, body) = http_write(
+        port,
+        "PATCH",
+        "/api/issues/CAD-2",
+        &format!("{TS_DNS}:9450"),
+        &href,
+        br#"{"status":"done"}"#,
+    );
+    assert_eq!(code, 403);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["check"],
+        "origin"
+    );
+}
+
+#[test]
+fn read_only_board_refuses_every_write() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let port = start_ui_opts(pm.path().to_path_buf(), state.path().to_path_buf(), |o| {
+        o.read_only = true
+    });
+    let host = format!("127.0.0.1:{port}");
+    let before = commits(pm.path());
+
+    // Every write shape answers 403 with the read-only marker.
+    for (method, path, body) in [
+        (
+            "POST",
+            "/api/issues",
+            r#"{"project":"cadence","title":"x"}"#,
+        ),
+        ("PATCH", "/api/issues/CAD-2", r#"{"status":"done"}"#),
+        ("POST", "/api/issues/CAD-2/comments", r#"{"body":"hi"}"#),
+        (
+            "POST",
+            "/api/issues/CAD-2/links",
+            r#"{"kind":"relates","target":"CAD-1"}"#,
+        ),
+        (
+            "POST",
+            "/api/issues/CAD-2/refs",
+            r#"{"kind":"commit","value":"abc"}"#,
+        ),
+    ] {
+        let (code, _, body) = write_json(port, method, path, &host, body);
+        assert_eq!(code, 403, "{method} {path}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["check"], "read_only", "{method} {path}: {v}");
+        assert!(v["error"].as_str().unwrap().contains("read-only"), "{v}");
+    }
+    // Artifact upload (octet-stream) too.
+    let (code, _, body) = http_write(
+        port,
+        "POST",
+        "/api/issues/CAD-2/artifacts?name=note.txt",
+        &host,
+        &[
+            "Content-Type: application/octet-stream",
+            "X-Cadence-Board: 1",
+            "Sec-Fetch-Site: same-origin",
+        ],
+        b"data",
+    );
+    assert_eq!(code, 403);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["check"],
+        "read_only"
+    );
+
+    // Reads still work; meta reports the mode + local actor.
+    let (code, body) = http(port, "GET", "/api/issues", &host);
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http(port, "GET", "/api/meta", &host);
+    assert_eq!(code, 200);
+    let meta: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(meta["read_only"], true);
+    assert_eq!(meta["actor"], "operator (ui)");
+    assert_eq!(meta["tailnet_url"], Value::Null);
+    assert_eq!(commits(pm.path()), before, "no write landed");
+}
+
+/// A dumb TCP relay — what tailscaled is, once TLS is stripped: bytes
+/// in, bytes out, no buffering policy. Proves the SSE stream survives
+/// a proxy hop (frames flush per write, `: ping` keeps it alive).
+fn tcp_relay(listen: u16, target: u16) {
+    // Bound in the caller so the port is live before the test dials it.
+    let listener = TcpListener::bind(("127.0.0.1", listen)).unwrap();
+    thread::spawn(move || {
+        for c in listener.incoming().flatten() {
+            let Ok(u) = TcpStream::connect(("127.0.0.1", target)) else {
+                continue;
+            };
+            let (mut c2, mut u2) = (c.try_clone().unwrap(), u.try_clone().unwrap());
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut c2, &mut u.try_clone().unwrap());
+            });
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut u2, &mut c.try_clone().unwrap());
+            });
+        }
+    });
+}
+
+#[test]
+fn sse_stream_survives_a_tcp_proxy() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let relay_port = free_port();
+    tcp_relay(relay_port, port);
+
+    // Connect to the stream THROUGH the relay, not directly.
+    let mut s = TcpStream::connect(("127.0.0.1", relay_port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+    write!(
+        s,
+        "GET /api/stream HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    )
+    .unwrap();
+
+    // The head + the first `: ping` arrive through the proxy.
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !String::from_utf8_lossy(&got).contains(": ping") {
+        assert!(
+            Instant::now() < deadline,
+            "no : ping through proxy: {got:?}"
+        );
+        let mut buf = [0u8; 4096];
+        match s.read(&mut buf) {
+            Ok(0) => panic!("proxy closed stream: {got:?}"),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => panic!("read: {e} — got {got:?}"),
+        }
+    }
+    assert!(String::from_utf8_lossy(&got).contains("text/event-stream"));
+
+    // A write → `event: issues` arrives through the same proxy hop.
+    let host = format!("127.0.0.1:{port}");
+    let (code, _, _) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/CAD-2",
+        &host,
+        r#"{"status":"review"}"#,
+    );
+    assert_eq!(code, 200);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !String::from_utf8_lossy(&got).contains("event: issues") {
+        assert!(
+            Instant::now() < deadline,
+            "no issues event through proxy: {got:?}"
+        );
+        let mut buf = [0u8; 4096];
+        match s.read(&mut buf) {
+            Ok(0) => panic!("proxy closed stream: {got:?}"),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => panic!("read: {e} — got {got:?}"),
+        }
+    }
 }

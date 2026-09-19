@@ -1412,15 +1412,31 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
         std::thread::sleep(Duration::from_millis(500));
     };
     if let Some(ui_pid) = ui_was_running {
-        cadence_agent::ui::run_cli(state_dir, &cadence_agent::ui::UiAction::Stop)?;
-        let (host, port, dist, allow_hosts) = ui_run_args(ui_pid);
+        cadence_agent::ui::run_cli(
+            state_dir,
+            &cadence_agent::ui::UiAction::Stop {
+                tailscale_off: false,
+            },
+        )?;
+        // ui.json is the source of truth now; the /proc argv is only
+        // the fallback for a server started before options persisted.
+        let flags = if cadence_agent::ui::opts_present(state_dir) {
+            cadence_agent::ui::UiFlags::default()
+        } else {
+            let (host, port, dist, allow_hosts) = ui_run_args(ui_pid);
+            cadence_agent::ui::UiFlags {
+                host: Some(host),
+                port: Some(port),
+                dist,
+                allow_hosts,
+                ..Default::default()
+            }
+        };
         cadence_agent::ui::run_cli(
             state_dir,
             &cadence_agent::ui::UiAction::Start {
-                host,
-                port,
-                dist,
-                allow_hosts,
+                flags,
+                reset: false,
             },
         )?;
         println!("ui: restarted");

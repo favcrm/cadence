@@ -324,20 +324,92 @@ list in the output and a `Forced: true` trailer on the commit.
 ```bash
 cadence ui run                  # foreground, 127.0.0.1:3010
 cadence ui start [--port 3010]  # detached; pid + ui.log under state dir
-cadence ui status               # pid + /api/health probe
-cadence ui stop
+cadence ui status               # pid, /api/health probe, effective options
+cadence ui stop [--tailscale-off]
+
+cadence ui tailscale start [--port 9450] [--read-only]
+cadence ui tailscale stop
+cadence ui tailscale status     # sharing state, tailnet URL, identity probe, QR
 ```
 
 `run`/`start` take `--dist <dir>` to serve an unpacked SPA. Built with
 `--features ui`, the binary embeds `ui/dist` (index.html,
 assets/index.js, assets/index.css, and the latin woff2 files — Vite
-emits fixed names) so `--dist` is unnecessary.
+emits fixed names) so `--dist` is unnecessary. `start` merges flags
+over the persisted `ui.json` in the state dir and saves the result —
+a later plain `ui start` reuses it, `--reset` forgets it, and
+`ui status` prints the effective options. Extra flags:
+`--allow-host <name>` / `--allow-origin <origin>` (repeatable — extend
+the Host/Origin allowlists), `--read-only` (every write answers `403`,
+the SPA hides its edit controls; `--no-read-only` clears a persisted
+one).
+
+## Remote access — `ui tailscale`
+
+`cadence ui tailscale start` publishes the board on the tailnet through
+`tailscale serve` — the loopback bind never changes, Tailscale's proxy
+terminates TLS and forwards to `127.0.0.1:<ui port>`:
+
+```
+phone/laptop ── https:<dns>:9450 (tailnet) ──▶ tailscaled
+                                                 │ http://127.0.0.1:3010
+                                                 ▼
+                                            cadence ui
+```
+
+`start` checks `tailscale status --json` first and refuses plainly when
+tailscale is missing, logged out, not `Running`, or the tailnet has no
+HTTPS certs enabled (admin console → DNS → HTTPS Certificates). It then
+ensures the `https:<port> → http://127.0.0.1:<ui port>` mapping
+idempotently — an identical existing mapping is reused, a *different*
+one on the same port is a hard refusal, never overwritten. The tailnet
+DNS name (with and without the port) joins the Host allowlist and
+`https://<dns>[:port]` the Origin allowlist. `tailscale start` works
+whether the board is running or not: it persists the options and
+restarts the detached server (brief outage, announced) so the new
+allowlists take effect. `ui start --tailscale[=<port>]` is the same
+flow for scripts.
+
+`ui tailscale stop` removes only the mapping cadence recorded — checked
+against the live serve config, so a foreign mapping on the port is left
+alone and named — drops the tailnet options from `ui.json`, and
+restarts the board local-only if it was running. Plain `ui stop`
+leaves the mapping in place; `ui stop --tailscale-off` is the same
+removal without the restart semantics. `funnel` is never invoked —
+tailnet-only, no public exposure.
+
+Writers are attributed per request: when tailscale sharing is armed
+**and** the TCP peer is loopback **and** the request's `Host` is the
+tailnet name, `Tailscale-User-Login` resolves the actor to
+`<login> (tailscale)` — the tracker commit's `Actor:` trailer names the
+person who wrote. The same headers on a direct loopback request
+(non-tailnet `Host`) are ignored; the default actor stays
+`operator (ui)`. `GET /api/meta` reports `{read_only, actor,
+tailnet_url}` so the SPA renders the right controls.
+
+Threat model, unchanged in four lines:
+
+1. **Tailnet-only** — `tailscale serve`, never `funnel`; nothing is
+   exposed outside your tailnet.
+2. **Loopback bind** — the board still binds `127.0.0.1`; only
+   tailscaled (same host) can reach it.
+3. **Host + Origin allowlists** — the tailnet name is the only new
+   allowed Host; `https://<dns>:<port>` the only new write Origin.
+   Everything else is `421`/`403` exactly as before.
+4. **Header trust rule** — `Tailscale-User-*` identity headers count
+   only on the tailnet `Host` from a loopback peer; forged headers on
+   direct loopback are ignored.
+
+`--read-only` on `tailscale start` is the browse-only share: every
+write route answers `403` with `check: "read_only"` and the SPA hides
+quick-add, drag, edit, link/ref, attach and comment controls.
 
 ### API — reads
 
 | Route | Returns |
 |---|---|
 | `GET /api/health` | `ok`, `pm_dir`, `pm_present`, counts, `daemon`, `embedded` |
+| `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_url` |
 | `GET /api/projects` | folders, prefixes, components, repos, issue counts |
 | `GET /api/issues?project=` | card views: derived status, readiness, counts, `rev` |
 | `GET /api/issues/:id` | the drawer payload: frontmatter, body, links both ways, refs, files, comments, notes chain, merged activity |
@@ -399,6 +471,9 @@ or any writer runs, and each refusal names its check in `403` JSON:
 4. **Origin / fetch metadata.** If `Origin` is present it must be one
    of the allowlisted board origins (the `Host` allowlist over http);
    if `Sec-Fetch-Site` is present it must be `same-origin`.
+
+A `--read-only` board short-circuits even earlier: every write route
+answers `403` (`check: "read_only"`) before the content-type check.
 
 Then the I1 containment still holds:
 

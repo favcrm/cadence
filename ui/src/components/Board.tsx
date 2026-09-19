@@ -33,6 +33,8 @@ interface Props {
   health: Health | null;
   project: string;
   query: string;
+  readOnly: boolean;
+  actor: string;
   onQuery: (q: string) => void;
   onOpen: (id: string) => void;
   onMove: (issue: IssueCard, status: string) => void;
@@ -150,6 +152,8 @@ export default function Board({
   health,
   project,
   query,
+  readOnly,
+  actor,
   onQuery,
   onOpen,
   onMove,
@@ -361,17 +365,18 @@ export default function Board({
         </div>
       </section>
 
-      <div className="grid grid-flow-col auto-cols-[minmax(232px,1fr)] lg:auto-cols-[minmax(0,1fr)] gap-3 overflow-x-auto lg:overflow-visible pb-2">
+      <div className="grid grid-flow-col auto-cols-[minmax(232px,78vw)] lg:auto-cols-[minmax(0,1fr)] gap-3 overflow-x-auto lg:overflow-visible pb-2 snap-x snap-mandatory lg:snap-none">
         {COLS.map(([key, name, wip], ci) => {
           const cards = visible.filter((t) => t.status === key);
           return (
             <section
               key={key}
-              className={`rounded-lg border bg-ink-875 min-h-[26rem] flex flex-col reveal transition-colors ${
+              className={`snap-start rounded-lg border bg-ink-875 min-h-[26rem] flex flex-col reveal transition-colors ${
                 over === key ? "border-accent/60" : "border-ink-700"
               }`}
               style={{ animationDelay: `${120 + ci * 45}ms` }}
               onDragOver={(e) => {
+                if (readOnly) return;
                 e.preventDefault();
                 e.dataTransfer.dropEffect = "move";
                 setOver(key);
@@ -384,6 +389,7 @@ export default function Board({
               onDrop={(e) => {
                 e.preventDefault();
                 setOver(null);
+                if (readOnly) return;
                 const id = e.dataTransfer.getData("text/plain");
                 const issue = issues.find((t) => t.id === id);
                 if (!issue || issue.status === key) return;
@@ -406,7 +412,7 @@ export default function Board({
                 </span>
               </header>
               <div className="p-2.5 space-y-2.5 flex-1">
-                {key === "backlog" && (
+                {key === "backlog" && !readOnly && (
                   <QuickAdd
                     projects={projects}
                     project={project}
@@ -425,6 +431,7 @@ export default function Board({
                         t.parent ? titleOf.get(t.parent) : undefined
                       }
                       busyBy={busy.get(t.id) ?? []}
+                      canDrag={!readOnly}
                       onOpen={onOpen}
                     />
                   ))
@@ -437,8 +444,10 @@ export default function Board({
 
       <footer className="mt-8 pt-4 border-t border-ink-700 text-label text-ink-500 num">
         source: {health?.pm_dir ?? "~/pm"} issue folders ·{" "}
-        /var/www/agent-notes chains · cadence daemon socket · writes commit
-        as operator (ui).
+        /var/www/agent-notes chains · cadence daemon socket ·{" "}
+        {readOnly
+          ? "read-only — writes are disabled."
+          : `writes commit as ${actor}.`}
       </footer>
     </main>
   );
