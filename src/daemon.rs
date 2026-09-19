@@ -1776,6 +1776,10 @@ impl Shared {
                 Error::rejected("Outside a cadence pane, --reviewer <alias|operator> is required")
             })?,
         };
+        let verify = params
+            .get("verify")
+            .filter(|v| !v.is_null())
+            .map(|v| v.to_string());
         let (task, v) = self.store.record_verdict(
             task_id,
             sha,
@@ -1785,6 +1789,7 @@ impl Shared {
             optional_str(params, "evidence"),
             optional_str(params, "message"),
             optional_i64(params, "revision"),
+            verify.as_deref(),
         )?;
         let job = self.store.job(&task.job_id)?;
         self.notify_agent(&job.pm_alias);
