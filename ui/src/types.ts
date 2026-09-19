@@ -163,6 +163,10 @@ export interface Agent {
   dead?: boolean;
   inbox?: boolean;
   last_activity?: string | null;
+  /** Seconds since the running turn's last observed activity. */
+  silent_secs?: number;
+  /** The daemon declared this running turn stalled. */
+  stalled?: boolean;
   event_cursor?: number;
 }
 
@@ -200,6 +204,8 @@ export interface AgentDetail {
     params?: Record<string, unknown>;
     generation?: number;
     dead?: boolean;
+    silent_secs?: number;
+    stalled?: boolean;
     capabilities?: Record<string, unknown> | null;
     tasks?: string[];
   };

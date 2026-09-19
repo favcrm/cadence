@@ -405,6 +405,13 @@ impl ProviderAdapter for ClaudeAdapter {
         *self.shared.last_activity.lock().unwrap() = Instant::now();
     }
 
+    /// The transcript clock — every parsed provider notification bumps
+    /// it in `Shared::dispatch`, so the daemon's stall watch reads the
+    /// same liveness signal the turn's own idle check uses.
+    fn activity_at(&self) -> Option<Instant> {
+        Some(*self.shared.last_activity.lock().unwrap())
+    }
+
     /// Open: fresh agents mint a `--session-id`; a stored `thread_id`
     /// reopens with `--resume`. The id is verified for real at the
     /// first `system/init` — Claude emits it lazily with the first

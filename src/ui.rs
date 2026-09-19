@@ -465,6 +465,8 @@ fn agents_payload(state_dir: &Path) -> Value {
             "resume_hint": "after stop",
             "dead": agent["dead"],
             "last_activity": last_activity,
+            "silent_secs": agent["silent_secs"],
+            "stalled": agent["stalled"],
             "event_cursor": cursor,
         }));
     }

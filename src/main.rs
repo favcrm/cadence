@@ -503,6 +503,10 @@ enum JobAction {
         /// the task to blocked.
         #[arg(long, default_value_t = 2)]
         max_revisions: i64,
+        /// Silence budget for turns this job's kickoffs start — over it
+        /// the PM gets a `turn_stalled` notice (0 disables).
+        #[arg(long)]
+        stall_secs: Option<u64>,
         /// Title for the default `<job>-t1` task.
         #[arg(long)]
         task_title: Option<String>,
@@ -2289,6 +2293,7 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
             repo,
             base_ref,
             max_revisions,
+            stall_secs,
             task_title,
             task_worktree,
             task_branch,
@@ -2312,6 +2317,7 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                        "job": job, "title": title, "issue": issue,
                        "repo": repo, "base_ref": base_ref,
                        "max_revisions": max_revisions,
+                       "stall_secs": stall_secs,
                        "task_title": task_title,
                        "task_worktree": task_worktree,
                        "task_branch": task_branch,
@@ -4047,6 +4053,8 @@ mod tests {
             "CAD-26",
             "--max-revisions",
             "3",
+            "--stall-secs",
+            "45",
         ])
         .unwrap();
         assert!(matches!(
@@ -4054,6 +4062,7 @@ mod tests {
             Commands::Job {
                 action: JobAction::New {
                     max_revisions: 3,
+                    stall_secs: Some(45),
                     ..
                 }
             }
