@@ -12362,7 +12362,10 @@ fn review_fixture(base: &Path) -> ReviewFixture {
     put("shared.txt", "a");
     put("shared2.txt", "a");
     put("other.txt", "a");
-    put("tests/test_old.rs", "#[test]\nfn old_test() {}\n");
+    put(
+        "tests/test_old.rs",
+        "#[test]\nfn old_test() {}\n#[test]\nfn new_flaky() {}\n",
+    );
     put(
         "cadence-review.toml",
         r#"prepare = ["echo prepared >> \"$GATE_LOG\""]
@@ -12382,12 +12385,16 @@ stress_pattern = ["wait_"]
         "gate_fail.sh",
         "echo gate3-output-line1\n\
          echo \"test new_flaky ... FAILED\"\n\
+         echo \"test ghost_test ... FAILED\"\n\
+         echo \"test bad;touch_pwn ... FAILED\"\n\
          echo \"\"\n\
          echo \"failures:\"\n\
          echo \"\"\n\
          echo \"    new_flaky\"\n\
+         echo \"    ghost_test\"\n\
+         echo \"    bad;touch_pwn\"\n\
          echo \"\"\n\
-         echo \"test result: FAILED. 0 passed; 1 failed\"\n\
+         echo \"test result: FAILED. 0 passed; 3 failed\"\n\
          exit 1\n",
     );
     put(
@@ -12555,8 +12562,10 @@ fn review_verb_end_to_end() {
     let base = TempDir::new().unwrap();
     let f = review_fixture(base.path());
     let out = review_cmd(&f).arg("7").output().unwrap();
-    assert!(
-        out.status.success(),
+    // blocked → exit 2
+    assert_eq!(
+        out.status.code(),
+        Some(2),
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
@@ -12610,14 +12619,43 @@ fn review_verb_end_to_end() {
     assert_eq!(r["full_suite"]["outcome"], json!("ok"));
     assert!(r["suite_lock"]["path"].is_string(), "{:?}", r["suite_lock"]);
 
-    // Equal-conditions compare: new_flaky fails the gated tree, passes
-    // on the base head → regression.
+    // Equal-conditions compare, sorted by name:
+    // - `bad;touch_pwn` fails name validation — never executed,
+    //   unknown on both sides → inconclusive.
+    // - `ghost_test` cannot be located — never executed → inconclusive.
+    // - `new_flaky` fails the gated tree, passes on the base →
+    //   regression.
     let fails = r["failures"].as_array().unwrap();
-    assert_eq!(fails.len(), 1, "{fails:?}");
-    assert_eq!(fails[0]["test"], json!("new_flaky"));
-    assert_eq!(fails[0]["isolated_gated"]["outcome"], json!("fail"));
-    assert_eq!(fails[0]["isolated_base"]["outcome"], json!("pass"));
-    assert_eq!(fails[0]["verdict"], json!("regression"));
+    assert_eq!(fails.len(), 3, "{fails:?}");
+    assert_eq!(fails[0]["test"], json!("bad;touch_pwn"));
+    assert_eq!(fails[0]["verdict"], json!("inconclusive"));
+    assert_eq!(
+        fails[0]["isolated_gated"]["outcome"],
+        json!("unknown"),
+        "{fails:?}"
+    );
+    assert!(
+        fails[0].get("cmd").is_none(),
+        "invalid name must never reach a command: {fails:?}"
+    );
+    assert_eq!(fails[1]["test"], json!("ghost_test"));
+    assert_eq!(fails[1]["verdict"], json!("inconclusive"));
+    assert_eq!(fails[1]["isolated_base"]["outcome"], json!("unknown"));
+    assert!(
+        fails[1]["isolated_base"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not found"),
+        "{fails:?}"
+    );
+    assert_eq!(fails[2]["test"], json!("new_flaky"));
+    assert_eq!(fails[2]["isolated_gated"]["outcome"], json!("fail"));
+    assert_eq!(fails[2]["isolated_base"]["outcome"], json!("pass"));
+    assert_eq!(fails[2]["verdict"], json!("regression"));
+    // Base prepare ran and was recorded.
+    let bp = r["base_prepare"].as_array().unwrap();
+    assert_eq!(bp.len(), 1, "{bp:?}");
+    assert_eq!(bp[0]["outcome"], json!("ok"));
 
     // Pairwise open-PR conflicts: PR 8 conflicts on shared.txt; PR 9
     // and PR 10 merge clean.
@@ -12642,8 +12680,10 @@ fn review_verb_merge_conflict_blocks() {
     let base = TempDir::new().unwrap();
     let f = review_fixture(base.path());
     let out = review_cmd(&f).arg("10").output().unwrap();
-    assert!(
-        out.status.success(),
+    // blocked → exit 2
+    assert_eq!(
+        out.status.code(),
+        Some(2),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -12723,10 +12763,112 @@ fn review_verb_suite_lock_serializes() {
     assert!(!f.suite_ran.exists(), "suite ran while its lock was held");
     drop(held);
     let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
+    assert_eq!(
+        out.status.code(),
+        Some(2),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(f.suite_ran.exists());
+}
+
+#[test]
+fn review_verb_refuses_to_adopt_an_existing_dir() {
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    let dir = f.repo.join(".cadence/wt/review-7");
+
+    // A plain directory with an uncommitted file at the path — the
+    // run refuses and leaves it byte-for-byte untouched.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("precious.txt"), "keep me").unwrap();
+    let out = review_cmd(&f).arg("7").output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected refusal, got {:?}",
+        out.status
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("already exists"), "{err}");
+    assert!(err.contains("review-7"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("precious.txt")).unwrap(),
+        "keep me"
+    );
+
+    // A foreign worktree at the same path — same refusal, still
+    // registered and untouched afterwards.
+    std::fs::remove_dir_all(&dir).unwrap();
+    review_git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &dir.to_string_lossy(),
+            &f.head7,
+        ],
+    );
+    std::fs::write(dir.join("precious.txt"), "keep me").unwrap();
+    let out = review_cmd(&f).arg("7").output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected refusal, got {:?}",
+        out.status
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("already exists"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("precious.txt")).unwrap(),
+        "keep me"
+    );
+    assert!(dir.join("marker.txt").exists(), "foreign checkout intact");
+    let wts = review_git_sha(&f.repo, &["worktree", "list"]);
+    assert!(wts.contains("review-7"), "{wts}");
+    review_git(
+        &f.repo,
+        &["worktree", "remove", "--force", &dir.to_string_lossy()],
+    );
+}
+
+#[test]
+fn review_verb_base_prepare_failure_marks_inconclusive() {
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    // Prepare succeeds on the gated tree, fails on the base tree.
+    std::fs::write(
+        f.repo.join("cadence-review.toml"),
+        r#"prepare = ["if [ \"$CADENCE_REVIEW_TREE\" = \"base\" ]; then echo base-prep-broke; exit 1; else echo prepared >> \"$GATE_LOG\"; fi"]
+gates = ["echo gate1 >> \"$GATE_LOG\"", "sh gate_fail.sh"]
+full_suite = "sh suite.sh"
+test_globs = ["tests/**"]
+test_command = "sh one_test.sh {test}"
+stress_pattern = ["wait_"]
+"#,
+    )
+    .unwrap();
+    let out = review_cmd(&f).arg("7").output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = review_report(&f, 7);
+    // The failed prepare is recorded as its own step.
+    let bp = r["base_prepare"].as_array().unwrap();
+    assert_eq!(bp.len(), 1, "{bp:?}");
+    assert_eq!(bp[0]["outcome"], json!("fail"));
+    // Every comparison's base side is unknown — nothing laundered into
+    // a fake "pre-existing".
+    let fails = r["failures"].as_array().unwrap();
+    assert_eq!(fails.len(), 3, "{fails:?}");
+    for c in fails {
+        assert_eq!(c["isolated_base"]["outcome"], json!("unknown"), "{c:?}");
+        assert_eq!(c["verdict"], json!("inconclusive"), "{c:?}");
+    }
+    // new_flaky still ran on the gated tree and failed there.
+    let nf = fails.iter().find(|c| c["test"] == "new_flaky").unwrap();
+    assert_eq!(nf["isolated_gated"]["outcome"], json!("fail"));
+    assert_eq!(r["suggested_verdict"], json!("blocked"));
 }

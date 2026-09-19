@@ -216,19 +216,22 @@ impl Flock {
         })
     }
 
-    /// Exclusive, blocking — used for the host-wide suite slot.
-    fn lock(path: &Path) -> Result<Flock> {
-        use std::os::unix::io::AsRawFd;
-        let file = Self::open(path)?;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(Error::internal(format!(
-                "flock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            )));
+    /// Exclusive with a deadline — the host-wide suite slot must not
+    /// wait forever behind a wedged holder.
+    fn lock_deadline(path: &Path, secs: u64) -> Result<Flock> {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(l) = Self::try_lock(path)? {
+                return Ok(l);
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::rejected(format!(
+                    "timed out after {secs}s waiting for the suite lock {}",
+                    path.display()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
-        Ok(Flock { _file: file })
     }
 }
 
@@ -434,17 +437,23 @@ pub struct NewTest {
 /// Parse a unified diff (`git diff --unified=0 <merge-base> <head>`)
 /// for `fn` items added under files matching `globs`, then keep those
 /// whose name or added body contains any `patterns` substring (an
-/// empty pattern list keeps every new test).
+/// empty pattern list keeps every new test). A `fn` only counts as a
+/// test when an added `#[test]`/`#[tokio::test]` attribute precedes it —
+/// helpers like `fn review_fixture` are not tests and stressing them
+/// would run zero tests.
 pub fn parse_new_tests(diff: &str, globs: &[String], patterns: &[String]) -> Vec<NewTest> {
     let mut file = String::new();
     let mut file_ok = false;
     let mut tests: Vec<NewTest> = Vec::new();
     let mut cur: Option<usize> = None;
+    // Contiguous added `#[...]` lines immediately before the next `fn`.
+    let mut attrs: Vec<String> = Vec::new();
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("+++ b/") {
             file = rest.trim().to_string();
             file_ok = globs.iter().any(|g| glob_match(g, &file));
             cur = None;
+            attrs.clear();
             continue;
         }
         if line.starts_with("+++")
@@ -452,7 +461,12 @@ pub fn parse_new_tests(diff: &str, globs: &[String], patterns: &[String]) -> Vec
             || line.starts_with("index ")
             || line.starts_with("Binary")
         {
+            // `+++ /dev/null` (deleted file) and every other header
+            // clears the file match too.
+            file.clear();
+            file_ok = false;
             cur = None;
+            attrs.clear();
             continue;
         }
         if !file_ok {
@@ -460,19 +474,33 @@ pub fn parse_new_tests(diff: &str, globs: &[String], patterns: &[String]) -> Vec
         }
         if let Some(added) = line.strip_prefix('+') {
             if let Some(name) = added_fn_name(added) {
-                tests.push(NewTest {
-                    name,
-                    file: file.clone(),
-                    body: String::new(),
-                });
-                cur = Some(tests.len() - 1);
-            } else if let Some(i) = cur {
-                tests[i].body.push_str(added);
-                tests[i].body.push('\n');
+                if attrs.iter().any(|a| is_test_attr(a)) {
+                    tests.push(NewTest {
+                        name,
+                        file: file.clone(),
+                        body: String::new(),
+                    });
+                    cur = Some(tests.len() - 1);
+                } else {
+                    cur = None;
+                }
+                attrs.clear();
+            } else {
+                if let Some(i) = cur {
+                    tests[i].body.push_str(added);
+                    tests[i].body.push('\n');
+                }
+                let t = added.trim();
+                if t.starts_with("#[") {
+                    attrs.push(t.to_string());
+                } else if !t.is_empty() {
+                    attrs.clear();
+                }
             }
         } else {
             // Context/removal/hunk boundary: the fn's added block ends.
             cur = None;
+            attrs.clear();
         }
     }
     tests.retain(|t| {
@@ -482,6 +510,12 @@ pub fn parse_new_tests(diff: &str, globs: &[String], patterns: &[String]) -> Vec
             })
     });
     tests
+}
+
+/// `#[test]` or `#[tokio::test]` (with or without arguments).
+fn is_test_attr(line: &str) -> bool {
+    let t = line.trim();
+    t == "#[test]" || t.starts_with("#[tokio::test")
 }
 
 /// `fn name(` out of an added diff line — accepts `fn`, `pub fn`,
@@ -594,15 +628,78 @@ fn set_version_bump(s: &str) -> bool {
 
 /// The isolated-test command for one test: `{test}` `{file}` `{target}`
 /// substitution (`{target}` is the file stem — cargo's `--test <stem>`).
+/// Every value is single-quoted: the names come from diff and test
+/// output the PR controls, so the template must not pre-quote.
 pub fn test_command(template: &str, test: &NewTest) -> String {
     let stem = Path::new(&test.file)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     template
-        .replace("{test}", &test.name)
-        .replace("{file}", &test.file)
-        .replace("{target}", &stem)
+        .replace("{test}", &sh_quote(&test.name))
+        .replace("{file}", &sh_quote(&test.file))
+        .replace("{target}", &sh_quote(&stem))
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// `^[A-Za-z0-9_:]+$` — cargo test names, nothing else. A name that
+/// fails validation is reported `unknown` and never executed.
+fn valid_test_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+/// A repo-relative path with no traversal and no shell metacharacters.
+fn safe_rel_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.split('/').any(|c| c == "..")
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'))
+}
+
+/// `(passed, failed)` totals from `test result:` summary lines, or
+/// `None` when the output isn't a cargo-style run at all.
+fn test_totals(output: &str) -> Option<(u64, u64)> {
+    let mut found = false;
+    let (mut passed, mut failed) = (0u64, 0u64);
+    for line in output.lines() {
+        let Some(rest) = line.trim().strip_prefix("test result:") else {
+            continue;
+        };
+        found = true;
+        if let Some(n) = count_before(rest, "passed") {
+            passed += n;
+        }
+        if let Some(n) = count_before(rest, "failed") {
+            failed += n;
+        }
+    }
+    found.then_some((passed, failed))
+}
+
+fn count_before(s: &str, unit: &str) -> Option<u64> {
+    let idx = s.find(unit)?;
+    s[..idx].trim_end().rsplit(' ').next()?.parse().ok()
+}
+
+/// pass | fail | unknown — `unknown` means "could not run": timeout,
+/// missing file, prepare failure, or a filter that matched zero tests.
+/// A non-zero exit IS a test failure; the command ran.
+fn classify_isolated(step: &Step) -> &'static str {
+    match step.outcome {
+        "ok" => match test_totals(&step.output) {
+            Some((0, 0)) => "unknown",
+            _ => "pass",
+        },
+        "fail" => "fail",
+        _ => "unknown",
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -637,82 +734,98 @@ fn find_test_file(dir: &Path, name: &str, globs: &[String], git_secs: u64) -> Op
         .map(str::to_string)
 }
 
-/// A file to point `{target}` at when a failing name did not come from
-/// the diff's own new tests.
-fn first_test_file(globs: &[String]) -> String {
-    globs
-        .first()
-        .map(|g| g.replace(['*', '?'], ""))
-        .unwrap_or_else(|| "tests/".to_string())
+/// An `{unknown}` isolated result for the report — the test was never
+/// executed for `reason`.
+fn unknown_side(reason: &str) -> Value {
+    json!({"outcome": "unknown", "reason": reason})
 }
 
 // ---------------------------------------------------------------------------
 // Review worktree
 // ---------------------------------------------------------------------------
 
-/// A detached git checkout under `<root>/.cadence/wt/` that the review
-/// owns — removed on drop unless `keep`.
+/// Written into every worktree the review creates, checked before any
+/// destructive call — the tool only ever mutates or removes a tree it
+/// created in THIS run, so a crash-recovery path cannot destroy a
+/// reviewer's own checkout that happens to sit at the same path.
+const REVIEW_MARKER: &str = ".cadence-review-tree";
+
+/// A detached git checkout under `<root>/.cadence/wt/` that this run
+/// created — removed on drop unless `keep`.
 struct ReviewTree {
     root: PathBuf,
     dir: PathBuf,
     keep: bool,
+    git_secs: u64,
 }
 
 impl ReviewTree {
-    /// `git worktree add --detach <dir> <sha>`; an existing directory is
-    /// re-pointed at `sha` (leftover from `--keep`), else recreated.
+    /// `git worktree add --detach <dir> <sha>`; refuses when the path
+    /// already exists (a `--keep` leftover counts — the operator
+    /// clears it), then writes the ownership marker.
     fn checkout(root: &Path, name: &str, sha: &str, keep: bool, git_secs: u64) -> Result<Self> {
         let dir = root.join(".cadence").join("wt").join(name);
-        worktree::ensure_cadence_ignored(root)?;
-        if dir.is_dir() {
-            let reused = git(&dir, &["merge", "--abort"], git_secs)
-                .or_else(|_| Ok(String::new()))
-                .and_then(|_| git(&dir, &["checkout", "--detach", sha], git_secs))
-                .and_then(|_| git(&dir, &["reset", "--hard", sha], git_secs))
-                .and_then(|_| git(&dir, &["clean", "-fdx"], git_secs))
-                .is_ok();
-            if reused {
-                return Ok(Self {
-                    root: root.to_path_buf(),
-                    dir,
-                    keep,
-                });
-            }
-            // Stale or foreign directory: deregister any worktree
-            // record, then drop the files so `add` starts clean.
-            let _ = git_status(
-                root,
-                &["worktree", "remove", "--force", &dir.to_string_lossy()],
-                git_secs,
-            );
-            if dir.exists() {
-                std::fs::remove_dir_all(&dir)?;
-            }
+        if dir.exists() {
+            return Err(Error::rejected(format!(
+                "review checkout {} already exists — refusing to touch a \
+                 tree the review did not create; inspect it, then clear \
+                 it with `git worktree remove --force {}` or delete the \
+                 directory",
+                dir.display(),
+                dir.display()
+            )));
         }
         git(
             root,
             &["worktree", "add", "--detach", &dir.to_string_lossy(), sha],
             git_secs,
         )?;
+        if let Err(e) = std::fs::write(
+            dir.join(REVIEW_MARKER),
+            format!(
+                "created by `cadence review` at {} — this file marks the \
+                 tree as tool-owned\n",
+                time::iso(time::now_epoch())
+            ),
+        ) {
+            // No marker ⇒ not ours: deregister rather than leave a
+            // tree the drop guard would refuse to touch.
+            let mut rm = Command::new("git");
+            rm.arg("-C")
+                .arg(root)
+                .args(["worktree", "remove", "--force"])
+                .arg(&dir);
+            let _ = run_bounded(&mut rm, Duration::from_secs(git_secs));
+            return Err(e.into());
+        }
         Ok(Self {
             root: root.to_path_buf(),
             dir,
             keep,
+            git_secs,
         })
+    }
+
+    /// Marker present ⇒ this run created the tree and may destroy it.
+    fn owns(&self) -> bool {
+        self.dir.join(REVIEW_MARKER).is_file()
     }
 }
 
 impl Drop for ReviewTree {
     fn drop(&mut self) {
-        if self.keep {
+        if self.keep || !self.owns() {
             return;
         }
-        let _ = Command::new("git")
-            .arg("-C")
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
             .arg(&self.root)
             .args(["worktree", "remove", "--force"])
-            .arg(&self.dir)
-            .output();
+            .arg(&self.dir);
+        let _ = run_bounded(&mut cmd, Duration::from_secs(self.git_secs));
+        if self.dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -982,6 +1095,7 @@ pub fn run(opts: &Options) -> Result<i32> {
             let cmd = test_command(&cfg.test_command, nt);
             let mut failures = 0u32;
             let mut runs = Vec::new();
+            let mut unknown = 0u32;
             for i in 0..opts.stress {
                 let s = run_step(
                     &format!("stress-{}-{}", nt.name, i + 1),
@@ -990,16 +1104,26 @@ pub fn run(opts: &Options) -> Result<i32> {
                     &env(gated_tree),
                     t.stress_secs,
                 )?;
-                if s.outcome != "ok" {
-                    failures += 1;
+                // A "pass" that ran zero tests means the filter missed —
+                // that is `unknown`, not `ok`.
+                let outcome = if s.outcome == "ok" && test_totals(&s.output) == Some((0, 0)) {
+                    "unknown"
+                } else {
+                    s.outcome
+                };
+                match outcome {
+                    "unknown" => unknown += 1,
+                    o if o != "ok" => failures += 1,
+                    _ => {}
                 }
-                runs.push(json!({"run": i + 1, "outcome": s.outcome,
+                runs.push(json!({"run": i + 1, "outcome": outcome,
                     "duration_ms": s.duration_ms,
                     "tail": s.tail}));
             }
             stress_results.push(json!({
                 "test": nt.name, "file": nt.file, "cmd": cmd,
                 "runs": opts.stress, "failures": failures,
+                "unknown": unknown,
                 "detail": runs,
             }));
         }
@@ -1011,7 +1135,7 @@ pub fn run(opts: &Options) -> Result<i32> {
                 if !path.is_empty() {
                     let path = PathBuf::from(path);
                     let wait = Instant::now();
-                    _suite_guard = Some(Flock::lock(&path)?);
+                    _suite_guard = Some(Flock::lock_deadline(&path, t.full_secs)?);
                     suite_lock = json!({"path": path,
                         "waited_ms": wait.elapsed().as_millis()});
                 }
@@ -1053,31 +1177,54 @@ pub fn run(opts: &Options) -> Result<i32> {
     failures_to_check.dedup();
 
     let mut comparisons = Vec::new();
+    let mut base_prepare_steps: Vec<Step> = Vec::new();
     if !failures_to_check.is_empty() {
-        // Base-head checkout, prepared like the gated tree.
+        // Base-head checkout, prepared like the gated tree. A prepare
+        // failure here is its own recorded step — it must not quietly
+        // turn every base run into the same error.
         let base_name = format!("review-{}-base", pr.number);
         let base_tree = ReviewTree::checkout(&root, &base_name, &base_sha, opts.keep, t.git_secs)?;
+        let mut base_ready = true;
         for cmd in &cfg.prepare {
-            if run_step(
+            let s = run_step(
                 "prepare-base",
                 cmd,
                 &base_tree.dir,
                 &env("base"),
                 t.prepare_secs,
-            )?
-            .outcome
-                != "ok"
-            {
+            )?;
+            base_ready &= s.outcome == "ok";
+            base_prepare_steps.push(s);
+            if !base_ready {
                 break;
             }
         }
         for name in &failures_to_check {
+            // Names come from test output the PR controls — validate
+            // before they reach a shell, and never execute a bad one.
+            if !valid_test_name(name) {
+                comparisons.push(json!({
+                    "test": name, "in_run": "fail",
+                    "isolated_gated": unknown_side("test name failed validation"),
+                    "isolated_base": unknown_side("test name failed validation"),
+                    "verdict": "inconclusive",
+                }));
+                continue;
+            }
             let file = new_tests
                 .iter()
                 .find(|t| &t.name == name)
                 .map(|t| t.file.clone())
-                .or_else(|| find_test_file(&tree.dir, name, &cfg.test_globs, t.git_secs))
-                .unwrap_or_else(|| first_test_file(&cfg.test_globs));
+                .or_else(|| find_test_file(&tree.dir, name, &cfg.test_globs, t.git_secs));
+            let Some(file) = file.filter(|f| safe_rel_path(f)) else {
+                comparisons.push(json!({
+                    "test": name, "in_run": "fail",
+                    "isolated_gated": unknown_side("test file not found under test_globs"),
+                    "isolated_base": unknown_side("test file not found under test_globs"),
+                    "verdict": "inconclusive",
+                }));
+                continue;
+            };
             let nt = NewTest {
                 name: name.clone(),
                 file,
@@ -1091,39 +1238,62 @@ pub fn run(opts: &Options) -> Result<i32> {
                 &env(gated_tree),
                 t.test_secs,
             )?;
-            let on_base = run_step(
-                "compare-base",
-                &cmd,
-                &base_tree.dir,
-                &env("base"),
-                t.test_secs,
-            )?;
-            let gated = if on_gated.outcome == "ok" {
-                "pass"
+            let gated = classify_isolated(&on_gated);
+            let (base, base_tail, base_reason) = if !base_ready {
+                ("unknown", Vec::new(), Some("base prepare failed"))
             } else {
-                "fail"
+                let on_base = run_step(
+                    "compare-base",
+                    &cmd,
+                    &base_tree.dir,
+                    &env("base"),
+                    t.test_secs,
+                )?;
+                let c = classify_isolated(&on_base);
+                (
+                    c,
+                    on_base.tail.clone(),
+                    if c == "unknown" {
+                        Some("could not run on the base tree")
+                    } else {
+                        None
+                    },
+                )
             };
-            let base = if on_base.outcome == "ok" {
-                "pass"
+            let gated_reason = if gated == "unknown" {
+                Some("could not run on the gated tree")
             } else {
-                "fail"
+                None
             };
             let verdict = match (gated, base) {
                 ("fail", "pass") => "regression",
                 ("fail", "fail") => "pre-existing",
+                ("unknown", _) | (_, "unknown") => "inconclusive",
                 _ => "flake-under-load",
             };
+            let mut gated_side = json!({"outcome": gated, "tail": on_gated.tail});
+            if let Some(r) = gated_reason {
+                gated_side["reason"] = json!(r);
+            }
+            let mut base_side = json!({"outcome": base, "tail": base_tail});
+            if let Some(r) = base_reason {
+                base_side["reason"] = json!(r);
+            }
             comparisons.push(json!({
                 "test": name, "cmd": cmd,
                 "in_run": "fail",
-                "isolated_gated": {"outcome": gated, "tail": on_gated.tail},
-                "isolated_base": {"outcome": base, "tail": on_base.tail},
+                "isolated_gated": gated_side,
+                "isolated_base": base_side,
                 "verdict": verdict,
             }));
         }
         drop(base_tree);
     }
     report["failures"] = json!(comparisons);
+    report["base_prepare"] = json!(base_prepare_steps
+        .iter()
+        .map(Step::to_json)
+        .collect::<Vec<_>>());
 
     // Pairwise conflicts with the other open PRs (files only).
     let mut pr_conflicts = Vec::new();
@@ -1181,7 +1351,9 @@ pub fn run(opts: &Options) -> Result<i32> {
                     continue;
                 }
                 // --name-only output: tree OID, conflicted names, blank
-                // line, then the conflict messages.
+                // line, then the conflict messages. Only exit 1 with a
+                // file list is a conflict — any other non-zero is a
+                // scan error, surfaced instead of dropped.
                 let files: Vec<String> = mt
                     .stdout
                     .lines()
@@ -1189,8 +1361,19 @@ pub fn run(opts: &Options) -> Result<i32> {
                     .take_while(|l| !l.trim().is_empty())
                     .map(|s| s.to_string())
                     .collect();
-                pr_conflicts.push(json!({"pr": num, "title": other["title"],
-                    "files": files}));
+                if mt.status == Some(1) && !files.is_empty() {
+                    pr_conflicts.push(json!({"pr": num, "title": other["title"],
+                        "files": files}));
+                } else {
+                    let why = if mt.timed_out {
+                        "merge-tree timed out".to_string()
+                    } else {
+                        format!("merge-tree exited {:?}: {}", mt.status, mt.stderr.trim())
+                    };
+                    pr_conflicts.push(json!({"pr": num,
+                        "title": other["title"],
+                        "error": why}));
+                }
             }
         }
         Err(e) => {
@@ -1230,7 +1413,11 @@ pub fn run(opts: &Options) -> Result<i32> {
         println!("report: {}", md_path.display());
         println!("verdict: {verdict} — {}", reasons.join("; "));
     }
-    Ok(0)
+    Ok(match verdict {
+        "pass" => 0,
+        "needs-hands-on" => 1,
+        _ => 2,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,7 +1512,28 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
                 1,
                 format!("`{name}` only fails under the parallel run — flake"),
             ),
+            Some("inconclusive") => push_reason(
+                &mut level,
+                &mut reasons,
+                2,
+                format!("`{name}` could not be rerun cleanly — inconclusive"),
+            ),
             _ => {}
+        }
+    }
+    for s in report["base_prepare"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        if s["outcome"].as_str() != Some("ok") {
+            push_reason(
+                &mut level,
+                &mut reasons,
+                2,
+                "base-tree prepare failed — base-side comparison degraded".into(),
+            );
+            break;
         }
     }
     if suite_failed && comparisons.is_empty() {
@@ -1346,6 +1554,19 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
                     "`{}` failed {}/{} isolated stress runs",
                     s["test"].as_str().unwrap_or("?"),
                     s["failures"].as_u64().unwrap_or(0),
+                    s["runs"].as_u64().unwrap_or(0)
+                ),
+            );
+        }
+        if s["unknown"].as_u64().unwrap_or(0) > 0 {
+            push_reason(
+                &mut level,
+                &mut reasons,
+                1,
+                format!(
+                    "`{}` stress ran zero tests {}/{} times — the filter matched nothing",
+                    s["test"].as_str().unwrap_or("?"),
+                    s["unknown"].as_u64().unwrap_or(0),
                     s["runs"].as_u64().unwrap_or(0)
                 ),
             );
@@ -1380,6 +1601,17 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
                             .collect::<Vec<_>>()
                             .join(", "))
                         .unwrap_or_default()
+                ),
+            );
+        } else if c["error"].is_string() {
+            push_reason(
+                &mut level,
+                &mut reasons,
+                1,
+                format!(
+                    "conflict scan incomplete for #{} ({})",
+                    c["pr"].as_i64().unwrap_or(0),
+                    c["error"].as_str().unwrap_or("?")
                 ),
             );
         }
@@ -1539,6 +1771,11 @@ fn render_markdown(r: &Value) -> String {
         md.push('\n');
     }
 
+    let base_prepare = r["base_prepare"].as_array().cloned().unwrap_or_default();
+    if !base_prepare.is_empty() {
+        section(&mut md, "Base-tree prepare", &base_prepare);
+    }
+
     let conflicts = r["open_pr_conflicts"]
         .as_array()
         .cloned()
@@ -1614,6 +1851,13 @@ index 333..444 100644
 +fn new_quiet_test() {
 +    assert_eq!(1, 1);
 +}
++fn helper_without_attr() {}
++#[cfg(test)]
++fn attr_but_cfg_only() {}
++#[tokio::test]
++fn tokio_wait() {
++    wait_agent(\"w\", \"idle\", 10);
++}
 diff --git a/tests/deep/sub.rs b/tests/deep/sub.rs
 index 555..666 100644
 --- a/tests/deep/sub.rs
@@ -1649,15 +1893,26 @@ index 555..666 100644
         let pats = vec!["wait_".to_string()];
         let tests = parse_new_tests(DIFF, &globs(), &pats);
         let names: Vec<&str> = tests.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["new_daemon_wait", "another_wait"]);
+        assert_eq!(names, vec!["new_daemon_wait", "tokio_wait", "another_wait"]);
         assert_eq!(tests[0].file, "tests/integration.rs");
-        assert_eq!(tests[1].file, "tests/deep/sub.rs");
+        assert_eq!(tests[2].file, "tests/deep/sub.rs");
     }
 
     #[test]
-    fn empty_pattern_keeps_every_new_fn() {
+    fn helpers_without_test_attr_are_not_tests() {
         let tests = parse_new_tests(DIFF, &globs(), &[]);
-        assert_eq!(tests.len(), 3);
+        let names: Vec<&str> = tests.iter().map(|t| t.name.as_str()).collect();
+        // #[test] and #[tokio::test] count; bare helpers and #[cfg]-only
+        // functions do not.
+        assert_eq!(
+            names,
+            vec![
+                "new_daemon_wait",
+                "new_quiet_test",
+                "tokio_wait",
+                "another_wait"
+            ]
+        );
     }
 
     #[test]
@@ -1667,10 +1922,49 @@ index 555..666 100644
             file: "tests/integration.rs".into(),
             body: String::new(),
         };
+        // Substitutions arrive shell-quoted — the template must not
+        // pre-quote.
         assert_eq!(
             test_command("cargo test --test {target} {test}", &nt),
-            "cargo test --test integration x"
+            "cargo test --test 'integration' 'x'"
         );
+    }
+
+    #[test]
+    fn validation_and_classification() {
+        assert!(valid_test_name("tests::a::b"));
+        assert!(valid_test_name("new_flaky"));
+        assert!(!valid_test_name("bad;name"));
+        assert!(!valid_test_name("$(evil)"));
+        assert!(!valid_test_name("a b"));
+        assert!(!valid_test_name(""));
+        assert!(safe_rel_path("tests/deep/sub.rs"));
+        assert!(!safe_rel_path("../x.rs"));
+        assert!(!safe_rel_path("/abs/x.rs"));
+        assert!(!safe_rel_path("a;b.rs"));
+
+        let step = |outcome: &'static str, output: &str| Step {
+            name: "t".into(),
+            cmd: "c".into(),
+            duration_ms: 0,
+            outcome,
+            exit: None,
+            tail: vec![],
+            output: output.to_string(),
+        };
+        assert_eq!(
+            classify_isolated(&step("ok", "test result: ok. 3 passed; 0 failed")),
+            "pass"
+        );
+        // A filter that matched nothing is `unknown`, not `ok`.
+        assert_eq!(
+            classify_isolated(&step("ok", "test result: ok. 0 passed; 0 failed")),
+            "unknown"
+        );
+        // Non-cargo output still classifies by exit.
+        assert_eq!(classify_isolated(&step("ok", "done")), "pass");
+        assert_eq!(classify_isolated(&step("fail", "boom")), "fail");
+        assert_eq!(classify_isolated(&step("timeout", "")), "unknown");
     }
 
     #[test]
@@ -1745,6 +2039,18 @@ gate_secs = 42
         assert_eq!(suggest(&r, false).0, "blocked");
         r["failures"] = json!([]);
         r["full_suite"] = json!({"outcome": "fail"});
+        assert_eq!(suggest(&r, false).0, "blocked");
+        r["full_suite"] = json!({"outcome": "ok"});
+        // An inconclusive compare blocks — never launders into pass.
+        r["failures"] = json!([{"test": "x", "verdict": "inconclusive"}]);
+        assert_eq!(suggest(&r, false).0, "blocked");
+        // A conflict-scan error is a reason, not a conflict.
+        r["failures"] = json!([]);
+        r["open_pr_conflicts"] = json!([{"pr": 9, "error": "merge-tree exited 128"}]);
+        assert_eq!(suggest(&r, false).0, "needs-hands-on");
+        // A failed base prepare blocks too.
+        r["open_pr_conflicts"] = json!([]);
+        r["base_prepare"] = json!([{"outcome": "fail"}]);
         assert_eq!(suggest(&r, false).0, "blocked");
     }
 }

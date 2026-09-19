@@ -26,7 +26,8 @@ full_suite = "cargo test --test integration"
 test_globs = ["tests/**"]
 
 # How one test runs alone — {test} = fn name, {file} = diff path,
-# {target} = file stem (cargo's --test <stem>).
+# {target} = file stem (cargo's --test <stem>). Substitutions arrive
+# single-quoted — do not quote them again here.
 test_command = "cargo test --test {target} {test}"
 
 # The "waits on daemon state" heuristic: a new test whose name or added

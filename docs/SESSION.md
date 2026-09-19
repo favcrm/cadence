@@ -160,8 +160,16 @@ The report (Markdown + `--json`) lands under
 `<state>/reviews/` with per-step durations and tails, new-test stress
 counts, the three-way failure compare, pairwise conflicts with other
 open PRs, a schema-migration flag, and a `suggested_verdict` of
-`pass|needs-hands-on|blocked` with reasons. It never posts a status,
-never merges, never pushes.
+`pass|needs-hands-on|blocked` with reasons — also the process exit
+code (0/1/2). It never posts a status, never merges, never pushes.
+
+Safety edges the tool owns: it refuses to reuse an existing
+`.cadence/wt/review-<pr>` checkout (a `--keep` leftover or a
+reviewer's own tree) and marks every worktree it creates so cleanup
+can never remove a foreign one. A failure it cannot rerun — the test
+file is not locatable, the base tree would not prepare, the run timed
+out — is `unknown`, the comparison `inconclusive`, and the suggestion
+`blocked`; it never launders "could not run" into "pre-existing".
 
 Two guards keep it from colliding with the fleet: one review at a time
 per repo (a lock under `<state>/reviews/`), and — when
