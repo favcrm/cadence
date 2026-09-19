@@ -57,6 +57,7 @@ CREATE TABLE verdicts(
     reviewer TEXT NOT NULL,           -- agent alias or 'operator'
     evidence TEXT,                    -- JSON: commands run, outputs, paths
     message TEXT,                     -- message id that carried the QA report, if any
+    verify TEXT,                      -- JSON: worktree checks {checked, skipped} (v5, CAD-51)
     created REAL NOT NULL);
 CREATE INDEX verdicts_task ON verdicts(task_id, revision);
 ```
@@ -97,10 +98,14 @@ wedging. No data migration is needed.
   record; `tasks.revision` numbers attempts; `verdicts` keys QA to them.
 
 Deferred to M3b: `artifacts` table, reviewer/merger task roles,
-`--workers-from`, `--verify-worktree`, stall detection, board changes.
+`--workers-from`, stall detection, board changes.
 
-GitHub bridge for `job verdict`: not built; until then the reviewer runs
-`scripts/qa-verdict.sh` ([DOGFOOD.md](DOGFOOD.md#reviewer-verdict-gate)).
+GitHub bridge for `job verdict` (built, CAD-51): when the task is
+worktree-scoped the CLI verifies the judged sha against the worktree
+before the RPC (§3), and after the verdict commits it posts the
+`qa-verdict` commit status on the PR head — the same call
+`scripts/qa-verdict.sh` makes, which stays the manual path
+([DOGFOOD.md](DOGFOOD.md#reviewer-verdict-gate)).
 
 ---
 
@@ -208,6 +213,31 @@ jobs.max_revisions` records the verdict but transitions to `blocked` —
 the PM is notified once per verdict, and the loop cannot continue
 without an operator `reopen`.
 
+4. **Worktree verification (CAD-51).** When the task carries
+   `worktree` + `branch` (every task `cadence issue start --job`
+   mints), `job verdict` first checks — client-side, in the job's
+   `repo`, each with a short timeout — that `--sha` resolves to a
+   commit, equals the tip of `branch`, has `base_sha` as an ancestor,
+   that `git status --porcelain` in the worktree is empty, and that
+   `origin/<branch>` equals the sha (the commit is pushed). A failed
+   check rejects before anything is written, naming the check and both
+   values; checks that cannot apply (absent worktree dir, no `origin`,
+   no `base_sha`) land in `verify.skipped`. The result is stored on the
+   verdict row and echoed on `verdict_recorded`; `--no-verify-worktree`
+   opts out and is recorded the same way.
+5. **The qa-verdict bridge.** After the verdict commits, when the
+   job's `repo` has a GitHub `origin` and an open PR exists for the
+   task's branch (`gh pr list --head <branch>`, or `--pr <n>` to name
+   it), the CLI posts a `qa-verdict` commit status on the judged sha —
+   `success` for `--pass`, `failure` for `--revise`/`--blocked`,
+   description `<verdict> — <task> r<revision>` capped at 140 chars,
+   no `target_url`. The same call `scripts/qa-verdict.sh` makes.
+   Posting never decides the verdict: missing `gh`, no PR, an API
+   error, or a PR head that differs from `--sha` is reported
+   `status: {posted: false, reason}` while the committed verdict
+   stands — a status is never posted to a sha the reviewer did not
+   name. `--no-status` skips the bridge.
+
 ---
 
 ## 4. CLI surface
@@ -234,6 +264,7 @@ cadence job dispatch <task> [--to <worker>] [--ready] [--message <id>]
 cadence job verdict <task> --sha <sha> (--pass|--revise|--blocked)
                 [--reviewer <alias>] [--evidence <file>]
                 [--message <note-id>] [--revision <n>]
+                [--no-verify-worktree] [--no-status] [--pr <n>]
 cadence job accept <task> [--merged-sha <sha>]
 cadence job cancel <job>               # all non-terminal tasks
 cadence job close <job>                # legal only when every task is done
@@ -343,6 +374,11 @@ and a disciplined retry path, never a blind replay.
 default `<job>-t1` it mints (assignee is validated against the job's
 group, same rule as `task_new`). Absent params keep the original
 behaviour: an unscoped draft `t1`.
+
+`task_verdict` accepts `verify` — the CLI's worktree-verification
+result `{checked, skipped}` (§3), stored verbatim on the verdict row
+and echoed on `verdict_recorded`. All network/git work stays
+client-side; the daemon only persists what the CLI proved.
 
 Capabilities: `job_lifecycle`, `revision_bound_verdicts`.
 

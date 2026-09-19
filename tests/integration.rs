@@ -9326,3 +9326,659 @@ fn issue_start_job_opens_scoped_task() {
     );
     assert_eq!(scoped["assignee"].as_str().unwrap(), "w1");
 }
+
+// ---- CAD-51: `job verdict` worktree verification + qa-verdict bridge ----
+
+/// git in tests — panics on failure, returns trimmed stdout.
+fn tgit(dir: &Path, args: &[&str]) -> String {
+    let o = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// Invoke the real `cadence` binary — the verify checks and the gh
+/// bridge run client-side. `envs` overlays PATH/FAKE_GH_* after the
+/// defaults; CADENCE_ALIAS is always removed (operator reviewer).
+fn cadence_cli(state: &Path, args: &[&str], envs: &[(String, String)]) -> (bool, Value) {
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
+        .arg(state)
+        .args(args)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("CADENCE_ALIAS");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    let text = if out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stderr).to_string()
+    } else {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    (
+        out.status.success(),
+        serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+    )
+}
+
+/// Repo fixture for verdict verification: `main` + branch `cadence/fix`
+/// one commit ahead, checked out in `.cadence/wt/fix`. `origin`:
+/// `None` = no remote; a bare-path string is pushed for real; a
+/// GitHub URL is recorded as the remote and its tracking ref placed
+/// by hand (never fetched).
+struct VerifyRepo {
+    _tmp: TempDir,
+    repo: PathBuf,
+    worktree: PathBuf,
+    base: String,
+    head: String,
+}
+
+fn verify_repo(origin: Option<&str>) -> VerifyRepo {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    let wt = repo.join(".cadence/wt/fix");
+    std::fs::create_dir_all(&repo).unwrap();
+    tgit(&repo, &["init", "-b", "main"]);
+    tgit(&repo, &["config", "user.email", "t@t"]);
+    tgit(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "base\n").unwrap();
+    tgit(&repo, &["add", "-A"]);
+    tgit(&repo, &["commit", "-qm", "init"]);
+    let base = tgit(&repo, &["rev-parse", "HEAD"]);
+    tgit(
+        &repo,
+        &["worktree", "add", "-b", "cadence/fix", wt.to_str().unwrap()],
+    );
+    std::fs::write(wt.join("f"), "work\n").unwrap();
+    tgit(&wt, &["commit", "-qam", "work"]);
+    let head = tgit(&repo, &["rev-parse", "cadence/fix"]);
+    if let Some(url) = origin {
+        tgit(&repo, &["remote", "add", "origin", url]);
+        if url.contains("github.com") {
+            // A GitHub URL is never fetched in tests — place the
+            // remote-tracking ref by hand instead.
+            tgit(
+                &repo,
+                &["update-ref", "refs/remotes/origin/cadence/fix", &head],
+            );
+        } else {
+            tgit(&repo, &["push", "-qu", "origin", "cadence/fix"]);
+        }
+    }
+    VerifyRepo {
+        _tmp: tmp,
+        repo,
+        worktree: wt,
+        base,
+        head,
+    }
+}
+
+/// pm + worker + job `j1` bound to `repo`.
+fn verdict_setup(d: &TestDaemon, repo: &Path) {
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    let (spec, sha) = d.spec_file("spec.md", "do the work");
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
+               "repo": repo.to_str().unwrap()}),
+    )
+    .unwrap();
+}
+
+/// Dispatch `task` to the fake worker; its REPORT_SHA trailer lands
+/// `head` as the reported sha and the task reaches `review`.
+fn task_to_review(d: &TestDaemon, task: &str, head: &str, scope: Value) {
+    let mut new = json!({"job": "j1", "task": task, "assignee": "w1",
+        "acceptance": format!("ok REPORT_SHA:{head}")});
+    for (k, v) in scope.as_object().unwrap_or(&serde_json::Map::new()) {
+        new[k] = v.clone();
+    }
+    d.rpc("task_new", new).unwrap();
+    d.job_dispatch(task, json!({})).unwrap();
+    d.wait_task(task, "review", 15);
+}
+
+fn verdict_args(task: &str, sha: &str, flag: &str) -> Vec<String> {
+    vec![
+        "job".to_string(),
+        "verdict".to_string(),
+        task.to_string(),
+        "--sha".to_string(),
+        sha.to_string(),
+        flag.to_string(),
+        "--reviewer".to_string(),
+        "operator".to_string(),
+    ]
+}
+
+fn cli_verdict(
+    d: &TestDaemon,
+    task: &str,
+    sha: &str,
+    flag: &str,
+    extra: &[&str],
+    envs: &[(String, String)],
+) -> (bool, Value) {
+    let mut args: Vec<String> = verdict_args(task, sha, flag);
+    args.extend(extra.iter().map(|s| s.to_string()));
+    cadence_cli(
+        &d.state,
+        &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        envs,
+    )
+}
+
+/// The task's recorded verdicts.
+fn task_verdicts(d: &TestDaemon, task: &str) -> Value {
+    d.rpc("task_show", json!({"task": task})).unwrap()["task"]["verdicts"].clone()
+}
+
+#[test]
+fn job_verdict_worktree_verify_binds_and_records() {
+    let d = TestDaemon::start();
+    // A real bare repo gets a real `origin/<branch>` ref via push.
+    let bare = TempDir::new().unwrap();
+    tgit(bare.path(), &["init", "--bare"]);
+    let r = verify_repo(Some(bare.path().to_str().unwrap()));
+    verdict_setup(&d, &r.repo);
+    task_to_review(
+        &d,
+        "j1-t2",
+        &r.head,
+        json!({"worktree": "fix", "branch": "cadence/fix", "base_sha": r.base}),
+    );
+
+    let (ok, out) = cli_verdict(&d, "j1-t2", &r.head, "--pass", &[], &[]);
+    assert!(ok, "{out}");
+    let verify = out["verdict"]["verify"].clone();
+    assert_eq!(
+        verify["checked"].as_array().unwrap(),
+        &json!([
+            "commit",
+            "branch tip",
+            "base ancestor",
+            "worktree clean",
+            "pushed"
+        ])
+        .as_array()
+        .unwrap()
+        .clone(),
+        "{verify}"
+    );
+    assert_eq!(verify["skipped"], json!([]), "{verify}");
+    // The origin is a local path — not a GitHub remote, so the bridge
+    // reports instead of posting; the verdict still committed.
+    assert_eq!(out["status"]["posted"], false, "{out}");
+    assert!(
+        out["status"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not a GitHub remote"),
+        "{out}"
+    );
+
+    // The verify result is stored on the row and echoed on the event.
+    let vs = task_verdicts(&d, "j1-t2");
+    assert_eq!(vs.as_array().unwrap().len(), 1, "{vs}");
+    assert_eq!(vs[0]["verify"]["checked"], verify["checked"], "{vs}");
+    let events = d.rpc("job_events", json!({"job": "j1"})).unwrap()["events"].clone();
+    let recorded = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "verdict_recorded")
+        .expect("verdict_recorded event");
+    assert_eq!(
+        recorded["payload"]["verify"]["checked"], verify["checked"],
+        "{recorded}"
+    );
+}
+
+#[test]
+fn job_verdict_worktree_verify_rejects_each_check() {
+    let d = TestDaemon::start();
+    let bare = TempDir::new().unwrap();
+    tgit(bare.path(), &["init", "--bare"]);
+    let r = verify_repo(Some(bare.path().to_str().unwrap()));
+    verdict_setup(&d, &r.repo);
+    let scope = || json!({"worktree": "fix", "branch": "cadence/fix", "base_sha": r.base});
+    let still_review = |task: &str| {
+        assert_eq!(
+            task_verdicts(&d, task),
+            json!([]),
+            "verdict row written for {task}"
+        );
+        assert_eq!(d.task_state(task), "review");
+    };
+
+    // Dirty worktree — the uncommitted file names the clean check.
+    task_to_review(&d, "j1-t2", &r.head, scope());
+    std::fs::write(r.worktree.join("dirty.txt"), "x").unwrap();
+    let (ok, out) = cli_verdict(&d, "j1-t2", &r.head, "--pass", &[], &[]);
+    assert!(!ok, "{out}");
+    let err = out["error"].as_str().unwrap();
+    assert!(
+        err.contains("worktree clean") && err.contains("uncommitted") && err.contains("dirty.txt"),
+        "{err}"
+    );
+    std::fs::remove_file(r.worktree.join("dirty.txt")).unwrap();
+    still_review("j1-t2");
+
+    // Wrong tip — head_sha is the real base commit, not the branch tip.
+    task_to_review(&d, "j1-t3", &r.base, scope());
+    let (ok, out) = cli_verdict(&d, "j1-t3", &r.base, "--pass", &[], &[]);
+    assert!(!ok, "{out}");
+    let err = out["error"].as_str().unwrap();
+    assert!(
+        err.contains("branch tip") && err.contains(&r.head) && err.contains(&r.base),
+        "{err}"
+    );
+    still_review("j1-t3");
+
+    // Base not an ancestor — a newer main commit never joined the branch.
+    std::fs::write(r.repo.join("m"), "main\n").unwrap();
+    tgit(&r.repo, &["add", "-A"]);
+    tgit(&r.repo, &["commit", "-qm", "main work"]);
+    let main_tip = tgit(&r.repo, &["rev-parse", "main"]);
+    task_to_review(
+        &d,
+        "j1-t4",
+        &r.head,
+        json!({"worktree": "fix", "branch": "cadence/fix", "base_sha": main_tip}),
+    );
+    let (ok, out) = cli_verdict(&d, "j1-t4", &r.head, "--pass", &[], &[]);
+    assert!(!ok, "{out}");
+    let err = out["error"].as_str().unwrap();
+    assert!(
+        err.contains("base ancestor") && err.contains(&main_tip) && err.contains(&r.head),
+        "{err}"
+    );
+    still_review("j1-t4");
+
+    // Unpushed — the branch advanced locally, origin stayed behind.
+    std::fs::write(r.worktree.join("f"), "more\n").unwrap();
+    tgit(&r.worktree, &["commit", "-qam", "more"]);
+    let head2 = tgit(&r.repo, &["rev-parse", "cadence/fix"]);
+    assert_ne!(head2, r.head);
+    task_to_review(&d, "j1-t5", &head2, scope());
+    let (ok, out) = cli_verdict(&d, "j1-t5", &head2, "--pass", &[], &[]);
+    assert!(!ok, "{out}");
+    let err = out["error"].as_str().unwrap();
+    assert!(
+        err.contains("pushed") && err.contains(&r.head) && err.contains(&head2),
+        "{err}"
+    );
+    still_review("j1-t5");
+
+    // A bogus reported sha never resolves to a commit at all — the
+    // worker can report any 40-hex; the check is what binds it.
+    let bogus = "1".repeat(40);
+    task_to_review(&d, "j1-t6", &bogus, scope());
+    let (ok, out) = cli_verdict(&d, "j1-t6", &bogus, "--pass", &[], &[]);
+    assert!(!ok, "{out}");
+    let err = out["error"].as_str().unwrap();
+    assert!(
+        err.contains("commit") && err.contains(&bogus) && err.contains("does not resolve"),
+        "{err}"
+    );
+    still_review("j1-t6");
+}
+
+#[test]
+fn job_verdict_worktree_verify_skips_and_opt_out() {
+    let d = TestDaemon::start();
+    let r = verify_repo(None); // no origin at all
+    verdict_setup(&d, &r.repo);
+    task_to_review(
+        &d,
+        "j1-t2",
+        &r.head,
+        json!({"worktree": "fix", "branch": "cadence/fix", "base_sha": r.base}),
+    );
+    // The worktree dir is gone — both the clean check and the pushed
+    // check cannot apply.
+    std::fs::remove_dir_all(&r.worktree).unwrap();
+    let (ok, out) = cli_verdict(&d, "j1-t2", &r.head, "--pass", &["--no-status"], &[]);
+    assert!(ok, "{out}");
+    let verify = out["verdict"]["verify"].clone();
+    let skipped: Vec<&str> = verify["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["check"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        verify["checked"].as_array().unwrap(),
+        &json!(["commit", "branch tip", "base ancestor"])
+            .as_array()
+            .unwrap()
+            .clone(),
+        "{verify}"
+    );
+    assert!(skipped.contains(&"worktree clean"), "{verify}");
+    assert!(skipped.contains(&"pushed"), "{verify}");
+
+    // No base_sha → the ancestor check skips too.
+    task_to_review(
+        &d,
+        "j1-t3",
+        &r.head,
+        json!({"worktree": "fix", "branch": "cadence/fix"}),
+    );
+    let (ok, out) = cli_verdict(&d, "j1-t3", &r.head, "--pass", &["--no-status"], &[]);
+    assert!(ok, "{out}");
+    let skipped: Vec<&str> = out["verdict"]["verify"]["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["check"].as_str().unwrap())
+        .collect();
+    assert!(skipped.contains(&"base ancestor"), "{out}");
+
+    // --no-verify-worktree records the opt-out on the verdict.
+    task_to_review(
+        &d,
+        "j1-t4",
+        &r.head,
+        json!({"worktree": "fix", "branch": "cadence/fix", "base_sha": r.base}),
+    );
+    let (ok, out) = cli_verdict(
+        &d,
+        "j1-t4",
+        &r.head,
+        "--pass",
+        &["--no-verify-worktree", "--no-status"],
+        &[],
+    );
+    assert!(ok, "{out}");
+    let verify = &out["verdict"]["verify"];
+    assert_eq!(verify["checked"], json!([]), "{verify}");
+    assert!(
+        verify["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["reason"]
+                .as_str()
+                .unwrap()
+                .contains("--no-verify-worktree")),
+        "{verify}"
+    );
+    let vs = task_verdicts(&d, "j1-t4");
+    assert!(
+        vs[0]["verify"]["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["reason"]
+                .as_str()
+                .unwrap()
+                .contains("--no-verify-worktree")),
+        "{vs}"
+    );
+}
+
+/// A fake `gh` that logs each invocation to $FAKE_GH_LOG (one
+/// tab-joined line) and answers from the environment — same pattern
+/// as tests/scripts/test_qa_verdict.py. FAKE_GH_FAIL forces exit N.
+const FAKE_GH: &str = r#"#!/usr/bin/env bash
+(IFS=$'\t'; printf '%s\n' "$*") >> "$FAKE_GH_LOG"
+if [ -n "${FAKE_GH_FAIL:-}" ]; then echo "fake gh: forced failure" >&2; exit "$FAKE_GH_FAIL"; fi
+case "$1 ${2:-}" in
+  "pr list") printf '%s\n' "${FAKE_GH_PRS:-[]}" ;;
+  "pr view") printf '{"number": %s, "headRefOid": "%s"}\n' "${FAKE_GH_PR_NUM:-9}" "${FAKE_GH_HEAD:-}" ;;
+  "api --method") echo '{}' ;;
+  *) echo "fake gh: unexpected call: $*" >&2; exit 64 ;;
+esac
+"#;
+
+/// Fake-gh dir + call log; env vars for `cadence_cli`.
+struct FakeGh {
+    _tmp: TempDir,
+    bin: PathBuf,
+    log: PathBuf,
+}
+
+fn fake_gh() -> FakeGh {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, FAKE_GH).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let log = tmp.path().join("gh.log");
+    std::fs::write(&log, "").unwrap();
+    FakeGh {
+        _tmp: tmp,
+        bin,
+        log,
+    }
+}
+
+impl FakeGh {
+    /// Env overlay for cadence_cli: this gh first on PATH + the log +
+    /// any FAKE_GH_* knobs.
+    fn envs(&self, extra: &[(String, String)]) -> Vec<(String, String)> {
+        let mut v = vec![
+            (
+                "PATH".to_string(),
+                format!(
+                    "{}:{}",
+                    self.bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            ),
+            (
+                "FAKE_GH_LOG".to_string(),
+                self.log.to_str().unwrap().to_string(),
+            ),
+        ];
+        for (k, val) in extra {
+            v.push((k.clone(), val.clone()));
+        }
+        v
+    }
+
+    fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+#[test]
+fn job_verdict_status_bridge_posts_qa_verdict() {
+    let d = TestDaemon::start();
+    let r = verify_repo(Some("https://github.com/acme/widgets.git"));
+    let gh = fake_gh();
+    verdict_setup(&d, &r.repo);
+    let scope = || json!({"worktree": "fix", "branch": "cadence/fix", "base_sha": r.base});
+    let open_pr = |head: &str| {
+        (
+            "FAKE_GH_PRS".to_string(),
+            format!("[{{\"number\": 7, \"headRefOid\": \"{head}\"}}]"),
+        )
+    };
+
+    // pass → success on the head sha, task + revision in the description.
+    task_to_review(&d, "j1-t2", &r.head, scope());
+    let envs = gh.envs(&[open_pr(&r.head)]);
+    let (ok, out) = cli_verdict(&d, "j1-t2", &r.head, "--pass", &[], &envs);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out["status"],
+        json!({"posted": true, "pr": 7, "sha": r.head}),
+        "{out}"
+    );
+    let calls = gh.calls();
+    assert!(
+        calls.iter().any(|c| c.contains(&format!(
+            "api\t--method\tPOST\trepos/acme/widgets/statuses/{}\t-f\tcontext=qa-verdict\t-f\tstate=success\t-f\tdescription=pass — j1-t2 r1",
+            r.head
+        ))),
+        "{calls:?}"
+    );
+
+    // revise → failure; blocked → failure. Same head sha throughout.
+    task_to_review(&d, "j1-t3", &r.head, scope());
+    let (ok, out) = cli_verdict(&d, "j1-t3", &r.head, "--revise", &[], &envs);
+    assert!(ok, "{out}");
+    assert_eq!(out["status"]["posted"], true, "{out}");
+    d.job_dispatch("j1-t3", json!({})).unwrap();
+    d.wait_task("j1-t3", "review", 15);
+    let (ok, out) = cli_verdict(&d, "j1-t3", &r.head, "--blocked", &[], &envs);
+    assert!(ok, "{out}");
+    assert_eq!(out["status"]["posted"], true, "{out}");
+    let calls = gh.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("state=failure") && c.contains("description=revise — j1-t3 r1")),
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("state=failure") && c.contains("description=blocked — j1-t3 r2")),
+        "{calls:?}"
+    );
+
+    // --pr names the PR instead of branch discovery.
+    task_to_review(&d, "j1-t4", &r.head, scope());
+    let envs = gh.envs(&[
+        ("FAKE_GH_PR_NUM".to_string(), "9".to_string()),
+        ("FAKE_GH_HEAD".to_string(), r.head.clone()),
+    ]);
+    let (ok, out) = cli_verdict(&d, "j1-t4", &r.head, "--pass", &["--pr", "9"], &envs);
+    assert!(ok, "{out}");
+    assert_eq!(out["status"]["pr"], 9, "{out}");
+    assert!(
+        gh.calls().iter().any(|c| c.contains("pr\tview\t9")),
+        "{:?}",
+        gh.calls()
+    );
+}
+
+#[test]
+fn job_verdict_status_bridge_failures_keep_the_verdict() {
+    let d = TestDaemon::start();
+    let r = verify_repo(Some("https://github.com/acme/widgets.git"));
+    let gh = fake_gh();
+    verdict_setup(&d, &r.repo);
+    let scope = || json!({"worktree": "fix", "branch": "cadence/fix", "base_sha": r.base});
+    let envs_of = |extra: &[(String, String)]| -> Vec<(String, String)> { gh.envs(extra) };
+
+    // No open PR — the verdict commits, the status reports why.
+    task_to_review(&d, "j1-t2", &r.head, scope());
+    let envs = envs_of(&[("FAKE_GH_PRS".to_string(), "[]".to_string())]);
+    let (ok, out) = cli_verdict(&d, "j1-t2", &r.head, "--pass", &[], &envs);
+    assert!(ok, "{out}");
+    assert_eq!(out["status"]["posted"], false, "{out}");
+    assert!(
+        out["status"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no open PR for branch cadence/fix"),
+        "{out}"
+    );
+    assert_eq!(d.task_state("j1-t2"), "verified");
+
+    // A moved head is reported — never posted to a sha the reviewer
+    // did not name.
+    task_to_review(&d, "j1-t3", &r.head, scope());
+    let other = "1".repeat(40);
+    let envs = envs_of(&[(
+        "FAKE_GH_PRS".to_string(),
+        format!("[{{\"number\": 7, \"headRefOid\": \"{other}\"}}]"),
+    )]);
+    let (ok, out) = cli_verdict(&d, "j1-t3", &r.head, "--pass", &[], &envs);
+    assert!(ok, "{out}");
+    assert_eq!(
+        out["status"]["reason"].as_str().unwrap(),
+        format!("pr head {other} is not the judged sha {}", r.head),
+        "{out}"
+    );
+    assert!(
+        !gh.calls().iter().any(|c| c.contains("statuses/")),
+        "{:?}",
+        gh.calls()
+    );
+    assert_eq!(d.task_state("j1-t3"), "verified");
+
+    // A failing gh leaves the verdict in place with the reason.
+    task_to_review(&d, "j1-t4", &r.head, scope());
+    let envs = envs_of(&[("FAKE_GH_FAIL".to_string(), "1".to_string())]);
+    let (ok, out) = cli_verdict(&d, "j1-t4", &r.head, "--pass", &[], &envs);
+    assert!(ok, "{out}");
+    assert_eq!(out["status"]["posted"], false, "{out}");
+    assert!(
+        out["status"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("forced failure"),
+        "{out}"
+    );
+    assert_eq!(d.task_state("j1-t4"), "verified");
+
+    // --no-status makes no gh call at all.
+    task_to_review(&d, "j1-t5", &r.head, scope());
+    let before = gh.calls().len();
+    let envs = envs_of(&[]);
+    let (ok, out) = cli_verdict(&d, "j1-t5", &r.head, "--pass", &["--no-status"], &envs);
+    assert!(ok, "{out}");
+    assert_eq!(out["status"]["posted"], false, "{out}");
+    assert_eq!(gh.calls().len(), before, "{:?}", gh.calls());
+    assert_eq!(d.task_state("j1-t5"), "verified");
+}
+
+#[test]
+fn job_verdict_unscoped_task_is_unchanged() {
+    let d = TestDaemon::start();
+    verdict_setup(&d, Path::new("/tmp"));
+    // No worktree/branch scope — the old path, no verify, no bridge.
+    task_to_review(&d, "j1-t2", SHA_A, json!({}));
+    let (ok, out) = cli_verdict(&d, "j1-t2", SHA_A, "--pass", &[], &[]);
+    assert!(ok, "{out}");
+    assert!(out["verdict"]["verify"].is_null(), "{out}");
+    assert_eq!(out["status"]["posted"], false, "{out}");
+    assert!(
+        out["status"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no branch"),
+        "{out}"
+    );
+    assert_eq!(d.task_state("j1-t2"), "verified");
+}

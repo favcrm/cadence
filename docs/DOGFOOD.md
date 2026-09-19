@@ -372,6 +372,22 @@ the note's basename as the description. A status sits on one SHA: a
 later push moves the head and the status does not follow, so a verdict
 never covers code the reviewer did not see.
 
+The job path bakes the same bridge into `job verdict` (CAD-51): on a
+worktree-scoped task the verdict first proves the judged sha is the
+branch tip, a descendant of the task's base, clean and pushed, and
+then posts `qa-verdict` — `success`/`failure`, description
+`<verdict> — <task> r<revision>` — on the PR head that equals it:
+
+```bash
+cadence job verdict <task> --sha "$(git rev-parse HEAD)" --pass \
+    --reviewer operator
+```
+
+One reviewer action replaces the manual script run; the script stays
+for verdicts outside a job. A post that cannot happen (no `gh`, no PR,
+a head that moved) never blocks the verdict — it is reported as
+`status.posted: false` with the reason, and `--no-status` opts out.
+
 The operator's merge habit becomes check-then-merge:
 
 ```bash
