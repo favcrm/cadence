@@ -17,6 +17,7 @@ use cadence_agent::adapter::pty;
 use cadence_agent::adapter::registry::{self, Attach, Reporting};
 use cadence_agent::client;
 use cadence_agent::error::{Error, Result};
+use cadence_agent::proc::BoundedError;
 
 #[derive(Parser)]
 #[command(
@@ -2527,31 +2528,12 @@ fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
 /// short timeout every verdict check gets. Ok(stdout) on exit 0; the
 /// Err string carries stderr/exit/spawn/timeout.
 fn run_capped(prog: &str, args: &[String], cwd: &Path) -> std::result::Result<String, String> {
-    let mut child = Command::new(prog)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{prog}: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let out = loop {
-        if child
-            .try_wait()
-            .map_err(|e| format!("{prog}: {e}"))?
-            .is_some()
-        {
-            break child
-                .wait_with_output()
-                .map_err(|e| format!("{prog}: {e}"))?;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("{prog} timed out after 10s"));
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    let mut cmd = Command::new(prog);
+    cmd.args(args).current_dir(cwd);
+    let out = match cadence_agent::proc::run_bounded(&mut cmd, Duration::from_secs(10)) {
+        Ok(out) => out,
+        Err(BoundedError::TimedOut { .. }) => return Err(format!("{prog} timed out after 10s")),
+        Err(e) => return Err(format!("{prog}: {e}")),
     };
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())

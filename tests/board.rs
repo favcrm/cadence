@@ -3086,6 +3086,74 @@ fn issue_detail_lists_code_commits() {
     assert_eq!(api["commits_skipped"], out["commits_skipped"]);
 }
 
+/// CAD-60: `--all` walks stale remote-tracking refs, so a squash-merged
+/// branch would list its work twice. The default-branch twin wins; a
+/// branch-only commit stays, tagged `on_default: false`, after the
+/// default-branch commits even when it is the newest.
+#[test]
+fn issue_detail_dedupes_stale_branch_commits() {
+    let (pm, state, repo, _port) = commits_fixture();
+    let commit = |subject: &str, date: &str| {
+        assert!(
+            git(
+                repo.path(),
+                &[
+                    "-c",
+                    "user.name=dev",
+                    "-c",
+                    "user.email=d@d",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "--date",
+                    date,
+                    "-m",
+                    subject
+                ]
+            )
+            .0
+        );
+    };
+    assert!(git(repo.path(), &["checkout", "-q", "-b", "feat"]).0);
+    commit("land it (X-1)", "2030-01-01T00:00:00Z");
+    commit("wip (X-1) branch only", "2030-01-03T00:00:00Z");
+    assert!(git(repo.path(), &["checkout", "-q", "-"]).0);
+    commit("land it (X-1) (#7)", "2030-01-02T00:00:00Z");
+    // The merged branch is gone locally; only the stale remote ref holds it.
+    assert!(
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/feat", "feat"]
+        )
+        .0
+    );
+    assert!(git(repo.path(), &["branch", "-q", "-D", "feat"]).0);
+
+    let (ok, out) = cli(pm.path(), state.path(), &["issue", "show", "X-1", "--json"]);
+    assert!(ok, "{out}");
+    let listed: Vec<(&str, bool)> = out["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["subject"].as_str().unwrap(),
+                c["on_default"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("land it (X-1) (#7)", true),
+            ("fix (X-1) edge case", true),
+            ("feat: wire it", true),
+            ("wip (X-1) branch only", false),
+        ],
+        "twin listed once from the default branch; default first, then newest"
+    );
+}
+
 #[test]
 fn issue_trailer_prints_and_validates() {
     let (pm, state, _repo, _port) = commits_fixture();
