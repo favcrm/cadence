@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::adapter::{self, registry, AdapterHooks, ProviderAdapter, ProviderRequest, TurnResult};
+use crate::adapter::{
+    self, registry, AdapterHooks, ProviderAdapter, ProviderEnv, ProviderRequest, TurnResult,
+};
 use crate::client;
 use crate::error::{Error, Result};
 use crate::proto;
@@ -240,10 +242,12 @@ pub struct Shared {
     /// `"respawned"` — attachable kinds only), recorded before the
     /// identity write so a resume report can say which happened.
     open_attach: Mutex<HashMap<String, &'static str>>,
+    /// Provider launch overrides for this daemon instance.
+    provider_env: ProviderEnv,
 }
 
 impl Shared {
-    pub fn new(state_dir: &Path) -> Result<Arc<Self>> {
+    pub fn new(state_dir: &Path, provider_env: ProviderEnv) -> Result<Arc<Self>> {
         let store = Store::open(&state_dir.join("cadence.sqlite3"))?;
         let provider_log_dir = state_dir.join("agents");
         std::fs::create_dir_all(&provider_log_dir)?;
@@ -257,6 +261,7 @@ impl Shared {
             provider_log_dir,
             state_dir: state_dir.to_path_buf(),
             open_attach: Mutex::new(HashMap::new()),
+            provider_env,
         }))
     }
 
@@ -527,7 +532,7 @@ impl Shared {
                 Box::new(move |request| shared.on_provider_request(&owned, request))
             },
         };
-        let adapter = adapter::build(&agent, hooks, &log_path)?;
+        let adapter = adapter::build(&agent, hooks, &log_path, &self.provider_env)?;
         let adapter: Arc<dyn ProviderAdapter> = Arc::from(adapter);
         // Publish before `open` so stop/shutdown can force-close the
         // transport while initialization RPCs are still in flight.
@@ -973,7 +978,7 @@ impl Shared {
                     // the explicit kill; never leave an orphan session
                     // on the private socket behind a dropped row.
                     if agent.endpoint_kind == "pty" {
-                        adapter::pty::kill_pane(&self.state_dir, &alias);
+                        adapter::pty::kill_pane(&self.state_dir, &alias, &self.provider_env);
                     }
                     self.open_attach.lock().unwrap().remove(&alias);
                     // Re-checks endpoint/state inside its transaction.
@@ -998,7 +1003,11 @@ impl Shared {
                         // the explicit kill; no orphan sessions behind
                         // dropped rows.
                         if agent.endpoint_kind == "pty" {
-                            adapter::pty::kill_pane(&self.state_dir, &agent.alias);
+                            adapter::pty::kill_pane(
+                                &self.state_dir,
+                                &agent.alias,
+                                &self.provider_env,
+                            );
                         }
                         if self.store.remove_agent(&agent.alias).is_ok() {
                             self.open_attach.lock().unwrap().remove(&agent.alias);
@@ -2337,7 +2346,7 @@ impl Shared {
         // `agent stop` is the explicit kill. For a live agent the
         // actor's own close() already ran, so this is a no-op for it.
         if agent.endpoint_kind == "pty" {
-            adapter::pty::kill_pane(&self.state_dir, &alias);
+            adapter::pty::kill_pane(&self.state_dir, &alias, &self.provider_env);
         }
         // The actor writes its own terminal state on exit; do not mask a
         // fence it may have raised while finishing.
@@ -2909,11 +2918,25 @@ fn acquire_singleton(state_dir: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
+/// Per-instance daemon configuration.
+#[derive(Clone, Default)]
+pub struct ServeOptions {
+    /// Provider launch overrides (`CADENCE_CLAUDE_COMMAND`, …) for this
+    /// daemon only; unset names fall back to the environment.
+    pub provider_env: ProviderEnv,
+}
+
 /// Run the daemon in the foreground until `shutdown` or a signal.
 pub fn serve(state_dir: &Path) -> Result<()> {
+    serve_with(state_dir, ServeOptions::default())
+}
+
+/// `serve` with per-instance options — in-process test daemons pass
+/// their mock commands here instead of through the shared environment.
+pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let _singleton = acquire_singleton(state_dir)?;
-    let shared = Shared::new(state_dir)?;
+    let shared = Shared::new(state_dir, opts.provider_env)?;
     let socket_path = state_dir.join("cadence.sock");
     if socket_path.exists() {
         // Safe while the singleton is held: no live owner can exist.
@@ -3016,7 +3039,7 @@ mod tests {
 
     fn shared() -> (tempfile::TempDir, Arc<Shared>) {
         let dir = tempfile::tempdir().unwrap();
-        let shared = Shared::new(dir.path()).unwrap();
+        let shared = Shared::new(dir.path(), ProviderEnv::default()).unwrap();
         (dir, shared)
     }
 

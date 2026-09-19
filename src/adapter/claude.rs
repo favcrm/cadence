@@ -52,7 +52,7 @@ use uuid::Uuid;
 
 use super::link::Incoming;
 use super::stdio::{EnvScrub, StdioAdapter};
-use super::{AdapterHooks, Identity, ProviderAdapter, TurnResult};
+use super::{AdapterHooks, Identity, ProviderAdapter, ProviderEnv, TurnResult};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
@@ -85,8 +85,8 @@ fn claude_env_scrub() -> EnvScrub {
 /// Provider binary; `CADENCE_CLAUDE_COMMAND` overrides it (test/mock).
 /// Stream-json flags are appended after this prefix so a mock sees the
 /// same argv shape (`--resume`, `--permission-mode`, …) as the real CLI.
-fn claude_command() -> Vec<String> {
-    if let Ok(cmd) = std::env::var("CADENCE_CLAUDE_COMMAND") {
+fn claude_command(env: &ProviderEnv) -> Vec<String> {
+    if let Some(cmd) = env.var("CADENCE_CLAUDE_COMMAND") {
         let parts: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
         if !parts.is_empty() {
             return parts;
@@ -104,13 +104,14 @@ fn claude_command() -> Vec<String> {
 /// `params.broker_approvals` is set — it lands beside the permission
 /// flags so every resume replays the broker wiring too.
 fn build_command(
+    env: &ProviderEnv,
     agent: &Agent,
     session_id: &str,
     resume: bool,
     mcp_config: Option<&Path>,
 ) -> Vec<String> {
     let params = agent.params.clone().unwrap_or(Value::Null);
-    let mut cmd = claude_command();
+    let mut cmd = claude_command(env);
     for flag in [
         "-p",
         "--input-format",
@@ -162,9 +163,9 @@ fn build_command(
 /// hidden `mcp-permission` subcommand. `CADENCE_MCP_PERMISSION_COMMAND`
 /// overrides the binary path (tests point it at the built binary —
 /// `current_exe` there is the test runner).
-fn mcp_permission_command() -> Vec<String> {
-    let exe = std::env::var("CADENCE_MCP_PERMISSION_COMMAND")
-        .ok()
+fn mcp_permission_command(env: &ProviderEnv) -> Vec<String> {
+    let exe = env
+        .var("CADENCE_MCP_PERMISSION_COMMAND")
         .filter(|c| !c.trim().is_empty())
         .or_else(|| {
             std::env::current_exe()
@@ -193,6 +194,8 @@ pub struct ClaudeAdapter {
     shared: Arc<Shared>,
     log_path: PathBuf,
     state_dir: PathBuf,
+    /// This daemon's launch overrides — read at every `open`.
+    env: ProviderEnv,
 }
 
 struct Shared {
@@ -222,7 +225,7 @@ struct Shared {
 }
 
 impl ClaudeAdapter {
-    pub fn new(hooks: AdapterHooks, log_path: &Path) -> Self {
+    pub fn new(hooks: AdapterHooks, log_path: &Path, env: &ProviderEnv) -> Self {
         let shared = Arc::new(Shared {
             hooks,
             results: Mutex::new(VecDeque::new()),
@@ -240,13 +243,14 @@ impl ClaudeAdapter {
         let disconnected = Arc::clone(&shared);
         Self {
             transport: RwLock::new(StdioAdapter::new_lines(
-                &claude_command(),
+                &claude_command(env),
                 claude_env_scrub(),
                 Box::new(move |incoming| routed.dispatch(incoming)),
                 Box::new(move || disconnected.on_disconnect()),
             )),
             shared,
             log_path: log_path.to_path_buf(),
+            env: env.clone(),
             state_dir: log_path
                 .parent()
                 .and_then(|p| p.parent())
@@ -279,7 +283,7 @@ impl ClaudeAdapter {
             .state_dir
             .join("agents")
             .join(format!("{}.mcp.json", agent.alias));
-        let cmd = mcp_permission_command();
+        let cmd = mcp_permission_command(&self.env);
         let timeout = agent
             .params
             .as_ref()
@@ -438,7 +442,7 @@ impl ProviderAdapter for ClaudeAdapter {
         } else {
             None
         };
-        let command = build_command(agent, &session_id, resume, mcp_config.as_deref());
+        let command = build_command(&self.env, agent, &session_id, resume, mcp_config.as_deref());
         *self.shared.expected_session.lock().unwrap() = Some(session_id.clone());
         *self.shared.session_mismatch.lock().unwrap() = None;
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();

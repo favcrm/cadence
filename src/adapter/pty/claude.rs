@@ -24,7 +24,7 @@ use std::time::Duration;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::adapter::Probe;
+use crate::adapter::{Probe, ProviderEnv};
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
@@ -261,14 +261,15 @@ impl ClaudeProfile {
     /// used verbatim — tests pass `python3 mock.py <sessions>` — else a
     /// `claude` found on PATH), and the permission/model/tool params
     /// replayed on every launch exactly as the managed adapter does.
-    pub fn new(agent: &Agent) -> Result<Self> {
-        let sessions_dir = std::env::var("CADENCE_CLAUDE_SESSIONS")
+    pub fn new(agent: &Agent, env: &ProviderEnv) -> Result<Self> {
+        let sessions_dir = env
+            .var("CADENCE_CLAUDE_SESSIONS")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|| {
                 PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude/sessions")
             });
-        let (command, real) = match std::env::var("CADENCE_CLAUDE_TUI_COMMAND") {
-            Ok(cmd) if !cmd.is_empty() => (cmd, false),
+        let (command, real) = match env.var("CADENCE_CLAUDE_TUI_COMMAND") {
+            Some(cmd) if !cmd.is_empty() => (cmd, false),
             _ => (resolve_on_path("claude").map(|p| shlex_quote(&p))?, true),
         };
         let params = agent.params.clone().unwrap_or(Value::Null);

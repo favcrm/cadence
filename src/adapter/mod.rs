@@ -14,10 +14,52 @@ pub mod registry;
 pub mod stdio;
 pub mod ws;
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
+
 use serde_json::Value;
 
 use crate::error::Result;
 use crate::store::Agent;
+
+/// Per-daemon values for the provider launch variables
+/// (`CADENCE_CLAUDE_COMMAND`, `CADENCE_TMUX_COMMAND`, …). A name set
+/// here wins; an unset one falls back to the process environment,
+/// which stays the operator-facing override. In-process test daemons
+/// set their mocks here — the environment is shared by every daemon
+/// in the process, so a mock installed there reaches all of them.
+#[derive(Clone, Default)]
+pub struct ProviderEnv(Arc<RwLock<BTreeMap<String, String>>>);
+
+impl ProviderEnv {
+    pub fn set(&self, name: &str, value: impl Into<String>) {
+        self.0
+            .write()
+            .unwrap()
+            .insert(name.to_string(), value.into());
+    }
+
+    pub fn remove(&self, name: &str) {
+        self.0.write().unwrap().remove(name);
+    }
+
+    /// Every value set here — for handing to a daemon this one spawns
+    /// as a separate process (`daemon restart`), which sees only env.
+    pub fn vars(&self) -> Vec<(String, String)> {
+        self.0
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// This daemon's value for `name`, else the environment's.
+    pub fn var(&self, name: &str) -> Option<String> {
+        let own = self.0.read().unwrap().get(name).cloned();
+        own.or_else(|| std::env::var(name).ok())
+    }
+}
 
 /// Native identity returned by a successful `open`.
 pub struct Identity {
@@ -177,6 +219,7 @@ pub fn build(
     agent: &Agent,
     hooks: AdapterHooks,
     log_path: &std::path::Path,
+    env: &ProviderEnv,
 ) -> Result<Box<dyn ProviderAdapter>> {
     // The registry is consulted for pair validation only — its
     // rejections carry the same per-kind text the match arms below
@@ -185,14 +228,14 @@ pub fn build(
     registry::spec(&agent.provider, &agent.endpoint_kind)?;
     match agent.endpoint_kind.as_str() {
         "managed" => match agent.provider.as_str() {
-            "codex" => Ok(Box::new(codex::CodexAdapter::new(hooks, log_path))),
-            "claude" => Ok(Box::new(claude::ClaudeAdapter::new(hooks, log_path))),
+            "codex" => Ok(Box::new(codex::CodexAdapter::new(hooks, log_path, env))),
+            "claude" => Ok(Box::new(claude::ClaudeAdapter::new(hooks, log_path, env))),
             other => Err(crate::error::Error::rejected(format!(
                 "No managed adapter for provider '{other}' (implemented: codex, claude)"
             ))),
         },
         "managed-ws" => match agent.provider.as_str() {
-            "codex" => Ok(Box::new(codex::CodexAdapter::new_ws(hooks, log_path))),
+            "codex" => Ok(Box::new(codex::CodexAdapter::new_ws(hooks, log_path, env))),
             other => Err(crate::error::Error::rejected(format!(
                 "No managed-ws adapter for provider '{other}' (implemented: codex)"
             ))),
@@ -202,10 +245,11 @@ pub fn build(
                 hooks,
                 log_path,
                 agent,
+                env,
                 // The stored permission mode rides the profile so the
                 // same argv is replayed on every open — fresh launch
                 // and `-r` resume alike.
-                pty::DevinProfile::new()?.with_permission_mode(agent.params.as_ref().and_then(
+                pty::DevinProfile::new(env)?.with_permission_mode(agent.params.as_ref().and_then(
                     |p| {
                         p.get("permission_mode")
                             .and_then(Value::as_str)
@@ -217,20 +261,23 @@ pub fn build(
                 hooks,
                 log_path,
                 agent,
-                pty::ClaudeProfile::new(agent)?,
+                env,
+                pty::ClaudeProfile::new(agent, env)?,
             )?)),
             "cursor" => Ok(Box::new(pty::PtyAdapter::new(
                 hooks,
                 log_path,
                 agent,
-                pty::CursorProfile::new(agent)?,
+                env,
+                pty::CursorProfile::new(agent, env)?,
             )?)),
             // Harness double: proves the adapter is profile-driven.
             "tui-stub" => Ok(Box::new(pty::PtyAdapter::new(
                 hooks,
                 log_path,
                 agent,
-                pty::StubProfile::new()?,
+                env,
+                pty::StubProfile::new(env)?,
             )?)),
             other => Err(crate::error::Error::rejected(format!(
                 "No pty adapter for provider '{other}' (implemented: devin, claude, cursor)"
