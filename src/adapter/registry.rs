@@ -650,7 +650,8 @@ pub fn validate_next_launch_param(
     if !NEXT_LAUNCH_PARAMS.contains(&key) || !launches {
         return Err(Error::rejected(format!(
             "'{key}' cannot be set for the next launch of a {provider}/{kind} \
-             agent — --next-launch takes model and effort (claude). Recreate \
+             agent — --next-launch takes the launch params an endpoint \
+             declares (claude: model, effort; cursor: model). Recreate \
              the agent to change wiring params like upstream or session"
         )));
     }

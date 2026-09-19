@@ -575,6 +575,22 @@ impl ProviderAdapter for PtyAdapter {
         };
         let generation = Uuid::new_v4().simple().to_string();
 
+        // A stored session id means this open is a resume attempt. If
+        // the pane then fails to prove that session — TUI exits on a
+        // deleted chat, or attaches to a different one — the stored id
+        // is unresumable, and keeping it would wedge the alias on the
+        // same dead chat every open. The event clears params.session
+        // so the next open mints a fresh one. A freshly-minted id is
+        // never "resumed", so mint failures never trigger the clear.
+        let resume_failed = |desired: &Option<String>, reason: &Error| {
+            if let Some(session) = desired {
+                (self.hooks.on_event)(
+                    "cadence/session_resume_failed",
+                    serde_json::json!({"session": session, "reason": reason.to_string()}),
+                );
+            }
+        };
+
         let (native, pane_pid, attach) = if self.has_session(&session) {
             // Reattach: verify the pane still owns a native session.
             // When one was recorded it must match; a pane left by a
@@ -586,18 +602,23 @@ impl ProviderAdapter for PtyAdapter {
             // deadline the spawn path gets rather than fencing a live
             // pane on one observation.
             let pane_pid = self.pane_pid(&session)?;
-            let found = self.wait_owned_session(&session, pane_pid)?;
-            (
-                self.profile.resolve_session(desired.as_deref(), found)?,
-                pane_pid,
-                "adopted",
-            )
+            match self
+                .wait_owned_session(&session, pane_pid)
+                .and_then(|found| self.profile.resolve_session(desired.as_deref(), found))
+            {
+                Ok(native) => (native, pane_pid, "adopted"),
+                Err(e) => {
+                    resume_failed(&desired, &e);
+                    return Err(e);
+                }
+            }
         } else {
             // Mint once: a profile with a prepare step mints its native
             // session id *before* the pane exists, and the event folds
             // it into `params.session` — a respawn after a failed launch
             // resumes the same id instead of abandoning a mint per
             // retry. `desired` is the adapter's copy for this open.
+            let resuming = desired.is_some();
             let desired = match desired {
                 Some(want) => Some(want),
                 None => {
@@ -646,18 +667,26 @@ impl ProviderAdapter for PtyAdapter {
             ])?;
             let pane_pid = self.pane_pid(&session)?;
             // Bound the wait for the TUI to acquire its native session.
-            let native = match self.wait_owned_session(&session, pane_pid)? {
-                Some(found) => self
-                    .profile
-                    .resolve_session(desired.as_deref(), Some(found))?,
-                None => {
-                    return Err(Error::provider(format!(
+            let proof = self
+                .wait_owned_session(&session, pane_pid)
+                .and_then(|found| match found {
+                    Some(found) => self
+                        .profile
+                        .resolve_session(desired.as_deref(), Some(found)),
+                    None => Err(Error::provider(format!(
                         "timed out waiting for the {} TUI to acquire its session",
                         self.profile.name()
-                    )))
+                    ))),
+                });
+            match proof {
+                Ok(native) => (native, pane_pid, "respawned"),
+                Err(e) => {
+                    if resuming {
+                        resume_failed(&desired, &e);
+                    }
+                    return Err(e);
                 }
-            };
-            (native, pane_pid, "respawned")
+            }
         };
 
         // Pane defaults for cadence-owned sessions, scoped to this

@@ -363,9 +363,32 @@ impl Shared {
             if kind == "session_minted" {
                 // A pty profile minted its native session id before
                 // spawning — persist it so the next open resumes it
-                // even if this launch dies before session proof.
+                // even if this launch dies before session proof. A
+                // lost persist must be loud: without it the next open
+                // silently re-mints, churning a new session per retry.
                 if let Some(session) = params.get("session").and_then(Value::as_str) {
-                    let _ = self.store.set_params(alias, &json!({"session": session}));
+                    if let Err(e) = self.store.set_params(alias, &json!({"session": session})) {
+                        eprintln!("session_minted: persist failed for '{alias}': {e}");
+                        let _ = self.store.event_public(
+                            alias,
+                            "session_persist_failed",
+                            json!({"session": session, "error": e.to_string()}),
+                        );
+                    }
+                }
+            }
+            if kind == "session_resume_failed" {
+                // The stored native session failed to prove after the
+                // pane ran — the chat/session is unresumable. Clearing
+                // it lets the next open mint a fresh one instead of
+                // wedging the alias on the same dead id forever.
+                if let Err(e) = self.store.set_params(alias, &json!({"session": null})) {
+                    eprintln!("session_resume_failed: clear failed for '{alias}': {e}");
+                    let _ = self.store.event_public(
+                        alias,
+                        "session_persist_failed",
+                        json!({"error": e.to_string()}),
+                    );
                 }
             }
             let _ = self.store.event_public(alias, kind, params);
@@ -3110,6 +3133,35 @@ mod tests {
         if let Some(ctl) = lc.agents.get("w1") {
             ctl.wake.notify_all();
         }
+    }
+
+    /// A `session_minted` whose `set_params` fails must not vanish:
+    /// the mint is still recorded and a `session_persist_failed` sits
+    /// beside it — a lost persist would otherwise silently re-mint a
+    /// new session on every retry. The deterministic failure is an
+    /// alias the store doesn't know; events key on alias text, so
+    /// registering the alias afterwards still surfaces both rows.
+    #[test]
+    fn session_minted_persist_failure_is_evented() {
+        let (dir, shared) = shared();
+        shared.on_provider_event(
+            "ghost",
+            "cadence/session_minted",
+            json!({"session": "chat-1"}),
+        );
+        register(&shared, dir.path(), "ghost");
+        let kinds: Vec<String> = shared
+            .store
+            .events("ghost", 0, 50)
+            .unwrap()
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect();
+        assert!(kinds.iter().any(|k| k == "session_minted"), "{kinds:?}");
+        assert!(
+            kinds.iter().any(|k| k == "session_persist_failed"),
+            "{kinds:?}"
+        );
     }
 
     /// While a stop reservation is in flight (its owner has not yet
