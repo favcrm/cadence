@@ -185,7 +185,9 @@ impl Shared {
             )));
         }
         if self.store.has_unknown(alias)? {
-            self.store.set_agent_state(
+            // One write: the fence lands with the runtime fields
+            // cleared — no `attention` + live endpoint window.
+            self.store.set_state_detached(
                 alias,
                 "attention",
                 Some(&self.uncertain_fence_text(alias)),
@@ -335,7 +337,6 @@ impl Shared {
         }
         self.wake();
         let closing = self.closing.load(Ordering::SeqCst);
-        let _ = self.store.clear_runtime(alias);
         match outcome {
             Err(ref error) => {
                 // When unreconciled unknowns outlive the actor, the
@@ -349,9 +350,11 @@ impl Shared {
                 } else {
                     error.to_string()
                 };
+                // One write: `attention` must never be observable with
+                // the dead actor's endpoint still attached.
                 let _ = self
                     .store
-                    .set_agent_state(alias, "attention", Some(&reason));
+                    .set_state_detached(alias, "attention", Some(&reason));
                 let _ = self
                     .store
                     .event_public(alias, "attention", json!({"reason": reason}));
@@ -366,7 +369,9 @@ impl Shared {
                 } else {
                     "idle"
                 };
-                let _ = self.store.set_agent_state(alias, state, None);
+                // One write: the terminal state lands together with the
+                // cleared endpoint fields.
+                let _ = self.store.set_state_detached(alias, state, None);
             }
         }
         // Release the alias only after cleanup and the final state write:
@@ -667,7 +672,10 @@ impl Shared {
             &json!({"status": "unknown", "text": "", "error": reason}),
             Some(reason),
         )?;
-        self.store.set_agent_state(
+        // One write: the fence is visible immediately, so the cleared
+        // endpoint must land with it — a reader in between must never
+        // see `attention` plus a live endpoint.
+        self.store.set_state_detached(
             alias,
             "attention",
             Some(&format!(
@@ -2142,7 +2150,9 @@ impl Shared {
         let state = if self.store.agent(&alias)?.state == "attention" {
             "attention"
         } else {
-            self.store.set_agent_state(&alias, "stopped", None)?;
+            // One write: `stopped` lands with the runtime fields
+            // cleared — the actor may still be finishing its own exit.
+            self.store.set_state_detached(&alias, "stopped", None)?;
             "stopped"
         };
         self.wake();
@@ -2401,7 +2411,7 @@ pub fn serve(state_dir: &Path) -> Result<()> {
             };
             shared
                 .store
-                .set_agent_state(&agent.alias, "attention", Some(&error))?;
+                .set_state_detached(&agent.alias, "attention", Some(&error))?;
             eprintln!("start: skipping fenced agent '{}' ({reason})", agent.alias);
             let _ = shared.store.event_public(
                 &agent.alias,

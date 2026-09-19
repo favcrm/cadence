@@ -1392,6 +1392,10 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Live-actor states only (`starting`, `stopping`, busy/idle
+    /// transitions): the actor still owns its endpoint. Fence and
+    /// terminal writes go through `set_state_detached` so the state
+    /// never lands ahead of the cleared runtime fields.
     pub fn set_agent_state(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1529,15 +1533,19 @@ impl Store {
         Ok(())
     }
 
-    /// Clear runtime ownership markers when the actor exits: the pid and
-    /// any attachable endpoint belong to the dead process, so leaving
-    /// them would let `agent attach` point at a stale address.
-    pub fn clear_runtime(&self, alias: &str) -> Result<()> {
+    /// Publish a detached runtime state in ONE write: the state, its
+    /// error and the cleared runtime fields land together so a reader
+    /// can never observe a fenced (`attention`) or terminal agent that
+    /// still holds a live endpoint — `dead`/`resumable` and
+    /// `agent attach` derive from exactly that pair. The pid and any
+    /// attachable endpoint belong to the dead process regardless, so
+    /// leaving them would also point `agent attach` at a stale address.
+    pub fn set_state_detached(&self, alias: &str, state: &str, error: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE agents SET pid=NULL, endpoint=NULL, generation=NULL
-             WHERE alias=?",
-            [alias],
+            "UPDATE agents SET state=?,error=?,pid=NULL,endpoint=NULL,
+                generation=NULL,updated=? WHERE alias=?",
+            params![state, error, now(), alias],
         )?;
         Ok(())
     }
