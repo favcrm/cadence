@@ -16778,12 +16778,15 @@ fn issue_start_honours_cargo_target_dir_env() {
 
 // ---- session start|end: stub daemon socket, fixture pm + repo (CAD-92) ----
 
-/// Canned `agent_show` data for one alias.
+/// Canned `agent_show` data for one alias. `flip` replaces the answer
+/// after the first `agent_show` — an agent that goes busy between the
+/// fleet snapshot and the pre-stop re-check.
 struct StubAgent {
     row: Value,
     messages: Vec<Value>,
     queued: i64,
     unknown: i64,
+    flip: Option<Value>,
 }
 
 fn stub_agent(
@@ -16809,38 +16812,51 @@ fn stub_agent(
         messages,
         queued,
         unknown,
+        flip: None,
+    }
+}
+
+impl StubAgent {
+    /// After the first `agent_show`, serve `flip` — the race case.
+    fn flipping(mut self, flip: Value) -> Self {
+        self.flip = Some(flip);
+        self
     }
 }
 
 /// The daemon wire protocol on `<state>/cadence.sock` with canned
 /// answers — the session verbs under test connect exactly like they
-/// would to the real daemon. `calls` records every method seen so a
-/// test can prove `--dry-run` mutated nothing.
+/// would to the real daemon. `calls` records `(method, params)` so a
+/// test can prove `--dry-run` mutated nothing and which agent a stop
+/// actually named.
 struct StubDaemon {
-    calls: Arc<Mutex<Vec<String>>>,
+    calls: Arc<Mutex<Vec<(String, Value)>>>,
     _thread: JoinHandle<()>,
 }
 
 fn stub_daemon(state: &Path, build_commit: &str, agents: Vec<StubAgent>) -> StubDaemon {
     std::fs::create_dir_all(state).unwrap();
     let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
-    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
     let calls_t = Arc::clone(&calls);
     let rows: Vec<Value> = agents.iter().map(|a| a.row.clone()).collect();
-    let shows: std::collections::HashMap<String, Value> = agents
-        .into_iter()
-        .map(|a| {
-            let alias = a.row["alias"].as_str().unwrap().to_string();
-            (
-                alias.clone(),
-                json!({
-                    "agent": a.row, "messages": a.messages,
-                    "queued": a.queued, "unknown": a.unknown,
-                    "event_cursor": 0,
-                }),
-            )
-        })
-        .collect();
+    let mut shows: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut flips: std::collections::HashMap<String, (Arc<Mutex<u32>>, Value)> =
+        std::collections::HashMap::new();
+    for a in agents {
+        let alias = a.row["alias"].as_str().unwrap().to_string();
+        shows.insert(
+            alias.clone(),
+            json!({
+                "agent": a.row, "messages": a.messages,
+                "queued": a.queued, "unknown": a.unknown,
+                "event_cursor": 0,
+            }),
+        );
+        if let Some(flip) = a.flip {
+            flips.insert(alias, (Arc::new(Mutex::new(0)), flip));
+        }
+    }
     let info = json!({
         "build_commit": build_commit,
         "build_time": "2026-01-01T00:00:00Z",
@@ -16856,16 +16872,32 @@ fn stub_daemon(state: &Path, build_commit: &str, agents: Vec<StubAgent>) -> Stub
             }
             let req: Value = serde_json::from_str(&line).unwrap_or_default();
             let method = req["method"].as_str().unwrap_or_default().to_string();
-            calls_t.lock().unwrap().push(method.clone());
+            calls_t
+                .lock()
+                .unwrap()
+                .push((method.clone(), req["params"].clone()));
             let params = &req["params"];
             let result = match method.as_str() {
                 "health" => json!({"ok": true, "version": 1}),
                 "daemon_info" => info.clone(),
                 "agent_list" => json!({"agents": rows}),
-                "agent_show" => shows
-                    .get(params["alias"].as_str().unwrap_or_default())
-                    .cloned()
-                    .unwrap_or_else(|| json!({"messages": [], "queued": 0, "unknown": 0})),
+                "agent_show" => {
+                    let alias = params["alias"].as_str().unwrap_or_default();
+                    if let Some((n, flip)) = flips.get(alias) {
+                        let mut n = n.lock().unwrap();
+                        *n += 1;
+                        if *n >= 2 {
+                            flip.clone()
+                        } else {
+                            shows.get(alias).cloned().unwrap_or_default()
+                        }
+                    } else {
+                        shows
+                            .get(alias)
+                            .cloned()
+                            .unwrap_or_else(|| json!({"messages": [], "queued": 0, "unknown": 0}))
+                    }
+                }
                 "agent_requests" => json!({"requests": []}),
                 "agent_probe" => json!({"idle": true}),
                 "agent_stop" => json!({"alias": params["alias"], "state": "stopped"}),
@@ -16889,12 +16921,15 @@ fn stub_daemon(state: &Path, build_commit: &str, agents: Vec<StubAgent>) -> Stub
     }
 }
 
-fn stub_calls(sd: &StubDaemon) -> Vec<String> {
+fn stub_calls(sd: &StubDaemon) -> Vec<(String, Value)> {
     sd.calls.lock().unwrap().clone()
 }
 
 /// `<pm>` with one project pointing at `repo`, one `doing` issue
-/// owned by an alias the stub does not serve, and an empty notes dir.
+/// owned by an alias the stub does not serve, a second `doing` issue
+/// with branch+worktree refs to `repo`'s merged `.cadence/wt/tst-7-done`
+/// (what `issue start` records), and an empty notes dir. The pm dir is
+/// a git repo — `issue finish` commits ref-closures into it.
 fn seed_pm(pm: &Path, repo: &Path, notes: &Path) {
     std::fs::create_dir_all(pm.join("tst")).unwrap();
     std::fs::create_dir_all(notes).unwrap();
@@ -16922,6 +16957,41 @@ fn seed_pm(pm: &Path, repo: &Path, notes: &Path) {
          priority: P2\nowner: ghost-agent\ncreated: 2026-01-01T00:00:00Z\n---\n\nbody\n",
     )
     .unwrap();
+    let wt = repo.join(".cadence/wt/tst-7-done");
+    let done = pm.join("tst/TST-7");
+    std::fs::create_dir_all(&done).unwrap();
+    std::fs::write(
+        done.join("issue.md"),
+        format!(
+            "---\nid: TST-7\ntitle: merged worktree\nstatus: doing\npriority: P2\n\
+             created: 2026-01-01T00:00:00Z\nrefs:\n\
+             - kind: branch\n  path: cadence/tst-7-done\n\
+             - kind: worktree\n  path: {}\n---\n\nbody\n",
+            wt.display()
+        ),
+    )
+    .unwrap();
+    // `issue finish` commits the ref-closure — the pm dir must be a
+    // real git repo with an identity.
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "seed"],
+    ] {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(pm)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
 }
 
 /// A git repo with a merged `cadence/tst-7-done` worktree and a plain
@@ -17030,7 +17100,7 @@ fn session_start_reports_failures_and_fix_only_starts_ui() {
     );
     // Nothing was fixed or mutated without --fix.
     assert!(!state.join("ui.pid").exists());
-    for m in stub_calls(&sd) {
+    for (m, _) in stub_calls(&sd) {
         assert!(
             !matches!(m.as_str(), "agent_stop" | "agent_gc"),
             "read-only start mutated: {m}"
@@ -17061,7 +17131,7 @@ fn session_start_reports_failures_and_fix_only_starts_ui() {
         !state.join("daemon.log").exists(),
         "daemon was started:\n{text}"
     );
-    for m in stub_calls(&sd) {
+    for (m, _) in stub_calls(&sd) {
         assert!(
             !matches!(m.as_str(), "agent_stop" | "agent_gc" | "agent_send"),
             "--fix mutated: {m}"
@@ -17091,6 +17161,21 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
         vec![
             stub_agent("old-idle", "fake", "fake", "idle", 7200, (vec![], 0, 0)),
             stub_agent("fresh-idle", "fake", "fake", "idle", 60, (vec![], 0, 0)),
+            // `state: idle` with a running message — the message, not
+            // the state field, is what keeps it alive (running_msg).
+            stub_agent(
+                "idle-running",
+                "fake",
+                "fake",
+                "idle",
+                7200,
+                (
+                    vec![json!({"id": "m-ir", "state": "running",
+                             "body": "claimed mid-run", "started": 1.0})],
+                    0,
+                    0,
+                ),
+            ),
             stub_agent(
                 "busy-one",
                 "fake",
@@ -17140,12 +17225,24 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
         !text.contains("fresh-idle"),
         "dry-run must not list a still-active agent:\n{text}"
     );
-    for m in stub_calls(&sd) {
+    for (m, _) in stub_calls(&sd) {
         assert!(
             !matches!(m.as_str(), "agent_stop" | "agent_gc"),
             "dry-run mutated: {m}"
         );
     }
+    // A dry run writes nothing — no sessions/ dir, and the markdown is
+    // previewed to stdout instead.
+    let sessions = state.join("sessions");
+    assert!(
+        !sessions.exists() || std::fs::read_dir(&sessions).unwrap().next().is_none(),
+        "dry-run wrote a handoff file: {:?}",
+        sessions
+    );
+    assert!(
+        text.contains("would write") && text.contains("## open PRs"),
+        "dry-run previews the handoff, writes nothing:\n{text}"
+    );
 
     // Real run: only the agent idle past --idle-secs is stopped.
     let out = run_session(
@@ -17159,17 +17256,29 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let stops: Vec<String> = stub_calls(&sd)
+    let stops: Vec<(String, Value)> = stub_calls(&sd)
         .into_iter()
-        .filter(|m| m == "agent_stop")
+        .filter(|(m, _)| m == "agent_stop")
         .collect();
+    assert_eq!(stops.len(), 1, "exactly one stop:\n{text}");
     assert_eq!(
-        stops,
-        vec!["agent_stop".to_string()],
-        "exactly one stop:\n{text}"
+        stops[0].1["alias"].as_str().unwrap_or_default(),
+        "old-idle",
+        "the stop names only the idle agent:\n{text}"
     );
+    // `idle-running` was state-idle but carries a running message —
+    // never stopped.
+    for (m, p) in stub_calls(&sd) {
+        if m == "agent_stop" {
+            assert_ne!(
+                p["alias"].as_str().unwrap_or_default(),
+                "idle-running",
+                "an agent with a running message was stopped:\n{text}"
+            );
+        }
+    }
     assert!(
-        stub_calls(&sd).iter().any(|m| m == "agent_gc"),
+        stub_calls(&sd).iter().any(|(m, _)| m == "agent_gc"),
         "agent gc ran:\n{text}"
     );
     assert!(text.contains("old-idle"));
@@ -17194,4 +17303,276 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
         assert!(md.contains(section), "handoff missing {section}:\n{md}");
     }
     assert!(md.contains("old-idle"), "stopped agent recorded:\n{md}");
+
+    // A second real run the same day never overwrites the first.
+    let out = run_session(&state, &pm, &repo, &["session", "end"]);
+    // warnings are fine — the host sweep reads the real host — but a
+    // hard failure (2) is not.
+    assert_ne!(
+        out.status.code().unwrap_or(-1),
+        2,
+        "second end failed:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let notes: Vec<PathBuf> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(
+        notes.len(),
+        2,
+        "two handoff files, none overwritten: {notes:?}"
+    );
+}
+
+/// Round-2 B1: the initial `fleet()` snapshot is only a candidate list.
+/// If an agent turns busy between the snapshot and the stop, `session
+/// end` re-shows it and must not stop it.
+#[test]
+fn session_end_stop_race_rechecks_show() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, notes) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("notes"),
+    );
+    for d in [&state, &pm, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    seed_pm(&pm, &repo, &notes);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    // First agent_show: an idle, stop-worthy candidate. Second show —
+    // the pre-stop re-check — the agent has turned busy with a running
+    // message. No agent_stop may be issued for it.
+    let flip_show = json!({
+        "agent": {
+            "alias": "racy", "provider": "fake", "endpoint_kind": "fake",
+            "endpoint": "ep", "state": "busy", "dead": false,
+            "updated": now,
+        },
+        "messages": [{"id": "m-racy", "state": "running",
+                      "body": "dispatched mid-sweep", "started": now}],
+        "queued": 0, "unknown": 0, "event_cursor": 0,
+    });
+    let sd = stub_daemon(
+        &state,
+        cadence_agent::overview::BUILD_COMMIT,
+        vec![
+            stub_agent("racy", "fake", "fake", "idle", 7200, (vec![], 0, 0)).flipping(flip_show),
+            stub_agent("calm", "fake", "fake", "idle", 7200, (vec![], 0, 0)),
+        ],
+    );
+    let out = run_session(&state, &pm, &repo, &["session", "end"]);
+    assert_ne!(
+        out.status.code().unwrap_or(-1),
+        2,
+        "end failed:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let stops: Vec<(String, Value)> = stub_calls(&sd)
+        .into_iter()
+        .filter(|(m, _)| m == "agent_stop")
+        .collect();
+    assert_eq!(
+        stops.len(),
+        1,
+        "only the still-idle agent was stopped:\n{text}"
+    );
+    assert_eq!(
+        stops[0].1["alias"].as_str().unwrap_or_default(),
+        "calm",
+        "the raced agent must never be stopped:\n{text}"
+    );
+    assert!(
+        text.contains("racy") && text.contains("skip"),
+        "the skipped re-check is reported:\n{text}"
+    );
+    // Contract: the re-check was a second agent_show for racy.
+    let shows = stub_calls(&sd)
+        .iter()
+        .filter(|(m, p)| m == "agent_show" && p["alias"] == "racy")
+        .count();
+    assert!(
+        shows >= 2,
+        "racy was re-shown {shows}x before the stop decision"
+    );
+}
+
+/// Round-2 B3: --project scopes the finish sweep; other projects'
+/// merged worktrees are never touched.
+#[test]
+fn session_end_project_scopes_sweep() {
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, home, state) = (
+        tmp.path().join("pm"),
+        tmp.path().join("home"),
+        tmp.path().join("state"),
+    );
+    let repo_a = tmp.path().join("repo-a");
+    let repo_b = tmp.path().join("repo-b");
+    for dir in [&pm_dir, &home, &state, &repo_a, &repo_b] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    for repo in [&repo_a, &repo_b] {
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "t@t"]);
+        git(repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-qm", "init"]);
+    }
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli_raw = |args: &[&str]| -> (i32, String, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let (code, stdout, stderr) = cli_raw(args);
+        (
+            code == 0,
+            serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|_| panic!("{args:?} not json ({stderr}): {stdout}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let ra = repo_a.canonicalize().unwrap().to_str().unwrap().to_string();
+    let rb = repo_b.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "aaa", "--prefix", "A", "--repo", &ra]).0);
+    assert!(cli(&["issue", "project", "add", "bbb", "--prefix", "B", "--repo", &rb]).0);
+    assert!(cli(&["issue", "new", "one", "--project", "aaa"]).0);
+    assert!(cli(&["issue", "new", "two", "--project", "bbb"]).0);
+    for id in ["A-1", "B-1"] {
+        let (ok, out) = cli(&["issue", "start", id]);
+        assert!(ok, "{out}");
+        let (ok, _) = cli(&["issue", "set", id, "owner="]);
+        assert!(ok);
+    }
+    let wt_a = repo_a.join(".cadence/wt/a-1-one");
+    let wt_b = repo_b.join(".cadence/wt/b-1-two");
+    for (wt, file) in [(&wt_a, "a.txt"), (&wt_b, "b.txt")] {
+        std::fs::write(wt.join(file), "x").unwrap();
+        git(wt, &["add", "-A"]);
+        git(wt, &["commit", "-qm", "work"]);
+    }
+    git(&repo_a, &["merge", "-q", "cadence/a-1-one"]);
+    git(&repo_b, &["merge", "-q", "cadence/b-1-two"]);
+    assert!(wt_a.exists() && wt_b.exists(), "fixture wts exist");
+
+    // Empty fleet — the sweep is all that matters here.
+    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+    let out = run_session(
+        &state,
+        &pm_dir,
+        &repo_a,
+        &["session", "end", "--project", "aaa"],
+    );
+    assert_ne!(
+        out.status.code().unwrap_or(-1),
+        2,
+        "scoped end failed:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !wt_a.exists(),
+        "scoped run left project aaa's merged worktree"
+    );
+    assert!(wt_b.exists(), "scoped run removed project bbb's worktree");
+}
+
+/// Round-2 S7 + nit: `--json` stdout is exactly one JSON document, and
+/// an unknown `--project` is rejected like `issue ls --project`.
+#[test]
+fn session_json_single_document_and_project_validation() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, notes) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("notes"),
+    );
+    for d in [&state, &pm, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    seed_pm(&pm, &repo, &notes);
+    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+    // `ui.json` seeded with a free port so `start --fix` actually starts
+    // the UI — the path that used to pollute the composed JSON.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    std::fs::write(state.join("ui.json"), format!("{{\"port\": {port}}}")).unwrap();
+
+    let out = run_session(&state, &pm, &repo, &["session", "start", "--fix", "--json"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str::<Value>(text.trim())
+        .unwrap_or_else(|e| panic!("start --fix --json is not one document: {e}\n{text}"));
+    let _ = run_session(&state, &pm, &repo, &["ui", "stop"]);
+
+    let out = run_session(&state, &pm, &repo, &["session", "end", "--json"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str::<Value>(text.trim())
+        .unwrap_or_else(|e| panic!("end --json is not one document: {e}\n{text}"));
+
+    // Unknown project is an error, not an empty sweep.
+    for args in [
+        vec!["session", "start", "--project", "nosuch"],
+        vec!["session", "end", "--project", "nosuch"],
+    ] {
+        let out = run_session(&state, &pm, &repo, &args);
+        assert!(
+            !out.status.success(),
+            "{args:?} accepted an unknown project:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let msg = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(msg.contains("nosuch"), "{args:?}: {msg}");
+    }
 }

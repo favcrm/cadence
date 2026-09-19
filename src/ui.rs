@@ -2174,6 +2174,12 @@ fn start(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i32> {
     start_inner(state_dir, flags, reset, false)
 }
 
+/// `ui start` with no stdout — for composed callers (session's
+/// `--fix`) whose own output must stay a single document.
+pub(crate) fn start_quiet(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i32> {
+    start_inner(state_dir, flags, reset, true)
+}
+
 fn start_inner(state_dir: &Path, flags: &UiFlags, reset: bool, quiet: bool) -> Result<i32> {
     std::fs::create_dir_all(state_dir)?;
     if reset {
@@ -2517,6 +2523,16 @@ fn tailscale_cli(state_dir: &Path, action: &TailscaleAction) -> Result<i32> {
 /// identity, ensure the mapping, persist, (re)start the board so the
 /// new Host/Origin allowlists are live, print the URL.
 fn ts_start(state_dir: &Path, https_port: u16, read_only: bool) -> Result<i32> {
+    ts_start_inner(state_dir, https_port, read_only, false)
+}
+
+/// `ui tailscale start` with no stdout — for composed callers
+/// (session's `--fix`).
+pub(crate) fn ts_start_quiet(state_dir: &Path, https_port: u16, read_only: bool) -> Result<i32> {
+    ts_start_inner(state_dir, https_port, read_only, true)
+}
+
+fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: bool) -> Result<i32> {
     let me = ts_self()?;
     let mut opts = load_opts(state_dir);
     let ui_port = opts.port.unwrap_or(3010);
@@ -2542,18 +2558,20 @@ fn ts_start(state_dir: &Path, https_port: u16, read_only: bool) -> Result<i32> {
     }
     let code = start_inner(state_dir, &UiFlags::default(), false, true)?;
     let ts = opts.tailscale.as_ref().expect("set above");
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "state": "sharing",
-            "tailnet_url": ts.url(),
-            "mapping": format!("https:{} → {}", ts.https_port, ts.target),
-            "mapping_created": created,
-            "board": if was_running { "restarted" } else { "started" },
-            "read_only": opts.read_only,
-        }))
-        .unwrap_or_default()
-    );
+    if !quiet {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "state": "sharing",
+                "tailnet_url": ts.url(),
+                "mapping": format!("https:{} → {}", ts.https_port, ts.target),
+                "mapping_created": created,
+                "board": if was_running { "restarted" } else { "started" },
+                "read_only": opts.read_only,
+            }))
+            .unwrap_or_default()
+        );
+    }
     Ok(code)
 }
 

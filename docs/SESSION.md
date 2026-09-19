@@ -46,7 +46,9 @@ live owner, open PRs on `cadence/` branches with no local worktree,
 `.cadence/wt/*` dirs with neither an open PR nor an open issue) and
 `inbox` (unread mailbox queues). Every line prints `ok`/`warn`/`fail`
 with a one-line remedy; `--fix` only ever starts things, never
-restarts a running daemon, never removes anything.
+restarts a running daemon, never removes anything. `--project <key>`
+scopes the tracker reads and repo scans to one project — an unknown
+key is an error, same as `issue ls --project`.
 
 Then bring the workers back:
 
@@ -368,16 +370,20 @@ cadence session end            # the sweep below as one verb — plan, apply, ha
 cadence session end --dry-run  # the plan only: idle agents, merged worktrees, gc
 ```
 
-`session end` runs `issue finish --merged` when the build has it
-(`--force-finish` forwards `--force`, recorded), stops every agent
-idle past `--idle-secs` (default 1800) that has nothing queued, no
-running message and no busy pane, runs `agent gc --older-than 1h`,
-reports orphan test processes and disk state (never kills), then
-prints and writes the handoff note to `<state>/sessions/<date>-end.md`
-— open PRs with head and verdict, running turns, queued kickoffs,
-issues in review, what the next session does first, and what the run
-applied. It never stops a busy agent and never stops the daemon while
-work is live.
+`session end` runs the same merged-worktree sweep as `issue finish
+--merged` (`--project` scopes it to one project, `--force-finish` is
+recorded but ignored — the sweep never forces), then stops every
+agent idle past `--idle-secs` (default 1800) that has nothing queued,
+no running message and no busy pane — re-checking each one live
+immediately before the stop so an agent that claimed work mid-sweep
+is skipped, never killed mid-turn. It then runs `agent gc --older-than
+1h`, reports orphan test processes and disk state (never kills; argv
+secrets are redacted), and writes the handoff note to
+`<state>/sessions/<YYYYMMDDTHHMMSSZ>-end.md` — timestamped, so a same-day
+rerun never overwrites. `--dry-run` writes nothing: the row names the
+file it would write and the markdown prints to stdout (or the `--json`
+payload's `handoff_md`). It never stops a busy agent and never stops
+the daemon while work is live.
 
 What the run decides, for reference — the same judgments the checklist
 used to list by hand:

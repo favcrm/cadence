@@ -3472,7 +3472,7 @@ fn run() -> Result<i32> {
                 idle_secs,
                 cwd: std::env::current_dir()?,
                 state_dir,
-                merged_finish: probe_finish_merged(force_finish),
+                merged_force: probe_finish_force(),
             }),
         },
         Commands::Overview { json, watch } => run_overview(&state_dir, json, watch),
@@ -3480,28 +3480,12 @@ fn run() -> Result<i32> {
     }
 }
 
-/// `issue finish --merged` (CAD-93) parsed against this build's CLI —
-/// the feature check that lets `session end` call the sweep the day it
-/// lands and report "not available" until then. `--force` is probed
-/// first when `--force-finish` was passed; a build whose sweep lacks
-/// `--force` falls back to the plain call.
-fn probe_finish_merged(force: bool) -> Option<cadence_agent::issue::cli::IssueAction> {
-    let attempts: &[&[&str]] = if force {
-        &[
-            &["cadence", "issue", "finish", "--merged", "--force"],
-            &["cadence", "issue", "finish", "--merged"],
-        ]
-    } else {
-        &[&["cadence", "issue", "finish", "--merged"]]
-    };
-    for argv in attempts {
-        if let Ok(cli) = Cli::try_parse_from(argv.iter().copied()) {
-            if let Commands::Issue { action } = cli.command {
-                return Some(action);
-            }
-        }
-    }
-    None
+/// Whether this build's CLI accepts `issue finish --merged --force` —
+/// the sweep itself is the library call `issue::finish::sweep`, which
+/// has no force path; this probe only decides whether `session end
+/// --force-finish` is honoured or reported as ignored.
+fn probe_finish_force() -> bool {
+    Cli::try_parse_from(["cadence", "issue", "finish", "--merged", "--force"]).is_ok()
 }
 
 /// The `cadence job` tree — thin RPC wrappers. Validation, transitions

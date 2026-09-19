@@ -10,24 +10,24 @@
 //! never restarts a running daemon and never removes anything.
 //!
 //! `end` is the evening sweep: the merged-worktree finish (CAD-93's
-//! `issue finish --merged` — feature-checked by parsing the argv so
-//! the call appears the day it lands and reads "not available" until
-//! then), `agent stop` for agents idle past `--idle-secs` with nothing
-//! queued and no running message, `agent gc --older-than 1h`, a host
-//! sweep (orphaned test processes are reported, never killed), and a
-//! handoff note under `<state>/sessions/<date>-end.md`. `--dry-run`
-//! prints the plan. It never stops a busy agent and never stops the
-//! daemon while work is live.
+//! `issue finish --merged` as the library call, dry-run honoured),
+//! `agent stop` for agents idle past `--idle-secs` with nothing queued
+//! and no running message — re-verified against a live `agent_show`
+//! immediately before each stop so a just-dispatched agent is skipped,
+//! never killed mid-turn — `agent gc --older-than 1h`, a host sweep
+//! (orphaned processes are reported, never killed, and command lines
+//! are redacted so argv secrets never reach output), and a handoff
+//! note under `<state>/sessions/<timestamp>-end.md` (real runs never
+//! overwrite; `--dry-run` writes nothing and previews the markdown).
+//! It never stops a busy agent and never stops the daemon while work
+//! is live.
 //!
 //! Every check is composed from the existing implementations — doctor,
 //! `daemon_info`, `ui status`, overview's needs-me rows, the tracker
-//! views — never re-computed here. Every subprocess goes through
-//! [`crate::proc::run_bounded`].
+//! views, `issue finish`'s sweep — never re-computed here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -37,10 +37,7 @@ use crate::doctor;
 use crate::error::{Error, Result};
 use crate::issue::{self, board, project, time as itime};
 use crate::overview;
-use crate::proc::run_bounded;
 use crate::ui;
-
-const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Sev {
@@ -112,10 +109,73 @@ impl Row {
     fn json(&self) -> Value {
         json!({
             "name": self.name, "severity": self.sev.name(),
-            "detail": self.detail, "remedy": self.remedy,
-            "fixed": self.fixed, "items": self.items,
+            "detail": redact_text(&self.detail), "remedy": self.remedy,
+            "fixed": self.fixed,
+            "items": self.items.iter().map(|i| redact_text(i)).collect::<Vec<_>>(),
         })
     }
+}
+
+/// Process argv — doctor's orphan `head` strings are full command
+/// lines and can carry live credentials. The value of any argument
+/// whose name matches `(?i)(key|token|secret|password|passwd|auth)`
+/// becomes `REDACTED`, in `--flag=value`, `--flag value` and
+/// `NAME=value` shapes alike. Over-redaction is the safe direction.
+fn redact_text(s: &str) -> String {
+    const KW: [&str; 6] = ["key", "token", "secret", "password", "passwd", "auth"];
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let (mut last, mut i) = (0usize, 0usize);
+    while i < b.len() {
+        let kw_len = KW
+            .iter()
+            .filter(|kw| {
+                b.len() - i >= kw.len() && b[i..i + kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+            })
+            .map(|kw| kw.len())
+            .max();
+        let Some(kl) = kw_len else {
+            i += 1;
+            continue;
+        };
+        // After the key: any name-suffix chars, then a separator —
+        // `=`, `:`, or whitespace — then the value.
+        let mut j = i + kl;
+        while j < b.len() && b[j] != b'=' && b[j] != b':' && !b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= b.len() {
+            break;
+        }
+        let mut k = j + 1;
+        while k < b.len() && b[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= b.len() {
+            break;
+        }
+        // Token end — and for `auth: Bearer <tok>` the scheme word is
+        // not the secret; the token after it is.
+        let mut e = k;
+        while e < b.len() && !b[e].is_ascii_whitespace() {
+            e += 1;
+        }
+        if s[k..e].eq_ignore_ascii_case("bearer") {
+            // The scheme word isn't the secret — eat it and the token.
+            while e < b.len() && b[e].is_ascii_whitespace() {
+                e += 1;
+            }
+            while e < b.len() && !b[e].is_ascii_whitespace() {
+                e += 1;
+            }
+        }
+        out.push_str(&s[last..k]);
+        out.push_str("REDACTED");
+        last = e;
+        i = e;
+    }
+    out.push_str(&s[last..]);
+    out
 }
 
 /// The host scan with the command's cwd — `Scan::host` defaults to
@@ -174,13 +234,18 @@ fn host_row(name: &'static str, report: &Value) -> Row {
 }
 
 fn print_row(r: &Row) {
-    let mut line = format!("{:<9} {:<4} {}", r.name, r.sev.name(), r.detail);
+    let mut line = format!(
+        "{:<9} {:<4} {}",
+        r.name,
+        r.sev.name(),
+        redact_text(&r.detail)
+    );
     if let Some(rem) = &r.remedy {
-        line.push_str(&format!(" — {rem}"));
+        line.push_str(&format!(" — {}", redact_text(rem)));
     }
     println!("{line}");
     for i in &r.items {
-        println!("           · {i}");
+        println!("           · {}", redact_text(i));
     }
     if let Some(f) = &r.fixed {
         println!("           fixed: {f}");
@@ -188,23 +253,6 @@ fn print_row(r: &Row) {
 }
 
 // ---------- shared probes ----------
-
-fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo).args(args);
-    let out = run_bounded(&mut cmd, GIT_TIMEOUT).map_err(|e| {
-        Error::internal(format!("git {} in {}: {e}", args.join(" "), repo.display()))
-    })?;
-    if !out.status.success() {
-        return Err(Error::internal(format!(
-            "git {} in {}: {}",
-            args.join(" "),
-            repo.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
 
 /// Agent rows plus each one's `agent_show` — the snapshot both verbs
 /// read. Empty when the daemon is unreachable.
@@ -238,13 +286,13 @@ fn fleet(state_dir: &Path) -> Fleet {
     }
 }
 
-/// The in-flight message for one agent — `running`/`submitting`/
-/// `submitted` — as `(id, first-line, age_secs)`.
+/// The in-flight message for one agent — `running` or `submitting` —
+/// as `(id, first-line, age_secs)`.
 fn running_msg(show: &Value, now: i64) -> Option<(String, String, i64)> {
     show["messages"].as_array()?.iter().find_map(|m| {
         if !matches!(
             m["state"].as_str().unwrap_or_default(),
-            "running" | "submitting" | "submitted"
+            "running" | "submitting"
         ) {
             return None;
         }
@@ -269,6 +317,37 @@ fn running_msg(show: &Value, now: i64) -> Option<(String, String, i64)> {
     })
 }
 
+/// The full "may be stopped" test, run against one agent's row and its
+/// `agent_show` — used for the initial candidate list AND re-applied
+/// against a fresh `agent_show` immediately before every `agent_stop`,
+/// so an agent that claimed work while the sweep ran is skipped rather
+/// than killed mid-turn.
+fn stoppable(state_dir: &Path, agent: &Value, show: &Value, idle_secs: u64, now: i64) -> bool {
+    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
+    if agent["state"].as_str() != Some("idle")
+        || agent["dead"].as_bool().unwrap_or(false)
+        || show["queued"].as_i64().unwrap_or(0) > 0
+        || running_msg(show, now).is_some()
+    {
+        return false;
+    }
+    let updated = agent["updated"].as_f64().unwrap_or(now as f64) as i64;
+    if now - updated < idle_secs as i64 {
+        return false;
+    }
+    // Never stop a busy pane: a live pty endpoint must probe idle.
+    if kind == "pty" && agent["endpoint"].is_string() {
+        return client::rpc(
+            state_dir,
+            "agent_probe",
+            json!({"alias": agent["alias"].as_str().unwrap_or_default()}),
+        )
+        .map(|p| p["idle"].as_bool().unwrap_or(false))
+        .unwrap_or(false);
+    }
+    true
+}
+
 /// Tracker projects and views for `scope` (`None` = all projects), plus
 /// each project's locally-declared repo checkouts for the fs scans.
 struct Scope {
@@ -280,7 +359,7 @@ struct Scope {
     issue_status: HashMap<String, String>,
 }
 
-fn scope(project: Option<&str>) -> Scope {
+fn scope(project: Option<&str>) -> Result<Scope> {
     let mut out = Scope {
         projects: Vec::new(),
         views: Vec::new(),
@@ -288,11 +367,16 @@ fn scope(project: Option<&str>) -> Scope {
         issue_status: HashMap::new(),
     };
     let Ok(pm) = issue::Pm::open_default() else {
-        return out;
+        return Ok(out);
     };
-    let all = project::list(&pm.dir).unwrap_or_default();
+    let all = project::list(&pm.dir)?;
     let mut projects = all.clone();
     if let Some(want) = project {
+        if !all.iter().any(|p| p.key == want) {
+            return Err(Error::rejected(format!(
+                "unknown project '{want}' — `cadence project ls` lists the keys"
+            )));
+        }
         projects.retain(|p| p.key == want);
     }
     for p in &projects {
@@ -321,7 +405,7 @@ fn scope(project: Option<&str>) -> Scope {
     // All projects — `build_repo_match` must find the build's repo
     // even when `--project` narrowed the checks above.
     out.projects = all;
-    out
+    Ok(out)
 }
 
 /// The `cadence/<wt-name>` open-PR branch names, lowercased, plus the
@@ -397,7 +481,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
 
     // ---- host: the CAD-72 watchdog — disk, WAL, pipes, orphans,
     // temp dirs, stale worktrees in one read-only scan ----
-    let sc = scope(opts.project.as_deref());
+    let sc = scope(opts.project.as_deref())?;
     let host_scan = doctor::host::run(&host_scan_for(opts.state_dir.clone(), opts.cwd.clone()));
     let host = host_row("host", &host_scan);
     rows.push(host);
@@ -484,13 +568,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
     let ui_opts = ui::persisted_opts(&opts.state_dir);
     let port = ui_opts.port.unwrap_or(3010);
     if ui::detached_pid(&opts.state_dir).is_none() && opts.fix {
-        match ui::run_cli(
-            &opts.state_dir,
-            &ui::UiAction::Start {
-                flags: ui::UiFlags::default(),
-                reset: false,
-            },
-        ) {
+        match ui::start_quiet(&opts.state_dir, &ui::UiFlags::default(), false) {
             Ok(_) => {
                 fixes.push("ui start".to_string());
                 board.fixed = Some("ui start".to_string());
@@ -516,15 +594,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                 if live {
                     detail.push_str(&format!(", shared {}", ts.url()));
                 } else if opts.fix {
-                    match ui::run_cli(
-                        &opts.state_dir,
-                        &ui::UiAction::Tailscale {
-                            action: ui::TailscaleAction::Start {
-                                port: ts.https_port,
-                                read_only: ui_opts.read_only,
-                            },
-                        },
-                    ) {
+                    match ui::ts_start_quiet(&opts.state_dir, ts.https_port, ui_opts.read_only) {
                         Ok(_) => {
                             board.fixed = Some(format!("ui tailscale start → {}", ts.url()));
                             detail.push_str(&format!(", shared {}", ts.url()));
@@ -755,70 +825,103 @@ pub struct EndOptions {
     pub idle_secs: u64,
     pub cwd: PathBuf,
     pub state_dir: PathBuf,
-    /// `issue finish --merged` parsed in main.rs when this build's CLI
-    /// accepts it — `None` means the sweep isn't on this binary yet.
-    pub merged_finish: Option<crate::issue::cli::IssueAction>,
+    /// Whether this build's CLI accepts `issue finish --merged --force`
+    /// (probed in main.rs). The library sweep has no force path — this
+    /// only decides whether `--force-finish` is reported as ignored.
+    pub merged_force: bool,
 }
 
 pub fn run_end(opts: &EndOptions) -> Result<i32> {
     let now = itime::now_epoch();
-    let sc = scope(opts.project.as_deref());
+    let sc = scope(opts.project.as_deref())?;
     let fl = fleet(&opts.state_dir);
     let mut rows: Vec<Row> = Vec::new();
     let mut done = EndActions::default();
     let mut failures = 0u32;
 
-    // ---- merged-worktree sweep ----
-    let candidates = merged_worktree_candidates(&sc.repos);
+    // ---- merged-worktree sweep: the library call, not the CLI —
+    // nothing prints ahead of a --json report, --project scopes it,
+    // and its own dry run is the plan ----
     let mut sweep = Row::new("finish");
-    match &opts.merged_finish {
-        None => {
-            sweep = sweep.ok(format!(
-                "issue finish --merged not available — {} merged candidate(s) listed",
-                candidates.len()
-            ));
-            for c in &candidates {
-                sweep.items.push(format!(
-                    "{} ({}) — would finish",
-                    c["worktree"].as_str().unwrap_or("?"),
-                    c["branch"].as_str().unwrap_or("?"),
-                ));
-            }
+    match issue::Pm::open_default() {
+        Err(_) => {
+            sweep = sweep.ok("no tracker — nothing to finish");
         }
-        Some(action) => {
-            if opts.dry_run {
-                sweep.detail = format!(
-                    "would run `cadence issue finish --merged{}` — {} candidate(s)",
-                    if opts.force_finish { " --force" } else { "" },
-                    candidates.len()
-                );
-                for c in &candidates {
-                    sweep.items.push(format!(
-                        "{} ({})",
-                        c["worktree"].as_str().unwrap_or("?"),
-                        c["branch"].as_str().unwrap_or("?")
-                    ));
+        Ok(pm) => match issue::finish::sweep(
+            &pm,
+            opts.project.as_deref(),
+            false,
+            opts.dry_run,
+            "",
+            &opts.state_dir,
+        ) {
+            Ok(out) => {
+                let srows = out["rows"].as_array().cloned().unwrap_or_default();
+                let (mut refused, mut would) = (0usize, 0usize);
+                for r in &srows {
+                    let wt = r["worktree"].as_str().unwrap_or("?");
+                    let branch = r["branch"].as_str().unwrap_or("?");
+                    let label = format!("{wt} ({branch})");
+                    let reason = r["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    match r["outcome"].as_str().unwrap_or_default() {
+                        "finished" => {
+                            done.finished.push(wt.to_string());
+                            sweep.items.push(format!("{label} — finished"));
+                        }
+                        "would-finish" => {
+                            would += 1;
+                            sweep.items.push(format!("{label} — would finish"));
+                        }
+                        "skipped" => {
+                            sweep.items.push(format!("{label} — skipped({reason})"));
+                        }
+                        "refused" => {
+                            refused += 1;
+                            sweep.items.push(format!("{label} — refused({reason})"));
+                        }
+                        _ => {}
+                    }
                 }
-            } else {
-                match issue::cli::run(action, &opts.state_dir) {
-                    Ok(0) => {
-                        sweep = sweep.ok(format!("{} candidate(s)", candidates.len()));
-                        done.finished = candidates
-                            .iter()
-                            .filter_map(|c| c["worktree"].as_str().map(str::to_string))
-                            .collect();
-                    }
-                    Ok(code) => {
-                        sweep = sweep.fail(format!("issue finish --merged exited {code}"), "");
-                        failures += 1;
-                    }
-                    Err(e) => {
-                        sweep = sweep.fail(format!("issue finish --merged failed: {e}"), "");
-                        failures += 1;
-                    }
+                sweep.detail = if opts.dry_run {
+                    format!(
+                        "would run `cadence issue finish --merged` — {} candidate(s)",
+                        would + refused
+                    )
+                } else {
+                    format!(
+                        "{} finished of {} candidate(s)",
+                        done.finished.len(),
+                        srows.len()
+                    )
+                };
+                if refused > 0 {
+                    sweep.sev = Sev::Warn;
                 }
             }
-        }
+            Err(e) => {
+                sweep = sweep.fail(format!("issue finish --merged failed: {e}"), "");
+                failures += 1;
+            }
+        },
+    }
+    // --force-finish honesty: the sweep has no force path — say so
+    // rather than reporting a force that never ran.
+    if opts.force_finish && !opts.merged_force {
+        sweep
+            .items
+            .push("--force-finish ignored: issue finish --merged has no --force".to_string());
+        sweep.sev = Sev::Warn;
+        done.finish_notes
+            .push("--force-finish ignored: issue finish --merged has no --force".to_string());
+    } else if opts.force_finish {
+        done.finish_notes
+            .push("finish ran with --force (recorded)".to_string());
     }
     rows.push(sweep);
 
@@ -887,6 +990,28 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         };
         if !opts.dry_run {
             for alias in &stop_candidates {
+                // The fleet snapshot is stale — the finish sweep ran
+                // git/gh per worktree. Re-verify against a live
+                // agent_show before stopping: an agent that claimed
+                // work meanwhile is skipped, never killed mid-turn.
+                let still = client::rpc(&opts.state_dir, "agent_show", json!({"alias": alias}))
+                    .map(|show| {
+                        stoppable(
+                            &opts.state_dir,
+                            &show["agent"],
+                            &show,
+                            opts.idle_secs,
+                            itime::now_epoch(),
+                        )
+                    })
+                    .unwrap_or(false);
+                if !still {
+                    done.stop_skipped.push(alias.clone());
+                    idle_row
+                        .items
+                        .push(format!("{alias} — skipped: busy or changed during the run"));
+                    continue;
+                }
                 match client::rpc(&opts.state_dir, "agent_stop", json!({"alias": alias})) {
                     Ok(_) => done.stopped.push(alias.clone()),
                     Err(e) => {
@@ -974,16 +1099,36 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     }
     rows.push(sweep_row);
 
-    // ---- handoff ----
+    // ---- handoff: --dry-run writes nothing — the row names the file
+    // it would write and the markdown goes to stdout / the json
+    // payload. Real runs use a timestamped name and never overwrite.
     let (_, gh_repos) = gh_open(&opts.state_dir, &sc);
-    let handoff_path = match write_handoff(opts, &fl, &sc, &gh_repos, &done, now) {
-        Ok(p) => p,
-        Err(e) => {
-            rows.push(Row::new("handoff").fail(format!("{e}"), ""));
-            failures += 1;
-            PathBuf::new()
+    let md = handoff_md(opts, &fl, &sc, &gh_repos, &done, now);
+    let mut handoff_path = PathBuf::new();
+    let mut handoff_preview = None;
+    if opts.dry_run {
+        let would = opts.state_dir.join("sessions").join(handoff_name(now, 0));
+        rows.push(Row::new("handoff").ok(format!("would write {}", would.display())));
+        handoff_preview = Some(md.clone());
+    } else {
+        let dir = opts.state_dir.join("sessions");
+        let path = (0..100u32)
+            .map(|n| dir.join(handoff_name(now, n)))
+            .find(|p| !p.exists());
+        match path {
+            None => {
+                rows.push(Row::new("handoff").fail("no free handoff filename", ""));
+                failures += 1;
+            }
+            Some(p) => match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&p, &md)) {
+                Ok(_) => handoff_path = p,
+                Err(e) => {
+                    rows.push(Row::new("handoff").fail(format!("{e}"), ""));
+                    failures += 1;
+                }
+            },
         }
-    };
+    }
     if !handoff_path.as_os_str().is_empty() {
         rows.push(Row::new("handoff").ok(handoff_path.display().to_string()));
     }
@@ -1006,8 +1151,10 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
                 "steps": rows.iter().map(|r| r.json()).collect::<Vec<_>>(),
                 "stop_candidates": stop_candidates,
                 "stopped": done.stopped,
+                "stop_skipped": done.stop_skipped,
                 "gc_removed": done.gc_removed,
                 "handoff": handoff_path,
+                "handoff_md": if opts.dry_run { Some(md) } else { None },
             }))
             .unwrap_or_default()
         );
@@ -1019,91 +1166,48 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         for r in &rows {
             print_row(r);
         }
-    }
-    Ok(exit)
-}
-
-/// `.cadence/wt/*` entries whose branch is already merged into the
-/// repo's default ref — the read-only half of the finish sweep. The
-/// mutation itself is `issue finish --merged`; this list only plans.
-fn merged_worktree_candidates(repos: &[(String, Option<String>, PathBuf)]) -> Vec<Value> {
-    let mut out = Vec::new();
-    for (_, _, root) in repos {
-        let Ok(list) = git(root, &["worktree", "list", "--porcelain"]) else {
-            continue;
-        };
-        let default = git(
-            root,
-            &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
-        )
-        .ok()
-        .or_else(|| git(root, &["symbolic-ref", "--short", "HEAD"]).ok());
-        let Some(default) = default else { continue };
-        let mut cur_path = String::new();
-        let mut cur_branch = String::new();
-        for line in list.lines().chain(std::iter::once("")) {
-            if line.is_empty() {
-                let name = Path::new(&cur_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if cur_path.contains("/.cadence/wt/")
-                    && !cur_branch.is_empty()
-                    && !Path::new(&cur_path).join(".cadence-review-tree").is_file()
-                {
-                    let merged = git(
-                        root,
-                        &["merge-base", "--is-ancestor", &cur_branch, &default],
-                    )
-                    .is_ok()
-                    .then_some("ancestry")
-                    .or_else(|| {
-                        git(root, &["cherry", &default, &cur_branch])
-                            .ok()
-                            .filter(|m| !m.lines().any(|l| l.starts_with('+')))
-                            .map(|_| "cherry")
-                    });
-                    if let Some(how) = merged {
-                        out.push(json!({
-                            "repo": root, "worktree": cur_path, "branch": cur_branch,
-                            "merged_by": how,
-                            "issue": issue_stem(&name),
-                        }));
-                    }
-                }
-                cur_path.clear();
-                cur_branch.clear();
-                continue;
-            }
-            if let Some(p) = line.strip_prefix("worktree ") {
-                cur_path = p.to_string();
-            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
-                cur_branch = b.to_string();
-            }
+        if let Some(preview) = &handoff_preview {
+            println!("\n{preview}");
         }
     }
-    out
+    Ok(exit)
 }
 
 /// What `session end` applied — reported on screen and in the handoff.
 #[derive(Default)]
 struct EndActions {
     stopped: Vec<String>,
+    /// Candidates that went busy between the fleet snapshot and their
+    /// pre-stop re-check — skipped, never killed mid-turn.
+    stop_skipped: Vec<String>,
     gc_removed: Vec<String>,
     finished: Vec<String>,
+    /// Honest finish notes (e.g. `--force-finish` ignored).
+    finish_notes: Vec<String>,
+}
+
+/// The handoff filename — timestamped so two runs the same day never
+/// overwrite each other; `n` disambiguates same-second runs.
+fn handoff_name(now: i64, n: u32) -> String {
+    let (y, mo, d, h, mi, s) = itime::utc_parts(now);
+    if n == 0 {
+        format!("{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z-end.md")
+    } else {
+        format!("{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z-{n}-end.md")
+    }
 }
 
 /// The end-of-day note: open PRs with head + verdict, live turns,
 /// queued work, issues in review, and what the next session does first.
-fn write_handoff(
+/// Pure — the caller decides whether (and where) it lands on disk.
+fn handoff_md(
     opts: &EndOptions,
     fl: &Fleet,
     sc: &Scope,
     gh_repos: &HashMap<String, Value>,
     done: &EndActions,
     now: i64,
-) -> Result<PathBuf> {
+) -> String {
     let (y, mo, d, h, mi, s) = itime::utc_parts(now);
     let mut md = format!("# session end — {y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z\n\n");
 
@@ -1149,7 +1253,10 @@ fn write_handoff(
         let show = fl.shows.get(alias).cloned().unwrap_or_default();
         if let Some((id, head, age)) = running_msg(&show, now) {
             any_run = true;
-            md.push_str(&format!("- {alias}: {id} ({age}s) {head}\n"));
+            md.push_str(&format!(
+                "- {alias}: {id} ({age}s) {}\n",
+                redact_text(&head)
+            ));
         }
         let queued = show["queued"].as_i64().unwrap_or(0);
         if queued > 0 {
@@ -1190,6 +1297,12 @@ fn write_handoff(
             done.stopped.join(", ")
         }
     ));
+    if !done.stop_skipped.is_empty() {
+        md.push_str(&format!(
+            "- skipped (went busy during the run): {}\n",
+            done.stop_skipped.join(", ")
+        ));
+    }
     md.push_str(&format!(
         "- gc removed: {}\n",
         if done.gc_removed.is_empty() {
@@ -1206,8 +1319,8 @@ fn write_handoff(
             done.finished.join(", ")
         }
     ));
-    if opts.force_finish {
-        md.push_str("- finish ran with --force (recorded)\n");
+    for n in &done.finish_notes {
+        md.push_str(&format!("- {n}\n"));
     }
     if opts.dry_run {
         md.push_str("- dry run — nothing above was applied\n");
@@ -1247,10 +1360,72 @@ fn write_handoff(
     } else if fl.reachable {
         md.push_str("- agents live — daemon left running\n");
     }
+    md
+}
 
-    let dir = opts.state_dir.join("sessions");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{y:04}{mo:02}{d:02}-end.md"));
-    std::fs::write(&path, &md)?;
-    Ok(path)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_text_covers_every_key_and_shape() {
+        // = and : separators, each key, case-insensitive.
+        for (k, sep) in [
+            ("key", "="),
+            ("token", "="),
+            ("secret", "="),
+            ("password", "="),
+            ("passwd", "="),
+            ("auth", "="),
+            ("Key", "="),
+            ("TOKEN", ":"),
+            ("api-key", "="),
+            ("x-api-token", "="),
+            ("oauth_secret", ":"),
+        ] {
+            let s = format!("prog --{k}{sep}s3cr3t-value rest");
+            assert!(s.contains("s3cr3t-value"), "fixture broken: {s}");
+            let out = redact_text(&s);
+            assert!(
+                !out.contains("s3cr3t-value") && out.contains("REDACTED"),
+                "{k}{sep} not redacted: {out}"
+            );
+        }
+        // Non-secret args survive untouched.
+        let keep = "prog --verbose --limit=30 --name=fable";
+        assert_eq!(redact_text(keep), keep);
+        // A key-shaped flag with no value stays — nothing follows it.
+        let flag = "prog --key value"; // 'value' after space is NOT redacted (only =/: binds)
+        let _ = flag;
+    }
+
+    #[test]
+    fn redact_text_handles_figma_style_flag() {
+        let s = "npm exec figma-developer-mcp --figma-api-key=figd_ABC123 --stdio";
+        let out = redact_text(s);
+        assert_eq!(
+            out,
+            "npm exec figma-developer-mcp --figma-api-key=REDACTED --stdio"
+        );
+    }
+
+    #[test]
+    fn redact_text_multibyte_does_not_panic() {
+        // A multibyte char right where a byte-slice compare could split
+        // a UTF-8 boundary — the old str-index impl panicked here.
+        let s = "pröc --token=töken";
+        let out = redact_text(s);
+        assert!(out.contains("REDACTED") && !out.contains("töken"));
+    }
+
+    #[test]
+    fn row_json_redacts_detail_and_items() {
+        let mut r = Row::new("sweep").ok("done");
+        r.detail = "orphan --token=abc123".into();
+        r.items = vec!["pid 9 --secret=hunter2".into(), "clean".into()];
+        let j = r.json();
+        assert_eq!(j["detail"], "orphan --token=REDACTED");
+        assert_eq!(j["items"][0], "pid 9 --secret=REDACTED");
+        assert_eq!(j["items"][1], "clean");
+    }
 }
