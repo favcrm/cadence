@@ -1,14 +1,18 @@
 //! `cadence issue finish <ID>` — remove an issue's recorded worktree
-//! and branch once the work has landed. Three guards make the unsafe
-//! cleanup impossible by default: a busy owner agent (live message or
-//! a pty pane that probes busy — an `inbox` owner is a mailbox, never
-//! busy), a dirty worktree (ignored paths don't count), and a branch
+//! and branch once the work has landed. The guard is per worktree,
+//! not per agent: it refuses only while the worktree is actually in
+//! use — a live message whose dispatch recorded this worktree (the
+//! issue's `message` refs, or a job task's recorded worktree), a pane
+//! process tree with cwd inside it, or any process standing in it —
+//! plus a dirty worktree (ignored paths don't count) and a branch
 //! whose work survives nowhere — merged into the repo's default
 //! branch by ancestry, patch-equivalent commits, a squash merge, or
-//! a merged PR, or pushed. `--force` overrides each and is recorded
-//! as a `Forced:` trailer on the finish commit. Refs are kept as
-//! history, marked `closed: true`; the issue's status is untouched —
-//! status follows the job or the PM.
+//! a merged PR, or pushed. A busy owner working ELSEWHERE is not a
+//! reason. `--force` overrides each and is recorded as a `Forced:`
+//! trailer on the finish commit. Refs are kept as history, marked
+//! `closed: true`; the issue's status is untouched — status follows
+//! the job or the PM. `issue finish --merged` sweeps every open
+//! worktree ref whose branch is merged and whose guard passes.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -17,9 +21,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+use crate::adapter::pty;
 use crate::client;
 use crate::error::{Error, Result};
-use crate::issue::{project, write, Pm};
+use crate::issue::{board, model::Front, project, write, Pm};
 use crate::proc::{run_bounded, BoundedError};
 
 /// Message states that mean the owner is or will be working — a
@@ -177,101 +182,41 @@ fn pr_merged(root: &Path, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Refuse while the owner has a live message or a pty pane probing
-/// busy — naming the agent and what it is doing. Daemon-down refuses
-/// rather than guesses (a pane the daemon can't see may still be
-/// mid-run). Under `--force` the check still runs so `overrode`
-/// records what was bypassed truthfully; an unreachable daemon is
-/// recorded as such rather than treated as idle.
-fn check_owner_idle(
-    state_dir: &Path,
-    owner: &str,
-    force: bool,
-    overridden: &mut Vec<String>,
-) -> Result<()> {
-    let show = client::rpc(state_dir, "agent_show", json!({"alias": owner}));
-    let show = match (show, force) {
-        (Ok(show), _) => show,
-        (Err(_), true) => {
-            overridden.push("owner-check-unreachable".to_string());
-            return Ok(());
-        }
-        (Err(e), false) => {
-            return Err(Error::rejected(format!(
-                "Cannot check owner '{owner}' ({e}) — the daemon must be \
-                 reachable to finish safely; rerun when it is up or pass \
-                 --force"
-            )));
-        }
-    };
-    // An inbox is a durable mailbox, not an actor — nothing it owns
-    // can be touching the worktree, so queued messages there never
-    // block. The daemon lookup above still runs: kind is only known
-    // once the daemon answers.
-    if show["agent"]["endpoint_kind"].as_str() == Some("inbox") {
-        return Ok(());
-    }
-    if let Some(msg) = show["messages"].as_array().and_then(|ms| {
-        ms.iter()
-            .find(|m| LIVE_MESSAGE_STATES.contains(&m["state"].as_str().unwrap_or_default()))
-    }) {
-        if force {
-            overridden.push("owner-busy".to_string());
-        } else {
-            let body: String = msg["body"]
-                .as_str()
-                .unwrap_or_default()
-                .chars()
-                .take(60)
-                .collect();
-            return Err(Error::rejected(format!(
-                "Owner '{owner}' has a {} message {}: \"{body}\" — wait for \
-                 it or pass --force",
-                msg["state"].as_str().unwrap_or_default(),
-                msg["id"].as_str().unwrap_or_default()
-            )));
-        }
-    }
-    if show["agent"]["endpoint_kind"].as_str() == Some("pty")
-        && show["agent"]["dead"].as_bool() != Some(true)
-    {
-        if let Ok(probe) = client::rpc(state_dir, "agent_probe", json!({"alias": owner})) {
-            if probe["idle"].as_bool() == Some(false) {
-                if force {
-                    overridden.push("pane-busy".to_string());
-                } else {
-                    return Err(Error::rejected(format!(
-                        "Owner '{owner}'s pane is busy ({}) — wait for it or \
-                         pass --force",
-                        probe["reason"].as_str().unwrap_or("not idle")
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
+/// A resolved finish target: the issue's open worktree/branch refs
+/// plus the repo root the git probes run against. `msg_refs` are the
+/// issue's `message` ref targets — the dispatches recorded against
+/// this worktree.
+struct Target {
+    front: Front,
+    body: String,
+    dir: PathBuf,
+    wt_dir: Option<PathBuf>,
+    wt_name: Option<String>,
+    branch: String,
+    root: PathBuf,
+    msg_refs: std::collections::HashSet<String>,
 }
 
-/// `issue finish <ID> [--force] [--keep-branch] [--remote]` — JSON like
-/// the other issue verbs.
-pub fn run(
-    pm: &Pm,
-    id: &str,
-    force: bool,
-    keep_branch: bool,
-    remote: bool,
-    actor: &str,
-    state_dir: &Path,
-) -> Result<Value> {
-    let (_project, dir) = write::issue_dir(pm, id)?;
-    let _lock = pm.lock()?;
-    let (mut front, body) = write::load_front(&dir)?;
+/// The three ref states an issue can be in for finishing.
+enum Resolve {
+    /// No worktree/branch refs at all — `finish` errors.
+    Nothing,
+    /// Refs exist but every worktree/branch ref is closed.
+    Finished,
+    /// An open worktree and/or branch ref to clean up.
+    Target(Box<Target>),
+}
 
-    // The first OPEN worktree ref, paired with the open branch ref of
-    // the SAME name — a re-start under `--name` leaves older pairs
-    // behind, and first-of-kind matching could fuse halves of
-    // different pairs. A lone open branch ref (hand-edited history)
-    // is still finishable on its own.
+/// Load the issue and resolve its open worktree/branch refs + repo
+/// root — shared by `run` and the `--merged` sweep. The first OPEN
+/// worktree ref pairs with the open branch ref of the SAME name — a
+/// re-start under `--name` leaves older pairs behind, and
+/// first-of-kind matching could fuse halves of different pairs. A
+/// lone open branch ref (hand-edited history) is still finishable on
+/// its own.
+fn resolve(pm: &Pm, id: &str) -> Result<Resolve> {
+    let (_project, dir) = write::issue_dir(pm, id)?;
+    let (front, body) = write::load_front(&dir)?;
     let open_wt = front
         .refs
         .iter()
@@ -303,18 +248,14 @@ pub fn run(
             .iter()
             .any(|r| matches!(r.kind.as_str(), "worktree" | "branch"))
         {
-            return Ok(json!({"issue": front.id, "finished": false,
-                             "reason": "worktree already finished"}));
+            return Ok(Resolve::Finished);
         }
-        return Err(Error::rejected(format!(
-            "{id}: no worktree/branch refs recorded — nothing to finish"
-        )));
+        return Ok(Resolve::Nothing);
     }
-    let wt_dir = open_wt.clone();
-
     // The repo root: through the live worktree when it exists, else
     // any recorded `<root>/.cadence/wt/<name>` path walked upward
     // (closed refs still name the repo).
+    let wt_dir = open_wt;
     let root = wt_dir
         .as_deref()
         .filter(|d| d.is_dir())
@@ -343,86 +284,330 @@ pub fn run(
                     .unwrap_or_default()
             ))
         })?;
+    let msg_refs = front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "message")
+        .filter_map(|r| r.path.clone())
+        .collect();
+    Ok(Resolve::Target(Box::new(Target {
+        front,
+        body,
+        dir,
+        wt_dir,
+        wt_name,
+        branch,
+        root,
+        msg_refs,
+    })))
+}
 
-    let mut overridden = Vec::new();
+/// One condition blocking a finish. `reason` names the pid or
+/// message id so the operator knows what to wait for; `tag` is the
+/// short `overrode` entry `--force` records.
+struct Block {
+    tag: String,
+    reason: String,
+}
 
-    // 1. Owner-busy (daemon) — skipped entirely with no owner.
-    if let Some(owner) = front.owner.clone() {
-        check_owner_idle(state_dir, &owner, force, &mut overridden)?;
+/// Everything the read-only probes learned about a target — shared by
+/// `run` (which refuses on the first block) and the `--merged` sweep
+/// (which reports them as rows).
+struct Check {
+    blocks: Vec<Block>,
+    merged_by: Option<&'static str>,
+}
+
+/// Pids whose `/proc/<pid>/cwd` resolves under `dir` — the "open
+/// shell in the worktree" check. /proc races are fine: a vanished pid
+/// or a denied read just doesn't report. The cadence process itself
+/// is excluded; a parent shell standing in the worktree is not — that
+/// is exactly the open-shell case.
+fn pids_cwd_under(dir: &Path) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(dir) = dir.canonicalize() else {
+        return out;
+    };
+    let me = std::process::id();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in procs.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
+            continue;
+        };
+        if cwd.starts_with(&dir) {
+            out.push(pid);
+        }
     }
+    out
+}
 
-    // 2. Dirty worktree — `--ignored` marks ignored paths `!!` so a
-    //    build artifact (like the ui/node_modules symlink) never
-    //    blocks; only real changes and non-ignored untracked files do.
-    //    A status that cannot be read refuses too: an unreadable tree
-    //    is not a clean one.
-    if let Some(d) = wt_dir.as_deref().filter(|d| d.is_dir()) {
+/// Best-effort process name for a refusal message.
+fn comm_of(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+/// Is this live message bound to the target's worktree? Binding is
+/// recorded, never parsed: the issue's `message` refs name the
+/// dispatches sent against it, and a job task's `worktree` names the
+/// worktree its kickoff runs in. A `task_show` that fails proves
+/// nothing — the pane/proc scans still catch real use.
+fn message_bound(state_dir: &Path, msg: &Value, t: &Target) -> bool {
+    let id = msg["id"].as_str().unwrap_or_default();
+    if t.msg_refs.contains(id) {
+        return true;
+    }
+    // A branch-only target has no worktree a task could be bound to —
+    // skip the rpc.
+    if t.wt_name.is_none() && t.wt_dir.is_none() {
+        return false;
+    }
+    let Some(task) = msg["task_id"].as_str() else {
+        return false;
+    };
+    let Ok(show) = client::rpc(state_dir, "task_show", json!({"task": task})) else {
+        return false;
+    };
+    let Some(wt) = show["task"]["worktree"].as_str() else {
+        return false;
+    };
+    t.wt_name.as_deref() == Some(wt)
+        || t.wt_dir
+            .as_deref()
+            .is_some_and(|d| d.to_string_lossy() == wt)
+}
+
+/// Where the target's branch stands for survivability — one
+/// `rev-parse` + `merge_rule` pair feeds both the finish guard and
+/// the `--merged` sweep's candidate filter.
+enum Branch {
+    /// No branch ref recorded, or the recorded ref no longer exists.
+    Gone,
+    /// The ref exists but `merge_rule` does not land.
+    Open,
+    /// Merged into the repo's default branch — `merged_by` names how.
+    Merged(&'static str),
+}
+
+fn branch_state(t: &Target) -> Branch {
+    if t.branch.is_empty() {
+        return Branch::Gone;
+    }
+    let exists = git(
+        &t.root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", t.branch),
+        ],
+    )
+    .is_ok();
+    if !exists {
+        return Branch::Gone;
+    }
+    match default_ref(&t.root).and_then(|d| merge_rule(&t.root, &t.branch, &d)) {
+        Some(how) => Branch::Merged(how),
+        None => Branch::Open,
+    }
+}
+
+/// The per-worktree guard plus the unchanged dirty/survivability
+/// checks, evaluated read-only. In-use means THIS worktree: a live
+/// message recorded against it, the owner's pane tree with cwd inside
+/// it, or any process standing in it. An owner busy elsewhere does
+/// not block. Daemon-down while an owner is recorded blocks rather
+/// than guesses — a pane the daemon can't see may still be mid-run.
+fn inspect(state_dir: &Path, t: &Target) -> Check {
+    let mut blocks = Vec::new();
+    let mut pane_pid = None;
+    if let Some(owner) = t.front.owner.as_deref() {
+        match client::rpc(state_dir, "agent_show", json!({"alias": owner})) {
+            Ok(show) => {
+                if let Some(msg) = show["messages"].as_array().and_then(|ms| {
+                    ms.iter().find(|m| {
+                        LIVE_MESSAGE_STATES.contains(&m["state"].as_str().unwrap_or_default())
+                            && message_bound(state_dir, m, t)
+                    })
+                }) {
+                    let body: String = msg["body"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(60)
+                        .collect();
+                    blocks.push(Block {
+                        tag: "bound-message".to_string(),
+                        reason: format!(
+                            "Owner '{owner}' has a {} message {} recorded \
+                             against this worktree: \"{body}\" — wait for \
+                             it or pass --force",
+                            msg["state"].as_str().unwrap_or_default(),
+                            msg["id"].as_str().unwrap_or_default()
+                        ),
+                    });
+                }
+                if show["agent"]["endpoint_kind"].as_str() == Some("pty")
+                    && show["agent"]["dead"].as_bool() != Some(true)
+                {
+                    pane_pid = show["agent"]["pid"].as_u64().map(|p| p as u32);
+                }
+            }
+            Err(e) => blocks.push(Block {
+                tag: "owner-check-unreachable".to_string(),
+                reason: format!(
+                    "Cannot check owner '{owner}' ({e}) — the daemon must be \
+                     reachable to finish safely; rerun when it is up or \
+                     pass --force"
+                ),
+            }),
+        }
+    }
+    // Any process standing in the worktree blocks it — an owner pane's
+    // descendants are named as such, everything else as a plain pid.
+    if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
+        let mut pane_hit = None;
+        let mut proc_hit = None;
+        for pid in pids_cwd_under(d) {
+            if pane_pid.is_some_and(|pp| pty::descends_from(pid, pp)) {
+                pane_hit.get_or_insert(pid);
+            } else {
+                proc_hit.get_or_insert(pid);
+            }
+        }
+        if let Some(pid) = pane_hit {
+            blocks.push(Block {
+                tag: "pane-cwd".to_string(),
+                reason: format!(
+                    "Owner '{}' pane descendant pid {pid} ({}) has cwd \
+                     inside {} — wait for it or pass --force",
+                    t.front.owner.as_deref().unwrap_or("?"),
+                    comm_of(pid),
+                    d.display()
+                ),
+            });
+        }
+        if let Some(pid) = proc_hit {
+            blocks.push(Block {
+                tag: "proc-cwd".to_string(),
+                reason: format!(
+                    "Process {pid} ({}) has cwd inside {} — close it or \
+                     pass --force",
+                    comm_of(pid),
+                    d.display()
+                ),
+            });
+        }
+    }
+    // Dirty worktree — `--ignored` marks ignored paths `!!` so a build
+    // artifact (like the ui/node_modules symlink) never blocks; only
+    // real changes and non-ignored untracked files do. A status that
+    // cannot be read refuses too: an unreadable tree is not a clean one.
+    if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
         match git(d, &["status", "--porcelain", "--ignored"]) {
-            Err(e) if force => overridden.push(format!("dirty-check-failed: {e}")),
-            Err(e) => {
-                return Err(Error::rejected(format!(
+            Err(e) => blocks.push(Block {
+                tag: format!("dirty-check-failed: {e}"),
+                reason: format!(
                     "Cannot check {} for uncommitted changes ({e}) — \
                      refusing to guess; pass --force",
                     d.display()
-                )))
-            }
+                ),
+            }),
             Ok(status) => {
                 let dirty: Vec<&str> = status.lines().filter(|l| !l.starts_with("!!")).collect();
                 if !dirty.is_empty() {
-                    if force {
-                        overridden.push("dirty-worktree".to_string());
-                    } else {
-                        let list: Vec<&str> = dirty.iter().take(10).copied().collect();
-                        return Err(Error::rejected(format!(
+                    let list: Vec<&str> = dirty.iter().take(10).copied().collect();
+                    blocks.push(Block {
+                        tag: "dirty-worktree".to_string(),
+                        reason: format!(
                             "Worktree {} has uncommitted changes:\n  {}\nCommit, \
                              stash or pass --force",
                             d.display(),
                             list.join("\n  ")
-                        )));
-                    }
+                        ),
+                    });
                 }
             }
         }
     }
-
-    // 3. Survivability: refuse when the branch's work survives nowhere
-    //    — not merged into the repo's default branch (by ancestry,
-    //    patch-equivalent commits, a squash merge, or a merged PR) and
-    //    not pushed.
-    let mut merged_by = Value::Null;
-    if !branch.is_empty() {
-        let branch_exists = git(
-            &root,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ],
-        )
-        .is_ok();
-        if branch_exists {
-            if let Some(default) = default_ref(&root) {
-                if let Some(how) = merge_rule(&root, &branch, &default) {
-                    merged_by = json!(how);
-                }
-            }
-            let remote_ref = format!("refs/remotes/origin/{branch}");
-            let pushed = git(&root, &["rev-parse", "--verify", "--quiet", &remote_ref]).is_ok()
-                && ancestor(&root, &branch, &format!("origin/{branch}"));
-            if merged_by.is_null() && !pushed {
-                if force {
-                    overridden.push("unmerged-unpushed".to_string());
-                } else {
-                    return Err(Error::rejected(format!(
-                        "Branch '{branch}' is neither merged into the default \
+    // Survivability: the branch's work must survive somewhere — merged
+    // into the repo's default branch or pushed.
+    let mut merged_by = None;
+    match branch_state(t) {
+        Branch::Merged(how) => merged_by = Some(how),
+        Branch::Open => {
+            let remote_ref = format!("refs/remotes/origin/{}", t.branch);
+            let pushed = git(&t.root, &["rev-parse", "--verify", "--quiet", &remote_ref]).is_ok()
+                && ancestor(&t.root, &t.branch, &format!("origin/{}", t.branch));
+            if !pushed {
+                blocks.push(Block {
+                    tag: "unmerged-unpushed".to_string(),
+                    reason: format!(
+                        "Branch '{}' is neither merged into the default \
                          branch nor pushed — its work would be lost. Merge or \
-                         push it, or pass --force"
-                    )));
-                }
+                         push it, or pass --force",
+                        t.branch
+                    ),
+                });
             }
         }
+        Branch::Gone => {}
     }
+    Check { blocks, merged_by }
+}
+
+/// `issue finish <ID> [--force] [--keep-branch] [--remote]` — JSON like
+/// the other issue verbs.
+pub fn run(
+    pm: &Pm,
+    id: &str,
+    force: bool,
+    keep_branch: bool,
+    remote: bool,
+    actor: &str,
+    state_dir: &Path,
+) -> Result<Value> {
+    let _lock = pm.lock()?;
+    let mut t = match resolve(pm, id)? {
+        Resolve::Nothing => {
+            return Err(Error::rejected(format!(
+                "{id}: no worktree/branch refs recorded — nothing to finish"
+            )))
+        }
+        Resolve::Finished => {
+            return Ok(json!({"issue": id, "finished": false,
+                             "reason": "worktree already finished"}))
+        }
+        Resolve::Target(t) => t,
+    };
+    let dir = t.dir.clone();
+    let wt_dir = t.wt_dir.clone();
+    let wt_name = t.wt_name.clone();
+    let branch = t.branch.clone();
+    let root = t.root.clone();
+
+    // The per-worktree guard + dirty + survivability, evaluated once.
+    // `--force` records every block it bypasses; without it the first
+    // block refuses, naming its pid or message id.
+    let check = inspect(state_dir, &t);
+    let mut overridden = Vec::new();
+    for b in check.blocks {
+        if force {
+            overridden.push(b.tag);
+        } else {
+            return Err(Error::rejected(b.reason));
+        }
+    }
+    let merged_by = check.merged_by.map_or(Value::Null, |h| json!(h));
 
     // Removal: the worktree first (frees the branch), then the branch.
     let _ = git(&root, &["worktree", "prune"]);
@@ -461,7 +646,7 @@ pub fn run(
     }
 
     // One tracker commit marks both refs closed — kept as history.
-    for r in &mut front.refs {
+    for r in &mut t.front.refs {
         if (r.kind == "worktree"
             && wt_dir
                 .as_deref()
@@ -471,7 +656,7 @@ pub fn run(
             r.closed = Some(true);
         }
     }
-    write::save_front(&dir, &front, &body)?;
+    write::save_front(&dir, &t.front, &t.body)?;
     let what = if branch.is_empty() {
         wt_name.as_deref().unwrap_or("worktree").to_string()
     } else {
@@ -489,7 +674,7 @@ pub fn run(
     pm.commit(&format!("{subject}\n\n{trailers}"))?;
 
     Ok(json!({
-        "issue": front.id,
+        "issue": t.front.id,
         "finished": true,
         "worktree": wt_dir,
         "branch": branch,
@@ -501,6 +686,104 @@ pub fn run(
         "forced": force,
         "overrode": overridden,
         "merged_by": merged_by,
-        "status": front.status,
+        "status": t.front.status,
+    }))
+}
+
+/// `issue finish --merged [--project P] [--remote] [--dry-run]` —
+/// sweep every open worktree ref in scope whose branch is merged into
+/// the repo's default branch and whose per-worktree guard passes.
+/// One row per worktree: `finished` (or `would-finish` under
+/// `--dry-run`), `skipped(<reason>)` when it is not a merged
+/// candidate, `refused(<reason>)` when a guard blocks. The sweep never
+/// forces. `refused` counts the refused rows — the CLI maps nonzero
+/// to exit 1.
+pub fn sweep(
+    pm: &Pm,
+    project: Option<&str>,
+    remote: bool,
+    dry_run: bool,
+    actor: &str,
+    state_dir: &Path,
+) -> Result<Value> {
+    let issues = board::load_all(&pm.dir, project)?;
+    let mut rows = Vec::new();
+    let mut refused = 0usize;
+    for issue in issues {
+        let mut row = json!({
+            "issue": issue.front.id,
+            "worktree": issue.front.refs.iter()
+                .find(|r| r.kind == "worktree" && r.closed != Some(true))
+                .and_then(|r| r.path.clone()),
+            "branch": Value::Null,
+            "merged_by": Value::Null,
+            "outcome": Value::Null,
+            "reason": Value::Null,
+        });
+        let id = issue.front.id.clone();
+        // Only open WORKTREE refs are sweep candidates — a lone open
+        // branch ref is finished by name, not swept.
+        let t = match resolve(pm, &id) {
+            Ok(Resolve::Target(t)) if t.wt_dir.is_some() => t,
+            Ok(_) => continue,
+            Err(e) => {
+                row["outcome"] = json!("refused");
+                row["reason"] = json!(e.to_string());
+                refused += 1;
+                rows.push(row);
+                continue;
+            }
+        };
+        row["branch"] = json!(t.branch);
+        // Candidates are merged branches — unmerged work is skipped,
+        // never refused (the point of the verb).
+        match branch_state(&t) {
+            Branch::Gone => {
+                row["outcome"] = json!("skipped");
+                row["reason"] = json!(if t.branch.is_empty() {
+                    "no branch ref"
+                } else {
+                    "branch missing"
+                });
+            }
+            Branch::Open => {
+                row["outcome"] = json!("skipped");
+                row["reason"] = json!("unmerged");
+            }
+            Branch::Merged(how) => {
+                row["merged_by"] = json!(how);
+                if dry_run {
+                    match inspect(state_dir, &t).blocks.first() {
+                        Some(b) => {
+                            row["outcome"] = json!("refused");
+                            row["reason"] = json!(b.reason);
+                            refused += 1;
+                        }
+                        None => row["outcome"] = json!("would-finish"),
+                    }
+                } else {
+                    match run(pm, &id, false, false, remote, actor, state_dir) {
+                        Ok(out) => {
+                            row["outcome"] = json!("finished");
+                            row["removed_worktree"] = out["removed_worktree"].clone();
+                            row["deleted_branch"] = out["deleted_branch"].clone();
+                            row["remote_deleted"] = out["remote_deleted"].clone();
+                        }
+                        Err(e) => {
+                            row["outcome"] = json!("refused");
+                            row["reason"] = json!(e.to_string());
+                            refused += 1;
+                        }
+                    }
+                }
+            }
+        }
+        rows.push(row);
+    }
+    Ok(json!({
+        "rows": rows,
+        "refused": refused,
+        "dry_run": dry_run,
+        "project": project,
     }))
 }

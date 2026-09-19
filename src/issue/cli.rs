@@ -163,25 +163,43 @@ pub enum IssueAction {
         #[arg(long, requires = "job")]
         assignee: Option<String>,
     },
-    /// Finish an issue's worktree: refuse while the owner agent has a
-    /// live message or a busy pane, while the worktree is dirty, or
-    /// while the branch is neither merged nor pushed — `--force`
-    /// overrides each (recorded). Then `git worktree remove`, delete
-    /// the branch (`--keep-branch` keeps it, `--remote` deletes the
-    /// remote one too) and mark both refs `closed: true` in one
-    /// commit. The issue's status is untouched.
+    /// Finish an issue's worktree: refuse while the worktree is in use
+    /// (a live message recorded against it, a pane tree or any process
+    /// with cwd inside it), while the worktree is dirty, or while the
+    /// branch is neither merged nor pushed — `--force` overrides each
+    /// (recorded). Then `git worktree remove`, delete the branch
+    /// (`--keep-branch` keeps it, `--remote` deletes the remote one
+    /// too) and mark both refs `closed: true` in one commit. The
+    /// issue's status is untouched. `--merged` instead sweeps every
+    /// open worktree ref in scope whose branch is merged and whose
+    /// guard passes, one row per worktree; it never forces.
     Finish {
-        id: String,
-        /// Override the owner-busy, dirty and unmerged refusals —
+        /// Issue id — required unless --merged.
+        id: Option<String>,
+        /// Override the in-use, dirty and unmerged refusals —
         /// recorded on the finish commit and in the output.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "merged")]
         force: bool,
         /// Remove the worktree but keep the local branch.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "merged")]
         keep_branch: bool,
         /// Also delete the remote branch (`push origin --delete`).
         #[arg(long)]
         remote: bool,
+        /// Sweep every merged+idle worktree in scope — one row per
+        /// open worktree ref: finished | skipped(reason) |
+        /// refused(reason). Exits 1 when anything refused.
+        #[arg(long, conflicts_with = "id")]
+        merged: bool,
+        /// Limit the sweep to one project (all projects when omitted).
+        #[arg(long, requires = "merged")]
+        project: Option<String>,
+        /// Print the sweep plan without changing anything.
+        #[arg(long, requires = "merged")]
+        dry_run: bool,
+        /// Emit the sweep rows as JSON.
+        #[arg(long, requires = "merged")]
+        json: bool,
     },
     /// Show one issue — frontmatter, body, links both ways, comments,
     /// artifacts, activity.
@@ -565,8 +583,53 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             force,
             keep_branch,
             remote,
+            merged,
+            project,
+            dry_run,
+            json,
         } => {
             let pm_dir = open_pm()?;
+            if *merged {
+                let out = finish::sweep(
+                    &pm_dir,
+                    project.as_deref(),
+                    *remote,
+                    *dry_run,
+                    "",
+                    state_dir,
+                )?;
+                if *json {
+                    print_json(&out);
+                } else {
+                    for row in out["rows"].as_array().into_iter().flatten() {
+                        let mut line = format!(
+                            "{}: {}",
+                            row["issue"].as_str().unwrap_or("?"),
+                            row["outcome"].as_str().unwrap_or("?")
+                        );
+                        if let Some(r) = row["reason"].as_str() {
+                            line.push_str(&format!("({})", r.lines().next().unwrap_or(r)));
+                        }
+                        if let Some(wt) = row["worktree"].as_str() {
+                            line.push_str(&format!(" — {wt}"));
+                        }
+                        if let Some(how) = row["merged_by"].as_str() {
+                            line.push_str(&format!(" [{how}]"));
+                        }
+                        println!("{line}");
+                    }
+                }
+                return Ok(if out["refused"].as_u64().unwrap_or(0) > 0 {
+                    1
+                } else {
+                    0
+                });
+            }
+            let Some(id) = id.as_deref() else {
+                return Err(Error::rejected(
+                    "issue finish needs an id — or --merged to sweep",
+                ));
+            };
             print_json(&finish::run(
                 &pm_dir,
                 id,
@@ -616,7 +679,16 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 )));
             }
             let pm = open_pm()?;
-            print_json(&write::set_fields(&pm, ids, pairs, "")?);
+            let out = write::set_fields(&pm, ids, pairs, "")?;
+            print_json(&out);
+            // The post-merge reminder: a done issue with an open
+            // worktree ref still holds the tree — finish it (or sweep
+            // every merged one with `issue finish --merged`).
+            if let Some(ids) = out["worktree_open"].as_array() {
+                for id in ids.iter().filter_map(|i| i.as_str()) {
+                    eprintln!("{id}: worktree open: run cadence issue finish {id}");
+                }
+            }
             Ok(0)
         }
         IssueAction::Tag { args } => {

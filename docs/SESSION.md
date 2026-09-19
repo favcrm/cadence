@@ -232,9 +232,17 @@ In this order:
    tracker.
 2. Close the issue with the merge commit in a comment.
 3. Clean up the lane: `cadence issue finish <ID> --remote` removes
-   the worktree and the local+remote branches — and refuses while
-   the owner is busy, the tree is dirty, or the branch is neither
-   merged nor pushed, so it is safe by default.
+   the worktree and the local+remote branches — and refuses while the
+   worktree is in use (a live message recorded against it, or a
+   process with cwd inside it), while the tree is dirty, or while the
+   branch is neither merged nor pushed, so it is safe by default. An
+   owner busy in a DIFFERENT worktree does not block. To clear
+   everything at once after a batch of merges: `cadence issue finish
+   --merged --dry-run` prints the plan, then `cadence issue finish
+   --merged --remote` finishes every merged+idle worktree in the
+   project — one row each: `finished | skipped(reason) |
+   refused(reason)`; the verb exits 1 when anything refused and never
+   forces.
 4. Restart the daemon when every pane is idle. `cadence daemon stop`,
    wait for the process to exit, `cadence daemon start`, then
    `cadence ui stop && cadence ui start`. Panes survive a restart and
