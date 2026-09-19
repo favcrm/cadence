@@ -1488,14 +1488,26 @@ fn acquire_suite_slot() -> Result<Option<std::fs::File>, String> {
         .unwrap_or(3600);
     let path = PathBuf::from(path);
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("suite lock dir: {e}"))?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            format!(
+                "cannot create the directory of the host suite slot {} \
+                 (CADENCE_SUITE_LOCK): {e} — fix the path or unset the variable",
+                path.display()
+            )
+        })?;
     }
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .open(&path)
-        .map_err(|e| format!("suite lock {}: {e}", path.display()))?;
+        .map_err(|e| {
+            format!(
+                "cannot open the host suite slot {} (CADENCE_SUITE_LOCK): {e} \
+                 — fix the path or unset the variable",
+                path.display()
+            )
+        })?;
     let epoch = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

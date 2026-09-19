@@ -190,29 +190,63 @@ impl ReviewConfig {
 /// failed in the full run but passed alone on the gated tree and on the
 /// base. The ledger is the quarantine: no attribute in the code.
 pub const FLAKE_LEDGER: &str = "flakes.jsonl";
-/// Sightings (this one included) at which a flake stops blocking.
-pub const KNOWN_FLAKE_SIGHTINGS: u64 = 3;
+/// Distinct PR heads a flake needs sightings on before it stops
+/// blocking — repeated reviews of one head never qualify on their own.
+pub const KNOWN_FLAKE_HEADS: usize = 3;
 
-/// Append `entry` and return how many sightings of its test the ledger
-/// now holds, this one included. Malformed lines are skipped.
-pub fn record_flake(ledger: &Path, entry: &Value) -> Result<u64> {
-    use std::io::Write;
-    let test = entry["test"].as_str().unwrap_or_default();
-    let prior = std::fs::read_to_string(ledger)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v["test"].as_str() == Some(test))
-        .count() as u64;
+/// What the ledger holds for one `(repo, test)` after a sighting.
+#[derive(Debug, PartialEq)]
+pub struct Sightings {
+    /// Every sighting, this one included.
+    pub total: u64,
+    /// Distinct heads among them — the current head counts once.
+    pub heads: usize,
+}
+
+impl Sightings {
+    pub fn known_flake(&self) -> bool {
+        self.heads >= KNOWN_FLAKE_HEADS
+    }
+}
+
+/// Append `entry` (`repo`, `test`, `head`, …) and return the sightings
+/// of its `(repo, test)` now on record. The read and the append happen
+/// under an exclusive `flock` on the ledger, so concurrent reviews see
+/// exact counts; each line is one `write_all`, so appends never fuse.
+/// Malformed lines are skipped.
+pub fn record_flake(ledger: &Path, entry: &Value) -> Result<Sightings> {
+    use std::io::{Read, Write};
+    use std::os::unix::io::AsRawFd;
     if let Some(dir) = ledger.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let mut f = std::fs::OpenOptions::new()
-        .create(true)
+        .read(true)
         .append(true)
+        .create(true)
         .open(ledger)?;
-    writeln!(f, "{}", serde_json::to_string(entry)?)?;
-    Ok(prior + 1)
+    // Released when `f` closes at return.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut text = String::new();
+    f.read_to_string(&mut text)?;
+    let prior: Vec<Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["repo"] == entry["repo"] && v["test"] == entry["test"])
+        .collect();
+    let mut heads: std::collections::HashSet<&str> = prior
+        .iter()
+        .map(|v| v["head"].as_str().unwrap_or_default())
+        .collect();
+    heads.insert(entry["head"].as_str().unwrap_or_default());
+    let seen = Sightings {
+        total: prior.len() as u64 + 1,
+        heads: heads.len(),
+    };
+    f.write_all(format!("{}\n", serde_json::to_string(entry)?).as_bytes())?;
+    Ok(seen)
 }
 
 /// The first lines of `test`'s panic in a full-suite output — enough to
@@ -234,14 +268,38 @@ fn host_load() -> Value {
             .next()
             .and_then(|v| v.parse::<f64>().ok())
     });
+    // This review and its ancestors (a `cargo test` that launched it)
+    // are not load on the suite about to run.
+    use std::os::unix::ffi::OsStrExt;
+    let mut own = vec![std::process::id()];
+    while let Some(ppid) = std::fs::read_to_string(format!("/proc/{}/stat", own[own.len() - 1]))
+        .ok()
+        .and_then(|s| {
+            // `pid (comm) state ppid …` — comm may hold spaces; split after `)`.
+            s.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok())
+        })
+        .filter(|p| *p > 1 && !own.contains(p))
+    {
+        own.push(ppid);
+    }
     let cargo_tests = std::fs::read_dir("/proc")
         .map(|dir| {
             dir.filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|p| p.parse::<u32>().ok())
+                        .is_some_and(|pid| !own.contains(&pid))
+                })
                 .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
                 .filter(|raw| {
                     let argv: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
-                    argv.first().is_some_and(|a0| a0.ends_with(b"cargo"))
-                        && argv.iter().skip(1).any(|a| *a == b"test")
+                    let is_cargo = argv.first().is_some_and(|a0| {
+                        Path::new(std::ffi::OsStr::from_bytes(a0)).file_name()
+                            == Some(std::ffi::OsStr::new("cargo"))
+                    });
+                    is_cargo && argv.iter().skip(1).any(|a| *a == b"test")
                 })
                 .count()
         })
@@ -1364,6 +1422,7 @@ pub fn run(opts: &Options) -> Result<i32> {
             if (gated, base) == ("pass", "pass") {
                 let entry = json!({
                     "at": time::iso(time::now_epoch()),
+                    "repo": slug,
                     "test": name,
                     "pr": pr.number,
                     "head": head_sha,
@@ -1374,9 +1433,9 @@ pub fn run(opts: &Options) -> Result<i32> {
                         .unwrap_or_default(),
                     "host_load": report["host_load"].clone(),
                 });
-                let sightings = record_flake(&reviews_dir.join(FLAKE_LEDGER), &entry)?;
-                sighting = json!({"sightings": sightings,
-                    "known_flake": sightings >= KNOWN_FLAKE_SIGHTINGS});
+                let seen = record_flake(&reviews_dir.join(FLAKE_LEDGER), &entry)?;
+                sighting = json!({"sightings": seen.total, "heads": seen.heads,
+                    "known_flake": seen.known_flake()});
             }
             let mut gated_side = json!({"outcome": gated, "tail": on_gated.tail});
             if let Some(r) = gated_reason {
@@ -1623,8 +1682,8 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
                 &mut reasons,
                 0,
                 format!(
-                    "`{name}` is a known flake ({} sightings) — not blocking",
-                    f["flake"]["sightings"]
+                    "`{name}` is a known flake ({} sightings on {} heads) — not blocking",
+                    f["flake"]["sightings"], f["flake"]["heads"]
                 ),
             ),
             Some("flake-under-load") => push_reason(
@@ -1889,7 +1948,7 @@ fn render_markdown(r: &Value) -> String {
                 f["verdict"].as_str().unwrap_or(""),
                 f["flake"]["sightings"]
                     .as_u64()
-                    .map(|n| n.to_string())
+                    .map(|n| format!("{n} ({} heads)", f["flake"]["heads"]))
                     .unwrap_or_else(|| "-".into())
             ));
         }
@@ -1900,13 +1959,14 @@ fn render_markdown(r: &Value) -> String {
             .collect();
         if !known.is_empty() {
             md.push_str(&format!(
-                "## Known flakes\n\n{KNOWN_FLAKE_SIGHTINGS}+ ledger sightings — listed, not blocking:\n\n"
+                "## Known flakes\n\nLedger sightings on {KNOWN_FLAKE_HEADS}+ distinct heads — listed, not blocking:\n\n"
             ));
             for f in known {
                 md.push_str(&format!(
-                    "- `{}` — {} sightings\n",
+                    "- `{}` — {} sightings on {} heads\n",
                     f["test"].as_str().unwrap_or(""),
-                    f["flake"]["sightings"]
+                    f["flake"]["sightings"],
+                    f["flake"]["heads"]
                 ));
             }
             md.push('\n');
@@ -2205,30 +2265,74 @@ gate_secs = 42
     }
 
     #[test]
-    fn flake_ledger_counts_sightings_and_skips_malformed_lines() {
+    fn flake_ledger_needs_three_distinct_heads() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = dir.path().join("reviews").join(FLAKE_LEDGER);
-        let entry = |test: &str| json!({"at": "t", "test": test, "pr": 1});
-        // First sighting: counted once, not yet known.
-        assert_eq!(record_flake(&ledger, &entry("a")).unwrap(), 1);
-        // Other tests and malformed lines never count toward `a`.
-        assert_eq!(record_flake(&ledger, &entry("b")).unwrap(), 1);
+        let entry = |repo: &str, test: &str, head: &str| json!({"at": "t", "repo": repo, "test": test, "pr": 1, "head": head});
+        let seen = |e: Value| record_flake(&ledger, &e).unwrap();
+        // First sighting: one head, not known.
+        let first = seen(entry("o/r", "a", "h1"));
+        assert_eq!(first, Sightings { total: 1, heads: 1 });
+        assert!(!first.known_flake());
+        // Three sightings on one head never qualify.
+        seen(entry("o/r", "a", "h1"));
+        let same_head = seen(entry("o/r", "a", "h1"));
+        assert_eq!(same_head, Sightings { total: 3, heads: 1 });
+        assert!(!same_head.known_flake());
+        // Another repo and another test never count toward (o/r, a).
+        assert_eq!(seen(entry("x/y", "a", "h2")).heads, 1);
+        assert_eq!(seen(entry("o/r", "b", "h2")).heads, 1);
+        // Malformed lines are skipped.
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&ledger)
             .unwrap();
         std::io::Write::write_all(&mut f, b"{not json\n\n{\"test\": 7}\n").unwrap();
-        assert_eq!(record_flake(&ledger, &entry("a")).unwrap(), 2);
-        // Third sighting reaches the known-flake threshold.
-        let third = record_flake(&ledger, &entry("a")).unwrap();
-        assert_eq!(third, KNOWN_FLAKE_SIGHTINGS);
+        assert_eq!(seen(entry("o/r", "a", "h2")).heads, 2);
+        let third = seen(entry("o/r", "a", "h3"));
+        assert_eq!(third, Sightings { total: 5, heads: 3 });
+        assert!(third.known_flake());
+        // A fourth review of an already-seen head adds no qualifying head.
+        let again = seen(entry("o/r", "a", "h3"));
+        assert_eq!(again, Sightings { total: 6, heads: 3 });
+    }
+
+    #[test]
+    fn flake_ledger_appends_stay_whole_under_concurrency() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join(FLAKE_LEDGER);
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let ledger = ledger.clone();
+                std::thread::spawn(move || {
+                    for n in 0..25 {
+                        record_flake(
+                            &ledger,
+                            &json!({"repo": "o/r", "test": "t", "head": format!("h{i}-{n}"),
+                                    "pad": "x".repeat(8000)}),
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&ledger).unwrap();
+        assert_eq!(text.lines().count(), 200);
+        assert!(text
+            .lines()
+            .all(|l| serde_json::from_str::<Value>(l).is_ok()));
+        // The locked read makes the count exact.
+        let last =
+            record_flake(&ledger, &json!({"repo": "o/r", "test": "t", "head": "z"})).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&ledger)
-                .unwrap()
-                .lines()
-                .filter(|l| l.contains("\"test\":\"a\""))
-                .count(),
-            3
+            last,
+            Sightings {
+                total: 201,
+                heads: 201
+            }
         );
     }
 
@@ -2237,10 +2341,10 @@ gate_secs = 42
         let mut r = json!({"merge": {}, "prepare": [], "gates": [], "stress": [],
             "open_pr_conflicts": [], "full_suite": {"outcome": "fail"}});
         r["failures"] = json!([{"test": "x", "verdict": "flake-under-load",
-            "flake": {"sightings": 2, "known_flake": false}}]);
+            "flake": {"sightings": 4, "heads": 2, "known_flake": false}}]);
         assert_eq!(suggest(&r, false).0, "needs-hands-on");
         r["failures"] = json!([{"test": "x", "verdict": "flake-under-load",
-            "flake": {"sightings": 3, "known_flake": true}}]);
+            "flake": {"sightings": 4, "heads": 3, "known_flake": true}}]);
         let (verdict, reasons) = suggest(&r, false);
         assert_eq!(verdict, "pass", "{reasons:?}");
         assert!(
