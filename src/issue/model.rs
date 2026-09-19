@@ -31,6 +31,10 @@ pub struct Ref {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// `issue finish` marks worktree/branch refs closed rather than
+    /// deleting them — the ref stays as history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<bool>,
 }
 
 /// `issue.md` YAML frontmatter. No `project` field (the folder says

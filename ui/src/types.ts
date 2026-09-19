@@ -18,6 +18,7 @@ export interface Ref {
   url?: string;
   path?: string;
   label?: string;
+  closed?: boolean;
 }
 
 export interface IssueCard {

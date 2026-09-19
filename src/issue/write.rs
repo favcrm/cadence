@@ -715,6 +715,7 @@ pub fn add_ref(
         url: is_url.then(|| target.to_string()),
         path: (!is_url).then(|| target.to_string()),
         label: label.map(str::to_string),
+        closed: None,
     };
     front.refs.push(r);
     save_front(&dir, &front, &body)?;

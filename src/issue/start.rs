@@ -55,6 +55,19 @@ fn slugify(title: &str) -> String {
     }
 }
 
+/// Derive the worktree name and branch for an issue start — shared by
+/// `dispatch`, which must know the names before anything is created.
+/// Returns `(wt_name, branch)`; the dir is `<root>/.cadence/wt/<wt_name>`.
+pub(crate) fn names(id: &str, title: &str, name: Option<&str>) -> Result<(String, String)> {
+    let slug = match name {
+        Some(name) => proto::identifier(name, "--name")?,
+        None => slugify(title),
+    };
+    let wt_name = format!("{}-{}", id.to_lowercase(), slug);
+    proto::identifier(&wt_name, "Worktree name")?;
+    Ok((wt_name.clone(), format!("cadence/{wt_name}")))
+}
+
 /// The project's declared repo roots, canonicalized.
 fn declared_repos(project: &project::Project) -> Vec<PathBuf> {
     project
@@ -90,7 +103,11 @@ fn repo_list(project: &project::Project, candidates: &[PathBuf]) -> String {
 /// discovery), then the cwd's repo when it is one of the project's,
 /// then the project's only repo, else refuse naming the candidates.
 /// Returns the main checkout root (linked worktrees resolve to it).
-fn resolve_repo(project: &project::Project, flag: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_repo(
+    project: &project::Project,
+    flag: Option<&Path>,
+    cwd: &Path,
+) -> Result<PathBuf> {
     let candidates = declared_repos(project);
     if let Some(dir) = flag {
         let root = worktree::main_root(dir)?;
@@ -121,7 +138,7 @@ fn resolve_repo(project: &project::Project, flag: Option<&Path>, cwd: &Path) -> 
 /// Base resolution per decision 1: `--base`, then the repo's
 /// `origin/HEAD` target, then the current branch, then `HEAD`.
 /// Returns `(ref, sha)`; no fetch.
-fn resolve_base(root: &Path, flag: Option<&str>) -> Result<(String, String)> {
+pub(crate) fn resolve_base(root: &Path, flag: Option<&str>) -> Result<(String, String)> {
     let base = if let Some(b) = flag {
         b.to_string()
     } else if let Ok(origin_head) = git(
@@ -199,13 +216,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
 
     let _lock = pm.lock()?;
     let (mut front, body) = write::load_front(&dir)?;
-    let slug = match &args.name {
-        Some(name) => proto::identifier(name, "--name")?,
-        None => slugify(&front.title),
-    };
-    let wt_name = format!("{}-{}", front.id.to_lowercase(), slug);
-    proto::identifier(&wt_name, "Worktree name")?;
-    let branch = format!("cadence/{wt_name}");
+    let (wt_name, branch) = names(&front.id, &front.title, args.name.as_deref())?;
     let wt_dir = root.join(".cadence").join("wt").join(&wt_name);
 
     // Recorded refs are matched by value, not first-of-kind: a
@@ -291,6 +302,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 url: None,
                 path: Some(branch.clone()),
                 label: Some(repo_label),
+                closed: None,
             });
         }
         if !has_ref("worktree", &wt_str) {
@@ -299,6 +311,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 url: None,
                 path: Some(wt_str.clone()),
                 label: None,
+                closed: None,
             });
         }
         if matches!(new_front.status.as_str(), "backlog" | "ready") {

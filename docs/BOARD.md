@@ -268,6 +268,57 @@ them by hand via `issue ref` works but is unusual — and a tracker
 whose pre-commit hook runs a pre-CAD-43 `cadence` will refuse these
 refs at lint time, so upgrade the installed binary first.
 
+## Dispatch and finish — `dispatch`, `issue finish`
+
+`dispatch <ISSUE> --to <worker> --note <kickoff>` is the PM's one-step
+hand-off: it runs `issue start --owner <worker>` (idempotent — an
+already-started issue is reused), then enqueues exactly one
+single-line kickoff built from a fixed template:
+
+```
+read <note> — <ISSUE>: <summary or issue title>. Your worktree exists:
+<worktree> (branch <branch>, base <sha7>). Commit trailer:
+Issue: <ISSUE>. PR to main; reply to <reply-to>.
+```
+
+then adds a tracker comment `Dispatched to <worker>: <note>` and a
+`message` ref carrying the queued message id. `--reply-to` defaults to
+`CADENCE_ALIAS` and is required when that is unset. `--job --spec
+<file>` instead opens the M3 job through `issue start --job --pm
+<reply-to> --assignee <worker>` and sends the kickoff through
+`job dispatch`, so the task and the message are bound.
+
+Everything is checked before anything is created: the note is
+readable, the daemon is reachable, the worker exists and is not
+fenced (`attention`), for `--job` it is the PM or a member of its
+group, and the composed body passes the pty single-line and
+forbidden-prefix rules. A second identical run reuses the worktree but
+refuses to queue a duplicate while the first kickoff is still queued
+or running — the output says so. Delivery itself stays the daemon's
+business: no `--ready`, no forced claims; the output prints the queued
+message id and the worker's probe verdict so the operator knows
+whether it lands now or when the pane idles.
+
+`issue finish <ID>` is the other end — safe cleanup of the recorded
+worktree+branch pair. It refuses, naming what it found, while:
+
+- the issue's `owner` agent has a queued/running message or a pty pane
+  that probes busy (the daemon must be reachable — it refuses rather
+  than guesses),
+- the worktree has uncommitted changes (the refusal lists them), or
+- the branch is neither merged into the repo's default branch
+  (`origin/HEAD`, else the checkout's current branch) nor pushed to a
+  remote-tracking ref.
+
+Then it runs `git worktree remove`, deletes the local branch (with
+`--remote` the remote one too), and lands one tracker commit
+`<ID>: finish <branch>` that marks both refs `closed: true` — kept as
+history, so a later `issue log` still shows where the work lived. The
+issue's status is not touched: status follows the job or the PM.
+`--force` overrides each refusal and is recorded — the `overrode`
+list in the output and a `Forced: true` trailer on the commit.
+`--keep-branch` removes only the worktree.
+
 ## `cadence ui` — the reader
 
 ```bash
