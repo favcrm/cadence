@@ -10971,3 +10971,379 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
     );
     std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
 }
+
+// ---- CAD-55: `cadence dispatch` + `cadence issue finish` against a live daemon ----
+
+/// One dispatch: `issue start` side effects + exactly one templated
+/// kickoff + comment + message ref. A second run reuses the worktree
+/// and refuses the duplicate while the first is live. Fenced and
+/// out-of-group workers are refused before anything is created, as is
+/// a `--summary` that breaks the pty single-line rule. `--job` binds
+/// the kickoff through `job dispatch` to the scoped task. `issue
+/// finish` then refuses while the owner has a live message, while the
+/// worktree is dirty, and while the branch is unmerged+unpushed —
+/// and succeeds after the merge.
+#[test]
+fn dispatch_kickoff_and_finish_guards() {
+    // Seed the group before the daemon starts: pm plus its members,
+    // one fenced, one outside the group.
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        // w1/w2 are `inbox` endpoints — no actor drains their queue,
+        // so a queued kickoff stays live for the duplicate/owner-busy
+        // checks. The others are fake.
+        for (alias, params, kind) in [
+            ("pm", None, "fake"),
+            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox"),
+            ("w2", Some("{\"upstream\":\"pm\"}"), "inbox"),
+            ("fenced", Some("{\"upstream\":\"pm\"}"), "fake"),
+            ("outsider", None, "fake"),
+        ] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params,
+                })
+                .unwrap();
+        }
+        store
+            .set_agent_state("fenced", "attention", Some("test fence"))
+            .unwrap();
+    }
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("fenced", "attention", 10);
+
+    // Tracker + project repo + issues fixture (same shape as the
+    // issue-start test).
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
+    for title in ["One", "Two", "Three", "Four"] {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+    let tracker_commits = || {
+        String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .arg("-C")
+                .arg(&pm_dir)
+                .args(["rev-list", "--count", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .parse::<usize>()
+        .unwrap()
+    };
+    let note = tmp.path().join("kickoff.md");
+    std::fs::write(&note, "# kickoff D-1").unwrap();
+    let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
+
+    // A fenced worker refuses before anything is created.
+    let (ok, err) = cli(&[
+        "dispatch",
+        "D-1",
+        "--to",
+        "fenced",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("fenced"),
+        "{err}"
+    );
+    let wt1 = repo.join(".cadence/wt/d-1-one");
+    assert!(!wt1.exists());
+
+    // A body that breaks the single-line rule refuses pre-creation.
+    let (ok, err) = cli(&[
+        "dispatch",
+        "D-1",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+        "--summary",
+        "line one\nline two",
+    ]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("single line"),
+        "{err}"
+    );
+    assert!(!wt1.exists());
+    let before = tracker_commits();
+
+    // The dispatch: worktree+branch, owner w1, exactly one kickoff.
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-1",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], true);
+    assert_eq!(out["created"], true);
+    assert!(wt1.is_dir());
+    let msg_id = out["message"].as_str().unwrap().to_string();
+    assert!(!msg_id.is_empty());
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let msgs = show["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1);
+    let kickoff = &msgs[0];
+    assert_eq!(kickoff["id"].as_str().unwrap(), msg_id);
+    assert_eq!(kickoff["state"].as_str().unwrap(), "queued");
+    assert_eq!(kickoff["reply_to"].as_str().unwrap(), "pm");
+    let body = kickoff["body"].as_str().unwrap();
+    assert!(
+        body.starts_with(&format!("read {note_s} — D-1:"))
+            && body.contains(".cadence/wt/d-1-one")
+            && body.contains("(branch cadence/d-1-one, base ")
+            && body.contains("Commit trailer: Issue: D-1")
+            && body.contains("PR to main; reply to pm."),
+        "{body}"
+    );
+    // Tracker: start + comment + ref commits; the comment and the
+    // message ref name the worker and the kickoff id.
+    assert_eq!(tracker_commits(), before + 3);
+    let issue = cli(&["issue", "show", "D-1", "--json"]).1;
+    assert_eq!(issue["owner"].as_str().unwrap(), "w1");
+    assert!(
+        issue["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["body"].as_str().unwrap().contains("Dispatched to w1")),
+        "{issue}"
+    );
+    assert!(
+        issue["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "message" && r["path"] == msg_id),
+        "{issue}"
+    );
+
+    // A second identical run reuses the worktree and refuses the
+    // duplicate while the kickoff is still live — no new commits.
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-1",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], false);
+    assert_eq!(out["duplicate"], true);
+    assert_eq!(out["message"].as_str().unwrap(), msg_id);
+    assert_eq!(out["created"], false);
+    assert_eq!(tracker_commits(), before + 3);
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["messages"].as_array().unwrap().len(), 1);
+
+    // --job: an out-of-group worker is refused before the job exists.
+    let (spec, _sha) = d.spec_file("spec.md", "job dispatch spec");
+    let (ok, err) = cli(&[
+        "dispatch",
+        "D-2",
+        "--to",
+        "outsider",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+        "--job",
+        "--spec",
+        &spec,
+    ]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("group"),
+        "{err}"
+    );
+    assert!(!repo.join(".cadence/wt/d-2-two").exists());
+
+    // --job to a member: job + scoped task + a task_dispatch kickoff,
+    // all bound to the issue.
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-2",
+        "--to",
+        "w2",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+        "--job",
+        "--spec",
+        &spec,
+    ]);
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], true);
+    let (job_id, task_id) = (
+        out["job"].as_str().unwrap().to_string(),
+        out["task"].as_str().unwrap().to_string(),
+    );
+    assert_eq!(task_id, format!("{job_id}-t1"));
+    let job = d.rpc("job_show", json!({"job": job_id})).unwrap();
+    let tasks = job["job"]["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["assignee"].as_str().unwrap(), "w2");
+    assert_eq!(tasks[0]["worktree"].as_str().unwrap(), "d-2-two");
+    assert_eq!(tasks[0]["state"].as_str().unwrap(), "dispatched");
+    // The kickoff rides the task — the issue's message ref matches.
+    let issue = cli(&["issue", "show", "D-2", "--json"]).1;
+    let ref_msg = issue["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "message")
+        .and_then(|r| r["path"].as_str())
+        .unwrap()
+        .to_string();
+    assert_eq!(ref_msg, out["message"].as_str().unwrap());
+
+    // `issue finish` while the owner has a live kickoff: refused,
+    // naming w1 and the message.
+    let (ok, err) = cli(&["issue", "finish", "D-1"]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("w1") && msg.contains("queued"), "{msg}");
+    assert!(wt1.is_dir());
+
+    // --force overrides and records it.
+    let (ok, out) = cli(&["issue", "finish", "D-1", "--force"]);
+    assert!(ok && out["finished"] == true, "{out}");
+    assert!(
+        out["overrode"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == "owner-busy"),
+        "{out}"
+    );
+    assert!(!wt1.exists());
+
+    // D-4: owner w2 idle (its kickoff went to D-2's task, and w2's
+    // queued message is the dispatch on D-2 — wait, w2 HAS a live
+    // message from the job dispatch). Use a fresh started issue owned
+    // by 'pm' — pm has no inbound messages.
+    let (ok, _) = cli(&["issue", "start", "D-4", "--owner", "pm"]);
+    assert!(ok);
+    let wt4 = repo.join(".cadence/wt/d-4-four");
+    // Dirty refusal lists the files.
+    std::fs::write(wt4.join("wip.txt"), "x").unwrap();
+    let (ok, err) = cli(&["issue", "finish", "D-4"]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("wip.txt"),
+        "{err}"
+    );
+    // Unmerged+unpushed refusal once committed.
+    git(&wt4, &["add", "-A"]);
+    git(&wt4, &["commit", "-qm", "wip"]);
+    let (ok, err) = cli(&["issue", "finish", "D-4"]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("neither merged"),
+        "{err}"
+    );
+    // Merged → finish succeeds, refs closed in one commit.
+    git(&repo, &["merge", "-q", "cadence/d-4-four"]);
+    let before = tracker_commits();
+    let (ok, out) = cli(&["issue", "finish", "D-4"]);
+    assert!(
+        ok && out["finished"] == true && out["overrode"] == json!([]),
+        "{out}"
+    );
+    assert!(!wt4.exists());
+    assert_eq!(tracker_commits(), before + 1);
+    let issue = cli(&["issue", "show", "D-4", "--json"]).1;
+    assert!(
+        issue["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["kind"] != "worktree" || r["closed"] == true),
+        "{issue}"
+    );
+}

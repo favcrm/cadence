@@ -585,7 +585,10 @@ export default function Drawer({
                     {detail.refs.map((r, i) => (
                       <span
                         key={i}
-                        className="chip bg-ink-800 text-ink-300 !py-[.2rem]"
+                        className={`chip bg-ink-800 !py-[.2rem] ${
+                          r.closed ? "text-ink-500 line-through" : "text-ink-300"
+                        }`}
+                        title={r.closed ? "closed — kept as history" : undefined}
                       >
                         <span className="text-ink-500">{r.kind}</span>
                         {r.url ? (

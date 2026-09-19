@@ -145,6 +145,15 @@ cadence issue blame CAD-16            # for the board at a revision —
 cadence issue trailer CAD-16       # prints `Issue: CAD-16` — tag code
                                       # commits so issue detail lists
                                       # them (`commits` on show/API)
+cadence issue start CAD-16         # mints the project worktree+branch,
+                                      # records refs, moves to doing
+cadence issue finish CAD-16        # safe cleanup: refuses while the owner
+                                      # is busy, the tree dirty, or the
+                                      # branch unmerged+unpushed
+cadence dispatch CAD-16 --to w1 --note kick.md
+                                   # one-step hand-off: issue start +
+                                      # one templated kickoff + comment;
+                                      # --job --spec f dispatches the job
 cadence ui run                     # 127.0.0.1:3010 — SPA + read/write API
 ```
 

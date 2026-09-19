@@ -271,6 +271,44 @@ enum Commands {
         #[arg(long, requires = "ready")]
         force: bool,
     },
+    /// One-step issue dispatch: `issue start` (idempotent, owner =
+    /// the worker) then exactly one templated kickoff message, a
+    /// tracker comment and a `message` ref on the issue. With `--job`
+    /// the kickoff goes through `job dispatch` instead.
+    Dispatch {
+        /// Issue id (e.g. CAD-55).
+        issue: String,
+        /// Worker agent to dispatch to.
+        #[arg(long)]
+        to: String,
+        /// Kickoff note the worker reads (`read <note> — …`).
+        #[arg(long)]
+        note: PathBuf,
+        /// Worktree slug — default: the slugified issue title.
+        #[arg(long)]
+        name: Option<String>,
+        /// Base ref — else the repo's origin/HEAD, else current branch.
+        #[arg(long)]
+        base: Option<String>,
+        /// Repo path — same resolution as `issue start`.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Return address for the worker's result [default:
+        /// CADENCE_ALIAS]. Required outside a cadence pane.
+        #[arg(long)]
+        reply_to: Option<String>,
+        /// One-line summary for the kickoff body [default: issue
+        /// title].
+        #[arg(long)]
+        summary: Option<String>,
+        /// Open the M3 job and dispatch through `job dispatch`
+        /// (requires --spec; the job's PM is --reply-to).
+        #[arg(long, requires = "spec")]
+        job: bool,
+        /// Job spec file for --job — hashed at creation.
+        #[arg(long)]
+        spec: Option<PathBuf>,
+    },
     /// Join a new worker agent to a group. `<group>` is the PM agent —
     /// its alias or provider-native id — and `<provider>` is devin,
     /// codex, claude or fake. The worker's results route back to the PM
@@ -2268,6 +2306,38 @@ fn run() -> Result<i32> {
             }
         }
         Commands::Job { action } => run_job(&state_dir, &action),
+        Commands::Dispatch {
+            issue,
+            to,
+            note,
+            name,
+            base,
+            repo,
+            reply_to,
+            summary,
+            job,
+            spec,
+        } => {
+            let pm = cadence_agent::issue::Pm::open_default()?;
+            let args = cadence_agent::issue::dispatch::DispatchArgs {
+                to: to.clone(),
+                note: note.clone(),
+                name: name.clone(),
+                base: base.clone(),
+                repo: repo.clone(),
+                reply_to: reply_to.clone(),
+                summary: summary.clone(),
+                job_spec: job.then(|| spec.clone().unwrap_or_default()),
+            };
+            print_json(&cadence_agent::issue::dispatch::run(
+                &pm,
+                issue.as_str(),
+                &args,
+                "",
+                &state_dir,
+            )?);
+            Ok(0)
+        }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
