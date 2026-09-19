@@ -5829,6 +5829,10 @@ fn agent_dead_and_resumable_per_endpoint_kind() {
     )
     .unwrap();
     let agent = d.wait_agent("dv1", "attention", 25);
+    // The fence is atomic: the same snapshot that reads `attention`
+    // must already carry the cleared endpoint — never a fenced agent
+    // holding a live one.
+    assert!(agent["endpoint"].is_null(), "{agent}");
     assert_eq!(agent["dead"], true, "{agent}");
     assert_eq!(agent["resumable"], false, "{agent}");
     // Unfence without resume → stopped: not dead, resumable — the
