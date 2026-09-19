@@ -3109,11 +3109,11 @@ fn claude_sessions(dir: &Path) -> Vec<(u32, String)> {
 /// pane open a different chat than asked — a changed-owner fence.
 /// `$FAKE_PANE` (set by the mock tmux) points at the session state.
 const MOCK_CURSOR_TUI_PY: &str = r#"
-import os, sys, time
+import os, sys, time, uuid
 
 chats = sys.argv[1]
 if "create-chat" in sys.argv:
-    print("mock-chat-%d" % os.getpid()); sys.exit(0)
+    print(uuid.uuid4()); sys.exit(0)
 sid = sys.argv[sys.argv.index("--resume") + 1] if "--resume" in sys.argv \
     else "missing-resume"
 if os.environ.get("MOCK_CURSOR_SWAP"):
@@ -3186,11 +3186,26 @@ fn install_mock_cursor_tui(dir: &Path) -> MockCursorTui {
     std::fs::write(&cursor_py, MOCK_CURSOR_TUI_PY).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A `cursor-agent`-named symlink onto python3: the pane's argv[0]
+    // then names the real binary, so the profile's `--resume` argv
+    // proof (not only the store.db fd) is exercised in integration.
+    let out = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    let python = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    let cursor_bin = dir.join("cursor-agent");
+    std::os::unix::fs::symlink(&python, &cursor_bin).unwrap();
     std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
     std::env::set_var("CADENCE_TMUX_COMMAND", &tmux);
     std::env::set_var(
         "CADENCE_CURSOR_COMMAND",
-        format!("python3 {} {}", cursor_py.display(), chats.display()),
+        format!(
+            "{} {} {}",
+            cursor_bin.display(),
+            cursor_py.display(),
+            chats.display()
+        ),
     );
     std::env::set_var("CADENCE_CURSOR_CHATS", &chats);
     // A swap set by an earlier test must not leak into this install.
@@ -9405,7 +9420,7 @@ fn pty_cursor_launch_mints_chat_and_proves_ownership() {
     // mock's argv/env dumps — the cause ordered after them.
     wait_probe_idle(&d, "cu", 15);
     let session = agent["session_id"].as_str().unwrap().to_string();
-    assert!(session.starts_with("mock-chat-"), "{agent}");
+    assert!(uuid::Uuid::parse_str(&session).is_ok(), "{session}");
     // The profile minted the chat then resumed it — the pane's own
     // argv names its session.
     let argv = std::fs::read_to_string(d.cursor_pane_file(&mock, "cu", "argv")).unwrap();
@@ -9482,6 +9497,132 @@ fn pty_cursor_foreign_session_refuses_takeover() {
     assert!(err.contains("owned by another terminal"), "{err}");
     holder.kill().unwrap();
     let _ = holder.wait();
+}
+
+/// A foreign `cursor-agent` argv carrying `--resume <chat>` is the
+/// same ownership proof as the store.db fd — a fabricated argv with
+/// no chat-store fd at all still refuses takeover.
+#[test]
+fn pty_cursor_foreign_argv_refuses_takeover() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_cursor_tui();
+    // `exec -a` fabricates argv[0]=cursor-agent; python keeps the
+    // `--resume argv-held` tail on its cmdline while it sleeps.
+    let mut holder = std::process::Command::new("bash")
+        .args([
+            "-c",
+            "exec -a cursor-agent python3 -c 'import time; time.sleep(60)' --resume argv-held",
+        ])
+        .spawn()
+        .unwrap();
+    // The exec is async — wait until the fabricated argv is visible
+    // in /proc before registering.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", holder.id())).unwrap_or_default();
+        if cmdline.windows(8).any(|w| w == b"--resume") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fabricated argv never appeared");
+        thread::sleep(Duration::from_millis(20));
+    }
+    d.register_cursor_pty("cu", json!({"session": "argv-held"}));
+    let agent = d.wait_agent("cu", "attention", 20);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("owned by another terminal"), "{err}");
+    holder.kill().unwrap();
+    let _ = holder.wait();
+}
+
+/// A fresh open mints once: the id is folded into `params.session`
+/// before the pane exists (`cadence/session_minted`), so the respawn
+/// after a stop resumes the same chat rather than minting a new one.
+/// `agent set --next-launch model=…` is legal for a pty endpoint and
+/// replays verbatim on the next open.
+#[test]
+fn pty_cursor_minted_session_persists_and_model_replays() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    d.register_cursor_pty("cu", json!({"model": "grok-one"}));
+    let agent = d.wait_agent("cu", "idle", 20);
+    wait_probe_idle(&d, "cu", 15);
+    let sid = agent["session_id"].as_str().unwrap().to_string();
+    let argv_file = d.cursor_pane_file(&mock, "cu", "argv");
+    let argv1 = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv1.contains("--model grok-one"), "{argv1}");
+    assert!(argv1.contains(&format!("--resume {sid}")), "{argv1}");
+    // The mint landed in params.session at open — not only in
+    // thread_id after it — so even an unproven launch keeps its id.
+    let show = d.rpc("agent_show", json!({"alias": "cu"})).unwrap();
+    assert_eq!(
+        show["agent"]["params"]["session"].as_str().unwrap(),
+        sid,
+        "{show}"
+    );
+    d.rpc(
+        "agent_set",
+        json!({"alias": "cu", "patch": {"model": "grok-two"},
+               "next_launch": true}),
+    )
+    .unwrap();
+    d.rpc("agent_stop", json!({"alias": "cu"})).unwrap();
+    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    let agent = d.wait_agent("cu", "idle", 20);
+    // Same chat — the respawn resumed the minted id, never re-minted.
+    assert_eq!(agent["session_id"].as_str().unwrap(), sid);
+    wait_probe_idle(&d, "cu", 15);
+    let argv2 = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv2.contains("--model grok-two"), "{argv2}");
+    assert!(!argv2.contains("--model grok-one"), "{argv2}");
+    assert!(argv2.contains(&format!("--resume {sid}")), "{argv2}");
+}
+
+/// Launch merges `Shell(cadence)` into the CLI's allowlist
+/// (`<chats>/../cli-config.json`), preserving the document and
+/// dropping a `.bak`; a second launch leaves the file untouched.
+#[test]
+fn pty_cursor_allowlist_merged_into_cli_config() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    let config = mock.dir.join("cli-config.json");
+    std::fs::write(
+        &config,
+        "{\n  \"permissions\": {\n    \"allow\": [\"Shell(ls)\"],\n    \"deny\": []\n  },\n  \"display\": {\"mode\": \"zen\"}\n}\n",
+    )
+    .unwrap();
+    d.register_cursor_pty("cu", json!({}));
+    d.wait_agent("cu", "idle", 20);
+    let text = std::fs::read_to_string(&config).unwrap();
+    let doc: Value = serde_json::from_str(&text).unwrap();
+    let allow = doc["permissions"]["allow"].as_array().unwrap();
+    assert!(allow.iter().any(|e| e == "Shell(cadence)"), "{text}");
+    assert!(allow.iter().any(|e| e == "Shell(ls)"), "{text}");
+    assert_eq!(doc["display"]["mode"].as_str().unwrap(), "zen", "{text}");
+    let bak = std::fs::read_to_string(mock.dir.join("cli-config.json.bak")).unwrap();
+    assert!(bak.contains("Shell(ls)"), "{bak}");
+    // A resume leaves an already-merged config byte-identical.
+    let before = std::fs::read_to_string(&config).unwrap();
+    d.rpc("agent_stop", json!({"alias": "cu"})).unwrap();
+    d.rpc("agent_resume", json!({"alias": "cu"})).unwrap();
+    d.wait_agent("cu", "idle", 20);
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+}
+
+/// An unparseable `cli-config.json` refuses the launch with a clear
+/// error rather than clobbering the user's settings.
+#[test]
+fn pty_cursor_malformed_cli_config_refuses_launch() {
+    let d = TestDaemon::start();
+    let mock = d.mock_cursor_tui();
+    let config = mock.dir.join("cli-config.json");
+    std::fs::write(&config, "{ not json").unwrap();
+    d.register_cursor_pty("cu", json!({}));
+    let agent = d.wait_agent("cu", "attention", 20);
+    let err = agent["error"].as_str().unwrap_or("");
+    assert!(err.contains("not valid JSON"), "{err}");
+    assert!(err.contains("refusing to launch"), "{err}");
+    // The malformed file is left exactly as found.
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "{ not json");
 }
 
 /// The pane opening a different chat than the one we asked for is a
@@ -9628,10 +9769,11 @@ fn pty_cursor_busy_and_approval_gate_sends() {
     .unwrap();
     pty_token(&d, "cu", "m1");
     // The cursor spinner's own shape holds the gate — status row
-    // above the input line plus the interrupt hint on it.
+    // above the input line plus the interrupt hint on it. (The
+    // model/cwd bar renders below the input row on real frames.)
     std::fs::write(
         &state,
-        " ⠠⠛ Running  30 tokens\n  → Add a follow-up     ctrl+c to stop\n",
+        " ⠠⠛ Running  30 tokens\n  → Add a follow-up     ctrl+c to stop\n  /mock · main\n",
     )
     .unwrap();
     d.rpc(

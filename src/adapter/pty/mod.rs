@@ -592,6 +592,24 @@ impl ProviderAdapter for PtyAdapter {
                 "adopted",
             )
         } else {
+            // Mint once: a profile with a prepare step mints its native
+            // session id *before* the pane exists, and the event folds
+            // it into `params.session` — a respawn after a failed launch
+            // resumes the same id instead of abandoning a mint per
+            // retry. `desired` is the adapter's copy for this open.
+            let desired = match desired {
+                Some(want) => Some(want),
+                None => {
+                    let minted = self.profile.prepare_session()?;
+                    if let Some(id) = &minted {
+                        (self.hooks.on_event)(
+                            "cadence/session_minted",
+                            serde_json::json!({"session": id}),
+                        );
+                    }
+                    minted
+                }
+            };
             // Refuse takeover: a session owned outside our (future)
             // pane means another TUI already owns it.
             if let Some(want) = &desired {

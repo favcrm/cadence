@@ -321,12 +321,28 @@ store the TUI itself holds open: a running `cursor-agent` keeps an fd
 on `~/.cursor/chats/<project-hash>/<chat-id>/store.db` for the whole
 session, and its argv carries `--resume <chat-id>` from exec. A live
 attachment counts when the holding process (or the argv carrier)
-descends from the pane pid — `/proc` walked the same way. A fresh
-launch mints its chat id first (`cursor-agent create-chat`) so every
-pane names its session in argv, and the same three rules follow: a
-live foreign attachment to the wanted chat refuses takeover, a pane
-owning a different chat fails closed, and a dead pane relaunches with
-`cursor-agent --resume <stored>`.
+descends from the pane pid — `/proc` walked the same way, and any
+descendant holder proves it (`/proc` order is not pane-first). A fresh
+launch mints its chat id once (`cursor-agent create-chat`, uuid-shaped
+output anchored exactly) and records it via `cadence/session_minted`
+→ `params.session` *before* the pane exists, so a respawn after a
+failed open resumes the same id rather than abandoning a chat per
+retry. The same three rules follow: a live foreign attachment to the
+wanted chat refuses takeover, a pane owning a different chat fails
+closed, and a dead pane relaunches with `cursor-agent --resume
+<stored>`.
+
+Cursor also has no per-launch allow flag for the worker's own
+`cadence` calls — where claude's argv carries
+`--allowedTools 'Bash(cadence *)'`, cursor's allowlist lives in the
+CLI's own `~/.cursor/cli-config.json` (`permissions.allow`, entries
+like `Shell(ls)`). At every launch the profile merges
+`Shell(cadence)` into that array idempotently: the file is parsed
+first, rewritten only when the entry is absent, a `.bak` of the
+original bytes is kept on modification, and an unparseable or
+non-array config refuses the launch rather than clobbering it. In
+every permission mode a worker's `cadence self`/`message result`
+then runs without an approval menu.
 
 **Submission gates.** `run_turn` requires all of: pane alive,
 `pane_dead=0`, `pane_in_mode=0`, native ownership still held, and a
@@ -368,13 +384,19 @@ input when the cursor has moved (an unreadable cursor treats it as
 real text — conservative).
 Cursor's analyzer keys on its own shapes, all captured from live
 panes (2026.09.15/2026.09.18): the input line is the last `→`-leading
-row, an empty input shows a watermark (`Plan, search, build anything`
-idle, `Add a follow-up` after a turn — either is *empty*, never a
-draft), busy is the `ctrl+c to stop` interrupt hint on the input row
-itself or the status row directly above it (the braille spinner, a
-spinner word with its token counter, or the staged `follow-ups` box),
-and approval is the `Run this command?` menu — read only inside the
-status region since the transcript above can quote the same strings.
+row *inside the bottom status region* — and never the frame's last
+row, since the model/cwd bar always renders below it (a `→` higher up
+or ending the frame is transcript text, a scrolled-out input row, or
+a menu cursor). An empty input shows a watermark (`Plan, search,
+build anything` idle, `Add a follow-up` after a turn — either is
+*empty*, never a draft), busy is the `ctrl+c to stop` interrupt hint
+on the input row itself or the status row directly above it (the
+braille spinner, a spinner word with its token counter, or the staged
+`follow-ups` box), and approval requires a strong anchor (`Run this
+command?`, `Not in allowlist`, `Waiting for approval`) or a cluster
+of menu hints — navigation chrome like `more below` or `Esc to close`
+alone never decides, since transcript text can quote it. Everything
+matches only inside the status region.
 `agent probe <alias>`
 runs the same analyzer on demand (`{idle, reason, prompt_visible,
 input_nonempty, busy_marker, approval_menu}`) without claiming. An
@@ -783,7 +805,7 @@ Kinds: `registered, queued, submitting, turn_started, turn_finished,
 provider_event, input_required, input_answered, input_resolved,
 request_opened, request_closed,
 result_routed, notice_routed, ready, ready_claimed, claim_used,
-gate_wait, submitted,
+gate_wait, submitted, session_minted,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
 params_updated, reconciled, relaunch_skipped, attention,
 turn_stalled, turn_resumed, stop_requested`. `wait>0` long-polls

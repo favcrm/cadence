@@ -84,17 +84,24 @@ mod cursor_screen {
     /// neutral documentation (it can sit between the spinner and the
     /// box), and box rules are frame, not status.
     pub const TIP: &str = "Tip:";
-    /// An open select/permission menu — the command-approval box's
-    /// title, options and key hints, the inline wait state, plus the
-    /// generic menu footers (`/`, `@`, `/skills` pickers).
-    pub const APPROVAL: &[&str] = &[
+    /// Strong approval evidence — strings only a real permission box
+    /// (or a pending inline approval) renders. Anchors alone decide;
+    /// transcript text can legitimately quote the hints below, so they
+    /// never decide by themselves.
+    pub const ANCHOR: &[&str] = &[
         "Run this command?",
-        "Not in allowlist:",
+        "Not in allowlist",
+        "Waiting for approval",
+    ];
+    /// Secondary menu chrome — the approval box's options and key
+    /// hints plus the generic select footers (`/`, `@`, `/skills`
+    /// pickers). A cluster of two or more in the status region counts
+    /// as a menu; a lone hint is transcript-speakable and does not.
+    pub const HINT: &[&str] = &[
         "to allowlist? (tab)",
         "Run (once) (y)",
         "Run Everything (shift+tab)",
         "tell the agent what to do instead",
-        "Waiting for approval",
         "to navigate",
         "more below",
         "Esc to close",
@@ -107,6 +114,28 @@ mod cursor_screen {
 /// picker. `#` stays a literal draft and is deliberately absent.
 pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
 
+/// A `cli-config.json` shape we refuse to silently rewrite — the file
+/// parses but a node we must edit holds an unexpected type.
+fn malformed(path: &Path, what: &str) -> Error {
+    Error::provider(format!(
+        "{} is malformed ({what}) — refusing to launch cursor-agent; \
+         fix or remove the file",
+        path.display()
+    ))
+}
+
+/// A chat id's shape: uuid groups 8-4-4-4-12, hex only. `create-chat`
+/// output may carry warnings around the id — only this shape counts.
+fn uuid_shape(token: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = token.split('-').collect();
+    parts.len() == 5
+        && GROUPS
+            .iter()
+            .zip(parts.iter())
+            .all(|(n, part)| part.len() == *n && part.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// A row of the TUI's own activity indicator: a braille spinner glyph
 /// (U+2800–U+28FF — the TUI animates through them) or a spinner word
 /// with its live token counter.
@@ -115,20 +144,26 @@ fn spinner_row(row: &str) -> bool {
         || (cursor_screen::SPINNER.iter().any(|w| row.contains(w)) && row.contains("tokens"))
 }
 
-/// Reduce a captured Cursor screen to gate facts. The last `→` line
-/// is the input line; text after it that is not an input watermark is
-/// a staged draft. Menus and busy markers win over prompt parsing — a
-/// `→` leads the first approval option too. Approval menus are only
-/// read in the bottom status region (the transcript above can
-/// legitimately print the same strings), and busy is anchored tighter
-/// still (CAD-50): the `ctrl+c to stop` hint on the input line
-/// itself, or the status row directly above it — the braille spinner,
-/// a spinner word with its token count, or the staged follow-ups box.
-/// Blank rows, box rules and `Tip:` rows sit between the two and are
-/// skipped — a tip quoting the same hints stays neutral. The region
-/// is anchored at the last NON-BLANK row — `capture-pane` pads to
-/// pane height, so a young session on a tall pane has blank rows
-/// below the real content.
+/// Reduce a captured Cursor screen to gate facts. The input line is
+/// the last `→`-leading row inside the bottom status region — and it
+/// is never the last non-blank row (the model/cwd bar always sits
+/// below it), so a `→` higher up or a bare `→` ending the frame is
+/// transcript text (a menu cursor, a pasted glyph, a scrolled-out
+/// input row), never the prompt. Text after a real `→` that is not an
+/// input watermark is a staged draft. Menus and busy markers win over
+/// prompt parsing — a `→` leads the first approval option too.
+/// Approval needs a strong anchor (`Run this command?`,
+/// `Not in allowlist`, `Waiting for approval`) or a cluster of menu
+/// hints — the transcript above can legitimately print a lone hint,
+/// and it all only matches inside the status region. Busy is anchored
+/// tighter still (CAD-50): the `ctrl+c to stop` hint on the input
+/// line itself, or the status row directly above it — the braille
+/// spinner, a spinner word with its token count, or the staged
+/// follow-ups box. Blank rows, box rules and `Tip:` rows sit between
+/// the two and are skipped — a tip quoting the same hints stays
+/// neutral. The region is anchored at the last NON-BLANK row —
+/// `capture-pane` pads to pane height, so a young session on a tall
+/// pane has blank rows below the real content.
 pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
     let content = screen.trim_end();
     let tail: String = content
@@ -140,11 +175,20 @@ pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
-    let approval_menu = cursor_screen::APPROVAL.iter().any(|m| tail.contains(m));
+    let approval_menu = cursor_screen::ANCHOR.iter().any(|m| tail.contains(m))
+        || cursor_screen::HINT
+            .iter()
+            .filter(|m| tail.contains(*m))
+            .count()
+            >= 2;
     let lines: Vec<&str> = content.lines().collect();
+    // Prompt search is anchored to the bottom `STATUS_LINES` rows —
+    // the input row lives there on every real frame — and can never
+    // be the last row: the model/cwd bar always renders below it.
     let prompt_idx = lines
         .iter()
-        .rposition(|l| l.trim_start().starts_with(cursor_screen::PROMPT));
+        .rposition(|l| l.trim_start().starts_with(cursor_screen::PROMPT))
+        .filter(|i| *i + 1 < lines.len() && lines.len() - i <= STATUS_LINES);
     let prompt_visible = prompt_idx.is_some();
     let input_line = prompt_idx.map(|i| lines[i]).unwrap_or("");
     // The interrupt hint shares the input row while a turn runs —
@@ -204,7 +248,9 @@ pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
 /// the TUI holds for the session's whole life. SQLite sidecars
 /// (`store.db-wal`, `store.db-journal`) name the same chat.
 fn store_db_chat(chats_dir: &Path, pid: u32) -> Option<String> {
-    let prefix = format!("{}/", chats_dir.to_string_lossy());
+    // Trailing slashes in a configured chats dir must not double the
+    // separator in the fd-link prefix.
+    let prefix = format!("{}/", chats_dir.to_string_lossy().trim_end_matches('/'));
     let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
     for fd in fds.flatten() {
         let Ok(link) = std::fs::read_link(fd.path()) else {
@@ -244,6 +290,14 @@ fn argv_chat(pid: u32) -> Option<String> {
     Some(args.get(i + 1)?.clone())
 }
 
+/// The entry that lets a Cursor worker run `cadence …` commands —
+/// `cadence self`, `message result`, `agent list` — without an
+/// approval prompt in every permission mode. Cursor has no launch
+/// flag for allowed tools, so it rides the CLI's own
+/// `permissions.allow` in `cli-config.json` (entries are command
+/// prefixes: `Shell(cadence)` covers every `cadence` invocation).
+const CADENCE_ALLOW_ENTRY: &str = "Shell(cadence)";
+
 /// The Cursor profile: `cursor-agent` argv (`create-chat` mint +
 /// `--resume <chat>` on every launch, `--trust` always, `--model`,
 /// and `--force`/`--auto-review` permission modes), chat ownership
@@ -269,11 +323,20 @@ impl CursorProfile {
     /// found on PATH), and the model/permission params replayed on
     /// every launch exactly as registered.
     pub fn new(agent: &Agent) -> Result<Self> {
-        let chats_dir = std::env::var("CADENCE_CURSOR_CHATS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cursor/chats")
-            });
+        let chats_dir = match std::env::var("CADENCE_CURSOR_CHATS") {
+            Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => match std::env::var("HOME") {
+                Ok(home) if !home.is_empty() => PathBuf::from(home).join(".cursor/chats"),
+                // A relative `.cursor/chats` would silently follow the
+                // daemon's cwd — refuse rather than scan the wrong tree.
+                _ => {
+                    return Err(Error::provider(
+                        "HOME is unset and CADENCE_CURSOR_CHATS is not — \
+                         cannot locate ~/.cursor",
+                    ))
+                }
+            },
+        };
         let command = match std::env::var("CADENCE_CURSOR_COMMAND") {
             Ok(cmd) if !cmd.is_empty() => cmd,
             _ => resolve_on_path("cursor-agent").map(|p| shlex_quote(&p))?,
@@ -313,22 +376,118 @@ impl CursorProfile {
             )));
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let id = stdout
-            .lines()
-            .rev()
-            .find_map(|l| l.split_whitespace().last())
-            .unwrap_or("");
-        // A chat id is uuid-shaped — accept only id characters so a
-        // warning or error line can never be launched as a session.
-        if id.is_empty()
-            || id.len() > 128
-            || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
-            return Err(Error::provider(format!(
-                "cursor-agent create-chat returned an unusable chat id: {id:?}"
-            )));
+        // Anchor on the id's real shape — uuid groups 8-4-4-4-12 —
+        // and fail closed on ambiguity: a warning line's trailing
+        // token or two printed ids must never be launched as a
+        // session.
+        let found: std::collections::BTreeSet<&str> = stdout
+            .split_whitespace()
+            .filter(|token| uuid_shape(token))
+            .collect();
+        match found.len() {
+            1 => Ok(found.into_iter().next().unwrap().to_string()),
+            0 => Err(Error::provider(format!(
+                "cursor-agent create-chat printed no chat id: {}",
+                stdout.trim()
+            ))),
+            _ => Err(Error::provider(format!(
+                "cursor-agent create-chat printed ambiguous chat ids: {}",
+                stdout.trim()
+            ))),
         }
-        Ok(id.to_string())
+    }
+
+    /// `cli-config.json` sits beside `chats/` under `~/.cursor` — the
+    /// same root override (`CADENCE_CURSOR_CHATS`) relocates it in
+    /// tests, so the merge never touches a real config there.
+    fn cli_config_path(&self) -> PathBuf {
+        self.chats_dir
+            .parent()
+            .unwrap_or(self.chats_dir.as_path())
+            .join("cli-config.json")
+    }
+
+    /// Idempotent `Shell(cadence)` merge into the CLI's allowlist,
+    /// run at every launch: absent entry → write, present → leave the
+    /// file byte-identical (no `.bak`, no rewrite). The file is read
+    /// as JSON first — an unparseable config refuses the launch
+    /// rather than clobbering the user's settings, and a non-array
+    /// `allow` is malformed the same way. A `.bak` of the original
+    /// bytes is written before every modification.
+    fn ensure_cadence_allowlist(&self) -> Result<()> {
+        let path = self.cli_config_path();
+        let original = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(Error::provider(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        let mut doc: Value = match &original {
+            Some(text) => serde_json::from_str(text).map_err(|e| {
+                Error::provider(format!(
+                    "{} is not valid JSON ({e}) — refusing to launch \
+                     cursor-agent; fix or remove the file",
+                    path.display()
+                ))
+            })?,
+            None => serde_json::json!({"version": 1}),
+        };
+        let root = doc
+            .as_object_mut()
+            .ok_or_else(|| malformed(&path, "config root is not a JSON object"))?;
+        let permissions = match root.get_mut("permissions") {
+            Some(v) => v
+                .as_object_mut()
+                .ok_or_else(|| malformed(&path, "`permissions` is not a JSON object"))?,
+            None => {
+                root.insert(
+                    "permissions".to_string(),
+                    serde_json::json!({"allow": [], "deny": []}),
+                );
+                root.get_mut("permissions")
+                    .and_then(Value::as_object_mut)
+                    .unwrap()
+            }
+        };
+        let allow = match permissions.get_mut("allow") {
+            Some(v) => v
+                .as_array_mut()
+                .ok_or_else(|| malformed(&path, "`permissions.allow` is not an array"))?,
+            None => {
+                permissions.insert("allow".to_string(), serde_json::json!([]));
+                permissions
+                    .get_mut("allow")
+                    .and_then(Value::as_array_mut)
+                    .unwrap()
+            }
+        };
+        if allow
+            .iter()
+            .any(|e| e.as_str() == Some(CADENCE_ALLOW_ENTRY))
+        {
+            return Ok(());
+        }
+        allow.push(Value::String(CADENCE_ALLOW_ENTRY.to_string()));
+        let rendered = serde_json::to_string_pretty(&doc)?;
+        if let Some(text) = &original {
+            // `.bak` only when modifying — and it keeps the source
+            // file's mode (the config carries auth details).
+            let bak = PathBuf::from(format!("{}.bak", path.display()));
+            std::fs::write(&bak, text)
+                .map_err(|e| Error::provider(format!("cannot write {}: {e}", bak.display())))?;
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let _ = std::fs::set_permissions(&bak, meta.permissions());
+            }
+        } else if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::provider(format!("cannot create {}: {e}", parent.display())))?;
+        }
+        std::fs::write(&path, format!("{rendered}\n"))
+            .map_err(|e| Error::provider(format!("cannot write {}: {e}", path.display())))
     }
 
     /// Every live (pid, chat) attachment on the host: the open
@@ -357,17 +516,27 @@ impl TuiProfile for CursorProfile {
         "Cursor"
     }
 
+    /// A fresh open mints its chat id here — once, before the pane
+    /// exists. The adapter folds it into `params.session`
+    /// (`cadence/session_minted`) so a later respawn resumes it; an
+    /// id minted but never proven is still the agent's session.
+    fn prepare_session(&self) -> Result<Option<String>> {
+        self.mint_chat().map(Some)
+    }
+
     /// `cursor-agent --trust [--model M] [--force|--auto-review]
-    /// --resume <chat>` — a fresh launch mints its chat id first so
-    /// the pane's argv names its session from exec. `--trust` keeps
-    /// the workspace-trust prompt from ever gating the pane; Cadence
-    /// manages worktrees itself, so cursor's own `--worktree` is
-    /// never used.
+    /// --resume <chat>` — every launch carries its chat id in argv
+    /// from exec (fresh ids arrive pre-minted via `prepare_session`).
+    /// `--trust` keeps the workspace-trust prompt from ever gating
+    /// the pane; Cadence manages worktrees itself, so cursor's own
+    /// `--worktree` is never used. The launch also ensures the
+    /// worker's own `cadence` calls are allowlisted — a malformed
+    /// `cli-config.json` refuses here, before the pane exists.
     fn launch_command(&self, resume: Option<&str>) -> Result<String> {
-        let chat = match resume {
-            Some(want) => want.to_string(),
-            None => self.mint_chat()?,
-        };
+        self.ensure_cadence_allowlist()?;
+        let chat = resume.ok_or_else(|| {
+            Error::internal("cursor-agent needs a chat id — minted in prepare_session")
+        })?;
         let mut argv = format!("{} --trust", self.command);
         if let Some(model) = &self.model {
             argv.push_str(&format!(" --model {}", shlex_quote(model)));
@@ -377,7 +546,7 @@ impl TuiProfile for CursorProfile {
             Some("auto-review") => argv.push_str(" --auto-review"),
             _ => {}
         }
-        argv.push_str(&format!(" --resume {}", shlex_quote(&chat)));
+        argv.push_str(&format!(" --resume {}", shlex_quote(chat)));
         Ok(argv)
     }
 
@@ -428,7 +597,10 @@ impl TuiProfile for CursorProfile {
     }
 
     /// The pane owns `native` while a descendant of its pid is
-    /// attached to the chat — rechecked before every send.
+    /// attached to the chat — rechecked before every send. ANY
+    /// descendant holder proves it: `/proc` enumeration order is not
+    /// pane-first, so a foreign holder listed earlier must not
+    /// reject a valid child.
     fn verify_ownership(&self, native: &str, pane_pid: u32) -> Result<()> {
         let holders: Vec<u32> = self
             .attachments()
@@ -436,8 +608,10 @@ impl TuiProfile for CursorProfile {
             .filter(|(_, chat)| chat.as_str() == native)
             .map(|(pid, _)| pid)
             .collect();
+        if holders.iter().any(|pid| descends_from(*pid, pane_pid)) {
+            return Ok(());
+        }
         match holders.first() {
-            Some(pid) if descends_from(*pid, pane_pid) => Ok(()),
             Some(pid) => Err(Error::provider(format!(
                 "Cursor chat '{native}' is owned by pid {pid} outside our pane"
             ))),
@@ -469,7 +643,7 @@ impl TuiProfile for CursorProfile {
 mod tests {
     use super::{analyze_cursor, argv_chat, store_db_chat, CursorProfile};
     use crate::adapter::pty::profile::TuiProfile;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::path::PathBuf;
 
     /// Real captures from live cursor-agent panes (CAD-56, versions
@@ -537,14 +711,39 @@ mod tests {
     }
 
     #[test]
-    fn markers_absent_mean_idle() {
-        // A bare frame with only the input line: no busy/approval
-        // evidence anywhere.
+    fn markers_absent_and_prompt_in_region_is_idle() {
+        // A bare frame with the input row in the status region and a
+        // status bar below it: no busy/approval evidence anywhere.
         let p = analyze_cursor(
             "  Cursor Agent\n  → Plan, search, build anything\n  Cursor Grok 4.6 High\n  /tmp/x · main\n",
             None,
         );
         assert!(p.idle && !p.busy_marker && !p.approval_menu);
+    }
+
+    #[test]
+    fn bare_prompt_as_last_row_is_not_the_input() {
+        // The input row is never the frame's last row — the model/cwd
+        // bar always sits below it. A bare `→` ending the frame (the
+        // input row scrolled out, or transcript text) must not read
+        // as a prompt: missing it fails closed, never idle.
+        let p = analyze_cursor("work done\n→ ", None);
+        assert!(!p.idle && !p.prompt_visible);
+        assert_eq!(p.reason, "no prompt line visible");
+    }
+
+    #[test]
+    fn prompt_glyph_above_status_region_is_transcript_text() {
+        // A `→` row more than STATUS_LINES above the last row is
+        // transcript text, not the input — e.g. a pasted glyph or a
+        // menu cursor that scrolled up.
+        let mut screen = String::from("work\n→ transcript arrow\n");
+        for i in 0..20 {
+            screen.push_str(&format!("transcript row {i}\n"));
+        }
+        let p = analyze_cursor(&screen, None);
+        assert!(!p.idle && !p.prompt_visible);
+        assert_eq!(p.reason, "no prompt line visible");
     }
 
     #[test]
@@ -564,7 +763,7 @@ mod tests {
         // The `┌─ follow-ups ─┐` box interior can become the row above
         // the input — its title/footer are staged-queue evidence.
         let p = analyze_cursor(
-            "work\n │ enter steer · ↑ select/edit · esc cancel │\n  → Add a follow-up\n",
+            "work\n │ enter steer · ↑ select/edit · esc cancel │\n  → Add a follow-up\n  /mock · main\n",
             None,
         );
         assert!(!p.idle && p.busy_marker);
@@ -576,12 +775,12 @@ mod tests {
         // on real frames — skipping it must still find the spinner;
         // without one the tip alone is documentation, never busy.
         let busy = analyze_cursor(
-            " ⠠⠛ Running  43 tokens\n    Tip: Try Cursor Grok 4.6 via /model\n  → Add a follow-up\n",
+            " ⠠⠛ Running  43 tokens\n    Tip: Try Cursor Grok 4.6 via /model\n  → Add a follow-up\n  /mock · main\n",
             None,
         );
         assert!(!busy.idle && busy.busy_marker, "{}", busy.reason);
         let idle = analyze_cursor(
-            "  Tip: Use /skills to give Cursor specialized knowledge\n  → Plan, search, build anything\n",
+            "  Tip: Use /skills to give Cursor specialized knowledge\n  → Plan, search, build anything\n  /mock · main\n",
             None,
         );
         assert!(idle.idle && !idle.busy_marker, "{}", idle.reason);
@@ -590,19 +789,50 @@ mod tests {
     #[test]
     fn menu_options_are_not_prompt_drafts() {
         // A menu's selected option leads with `→` like the input —
-        // generic menu chrome in the region reads as a menu, not as
-        // "unsubmitted text".
+        // a cluster of menu chrome in the region reads as a menu,
+        // not as "unsubmitted text".
         let p = analyze_cursor(
-            "  /skills\n   → + Create new skill\n   ↓ more below\n",
+            "  /skills\n   → + Create new skill\n   ↓ more below\n   Esc to close\n",
             None,
         );
         assert!(!p.idle && p.approval_menu);
         assert_eq!(p.reason, "approval menu is open");
     }
 
+    #[test]
+    fn lone_navigation_hint_is_not_a_menu() {
+        // Transcript text can quote a navigation hint — one hint
+        // alone never opens a menu. The `→` row still isn't a
+        // prompt: ending the frame means the input scrolled out, so
+        // the frame fails closed rather than idle.
+        let p = analyze_cursor("work\nasked how to navigate menus\n→ ", None);
+        assert!(!p.idle && !p.approval_menu);
+        // Even with a real prompt, a lone hint quoted in the
+        // transcript region is not approval evidence.
+        let p = analyze_cursor(
+            "docs say ↑↓ to navigate\n  → Plan, search, build anything\n  Grok 4.6\n",
+            None,
+        );
+        assert!(p.idle && !p.approval_menu, "{}", p.reason);
+    }
+
+    #[test]
+    fn approval_anchor_wins_over_transcript() {
+        // `Not in allowlist` inside the status region is a real
+        // pending approval — anchor evidence decides on its own.
+        let p = analyze_cursor(
+            "$ cadence self\n  → Add a follow-up\nNot in allowlist: cadence\n  Grok 4.6\n",
+            None,
+        );
+        assert!(!p.idle && p.approval_menu);
+    }
+
     fn profile(params: serde_json::Value) -> CursorProfile {
         CursorProfile {
-            chats_dir: PathBuf::from("/nonexistent"),
+            // A real temp dir — `launch_command` merges the allowlist
+            // into `<chats>/../cli-config.json`, so a bogus path would
+            // write a config at the filesystem root in tests.
+            chats_dir: tempfile::tempdir().unwrap().keep().join("chats"),
             command: "cursor-agent".to_string(),
             model: params
                 .get("model")
@@ -663,5 +893,187 @@ mod tests {
         // argv proof: only a cursor-agent argv[0] counts — our own
         // test process's cmdline names no chat.
         assert_eq!(argv_chat(pid), None);
+        // A trailing slash in the chats dir must not break the
+        // fd-link prefix match.
+        let file = std::fs::File::create(&db).unwrap();
+        assert_eq!(
+            store_db_chat(&chats.join(""), pid).as_deref(),
+            Some("chat-9"),
+        );
+        drop(file);
+    }
+
+    #[test]
+    fn argv_proof_fabricated() {
+        // A process whose argv[0] names cursor-agent and carries
+        // `--resume <chat>` proves that chat — fabricated with
+        // `exec -a` so the test needs no real binary.
+        let mut holder = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "exec -a cursor-agent python3 -c 'import time; time.sleep(30)' --resume chat-fab-9",
+            ])
+            .spawn()
+            .unwrap();
+        let mut found = None;
+        for _ in 0..100 {
+            if let Some(chat) = argv_chat(holder.id()) {
+                found = Some(chat);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(found.as_deref(), Some("chat-fab-9"));
+        // An argv[0] that does not name cursor-agent proves nothing
+        // even with `--resume` on its cmdline.
+        let mut other = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "exec -a bash python3 -c 'import time; time.sleep(30)' --resume chat-not-mine",
+            ])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(argv_chat(other.id()), None);
+        let _ = holder.kill();
+        let _ = other.kill();
+        let _ = holder.wait();
+        let _ = other.wait();
+    }
+
+    /// A profile rooted in a temp dir: `cli-config.json` lands next
+    /// to `chats/` inside it.
+    fn profile_in(dir: &std::path::Path) -> CursorProfile {
+        CursorProfile {
+            chats_dir: dir.join("chats"),
+            command: "cursor-agent".to_string(),
+            model: None,
+            permission_mode: None,
+        }
+    }
+
+    fn allow_entries(dir: &std::path::Path) -> Vec<String> {
+        let text = std::fs::read_to_string(dir.join("cli-config.json")).unwrap();
+        serde_json::from_str::<Value>(&text).unwrap()["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn allowlist_merge_creates_config_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = profile_in(dir.path());
+        p.ensure_cadence_allowlist().unwrap();
+        assert_eq!(allow_entries(dir.path()), ["Shell(cadence)"]);
+        assert!(!dir.path().join("cli-config.json.bak").exists());
+        // Idempotent: a second run leaves the file untouched.
+        let before = std::fs::read_to_string(dir.path().join("cli-config.json")).unwrap();
+        p.ensure_cadence_allowlist().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cli-config.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn allowlist_merge_preserves_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("cli-config.json");
+        // `permissions` without `allow` — the array is created.
+        std::fs::write(
+            &config,
+            "{\n  \"permissions\": {\"deny\": []},\n  \"display\": {\"mode\": \"zen\"}\n}\n",
+        )
+        .unwrap();
+        let p = profile_in(dir.path());
+        p.ensure_cadence_allowlist().unwrap();
+        let text = std::fs::read_to_string(&config).unwrap();
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            doc["permissions"]["allow"].as_array().unwrap(),
+            &vec![Value::String("Shell(cadence)".to_string())]
+        );
+        assert_eq!(doc["display"]["mode"].as_str().unwrap(), "zen");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cli-config.json.bak")).unwrap(),
+            "{\n  \"permissions\": {\"deny\": []},\n  \"display\": {\"mode\": \"zen\"}\n}\n"
+        );
+    }
+
+    #[test]
+    fn allowlist_merge_existing_entry_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("cli-config.json");
+        std::fs::write(
+            &config,
+            "{\"permissions\": {\"allow\": [\"Shell(ls)\", \"Shell(cadence)\"]}}",
+        )
+        .unwrap();
+        let p = profile_in(dir.path());
+        p.ensure_cadence_allowlist().unwrap();
+        // Entry present → no write, no .bak, bytes unchanged.
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "{\"permissions\": {\"allow\": [\"Shell(ls)\", \"Shell(cadence)\"]}}"
+        );
+        assert!(!dir.path().join("cli-config.json.bak").exists());
+    }
+
+    #[test]
+    fn allowlist_merge_refuses_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("cli-config.json");
+        std::fs::write(&config, "{ not json").unwrap();
+        let p = profile_in(dir.path());
+        let err = p.ensure_cadence_allowlist().unwrap_err().to_string();
+        assert!(err.contains("not valid JSON"), "{err}");
+        assert!(err.contains("refusing to launch"), "{err}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "{ not json");
+        // A well-formed file with a non-array allow is malformed too.
+        std::fs::write(&config, "{\"permissions\": {\"allow\": \"cadence\"}}").unwrap();
+        let err = p.ensure_cadence_allowlist().unwrap_err().to_string();
+        assert!(err.contains("malformed"), "{err}");
+        assert!(err.contains("`permissions.allow` is not an array"), "{err}");
+    }
+
+    /// `prepare_session` runs `sh -c "<command> create-chat"` — a
+    /// fabricated command prints whatever shape the test needs.
+    fn mint_with(command: &str) -> crate::error::Result<Option<String>> {
+        CursorProfile {
+            chats_dir: PathBuf::from("/nonexistent"),
+            command: command.to_string(),
+            model: None,
+            permission_mode: None,
+        }
+        .prepare_session()
+    }
+
+    #[test]
+    fn mint_anchors_on_uuid_shape() {
+        // Warnings around the id are fine — only the uuid token
+        // counts.
+        let p = mint_with("printf 'a warning line\\n%s\\n' 11111111-2222-3333-4444-555555555555");
+        assert_eq!(
+            p.unwrap().as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        // No id-shaped token at all fails closed.
+        let err = mint_with("echo create-chat failed upstream")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("printed no chat id"), "{err}");
+        // Two different ids is ambiguous — never pick one.
+        let err = mint_with(
+            "printf '%s\\n%s\\n' 11111111-2222-3333-4444-555555555555 aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        // A failing command reports its stderr.
+        let err = mint_with("false").unwrap_err().to_string();
+        assert!(err.contains("create-chat failed"), "{err}");
     }
 }
