@@ -18,7 +18,9 @@ pub const REF_KINDS: &[&str] = &[
     "pr", "commit", "note", "preview", "message", "url", "branch", "worktree",
 ];
 /// Fields `issue set` may write.
-pub const SETTABLE: &[&str] = &["status", "priority", "owner", "component", "title"];
+pub const SETTABLE: &[&str] = &["status", "priority", "owner", "component", "title", "tags"];
+/// Most tags one issue may carry.
+pub const TAG_MAX: usize = 12;
 
 /// `note` refs use `path` (the notes directory), preview refs store the
 /// publish path — never a signed URL.
@@ -49,6 +51,9 @@ pub struct Front {
     pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component: Option<String>,
+    /// Free-form slicing labels — stored sorted and de-duplicated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -71,6 +76,7 @@ impl Front {
             priority: "P2".to_string(),
             owner: None,
             component: None,
+            tags: vec![],
             parent: None,
             blocked_by: vec![],
             relates: vec![],
@@ -161,6 +167,39 @@ pub fn check_priority(priority: &str) -> Result<()> {
     }
 }
 
+/// Tag grammar: `[a-z0-9][a-z0-9-]{0,31}`.
+pub fn valid_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 32
+        && !tag.starts_with('-')
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The stored shape of a tag list: every tag well-formed, sorted,
+/// de-duplicated, at most `TAG_MAX`.
+pub fn normalize_tags(tags: &[String]) -> Result<Vec<String>> {
+    for tag in tags {
+        if !valid_tag(tag) {
+            return Err(Error::rejected(format!(
+                "Invalid tag '{tag}' — 1-32 lowercase letters, digits or hyphens, \
+                 not starting with a hyphen"
+            )));
+        }
+    }
+    let mut out = tags.to_vec();
+    out.sort();
+    out.dedup();
+    if out.len() > TAG_MAX {
+        return Err(Error::rejected(format!(
+            "{} tags — an issue carries at most {TAG_MAX}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
 /// Artifact basename grammar — shared by the upload route and the
 /// constrained read, so every stored file is fetchable:
 /// `[A-Za-z0-9._-]{1,120}`, never a leading dot.
@@ -213,6 +252,27 @@ mod tests {
         assert!(!valid_id("../CAD-16"));
         assert!(!valid_id("CAD-16.md"));
         assert!(!valid_id("1-2"));
+    }
+
+    #[test]
+    fn tag_grammar_and_normalizing() {
+        assert!(valid_tag("ui"));
+        assert!(valid_tag("2026-q4"));
+        assert!(valid_tag(&"a".repeat(32)));
+        assert!(!valid_tag(&"a".repeat(33)));
+        assert!(!valid_tag(""));
+        assert!(!valid_tag("-ui"));
+        assert!(!valid_tag("UI"));
+        assert!(!valid_tag("a b"));
+        assert!(!valid_tag("a,b"));
+        let tags = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            normalize_tags(&tags(&["ui", "api", "ui"])).unwrap(),
+            tags(&["api", "ui"])
+        );
+        assert!(normalize_tags(&tags(&["Bad"])).is_err());
+        let many: Vec<String> = (0..13).map(|n| format!("t{n}")).collect();
+        assert!(normalize_tags(&many).is_err());
     }
 
     #[test]

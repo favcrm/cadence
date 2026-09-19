@@ -3183,6 +3183,580 @@ fn issue_detail_dedupes_stale_branch_commits() {
     );
 }
 
+// ---------- CAD-81: tags, epics, filters, bulk edits ----------
+
+/// Tracker with project `x` (declares tags `ui api infra`) and project
+/// `y` (declares none), two epics and a loose issue:
+///
+/// ```text
+/// X-1 epic A ─ X-3 done    P1 ann  [ui]
+///            ├ X-4 doing      bob  [api ui]
+///            └ X-5 backlog    ann  [api]      blocked_by X-4
+/// X-2 epic B ─ X-6 dropped         [ui]
+///            └ X-7 ready      cy   []         component core
+/// X-8 review                       [infra]
+/// ```
+fn tags_fixture() -> (TempDir, TempDir) {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let run = |args: &[&str]| {
+        let (ok, out) = cli(pm.path(), state.path(), args);
+        assert!(ok, "{args:?}: {out}");
+    };
+    run(&["issue", "init"]);
+    run(&[
+        "issue", "project", "add", "x", "--prefix", "X", "--tag", "ui", "--tag", "api", "--tag",
+        "infra",
+    ]);
+    run(&["issue", "project", "add", "y", "--prefix", "Y"]);
+    run(&["issue", "new", "epic A", "--project", "x"]);
+    run(&["issue", "new", "epic B", "--project", "x"]);
+    run(&[
+        "issue",
+        "new",
+        "a1",
+        "--project",
+        "x",
+        "--epic",
+        "X-1",
+        "--tag",
+        "ui",
+        "--owner",
+        "ann",
+        "--priority",
+        "P1",
+    ]);
+    // Tags arrive unsorted and repeated; they are stored sorted, once.
+    run(&[
+        "issue",
+        "new",
+        "a2",
+        "--project",
+        "x",
+        "--epic",
+        "X-1",
+        "--tag",
+        "ui",
+        "--tag",
+        "api",
+        "--tag",
+        "ui",
+        "--owner",
+        "bob",
+    ]);
+    run(&[
+        "issue",
+        "new",
+        "a3",
+        "--project",
+        "x",
+        "--epic",
+        "X-1",
+        "--tag",
+        "api",
+        "--owner",
+        "ann",
+        "--blocked-by",
+        "X-4",
+    ]);
+    run(&[
+        "issue",
+        "new",
+        "b1",
+        "--project",
+        "x",
+        "--parent",
+        "X-2",
+        "--tag",
+        "ui",
+    ]);
+    run(&[
+        "issue",
+        "new",
+        "b2",
+        "--project",
+        "x",
+        "--epic",
+        "X-2",
+        "--owner",
+        "cy",
+        "--component",
+        "core",
+    ]);
+    run(&["issue", "new", "loose", "--project", "x", "--tag", "infra"]);
+    for (id, status) in [
+        ("X-3", "done"),
+        ("X-4", "doing"),
+        ("X-6", "dropped"),
+        ("X-7", "ready"),
+        ("X-8", "review"),
+    ] {
+        run(&["issue", "set", id, &format!("status={status}")]);
+    }
+    (pm, state)
+}
+
+fn tags_of(pm: &Path, state: &Path, id: &str) -> Vec<String> {
+    let (ok, out) = cli(pm, state, &["issue", "show", id, "--json"]);
+    assert!(ok, "{out}");
+    out["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn head_message(pm: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(pm)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn tree_is_clean(pm: &Path) -> bool {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(pm)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    out.stdout.is_empty()
+}
+
+#[test]
+fn issue_tags_round_trip_and_declared_list() {
+    let (pm, state) = tags_fixture();
+    let (pm, state) = (pm.path(), state.path());
+    assert_eq!(tags_of(pm, state, "X-4"), ["api", "ui"]);
+    assert!(cli(pm, state, &["issue", "tag", "X-4", "add", "infra"]).0);
+    assert_eq!(tags_of(pm, state, "X-4"), ["api", "infra", "ui"]);
+    assert!(cli(pm, state, &["issue", "tag", "X-4", "rm", "api", "infra"]).0);
+    assert_eq!(tags_of(pm, state, "X-4"), ["ui"]);
+    assert!(cli(pm, state, &["issue", "set", "X-4", "tags=infra,api"]).0);
+    assert_eq!(tags_of(pm, state, "X-4"), ["api", "infra"]);
+    // Empty clears; an issue with no tags stores no `tags:` key.
+    assert!(cli(pm, state, &["issue", "set", "X-4", "tags="]).0);
+    assert!(tags_of(pm, state, "X-4").is_empty());
+    let file = std::fs::read_to_string(pm.join("x/X-4/issue.md")).unwrap();
+    assert!(!file.contains("tags"), "{file}");
+    assert!(cli(pm, state, &["issue", "set", "X-4", "tags=ui,api"]).0);
+
+    // The declared list and the grammar reject through every CLI write,
+    // and a rejection commits nothing.
+    let before = commits(pm);
+    for args in [
+        &["issue", "new", "n", "--project", "x", "--tag", "nope"][..],
+        &["issue", "tag", "X-4", "add", "nope"],
+        &["issue", "set", "X-4", "tags=ui,nope"],
+    ] {
+        let (ok, out) = cli(pm, state, args);
+        assert!(!ok, "{args:?}");
+        let msg = out.to_string();
+        assert!(
+            msg.contains("Unknown tag 'nope'") && msg.contains("api, infra, ui"),
+            "{msg}"
+        );
+    }
+    let (ok, out) = cli(pm, state, &["issue", "tag", "X-4", "add", "Not-A-Tag"]);
+    assert!(!ok && out.to_string().contains("Invalid tag"), "{out}");
+    let (ok, out) = cli(pm, state, &["issue", "tag", "X-4", "add", "ui"]);
+    assert!(!ok && out.to_string().contains("changes nothing"), "{out}");
+    assert_eq!(commits(pm), before);
+    assert!(tree_is_clean(pm));
+    assert!(
+        !pm.join("x/X-9").exists(),
+        "a rejected new leaves no folder"
+    );
+    // A project that declares no tags accepts any well-formed one.
+    let (ok, out) = cli(
+        pm,
+        state,
+        &[
+            "issue",
+            "new",
+            "free",
+            "--project",
+            "y",
+            "--tag",
+            "whatever-2",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(tags_of(pm, state, "Y-1"), ["whatever-2"]);
+
+    // The HTTP write path: same validation, same if_rev rule.
+    let port = start_ui(pm.to_path_buf(), state.to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let detail = |id: &str| -> Value {
+        let (code, body) = http(port, "GET", &format!("/api/issues/{id}"), &host);
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str(&body).unwrap()
+    };
+    let rev = detail("X-4")["rev"].as_str().unwrap().to_string();
+    let before = commits(pm);
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/X-4",
+        &host,
+        &json!({"tags": ["ui", "nope"], "if_rev": rev}).to_string(),
+    );
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("Unknown tag 'nope'"), "{body}");
+    assert_eq!(commits(pm), before, "a rejected patch commits nothing");
+    assert_eq!(detail("X-4")["rev"], rev.as_str());
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/X-4",
+        &host,
+        &json!({"tags": ["infra", "api", "infra"], "if_rev": rev}).to_string(),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(commits(pm), before + 1);
+    assert_eq!(detail("X-4")["tags"], json!(["api", "infra"]));
+    assert!(head_message(pm).contains("X-4: set tags=api,infra (operator (ui))"));
+    // The rev moved, so the old one is now a conflict.
+    let (code, _, body) = write_json(
+        port,
+        "PATCH",
+        "/api/issues/X-4",
+        &host,
+        &json!({"tags": [], "if_rev": rev}).to_string(),
+    );
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(detail("X-4")["tags"], json!(["api", "infra"]));
+    let (code, _, body) = write_json(
+        port,
+        "POST",
+        "/api/issues",
+        &host,
+        &json!({"project": "x", "title": "via api", "tags": ["nope"]}).to_string(),
+    );
+    assert_eq!(code, 400, "{body}");
+    let (code, _, body) = write_json(
+        port,
+        "POST",
+        "/api/issues",
+        &host,
+        &json!({"project": "x", "title": "via api", "tags": ["ui"]}).to_string(),
+    );
+    assert_eq!(code, 201, "{body}");
+    let created: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(created["card"]["tags"], json!(["ui"]));
+    assert_eq!(
+        tags_of(pm, state, created["card"]["id"].as_str().unwrap()),
+        ["ui"]
+    );
+    // The declared list reaches the board through /api/projects.
+    let (_, body) = http(port, "GET", "/api/projects", &host);
+    let projects: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        projects["projects"][0]["tags"],
+        json!(["api", "infra", "ui"])
+    );
+
+    // Lint: clean now; a hand edit trips grammar, duplicate and the
+    // declared list.
+    let (ok, out) = cli(pm, state, &["issue", "lint"]);
+    assert!(ok, "{out}");
+    let path = pm.join("x/X-8/issue.md");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("tags:\n- infra\n"), "{text}");
+    std::fs::write(
+        &path,
+        text.replace(
+            "tags:\n- infra\n",
+            "tags:\n- infra\n- infra\n- Bad\n- nope\n",
+        ),
+    )
+    .unwrap();
+    let (ok, out) = cli(pm, state, &["issue", "lint"]);
+    assert!(!ok);
+    let errors = out["errors"].to_string();
+    for want in [
+        "X-8: duplicated tag 'infra'",
+        "X-8: bad tag grammar 'Bad'",
+        "X-8: unknown tag 'nope'",
+    ] {
+        assert!(errors.contains(want), "{want} missing from {errors}");
+    }
+}
+
+#[test]
+fn issue_bulk_edits_are_one_atomic_commit() {
+    let (pm, state) = tags_fixture();
+    let (pm, state) = (pm.path(), state.path());
+    let status_of = |id: &str| {
+        cli(pm, state, &["issue", "show", id, "--json"]).1["frontmatter"]["status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let before = commits(pm);
+    let (ok, out) = cli(
+        pm,
+        state,
+        &[
+            "issue",
+            "set",
+            "X-5",
+            "X-7",
+            "X-5",
+            "status=ready",
+            "priority=P1",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(
+        out["ids"],
+        json!(["X-5", "X-7"]),
+        "a repeated id counts once"
+    );
+    assert_eq!(commits(pm), before + 1, "one commit for the whole batch");
+    let msg = head_message(pm);
+    assert!(
+        msg.starts_with("X-5, X-7: set status=ready priority=P1\n"),
+        "{msg}"
+    );
+    for trailer in ["Issue: X-5\n", "Issue: X-7\n", "Actor: operator\n"] {
+        assert!(msg.contains(trailer), "{trailer:?} missing from {msg}");
+    }
+    assert_eq!(
+        (status_of("X-5"), status_of("X-7")),
+        ("ready".into(), "ready".into())
+    );
+
+    // One bad id, one bad value, one undeclared tag: nothing is written.
+    let before = commits(pm);
+    for args in [
+        &["issue", "set", "X-5", "X-99", "status=doing"][..],
+        &["issue", "set", "X-5", "X-7", "status=nonsense"],
+        &["issue", "set", "X-5", "X-7", "status=doing", "tags=nope"],
+        &["issue", "tag", "X-5", "X-99", "add", "ui"],
+        &["issue", "tag", "X-5", "X-7", "add", "nope"],
+        &["issue", "set", "X-5", "status=doing", "X-7"],
+    ] {
+        let (ok, out) = cli(pm, state, args);
+        assert!(!ok, "{args:?}: {out}");
+    }
+    assert_eq!(commits(pm), before);
+    assert!(tree_is_clean(pm));
+    assert_eq!(status_of("X-5"), "ready");
+    assert_eq!(tags_of(pm, state, "X-5"), ["api"]);
+
+    // Bulk tag: one commit; an issue the edit does not change stays out
+    // of it.
+    let (ok, out) = cli(
+        pm,
+        state,
+        &["issue", "tag", "X-3", "X-5", "X-7", "add", "ui"],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(commits(pm), before + 1);
+    assert_eq!(out["ids"], json!(["X-5", "X-7"]), "X-3 already had ui");
+    let msg = head_message(pm);
+    assert!(msg.starts_with("X-5, X-7: tag add ui\n"), "{msg}");
+    assert!(
+        msg.contains("Issue: X-5\n") && msg.contains("Issue: X-7\n"),
+        "{msg}"
+    );
+    assert!(!msg.contains("Issue: X-3"), "{msg}");
+    assert_eq!(tags_of(pm, state, "X-5"), ["api", "ui"]);
+    assert_eq!(tags_of(pm, state, "X-7"), ["ui"]);
+
+    // Each issue's history reads the shared commits as its own.
+    let (ok, log) = cli(pm, state, &["issue", "log", "X-7"]);
+    assert!(ok, "{log}");
+    let kinds: Vec<&str> = log["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(&kinds[..2], ["tag", "set"], "{log}");
+    assert_eq!(log["history"][1]["fields"]["status"], "ready", "{log}");
+    let (ok, blame) = cli(pm, state, &["issue", "blame", "X-7"]);
+    assert!(ok, "{blame}");
+    assert!(blame.to_string().contains("\"field\":\"tags\""), "{blame}");
+}
+
+#[test]
+fn issue_ls_filters_and_epics_match_the_api() {
+    let (pm, state) = tags_fixture();
+    let (pm, state) = (pm.path(), state.path());
+    let port = start_ui(pm.to_path_buf(), state.to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let ids = |v: &Value| -> Vec<String> {
+        v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // (CLI flags, API query, expected ids)
+    let cases: &[(&[&str], &str, &[&str])] = &[
+        (&["--tag", "ui"], "tag=ui", &["X-3", "X-4", "X-6"]),
+        (&["--tag", "ui", "--tag", "api"], "tag=ui&tag=api", &["X-4"]),
+        (&["--tag", "ui", "--tag", "api"], "tag=ui,api", &["X-4"]),
+        (&["--epic", "X-1"], "epic=X-1", &["X-3", "X-4", "X-5"]),
+        (&["--owner", "ann"], "owner=ann", &["X-3", "X-5"]),
+        // X-1 rolls up to doing from X-4.
+        (
+            &["--status", "doing", "--status", "review"],
+            "status=doing&status=review",
+            &["X-1", "X-4", "X-8"],
+        ),
+        (&["--status", "dropped"], "status=dropped", &["X-6"]),
+        (&["--component", "core"], "component=core", &["X-7"]),
+        (&["--priority", "P1"], "priority=P1", &["X-3"]),
+        (
+            &["--open"],
+            "open=1",
+            &["X-1", "X-2", "X-4", "X-5", "X-7", "X-8"],
+        ),
+        (
+            &["--epic", "X-1", "--open", "--tag", "api"],
+            "epic=X-1&open=1&tag=api",
+            &["X-4", "X-5"],
+        ),
+        (&["--owner", "ann", "--open"], "owner=ann&open=1", &["X-5"]),
+        (
+            &["--tag", "infra", "--epic", "X-1"],
+            "tag=infra&epic=X-1",
+            &[],
+        ),
+    ];
+    for (flags, query, want) in cases {
+        let mut args = vec!["issue", "ls", "--project", "x", "--json"];
+        args.extend_from_slice(flags);
+        let (ok, out) = cli(pm, state, &args);
+        assert!(ok, "{flags:?}: {out}");
+        assert_eq!(ids(&out), *want, "cli {flags:?}");
+        let (code, body) = http(
+            port,
+            "GET",
+            &format!("/api/issues?project=x&{query}"),
+            &host,
+        );
+        assert_eq!(code, 200, "{query}: {body}");
+        let api: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(ids(&api), *want, "api {query}");
+    }
+    // Cards carry the tags; a typo in a filter is an error, not an
+    // empty list.
+    let (_, out) = cli(pm, state, &["issue", "ls", "--tag", "api", "--json"]);
+    assert_eq!(out["issues"][0]["tags"], json!(["api", "ui"]));
+    assert!(
+        !cli(
+            pm,
+            state,
+            &["issue", "ls", "--status", "nonsense", "--json"]
+        )
+        .0
+    );
+    for bad in ["status=nonsense", "tag=Bad", "priority=P9", "epic=nope"] {
+        let (code, body) = http(port, "GET", &format!("/api/issues?{bad}"), &host);
+        assert_eq!(code, 400, "{bad}: {body}");
+    }
+
+    // Epics: numbers from the fixture's diagram.
+    let (ok, out) = cli(
+        pm,
+        state,
+        &["issue", "epic", "ls", "--project", "x", "--json"],
+    );
+    assert!(ok, "{out}");
+    let epics = out["epics"].as_array().unwrap();
+    assert_eq!(epics.len(), 2, "{out}");
+    let (a, b) = (&epics[0], &epics[1]);
+    assert_eq!(
+        (a["id"].as_str(), a["status"].as_str()),
+        (Some("X-1"), Some("doing"))
+    );
+    assert_eq!(a["total"], 3);
+    assert_eq!(
+        a["counts"],
+        json!({"backlog": 1, "ready": 0, "doing": 1, "review": 0, "done": 1, "dropped": 0})
+    );
+    assert_eq!(a["done_ratio"], 0.33);
+    assert_eq!(a["blocked"], 1, "X-5 waits on X-4");
+    assert_eq!(a["owners"], json!(["ann", "bob"]));
+    assert_eq!(a["children"], json!(["X-3", "X-4", "X-5"]));
+    assert_eq!(b["id"], "X-2");
+    assert_eq!(b["total"], 2);
+    assert_eq!(b["counts"]["dropped"], 1);
+    assert_eq!(b["counts"]["ready"], 1);
+    assert_eq!(
+        b["done_ratio"], 0.0,
+        "dropped children leave the ratio's base"
+    );
+    assert_eq!(b["blocked"], 0);
+    assert_eq!(b["owners"], json!(["cy"]));
+    // Finishing the only live child completes epic B.
+    assert!(cli(pm, state, &["issue", "set", "X-7", "status=done"]).0);
+    let (_, out) = cli(pm, state, &["issue", "epic", "ls", "--json"]);
+    assert_eq!(out["epics"][1]["done_ratio"], 1.0);
+    assert_eq!(out["epics"][1]["status"], "done");
+    // The API serves the identical payload; another project has none.
+    let (code, body) = http(port, "GET", "/api/epics?project=x", &host);
+    assert_eq!(code, 200, "{body}");
+    let api: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(api["epics"], out["epics"]);
+    let (_, body) = http(port, "GET", "/api/epics?project=y", &host);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["epics"],
+        json!([])
+    );
+
+    // epic show: the children, as JSON and as an aligned table.
+    let (ok, out) = cli(pm, state, &["issue", "epic", "show", "X-1", "--json"]);
+    assert!(ok, "{out}");
+    assert_eq!(ids(&out), ["X-3", "X-4", "X-5"]);
+    assert_eq!(out["total"], 3);
+    assert_eq!(out["issues"][1]["tags"], json!(["api", "ui"]));
+    let (ok, table) = cli_raw(pm, state, &["issue", "epic", "show", "X-1"]);
+    assert!(ok, "{table}");
+    let row = table.lines().find(|l| l.starts_with("X-4")).unwrap();
+    let header = table.lines().find(|l| l.starts_with("ID")).unwrap();
+    assert_eq!(
+        header.find("TAGS"),
+        row.find("api,ui"),
+        "columns align:\n{table}"
+    );
+    assert!(row.contains("doing") && row.contains("bob"), "{row}");
+    let (ok, err) = cli_raw(pm, state, &["issue", "epic", "show", "X-8"]);
+    assert!(!ok && err.contains("has no children"), "{err}");
+    // --epic is --parent: same rules, and the two cannot be combined.
+    let (ok, err) = cli_raw(
+        pm,
+        state,
+        &["issue", "new", "deep", "--project", "x", "--epic", "X-3"],
+    );
+    assert!(!ok && err.contains("depth"), "{err}");
+    let (ok, _) = cli_raw(
+        pm,
+        state,
+        &[
+            "issue",
+            "new",
+            "both",
+            "--project",
+            "x",
+            "--epic",
+            "X-1",
+            "--parent",
+            "X-2",
+        ],
+    );
+    assert!(!ok);
+}
+
 #[test]
 fn issue_trailer_prints_and_validates() {
     let (pm, state, _repo, _port) = commits_fixture();

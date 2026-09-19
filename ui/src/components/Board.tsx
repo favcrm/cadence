@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { api, type WriteResp } from "../api";
+import { epicProgress, matches, type BoardFilters } from "../filters";
 import type { AgentsPayload, Health, IssueCard, Project } from "../types";
 import Card, { noDragReason } from "./Card";
+import FilterBar from "./FilterBar";
 
 const COLS: [string, string, number?][] = [
   ["backlog", "Backlog"],
@@ -36,6 +38,8 @@ interface Props {
   readOnly: boolean;
   actor: string;
   onQuery: (q: string) => void;
+  filters: BoardFilters;
+  onFilters: (f: BoardFilters) => void;
   onOpen: (id: string) => void;
   onMove: (issue: IssueCard, status: string) => void;
   onCreated: (resp: WriteResp, verb: string) => void;
@@ -155,6 +159,8 @@ export default function Board({
   readOnly,
   actor,
   onQuery,
+  filters,
+  onFilters,
   onOpen,
   onMove,
   onCreated,
@@ -162,16 +168,19 @@ export default function Board({
   onAgents,
 }: Props) {
   const [over, setOver] = useState<string | null>(null);
-  const visible = issues.filter(
+  // `scope` is what the project and the search box leave; the filter
+  // bar counts over it and its chips narrow it to `visible`.
+  const scope = issues.filter(
     (t) =>
       !t.container &&
       t.status !== "dropped" &&
       (project === "all" || t.project === project) &&
       (!query ||
-        (t.id + t.title + (t.owner ?? ""))
+        (t.id + t.title + (t.owner ?? "") + (t.tags ?? []).join(" "))
           .toLowerCase()
           .includes(query.toLowerCase())),
   );
+  const visible = scope.filter((t) => matches(filters, t));
   const title =
     project === "all"
       ? "All projects"
@@ -197,6 +206,103 @@ export default function Board({
   const stoppedCount = (agents?.agents ?? []).filter(
     (a) => a.state === "stopped" && !a.fenced,
   ).length;
+
+  // The five status columns over one set of cards. `lane` keys the
+  // drop-target highlight so swimlanes light up one cell, not a column.
+  const columns = (laneCards: IssueCard[], lane: string, quickAdd: boolean) => (
+      <div className="grid grid-flow-col auto-cols-[minmax(232px,78vw)] lg:auto-cols-[minmax(0,1fr)] gap-3 overflow-x-auto lg:overflow-visible pb-2 snap-x snap-mandatory lg:snap-none">
+      {COLS.map(([key, name, wip], ci) => {
+        const showAdd = quickAdd && !readOnly;
+        const cards = laneCards.filter((t) => t.status === key);
+        const cell = `${lane}:${key}`;
+        return (
+          <section
+            key={key}
+            className={`snap-start rounded-lg border bg-ink-875 ${
+              lane === "" ? "min-h-[26rem]" : "min-h-[7rem]"
+            } flex flex-col reveal transition-colors ${
+              over === cell ? "border-accent/60" : "border-ink-700"
+            }`}
+            style={{ animationDelay: `${120 + ci * 45}ms` }}
+            onDragOver={(e) => {
+              if (readOnly) return;
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+              setOver(cell);
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                setOver((o) => (o === cell ? null : o));
+              }
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              setOver(null);
+              if (readOnly) return;
+              const id = e.dataTransfer.getData("text/plain");
+              const issue = issues.find((t) => t.id === id);
+              if (!issue || issue.status === key) return;
+              const reason = noDragReason(issue);
+              if (reason) {
+                onError(new Error(`${id}: ${reason}`), "move");
+                return;
+              }
+              onMove(issue, key);
+            }}
+          >
+            <header
+              className={`${
+                lane === "" ? "lg:sticky lg:top-[2.85rem] z-[5] " : ""
+              }flex items-center gap-2 px-3.5 h-10 border-b border-ink-700 shrink-0 bg-ink-875 rounded-t-lg`}
+            >
+              <i className={`w-1.5 h-1.5 rounded-full ${COL_DOT[key]}`} />
+              <h2 className="text-secondary font-semibold text-ink-100">
+                {name}
+              </h2>
+              <span className="kicker num">
+                {cards.length}
+                {/* The WIP limit is board-wide — a lane shows its count only. */}
+                  {wip && lane === "" ? ` of ${wip} wip` : ""}
+              </span>
+            </header>
+            <div className="p-2.5 space-y-2.5 flex-1">
+              {key === "backlog" && showAdd && (
+                <QuickAdd
+                  projects={projects}
+                  project={project}
+                  onCreated={onCreated}
+                  onError={onError}
+                />
+              )}
+              {cards.length === 0 && !(key === "backlog" && showAdd) ? (
+                <p className="kicker px-1 py-2">empty</p>
+              ) : (
+                cards.map((t) => (
+                  <Card
+                    key={t.id}
+                    issue={t}
+                    parentTitle={
+                      t.parent ? titleOf.get(t.parent) : undefined
+                    }
+                    busyBy={busy.get(t.id) ?? []}
+                    canDrag={!readOnly}
+                    onOpen={onOpen}
+                  />
+                ))
+              )}
+            </div>
+          </section>
+        );
+      })}
+    </div>
+  );
+
+  // Swimlanes: one lane per epic that still has a visible child, then
+  // the cards that belong to no epic.
+  const epicIds = [...new Set(visible.map((t) => t.parent ?? ""))]
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const loose = visible.filter((t) => !t.parent);
 
   return (
     <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
@@ -245,7 +351,7 @@ export default function Board({
           value={query}
           onChange={(e) => onQuery(e.target.value)}
           className="field ml-auto w-full sm:w-64"
-          placeholder="Filter issues by id, title or owner"
+          placeholder="Filter issues by id, title, owner or tag"
         />
       </div>
 
@@ -365,82 +471,72 @@ export default function Board({
         </div>
       </section>
 
-      <div className="grid grid-flow-col auto-cols-[minmax(232px,78vw)] lg:auto-cols-[minmax(0,1fr)] gap-3 overflow-x-auto lg:overflow-visible pb-2 snap-x snap-mandatory lg:snap-none">
-        {COLS.map(([key, name, wip], ci) => {
-          const cards = visible.filter((t) => t.status === key);
-          return (
-            <section
-              key={key}
-              className={`snap-start rounded-lg border bg-ink-875 min-h-[26rem] flex flex-col reveal transition-colors ${
-                over === key ? "border-accent/60" : "border-ink-700"
-              }`}
-              style={{ animationDelay: `${120 + ci * 45}ms` }}
-              onDragOver={(e) => {
-                if (readOnly) return;
-                e.preventDefault();
-                e.dataTransfer.dropEffect = "move";
-                setOver(key);
-              }}
-              onDragLeave={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-                  setOver((o) => (o === key ? null : o));
-                }
-              }}
-              onDrop={(e) => {
-                e.preventDefault();
-                setOver(null);
-                if (readOnly) return;
-                const id = e.dataTransfer.getData("text/plain");
-                const issue = issues.find((t) => t.id === id);
-                if (!issue || issue.status === key) return;
-                const reason = noDragReason(issue);
-                if (reason) {
-                  onError(new Error(`${id}: ${reason}`), "move");
-                  return;
-                }
-                onMove(issue, key);
-              }}
-            >
-              <header className="lg:sticky lg:top-[2.85rem] z-[5] flex items-center gap-2 px-3.5 h-10 border-b border-ink-700 shrink-0 bg-ink-875 rounded-t-lg">
-                <i className={`w-1.5 h-1.5 rounded-full ${COL_DOT[key]}`} />
-                <h2 className="text-secondary font-semibold text-ink-100">
-                  {name}
-                </h2>
-                <span className="kicker num">
-                  {cards.length}
-                  {wip ? ` of ${wip} wip` : ""}
-                </span>
-              </header>
-              <div className="p-2.5 space-y-2.5 flex-1">
-                {key === "backlog" && !readOnly && (
-                  <QuickAdd
-                    projects={projects}
-                    project={project}
-                    onCreated={onCreated}
-                    onError={onError}
-                  />
+      <FilterBar
+        scope={scope}
+        issues={issues}
+        filters={filters}
+        onChange={onFilters}
+      />
+
+      {!filters.groupByEpic ? (
+        columns(visible, "", true)
+      ) : (
+        <div className="space-y-5">
+          {epicIds.map((epic) => {
+            const p = epicProgress(issues, epic);
+            const pct = Math.round(p.ratio * 100);
+            return (
+              <section key={epic} aria-label={`Epic ${epic}`}>
+                <header className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-2">
+                  <button
+                    className="lnk num text-label"
+                    onClick={() => onOpen(epic)}
+                  >
+                    {epic}
+                  </button>
+                  <h2 className="text-secondary font-semibold text-ink-100 min-w-0 truncate">
+                    {titleOf.get(epic) ?? "unknown epic"}
+                  </h2>
+                  <div
+                    className="ml-auto flex items-center gap-2"
+                    title={`${p.done} of ${p.total} children done (dropped excluded)`}
+                  >
+                    <div
+                      className="w-32 h-1.5 rounded-full bg-ink-700 overflow-hidden"
+                      role="progressbar"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={pct}
+                    >
+                      <div
+                        className="h-full bg-ok transition-[width]"
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <span className="kicker num">
+                      {p.done}/{p.total} · {pct}%
+                    </span>
+                  </div>
+                </header>
+                {columns(
+                  visible.filter((t) => t.parent === epic),
+                  epic,
+                  false,
                 )}
-                {cards.length === 0 && key !== "backlog" ? (
-                  <p className="kicker px-1 py-2">empty</p>
-                ) : (
-                  cards.map((t) => (
-                    <Card
-                      key={t.id}
-                      issue={t}
-                      parentTitle={
-                        t.parent ? titleOf.get(t.parent) : undefined
-                      }
-                      busyBy={busy.get(t.id) ?? []}
-                      canDrag={!readOnly}
-                      onOpen={onOpen}
-                    />
-                  ))
-                )}
-              </div>
-            </section>
-          );
-        })}
-      </div>
+              </section>
+            );
+          })}
+          <section aria-label="No epic">
+            <header className="flex items-center gap-x-3 mb-2">
+              <h2 className="text-secondary font-semibold text-ink-300">
+                No epic
+              </h2>
+              <span className="kicker num">{loose.length}</span>
+            </header>
+            {columns(loose, "none", true)}
+          </section>
+        </div>
+      )}
 
       <footer className="mt-8 pt-4 border-t border-ink-700 text-label text-ink-500 num">
         source: {health?.pm_dir ?? "~/pm"} issue folders ·{" "}

@@ -25,6 +25,7 @@ const FIELD_ORDER: &[&str] = &[
     "priority",
     "owner",
     "component",
+    "tags",
     "parent",
     "blocked_by",
     "relates",
@@ -138,12 +139,17 @@ fn split_paren(text: &str) -> (String, Option<String>) {
 /// `(kind, summary, by)` for a cadence-shaped subject — `None` for
 /// anything else (hand edits, reverts, sync commits, unknown verbs).
 fn parse_subject(subject: &str, id: &str) -> Option<(&'static str, String, String)> {
-    let rest = subject.strip_prefix(&format!("{id}: "))?;
+    // A bulk write names every id it touched: `CAD-1, CAD-2: set …`.
+    let (ids, rest) = subject.split_once(": ")?;
+    if !ids.split(", ").any(|i| i == id) {
+        return None;
+    }
     let (summary, actor) = split_paren(rest);
     let summary = summary.trim_end().to_string();
     let kind = match summary.split_whitespace().next().unwrap_or("") {
         "created" if summary == "created" => "created",
         "set" => "set",
+        "tag" => "tag",
         "link" => "link",
         "unlink" => "unlink",
         "ref" => "ref",

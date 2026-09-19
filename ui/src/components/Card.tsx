@@ -154,6 +154,18 @@ export default function Card({
           ))}
         </div>
       )}
+      {(t.tags?.length ?? 0) > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1">
+          {t.tags!.map((tag) => (
+            <span
+              key={tag}
+              className="chip bg-ink-800 !py-[.1rem] text-ink-400"
+            >
+              #{tag}
+            </span>
+          ))}
+        </div>
+      )}
       {t.parent && (
         <div className="mt-1.5 num text-micro text-ink-500">
           in {t.parent}
