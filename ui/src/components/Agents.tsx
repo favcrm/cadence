@@ -380,7 +380,110 @@ export default function Agents({
         </div>
       )}
 
-      <div className="card overflow-hidden reveal" style={{ animationDelay: "80ms" }}>
+      {/* Phone: stacked agent cards — the table's columns don't fit 390px. */}
+      <div className="sm:hidden space-y-2.5 reveal" style={{ animationDelay: "80ms" }}>
+        {agents.map((a) => {
+          const st = stateLabel(a);
+          return (
+            <article
+              key={a.alias}
+              role="button"
+              tabIndex={0}
+              onClick={() => setOpen(a.alias)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  setOpen(a.alias);
+                }
+              }}
+              className={`card w-full text-left p-3.5 space-y-2 cursor-pointer ${
+                a.fenced ? "border-fail/40" : ""
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <i className={`w-1.5 h-1.5 rounded-full ${STATE_DOT[st] ?? STATE_DOT.stopped}`} />
+                <span className="num text-label text-ink-100 font-medium">
+                  {a.alias}
+                </span>
+                <span className={`chip ml-auto ${STATE_CHIP[st] ?? STATE_CHIP.stopped}`}>
+                  {st}
+                </span>
+              </div>
+              {a.fenced && <RecoveryBlock text={a.recovery ?? "fenced"} />}
+              <div className="grid grid-cols-[5.4rem_1fr] gap-y-1 text-label">
+                <span className="slabel">provider</span>
+                <span className="num text-ink-300">
+                  {a.provider}/{a.endpoint_kind}
+                </span>
+                <span className="slabel">group</span>
+                <span className="num text-ink-300">
+                  {a.group_root ? "root" : a.group}
+                </span>
+                {a.on.length > 0 && (
+                  <>
+                    <span className="slabel">on issue</span>
+                    <span className="flex flex-wrap gap-1.5">
+                      {a.on.map((id) => (
+                        <span
+                          key={id}
+                          role="link"
+                          className="lnk"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenIssue(id);
+                          }}
+                        >
+                          {id}
+                        </span>
+                      ))}
+                    </span>
+                  </>
+                )}
+                <span className="slabel">running</span>
+                <span className="num text-ink-300">
+                  {a.running}
+                  {a.message?.id ? ` · ${a.message.id}` : ""}
+                </span>
+                <span className="slabel">queued</span>
+                <span className={`num ${a.unknown > 0 ? "text-fail" : "text-ink-300"}`}>
+                  {a.queued}
+                  {a.unknown > 0 ? ` +${a.unknown} unk` : ""}
+                </span>
+                <span className="slabel">activity</span>
+                <span className="num text-ink-300">
+                  {a.last_activity ? fmtTime(a.last_activity) : "—"}
+                  {a.stalled
+                    ? ` · stalled ${fmtSilence(a.silent_secs ?? 0)}`
+                    : (a.silent_secs ?? 0) >= 60
+                      ? ` · silent ${fmtSilence(a.silent_secs!)}`
+                      : ""}
+                </span>
+                {(a.fenced || a.resume) && (
+                  <>
+                    <span className="slabel">recovery</span>
+                    <span>
+                      {a.fenced ? (
+                        <span className="chip bg-fail/10 text-fail">reconcile</span>
+                      ) : (
+                        <code className="num text-micro text-ink-400" title={a.resume_hint ?? "resume command"}>
+                          {a.resume}
+                        </code>
+                      )}
+                    </span>
+                  </>
+                )}
+              </div>
+            </article>
+          );
+        })}
+        {agents.length === 0 && (
+          <div className="card p-8 text-center text-ink-500">
+            No agents registered.
+          </div>
+        )}
+      </div>
+
+      <div className="hidden sm:block card overflow-hidden reveal" style={{ animationDelay: "80ms" }}>
         <table className="w-full text-label">
           <thead>
             <tr className="border-b border-ink-700 text-left">

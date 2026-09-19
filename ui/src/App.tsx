@@ -6,7 +6,15 @@ import Drawer from "./components/Drawer";
 import Plan from "./components/Plan";
 import Sidebar from "./components/Sidebar";
 import Toast, { type ToastMsg } from "./components/Toast";
-import type { AgentsPayload, Health, IssueCard, IssueDetail, Project } from "./types";
+import { Logo } from "./components/Logo";
+import type {
+  AgentsPayload,
+  Health,
+  IssueCard,
+  IssueDetail,
+  Meta,
+  Project,
+} from "./types";
 
 export default function App() {
   const [tab, setTab] = useState<"board" | "plan" | "agents">("board");
@@ -16,11 +24,16 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<AgentsPayload | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
+  const [meta, setMeta] = useState<Meta | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
   const [openDetail, setOpenDetail] = useState<IssueDetail | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastMsg | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
   const toastTimer = useRef<number>(0);
+
+  const readOnly = meta?.read_only ?? false;
+  const actor = meta?.actor ?? "operator (ui)";
 
   // Selection lives in the URL (`?project=cadence&issue=CAD-16`) so a
   // refresh or a pasted link restores the same view.
@@ -45,6 +58,7 @@ export default function App() {
 
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
+    api.meta().then(setMeta).catch(() => setMeta(null));
     api
       .projects()
       .then((r) => setProjects(r.projects))
@@ -147,6 +161,10 @@ export default function App() {
   /// `rollback` restores the previous card on failure.
   const moveIssue = useCallback(
     (issue: IssueCard, status: string) => {
+      if (readOnly) {
+        say("err", "board is read-only — writes are disabled");
+        return;
+      }
       if (issue.status === status) return;
       const prev = issue;
       // Optimistic: the card moves now, the write decides for real.
@@ -161,7 +179,7 @@ export default function App() {
           writeError(e, `${issue.id} move`);
         });
     },
-    [applyWrite, writeError],
+    [applyWrite, writeError, readOnly, say],
   );
 
   const openIssue = useCallback((id: string) => setOpenId(id), []);
@@ -179,31 +197,40 @@ export default function App() {
 
       <div className="min-w-0 flex flex-col">
         <header className="sticky top-0 z-10 h-[2.85rem] flex items-center gap-3 px-4 lg:px-8 border-b border-ink-700 bg-ink-900/95 backdrop-blur">
+          <button
+            onClick={() => setMenuOpen((o) => !o)}
+            className="lg:hidden -ml-1 inline-flex items-center gap-1.5 h-8 px-2 rounded text-ink-200 hover:bg-ink-800"
+            aria-label="menu"
+            aria-expanded={menuOpen}
+          >
+            <Logo size={17} />
+            <span className="text-label font-medium">cadence</span>
+            <svg
+              width="10"
+              height="10"
+              viewBox="0 0 10 10"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              className={`transition-transform ${menuOpen ? "rotate-180" : ""}`}
+            >
+              <path d="M2 3.5l3 3 3-3" />
+            </svg>
+          </button>
           <div className="num text-label text-ink-500">
-            <span className="text-ink-300">cadence</span> /{" "}
+            <span className="hidden sm:inline text-ink-300">cadence</span>
+            <span className="hidden sm:inline"> / </span>
             <span className="text-ink-100">{tab}</span>
           </div>
-          <div className="lg:hidden flex gap-1 ml-2">
-            <button
-              onClick={() => setTab("board")}
-              className="chip bg-ink-800 text-ink-200"
-            >
-              board
-            </button>
-            <button
-              onClick={() => setTab("agents")}
-              className="chip bg-ink-800 text-ink-200"
-            >
-              agents
-            </button>
-            <button
-              onClick={() => setTab("plan")}
-              className="chip bg-ink-800 text-ink-200"
-            >
-              plan
-            </button>
-          </div>
           <div className="ml-auto flex items-center gap-2">
+            {readOnly && (
+              <span
+                className="chip bg-warn/10 text-warn"
+                title="the server refuses every write — browsing only"
+              >
+                read-only
+              </span>
+            )}
             {health && (
               <span
                 className={`chip ${
@@ -227,14 +254,79 @@ export default function App() {
             >
               refresh
             </button>
-            <span
-              className="hidden sm:inline-flex chip bg-ink-800 text-ink-400"
-              title="writes commit to the tracker as operator (ui)"
-            >
-              writes: operator
-            </span>
+            {!readOnly && (
+              <span
+                className="hidden sm:inline-flex chip bg-ink-800 text-ink-400"
+                title={`writes commit to the tracker as ${actor}`}
+              >
+                writes: {actor}
+              </span>
+            )}
           </div>
         </header>
+
+        {menuOpen && (
+          <nav className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
+            <div className="grid grid-cols-3 gap-1.5">
+              {(["board", "plan", "agents"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => {
+                    setTab(t);
+                    setMenuOpen(false);
+                  }}
+                  className={`h-9 rounded text-secondary capitalize ${
+                    tab === t
+                      ? "bg-accent/15 text-accent font-medium"
+                      : "bg-ink-800 text-ink-300"
+                  }`}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+            <div className="slabel pt-2">projects</div>
+            <div className="grid gap-1">
+              <button
+                onClick={() => {
+                  setProject("all");
+                  setTab("board");
+                  setMenuOpen(false);
+                }}
+                className={`flex items-center justify-between h-8 px-2.5 rounded text-label ${
+                  project === "all"
+                    ? "bg-accent/15 text-accent"
+                    : "text-ink-300 hover:bg-ink-800"
+                }`}
+              >
+                All projects
+                <span className="num text-micro text-ink-500">
+                  {issues.filter((i) => !i.container).length}
+                </span>
+              </button>
+              {projects.map((p) => (
+                <button
+                  key={p.key}
+                  onClick={() => {
+                    setProject(p.key);
+                    setTab("board");
+                    setMenuOpen(false);
+                  }}
+                  className={`flex items-center justify-between h-8 px-2.5 rounded text-label ${
+                    project === p.key
+                      ? "bg-accent/15 text-accent"
+                      : "text-ink-300 hover:bg-ink-800"
+                  }`}
+                >
+                  {p.key}
+                  <span className="num text-micro text-ink-500">
+                    {p.prefix} {p.issues}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </nav>
+        )}
 
         {failed && (
           <div className="px-4 lg:px-8 pt-4">
@@ -252,6 +344,8 @@ export default function App() {
             health={health}
             project={project}
             query={query}
+            readOnly={readOnly}
+            actor={actor}
             onQuery={setQuery}
             onOpen={openIssue}
             onMove={moveIssue}
@@ -272,6 +366,8 @@ export default function App() {
           projects={projects}
           pmDir={health?.pm_dir}
           detail={openDetail}
+          readOnly={readOnly}
+          actor={actor}
           onClose={() => setOpenId(null)}
           onOpen={openIssue}
           onWrite={applyWrite}

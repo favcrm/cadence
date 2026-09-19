@@ -230,6 +230,15 @@ export interface AgentDetail {
   on?: string[];
 }
 
+/** GET /api/meta — what this client may do and who writes credit to.
+ *  Tailnet-shared boards resolve the actor from Tailscale identity
+ *  headers; `read_only` boards refuse every write. */
+export interface Meta {
+  read_only: boolean;
+  actor: string;
+  tailnet_url: string | null;
+}
+
 export interface Health {
   ok: boolean;
   pm_dir?: string;
