@@ -84,6 +84,9 @@ Error kinds:
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 | `agent_remove` | `alias` | deletes the agent + its history; refuses live endpoints |
 | `agent_gc` | `older_than?` | sweeps dead agents; `{removed:[alias]}` |
+| `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (the token). `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot |
+| `slot_release` | `token` | `{released:true,token,kind}` — unknown token is a named rejection |
+| `slot_status` | — | `{pools:{build,suite}:{capacity,held[]}, waiting[], config}` — also a reap pass: dead holders/waiters drop on the read |
 
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
@@ -1002,6 +1005,61 @@ methods keep the per-type responses above. Pending entries are
 in-memory: an actor exit or daemon restart reads as `closed` to any
 waiter. Today the only producer is the `mcp-permission` server backing
 brokered claude approvals (see the managed claude section).
+
+## Build slots (CAD-113)
+
+One bounded, fair, observable scheduler for cargo build/test work on a
+host, so lanes queue instead of thrashing. Wrap a build like
+`token=$(cadence build-slot acquire build --wait-secs 600); cargo build;
+cadence build-slot release $token` — the daemon owns the queue, the
+CLI only polls.
+
+Two pools share one queue: `build`/`test` requests draw on
+`build_slots` (default 3), `suite` requests on `suite_slots` (default
+1) — independent, so a queued full suite never starves ordinary
+builds. Grant order is FIFO with two modifiers: `test`/`suite`
+requests from a configured *priority lane* (`[host] priority_lanes` —
+the reviewer lane) outrank ordinary requests, and anything waiting
+longer than `starve_secs` (default 900) jumps to the front, so
+priority can never starve a lane out.
+
+A slot is a token bound to a pid: `release` returns it, and a holder
+whose pid dies is reaped on the next acquire/status — a killed agent
+frees its slot, nothing is ever killed for one. Waiting is
+client-side: `slot_acquire` answers instantly with granted-or-position,
+and a polling caller keeps its place by refreshing `last_poll`; a
+request that goes silent past the waiter TTL (30s) or whose pid dies
+drops out of the queue. `probe:true` is the non-mutating read — it
+grants or reports position without ever joining the queue.
+
+The registry is in-memory on purpose: a daemon restart forgets every
+token and reaps every dead pid, which is the desired fail-closed
+semantics. `CADENCE_SUITE_LOCK` keeps working underneath as the
+test-process suite slot — the daemon queue is the observable layer
+above it.
+
+Configuration rides the `[host]` table in `pm.yaml` (all optional):
+
+```yaml
+host:
+  build_slots: 3        # concurrent build+test grants
+  suite_slots: 1        # concurrent full-suite grants
+  jobs_per_lane: 4      # CARGO_BUILD_JOBS `issue start`/`dispatch` injects
+  starve_secs: 900      # never-starve bound
+  priority_lanes: [qa-1]  # test/suite requests outrank ordinary ones
+  load_warn_ratio: 1.0  # doctor --host load warn = ratio x cpus (fail 2x)
+  io_stall_warn_pct: 30 # doctor --host io stall warn % (fail 60)
+```
+
+`cadence issue start`/`dispatch` write `<worktree>/.env` with
+`CARGO_BUILD_JOBS=<jobs_per_lane>` and `CADENCE_BUILD_SLOT=<cadence
+binary>` so a worker never has to remember flags; existing foreign
+lines in `.env` are preserved. Observability: `slot_acquired` /
+`slot_waited` / `slot_released` events land on the requesting lane's
+event stream, `cadence status` carries a `slots:` footer line,
+`cadence build-slot status [--json]` shows holders and waiters, and
+`doctor --host`'s `load` check reports load, io stall and the queue.
+Nothing here kills a process or cancels anyone's work.
 
 ## Recovery
 

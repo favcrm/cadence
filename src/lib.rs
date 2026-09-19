@@ -18,6 +18,7 @@ pub mod proto;
 pub mod review;
 pub mod session;
 pub mod skill;
+pub mod slots;
 pub mod store;
 pub mod ui;
 pub mod worktree;

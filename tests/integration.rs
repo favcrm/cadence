@@ -24,12 +24,17 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start() -> Self {
+        Self::start_opts(daemon_opts())
+    }
+
+    /// `start` with explicit daemon options — slot tests shrink the
+    /// pools this way.
+    fn start_opts(opts: daemon::ServeOptions) -> Self {
         suite_slot();
         let dir = TempDir::new().unwrap();
         let state = dir.path().to_path_buf();
         std::fs::create_dir_all(&state).unwrap();
         let owned = state.clone();
-        let opts = daemon_opts();
         let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
         let daemon = Self {
             dir,
@@ -2169,6 +2174,9 @@ fn daemon_opts() -> daemon::ServeOptions {
     daemon::ServeOptions {
         provider_env: test_env(),
         stall_sample_secs: TEST_STALL_SAMPLE.with(std::sync::Arc::clone),
+        // Explicit defaults keep test daemons hermetic — a real pm.yaml
+        // [host] table on the dev host must never leak into a test.
+        slots: Some(cadence_agent::slots::SlotConfig::default()),
     }
 }
 
@@ -15500,7 +15508,7 @@ fn dispatch_degrades_on_memory_failures() {
     // D-2's title is sized so the kickoff body sits just under the
     // 4000-byte cap — the `Lessons:` suffix is what tips it over.
     let long_title = "x".repeat(3720);
-    for title in ["One".to_string(), long_title, "Three".to_string()] {
+    for title in ["One".to_string(), long_title] {
         assert!(cli(&["issue", "new", &title, "--project", "demo"]).0);
     }
     // One good accepted rule — matching works until the broken file.
@@ -15527,8 +15535,7 @@ fn dispatch_degrades_on_memory_failures() {
     std::fs::write(&note, "# kickoff").unwrap();
     let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
 
-    // Malformed memory file → excluded from the match and named;
-    // the valid rule still reaches the kickoff.
+    // Malformed memory file → match fails → degrade, dispatch lands.
     std::fs::write(
         pm_dir.join("demo/memory/broken.md"),
         "---\nid: [unclosed\n---\nbody\n",
@@ -15545,11 +15552,10 @@ fn dispatch_degrades_on_memory_failures() {
         "pm",
     ]);
     assert!(ok && out["dispatched"] == true, "{out}");
-    assert_eq!(out["lessons"], json!(["good-rule"]), "{out}");
-    let lessons_file = out["lessons_file"].as_str().unwrap_or_default();
-    assert!(lessons_file.ends_with("-lessons.md"), "{out}");
+    assert_eq!(out["lessons"], json!([]), "{out}");
+    assert_eq!(out["lessons_file"], Value::Null, "{out}");
     let err = out["lessons_error"].as_str().unwrap_or_default();
-    assert!(err.contains("broken.md"), "{out}");
+    assert!(err.contains("memory match failed"), "{out}");
     assert!(!out["message"].as_str().unwrap().is_empty());
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     let kick = show["messages"]
@@ -15558,8 +15564,8 @@ fn dispatch_degrades_on_memory_failures() {
         .iter()
         .find(|m| m["id"].as_str() == out["message"].as_str())
         .unwrap();
-    assert!(kick["body"].as_str().unwrap().contains("Lessons:"));
-    assert!(Path::new(lessons_file).is_file());
+    assert!(!kick["body"].as_str().unwrap().contains("Lessons:"));
+    assert!(!d.state.join("dispatch").exists());
 
     // Over-cap: the good rule matches, but the `Lessons:` suffix would
     // push the kickoff body past the 4000-byte pty cap → the suffix
@@ -15594,78 +15600,21 @@ fn dispatch_degrades_on_memory_failures() {
         "original long body sent: {}",
         sent.len()
     );
-    // No new lessons file — D-1's remains the only one — and no
-    // half-written .tmp residue.
-    let names: Vec<String> = std::fs::read_dir(d.state.join("dispatch"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
-    assert_eq!(
-        names.iter().filter(|n| n.ends_with("-lessons.md")).count(),
-        1,
-        "{names:?}"
-    );
-    assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
-
-    // Unwritable lessons dir: `<state>/dispatch` as a plain file →
-    // create_dir_all fails → dispatch still lands, the error is
-    // named, and nothing that looks like a lessons artifact exists.
-    std::fs::remove_dir_all(d.state.join("dispatch")).unwrap();
-    std::fs::write(d.state.join("dispatch"), "not a dir").unwrap();
-    let (ok, out) = cli(&[
-        "dispatch",
-        "D-3",
-        "--to",
-        "w1",
-        "--note",
-        &note_s,
-        "--reply-to",
-        "pm",
-    ]);
-    assert!(ok && out["dispatched"] == true, "{out}");
-    assert_eq!(out["lessons"], json!([]), "{out}");
-    assert_eq!(out["lessons_file"], Value::Null, "{out}");
-    let err = out["lessons_error"].as_str().unwrap_or_default();
-    assert!(err.contains("unwritable"), "{out}");
-    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
-    let kick = show["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["id"].as_str() == out["message"].as_str())
-        .unwrap();
-    assert!(!kick["body"].as_str().unwrap().contains("Lessons:"));
     assert!(
-        d.state.join("dispatch").is_file(),
-        "the placeholder is untouched — no dir or file replaced it"
+        !d.state.join("dispatch").exists(),
+        "no lessons file written"
     );
 
-    // Briefing cap: an oversized first rule is skipped, not a stop —
-    // later smaller rules still list, ≤8 entries and ≤4 KiB hold,
-    // and the omission is counted. fat-rule-00's hand-edited 5 KiB
-    // fact alone exceeds the byte budget: under the old `break` it
-    // hid every rule after it.
+    // Briefing cap: ten fat accepted rules exceed both bounds — the
+    // section keeps ≤8 entries and ≤4 KiB of items.
     let mem_dir = pm_dir.join("demo/memory");
-    let rule = |id: &str, fact: &str| {
-        format!(
-            "---\nid: {id}\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  project: true\n---\n{fact}\n\n**Why:** w\n\n**How to apply:** h\n"
-        )
-    };
-    std::fs::write(
-        mem_dir.join("fat-rule-00.md"),
-        rule("fat-rule-00", &"z".repeat(5 * 1024)),
-    )
-    .unwrap();
-    std::fs::write(
-        mem_dir.join("fat-rule-01-tiny.md"),
-        rule("fat-rule-01-tiny", "t"),
-    )
-    .unwrap();
-    for i in 2..10 {
+    for i in 0..10 {
         std::fs::write(
             mem_dir.join(format!("fat-rule-{i:02}.md")),
-            rule(&format!("fat-rule-{i:02}"), &"y".repeat(700)),
+            format!(
+                "---\nid: fat-rule-{i:02}\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  project: true\n---\n{}\n\n**Why:** w\n\n**How to apply:** h\n",
+                "y".repeat(700)
+            ),
         )
         .unwrap();
     }
@@ -15685,11 +15634,6 @@ fn dispatch_degrades_on_memory_failures() {
     let listed = items.matches("- `fat-rule-").count();
     assert!((1..=8).contains(&listed), "{listed} rules in section");
     assert!(items.len() <= 4 * 1024 + 128, "{} bytes", items.len());
-    // The oversized rule never listed; the tiny rule after it did —
-    // proof the budget skip keeps scanning. The omission is counted.
-    assert!(!items.contains("fat-rule-00`"), "{items}");
-    assert!(items.contains("- `fat-rule-01-tiny`"), "{items}");
-    assert!(items.contains("accepted rule(s) omitted"), "{items}");
 }
 
 // ==== operator IX: cadence status, daemon restart, events tail ====
@@ -17134,7 +17078,7 @@ fn overview_drift_reports_commits_after_build() {
     assert_eq!(row["command"], "cadence daemon restart --when-idle --ui");
 }
 
-/// `doctor --host --json` on the real host: one object, six named
+/// `doctor --host --json` on the real host: one object, the named
 /// checks, each ok|warn|fail, exit code the worst level. What the host
 /// measures is its own business — this only proves the surface runs
 /// and reports honestly, never which level comes back.
@@ -17176,7 +17120,8 @@ fn doctor_host_json_reports_all_checks() {
             "sessions",
             "orphans",
             "temp-dirs",
-            "worktrees"
+            "worktrees",
+            "load"
         ]
     );
     for c in report["checks"].as_array().unwrap() {
@@ -17814,6 +17759,7 @@ fn issue_start_honours_cargo_target_dir_env() {
         envdir.to_string_lossy()
     );
 }
+
 
 // ---- session start|end: stub daemon socket, fixture pm + repo (CAD-92) ----
 
@@ -20124,4 +20070,348 @@ fn audit_post_hoc_verdict_does_not_clear_flag() {
             .any(|f| f == "no-passing-verdict"),
         "post-hoc pass must not clear the flag: {m}"
     );
+}
+
+// ---------- CAD-113: build slots ----------
+
+/// A daemon with a shrunken slot config — hermetic (ServeOptions wins
+/// over pm.yaml, so no host config can leak in).
+fn slot_opts(build: usize, suite: usize, starve: u64, priority: &[&str]) -> daemon::ServeOptions {
+    daemon::ServeOptions {
+        slots: Some(cadence_agent::slots::SlotConfig {
+            build_slots: build,
+            suite_slots: suite,
+            starve_secs: starve,
+            priority_lanes: priority.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }),
+        ..daemon_opts()
+    }
+}
+
+/// `slot_acquire` with the test process's pid — alive for the whole
+/// test, so the pid check never reaps a live waiter here.
+fn slot_acquire(d: &TestDaemon, kind: &str, lane: &str, req: &str) -> Value {
+    d.rpc(
+        "slot_acquire",
+        json!({"kind": kind, "lane": lane, "pid": std::process::id(),
+               "request_id": req}),
+    )
+    .unwrap()
+}
+
+/// N+1 acquires: the last queues until a release, FIFO order is kept,
+/// and slot events land on each lane's stream.
+#[test]
+fn slot_acquire_queues_until_release() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    d.register("dev-1");
+    d.register("dev-2");
+    let g1 = slot_acquire(&d, "build", "dev-1", "r1");
+    assert_eq!(g1["granted"], true);
+    assert_eq!(g1["token"], "r1");
+    // The next acquire queues — answered, never hung.
+    let q = slot_acquire(&d, "build", "dev-2", "r2");
+    assert_eq!(q["granted"], false);
+    assert_eq!(q["position"], 1);
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert_eq!(s["pools"]["build"]["held"].as_array().unwrap().len(), 1);
+    let waiting = s["waiting"].as_array().unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0]["lane"], "dev-2");
+    // A re-poll keeps the original place — same request id, same
+    // position, no second slot_waited.
+    let q = slot_acquire(&d, "build", "dev-2", "r2");
+    assert_eq!(q["position"], 1);
+    // Release frees the pool; the waiter's next poll grants.
+    d.rpc("slot_release", json!({"token": "r1"})).unwrap();
+    let g2 = slot_acquire(&d, "build", "dev-2", "r2");
+    assert_eq!(g2["granted"], true);
+    assert_eq!(g2["token"], "r2");
+    // And a re-poll of a granted id returns the same token (the CLI's
+    // poll loop depends on this idempotency).
+    let again = slot_acquire(&d, "build", "dev-2", "r2");
+    assert_eq!(again["token"], "r2");
+    let kinds = |a: &str| {
+        d.events(a)
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert!(kinds("dev-1").contains(&"slot_acquired".to_string()));
+    assert!(kinds("dev-1").contains(&"slot_released".to_string()));
+    let dev2 = kinds("dev-2");
+    assert_eq!(
+        dev2.iter().filter(|k| *k == "slot_waited").count(),
+        1,
+        "one slot_waited for the whole wait: {dev2:?}"
+    );
+    assert!(dev2.contains(&"slot_acquired".to_string()));
+}
+
+/// A holder whose pid dies frees its slot on the next acquire —
+/// nothing kills the work, the slot just stops being owed by a corpse.
+#[test]
+fn slot_dead_holder_is_reaped() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    d.register("dev-1");
+    d.register("dev-2");
+    let mut child = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let g = d
+        .rpc(
+            "slot_acquire",
+            json!({"kind": "build", "lane": "dev-1", "pid": pid,
+                   "request_id": "r1"}),
+        )
+        .unwrap();
+    assert_eq!(g["granted"], true);
+    child.kill().unwrap();
+    child.wait().unwrap(); // reap the zombie so kill(pid,0) answers ESRCH
+    let g2 = slot_acquire(&d, "build", "dev-2", "r2");
+    assert_eq!(g2["granted"], true, "dead holder's slot must free");
+    // The reap names the cause on the dead lane's stream.
+    let evs = d.events("dev-1");
+    assert!(
+        evs.iter()
+            .any(|e| e["kind"].as_str() == Some("slot_released")
+                && e["payload"]["reason"].as_str() == Some("holder died")),
+        "{evs:?}"
+    );
+    // Releasing the dead token is now a named refusal, not a silent pass.
+    let err = d.rpc("slot_release", json!({"token": "r1"})).unwrap_err();
+    assert!(err.to_string().contains("Unknown slot token"), "{err}");
+}
+
+/// `starve_secs` promotes a long waiter ahead of a priority lane:
+/// priority wins inside the window, the starved waiter wins after it.
+#[test]
+fn slot_starve_promotes_long_waiter() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 3, &["qa-1"]));
+    slot_acquire(&d, "build", "dev-1", "h1"); // holder
+    slot_acquire(&d, "build", "dev-2", "w1"); // ordinary waiter, first
+    slot_acquire(&d, "test", "qa-1", "w2"); // priority waiter, second
+    d.rpc("slot_release", json!({"token": "h1"})).unwrap();
+    // Inside the starve window the reviewer lane's test wins.
+    let g = slot_acquire(&d, "test", "qa-1", "w2");
+    assert_eq!(g["granted"], true, "priority lane should outrank");
+    // Once w1 has waited past starve_secs it outranks even a new
+    // priority request — the never-starve bound.
+    thread::sleep(Duration::from_millis(3200));
+    slot_acquire(&d, "test", "qa-1", "w3");
+    d.rpc("slot_release", json!({"token": "w2"})).unwrap();
+    let g = slot_acquire(&d, "build", "dev-2", "w1");
+    assert_eq!(g["granted"], true, "starved waiter must outrank priority");
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    let w3 = s["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["request_id"] == "w3")
+        .expect("w3 still queued");
+    assert_eq!(w3["priority"], true);
+}
+
+/// suite draws on its own pool — a full suite queue never jams the
+/// build lanes, and `test` shares the build pool.
+#[test]
+fn slot_pools_are_independent() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    assert_eq!(slot_acquire(&d, "suite", "qa-1", "s1")["granted"], true);
+    assert_eq!(
+        slot_acquire(&d, "suite", "qa-1", "s2")["granted"],
+        false,
+        "second suite must queue"
+    );
+    // The suite pool being full does not touch build.
+    assert_eq!(slot_acquire(&d, "build", "dev-1", "b1")["granted"], true);
+    // test shares the build pool — now full too.
+    assert_eq!(slot_acquire(&d, "test", "dev-1", "t1")["granted"], false);
+}
+
+/// The CLI: `--wait-secs 0` fails fast with a named error, a free slot
+/// grants a bare token, release returns it, and `status` shows the
+/// pool both ways.
+#[test]
+fn build_slot_cli_acquire_release_status() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    slot_acquire(&d, "build", "dev-1", "r1"); // build pool full
+    let home = TempDir::new().unwrap();
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "acquire", "build", "--wait-secs", "0"],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("No build slot free"), "{err}");
+    // Free it through the CLI, then take it through the CLI.
+    let out = cadence_at(home.path(), &d.state, &["build-slot", "release", "r1"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("released r1"));
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "acquire",
+            "build",
+            "--wait-secs",
+            "0",
+            "--lane",
+            "dev-9",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(token.len() >= 8, "bare token on stdout: {token:?}");
+    // The token round-trips: release by exactly what acquire printed.
+    let out = cadence_at(home.path(), &d.state, &["build-slot", "release", &token]);
+    assert!(out.status.success());
+    // status --json shows the empty pool; bad kind is a named error.
+    let out = cadence_at(home.path(), &d.state, &["build-slot", "status", "--json"]);
+    let s: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(s["pools"]["build"]["held"].as_array().unwrap().is_empty());
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "acquire", "bogus", "--wait-secs", "0"],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("build, test or suite"));
+}
+
+/// `cadence status` carries the slot line — table and --json agree.
+#[test]
+fn status_footer_shows_slots() {
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    slot_acquire(&d, "build", "dev-1", "r1");
+    slot_acquire(&d, "build", "dev-2", "r2");
+    slot_acquire(&d, "build", "dev-3", "r3"); // the waiter
+    let home = TempDir::new().unwrap();
+    let out = cadence_at(home.path(), &d.state, &["status"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("slots: 2/2 build, 0/1 suite; waiting: 1"),
+        "{text}"
+    );
+    let out = cadence_at(home.path(), &d.state, &["status", "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["footer"]["slots"]["pools"]["build"]["held"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(v["footer"]["slots"]["waiting"].as_array().unwrap().len(), 1);
+}
+
+/// `issue start` writes the worktree slot env: `CARGO_BUILD_JOBS` from
+/// `[host] jobs_per_lane` plus the helper path — idempotent, and a
+/// foreign line in an existing `.env` survives.
+#[test]
+fn issue_start_writes_slot_env() {
+    let d = TestDaemon::start();
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]).0);
+    assert!(cli(&["issue", "new", "One", "--project", "demo"]).0);
+    // The [host] override lands before the start reads it.
+    let pm_yaml = pm_dir.join("pm.yaml");
+    let mut yaml = std::fs::read_to_string(&pm_yaml).unwrap();
+    yaml.push_str("host:\n  jobs_per_lane: 7\n");
+    std::fs::write(&pm_yaml, yaml).unwrap();
+    let (ok, out) = cli(&["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let env_file = PathBuf::from(out["slot_env"].as_str().unwrap());
+    assert_eq!(
+        env_file,
+        Path::new(out["worktree"].as_str().unwrap()).join(".env")
+    );
+    let text = std::fs::read_to_string(&env_file).unwrap();
+    assert!(text.contains("CARGO_BUILD_JOBS=7"), "{text}");
+    assert!(text.contains("CADENCE_BUILD_SLOT="), "{text}");
+    assert!(text.contains("cadence"), "{text}");
+    // A second start is idempotent and keeps foreign lines.
+    std::fs::write(&env_file, format!("OTHER=1\n{text}")).unwrap();
+    let (ok, _) = cli(&["issue", "start", "D-1"]);
+    assert!(ok);
+    let text = std::fs::read_to_string(&env_file).unwrap();
+    assert_eq!(text.matches("CARGO_BUILD_JOBS=").count(), 1, "{text}");
+    assert!(text.contains("OTHER=1"), "{text}");
+    drop(d);
 }

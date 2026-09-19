@@ -415,6 +415,9 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     }
     drop(_lock);
 
+    // CAD-113: the worktree's slot environment — best-effort, never
+    // fails the start.
+    let slot_env = write_slot_env(&wt_dir, &pm.dir).ok();
     let mut out = json!({
         "issue": front.id,
         "repo": root,
@@ -424,6 +427,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "trailer": format!("Issue: {}", front.id),
         "created": created,
         "target_dir": cargo_target,
+        "slot_env": slot_env,
     });
     if let (Some(job), Some((state_dir, spec, spec_sha256))) = (&args.job, job_probe) {
         let created_job = client::rpc(
@@ -445,4 +449,30 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         out["task"] = json!(format!("{job_id}-t1"));
     }
     Ok(out)
+}
+
+/// CAD-113: the worktree's build-slot environment — `CARGO_BUILD_JOBS`
+/// from `[host] jobs_per_lane` (default 4) and the `build-slot` helper
+/// path, so a worker never has to remember flags. Idempotent: lines we
+/// own are rewritten, everything else in an existing `.env` survives.
+fn write_slot_env(wt_dir: &Path, pm_dir: &Path) -> Result<PathBuf> {
+    let jobs = crate::doctor::host::host_overrides(pm_dir)
+        .and_then(|o| o.jobs_per_lane)
+        .unwrap_or(4);
+    let helper = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cadence"));
+    let file = wt_dir.join(".env");
+    let owned = ["CARGO_BUILD_JOBS=", "CADENCE_BUILD_SLOT="];
+    let mut text = String::new();
+    if let Ok(existing) = std::fs::read_to_string(&file) {
+        for line in existing.lines() {
+            if !owned.iter().any(|p| line.starts_with(p)) {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+    text.push_str(&format!("CARGO_BUILD_JOBS={jobs}\n"));
+    text.push_str(&format!("CADENCE_BUILD_SLOT={}\n", helper.display()));
+    std::fs::write(&file, text)?;
+    Ok(file)
 }

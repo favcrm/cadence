@@ -232,6 +232,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         "base": started["base"],
         "created": started["created"],
         "target_dir": started["target_dir"],
+        "slot_env": started["slot_env"],
     });
     if let Some(msg) = live {
         out["dispatched"] = json!(false);

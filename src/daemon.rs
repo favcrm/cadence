@@ -29,6 +29,7 @@ use crate::adapter::{
 use crate::client;
 use crate::error::{Error, Result};
 use crate::proto;
+use crate::slots::{SlotConfig, SlotKind, Slots};
 use crate::store::{self, Agent, Message, Store, Take};
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
@@ -271,6 +272,10 @@ pub struct Shared {
     /// shutdown marker, so the next daemon can prove a marker belongs
     /// to the immediately preceding run (CAD-89).
     instance: String,
+    /// CAD-113 build-slot registry — in-memory by design: a restart
+    /// reaps every holder (dead pids, forgotten tokens), which is the
+    /// fail-closed semantics the slot service wants.
+    slots: Mutex<Slots>,
 }
 
 impl Shared {
@@ -299,6 +304,7 @@ impl Shared {
             started_at: epoch_secs(),
             stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
             instance,
+            slots: Mutex::new(Slots::new(resolve_slot_config(opts))),
         }))
     }
 
@@ -1154,8 +1160,62 @@ impl Shared {
                 let state = if started { "starting" } else { "attention" };
                 Ok(json!({"alias": alias, "state": state}))
             }
+            "slot_acquire" => self.rpc_slot_acquire(params),
+            "slot_release" => self.rpc_slot_release(params),
+            "slot_status" => Ok(self.rpc_slot_status()),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
+    }
+
+    /// Slot lifecycle events ride the durable event stream addressed
+    /// to the requesting lane — an agent sees why its build waited in
+    /// its own `agent events` view.
+    fn emit_slot_events(&self, events: Vec<crate::slots::SlotEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        for (lane, kind, payload) in events {
+            let _ = self.store.event_public(&lane, kind, payload);
+        }
+        self.wake();
+    }
+
+    /// Non-blocking slot acquire (CAD-113) — the caller polls with a
+    /// stable `request_id`; each answer is granted-or-queue-position.
+    fn rpc_slot_acquire(&self, params: &Value) -> Result<Value> {
+        let kind = SlotKind::parse(required_str(params, "kind")?)?;
+        let request_id = required_str(params, "request_id")?;
+        if request_id.len() > 128 {
+            return Err(Error::rejected("Slot request_id must be <= 128 bytes"));
+        }
+        let lane = optional_str(params, "lane").unwrap_or("unknown");
+        if lane.len() > 128 {
+            return Err(Error::rejected("Slot lane must be <= 128 bytes"));
+        }
+        let pid = optional_u64(params, "pid").unwrap_or(0) as u32;
+        // `probe` is the read-only fast-fail: it answers granted or
+        // position without leaving a waiter in the queue.
+        let probe = params["probe"].as_bool().unwrap_or(false);
+        let (result, events) =
+            self.slots
+                .lock()
+                .unwrap()
+                .acquire(kind, lane, pid, request_id, probe, epoch_secs())?;
+        self.emit_slot_events(events);
+        Ok(result)
+    }
+
+    fn rpc_slot_release(&self, params: &Value) -> Result<Value> {
+        let token = required_str(params, "token")?;
+        let (result, events) = self.slots.lock().unwrap().release(token, epoch_secs())?;
+        self.emit_slot_events(events);
+        Ok(result)
+    }
+
+    fn rpc_slot_status(&self) -> Value {
+        let (status, events) = self.slots.lock().unwrap().status(epoch_secs());
+        self.emit_slot_events(events);
+        status
     }
 
     fn rpc_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -3597,6 +3657,40 @@ pub struct ServeOptions {
     /// back to `CADENCE_STALL_SAMPLE_SECS`, then one minute. Shared so
     /// an in-process test can shrink it after start.
     pub stall_sample_secs: Arc<AtomicU64>,
+    /// CAD-113 slot configuration: `Some` is verbatim (tests);
+    /// `None` resolves `[host]` in pm.yaml, falling back to defaults.
+    pub slots: Option<SlotConfig>,
+}
+
+/// Slot configuration precedence: explicit `ServeOptions.slots`, then
+/// `[host]` in the repo's pm.yaml, then the built-in defaults.
+fn resolve_slot_config(opts: &ServeOptions) -> SlotConfig {
+    if let Some(c) = &opts.slots {
+        return c.clone();
+    }
+    let mut c = SlotConfig::default();
+    let overrides = crate::issue::default_dir()
+        .ok()
+        .as_deref()
+        .and_then(crate::doctor::host::host_overrides);
+    if let Some(o) = overrides {
+        if let Some(v) = o.build_slots {
+            c.build_slots = v as usize;
+        }
+        if let Some(v) = o.suite_slots {
+            c.suite_slots = v as usize;
+        }
+        if let Some(v) = o.jobs_per_lane {
+            c.jobs_per_lane = v as usize;
+        }
+        if let Some(v) = o.starve_secs {
+            c.starve_secs = v;
+        }
+        if let Some(v) = o.priority_lanes {
+            c.priority_lanes = v;
+        }
+    }
+    c
 }
 
 // ---- Hot restart (CAD-89): clean-stop marker + instance files ----
