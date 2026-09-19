@@ -275,10 +275,11 @@ same table plus daemon-level features (`agent_registry`,
 never hand-listed per provider. Adding a provider or kind means one
 `SPECS` entry; every check, capability list and doctor probe follows.
 
-## pty endpoints (providers `devin`, `claude`)
+## pty endpoints (providers `devin`, `claude`, `cursor`)
 
-Cadence launches `devin [--permission-mode <mode>] [-r <session>]` or
-`claude [--session-id <id> | --resume <id>]` inside a detached tmux
+Cadence launches `devin [--permission-mode <mode>] [-r <session>]`,
+`claude [--session-id <id> | --resume <id>]` or `cursor-agent --trust
+[--model <m>] [--force|--auto-review] --resume <chat>` inside a detached tmux
 session on a private socket (`cadence-<state-hash>`), so every pane it
 can kill is one it spawned. The agent record keeps the fields separate:
 `alias`, `thread_id` = the native provider session id, `endpoint` =
@@ -291,7 +292,7 @@ differential render check — with every provider-specific fact behind a
 `TuiProfile` (`src/adapter/pty/profile.rs`): launch argv, native
 session-ownership proof, the screen analyzer that produces the probe
 verdict, message wording, the open deadline, and the forbidden-prefix
-list below. `devin` and `claude` are the real profiles; `tui-stub` is
+list below. `devin`, `claude` and `cursor` are the real profiles; `tui-stub` is
 a test-double profile the integration harness registers to prove the
 mechanics are profile-driven. A new TUI is a new profile module, not
 a copy of the adapter.
@@ -314,6 +315,18 @@ the pane pid. The same three rules follow: a live foreign pid claiming
 the wanted session refuses takeover, a pane owning a different session
 fails closed, and a dead pane relaunches with `claude --resume
 <stored>`.
+
+Cursor has no lock file or session registry — its proof is the chat
+store the TUI itself holds open: a running `cursor-agent` keeps an fd
+on `~/.cursor/chats/<project-hash>/<chat-id>/store.db` for the whole
+session, and its argv carries `--resume <chat-id>` from exec. A live
+attachment counts when the holding process (or the argv carrier)
+descends from the pane pid — `/proc` walked the same way. A fresh
+launch mints its chat id first (`cursor-agent create-chat`) so every
+pane names its session in argv, and the same three rules follow: a
+live foreign attachment to the wanted chat refuses takeover, a pane
+owning a different chat fails closed, and a dead pane relaunches with
+`cursor-agent --resume <stored>`.
 
 **Submission gates.** `run_turn` requires all of: pane alive,
 `pane_dead=0`, `pane_in_mode=0`, native ownership still held, and a
@@ -353,6 +366,15 @@ prompt start, so the adapter fetches `#{cursor_x},#{cursor_y}`
 alongside the capture and the analyzer only counts visible text as
 input when the cursor has moved (an unreadable cursor treats it as
 real text — conservative).
+Cursor's analyzer keys on its own shapes, all captured from live
+panes (2026.09.15/2026.09.18): the input line is the last `→`-leading
+row, an empty input shows a watermark (`Plan, search, build anything`
+idle, `Add a follow-up` after a turn — either is *empty*, never a
+draft), busy is the `ctrl+c to stop` interrupt hint on the input row
+itself or the status row directly above it (the braille spinner, a
+spinner word with its token counter, or the staged `follow-ups` box),
+and approval is the `Run this command?` menu — read only inside the
+status region since the transcript above can quote the same strings.
 `agent probe <alias>`
 runs the same analyzer on demand (`{idle, reason, prompt_visible,
 input_nonempty, busy_marker, approval_menu}`) without claiming. An
@@ -376,7 +398,10 @@ all forbidden; `#` stays a literal draft character. Claude's list was
 observed the same way (2.1.275): `/` opens the command menu, `!`
 switches to shell mode — a command that runs *outside* the permission
 system — `@` opens the agent/file autocomplete; `#` again stays
-literal.
+literal. Cursor's list was fixed live the same way
+(2026.09.15-d2fe57e): `/` opens the command menu, `!` enters
+shell-command mode, `@` opens the file picker — all forbidden; `#`
+stays a literal draft.
 
 **Durable submission vs. receipt.** Paste alone is not proof: the
 render check is *differential* — the pane is captured before the paste,

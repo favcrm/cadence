@@ -45,11 +45,13 @@
 //! provider's prompt.
 
 pub mod claude;
+pub mod cursor;
 pub mod devin;
 pub mod profile;
 pub mod stub;
 
 pub use claude::{analyze_claude, ClaudeProfile};
+pub use cursor::{analyze_cursor, CursorProfile};
 pub use devin::{analyze_devin, DevinProfile};
 pub use profile::TuiProfile;
 pub use stub::StubProfile;
@@ -309,6 +311,7 @@ pub fn forbidden_prefixes(provider: &str) -> &'static [char] {
     match provider {
         "devin" => devin::FORBIDDEN_PREFIXES,
         "claude" => claude::FORBIDDEN_PREFIXES,
+        "cursor" => cursor::FORBIDDEN_PREFIXES,
         "tui-stub" => stub::FORBIDDEN_PREFIXES,
         _ => &[],
     }

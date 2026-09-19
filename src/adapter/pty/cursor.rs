@@ -1,0 +1,667 @@
+//! The Cursor Agent TUI profile (`cursor-agent`): screen signatures,
+//! the `analyze` reduction, launch argv, and chat ownership proven
+//! through the chat store the TUI keeps open.
+//!
+//! Cursor has no session-lock file or pid registry. What the running
+//! TUI does expose is the chat's own state: it holds an open file
+//! descriptor on `~/.cursor/chats/<project-hash>/<chat-id>/store.db`
+//! for the whole session (observed live on 2026.09.15 and
+//! 2026.09.18), and the pane's `cursor-agent` process carries the
+//! chat id element-wise in its argv (`--resume <chatId>`). Ownership
+//! is *proven*, not assumed: a chat whose store fd or `--resume` argv
+//! belongs to a process outside our pane means another TUI owns it —
+//! open refuses rather than taking it over, and a changed owner fails
+//! closed.
+//!
+//! A fresh launch mints its chat id first (`cursor-agent
+//! create-chat`) and opens it with `--resume`, so every pane — fresh
+//! or resumed — carries its chat id in argv from exec.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+use serde_json::Value;
+
+use crate::adapter::Probe;
+use crate::error::{Error, Result};
+use crate::proc::run_bounded;
+use crate::store::Agent;
+
+use super::profile::TuiProfile;
+use super::{descends_from, resolve_on_path, shlex_quote};
+
+/// Bounded wait for the launched Cursor TUI to open its chat store —
+/// a cold node start plus the first `store.db` open can take a while.
+const OPEN_DEADLINE: Duration = Duration::from_secs(45);
+/// Bound on `cursor-agent create-chat` — a network round trip that
+/// must never stall the actor's open path.
+const MINT_DEADLINE: Duration = Duration::from_secs(20);
+/// How much of the screen bottom counts as the status region: input
+/// line, status chips, model/cwd bar and a menu tall enough for
+/// Cursor's permission select. Approval markers only match inside it
+/// — the transcript above can legitimately show these strings as
+/// text. (Busy is anchored tighter still: the input line's interrupt
+/// hint or the status row directly above it — see `analyze_cursor`.)
+const STATUS_LINES: usize = 16;
+
+/// Cursor TUI screen signatures — THE one place they live. A provider
+/// TUI update means editing this table, never the gate logic. Every
+/// string is verbatim from a live pane capture (2026.09.15-d2fe57e;
+/// the shapes held unchanged on 2026.09.18-9a7762b).
+mod cursor_screen {
+    /// Glyph leading the input line (also the selected option of an
+    /// open menu — approval is checked before input parsing).
+    pub const PROMPT: &str = "→";
+    /// Interrupt hint the TUI paints at the right edge of the input
+    /// line while a turn runs — busy evidence on the input row itself.
+    pub const INTERRUPT: &str = "ctrl+c to stop";
+    /// Input watermarks that mean EMPTY input — the TUI renders them
+    /// dim inside the line, and after a turn the placeholder flips to
+    /// the follow-up form. Presence of either (exactly) is an empty
+    /// input, never a staged draft.
+    pub const PLACEHOLDERS: &[&str] = &[
+        "Plan, search, build anything",
+        "Add a follow-up",
+        "Ask anything",
+    ];
+    /// Spinner words on the status row directly above the input while
+    /// a turn runs — `<braille> <word>  N tokens`.
+    pub const SPINNER: &[&str] = &[
+        "Running",
+        "Working",
+        "Thinking",
+        "Reading",
+        "Writing",
+        "Searching",
+        "Planning",
+    ];
+    /// Staged-queue rows while busy — the `┌─ follow-ups ─┐` box's
+    /// title and its `enter steer · ↑ select/edit · esc cancel`
+    /// footer (observed when a message was typed mid-turn).
+    pub const QUEUED: &[&str] = &["follow-ups", "enter steer", "select/edit"];
+    /// Rows skipped walking up from the input line: a `Tip:` hint is
+    /// neutral documentation (it can sit between the spinner and the
+    /// box), and box rules are frame, not status.
+    pub const TIP: &str = "Tip:";
+    /// An open select/permission menu — the command-approval box's
+    /// title, options and key hints, the inline wait state, plus the
+    /// generic menu footers (`/`, `@`, `/skills` pickers).
+    pub const APPROVAL: &[&str] = &[
+        "Run this command?",
+        "Not in allowlist:",
+        "to allowlist? (tab)",
+        "Run (once) (y)",
+        "Run Everything (shift+tab)",
+        "tell the agent what to do instead",
+        "Waiting for approval",
+        "to navigate",
+        "more below",
+        "Esc to close",
+    ];
+}
+
+/// Leading characters Cursor's TUI interprets before the prompt text —
+/// observed live in a scratch pane (CAD-56): `/` opens the command
+/// menu, `!` switches to shell-command mode, `@` opens the file
+/// picker. `#` stays a literal draft and is deliberately absent.
+pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
+
+/// A row of the TUI's own activity indicator: a braille spinner glyph
+/// (U+2800–U+28FF — the TUI animates through them) or a spinner word
+/// with its live token counter.
+fn spinner_row(row: &str) -> bool {
+    row.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+        || (cursor_screen::SPINNER.iter().any(|w| row.contains(w)) && row.contains("tokens"))
+}
+
+/// Reduce a captured Cursor screen to gate facts. The last `→` line
+/// is the input line; text after it that is not an input watermark is
+/// a staged draft. Menus and busy markers win over prompt parsing — a
+/// `→` leads the first approval option too. Approval menus are only
+/// read in the bottom status region (the transcript above can
+/// legitimately print the same strings), and busy is anchored tighter
+/// still (CAD-50): the `ctrl+c to stop` hint on the input line
+/// itself, or the status row directly above it — the braille spinner,
+/// a spinner word with its token count, or the staged follow-ups box.
+/// Blank rows, box rules and `Tip:` rows sit between the two and are
+/// skipped — a tip quoting the same hints stays neutral. The region
+/// is anchored at the last NON-BLANK row — `capture-pane` pads to
+/// pane height, so a young session on a tall pane has blank rows
+/// below the real content.
+pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
+    let content = screen.trim_end();
+    let tail: String = content
+        .lines()
+        .rev()
+        .take(STATUS_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let approval_menu = cursor_screen::APPROVAL.iter().any(|m| tail.contains(m));
+    let lines: Vec<&str> = content.lines().collect();
+    let prompt_idx = lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with(cursor_screen::PROMPT));
+    let prompt_visible = prompt_idx.is_some();
+    let input_line = prompt_idx.map(|i| lines[i]).unwrap_or("");
+    // The interrupt hint shares the input row while a turn runs —
+    // busy evidence on the input line itself, and never part of the
+    // staged text.
+    let interrupt_hint = input_line.contains(cursor_screen::INTERRUPT);
+    let draft = input_line
+        .trim_start()
+        .trim_start_matches(cursor_screen::PROMPT)
+        .trim_end_matches(cursor_screen::INTERRUPT)
+        .trim()
+        .to_string();
+    // Busy is decided by positive evidence tied to the input line:
+    // the interrupt hint on it, or the status row directly above —
+    // the first row up that is not blank, a box rule, or a `Tip:`
+    // hint. A transcript echo cannot land there while the pane is
+    // idle.
+    let status_row = prompt_idx.and_then(|i| {
+        lines[..i].iter().rev().find(|l| {
+            let t = l.trim();
+            !t.is_empty()
+                && !t.starts_with(cursor_screen::TIP)
+                && t.chars().filter(|c| matches!(c, '─' | '═')).count() < 8
+        })
+    });
+    let status_busy = status_row.is_some_and(|row| {
+        spinner_row(row) || cursor_screen::QUEUED.iter().any(|m| row.contains(m))
+    });
+    let busy_marker = interrupt_hint || status_busy;
+    let input_nonempty =
+        !draft.is_empty() && !cursor_screen::PLACEHOLDERS.contains(&draft.as_str());
+    let (idle, reason) = if approval_menu {
+        (false, "approval menu is open")
+    } else if interrupt_hint {
+        (false, "tui is busy (interrupt hint on the input line)")
+    } else if status_busy {
+        (false, "tui is busy (status row above the input line)")
+    } else if !prompt_visible {
+        (false, "no prompt line visible")
+    } else if input_nonempty {
+        (false, "unsubmitted text in the input line")
+    } else {
+        (true, "idle")
+    };
+    Probe {
+        idle,
+        reason: reason.to_string(),
+        input_nonempty,
+        prompt_visible,
+        busy_marker,
+        approval_menu,
+    }
+}
+
+/// The chat id a `/proc/<pid>` process is attached to, proven by an
+/// open fd on `<chats>/<project-hash>/<chat-id>/store.db` — the file
+/// the TUI holds for the session's whole life. SQLite sidecars
+/// (`store.db-wal`, `store.db-journal`) name the same chat.
+fn store_db_chat(chats_dir: &Path, pid: u32) -> Option<String> {
+    let prefix = format!("{}/", chats_dir.to_string_lossy());
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    for fd in fds.flatten() {
+        let Ok(link) = std::fs::read_link(fd.path()) else {
+            continue;
+        };
+        let link = link.to_string_lossy().into_owned();
+        let Some(rest) = link.strip_prefix(&prefix) else {
+            continue;
+        };
+        let mut parts = rest.rsplit('/');
+        if parts
+            .next()
+            .is_some_and(|name| name.starts_with("store.db"))
+        {
+            if let Some(chat) = parts.next() {
+                return Some(chat.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The chat id a cursor-agent argv claims, proven element-wise:
+/// `--resume` followed by the id. Only argv[0]s that name the real
+/// binary count — a foreign process's `--resume` is its own flag.
+fn argv_chat(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    if !args.first().is_some_and(|a| a.contains("cursor-agent")) {
+        return None;
+    }
+    let i = args.iter().position(|a| a == "--resume")?;
+    Some(args.get(i + 1)?.clone())
+}
+
+/// The Cursor profile: `cursor-agent` argv (`create-chat` mint +
+/// `--resume <chat>` on every launch, `--trust` always, `--model`,
+/// and `--force`/`--auto-review` permission modes), chat ownership
+/// via the open `store.db` fd / `--resume` argv, and the Cursor
+/// screen analyzer.
+pub struct CursorProfile {
+    /// `~/.cursor/chats` — overridable in tests.
+    chats_dir: PathBuf,
+    /// Launch command prefix: the `CADENCE_CURSOR_COMMAND` override
+    /// verbatim, else a PATH-resolved `cursor-agent`.
+    command: String,
+    model: Option<String>,
+    /// `auto-review` → `--auto-review`, `force` → `--force`; unset
+    /// keeps Cursor's own default permission behavior.
+    permission_mode: Option<String>,
+}
+
+impl CursorProfile {
+    /// Resolve the profile from the agent's stored params and the
+    /// environment: the chats dir (`CADENCE_CURSOR_CHATS` for tests),
+    /// the launch command (`CADENCE_CURSOR_COMMAND` used verbatim —
+    /// tests pass `python3 mock.py <chats>` — else a `cursor-agent`
+    /// found on PATH), and the model/permission params replayed on
+    /// every launch exactly as registered.
+    pub fn new(agent: &Agent) -> Result<Self> {
+        let chats_dir = std::env::var("CADENCE_CURSOR_CHATS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cursor/chats")
+            });
+        let command = match std::env::var("CADENCE_CURSOR_COMMAND") {
+            Ok(cmd) if !cmd.is_empty() => cmd,
+            _ => resolve_on_path("cursor-agent").map(|p| shlex_quote(&p))?,
+        };
+        let params = agent.params.clone().unwrap_or(Value::Null);
+        let model = params
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| agent.model.clone());
+        let permission_mode = params
+            .get("permission_mode")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(Self {
+            chats_dir,
+            command,
+            model,
+            permission_mode,
+        })
+    }
+
+    /// Mint a fresh chat id — `cursor-agent create-chat` prints it on
+    /// stdout. The id is unbound to any workspace until the TUI opens
+    /// it, so the daemon's own cwd is fine (observed: an id minted in
+    /// one directory opens cleanly in another).
+    fn mint_chat(&self) -> Result<String> {
+        let out = run_bounded(
+            Command::new("sh").args(["-c", &format!("{} create-chat", self.command)]),
+            MINT_DEADLINE,
+        )
+        .map_err(|e| Error::provider(format!("cursor-agent create-chat failed: {e}")))?;
+        if !out.status.success() {
+            return Err(Error::provider(format!(
+                "cursor-agent create-chat failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let id = stdout
+            .lines()
+            .rev()
+            .find_map(|l| l.split_whitespace().last())
+            .unwrap_or("");
+        // A chat id is uuid-shaped — accept only id characters so a
+        // warning or error line can never be launched as a session.
+        if id.is_empty()
+            || id.len() > 128
+            || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(Error::provider(format!(
+                "cursor-agent create-chat returned an unusable chat id: {id:?}"
+            )));
+        }
+        Ok(id.to_string())
+    }
+
+    /// Every live (pid, chat) attachment on the host: the open
+    /// `store.db` fd the TUI holds, or a cursor-agent argv carrying
+    /// `--resume <chat>`. Single-shot: callers that need resilience
+    /// retry at their own decision point.
+    fn attachments(&self) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        let Ok(procs) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for proc in procs.flatten() {
+            let Ok(pid) = proc.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if let Some(chat) = store_db_chat(&self.chats_dir, pid).or_else(|| argv_chat(pid)) {
+                out.push((pid, chat));
+            }
+        }
+        out
+    }
+}
+
+impl TuiProfile for CursorProfile {
+    fn name(&self) -> &'static str {
+        "Cursor"
+    }
+
+    /// `cursor-agent --trust [--model M] [--force|--auto-review]
+    /// --resume <chat>` — a fresh launch mints its chat id first so
+    /// the pane's argv names its session from exec. `--trust` keeps
+    /// the workspace-trust prompt from ever gating the pane; Cadence
+    /// manages worktrees itself, so cursor's own `--worktree` is
+    /// never used.
+    fn launch_command(&self, resume: Option<&str>) -> Result<String> {
+        let chat = match resume {
+            Some(want) => want.to_string(),
+            None => self.mint_chat()?,
+        };
+        let mut argv = format!("{} --trust", self.command);
+        if let Some(model) = &self.model {
+            argv.push_str(&format!(" --model {}", shlex_quote(model)));
+        }
+        match self.permission_mode.as_deref() {
+            Some("force") => argv.push_str(" --force"),
+            Some("auto-review") => argv.push_str(" --auto-review"),
+            _ => {}
+        }
+        argv.push_str(&format!(" --resume {}", shlex_quote(&chat)));
+        Ok(argv)
+    }
+
+    fn exit_banner(&self) -> &'static str {
+        "Cursor exited. This pane will close."
+    }
+
+    /// The chat whose live attachment descends from `pane_pid`, or
+    /// `None` when the pane owns no chat.
+    fn owned_session(&self, pane_pid: u32) -> Option<String> {
+        self.attachments()
+            .into_iter()
+            .find(|(pid, _)| descends_from(*pid, pane_pid))
+            .map(|(_, chat)| chat)
+    }
+
+    /// Adopt the pane's owned chat, refusing a mismatch with the
+    /// wanted one — a changed owner fails closed, never adopts.
+    fn resolve_session(&self, desired: Option<&str>, found: Option<String>) -> Result<String> {
+        match (desired, found) {
+            (Some(want), Some(found)) if *want == found => Ok(found),
+            (Some(want), Some(found)) => Err(Error::provider(format!(
+                "pane owns chat '{found}', expected '{want}' — \
+                 changed owner fails closed"
+            ))),
+            (Some(want), None) => Err(Error::provider(format!(
+                "pane has no live Cursor chat for '{want}'"
+            ))),
+            (None, Some(found)) => Ok(found),
+            (None, None) => Err(Error::provider("pane exists but owns no Cursor chat")),
+        }
+    }
+
+    /// Refuse takeover: a live attachment to `session` outside our
+    /// (future) pane means another TUI already owns it.
+    fn refuse_takeover(&self, session: &str) -> Result<()> {
+        if let Some((pid, _)) = self
+            .attachments()
+            .into_iter()
+            .find(|(_, chat)| chat.as_str() == session)
+        {
+            return Err(Error::rejected(format!(
+                "Cursor chat '{session}' is owned by another terminal \
+                 (pid {pid}); close it first — no takeover"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The pane owns `native` while a descendant of its pid is
+    /// attached to the chat — rechecked before every send.
+    fn verify_ownership(&self, native: &str, pane_pid: u32) -> Result<()> {
+        let holders: Vec<u32> = self
+            .attachments()
+            .into_iter()
+            .filter(|(_, chat)| chat.as_str() == native)
+            .map(|(pid, _)| pid)
+            .collect();
+        match holders.first() {
+            Some(pid) if descends_from(*pid, pane_pid) => Ok(()),
+            Some(pid) => Err(Error::provider(format!(
+                "Cursor chat '{native}' is owned by pid {pid} outside our pane"
+            ))),
+            None => Err(Error::provider(format!(
+                "pane owns no live Cursor chat for '{native}'"
+            ))),
+        }
+    }
+
+    fn open_deadline(&self) -> Duration {
+        OPEN_DEADLINE
+    }
+
+    fn analyze(&self, screen: &str, cursor: Option<(u32, u32)>) -> Probe {
+        analyze_cursor(screen, cursor)
+    }
+
+    fn respond_rejection(&self) -> &'static str {
+        "pty endpoints have no approval channel — answer Cursor \
+         permission prompts in the terminal itself"
+    }
+
+    fn forbidden_prefixes(&self) -> &'static [char] {
+        FORBIDDEN_PREFIXES
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{analyze_cursor, argv_chat, store_db_chat, CursorProfile};
+    use crate::adapter::pty::profile::TuiProfile;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    /// Real captures from live cursor-agent panes (CAD-56, versions
+    /// 2026.09.15/2026.09.18), committed under tests/fixtures/cursor-tui/.
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/cursor-tui/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn idle_prompt_is_pasteable() {
+        let p = analyze_cursor(&fixture("idle.txt"), None);
+        assert!(p.idle, "{} / {}", p.idle, p.reason);
+        assert_eq!(p.reason, "idle");
+        assert!(p.prompt_visible && !p.input_nonempty);
+        assert!(!p.busy_marker && !p.approval_menu);
+    }
+
+    #[test]
+    fn follow_up_watermark_is_still_empty_input() {
+        // After a turn the input placeholder flips to "Add a
+        // follow-up" — a watermark, never a staged draft.
+        let p = analyze_cursor(&fixture("idle-after-turn.txt"), None);
+        assert!(p.idle, "{} / {}", p.idle, p.reason);
+        assert!(!p.input_nonempty && !p.busy_marker);
+    }
+
+    #[test]
+    fn busy_pane_blocks_on_interrupt_hint_and_spinner() {
+        let p = analyze_cursor(&fixture("busy.txt"), None);
+        assert!(!p.idle && p.busy_marker);
+        assert_eq!(p.reason, "tui is busy (interrupt hint on the input line)");
+        // The placeholder watermark is still the input text — no draft.
+        assert!(!p.input_nonempty);
+    }
+
+    #[test]
+    fn staged_draft_while_busy_reports_via_spinner() {
+        // A draft staged mid-turn: no interrupt hint on this frame —
+        // the status row directly above the input carries the busy
+        // evidence, and the draft itself is separately not-idle.
+        let p = analyze_cursor(&fixture("busy-staged.txt"), None);
+        assert!(!p.idle && p.busy_marker);
+        assert_eq!(p.reason, "tui is busy (status row above the input line)");
+        assert!(p.input_nonempty);
+    }
+
+    #[test]
+    fn approval_menu_wins_over_prompt_shape() {
+        // The menu's first option also leads with `→` — menu detection
+        // must outrank prompt parsing or it reads as a draft.
+        let p = analyze_cursor(&fixture("approval.txt"), None);
+        assert!(!p.idle && p.approval_menu);
+        assert_eq!(p.reason, "approval menu is open");
+    }
+
+    #[test]
+    fn typed_draft_is_not_idle() {
+        let p = analyze_cursor(&fixture("draft.txt"), None);
+        assert!(!p.idle && p.input_nonempty);
+        assert_eq!(p.reason, "unsubmitted text in the input line");
+    }
+
+    #[test]
+    fn markers_absent_mean_idle() {
+        // A bare frame with only the input line: no busy/approval
+        // evidence anywhere.
+        let p = analyze_cursor(
+            "  Cursor Agent\n  → Plan, search, build anything\n  Cursor Grok 4.6 High\n  /tmp/x · main\n",
+            None,
+        );
+        assert!(p.idle && !p.busy_marker && !p.approval_menu);
+    }
+
+    #[test]
+    fn spinner_words_without_a_glyph_still_block() {
+        // The status row above the input carries a spinner word + its
+        // token counter even when the glyph column is unreadable.
+        let p = analyze_cursor(
+            "transcript\n  Thinking  12 tokens\n  → Add a follow-up\n  Cursor Grok 4.6 High\n",
+            None,
+        );
+        assert!(!p.idle && p.busy_marker);
+        assert_eq!(p.reason, "tui is busy (status row above the input line)");
+    }
+
+    #[test]
+    fn queued_follow_up_box_is_busy_evidence() {
+        // The `┌─ follow-ups ─┐` box interior can become the row above
+        // the input — its title/footer are staged-queue evidence.
+        let p = analyze_cursor(
+            "work\n │ enter steer · ↑ select/edit · esc cancel │\n  → Add a follow-up\n",
+            None,
+        );
+        assert!(!p.idle && p.busy_marker);
+    }
+
+    #[test]
+    fn tip_rows_between_spinner_and_input_are_neutral() {
+        // A `Tip:` row sits between the busy status row and the input
+        // on real frames — skipping it must still find the spinner;
+        // without one the tip alone is documentation, never busy.
+        let busy = analyze_cursor(
+            " ⠠⠛ Running  43 tokens\n    Tip: Try Cursor Grok 4.6 via /model\n  → Add a follow-up\n",
+            None,
+        );
+        assert!(!busy.idle && busy.busy_marker, "{}", busy.reason);
+        let idle = analyze_cursor(
+            "  Tip: Use /skills to give Cursor specialized knowledge\n  → Plan, search, build anything\n",
+            None,
+        );
+        assert!(idle.idle && !idle.busy_marker, "{}", idle.reason);
+    }
+
+    #[test]
+    fn menu_options_are_not_prompt_drafts() {
+        // A menu's selected option leads with `→` like the input —
+        // generic menu chrome in the region reads as a menu, not as
+        // "unsubmitted text".
+        let p = analyze_cursor(
+            "  /skills\n   → + Create new skill\n   ↓ more below\n",
+            None,
+        );
+        assert!(!p.idle && p.approval_menu);
+        assert_eq!(p.reason, "approval menu is open");
+    }
+
+    fn profile(params: serde_json::Value) -> CursorProfile {
+        CursorProfile {
+            chats_dir: PathBuf::from("/nonexistent"),
+            command: "cursor-agent".to_string(),
+            model: params
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            permission_mode: params
+                .get("permission_mode")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn launch_argv_resume_and_flags() {
+        let p = profile(json!({"model": "grok-4", "permission_mode": "force"}));
+        assert_eq!(
+            p.launch_command(Some("chat-1")).unwrap(),
+            format!(
+                "{} --trust --model 'grok-4' --force --resume 'chat-1'",
+                p.command
+            )
+        );
+        let p = profile(json!({"permission_mode": "auto-review"}));
+        assert_eq!(
+            p.launch_command(Some("chat-2")).unwrap(),
+            format!("{} --trust --auto-review --resume 'chat-2'", p.command)
+        );
+        // An unset mode keeps cursor's own default — no flag emitted.
+        let p = profile(json!({}));
+        assert_eq!(
+            p.launch_command(Some("chat-3")).unwrap(),
+            format!("{} --trust --resume 'chat-3'", p.command)
+        );
+        // Values are shell-quoted even if hand-edited past validation.
+        let p = profile(json!({"permission_mode": "bogus; rm -rf /"}));
+        assert_eq!(
+            p.launch_command(Some("c'hat")).unwrap(),
+            format!("{} --trust --resume 'c'\\''hat'", p.command)
+        );
+    }
+
+    #[test]
+    fn ownership_proofs() {
+        // store.db fd proof: a process holding
+        // <chats>/<hash>/<chat>/store.db owns that chat.
+        let dir = tempfile::tempdir().unwrap();
+        let chats = dir.path().join("chats");
+        let db = chats.join("abc123").join("chat-9").join("store.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&db).unwrap();
+        let pid = std::process::id();
+        assert_eq!(
+            store_db_chat(&chats, pid).as_deref(),
+            Some("chat-9"),
+            "our own fd on store.db must prove chat-9"
+        );
+        drop(file);
+        // argv proof: only a cursor-agent argv[0] counts — our own
+        // test process's cmdline names no chat.
+        assert_eq!(argv_chat(pid), None);
+    }
+}

@@ -62,9 +62,15 @@ cadence claude --tui            # interactive Claude in an owned tmux pane —
                                 #  pty rules: ready-gated literal paste, explicit
                                 #  `message result` reporting, -r <session-id>
                                 #  resumes a native session
+cadence cursor                  # Cursor Agent TUI in an owned tmux pane —
+                                #  same pty rules; the chat id is minted via
+                                #  `cursor-agent create-chat`, -r <chat-id>
+                                #  resumes one (--model, --permission-mode
+                                #  auto-review|force / --bypass are stored
+                                #  and replayed on every launch)
 
 cadence join <pm-slug> devin    # spawn a worker wired to a group: results route to the PM
-                                #  (providers: devin, codex, claude, fake)
+                                #  (providers: devin, codex, claude, cursor, fake)
                                 #  (--worktree <name> isolates it in .cadence/wt/<name>
                                 #   on branch cadence/<name>; --no-bootstrap skips the
                                 #   briefing file + kickoff message — note a bootstrap

@@ -29,6 +29,12 @@ pub const DEFAULT_ENDPOINT_KIND: &str = "managed";
 /// value itself.
 pub const DEVIN_PERMISSION_MODES: &[&str] = &["auto", "accept-edits", "smart", "dangerous"];
 
+/// The modes `cursor --permission-mode` accepts — each maps to one
+/// `cursor-agent` flag (`--auto-review`, `--force`). `--bypass` is a
+/// launch shorthand that stores `force`; it is never a stored value
+/// itself.
+pub const CURSOR_PERMISSION_MODES: &[&str] = &["auto-review", "force"];
+
 /// How a live endpoint's native surface is attached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attach {
@@ -264,6 +270,38 @@ pub static SPECS: &[EndpointSpec] = &[
         internal: false,
     },
     EndpointSpec {
+        provider: "cursor",
+        endpoint_kind: "pty",
+        display: "Cursor (pty/tmux)",
+        has_actor: true,
+        attach: Attach::Tmux,
+        ready_gate: true,
+        screen_probe: true,
+        reports: Reporting::Explicit,
+        report_hint: Reporting::Explicit,
+        brokers_requests: false,
+        resumable: true,
+        resume_label: "cursor-agent --resume <session>",
+        live_settable_params: &["auto_ready", "stall_secs"],
+        launch_params: &[
+            "model",
+            "permission_mode",
+            "bypass",
+            "session",
+            "upstream",
+            "auto_ready",
+            "agents_md",
+            "stall_secs",
+        ],
+        session_id_label: "Cursor chat",
+        respond_rejection: None,
+        capabilities: &["pty_cursor_tmux", "pty_verified_autoready"],
+        doctor_caps: &["pty_cursor_tmux"],
+        probe_bins: &[("cursor-agent", &["--version"]), ("tmux", &["-V"])],
+        launch_default: true,
+        internal: false,
+    },
+    EndpointSpec {
         provider: "tui-stub",
         endpoint_kind: "pty",
         display: "Stub TUI (pty profile double)",
@@ -431,7 +469,7 @@ pub fn default_kind(provider: &str) -> Result<&'static str> {
         .map(|s| s.endpoint_kind)
         .ok_or_else(|| {
             Error::rejected(format!(
-                "Unknown provider '{provider}' — expected devin, codex, claude or fake"
+                "Unknown provider '{provider}' — expected devin, codex, claude, cursor or fake"
             ))
         })
 }
@@ -640,6 +678,19 @@ pub fn devin_permission_mode(mode: &str) -> Result<()> {
     }
 }
 
+/// Reject a Cursor permission mode outside its two-value vocabulary —
+/// each accepted value maps to one `cursor-agent` flag.
+pub fn cursor_permission_mode(mode: &str) -> Result<()> {
+    if CURSOR_PERMISSION_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        Err(Error::rejected(format!(
+            "unknown cursor permission mode '{mode}' — expected one of: {}",
+            CURSOR_PERMISSION_MODES.join(", ")
+        )))
+    }
+}
+
 /// `stall_secs` accepts an unsigned integer, a digit string (`agent
 /// set` values arrive as strings), or null — shared by the launch and
 /// live-set checks so both reject the same values.
@@ -688,6 +739,19 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
                     return Err(Error::rejected(format!(
                         "claude effort must be a string, one of: {}",
                         CLAUDE_EFFORTS.join(", ")
+                    )))
+                }
+            }
+        }
+    }
+    if provider == "cursor" && kind == "pty" {
+        if let Some(v) = params.get("permission_mode") {
+            match v.as_str() {
+                Some(mode) => cursor_permission_mode(mode)?,
+                None => {
+                    return Err(Error::rejected(format!(
+                        "cursor permission_mode must be a string, one of: {}",
+                        CURSOR_PERMISSION_MODES.join(", ")
                     )))
                 }
             }
@@ -783,6 +847,7 @@ mod tests {
             ("claude", "managed"),
             ("claude", "pty"),
             ("devin", "pty"),
+            ("cursor", "pty"),
             ("tui-stub", "pty"),
             ("fake", "fake"),
         ] {
@@ -807,7 +872,7 @@ mod tests {
     fn unknown_pairs_reject_with_supported_combos() {
         assert_eq!(
             spec("codex", "pty").unwrap_err().to_string(),
-            "No pty adapter for provider 'codex' (implemented: claude, devin)"
+            "No pty adapter for provider 'codex' (implemented: claude, devin, cursor)"
         );
         assert_eq!(
             spec("devin", "managed").unwrap_err().to_string(),
@@ -831,6 +896,7 @@ mod tests {
             "managed_claude_stream",
             "pty_claude_tmux",
             "pty_devin_tmux",
+            "pty_cursor_tmux",
             "pty_verified_autoready",
             "operator_reconcile",
             "inbox_endpoint",
@@ -842,7 +908,7 @@ mod tests {
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 15);
+        assert_eq!(caps.len(), 16);
     }
 
     #[test]
@@ -947,10 +1013,52 @@ mod tests {
     }
 
     #[test]
+    fn cursor_permission_modes_validated() {
+        for mode in CURSOR_PERMISSION_MODES {
+            assert!(cursor_permission_mode(mode).is_ok(), "{mode}");
+        }
+        // Everything else rejects — including devin's own vocabulary —
+        // and the error always lists the two accepted values.
+        for bad in ["auto", "smart", "dangerous", "bypass", "", "FORCE"] {
+            let msg = cursor_permission_mode(bad).unwrap_err().to_string();
+            for accepted in CURSOR_PERMISSION_MODES {
+                assert!(
+                    msg.contains(accepted),
+                    "'{bad}' error missing '{accepted}': {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_launch_params_validated_at_register() {
+        for mode in CURSOR_PERMISSION_MODES {
+            assert!(
+                validate_launch_params("cursor", "pty", &json!({"permission_mode": mode})).is_ok(),
+                "{mode}"
+            );
+        }
+        let msg = validate_launch_params("cursor", "pty", &json!({"permission_mode": "bogus"}))
+            .unwrap_err()
+            .to_string();
+        for accepted in CURSOR_PERMISSION_MODES {
+            assert!(msg.contains(accepted), "missing '{accepted}': {msg}");
+        }
+        // Non-string values reject too; unrelated keys pass through.
+        assert!(validate_launch_params("cursor", "pty", &json!({"permission_mode": 1})).is_err());
+        assert!(validate_launch_params(
+            "cursor",
+            "pty",
+            &json!({"session": "c", "model": "g", "upstream": "pm", "auto_ready": "verified"})
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn permission_mode_is_not_live_settable() {
         // Launch-only: `agent set` must refuse it — a live patch would
         // silently diverge the stored mode from the running pane.
-        for pair in [("devin", "pty"), ("claude", "managed")] {
+        for pair in [("devin", "pty"), ("claude", "managed"), ("cursor", "pty")] {
             let msg = validate_live_param(pair.0, pair.1, "permission_mode", &json!("smart"))
                 .unwrap_err()
                 .to_string();
