@@ -222,6 +222,36 @@ pub fn opts_present(state_dir: &Path) -> bool {
     opts_file(state_dir).is_file()
 }
 
+/// The persisted `ui start` options — `session start`'s board check
+/// reads the tailscale block and port from them. Missing file is the
+/// defaults.
+pub fn persisted_opts(state_dir: &Path) -> UiOpts {
+    load_opts(state_dir)
+}
+
+/// `/api/health` on the running board — `None` when nothing answers.
+pub fn health(state_dir: &Path) -> Option<(u16, String)> {
+    let port = load_opts(state_dir).port.unwrap_or(3010);
+    http_get(
+        "127.0.0.1",
+        port,
+        "/api/health",
+        &format!("127.0.0.1:{port}"),
+        &[],
+    )
+    .ok()
+}
+
+/// Does the live `tailscale serve` config map `target`? `None` when
+/// tailscale cannot answer (not installed, daemon down).
+pub fn serve_has_target(target: &str) -> Option<bool> {
+    let out = ts(&["serve", "status", "--json"]).ok()?;
+    if !out.status.success() {
+        return Some(false);
+    }
+    Some(String::from_utf8_lossy(&out.stdout).contains(target))
+}
+
 fn load_opts(state_dir: &Path) -> UiOpts {
     let Ok(bytes) = std::fs::read(opts_file(state_dir)) else {
         return UiOpts::default();

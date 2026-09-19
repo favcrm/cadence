@@ -42,6 +42,63 @@ pub fn briefing_path(state_dir: &Path, params: &Value, alias: &str) -> PathBuf {
         .join(format!("BRIEFING-{alias}.md"))
 }
 
+/// `cadence daemon start`: spawn `<this binary> --state-dir <dir>
+/// daemon run` detached (own session, output to `daemon.log`) and wait
+/// for the socket to answer. Reports `already_running` when the socket
+/// belonged to a pre-existing daemon — our child exited instead.
+pub fn daemon_start(state_dir: &Path) -> Result<Value> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::Instant;
+    let exe = std::env::current_exe()?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state_dir.join("daemon.log"))?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(["--state-dir"])
+        .arg(state_dir)
+        .args(["daemon", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    // Wait until the socket answers or the child exits.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match rpc(state_dir, "health", serde_json::json!({})) {
+            Ok(health) => {
+                // If our child already exited, the socket belongs to a
+                // pre-existing daemon — report that honestly.
+                if child.try_wait().ok().flatten().is_some() {
+                    return Ok(serde_json::json!({
+                        "state": "already_running",
+                        "socket": socket_path(state_dir),
+                        "health": health,
+                    }));
+                }
+                return Ok(serde_json::json!({
+                    "state": "started",
+                    "pid": child.id(),
+                    "socket": socket_path(state_dir),
+                    "health": health,
+                }));
+            }
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Send one request, return the result value or the wire error.
 pub fn rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
     let socket = socket_path(state_dir);

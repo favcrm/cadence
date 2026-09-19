@@ -861,6 +861,37 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
     })
 }
 
+// ---------- shared with `cadence session` ----------
+
+/// `session`'s reconcile/handoff share the gh fetch (and its cache)
+/// rather than re-running `gh pr list` — same slug set, same data.
+pub(crate) fn github_repos(
+    state_dir: &Path,
+    slugs: &[String],
+) -> (HashMap<String, Value>, Value) {
+    github(state_dir, slugs)
+}
+
+/// Drift of an arbitrary commit against the repo's default ref —
+/// `session start` measures the *binary* build this way.
+pub(crate) fn drift_of(repo: &Path, commit: &str) -> Value {
+    compute_drift(repo, commit)
+}
+
+/// Which tracker project owns the repo this binary was built from.
+pub(crate) fn build_repo_match_pub(projects: &[project::Project]) -> Option<(String, PathBuf)> {
+    build_repo_match(projects)
+}
+
+/// Verdict + checks on a PR rollup, for the session-end handoff.
+pub(crate) fn verdict_state_pub(rollup: &[Value]) -> Option<String> {
+    verdict_state(rollup)
+}
+
+pub(crate) fn checks_green_pub(rollup: &[Value]) -> bool {
+    checks_green(rollup)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
