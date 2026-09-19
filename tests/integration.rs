@@ -21,6 +21,7 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start() -> Self {
+        suite_slot();
         let dir = TempDir::new().unwrap();
         let state = dir.path().to_path_buf();
         std::fs::create_dir_all(&state).unwrap();
@@ -38,6 +39,7 @@ impl TestDaemon {
 
     /// Start a daemon over a pre-seeded state directory.
     fn start_on(state: PathBuf) -> Self {
+        suite_slot();
         let dir = TempDir::new().unwrap(); // keeps lifetime uniform
         let owned = state.clone();
         let opts = daemon_opts();
@@ -1170,6 +1172,8 @@ fn pty_shutdown_straggler_detaches_pane() {
         .trim()
         .parse()
         .unwrap();
+    // Real env, under MockDevin's ENV_LOCK: the mock tmux reads its hold
+    // knobs per call from the env it inherits from the daemon.
     std::env::set_var("MOCK_TMUX_HOLD", "4"); // > STOP_GRACE (3s)
     std::env::set_var("MOCK_TMUX_HOLD_FMT", "#{pane_dead}");
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
@@ -1408,6 +1412,15 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 thread_local! {
     static TEST_ENV: ProviderEnv = ProviderEnv::default();
+    static TEST_STALL_SAMPLE: std::sync::Arc<std::sync::atomic::AtomicU64> =
+        std::sync::Arc::default();
+}
+
+/// Shrink this test's stall screen-sample interval (0 = daemon default)
+/// — a per-daemon option, never `CADENCE_STALL_SAMPLE_SECS` in the
+/// shared process env, and live for daemons already running.
+fn stall_sample(secs: u64) {
+    TEST_STALL_SAMPLE.with(|s| s.store(secs, std::sync::atomic::Ordering::Relaxed));
 }
 
 /// This test's provider launch overrides (mock commands). Each test
@@ -1417,9 +1430,134 @@ fn test_env() -> ProviderEnv {
     TEST_ENV.with(ProviderEnv::clone)
 }
 
+/// Host-wide suite slot (CAD-71). With `CADENCE_SUITE_LOCK` set, an
+/// unfiltered run of this binary — the full suite — holds that
+/// exclusive `flock` for the process lifetime, so concurrent full
+/// suites on one host take turns instead of starving each other into
+/// load flakes. A filtered run (one test, one group) never queues. The
+/// first daemon a test starts acquires it; the kernel releases it at
+/// exit. The wait is bounded (`CADENCE_SUITE_LOCK_WAIT_SECS`, default
+/// 3600) and every test panics with the reason if it runs out.
+static SUITE_SLOT: std::sync::OnceLock<Result<Option<std::fs::File>, String>> =
+    std::sync::OnceLock::new();
+
+fn suite_slot() {
+    if let Err(msg) = SUITE_SLOT.get_or_init(acquire_suite_slot) {
+        panic!("{msg}");
+    }
+}
+
+/// libtest's positional arguments are test-name filters; these flags
+/// take a separate value that is not one.
+fn is_filtered_run() -> bool {
+    const VALUED: &[&str] = &[
+        "--test-threads",
+        "--skip",
+        "--logfile",
+        "--color",
+        "--format",
+        "--shuffle-seed",
+        "-Z",
+    ];
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if VALUED.contains(&a.as_str()) {
+            args.next();
+        } else if !a.starts_with('-') {
+            return true;
+        }
+    }
+    false
+}
+
+fn acquire_suite_slot() -> Result<Option<std::fs::File>, String> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    let Some(path) = std::env::var("CADENCE_SUITE_LOCK")
+        .ok()
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(None);
+    };
+    if is_filtered_run() {
+        return Ok(None);
+    }
+    let wait_secs: u64 = std::env::var("CADENCE_SUITE_LOCK_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    let path = PathBuf::from(path);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            format!(
+                "cannot create the directory of the host suite slot {} \
+                 (CADENCE_SUITE_LOCK): {e} — fix the path or unset the variable",
+                path.display()
+            )
+        })?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| {
+            format!(
+                "cannot open the host suite slot {} (CADENCE_SUITE_LOCK): {e} \
+                 — fix the path or unset the variable",
+                path.display()
+            )
+        })?;
+    let epoch = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    };
+    // Raw stderr, not eprintln!: libtest captures the macros per test,
+    // and the queueing must be visible while it happens.
+    let say = |msg: String| {
+        let _ = std::io::stderr().write_all(format!("{msg}\n").as_bytes());
+    };
+    let start = Instant::now();
+    let mut announced = false;
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            say(format!(
+                "suite slot {} acquired at epoch {} after {}s (pid {})",
+                path.display(),
+                epoch(),
+                start.elapsed().as_secs(),
+                std::process::id()
+            ));
+            return Ok(Some(file));
+        }
+        if !announced {
+            say(format!(
+                "suite slot {} busy — another full suite runs on this host; \
+                 waiting up to {wait_secs}s (epoch {})",
+                path.display(),
+                epoch()
+            ));
+            announced = true;
+        }
+        if start.elapsed() >= Duration::from_secs(wait_secs) {
+            return Err(format!(
+                "timed out after {wait_secs}s waiting for the host suite slot {} \
+                 (CADENCE_SUITE_LOCK) — another full suite still holds it; \
+                 unset the variable to run unserialized",
+                path.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
 fn daemon_opts() -> daemon::ServeOptions {
     daemon::ServeOptions {
         provider_env: test_env(),
+        stall_sample_secs: TEST_STALL_SAMPLE.with(std::sync::Arc::clone),
     }
 }
 
@@ -2734,6 +2872,8 @@ fn install_mock_devin(dir: &Path) -> MockDevin {
     // mock must be executable.
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Real env, under this mock's ENV_LOCK: the mock tmux runs as a fresh
+    // child per call and finds its state only through inherited env.
     std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
     test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
     test_env().set(
@@ -2920,6 +3060,8 @@ fn install_mock_stub(dir: &Path) -> MockStub {
     std::fs::write(&stub_py, MOCK_STUB_PY).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Real env, under this mock's ENV_LOCK: the mock tmux runs as a fresh
+    // child per call and finds its state only through inherited env.
     std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
     test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
     test_env().set(
@@ -3044,6 +3186,8 @@ fn install_mock_claude_tui(dir: &Path) -> MockClaudeTui {
     std::fs::write(&claude_py, MOCK_CLAUDE_TUI_PY).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Real env, under this mock's ENV_LOCK: the mock tmux runs as a fresh
+    // child per call and finds its state only through inherited env.
     std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
     test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
     test_env().set(
@@ -3210,6 +3354,8 @@ fn install_mock_cursor_tui(dir: &Path) -> MockCursorTui {
     let python = String::from_utf8(out.stdout).unwrap().trim().to_string();
     let cursor_bin = dir.join("cursor-agent");
     std::os::unix::fs::symlink(&python, &cursor_bin).unwrap();
+    // Real env, under this mock's ENV_LOCK: the mock tmux runs as a fresh
+    // child per call and finds its state only through inherited env.
     std::env::set_var("MOCK_TMUX_STATE", &tmux_state);
     test_env().set("CADENCE_TMUX_COMMAND", tmux.display().to_string());
     test_env().set(
@@ -9137,6 +9283,8 @@ fn pty_claude_foreign_session_refuses_takeover() {
 fn pty_claude_session_mismatch_fences_closed() {
     let d = TestDaemon::start();
     let _mock = d.mock_claude_tui();
+    // Real env, under the TUI mock's ENV_LOCK: the pane's mock process
+    // reads the swap knob from the env the daemon passes to tmux.
     std::env::set_var("MOCK_CLAUDE_SWAP", "1");
     d.register_claude_pty("cl", json!({"session": "want-session"}));
     let agent = d.wait_agent("cl", "attention", 20);
@@ -9683,6 +9831,8 @@ fn pty_cursor_malformed_cli_config_refuses_launch() {
 fn pty_cursor_session_mismatch_fences_closed() {
     let d = TestDaemon::start();
     let _mock = d.mock_cursor_tui();
+    // Real env, under the TUI mock's ENV_LOCK: the pane's mock process
+    // reads the swap knob from the env the daemon passes to tmux.
     std::env::set_var("MOCK_CURSOR_SWAP", "1");
     d.register_cursor_pty("cu", json!({"session": "want-chat"}));
     let agent = d.wait_agent("cu", "attention", 20);
@@ -11596,7 +11746,7 @@ fn register_fake_opts(d: &TestDaemon, alias: &str, params: Value) {
 fn pty_stall_static_screen_fires_once_and_notices() {
     let d = TestDaemon::start();
     let _mock = d.mock_stub();
-    std::env::set_var("CADENCE_STALL_SAMPLE_SECS", "2");
+    stall_sample(2);
     d.register_inbox("pm");
     d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 2}));
     d.wait_agent("w1", "idle", 20);
@@ -11659,7 +11809,7 @@ fn pty_stall_static_screen_fires_once_and_notices() {
     )
     .unwrap();
     d.wait_message("w1", "ms1", &["completed"], 10);
-    std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
+    stall_sample(0);
 }
 
 /// A stalled turn resumes on real screen motion and re-arms: a second
@@ -11669,7 +11819,7 @@ fn pty_stall_static_screen_fires_once_and_notices() {
 fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
     let d = TestDaemon::start();
     let mock = d.mock_stub();
-    std::env::set_var("CADENCE_STALL_SAMPLE_SECS", "2");
+    stall_sample(2);
     d.register_inbox("pm");
     d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 2}));
     d.wait_agent("w1", "idle", 20);
@@ -11726,7 +11876,7 @@ fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
         .filter(|m| m["body"].as_str().unwrap_or("").contains("active again"))
         .count();
     assert_eq!((stalls, resumes), (2, 1), "{notices:?}");
-    std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
+    stall_sample(0);
 }
 
 /// Screen activity is debounced: a hash seen for exactly one sample —
@@ -11739,7 +11889,7 @@ fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
 fn pty_stall_transient_sample_neither_resumes_nor_resets() {
     let d = TestDaemon::start();
     let mock = d.mock_stub();
-    std::env::set_var("CADENCE_STALL_SAMPLE_SECS", "1");
+    stall_sample(1);
     d.register_inbox("pm");
     d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 8}));
     d.wait_agent("w1", "idle", 20);
@@ -11829,7 +11979,7 @@ fn pty_stall_transient_sample_neither_resumes_nor_resets() {
     let e = d.wait_event("w1", "turn_resumed", 20);
     assert_eq!(e["payload"]["message"], "mtr", "{e}");
     wait_source(&d, "pm", "worker_notice", 2, 10);
-    std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
+    stall_sample(0);
 }
 
 /// A job kickoff's stall goes to the PM as a `job_event`, the event is
@@ -11838,7 +11988,7 @@ fn pty_stall_transient_sample_neither_resumes_nor_resets() {
 fn job_kickoff_stall_flags_task_and_notifies_pm() {
     let d = TestDaemon::start();
     let _mock = d.mock_stub();
-    std::env::set_var("CADENCE_STALL_SAMPLE_SECS", "2");
+    stall_sample(2);
     d.register_inbox("pm");
     d.register_stub("w1", json!({"upstream": "pm", "auto_ready": "verified"}));
     d.wait_agent("w1", "idle", 20);
@@ -11877,7 +12027,7 @@ fn job_kickoff_stall_flags_task_and_notifies_pm() {
     assert_eq!(task["stalled"], true, "{task}");
     assert!(task["silent_secs"].as_u64().unwrap_or(0) >= 3, "{task}");
     assert_eq!(d.task_state("j1-t1"), "running");
-    std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
+    stall_sample(0);
 }
 
 /// The managed path (the fake's `SLEEP` is the managed mock) stalls on
@@ -11982,7 +12132,7 @@ fn stall_secs_zero_disables_and_live_set_rearms() {
 fn pty_stall_sampling_stops_when_nothing_runs() {
     let d = TestDaemon::start();
     let mock = d.mock_stub();
-    std::env::set_var("CADENCE_STALL_SAMPLE_SECS", "1");
+    stall_sample(1);
     // A high budget keeps this test out of stall semantics entirely —
     // it only measures the sampling clock.
     d.register_stub("w1", json!({"auto_ready": "verified", "stall_secs": 600}));
@@ -12032,7 +12182,7 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
         idle_count,
         "capture-pane ran while nothing was running"
     );
-    std::env::remove_var("CADENCE_STALL_SAMPLE_SECS");
+    stall_sample(0);
 }
 
 // ---- CAD-55: `cadence dispatch` + `cadence issue finish` against a live daemon ----

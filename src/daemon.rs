@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -76,16 +76,22 @@ const DEFAULT_STALL_SECS: u64 = 1800;
 /// bound is one capture per running pty agent per minute.
 const SCREEN_SAMPLE: Duration = Duration::from_secs(60);
 
-/// Screen sampling interval — tests shrink it through env, the way
-/// `MOCK_TMUX_HOLD` shrinks probe latency; production keeps the
-/// kickoff's one-minute bound.
-fn screen_sample() -> Duration {
-    std::env::var("CADENCE_STALL_SAMPLE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(SCREEN_SAMPLE)
+/// Screen sampling interval: this daemon's `ServeOptions` value when
+/// set (tests shrink it per daemon), else `CADENCE_STALL_SAMPLE_SECS`,
+/// else the kickoff's one-minute bound.
+fn screen_sample(own: &AtomicU64) -> Duration {
+    let secs = match own.load(Ordering::Relaxed) {
+        0 => std::env::var("CADENCE_STALL_SAMPLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0),
+        n => n,
+    };
+    if secs > 0 {
+        Duration::from_secs(secs)
+    } else {
+        SCREEN_SAMPLE
+    }
 }
 
 /// Unix epoch seconds — for `last_activity` in stall events.
@@ -247,10 +253,12 @@ pub struct Shared {
     /// Unix epoch seconds when this daemon process came up — the
     /// `started_at` half of `daemon_info`'s build/uptime report.
     started_at: f64,
+    /// Stall screen-sample seconds for this daemon (0 = unset).
+    stall_sample_secs: Arc<AtomicU64>,
 }
 
 impl Shared {
-    pub fn new(state_dir: &Path, provider_env: ProviderEnv) -> Result<Arc<Self>> {
+    pub fn new(state_dir: &Path, opts: &ServeOptions) -> Result<Arc<Self>> {
         let store = Store::open(&state_dir.join("cadence.sqlite3"))?;
         let provider_log_dir = state_dir.join("agents");
         std::fs::create_dir_all(&provider_log_dir)?;
@@ -264,8 +272,9 @@ impl Shared {
             provider_log_dir,
             state_dir: state_dir.to_path_buf(),
             open_attach: Mutex::new(HashMap::new()),
-            provider_env,
+            provider_env: opts.provider_env.clone(),
             started_at: epoch_secs(),
+            stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
         }))
     }
 
@@ -2569,7 +2578,9 @@ impl Shared {
                 }
                 w.sample_at = Some(Instant::now());
             }
-            if w.sample_rx.is_none() && w.sample_at.is_none_or(|at| at.elapsed() >= screen_sample())
+            if w.sample_rx.is_none()
+                && w.sample_at
+                    .is_none_or(|at| at.elapsed() >= screen_sample(&self.stall_sample_secs))
             {
                 if let Some(ad) = ad {
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -2935,6 +2946,10 @@ pub struct ServeOptions {
     /// Provider launch overrides (`CADENCE_CLAUDE_COMMAND`, …) for this
     /// daemon only; unset names fall back to the environment.
     pub provider_env: ProviderEnv,
+    /// Stall screen-sample interval in seconds for this daemon; 0 falls
+    /// back to `CADENCE_STALL_SAMPLE_SECS`, then one minute. Shared so
+    /// an in-process test can shrink it after start.
+    pub stall_sample_secs: Arc<AtomicU64>,
 }
 
 /// Run the daemon in the foreground until `shutdown` or a signal.
@@ -2947,7 +2962,7 @@ pub fn serve(state_dir: &Path) -> Result<()> {
 pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
     let _singleton = acquire_singleton(state_dir)?;
-    let shared = Shared::new(state_dir, opts.provider_env)?;
+    let shared = Shared::new(state_dir, &opts)?;
     let socket_path = state_dir.join("cadence.sock");
     if socket_path.exists() {
         // Safe while the singleton is held: no live owner can exist.
@@ -3050,7 +3065,7 @@ mod tests {
 
     fn shared() -> (tempfile::TempDir, Arc<Shared>) {
         let dir = tempfile::tempdir().unwrap();
-        let shared = Shared::new(dir.path(), ProviderEnv::default()).unwrap();
+        let shared = Shared::new(dir.path(), &ServeOptions::default()).unwrap();
         (dir, shared)
     }
 
