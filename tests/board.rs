@@ -3641,6 +3641,248 @@ fn issue_finish_dirty_and_unmerged_refusals() {
     assert_eq!(commits(&pm), before + 1);
 }
 
+/// Drop the recorded owner (and commit the edit) so `issue finish`
+/// skips the daemon-owner check entirely — board tests run with no
+/// daemon, and an owner would make finish refuse "unreachable".
+fn strip_owner(pm: &Path, id: &str) {
+    let md = pm.join(format!("demo/{id}/issue.md"));
+    let front = std::fs::read_to_string(&md).unwrap();
+    std::fs::write(&md, front.replace("owner: operator\n", "")).unwrap();
+    git(pm, &["add", "-A"]);
+    git(
+        pm,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "strip owner",
+        ],
+    );
+}
+
+/// CAD-64: a branch is "merged" when its work is on the default
+/// branch however it got there — a squash merge (combined patch) or
+/// cherry-picked commits both count, while an extra unmerged commit
+/// still refuses. Ignored paths (the ui/node_modules build symlink)
+/// never count as dirty; real untracked files do and are listed.
+#[test]
+fn issue_finish_squash_cherry_and_ignored() {
+    let (_tmp, pm, state, repo) = start_fx();
+    // The build-symlink rule lives in the repo's .gitignore, like the
+    // real cadence repo.
+    std::fs::write(repo.join(".gitignore"), "/ui/node_modules\n").unwrap();
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-qm", "ignore rules"]);
+
+    // D-1: two branch commits squash-merged into one → "patch".
+    assert!(cli(&pm, &state, &["issue", "new", "Sq", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-1"]).0);
+    let wt = repo.join(".cadence/wt/d-1-sq");
+    // Newline-terminated, multi-line, one file edited twice — the
+    // shape of real code, whose diff ends in a newline.
+    std::fs::write(wt.join("a.txt"), "1\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "part a"]);
+    std::fs::write(wt.join("a.txt"), "1\n2\n").unwrap();
+    std::fs::write(wt.join("b.txt"), "b1\nb2\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "part b"]);
+    git(&repo, &["merge", "--squash", "-q", "cadence/d-1-sq"]);
+    git(&repo, &["commit", "-qm", "D-1: sq (#1)"]);
+    strip_owner(&pm, "D-1");
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["finished"], true);
+    assert_eq!(out["merged_by"], "patch", "{out}");
+    assert_eq!(out["overrode"], json!([]));
+    assert!(!wt.exists());
+
+    // D-2: the single branch commit cherry-picked onto main →
+    // "cherry" (patch-equivalent, different sha).
+    assert!(cli(&pm, &state, &["issue", "new", "Ch", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-2"]).0);
+    let wt = repo.join(".cadence/wt/d-2-ch");
+    std::fs::write(wt.join("c.txt"), "c1\nc2\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "cherry work"]);
+    // -x records the source sha in the message — a different commit
+    // object with the same patch-id, like a real cherry-pick merge.
+    git(&repo, &["cherry-pick", "-x", "cadence/d-2-ch"]);
+    strip_owner(&pm, "D-2");
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-2"]);
+    assert!(ok && out["merged_by"] == "cherry", "{out}");
+
+    // D-3: squash-merged, then an extra commit only on the branch —
+    // the work isn't all upstream, so finish still refuses.
+    assert!(cli(&pm, &state, &["issue", "new", "Ex", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-3"]).0);
+    let wt = repo.join(".cadence/wt/d-3-ex");
+    std::fs::write(wt.join("d.txt"), "d1\nd2\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "part d"]);
+    git(&repo, &["merge", "--squash", "-q", "cadence/d-3-ex"]);
+    git(&repo, &["commit", "-qm", "D-3 part (#3)"]);
+    std::fs::write(wt.join("late.txt"), "late\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "unmerged late work"]);
+    strip_owner(&pm, "D-3");
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-3"]);
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains("neither merged"),
+        "{err}"
+    );
+    assert!(wt.is_dir());
+    git(&repo, &["branch", "-D", "cadence/d-3-ex"]);
+    let wts = wt.display().to_string();
+    git(&repo, &["worktree", "remove", "--force", &wts]);
+
+    // D-4: the ui/node_modules build symlink alone is ignored (`!!`)
+    // and never blocks — the branch tip is main's, so "ancestry".
+    assert!(cli(&pm, &state, &["issue", "new", "Sy", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-4"]).0);
+    let wt = repo.join(".cadence/wt/d-4-sy");
+    std::fs::create_dir_all(wt.join("ui")).unwrap();
+    std::fs::create_dir_all(wt.join("real_nm")).unwrap();
+    std::os::unix::fs::symlink("../real_nm", wt.join("ui/node_modules")).unwrap();
+    let status = git(&wt, &["status", "--porcelain", "--ignored"]).1;
+    assert!(status.contains("!!"), "{status}");
+    strip_owner(&pm, "D-4");
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-4"]);
+    assert!(ok && out["finished"] == true, "{out}");
+    assert_eq!(out["merged_by"], "ancestry");
+    assert!(!wt.exists());
+
+    // D-5: a real untracked file still refuses and is listed — while
+    // the ignored symlink alongside it is not.
+    assert!(cli(&pm, &state, &["issue", "new", "Re", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-5"]).0);
+    let wt = repo.join(".cadence/wt/d-5-re");
+    std::fs::create_dir_all(wt.join("ui")).unwrap();
+    std::fs::create_dir_all(wt.join("real_nm")).unwrap();
+    std::os::unix::fs::symlink("../real_nm", wt.join("ui/node_modules")).unwrap();
+    std::fs::write(wt.join("real.txt"), "x").unwrap();
+    strip_owner(&pm, "D-5");
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-5"]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(msg.contains("real.txt"), "{msg}");
+    assert!(
+        !msg.contains("node_modules") && !msg.contains("!!"),
+        "{msg}"
+    );
+    assert!(wt.is_dir());
+    std::fs::remove_file(wt.join("real.txt")).unwrap();
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-5"]);
+    assert!(ok && out["finished"] == true, "{out}");
+
+    // D-6 / D-7: two-commit squashes of a binary file and of a file
+    // with no trailing newline — both diff shapes still apply → "patch".
+    for (id, name, first, second) in [
+        (
+            "D-6",
+            "Bi",
+            &b"\x00\x01\xff\n\x00"[..],
+            &b"\x00\x02\xfe\x00"[..],
+        ),
+        ("D-7", "Nn", &b"x\ny"[..], &b"x\ny\nz"[..]),
+    ] {
+        assert!(cli(&pm, &state, &["issue", "new", name, "--project", "demo"]).0);
+        assert!(cli(&pm, &state, &["issue", "start", id]).0);
+        let branch = format!("cadence/{}-{}", id.to_lowercase(), name.to_lowercase());
+        let wt = repo.join(format!(
+            ".cadence/wt/{}-{}",
+            id.to_lowercase(),
+            name.to_lowercase()
+        ));
+        std::fs::write(wt.join("f.bin"), first).unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "first"]);
+        std::fs::write(wt.join("f.bin"), second).unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "second"]);
+        git(&repo, &["merge", "--squash", "-q", &branch]);
+        git(&repo, &["commit", "-qm", &format!("{id}: squash")]);
+        strip_owner(&pm, id);
+        let (ok, out) = cli(&pm, &state, &["issue", "finish", id]);
+        assert!(ok, "{id}: {out}");
+        assert_eq!(out["merged_by"], "patch", "{id}: {out}");
+        assert!(!wt.exists(), "{id}");
+    }
+}
+
+/// CAD-64: with a GitHub origin and `gh` on PATH, a merged PR with
+/// the branch as head counts as merged (`merged_by: "pr"`); a `gh`
+/// that reports nothing merged leaves the branch refused.
+#[test]
+fn issue_finish_pr_merge_via_gh() {
+    let (_tmp, pm, state, repo) = start_fx();
+    git(
+        &repo,
+        &["remote", "add", "origin", "https://github.com/o/r.git"],
+    );
+    // Fake gh — controlled JSON on stdout, ignores its arguments.
+    let fakebin = _tmp.path().join("fakebin");
+    std::fs::create_dir_all(&fakebin).unwrap();
+    let gh = fakebin.join("gh");
+    let set_gh = |body: &str| {
+        std::fs::write(&gh, format!("#!/bin/sh\nprintf '%s' '{body}'\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let path = format!(
+        "{}:{}:{}",
+        fakebin.display(),
+        Path::new(bin()).parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // D-1: branch commits not on main, nothing pushed — but gh says
+    // a PR with this head is MERGED → finished, merged_by "pr".
+    assert!(cli(&pm, &state, &["issue", "new", "Pr", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-1"]).0);
+    let wt = repo.join(".cadence/wt/d-1-pr");
+    std::fs::write(wt.join("p.txt"), "p").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "pr work"]);
+    strip_owner(&pm, "D-1");
+    set_gh("[{\"number\":7}]");
+    let (ok, out) = cli_env(
+        &pm,
+        &state,
+        &["issue", "finish", "D-1"],
+        &[("PATH", path.as_str())],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["merged_by"], "pr", "{out}");
+    assert!(!wt.exists());
+
+    // D-2: gh reports nothing merged → the branch is still refused.
+    assert!(cli(&pm, &state, &["issue", "new", "No", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-2"]).0);
+    let wt = repo.join(".cadence/wt/d-2-no");
+    std::fs::write(wt.join("n.txt"), "n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "unmerged"]);
+    strip_owner(&pm, "D-2");
+    set_gh("[]");
+    let (ok, err) = cli_env(
+        &pm,
+        &state,
+        &["issue", "finish", "D-2"],
+        &[("PATH", path.as_str())],
+    );
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains("neither merged"),
+        "{err}"
+    );
+    assert!(wt.is_dir());
+}
+
 /// Dispatch pre-flight refuses before anything is created: no return
 /// address, an unreadable note, or an unreachable daemon each leave
 /// no worktree, branch or tracker commit behind.

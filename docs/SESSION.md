@@ -193,9 +193,10 @@ In this order:
    rebuild before using a newly merged tracker feature on the live
    tracker.
 2. Close the issue with the merge commit in a comment.
-3. Remove the worker's worktree **only when its pane probes idle**
-   (`cadence agent probe <alias>`). A worker that is still watching CI
-   keeps running commands in that directory.
+3. Clean up the lane: `cadence issue finish <ID> --remote` removes
+   the worktree and the local+remote branches — and refuses while
+   the owner is busy, the tree is dirty, or the branch is neither
+   merged nor pushed, so it is safe by default.
 4. Restart the daemon when every pane is idle. `cadence daemon stop`,
    wait for the process to exit, `cadence daemon start`, then
    `cadence ui stop && cadence ui start`. Panes survive a restart and

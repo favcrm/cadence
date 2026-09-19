@@ -304,11 +304,18 @@ worktree+branch pair. It refuses, naming what it found, while:
 
 - the issue's `owner` agent has a queued/running message or a pty pane
   that probes busy (the daemon must be reachable — it refuses rather
-  than guesses),
-- the worktree has uncommitted changes (the refusal lists them), or
-- the branch is neither merged into the repo's default branch
-  (`origin/HEAD`, else the checkout's current branch) nor pushed to a
-  remote-tracking ref.
+  than guesses; an `inbox` owner is a durable mailbox, never busy),
+- the worktree has uncommitted changes — ignored paths like the
+  `ui/node_modules` build symlink don't count (the refusal lists what
+  does), or
+- the branch's work survives nowhere: not merged into the repo's
+  default branch (`origin/HEAD`, else the checkout's current branch)
+  and not pushed to a remote-tracking ref. "Merged" recognizes
+  however the work landed — ancestry, `git cherry` patch-equivalence
+  (rebase/cherry-pick), the branch's combined diff reverse-applying
+  onto the default tree (a squash merge, checked in a temporary index
+  so no worktree is touched), or a merged GitHub PR naming the head
+  branch. The output's `merged_by` reports which rule matched.
 
 Then it runs `git worktree remove`, deletes the local branch (with
 `--remote` the remote one too), and lands one tracker commit

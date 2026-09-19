@@ -1,24 +1,62 @@
 //! `cadence issue finish <ID>` — remove an issue's recorded worktree
 //! and branch once the work has landed. Three guards make the unsafe
-//! cleanup impossible by default: a busy owner agent (running message
-//! or a pty pane that probes busy), a dirty worktree, and a branch
-//! whose work survives nowhere (unmerged into the repo's default
-//! branch AND unpushed). `--force` overrides each and is recorded as
-//! a `Forced:` trailer on the finish commit. Refs are kept as
+//! cleanup impossible by default: a busy owner agent (live message or
+//! a pty pane that probes busy — an `inbox` owner is a mailbox, never
+//! busy), a dirty worktree (ignored paths don't count), and a branch
+//! whose work survives nowhere — merged into the repo's default
+//! branch by ancestry, patch-equivalent commits, a squash merge, or
+//! a merged PR, or pushed. `--force` overrides each and is recorded
+//! as a `Forced:` trailer on the finish commit. Refs are kept as
 //! history, marked `closed: true`; the issue's status is untouched —
 //! status follows the job or the PM.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use tempfile::TempDir;
 
 use crate::client;
 use crate::error::{Error, Result};
-use crate::issue::{git, project, write, Pm};
+use crate::issue::{project, write, Pm};
+use crate::proc::{run_bounded, BoundedError};
 
 /// Message states that mean the owner is or will be working — a
 /// queued kickoff points at the worktree even before it starts.
 const LIVE_MESSAGE_STATES: &[&str] = &["queued", "submitting", "running"];
+
+/// Every git/gh probe in this file runs through the bounded runner —
+/// user repos can be slow or locked and finish must not stall.
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `git -C dir <args>`; non-zero exit is a rejected error carrying
+/// stderr, like `issue::git`.
+fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = git_out(dir, args, &[])?;
+    if !out.status.success() {
+        return Err(Error::rejected(format!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Raw bounded git output for probes that need stdout on any exit.
+fn git_out(dir: &Path, args: &[&str], env: &[(&str, &Path)]) -> Result<Output> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    run_bounded(&mut cmd, GIT_TIMEOUT).map_err(|e| match e {
+        BoundedError::Spawn(_) => Error::rejected("`git` is required and was not found on PATH"),
+        e => Error::rejected(format!("git {} in {}: {e}", args.join(" "), dir.display())),
+    })
+}
 
 /// The repo's default ref for merge checks: `origin/HEAD` when set,
 /// else the main checkout's current branch.
@@ -34,6 +72,109 @@ fn default_ref(root: &Path) -> Option<String> {
 
 fn ancestor(root: &Path, branch: &str, into: &str) -> bool {
     git(root, &["merge-base", "--is-ancestor", branch, into]).is_ok()
+}
+
+/// Why `branch` counts as merged into `into`, checked in order:
+/// plain ancestry; every branch commit already applied upstream
+/// (`git cherry` — the rebase/cherry-pick case); the branch's whole
+/// diff reverse-applying onto `into` (a squash merge); or a merged
+/// GitHub PR naming this head branch. The first match wins and is
+/// reported as `merged_by`.
+fn merge_rule(root: &Path, branch: &str, into: &str) -> Option<&'static str> {
+    if ancestor(root, branch, into) {
+        return Some("ancestry");
+    }
+    // `+` = a commit with no patch-equivalent upstream; a listing
+    // with none means everything on the branch already landed.
+    if let Ok(marks) = git(root, &["cherry", into, branch]) {
+        if !marks.lines().any(|l| l.starts_with('+')) {
+            return Some("cherry");
+        }
+    }
+    if patch_applied(root, branch, into) {
+        return Some("patch");
+    }
+    if pr_merged(root, branch) {
+        return Some("pr");
+    }
+    None
+}
+
+/// Squash-merge test: if the branch's combined diff against its
+/// merge-base reverse-applies cleanly onto `into`'s tree, `into`
+/// already holds that state. Runs against a temporary index — no
+/// worktree is ever touched.
+fn patch_applied(root: &Path, branch: &str, into: &str) -> bool {
+    let Ok(base) = git(root, &["merge-base", into, branch]) else {
+        return false;
+    };
+    // Raw stdout bytes, not `git()`'s trimmed string — `git apply`
+    // rejects a patch whose final newline was stripped as corrupt.
+    let diff = match git_out(root, &["diff", "--binary", &base, branch], &[]) {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return false,
+    };
+    // An empty diff means the branch contributes nothing — deleting
+    // it loses no work.
+    if diff.is_empty() {
+        return true;
+    }
+    let Ok(tmp) = TempDir::new() else {
+        return false;
+    };
+    let index = tmp.path().join("index");
+    let env = [("GIT_INDEX_FILE", index.as_path())];
+    // git_out is Ok on any exit status — the check is the exit code.
+    let seeded = git_out(root, &["read-tree", into], &env)
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !seeded {
+        return false;
+    }
+    let patch = tmp.path().join("patch");
+    if std::fs::write(&patch, &diff).is_err() {
+        return false;
+    }
+    git_out(
+        root,
+        &[
+            "apply",
+            "--check",
+            "-R",
+            "--cached",
+            patch.to_str().unwrap(),
+        ],
+        &env,
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
+/// A merged GitHub PR with this head branch counts as merged — but
+/// only when the repo actually has a GitHub origin and `gh` answers.
+/// Any failure falls through: gh is a hint, never the only authority.
+fn pr_merged(root: &Path, branch: &str) -> bool {
+    let Ok(url) = git(root, &["remote", "get-url", "origin"]) else {
+        return false;
+    };
+    if !url.contains("github.com") {
+        return false;
+    }
+    let mut cmd = Command::new("gh");
+    cmd.args([
+        "pr", "list", "--head", branch, "--state", "merged", "--json", "number", "--limit", "1",
+    ])
+    .current_dir(root);
+    let Ok(out) = run_bounded(&mut cmd, Duration::from_secs(10)) else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&out.stdout)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+        .unwrap_or(false)
 }
 
 /// Refuse while the owner has a live message or a pty pane probing
@@ -63,6 +204,13 @@ fn check_owner_idle(
             )));
         }
     };
+    // An inbox is a durable mailbox, not an actor — nothing it owns
+    // can be touching the worktree, so queued messages there never
+    // block. The daemon lookup above still runs: kind is only known
+    // once the daemon answers.
+    if show["agent"]["endpoint_kind"].as_str() == Some("inbox") {
+        return Ok(());
+    }
     if let Some(msg) = show["messages"].as_array().and_then(|ms| {
         ms.iter()
             .find(|m| LIVE_MESSAGE_STATES.contains(&m["state"].as_str().unwrap_or_default()))
@@ -203,10 +351,13 @@ pub fn run(
         check_owner_idle(state_dir, &owner, force, &mut overridden)?;
     }
 
-    // 2. Dirty worktree — list the dirty paths. A status that cannot
-    //    be read refuses too: an unreadable tree is not a clean one.
+    // 2. Dirty worktree — `--ignored` marks ignored paths `!!` so a
+    //    build artifact (like the ui/node_modules symlink) never
+    //    blocks; only real changes and non-ignored untracked files do.
+    //    A status that cannot be read refuses too: an unreadable tree
+    //    is not a clean one.
     if let Some(d) = wt_dir.as_deref().filter(|d| d.is_dir()) {
-        match git(d, &["status", "--porcelain"]) {
+        match git(d, &["status", "--porcelain", "--ignored"]) {
             Err(e) if force => overridden.push(format!("dirty-check-failed: {e}")),
             Err(e) => {
                 return Err(Error::rejected(format!(
@@ -215,25 +366,30 @@ pub fn run(
                     d.display()
                 )))
             }
-            Ok(dirty) if !dirty.is_empty() => {
-                if force {
-                    overridden.push("dirty-worktree".to_string());
-                } else {
-                    let list: Vec<&str> = dirty.lines().take(10).collect();
-                    return Err(Error::rejected(format!(
-                        "Worktree {} has uncommitted changes:\n  {}\nCommit, \
-                         stash or pass --force",
-                        d.display(),
-                        list.join("\n  ")
-                    )));
+            Ok(status) => {
+                let dirty: Vec<&str> = status.lines().filter(|l| !l.starts_with("!!")).collect();
+                if !dirty.is_empty() {
+                    if force {
+                        overridden.push("dirty-worktree".to_string());
+                    } else {
+                        let list: Vec<&str> = dirty.iter().take(10).copied().collect();
+                        return Err(Error::rejected(format!(
+                            "Worktree {} has uncommitted changes:\n  {}\nCommit, \
+                             stash or pass --force",
+                            d.display(),
+                            list.join("\n  ")
+                        )));
+                    }
                 }
             }
-            Ok(_) => {}
         }
     }
 
-    // 3. Survivability: refuse when the branch is neither merged into
-    //    the repo's default branch nor pushed — the work would be lost.
+    // 3. Survivability: refuse when the branch's work survives nowhere
+    //    — not merged into the repo's default branch (by ancestry,
+    //    patch-equivalent commits, a squash merge, or a merged PR) and
+    //    not pushed.
+    let mut merged_by = Value::Null;
     if !branch.is_empty() {
         let branch_exists = git(
             &root,
@@ -246,11 +402,15 @@ pub fn run(
         )
         .is_ok();
         if branch_exists {
-            let merged = default_ref(&root).is_some_and(|d| ancestor(&root, &branch, &d));
+            if let Some(default) = default_ref(&root) {
+                if let Some(how) = merge_rule(&root, &branch, &default) {
+                    merged_by = json!(how);
+                }
+            }
             let remote_ref = format!("refs/remotes/origin/{branch}");
             let pushed = git(&root, &["rev-parse", "--verify", "--quiet", &remote_ref]).is_ok()
                 && ancestor(&root, &branch, &format!("origin/{branch}"));
-            if !merged && !pushed {
+            if merged_by.is_null() && !pushed {
                 if force {
                     overridden.push("unmerged-unpushed".to_string());
                 } else {
@@ -340,6 +500,7 @@ pub fn run(
         "remote_note": remote_note,
         "forced": force,
         "overrode": overridden,
+        "merged_by": merged_by,
         "status": front.status,
     }))
 }
