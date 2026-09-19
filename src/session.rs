@@ -137,11 +137,16 @@ fn host_row(name: &'static str, report: &Value) -> Row {
         _ => Sev::Ok,
     };
     let checks = report["checks"].as_array().cloned().unwrap_or_default();
-    let mut worst_detail = String::new();
-    let mut worst_remedy = None;
-    for c in &checks {
-        let cl = c["level"].as_str().unwrap_or("ok");
-        if cl == "ok" {
+    let bad: Vec<&Value> = checks
+        .iter()
+        .filter(|c| c["level"].as_str().unwrap_or("ok") != "ok")
+        .collect();
+    let head = bad
+        .iter()
+        .position(|c| c["level"].as_str() == Some("fail"))
+        .unwrap_or(0);
+    for (i, c) in bad.iter().enumerate() {
+        if i == head {
             continue;
         }
         let cname = c["name"].as_str().unwrap_or("?");
@@ -152,22 +157,19 @@ fn host_row(name: &'static str, report: &Value) -> Row {
         } else {
             format!("{cname}: {detail} — {remedy}")
         });
-        if worst_detail.is_empty() || (cl == "fail" && level == Sev::Fail) {
-            worst_detail = format!("{cname}: {detail}");
-            worst_remedy = if remedy.is_empty() {
-                None
-            } else {
-                Some(remedy.to_string())
-            };
-        }
     }
     row.sev = level;
-    row.detail = if worst_detail.is_empty() {
-        "host clean".to_string()
+    if let Some(c) = bad.get(head) {
+        let cname = c["name"].as_str().unwrap_or("?");
+        let detail = c["detail"].as_str().unwrap_or_default();
+        let remedy = c["remedy"].as_str().unwrap_or_default();
+        row.detail = format!("{cname}: {detail}");
+        if !remedy.is_empty() {
+            row.remedy = Some(remedy.to_string());
+        }
     } else {
-        worst_detail
-    };
-    row.remedy = worst_remedy;
+        row.detail = "host clean".to_string();
+    }
     row
 }
 
