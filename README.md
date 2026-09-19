@@ -128,6 +128,14 @@ cadence daemon restart          # stop (waits for exit), start, wait for live
                                 #   --timeout <secs>, --ui bounces the UI)
 cadence daemon stop             # shutdown + wait for the process to release
                                 #  the state-dir lock — `stop && start` is safe
+
+cadence review <PR>             # the reviewer's mechanical routine: detached
+                                #  checkout (merge result when the base moved),
+                                #  gates from cadence-review.toml, new-test
+                                #  stress, one full suite, equal-conditions
+                                #  compare — a Markdown+JSON report under the
+                                #  state dir (--no-full, --stress N, --keep,
+                                #  --json; never posts, merges or pushes)
 ```
 
 The **board** tracks issues as folders of Markdown files under `~/pm`
