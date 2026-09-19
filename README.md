@@ -147,6 +147,13 @@ cadence review <PR>             # the reviewer's mechanical routine: detached
                                 #  compare — a Markdown+JSON report under the
                                 #  state dir (--no-full, --stress N, --keep,
                                 #  --json; never posts, merges or pushes)
+
+cadence doctor --host           # read-only host watchdog: disk free, provider
+                                #  store/WAL growth, per-user pipe pressure,
+                                #  orphaned processes from deleted worktrees,
+                                #  leaked temp dirs, stale worktrees — each
+                                #  finding carries its remedy; exit 0/1/2
+                                #  (--json for machines; pm.yaml [host] tunes)
 ```
 
 The **board** tracks issues as folders of Markdown files under `~/pm`

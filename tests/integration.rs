@@ -14547,3 +14547,60 @@ fn overview_drift_reports_commits_after_build() {
         .expect("drift row");
     assert_eq!(row["command"], "cadence daemon restart --when-idle --ui");
 }
+
+/// `doctor --host --json` on the real host: one object, six named
+/// checks, each ok|warn|fail, exit code the worst level. What the host
+/// measures is its own business — this only proves the surface runs
+/// and reports honestly, never which level comes back.
+#[test]
+fn doctor_host_json_reports_six_checks() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    let home = dir.path().join("home");
+    let cwd = dir.path().join("nowhere");
+    for d in [&state, &home, &cwd] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["doctor", "--host", "--json"])
+        .env("HOME", &home)
+        .env("CADENCE_PM_DIR", home.join("pm"))
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|_| panic!("doctor --host --json printed no JSON: {out:?}"));
+    let names: Vec<&str> = report["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "disk",
+            "provider-state",
+            "pipes",
+            "orphans",
+            "temp-dirs",
+            "worktrees"
+        ]
+    );
+    for c in report["checks"].as_array().unwrap() {
+        assert!(matches!(c["level"].as_str(), Some("ok" | "warn" | "fail")));
+        for k in ["value", "threshold", "detail", "remedy"] {
+            assert!(c.get(k).is_some(), "check missing {k}: {c}");
+        }
+    }
+    let worst = report["level"].as_str().unwrap();
+    let expect = match worst {
+        "fail" => 2,
+        "warn" => 1,
+        _ => 0,
+    };
+    assert_eq!(code, expect, "level {worst} should exit {expect}");
+}
