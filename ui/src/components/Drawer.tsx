@@ -897,6 +897,14 @@ export default function Drawer({
                         <span className="text-secondary text-ink-300 truncate min-w-0">
                           {c.subject}
                         </span>
+                        {c.on_default === false && (
+                          <span
+                            className="chip bg-ink-800 text-ink-400 shrink-0"
+                            title="Not on the default branch"
+                          >
+                            branch
+                          </span>
+                        )}
                         <span className="text-micro text-ink-500 shrink-0 truncate max-w-[8rem]">
                           {c.repo}
                         </span>

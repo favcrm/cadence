@@ -618,14 +618,89 @@ fn git_bounded(
     }
 }
 
+/// The ref the repo treats as its default branch: `origin/HEAD`'s
+/// target, else a local `main`, else whatever is checked out.
+fn default_ref(dir: &Path) -> String {
+    let t = Duration::from_secs(2);
+    if let Ok(out) = git_bounded(
+        dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        t,
+    ) {
+        return out.trim().to_string();
+    }
+    match git_bounded(
+        dir,
+        &["rev-parse", "--verify", "--quiet", "refs/heads/main"],
+        t,
+    ) {
+        Ok(_) => "refs/heads/main".to_string(),
+        Err(_) => "HEAD".to_string(),
+    }
+}
+
+/// A subject without its trailing ` (#<n>)` squash-merge suffix.
+fn normalized_subject(subject: &str) -> &str {
+    let s = subject.trim();
+    let bare = s.strip_suffix(')').and_then(|rest| {
+        let (head, num) = rest.rsplit_once(" (#")?;
+        (!num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())).then_some(head)
+    });
+    bare.unwrap_or(s).trim()
+}
+
+/// Tag `(full sha, commit)` candidates from one repo with `on_default`
+/// and drop each not-on-default commit that has a same-subject twin on
+/// the default branch. One `rev-list --no-walk <candidates> --not
+/// <default>` names the commits the default branch does not reach.
+fn dedupe_stale(dir: &Path, hits: Vec<(&str, Value)>) -> Vec<Value> {
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let default = default_ref(dir);
+    let mut args = vec!["rev-list", "--no-walk"];
+    args.extend(hits.iter().map(|(full, _)| *full));
+    args.extend(["--not", default.as_str()]);
+    let off_default = git_bounded(dir, &args, Duration::from_secs(5)).ok();
+    let mut commits: Vec<Value> = hits
+        .into_iter()
+        .map(|(full, mut c)| {
+            c["on_default"] = match &off_default {
+                Some(off) => json!(!off.lines().any(|l| l.trim() == full)),
+                None => Value::Null,
+            };
+            c
+        })
+        .collect();
+    let landed: Vec<String> = commits
+        .iter()
+        .filter(|c| c["on_default"] == json!(true))
+        .map(|c| normalized_subject(c["subject"].as_str().unwrap_or_default()).to_string())
+        .collect();
+    commits.retain(|c| {
+        c["on_default"] != json!(false)
+            || !landed
+                .iter()
+                .any(|s| s == normalized_subject(c["subject"].as_str().unwrap_or_default()))
+    });
+    commits
+}
+
 /// `commits` for an issue's detail: for each repo the project lists,
 /// the newest commits on any ref whose message carries an
 /// `Issue: <ID>` trailer or names the id as a whole word in the
 /// subject (the `(CAD-47)` convention) — `{repo, sha, at, author,
-/// subject}`. Read-only `git log --all` bounded to the newest 2000
-/// commits per repo, ≤20 matches per repo, ≤20 merged; a missing or
-/// non-git path is skipped and reported in `commits_skipped`, never
-/// an error.
+/// subject, on_default}`. Read-only `git log --all` bounded to the
+/// newest 2000 commits per repo, ≤40 matches per repo before dedupe,
+/// ≤20 merged; a missing or non-git path is skipped and reported in
+/// `commits_skipped`, never an error.
+///
+/// `--all` also walks stale remote-tracking refs, so a merged issue
+/// would list its squash commit and the old branch tip. `on_default`
+/// marks what the default branch reaches (`null` when that could not
+/// be read); a not-on-default commit whose normalized subject has an
+/// `on_default` twin is dropped. Default-branch commits list first,
+/// then newest first.
 pub fn code_commits(pm_dir: &Path, issue: &board::Issue) -> (Vec<Value>, Vec<Value>) {
     let Ok(projects) = project::list(pm_dir) else {
         return (Vec::new(), Vec::new());
@@ -658,18 +733,19 @@ pub fn code_commits(pm_dir: &Path, issue: &board::Issue) -> (Vec<Value>, Vec<Val
                 "--all",
                 "-n",
                 "2000",
-                "--format=%h%x1f%at%x1f%an%x1f%s%x1f%(trailers:key=Issue,valueonly,separator=%x2C)",
+                "--format=%H%x1f%h%x1f%at%x1f%an%x1f%s%x1f%(trailers:key=Issue,valueonly,separator=%x2C)",
             ],
             Duration::from_secs(5),
         );
         match out {
             Err(reason) => skipped.push(json!({"repo": label, "reason": reason})),
             Ok(log) => {
-                let mut hits = log
+                let hits: Vec<(&str, Value)> = log
                     .lines()
                     .filter_map(|line| {
-                        let mut parts = line.splitn(5, '\x1f');
-                        let (sha, at, author, subject, issues) = (
+                        let mut parts = line.splitn(6, '\x1f');
+                        let (full, sha, at, author, subject, issues) = (
+                            parts.next()?,
                             parts.next()?,
                             parts.next()?,
                             parts.next()?,
@@ -678,25 +754,31 @@ pub fn code_commits(pm_dir: &Path, issue: &board::Issue) -> (Vec<Value>, Vec<Val
                         );
                         let tagged = issues.split(',').any(|t| t.trim() == id);
                         (tagged || subject_mentions(subject, id)).then(|| {
-                            json!({
-                                "repo": label,
-                                "sha": sha,
-                                "at": at
-                                    .parse::<i64>()
-                                    .map(time::iso)
-                                    .unwrap_or_else(|_| at.to_string()),
-                                "author": author,
-                                "subject": subject,
-                            })
+                            (
+                                full,
+                                json!({
+                                    "repo": label,
+                                    "sha": sha,
+                                    "at": at
+                                        .parse::<i64>()
+                                        .map(time::iso)
+                                        .unwrap_or_else(|_| at.to_string()),
+                                    "author": author,
+                                    "subject": subject,
+                                }),
+                            )
                         })
                     })
-                    .take(20)
+                    .take(40)
                     .collect();
-                commits.append(&mut hits);
+                commits.append(&mut dedupe_stale(&dir, hits));
             }
         }
     }
-    commits.sort_by(|a, b| b["at"].as_str().cmp(&a["at"].as_str()));
+    commits.sort_by(|a, b| {
+        let off = |c: &Value| c["on_default"] == json!(false);
+        (off(a), b["at"].as_str()).cmp(&(off(b), a["at"].as_str()))
+    });
     commits.truncate(20);
     (commits, skipped)
 }
@@ -712,6 +794,17 @@ mod tests {
         assert_eq!(actor.as_deref(), Some("operator (ui)"));
         assert_eq!(split_paren("comment by fable-cc").1, None);
         assert_eq!(split_paren("wip (draft)").1, Some("draft".to_string()));
+    }
+
+    #[test]
+    fn subject_normalizing() {
+        assert_eq!(
+            normalized_subject(" feat: x (CAD-1) (#42) "),
+            "feat: x (CAD-1)"
+        );
+        assert_eq!(normalized_subject("feat: x (CAD-1)"), "feat: x (CAD-1)");
+        assert_eq!(normalized_subject("fix (#)"), "fix (#)");
+        assert_eq!(normalized_subject("fix (#4a)"), "fix (#4a)");
     }
 
     #[test]

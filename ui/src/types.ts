@@ -76,6 +76,8 @@ export interface IssueCommit {
   at: string;
   author: string;
   subject: string;
+  /** Reachable from the repo's default branch; `null` when unknown. */
+  on_default?: boolean | null;
 }
 
 /** `GET /api/issues/<id>/history` — one parsed git-log entry. */
