@@ -3,7 +3,7 @@ import { Logo } from "./Logo";
 
 interface Props {
   tab: string;
-  onTab: (tab: "board" | "plan" | "agents") => void;
+  onTab: (tab: "board" | "plan" | "agents" | "memory") => void;
   project: string;
   onProject: (key: string) => void;
   projects: Project[];
@@ -35,6 +35,12 @@ const agentsIcon = (
   <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
     <rect x="2" y="3" width="12" height="8.5" rx="1.2" />
     <path d="M5.5 14h5" />
+  </svg>
+);
+const memoryIcon = (
+  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4">
+    <path d="M8 2.2c-2.6 0-4.7 1.9-4.7 4.3 0 1.4.7 2.7 1.7 3.5.4.4.7.9.7 1.5v1.3c0 .6.5 1 1 1h2.6c.6 0 1-.4 1-1v-1.3c0-.6.2-1.1.7-1.5 1-.8 1.7-2.1 1.7-3.5 0-2.4-2.1-4.3-4.7-4.3z" />
+    <path d="M6.5 8.5h3" />
   </svg>
 );
 
@@ -70,6 +76,13 @@ export default function Sidebar({ tab, onTab, project, onProject, projects, tota
           aria-current={tab === "agents" ? "page" : undefined}
         >
           {agentsIcon}Agents
+        </button>
+        <button
+          onClick={() => onTab("memory")}
+          className="navlink"
+          aria-current={tab === "memory" ? "page" : undefined}
+        >
+          {memoryIcon}Memory
         </button>
         <span className="navlink opacity-45 cursor-not-allowed" title="iteration 4">
           {loopsIcon}Loops <span className="ml-auto num text-[10px] text-ink-500">I4</span>

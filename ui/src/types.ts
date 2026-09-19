@@ -253,3 +253,31 @@ export interface Health {
   daemon: string;
   embedded: boolean;
 }
+
+/** GET /api/memories — one project-memory card. */
+export interface MemoryCard {
+  project: string;
+  slug: string;
+  type: string;
+  status: string;
+  confidence: string;
+  scope: {
+    project: boolean;
+    components: string[];
+    paths: string[];
+    providers: string[];
+    tags: string[];
+  };
+  source?: string | null;
+  author?: string | null;
+  created: string;
+  verified_at?: string | null;
+  supersedes?: string | null;
+  fact: string;
+  path: string;
+}
+
+/** GET /api/memories/<project>/<slug> — card + raw body. */
+export interface MemoryDetail extends MemoryCard {
+  body: string;
+}

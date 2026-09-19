@@ -183,7 +183,7 @@ pub fn resolve(pm_dir: &Path, flag: Option<&str>, cwd: &Path) -> Result<Project>
     ))
 }
 
-fn unknown_project(name: &str, pm_dir: &Path) -> Error {
+pub(crate) fn unknown_project(name: &str, pm_dir: &Path) -> Error {
     let known = list(pm_dir)
         .map(|ps| ps.iter().map(|p| p.key.clone()).collect::<Vec<_>>())
         .unwrap_or_default();

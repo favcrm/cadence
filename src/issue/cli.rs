@@ -326,7 +326,7 @@ pub enum ProjectAction {
     Ls,
 }
 
-fn print_json(value: &Value) {
+pub(crate) fn print_json(value: &Value) {
     println!(
         "{}",
         serde_json::to_string_pretty(value).unwrap_or_default()

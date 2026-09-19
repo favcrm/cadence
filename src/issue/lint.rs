@@ -70,6 +70,21 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
             if !ft.is_dir() || name.starts_with('.') {
                 continue;
             }
+            // `memory/` holds project-memory files, not an issue —
+            // its own lint validates them against the body contract.
+            if name == "memory" {
+                let (mut merrs, mut mwarns) = (Vec::new(), Vec::new());
+                crate::memory::lint_dir(&path, project, &mut |e| merrs.push(e), &mut |w| {
+                    mwarns.push(w)
+                });
+                for e in merrs {
+                    lint.err(e);
+                }
+                for w in mwarns {
+                    lint.warn(w);
+                }
+                continue;
+            }
             let file = path.join("issue.md");
             if file.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
                 lint.err(format!(

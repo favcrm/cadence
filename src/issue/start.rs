@@ -32,7 +32,7 @@ pub struct StartArgs {
 
 /// ASCII-lower `-`-separated slug, ≤32 chars — `New Login Form` →
 /// `new-login-form`. Non-ASCII titles fall back to `work`.
-fn slugify(title: &str) -> String {
+pub(crate) fn slugify(title: &str) -> String {
     let mut slug = String::new();
     let mut dash = false;
     for c in title.chars() {

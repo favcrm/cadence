@@ -12405,6 +12405,285 @@ fn dispatch_kickoff_and_finish_guards() {
     );
 }
 
+/// `dispatch` renders matching accepted memories into
+/// `<state>/dispatch/<msg>-lessons.md`, names the file in the kickoff
+/// and the issue comment, and reports slugs in JSON. `--no-lessons`
+/// skips the whole path.
+#[test]
+fn dispatch_injects_project_memory_lessons() {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        // w1 is `inbox` — the queued kickoff stays inspectable.
+        for (alias, params, kind) in [
+            ("pm", None, "fake"),
+            ("w1", Some("{\"upstream\":\"pm\"}"), "inbox"),
+        ] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params,
+                })
+                .unwrap();
+        }
+    }
+    let d = TestDaemon::start_on(state);
+
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
+    for title in ["One", "Two"] {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+
+    // Three memories on the project: one project-wide rule (matches),
+    // one component-scoped gotcha (no component on the issue → no
+    // match), one provider-scoped rule for a different provider.
+    let body = |fact: &str| format!("{fact}\n\n**Why:** test.\n\n**How to apply:** do it.\n");
+    assert!(
+        cli(&[
+            "memory",
+            "propose",
+            "--project",
+            "demo",
+            "--type",
+            "rule",
+            "--id",
+            "always-drain",
+            "--scope-project",
+            "-m",
+            &body("always drain the pipe before send"),
+        ])
+        .0
+    );
+    assert!(cli(&["memory", "accept", "always-drain", "--project", "demo"]).0);
+    assert!(
+        cli(&[
+            "memory",
+            "propose",
+            "--project",
+            "demo",
+            "--type",
+            "gotcha",
+            "--id",
+            "comp-only",
+            "--scope-component",
+            "daemon",
+            "-m",
+            &body("daemon-only gotcha"),
+        ])
+        .0
+    );
+    assert!(cli(&["memory", "accept", "comp-only", "--project", "demo"]).0);
+    assert!(
+        cli(&[
+            "memory",
+            "propose",
+            "--project",
+            "demo",
+            "--type",
+            "rule",
+            "--id",
+            "claude-only",
+            "--scope-provider",
+            "claude",
+            "-m",
+            &body("claude provider rule"),
+        ])
+        .0
+    );
+    assert!(cli(&["memory", "accept", "claude-only", "--project", "demo"]).0);
+    // A still-proposed memory never injects.
+    assert!(
+        cli(&[
+            "memory",
+            "propose",
+            "--project",
+            "demo",
+            "--type",
+            "rule",
+            "--id",
+            "pending-one",
+            "--scope-project",
+            "-m",
+            &body("not yet accepted"),
+        ])
+        .0
+    );
+
+    let note = tmp.path().join("kickoff.md");
+    std::fs::write(&note, "# kickoff").unwrap();
+    let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
+
+    // The dispatch: exactly the project-wide rule lands.
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-1",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(ok && out["dispatched"] == true, "{out}");
+    assert_eq!(out["lessons"], json!(["always-drain"]), "{out}");
+    let lessons_path = PathBuf::from(out["lessons_file"].as_str().unwrap());
+    let msg_id = out["message"].as_str().unwrap().to_string();
+    assert_eq!(
+        lessons_path,
+        d.state
+            .join("dispatch")
+            .join(format!("{msg_id}-lessons.md"))
+    );
+    let text = std::fs::read_to_string(&lessons_path).unwrap();
+    assert!(text.contains("always drain the pipe before send"), "{text}");
+    assert!(!text.contains("daemon-only gotcha"), "{text}");
+    assert!(text.len() <= 4096);
+    // The kickoff names the file; the comment records the injection.
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let kick = &show["messages"].as_array().unwrap()[0];
+    assert_eq!(kick["id"].as_str().unwrap(), msg_id);
+    let body_s = kick["body"].as_str().unwrap();
+    assert!(
+        body_s.contains(&format!("Lessons: {}.", lessons_path.display())),
+        "{body_s}"
+    );
+    let issue = cli(&["issue", "show", "D-1", "--json"]).1;
+    assert!(
+        issue["comments"].as_array().unwrap().iter().any(|c| {
+            c["body"]
+                .as_str()
+                .unwrap()
+                .contains("Lessons injected: always-drain")
+        }),
+        "{issue}"
+    );
+
+    // --no-lessons: nothing rendered, nothing appended.
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-2",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+        "--no-lessons",
+    ]);
+    assert!(ok && out["dispatched"] == true, "{out}");
+    assert_eq!(out["lessons"], json!([]), "{out}");
+    assert_eq!(out["lessons_file"], Value::Null, "{out}");
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let kick2 = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_str() == out["message"].as_str())
+        .unwrap();
+    assert!(
+        !kick2["body"].as_str().unwrap().contains("Lessons:"),
+        "{}",
+        kick2["body"]
+    );
+    assert_eq!(
+        std::fs::read_dir(d.state.join("dispatch")).unwrap().count(),
+        1
+    );
+
+    // The bootstrap briefing carries the project's accepted rules for
+    // an agent whose cwd sits inside the project repo — proposed and
+    // non-matching scopes stay out.
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w2", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": repo, "params": json!({"upstream": "pm"}).to_string()}),
+    )
+    .unwrap();
+    d.wait_agent("w2", "idle", 15);
+    let (ok, out) = cli(&["agent", "bootstrap", "w2"]);
+    assert!(ok, "{out}");
+    let briefing = d.state.join("briefings").join("pm").join("BRIEFING-w2.md");
+    let text = std::fs::read_to_string(&briefing).unwrap();
+    assert!(
+        text.contains("## Project memory — accepted rules (demo)"),
+        "{text}"
+    );
+    assert!(text.contains("always-drain"), "{text}");
+    assert!(!text.contains("pending-one"), "{text}");
+    assert!(!text.contains("claude-only"), "{text}");
+}
+
 // ==== operator IX: cadence status, daemon restart, events tail ====
 
 /// `cadence status --json` against a daemon's socket — the JSON shape
