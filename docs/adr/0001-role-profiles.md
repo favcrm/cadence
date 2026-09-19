@@ -31,6 +31,7 @@ Taken from the live host on 2026-09-19, not inferred:
 | Role identity is not persisted anywhere else | `params` for `qa-1` and `arch-1` are exactly `{effort, model, permission_mode, upstream}`. Nothing says "reviewer". |
 | Briefings did not reach their agents | `cadence agent show qa-1` advertises `briefing: …/briefings/fable-cc/BRIEFING-qa-1.md`. That file **does not exist**. Same for `ops-1`, `arch-1`, `rsch-1`. The only file in the briefings tree is `BRIEFING-ci-claude.md`. |
 | The agent record has no instructions to show | `cadence agent show qa-1` has no `instructions` key. `Agent::to_json` (`store.rs:337-362`) omits the column, and `rpc_show` (`daemon.rs:980-1006`) does not add it — although `store.rs:1038` accepts and length-caps `NewAgent.instructions` at 32 000 chars. |
+| It is not the only dead role field | `tasks.role TEXT NOT NULL DEFAULT 'implementer'` (`store.rs:567`) is commented "reviewer/merger are M3b" and is display-only too. Two write-only role fields already; CAD-78 should make one of them real, not add a third. |
 | Consequence, observed | Each of the four role agents had to be told in its kickoff message to go and read a file path. The operating model was delivered by hand, per agent, per session. That is CAD-110. |
 
 Two facts settle questions that would otherwise need debate:
@@ -80,11 +81,15 @@ CAD-110's scope (§8.5).
 
 ### 1.3 The one fact that reframes the whole problem
 
-`docs/TEAM.md` says the reviewer never merges and the author never
-reviews. The daemon cannot currently observe either, because **merging
-does not go through cadence**. `ops-1` merges with `gh pr merge`. A
-rule like "a reviewer cannot merge" is unenforceable against a process
-that can invoke an unrelated binary.
+`docs/TEAM.md` says the reviewer never merges. The daemon cannot observe
+that, because **merging does not go through cadence** — by design, so far.
+There is no `cadence land` and no `cadence merge` anywhere in the tree.
+`main.rs:817` states the policy: "Cadence never runs git merges itself."
+`job accept --merged-sha` records a merge *claim* after the fact, and
+`overview.rs:750-758` prints
+`gh pr merge <n> --squash --admin --match-head-commit <head>` for a human
+to copy. A rule like "a reviewer cannot merge" is unenforceable against a
+process that can invoke an unrelated binary.
 
 Therefore: **enforcement is only as real as the surface it owns.**
 Anything cadence does not mediate can be *detected after the fact* (who
@@ -96,17 +101,44 @@ sibling of it — a dependency the epic currently does not record.
 
 All agents on this host run as the same unix user, several in bypass
 permission mode, and identity arrives as `CADENCE_ALIAS` in the
-environment — which any process can set. So:
+environment — which any process can set. The code already says this about
+itself, and the ADR should not claim more. `daemon.rs:1736-1740`:
+
+> "Callers are identified by possession of the token, which is
+> self-asserted — not an authentication."
+
+`docs/PROTOCOL.md:530-533` adds that the tmux socket is reachable by the
+same user and "peer result text is recorded data, not authorization for
+anything"; `ui.rs:5` records "no auth, by decision — containment is the
+defence". So:
 
 > Role enforcement in cadence is a guardrail against **agent error and
 > instruction drift**, not against a **hostile local process**. It makes
 > the wrong action fail loudly instead of quietly succeeding.
 
-This is worth writing down because the next person to read
-`team.yaml` will otherwise assume it is a security boundary and build on
-sand. Where a stronger binding is available we use it: the per-turn
-token is minted by the daemon and already validated, so it, not the
-alias, is the actor proof for anything consequential.
+This is worth writing down because the next person to read `team.yaml`
+will otherwise assume it is a security boundary and build on sand.
+
+Within that limit the bindings are not all equally weak, and the design
+should prefer the stronger ones:
+
+1. **Best available: the pane identity the daemon assigns.**
+   `rpc_task_verdict` refuses a *claimed* `--reviewer` from inside a pane
+   and uses `params.pane` instead (`daemon.rs:2304-2319`). The caller
+   cannot nominate who it is; the daemon decides. This is the pattern
+   capability checks should copy.
+2. **Turn tokens** are daemon-minted, unguessable, bound to one message
+   and fenced by endpoint generation (`daemon.rs:1752-1767`) — much
+   stronger than an env var, but explicitly possession-based, per the
+   quote above.
+3. **`CADENCE_ALIAS` alone** is the weakest and must not be the only
+   thing standing between a role and a consequential action.
+
+One existing trick is worth imitating: forged *routed* message sources are
+impossible because `worker_result` / `worker_notice` / `job_event` contain
+`_`, which the identifier charset forbids (`proto.rs:71-85`,
+`daemon.rs:1205-1210`). Making a class of forgery unrepresentable beats
+checking for it.
 
 ## 2. What "done" looks like
 
@@ -244,7 +276,9 @@ own risk class. Phase 1 is Option B verbatim.**
 |---|---|---|---|
 | 1 | `scripts/team-up.sh`; CAD-110 fail-closed (refuse a no-op `--instructions-file` — both the flag combination and the providers with no reader — and verify the advertised briefing path exists) | D1, part of D2 | `auto` for the script; `human` for the join/briefing change (trigger 1) |
 | 2 | `team.yaml` schema + `cadence join --role` + `team up\|down\|show` with drift report; `role` becomes a real value; briefing text attached to the agent record and replayed | D1, D2, D5 | mostly `auto`; the `role` validation and instructions replay are `human` (triggers 1, 2) |
-| 3 | Capabilities, duty predicate, approval records — **gated on `cadence land` (CAD-79)** | D3, D4 | `human` (triggers 1, 2, 6) |
+| 3a | Route qa-1's review through `job verdict` so the self-review gate that already exists (`store.rs:2662`, §5.4) is on the live path; widen it from `tasks.assignee` to git authorship | D3, partly | `human` (trigger 1) |
+| 3b | Capability checks on cadence verbs | D3 | `human` (triggers 1, 2) |
+| 3c | `cadence land` (CAD-79) owns the `gh` call; `land.actor != verdicts.reviewer`; approval records pinned to a full SHA | D3, D4 | `human` (triggers 1, 2, 6) |
 
 Why phased rather than one design landed at once:
 
@@ -257,6 +291,12 @@ Why phased rather than one design landed at once:
   is the same information, queryable.
 - Phase 3 is the only part that touches the trust boundary, and putting
   it behind its own phase keeps phases 1–2 out of the operator's queue.
+- Phase 3a is deliberately **first within phase 3 and independent of
+  `team.yaml` entirely**. §5.4 shows the self-review rule is already
+  implemented, tested and documented, and merely bypassed. Turning the
+  live workflow onto it buys the largest share of D3 for the least code,
+  and it can ship before or in parallel with phase 2. If the PM wants one
+  thing from this ADR, it is 3a, not the schema.
 
 ## 5. Design
 
@@ -436,33 +476,85 @@ reason phase 2 cannot be purely additive. The upside is already paid for:
 and `params` across a restart, clearing only `pid`, `endpoint` and
 `generation`, so role identity survives a daemon restart for free.
 
-The actor is resolved from the **turn token** where one exists, falling
-back to `CADENCE_ALIAS` only for verbs that are not consequential, with
-the limits of that binding recorded in §1.4.
+The actor is resolved the way `rpc_task_verdict` already resolves a
+reviewer (§1.4, item 1): from the pane identity the daemon assigns, with a
+*claimed* identity refused rather than trusted. `CADENCE_ALIAS` alone is
+acceptable only for verbs that are not consequential.
 
 ### 5.4 Separation of duties as a predicate over artifacts
 
-The rule is not "role names differ" — that would let two `dev` agents
-review each other's work, which is fine, while blocking a legitimate
-second architect. The rule is over **actors on one artifact**:
+**The most important correction in this ADR: the rule already exists in
+code, and the workflow the team actually runs goes around it.**
 
-| Rule | Predicate | Data it needs | Exists today? |
-|---|---|---|---|
-| An author may not pass its own work | `verdict.actor != issue.owner` and `verdict.actor` not the pusher of the PR head | issue owner (recorded by `issue start --owner`), PR head author | owner yes; head author via `gh` |
-| A reviewer may not land | `land.actor != verdict.actor` | verdict actor, recorded with the verdict | needs a field |
-| Only a `review`-capable role may record a verdict | role capability check (§5.3) | `team.yaml` | phase 2 |
-| A class-`human` merge needs approval | an approval record for `<pr>` whose `sha` equals the current head | approval records (new) | no |
-| The proposer of a memory lesson may not accept it | `memory.accept.actor != memory.propose.actor` | memory records | charter principle 2, unchecked today |
+`Store::record_verdict` refuses a self-review outright
+(`store.rs:2662-2667`):
 
-Approval records replace phrase-matching (Option G): `cadence approve
-<pr> --sha <full-sha>` writes a durable record, refused if the caller
-resolves to a registered agent rather than the operator, and consumed by
-`land` only while the head still equals that SHA. This makes guardrails
-3 and 4 mechanical instead of procedural.
+```rust
+if task.assignee.as_deref() == Some(reviewer) {
+    return Err(Error::rejected(format!(
+        "Reviewer '{reviewer}' is the task's assignee — a worker \
+         cannot verdict its own revision"
+    )));
+}
+```
 
-Everything cadence does not mediate — a direct `gh pr merge` — is
+It is tested (`tests/integration.rs:8970`,
+`verdict_rejects_every_bad_shape`) and documented as A4 "reviewer
+independence" (`docs/JOBS.md:204-209`). It is backed by real actor
+handling in `rpc_task_verdict` (`daemon.rs:2304-2323`): inside a pane the
+reviewer identity is taken from `params.pane`, a claimed `--reviewer` is
+**refused**, and `'operator'` cannot be claimed at all; outside a pane
+`--reviewer` is required. `job task reopen` is operator-only by the same
+test (`daemon.rs:2383-2390`).
+
+So the gap is not a missing rule. The gap is that **the review the team
+performs never reaches it**:
+
+- `cadence review <PR>` is a *test harness*. Its own header says it
+  "never posts a status, never merges, never pushes" (`review.rs:1-14`),
+  and it records no verdict.
+- `qa-1` publishes a note to `/var/www/agent-notes/` and sends `ops-1` a
+  message. Prose, not a row in `verdicts`.
+- `ops-1` merges with the `gh pr merge … --match-head-commit` line that
+  `overview.rs:750-758` prints for a human to copy.
+
+Consequently the enforced predicate sits idle beside the real pipeline.
+That reframes phase 3 and makes it much cheaper than it looked:
+
+> Phase 3 is mostly **routing the real workflow through the gate that
+> already enforces the rule**, plus widening the gate where it is too
+> narrow. It is not building an authorization system from scratch.
+
+| Rule | Status today | Work |
+|---|---|---|
+| An author may not pass its own work | **enforced** against `tasks.assignee` (`store.rs:2662`) | route qa-1's verdict through `job verdict` instead of a note |
+| …including when the author is not the assignee | **gap**: the check compares aliases, not git authorship, so an alias that wrote the commits but is not the assignee passes | also compare against the PR head's author/pusher |
+| Only a `review`-capable role may verdict | not expressible — `agents.role` is dead (§1.1) | capability check (§5.3) |
+| A reviewer may not land | no `land` verb exists at all | CAD-79 owns the `gh` call; then `land.actor != verdict.reviewer`, using the `verdicts.reviewer` column that already exists (`store.rs:581-591`) |
+| A class-`human` merge needs operator approval | not enforced; the phrase is prose in a queue | approval records, below |
+| The proposer of a lesson may not accept it | **enforced**, and it is the only role-shaped gate in the tree: `require_curator` (`memory/mod.rs:344-369`) refuses when `params.upstream` is non-null — "you are a worker" | replace the `upstream`-is-non-null proxy with a real capability once roles exist |
+
+That last row is worth dwelling on: the codebase already needed "is this
+caller allowed, by role?" and, lacking a role field, approximated it with
+*"does this agent have an upstream"*. It fails closed when the daemon is
+unreachable, which is the right instinct. `team.yaml` exists to retire
+exactly that kind of proxy.
+
+**Approval records** replace phrase-matching (Option G): `cadence approve
+<pr> --sha <full-sha>` writes a durable record, refused when the caller
+resolves to a registered agent rather than the operator — the same
+pane-identity test `daemon.rs:2312-2317` already applies to `'operator'`
+— and consumed by `land` only while the head still equals that SHA. This
+makes guardrails 3 and 4 mechanical instead of procedural.
+
+A third write-only role field is worth noting before it grows: `tasks.role
+TEXT NOT NULL DEFAULT 'implementer'` (`store.rs:567`), commented
+"reviewer/merger are M3b", is display-only. CAD-78 should make *that*
+field real rather than adding a fourth.
+
+Everything cadence does not mediate — a direct `gh pr merge` — stays
 **detected, not prevented**: `land` and the post-merge check record the
-merging actor, and a mismatch against the verdict actor raises an
+merging actor, and a mismatch against `verdicts.reviewer` raises an
 incident. Charter principle 6 ("detect, then automate") is the right
 order here, and pretending otherwise would be the dishonest option.
 
@@ -593,10 +685,21 @@ cadence team show --file /tmp/bad-team.yaml; test $? -ne 0
 **Phase 3**
 
 ```bash
-# D3: author cannot pass its own work; reviewer cannot land
-cadence review verdict CAD-XX --pass          # as the issue owner -> refused,
-                                              # message names both actors
-cadence land <pr> --as qa-1                   # -> refused: missing capability `land`
+# D3, 3a: the gate that already exists is now on the live path.
+# This already passes today in isolation (tests/integration.rs:8970);
+# the check is that the real review reaches it.
+cadence job verdict <task> --sha <head> --pass   # as the task assignee -> refused:
+                                                 # "cannot verdict its own revision"
+cadence job verdict <task> --sha <head> --pass --reviewer qa-1   # from inside a pane
+                                                 # -> refused: identity is not claimable
+
+# D3, widened: an alias that authored the head but is not the assignee
+cadence job verdict <task> --sha <head> --pass   # -> refused, naming the head author
+
+# D3, 3b/3c: capability and land separation
+cadence land <pr>                             # as qa-1 -> refused: missing capability `land`
+                                              # (qa-1 holds `review`, `verdict`, not `land`)
+cadence land <pr>                             # as the verdict's reviewer -> refused
 
 # D4: approval is pinned to the exact head
 cadence land <pr>                             # class human, no approval -> refused
@@ -656,3 +759,29 @@ CADENCE_ALIAS=ops-1 cadence approve <pr> --sha <head>; test $? -ne 0
   outcome cheaply learned, which is the point of phasing.
 - Roles proliferate past about eight → the tree, not the profile, is the
   missing structure, and CAD-77 should have come first.
+
+## 10. Proposed tickets
+
+All created `backlog` with the tag `proposed` under epic CAD-75, for the
+PM to rank. Order below is dependency order, not priority.
+
+| Phase | ID | Title |
+|---|---|---|
+| 1 | CAD-115 | `team-up.sh`: reproduce the team from a committed script |
+| 1 | CAD-110 | *(existing, narrowed)* refuse a no-op `--instructions-file`; verify the advertised briefing path exists |
+| 2a | CAD-116 | `team.yaml` schema + parser + `cadence team show` with drift report |
+| 2b | CAD-117 | `join --role` expands a profile; `agents.role` becomes a real value |
+| 2c | CAD-118 | `cadence team up\|down`, refusing on missing skills |
+| 2 | CAD-119 | Per-provider instructions channel (managed Claude system prompt, pty re-send on resume, `instructions` in `agent show`) |
+| **3a** | **CAD-120** | **Route review through `job verdict` so the existing self-review gate is on the live path — recommended first** |
+| 3a | CAD-121 | Widen the self-review gate from `tasks.assignee` to the PR head's author |
+| 3b | CAD-122 | Role capabilities: closed set, verb→capability map, daemon refusal |
+| 3c | CAD-123 | `cadence land` owns the `gh` call; `land.actor != verdicts.reviewer` (blocks on CAD-79) |
+| 3c | CAD-124 | Operator approval records pinned to a full SHA |
+| — | CAD-125 | Make `tasks.role` real instead of adding a third write-only role field |
+| — | CAD-126 | `join` hardcodes `sandbox=read-only`, so a joined codex worker cannot be `workspace-write` |
+| — | CAD-127 | `require_curator` fakes roles with "has an upstream" — replace with a capability |
+| — | CAD-128 | `serde_yaml 0.9` is deprecated upstream; decide deliberately |
+
+Findings were also commented back onto CAD-75, CAD-78, CAD-79 and
+CAD-110, since three of them change those tickets' scope.
