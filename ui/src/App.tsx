@@ -3,6 +3,7 @@ import { api, ApiError, type WriteResp } from "./api";
 import Agents from "./components/Agents";
 import Board from "./components/Board";
 import Drawer from "./components/Drawer";
+import Memory from "./components/Memory";
 import Plan from "./components/Plan";
 import Sidebar from "./components/Sidebar";
 import Toast, { type ToastMsg } from "./components/Toast";
@@ -18,7 +19,7 @@ import type {
 } from "./types";
 
 export default function App() {
-  const [tab, setTab] = useState<"board" | "plan" | "agents">("board");
+  const [tab, setTab] = useState<"board" | "plan" | "agents" | "memory">("board");
   const [project, setProject] = useState("all");
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<BoardFilters>(NO_FILTERS);
@@ -226,6 +227,7 @@ export default function App() {
             <span className="hidden sm:inline"> / </span>
             <span className="text-ink-100">{tab}</span>
           </div>
+
           <div className="ml-auto flex items-center gap-2">
             {readOnly && (
               <span
@@ -271,8 +273,8 @@ export default function App() {
 
         {menuOpen && (
           <nav className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
-            <div className="grid grid-cols-3 gap-1.5">
-              {(["board", "plan", "agents"] as const).map((t) => (
+            <div className="grid grid-cols-4 gap-1.5">
+              {(["board", "plan", "agents", "memory"] as const).map((t) => (
                 <button
                   key={t}
                   onClick={() => {
@@ -362,6 +364,7 @@ export default function App() {
         )}
         {tab === "agents" && <Agents payload={agents} onOpenIssue={openIssue} />}
         {tab === "plan" && <Plan />}
+        {tab === "memory" && <Memory project={project} onError={writeError} />}
       </div>
 
       {openId && (

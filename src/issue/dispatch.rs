@@ -9,11 +9,13 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::adapter::pty;
 use crate::client;
 use crate::error::{Error, Result};
-use crate::issue::{start, write, Pm};
+use crate::issue::{board, start, write, Pm};
+use crate::memory;
 
 /// Message states that mean a dispatch is still in flight — a second
 /// dispatch must not queue a duplicate while one is live.
@@ -30,6 +32,8 @@ pub struct DispatchArgs {
     /// `--job` — the spec file `job_new` hashes; the kickoff then goes
     /// through `task_dispatch` rather than `agent_send`.
     pub job_spec: Option<PathBuf>,
+    /// `--no-lessons` — skip project-memory injection for this send.
+    pub no_lessons: bool,
 }
 
 /// The fixed single-line kickoff body — note path, issue id, summary
@@ -232,14 +236,69 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         return Ok(out);
     }
 
+    // Project-memory lessons: accepted memories matching the issue's
+    // component/tags/recorded-commit paths and the worker's provider
+    // render into `<state>/dispatch/<message>-lessons.md`, written
+    // before the send so the kickoff can name it. `--job`'s kickoff
+    // is daemon-templated and cannot carry the path — it is skipped.
+    // Memory failures never sink the dispatch — the worktree already
+    // exists by now. A malformed file, an unwritable lessons file or a
+    // suffix that pushes the body over the cap degrades to no lessons
+    // with `lessons_error` naming the reason.
+    let mut lessons: Vec<String> = vec![];
+    let mut lessons_file: Option<PathBuf> = None;
+    let mut lessons_error: Option<String> = None;
+    let mut message_id: Option<String> = None;
+    let mut body = body;
+    if !args.no_lessons {
+        if let Some(b) = body.as_mut() {
+            let issue_obj = board::Issue {
+                project: project.key.clone(),
+                dir: dir.clone(),
+                front: front.clone(),
+                body: String::new(),
+                comments: vec![],
+                artifacts: vec![],
+            };
+            match memory::match_for_issue(pm, &issue_obj, Some(&provider)) {
+                Err(e) => lessons_error = Some(format!("memory match failed: {e}")),
+                Ok(matched) => {
+                    let (text, slugs) = memory::render_lessons(&matched);
+                    if !slugs.is_empty() {
+                        let msgid = Uuid::new_v4().simple().to_string();
+                        let ddir = state_dir.join("dispatch");
+                        let file = ddir.join(format!("{msgid}-lessons.md"));
+                        let prior = b.clone();
+                        *b = format!("{prior} Lessons: {}.", file.display());
+                        if let Err(e) = check_body(b, &provider) {
+                            *b = prior;
+                            lessons_error = Some(format!(
+                                "lessons path pushed the kickoff over the body limit: {e}"
+                            ));
+                        } else if let Err(e) = std::fs::create_dir_all(&ddir)
+                            .and_then(|_| std::fs::write(&file, &text))
+                        {
+                            *b = prior;
+                            lessons_error = Some(format!("lessons file unwritable: {e}"));
+                        } else {
+                            lessons = slugs;
+                            lessons_file = Some(file);
+                            message_id = Some(msgid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Exactly one send — plain text kickoff, or `job dispatch`'s
     // spec-bound kickoff for --job (its state lives on the task).
     let (message, sent_state) = if let Some(body) = body {
-        let sent = client::rpc(
-            state_dir,
-            "agent_send",
-            json!({"alias": args.to, "text": body, "reply_to": reply_to}),
-        )?;
+        let mut params = json!({"alias": args.to, "text": body, "reply_to": reply_to});
+        if let Some(id) = &message_id {
+            params["message"] = json!(id);
+        }
+        let sent = client::rpc(state_dir, "agent_send", params)?;
         (
             sent["message"].as_str().unwrap_or_default().to_string(),
             ("message_state", sent["state"].clone()),
@@ -258,16 +317,13 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     };
 
     // The comment and the ref ride separate commits through the
-    // existing helpers — each is independently consistent.
-    let comment = write::add_comment(
-        pm,
-        id,
-        &format!("Dispatched to {}: {}", args.to, note.display()),
-        None,
-        Some("dispatch"),
-        None,
-        actor,
-    )?;
+    // existing helpers — each is independently consistent. A second
+    // comment line records which lessons were injected.
+    let mut comment_text = format!("Dispatched to {}: {}", args.to, note.display());
+    if !lessons.is_empty() {
+        comment_text.push_str(&format!("\nLessons injected: {}", lessons.join(", ")));
+    }
+    let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
     write::add_ref(
         pm,
         id,
@@ -291,6 +347,15 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     out["dispatched"] = json!(true);
     out["message"] = json!(message);
     out[sent_state.0] = sent_state.1;
+    out["lessons"] = json!(lessons);
+    out["lessons_file"] = lessons_file
+        .as_ref()
+        .map(|p| json!(p))
+        .unwrap_or(Value::Null);
+    out["lessons_error"] = lessons_error
+        .as_ref()
+        .map(|e| json!(e))
+        .unwrap_or(Value::Null);
     out["comment"] = comment["comment"].clone();
     out["job"] = started["job"].clone();
     out["task"] = started["task"].clone();
