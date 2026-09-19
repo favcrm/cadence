@@ -10,11 +10,13 @@ worked and what bit. Reference detail lives in
 
 ## 1. The roles
 
-| Role | What it is | How it talks |
-|---|---|---|
-| **Operator** | The human. Merges, approves, decides scope. | Terminal, board |
-| **PM** | Scopes work, dispatches, reviews, records verdicts. A human or an agent session. | An **inbox** endpoint: `cadence inbox <alias> --follow` |
-| **Worker** | Implements one issue at a time in its own worktree. | A provider endpoint: Devin or Claude terminal (pty), managed Claude, Codex |
+The full operating model (roles, responsibilities, routing, artifacts,
+guardrails, risk classes) is `docs/TEAM.md`; each role's standing
+instructions are in `docs/roles/`. In short: the **operator** sets goals
+and approves class `human` changes; the **PM** plans and dispatches;
+**developers** implement; **qa-1** reviews; **ops-1** runs the merge queue
+and post-merge operations; **rsch-1** and **arch-1** research and design
+ahead of the work.
 
 A PM that is an outside session (a Claude Code or Codex session you are
 already talking to) needs no pane. Register an inbox alias for it and
