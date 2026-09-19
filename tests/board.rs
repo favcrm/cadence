@@ -3444,3 +3444,246 @@ fn issue_start_conflicting_branch_refused_and_status_owner() {
         "{front}"
     );
 }
+
+// ---- CAD-55: `cadence dispatch` + `cadence issue finish` ----
+
+/// `issue finish` without a reachable daemon refuses rather than
+/// guesses; `--force` overrides and is recorded; a second finish is a
+/// no-op; an issue without refs has nothing to finish.
+#[test]
+fn issue_finish_daemon_down_force_and_idempotent() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Done", "--project", "demo"]).0);
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let wt = repo.join(".cadence/wt/d-1-done");
+    assert!(wt.is_dir());
+
+    // Owner 'operator' (start filled it) can't be checked — the
+    // daemon is down and finish refuses rather than guessing.
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("operator") && msg.contains("reachable"),
+        "{msg}"
+    );
+    assert!(wt.is_dir(), "refused finish must not remove the worktree");
+
+    // --force overrides and records it; the tracker commit carries
+    // the Forced trailer and closes both refs as history.
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1", "--force"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["finished"], true);
+    assert_eq!(out["removed_worktree"], true);
+    assert_eq!(out["deleted_branch"], true);
+    assert!(
+        out["overrode"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o.as_str().unwrap().contains("unreachable")),
+        "{out}"
+    );
+    assert!(!wt.exists());
+    assert!(
+        !git(
+            &repo,
+            &["rev-parse", "--verify", "--quiet", "cadence/d-1-done"]
+        )
+        .0
+    );
+    let body = git(&pm, &["log", "-1", "--format=%B"]).1;
+    assert!(
+        body.contains("D-1: finish cadence/d-1-done") && body.contains("Forced: true"),
+        "{body}"
+    );
+    let front = std::fs::read_to_string(pm.join("demo/D-1/issue.md")).unwrap();
+    assert!(front.contains("closed: true"), "{front}");
+    assert!(front.contains("status: doing"), "status untouched: {front}");
+
+    // Second finish is a no-op, not an error.
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["finished"], false);
+
+    // An issue never started has nothing to finish.
+    assert!(cli(&pm, &state, &["issue", "new", "Never", "--project", "demo"]).0);
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-2"]);
+    assert!(!ok && err["error"].as_str().unwrap().contains("nothing to finish"));
+
+    // --keep-branch leaves the local branch but still closes the refs.
+    assert!(cli(&pm, &state, &["issue", "new", "Keep", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-3"]).0);
+    let (ok, out) = cli(
+        &pm,
+        &state,
+        &["issue", "finish", "D-3", "--force", "--keep-branch"],
+    );
+    assert!(
+        ok && out["kept_branch"] == true && out["deleted_branch"] == false,
+        "{out}"
+    );
+    assert!(
+        git(
+            &repo,
+            &["rev-parse", "--verify", "--quiet", "cadence/d-3-keep"]
+        )
+        .0
+    );
+}
+
+/// With no owner recorded (hand-edited history), the daemon check is
+/// skipped and the worktree-side guards are observable without one:
+/// a dirty worktree refuses listing the files, an unmerged+unpushed
+/// branch refuses, and finish succeeds once the branch is merged.
+#[test]
+fn issue_finish_dirty_and_unmerged_refusals() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "Guards", "--project", "demo"]
+        )
+        .0
+    );
+    assert!(cli(&pm, &state, &["issue", "start", "D-1"]).0);
+    let wt = repo.join(".cadence/wt/d-1-guards");
+
+    // Strip the owner so the daemon check is skipped — a tracker
+    // commit of its own so finish commits nothing extra.
+    let md = pm.join("demo/D-1/issue.md");
+    let front = std::fs::read_to_string(&md).unwrap();
+    std::fs::write(&md, front.replace("owner: operator\n", "")).unwrap();
+    git(&pm, &["add", "-A"]);
+    git(
+        &pm,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "setup",
+        ],
+    );
+    let before = commits(&pm);
+
+    // Dirty: the refusal lists the uncommitted paths.
+    std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("uncommitted") && msg.contains("scratch.txt"),
+        "{msg}"
+    );
+    assert!(wt.is_dir());
+    assert_eq!(commits(&pm), before);
+
+    // Committed but unmerged and unpushed: the work would be lost.
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "wip"]);
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains("neither merged"),
+        "{err}"
+    );
+    assert!(wt.is_dir());
+
+    // Merge into the repo's default branch → the guards pass and the
+    // cleanup lands in one tracker commit.
+    git(&repo, &["merge", "-q", "cadence/d-1-guards"]);
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["finished"], true);
+    assert_eq!(out["overrode"], json!([]));
+    assert!(!wt.exists());
+    assert!(
+        !git(
+            &repo,
+            &["rev-parse", "--verify", "--quiet", "cadence/d-1-guards"]
+        )
+        .0
+    );
+    assert_eq!(commits(&pm), before + 1);
+}
+
+/// Dispatch pre-flight refuses before anything is created: no return
+/// address, an unreadable note, or an unreachable daemon each leave
+/// no worktree, branch or tracker commit behind.
+#[test]
+fn dispatch_refusals_leave_nothing() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Disp", "--project", "demo"]).0);
+    let before = commits(&pm);
+    let wt = repo.join(".cadence/wt/d-1-disp");
+    let note = _tmp.path().join("note.md");
+    std::fs::write(&note, "# kickoff").unwrap();
+    let note_s = note.to_str().unwrap().to_string();
+
+    // No --reply-to and no CADENCE_ALIAS (the cli helper strips it).
+    let (ok, err) = cli(
+        &pm,
+        &state,
+        &["dispatch", "D-1", "--to", "w1", "--note", &note_s],
+    );
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("return address"),
+        "{err}"
+    );
+
+    // Unreadable note.
+    let (ok, err) = cli(
+        &pm,
+        &state,
+        &[
+            "dispatch",
+            "D-1",
+            "--to",
+            "w1",
+            "--note",
+            "/nonexistent/kickoff.md",
+            "--reply-to",
+            "pm",
+        ],
+    );
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("unreadable"),
+        "{err}"
+    );
+
+    // Daemon down: the worker can't be verified — refused, nothing.
+    let (ok, err) = cli(
+        &pm,
+        &state,
+        &[
+            "dispatch",
+            "D-1",
+            "--to",
+            "w1",
+            "--note",
+            &note_s,
+            "--reply-to",
+            "pm",
+        ],
+    );
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains("not reachable"),
+        "{err}"
+    );
+
+    assert!(!wt.exists());
+    assert!(
+        !git(
+            &repo,
+            &["rev-parse", "--verify", "--quiet", "cadence/d-1-disp"]
+        )
+        .0
+    );
+    assert_eq!(commits(&pm), before);
+}

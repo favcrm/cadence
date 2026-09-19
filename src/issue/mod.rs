@@ -7,7 +7,9 @@
 
 pub mod board;
 pub mod cli;
+pub mod dispatch;
 pub mod doctor;
+pub mod finish;
 pub mod history;
 pub mod hooks;
 pub mod lint;

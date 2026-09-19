@@ -8,7 +8,9 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
-use crate::issue::{board, doctor, history, hooks, lint, model, project, start, sync, write, Pm};
+use crate::issue::{
+    board, doctor, finish, history, hooks, lint, model, project, start, sync, write, Pm,
+};
 
 #[derive(Subcommand)]
 pub enum IssueAction {
@@ -135,6 +137,26 @@ pub enum IssueAction {
         /// Assignee for the worktree-scoped task.
         #[arg(long, requires = "job")]
         assignee: Option<String>,
+    },
+    /// Finish an issue's worktree: refuse while the owner agent has a
+    /// live message or a busy pane, while the worktree is dirty, or
+    /// while the branch is neither merged nor pushed — `--force`
+    /// overrides each (recorded). Then `git worktree remove`, delete
+    /// the branch (`--keep-branch` keeps it, `--remote` deletes the
+    /// remote one too) and mark both refs `closed: true` in one
+    /// commit. The issue's status is untouched.
+    Finish {
+        id: String,
+        /// Override the owner-busy, dirty and unmerged refusals —
+        /// recorded on the finish commit and in the output.
+        #[arg(long)]
+        force: bool,
+        /// Remove the worktree but keep the local branch.
+        #[arg(long)]
+        keep_branch: bool,
+        /// Also delete the remote branch (`push origin --delete`).
+        #[arg(long)]
+        remote: bool,
     },
     /// Show one issue — frontmatter, body, links both ways, comments,
     /// artifacts, activity.
@@ -449,6 +471,24 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 },
             };
             print_json(&start::run(&pm_dir, id, &args, "", state_dir)?);
+            Ok(0)
+        }
+        IssueAction::Finish {
+            id,
+            force,
+            keep_branch,
+            remote,
+        } => {
+            let pm_dir = open_pm()?;
+            print_json(&finish::run(
+                &pm_dir,
+                id,
+                *force,
+                *keep_branch,
+                *remote,
+                "",
+                state_dir,
+            )?);
             Ok(0)
         }
         IssueAction::Show { id, json } => {

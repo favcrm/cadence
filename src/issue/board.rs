@@ -815,6 +815,7 @@ mod tests {
             url: Some("https://x/1".to_string()),
             path: None,
             label: Some("PR #1".to_string()),
+            closed: None,
         }];
         let vs = views(Path::new("/no-notes"), vec![i]);
         let card = card_json(view_of(&vs, "CAD-1"));

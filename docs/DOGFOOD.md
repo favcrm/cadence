@@ -453,6 +453,32 @@ not fooled; branch protection would be.
 **Rule that fell out:** a verdict is about a commit, so store it on the
 commit — a note about a branch goes stale the moment the branch moves.
 
+## Dispatch and cleanup were four commands each
+
+**What happened.** Even with `issue start` minting the worktree, a PM
+hand-off was still four manual steps: `issue start`, compose the
+message pointing at the kickoff note and the worktree, `cadence send`,
+add the tracker comment — and after the merge three more: `git
+worktree remove`, `git branch -D`, close the refs. Twice a PM removed
+a worktree while its worker was still running tests inside it — the
+cleanup had no idea the pane was busy because nothing checked.
+
+**What landed.** `cadence dispatch <ISSUE> --to <worker> --note
+<kickoff>` collapses the send side into one command: `issue start`
+(idempotent), then exactly one single-line kickoff built from a fixed
+template — note path, issue id, summary, worktree, branch, base sha7,
+the `Issue:` trailer instruction, the reply-to — plus a tracker
+comment and a `message` ref on the issue. Everything that can be
+checked is checked before anything is created: worker exists and
+isn't fenced, note readable, daemon reachable, body passes the pty
+single-line and forbidden-prefix rules. A live kickoff on the issue
+makes a second dispatch a reported duplicate, not a double-send.
+`issue finish <ID>` is the matching cleanup: it refuses while the
+owner has a live message or a busy pane (the daemon must answer — it
+will not guess), while the worktree is dirty, and while the branch is
+unmerged and unpushed — then removes both and closes the refs in one
+commit. `--force` overrides each guard and is recorded on the commit.
+
 ## The general lesson
 
 Every one of these was discovered by the system failing *in use*, not
