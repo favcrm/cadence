@@ -12,6 +12,7 @@ pub mod issue;
 pub mod mcp;
 pub mod proc;
 pub mod proto;
+pub mod review;
 pub mod skill;
 pub mod store;
 pub mod ui;

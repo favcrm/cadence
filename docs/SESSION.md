@@ -138,38 +138,64 @@ publish a blocking note from evidence you have not verified.
 
 ## 5. Review
 
-Review every PR in your own detached checkout, never in the worker's
-worktree (shared build directories and in-place rebases falsify test
-results):
+Run the mechanical routine as one command, then do the hands-on check:
 
 ```bash
-git fetch origin
-git worktree add --detach .cadence/wt/review-NN origin/<branch>
-cd .cadence/wt/review-NN/ui && ln -sfn ../../../../ui/node_modules node_modules && pnpm build && cd ..
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib --bins --test board
-cargo test --test integration            # about 8 minutes; once
+cadence review <PR>                  # report path + suggested verdict on stdout
+cadence review <PR> --no-full        # skip the ~8-minute full suite
+cadence review <PR> --stress 10 --keep --json
 ```
+
+`cadence review` resolves the PR through `gh`, gates a **detached**
+checkout under `.cadence/wt/review-<pr>` (never the worker's worktree —
+shared build directories and in-place rebases falsify test results),
+and when the base branch moved since the merge-base it gates the
+**merge result** instead (`git merge --no-commit` on the base head; a
+conflict is reported with its files). It then runs the ordered gates
+from `cadence-review.toml`, stresses every new test matching the
+"waits on daemon state" pattern `--stress` times in isolation, runs
+the full suite once, and reruns every failing test alone on the gated
+tree **and** on the base head before calling anything a regression.
+The report (Markdown + `--json`) lands under
+`<state>/reviews/` with per-step durations and tails, new-test stress
+counts, the three-way failure compare, pairwise conflicts with other
+open PRs, a schema-migration flag, and a `suggested_verdict` of
+`pass|needs-hands-on|blocked` with reasons — also the process exit
+code (0/1/2). It never posts a status, never merges, never pushes.
+
+Safety edges the tool owns: it refuses to reuse an existing
+`.cadence/wt/review-<pr>` checkout (a `--keep` leftover or a
+reviewer's own tree) and marks every worktree it creates so cleanup
+can never remove a foreign one. A failure it cannot rerun — the test
+file is not locatable, the base tree would not prepare, the run timed
+out — is `unknown`, the comparison `inconclusive`, and the suggestion
+`blocked`; it never launders "could not run" into "pre-existing".
+
+Two guards keep it from colliding with the fleet: one review at a time
+per repo (a lock under `<state>/reviews/`), and — when
+`CADENCE_SUITE_LOCK` names a path — an exclusive `flock` around the
+full suite so a reviewer and workers never run the ten-minute suite
+concurrently.
 
 Then do one thing the tests do not: drive the feature by hand on a
 scratch daemon (`CADENCE_STATE_DIR=/tmp/short-path`), a temp repo or a
 temp tracker. Most real findings came from this step.
 
-Rules that were learned the hard way:
+Rules that were learned the hard way (now encoded in the command):
 
 - **Compare under equal conditions before blaming a PR.** A failure in a
   full parallel run means nothing until the same test has been run
-  alone on the PR head *and* on main.
+  alone on the PR head *and* on main — the report's compare table does
+  exactly that.
 - **Stress new tests that wait on daemon state**, five to ten times in
   isolation. One green full run missed a real race.
-- **When main moved under the PR, gate the merge result**: check out
-  `origin/main`, `git merge` the PR branch, run the gates there. If the
+- **When main moved under the PR, gate the merge result.** If the
   author rebases meanwhile, `git diff <gated tree> <new head>` being
   empty lets you re-issue the verdict for the new head.
 - **A schema migration gets a rehearsal**: `sqlite3 <live db> ".backup
   copy.db"`, disable every agent in the copy (`update agents set
-  enabled=0`), open it with the PR binary.
+  enabled=0`), open it with the PR binary. The report flags it; the
+  rehearsal stays manual.
 - Findings go back as a new kickoff under the same loop id, quoting the
   failing items. The reviewer does not fix the PR.
 
