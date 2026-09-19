@@ -245,6 +245,67 @@ enum Commands {
         #[arg(long)]
         agents_md: bool,
     },
+    /// Launch a Cursor Agent terminal (`cursor-agent`) as a managed
+    /// agent on the pty endpoint — an owned tmux pane, the same gated
+    /// transport as `cadence devin`. `-r <chatId>` resumes an existing
+    /// Cursor chat; without it a fresh chat is minted with
+    /// `cursor-agent create-chat` and becomes addressable by its id.
+    /// Once the endpoint is open this terminal attaches to the owned
+    /// pane by default (`--detach` opts out; a non-TTY or nested-tmux
+    /// launch prints the command instead).
+    Cursor {
+        /// Resume an existing Cursor chat by its id.
+        #[arg(short = 'r', long)]
+        resume: Option<String>,
+        /// Do not attach this terminal to the owned pane once open.
+        #[arg(long)]
+        detach: bool,
+        /// Working directory for the session [default: current directory].
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Routing alias [default: cursor-<random>].
+        #[arg(long)]
+        alias: Option<String>,
+        /// pm or worker.
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// Model flag passed to the CLI (`--model <model>`).
+        #[arg(long)]
+        model: Option<String>,
+        /// Cursor permission mode: auto-review or force. Persisted and
+        /// replayed on every launch/resume.
+        #[arg(long)]
+        permission_mode: Option<String>,
+        /// Shortcut for --permission-mode force.
+        #[arg(long, conflicts_with = "permission_mode")]
+        bypass: bool,
+        /// File with reusable provider instructions.
+        #[arg(long)]
+        instructions_file: Option<PathBuf>,
+        /// Run the session in an isolated checkout:
+        /// `git worktree add <repo>/.cadence/wt/<name> -b cadence/<name>`
+        /// becomes the agent's cwd.
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Also enqueue the briefing as the agent's first durable
+        /// message (standalone launches get the file + AGENTS.md
+        /// silently by default).
+        #[arg(long, conflicts_with = "no_bootstrap")]
+        bootstrap: bool,
+        /// Skip the briefing file and AGENTS.md block entirely.
+        #[arg(long)]
+        no_bootstrap: bool,
+        /// Opt into verified auto-ready: the daemon probes the pane and
+        /// self-claims the ready gate when the TUI is visibly idle
+        /// (a human `agent ready` still wins).
+        #[arg(long)]
+        auto_ready: bool,
+        /// Write the cadence marker block into the cwd repo's AGENTS.md
+        /// once the endpoint opens (persisted, re-applied on resume).
+        /// Off by default — launches leave the repo untouched.
+        #[arg(long)]
+        agents_md: bool,
+    },
     /// Enqueue a durable message to an agent — the hot-path alias for
     /// `message send`. Returns once the message is durable; delivery and
     /// reporting continue asynchronously.
@@ -316,16 +377,17 @@ enum Commands {
     },
     /// Join a new worker agent to a group. `<group>` is the PM agent —
     /// its alias or provider-native id — and `<provider>` is devin,
-    /// codex, claude or fake. The worker's results route back to the PM
-    /// by default (its params gain `"upstream"`). This terminal attaches
-    /// once the endpoint is open, same rules as `cadence devin`.
+    /// codex, claude, cursor or fake. The worker's results route back
+    /// to the PM by default (its params gain `"upstream"`). This
+    /// terminal attaches once the endpoint is open, same rules as
+    /// `cadence devin`.
     Join {
         /// Group handle — the PM agent's alias or native session id.
         group: String,
-        /// Worker provider: devin, codex, claude or fake.
+        /// Worker provider: devin, codex, claude, cursor or fake.
         provider: String,
         /// Resume an existing native session as the worker (devin slug,
-        /// or a Claude session id with --tui).
+        /// a Claude session id with --tui, or a Cursor chat id).
         #[arg(short = 'r', long)]
         resume: Option<String>,
         /// Run the worker's interactive terminal in an owned tmux pane
@@ -365,7 +427,8 @@ enum Commands {
         /// resume). Off by default — joins leave the repo untouched.
         #[arg(long)]
         agents_md: bool,
-        /// Model flag for provider `claude` (e.g. sonnet, haiku).
+        /// Model flag for providers `claude` and `cursor` (e.g.
+        /// sonnet, haiku).
         #[arg(long)]
         model: Option<String>,
         /// Reasoning effort for provider `claude` (`--effort`).
@@ -373,7 +436,7 @@ enum Commands {
         effort: Option<String>,
         /// Permission mode, replayed on resume. Claude takes its own
         /// modes [default: manual]; devin takes auto, accept-edits,
-        /// smart or dangerous.
+        /// smart or dangerous; cursor takes auto-review or force.
         #[arg(long)]
         permission_mode: Option<String>,
         /// Extra auto-allowed tool patterns for provider `claude`;
@@ -381,7 +444,7 @@ enum Commands {
         #[arg(long)]
         allow: Vec<String>,
         /// Permission-mode shortcut: bypassPermissions for claude,
-        /// dangerous for devin.
+        /// dangerous for devin, force for cursor.
         #[arg(long, conflicts_with = "permission_mode")]
         bypass: bool,
         /// Seconds without any provider event before a claude turn is
@@ -2592,6 +2655,7 @@ fn run() -> Result<i32> {
                 permission_mode,
                 bypass,
             },
+            &CursorOpts::default(),
         ),
         Commands::Codex {
             detach,
@@ -2621,6 +2685,7 @@ fn run() -> Result<i32> {
             tui,
             &ClaudeOpts::default(),
             &DevinOpts::default(),
+            &CursorOpts::default(),
         ),
         Commands::Claude {
             tui,
@@ -2671,6 +2736,45 @@ fn run() -> Result<i32> {
                 turn_max_secs,
             },
             &DevinOpts::default(),
+            &CursorOpts::default(),
+        ),
+        Commands::Cursor {
+            resume,
+            detach,
+            cwd,
+            alias,
+            role,
+            model,
+            permission_mode,
+            bypass,
+            instructions_file,
+            worktree,
+            bootstrap,
+            no_bootstrap,
+            auto_ready,
+            agents_md,
+        } => provider_launch(
+            &state_dir,
+            "cursor",
+            cwd,
+            &role,
+            alias,
+            resume,
+            instructions_file,
+            detach,
+            None,
+            worktree.as_deref(),
+            BriefMode::standalone(no_bootstrap, bootstrap),
+            auto_ready,
+            agents_md,
+            false,
+            &ClaudeOpts::default(),
+            &DevinOpts::default(),
+            &CursorOpts {
+                model,
+                permission_mode,
+                bypass,
+            },
         ),
         Commands::Join {
             group,
@@ -2711,7 +2815,7 @@ fn run() -> Result<i32> {
             auto_ready,
             agents_md,
             ClaudeOpts {
-                model,
+                model: model.clone(),
                 effort,
                 permission_mode: permission_mode.clone(),
                 allow,
@@ -2725,6 +2829,13 @@ fn run() -> Result<i32> {
             // devin worker too — its four-mode vocabulary is validated
             // in provider_launch.
             DevinOpts {
+                permission_mode: permission_mode.clone(),
+                bypass,
+            },
+            // …and the cursor worker — its two-mode vocabulary is
+            // validated in provider_launch the same way.
+            CursorOpts {
+                model,
                 permission_mode,
                 bypass,
             },
@@ -3814,6 +3925,17 @@ struct DevinOpts {
     bypass: bool,
 }
 
+/// Cursor-specific launch options — `params.model` and
+/// `params.permission_mode` ride the profile so the same
+/// `--model`/`--force`/`--auto-review` argv replays on every pane open.
+/// `--bypass` is the `force` shorthand.
+#[derive(Default)]
+struct CursorOpts {
+    model: Option<String>,
+    permission_mode: Option<String>,
+    bypass: bool,
+}
+
 /// `cadence devin [-r slug]` / `cadence codex` / `cadence claude`:
 /// register the provider's endpoint, wait for it to open, then attach
 /// this terminal by default where the kind has an attachable surface.
@@ -3838,6 +3960,7 @@ fn provider_launch(
     tui: bool,
     claude: &ClaudeOpts,
     devin: &DevinOpts,
+    cursor: &CursorOpts,
 ) -> Result<i32> {
     // `--tui` selects the provider's pty endpoint where one exists;
     // otherwise the launch kind comes from the registry's default.
@@ -3979,6 +4102,23 @@ fn provider_launch(
         };
         if let Some(mode) = mode {
             registry::devin_permission_mode(mode)?;
+            params_obj.insert("permission_mode".to_string(), json!(mode));
+        }
+    }
+    // Cursor's model/permission params persist the same way — the
+    // profile replays them into the pane argv on every open; `--bypass`
+    // stores `force`.
+    if provider == "cursor" {
+        if let Some(model) = &cursor.model {
+            params_obj.insert("model".to_string(), json!(model));
+        }
+        let mode = if cursor.bypass {
+            Some("force")
+        } else {
+            cursor.permission_mode.as_deref()
+        };
+        if let Some(mode) = mode {
+            registry::cursor_permission_mode(mode)?;
             params_obj.insert("permission_mode".to_string(), json!(mode));
         }
     }
@@ -4131,6 +4271,7 @@ fn join_group(
     agents_md: bool,
     claude_opts: ClaudeOpts,
     devin_opts: DevinOpts,
+    cursor_opts: CursorOpts,
 ) -> Result<i32> {
     // Validate the provider before any work — the registry names the
     // supported launch verbs in the rejection.
@@ -4176,6 +4317,7 @@ fn join_group(
         tui,
         &claude_opts,
         &devin_opts,
+        &cursor_opts,
     )
 }
 
