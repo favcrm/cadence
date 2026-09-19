@@ -16792,10 +16792,9 @@ fn stub_agent(
     kind: &str,
     state: &str,
     idle_for_secs: i64,
-    messages: Vec<Value>,
-    queued: i64,
-    unknown: i64,
+    show: (Vec<Value>, i64, i64),
 ) -> StubAgent {
+    let (messages, queued, unknown) = show;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -16990,9 +16989,11 @@ fn session_start_reports_failures_and_fix_only_starts_ui() {
                 "fake",
                 "attention",
                 700,
-                vec![json!({"id": "m-unk", "state": "unknown", "body": "lost turn"})],
-                0,
-                1,
+                (
+                    vec![json!({"id": "m-unk", "state": "unknown", "body": "lost turn"})],
+                    0,
+                    1,
+                ),
             ),
             stub_agent(
                 "pm-inbox",
@@ -17000,9 +17001,11 @@ fn session_start_reports_failures_and_fix_only_starts_ui() {
                 "inbox",
                 "idle",
                 700,
-                vec![json!({"id": "k1", "state": "queued", "body": "kickoff"})],
-                2,
-                0,
+                (
+                    vec![json!({"id": "k1", "state": "queued", "body": "kickoff"})],
+                    2,
+                    0,
+                ),
             ),
         ],
     );
@@ -17086,18 +17089,20 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
         &state,
         cadence_agent::overview::BUILD_COMMIT,
         vec![
-            stub_agent("old-idle", "fake", "fake", "idle", 7200, vec![], 0, 0),
-            stub_agent("fresh-idle", "fake", "fake", "idle", 60, vec![], 0, 0),
+            stub_agent("old-idle", "fake", "fake", "idle", 7200, (vec![], 0, 0)),
+            stub_agent("fresh-idle", "fake", "fake", "idle", 60, (vec![], 0, 0)),
             stub_agent(
                 "busy-one",
                 "fake",
                 "fake",
                 "busy",
                 7200,
-                vec![json!({"id": "m-run", "state": "running",
-                       "body": "long turn", "started": 1.0})],
-                0,
-                0,
+                (
+                    vec![json!({"id": "m-run", "state": "running",
+                             "body": "long turn", "started": 1.0})],
+                    0,
+                    0,
+                ),
             ),
             stub_agent(
                 "queued-one",
@@ -17105,11 +17110,13 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
                 "fake",
                 "idle",
                 7200,
-                vec![json!({"id": "m-q", "state": "queued", "body": "queued"})],
-                1,
-                0,
+                (
+                    vec![json!({"id": "m-q", "state": "queued", "body": "queued"})],
+                    1,
+                    0,
+                ),
             ),
-            stub_agent("pm-inbox", "inbox", "inbox", "idle", 7200, vec![], 2, 0),
+            stub_agent("pm-inbox", "inbox", "inbox", "idle", 7200, (vec![], 2, 0)),
         ],
     );
 

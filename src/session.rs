@@ -942,12 +942,14 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         sweep_row.detail = "clean".to_string();
     }
     // Orphan pids deserve their own lines — the checklist's "five hung
-    // test binaries" are named, not counted.
+    // test binaries" are named, not counted. Capped: the summary line
+    // above already carries the full count.
     for c in host_scan["checks"].as_array().cloned().unwrap_or_default() {
         if c["name"].as_str() != Some("orphans") {
             continue;
         }
-        for o in c["value"]["pids"].as_array().cloned().unwrap_or_default() {
+        let pids = c["value"]["pids"].as_array().cloned().unwrap_or_default();
+        for o in pids.iter().take(8) {
             sweep_row.items.push(format!(
                 "orphan pid {} — {} ({})",
                 o["pid"],
@@ -961,6 +963,11 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+        }
+        if pids.len() > 8 {
+            sweep_row
+                .items
+                .push(format!("… and {} more orphan pid(s)", pids.len() - 8));
         }
     }
     rows.push(sweep_row);
