@@ -39,7 +39,7 @@ Error kinds:
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded) then exits |
 | `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?` | `{alias,state:"starting"|"idle",provider}` |
 | `agent_list` | — | `{agents:[Agent+tasks+capabilities]}` — `tasks` names the alias's non-terminal task assignments; `capabilities` is the registry descriptor |
-| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown}` — `unknown` counts unreconciled unknowns fencing the agent; `agent.capabilities` is the registry descriptor |
+| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown}` — `unknown` counts unreconciled unknowns fencing the agent; `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_source` (`configured` or `provider default`) and `effort` — also on every `agent_list` row |
 | `agent_send` | `alias, text, message?, reply_to?, source?, task?` | `{message,state,duplicate}` — `task` attaches the delivery to a task for indexing |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after?, wait(<=30), tail?` | `{events:[Event], cursor, has_older}` — `tail:true` returns the newest page (50) in ascending order instead of paging forward from `after` |
@@ -51,7 +51,7 @@ Error kinds:
 | `agent_ready` | `alias, by?, force?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; probes the pane first and refuses a visibly busy one unless `force`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
-| `agent_set` | `alias, patch` | merges an allowlisted param into the live agent — today only `auto_ready` (`"verified"` or null-removal, pty only); `{state:"updated"}` |
+| `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`; `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; null clears to the provider default) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit PTY ack/result; `sha` names the produced commit for task-attached kickoffs |
 | `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?, sha?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice. A `sha` on `completed` binds like a worker `--sha` |
@@ -132,13 +132,15 @@ name a registered agent (both enforced by `enqueue`).
 
 For provider `claude`, `params` holds the launch options the adapter
 replays verbatim on every resume: `{"model": "<cli model>",
-"permission_mode": "<claude mode>"}` (default `manual`;
+"effort": "low|medium|high|xhigh|max"` (the CLI's `--effort`; any other
+level is refused at register and by the verbs),
+`"permission_mode": "<claude mode>"}` (default `manual`;
 `--bypass` stores `bypassPermissions`), `{"allowed_tools": ["<pat>",
 …]}` — appended to the `Bash(cadence *)` baseline the CLI tool needs
 to self-report — and, on the managed endpoint only, the turn-liveness
 knobs `{"turn_idle_secs": N}` (default 900) plus `{"turn_max_secs": N}`
 (optional absolute cap; pty liveness is the pane itself). On the pty
-endpoint the same `permission_mode`/`allowed_tools`/`model` params map
+endpoint the same `permission_mode`/`allowed_tools`/`model`/`effort` params map
 to the TUI's own launch flags and `{"session": "<claude-session-id>"}`
 resumes a native session (`cadence claude --tui -r <id>`).
 
@@ -484,7 +486,7 @@ headless process per agent:
 
 ```
 claude -p --input-format stream-json --output-format stream-json --verbose
-         (--session-id <uuid> | --resume <uuid>) [--model <m>]
+         (--session-id <uuid> | --resume <uuid>) [--model <m>] [--effort <level>]
          --permission-mode <mode> --allowedTools <pat> …
 ```
 

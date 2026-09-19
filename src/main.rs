@@ -176,9 +176,14 @@ enum Commands {
         /// pm or worker.
         #[arg(long, default_value = "worker")]
         role: String,
-        /// Model flag passed to the CLI (e.g. sonnet, haiku).
+        /// Model flag passed to the CLI (e.g. sonnet, haiku, opus).
+        /// Unset = the provider default from the CLI's own settings.
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning effort passed as `--effort`. Replayed on resume;
+        /// unset = the provider default.
+        #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
+        effort: Option<String>,
         /// Claude permission mode [default: manual]. Replayed on resume.
         #[arg(long)]
         permission_mode: Option<String>,
@@ -363,6 +368,9 @@ enum Commands {
         /// Model flag for provider `claude` (e.g. sonnet, haiku).
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning effort for provider `claude` (`--effort`).
+        #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
+        effort: Option<String>,
         /// Permission mode, replayed on resume. Claude takes its own
         /// modes [default: manual]; devin takes auto, accept-edits,
         /// smart or dangerous.
@@ -893,10 +901,17 @@ enum AgentAction {
     /// Merge `key=value` pairs into an agent's endpoint params — e.g.
     /// `agent set <alias> auto_ready=verified` opts a live agent into
     /// daemon-verified readiness.
+    ///
+    /// `--next-launch` stores launch params (`model`, `effort`) for the
+    /// agent's next open instead — the live process is untouched; `agent
+    /// stop` + `agent resume` picks them up.
     Set {
         alias: String,
         /// key=value pairs; a bare `key` (no `=`) removes it.
         pairs: Vec<String>,
+        /// Store `model`/`effort` for the next launch rather than live.
+        #[arg(long)]
+        next_launch: bool,
     },
     /// Remove a dead agent's registry row — and with it the message and
     /// event history. Refuses while an endpoint is live (`agent stop`
@@ -2462,7 +2477,11 @@ fn run() -> Result<i32> {
                 AgentAction::Probe { alias } => {
                     client::rpc(&state_dir, "agent_probe", json!({"alias": alias}))?
                 }
-                AgentAction::Set { alias, pairs } => {
+                AgentAction::Set {
+                    alias,
+                    pairs,
+                    next_launch,
+                } => {
                     let mut patch = serde_json::Map::new();
                     for kv in &pairs {
                         match kv.split_once('=') {
@@ -2482,7 +2501,7 @@ fn run() -> Result<i32> {
                     client::rpc(
                         &state_dir,
                         "agent_set",
-                        json!({"alias": alias, "patch": patch}),
+                        json!({"alias": alias, "patch": patch, "next_launch": next_launch}),
                     )?
                 }
                 AgentAction::Capture { alias } => {
@@ -2581,6 +2600,7 @@ fn run() -> Result<i32> {
             alias,
             role,
             model,
+            effort,
             permission_mode,
             allow,
             bypass,
@@ -2612,6 +2632,7 @@ fn run() -> Result<i32> {
             tui,
             &ClaudeOpts {
                 model,
+                effort,
                 permission_mode,
                 allow,
                 bypass,
@@ -2637,6 +2658,7 @@ fn run() -> Result<i32> {
             auto_ready,
             agents_md,
             model,
+            effort,
             permission_mode,
             allow,
             bypass,
@@ -2661,6 +2683,7 @@ fn run() -> Result<i32> {
             agents_md,
             ClaudeOpts {
                 model,
+                effort,
                 permission_mode: permission_mode.clone(),
                 allow,
                 bypass,
@@ -3716,6 +3739,8 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
 #[derive(Default)]
 struct ClaudeOpts {
     model: Option<String>,
+    /// `params.effort` — the CLI's `--effort` level.
+    effort: Option<String>,
     permission_mode: Option<String>,
     allow: Vec<String>,
     bypass: bool,
@@ -3853,6 +3878,9 @@ fn provider_launch(
         let spec = registry::spec(provider, endpoint_kind)?;
         if let Some(model) = &claude.model {
             params_obj.insert("model".to_string(), json!(model));
+        }
+        if let Some(effort) = &claude.effort {
+            params_obj.insert("effort".to_string(), json!(effort));
         }
         let permission_mode = if claude.bypass {
             Some("bypassPermissions".to_string())

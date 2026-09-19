@@ -6927,6 +6927,156 @@ fn claude_params_replayed_on_resume() {
     assert_eq!(agent["params"]["turn_max_secs"], 3600, "{agent}");
 }
 
+/// CAD-88: `effort` rides the launch line like `model`, the stream's
+/// init model is reported beside the configured params, and `agent set
+/// --next-launch` changes model/effort for the next open only.
+#[test]
+fn claude_effort_next_launch_and_model_reported() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude("ok", None);
+    d.register_claude("w1", json!({"effort": "low"}));
+    d.wait_agent("w1", "idle", 15);
+    // A completed turn orders after the argv dump and the init event.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "boot", "message": "m-boot"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-boot", &["completed"], 20);
+    let argv_file = mock.pidfile.with_extension("pid.argv");
+    let argv1 = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv1.contains("--effort\nlow"), "{argv1}");
+    assert!(!argv1.contains("--model"), "{argv1}");
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["model_reported"], "mock-claude", "{agent}");
+    assert!(agent["model_configured"].is_null(), "{agent}");
+    assert_eq!(agent["model_source"], "provider default", "{agent}");
+    assert_eq!(agent["effort"], "low", "{agent}");
+    let row = d.rpc("agent_list", json!({})).unwrap()["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "w1")
+        .cloned()
+        .unwrap();
+    assert_eq!(row["model_reported"], "mock-claude", "{row}");
+    assert_eq!(row["model_source"], "provider default", "{row}");
+
+    // Without --next-launch the live-set refusal is unchanged.
+    let err = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "w1", "patch": {"model": "opus"}}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("not live-settable"), "{err}");
+    // With it (through the CLI): stored, the live process untouched.
+    let pid = agent["pid"].clone();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "agent",
+            "set",
+            "w1",
+            "model=opus",
+            "effort=high",
+            "--next-launch",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reply["applies"], "next launch", "{reply}");
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["pid"], pid, "live process must not change: {agent}");
+    assert_eq!(agent["state"], "idle", "{agent}");
+    assert_eq!(agent["model_configured"], "opus", "{agent}");
+    assert_eq!(agent["model_source"], "configured", "{agent}");
+    assert_eq!(agent["effort"], "high", "{agent}");
+    assert_eq!(std::fs::read_to_string(&argv_file).unwrap(), argv1);
+
+    // stop + resume picks both up; a turn orders after the rewrite.
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "boot2", "message": "m-boot2"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m-boot2", &["completed"], 20);
+    let argv2 = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv2.contains("--resume\n"), "{argv2}");
+    assert!(argv2.contains("--model\nopus"), "{argv2}");
+    assert!(argv2.contains("--effort\nhigh"), "{argv2}");
+
+    // A bare key clears back to the provider default for the next open.
+    d.rpc(
+        "agent_set",
+        json!({"alias": "w1", "patch": {"model": null}, "next_launch": true}),
+    )
+    .unwrap();
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["model_source"], "provider default", "{agent}");
+}
+
+/// CAD-88: a bad effort level is refused at register, at the CLI and
+/// by `--next-launch`, naming the allowed values; `--next-launch` takes
+/// model and effort only.
+#[test]
+fn claude_effort_validated() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    let err = d
+        .rpc(
+            "agent_register",
+            json!({"alias": "bad", "provider": "claude", "endpoint_kind": "managed",
+                   "cwd": cwd, "params": json!({"effort": "extreme"}).to_string()}),
+        )
+        .unwrap_err()
+        .to_string();
+    for level in ["low", "medium", "high", "xhigh", "max"] {
+        assert!(err.contains(level), "{level} missing: {err}");
+    }
+    for verb in [&["claude"][..], &["join", "pm", "claude"][..]] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(verb)
+            .args(["--effort", "extreme", "--detach"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{verb:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("xhigh"), "{verb:?}: {stderr}");
+    }
+    d.register_claude("w1", Value::Null);
+    d.wait_agent("w1", "idle", 15);
+    for (patch, want) in [
+        (json!({"effort": "extreme"}), "xhigh"),
+        (
+            json!({"upstream": "pm"}),
+            "cannot be set for the next launch",
+        ),
+        (json!({"model": ""}), "non-empty"),
+    ] {
+        let err = d
+            .rpc(
+                "agent_set",
+                json!({"alias": "w1", "patch": patch, "next_launch": true}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(want), "{want} missing: {err}");
+    }
+}
+
 #[test]
 fn claude_replay_fixture_turn() {
     let d = TestDaemon::start();
