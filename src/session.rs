@@ -290,29 +290,114 @@ fn mask_docker_login_positional(words: &mut [String]) {
     }
 }
 
+/// An unquoted token run through docker-positional masking and the
+/// shared argv scrubber — `(rendered, masked?)`.
+fn scrub_tokens(words: &[String]) -> (String, bool) {
+    let mut w = words.to_vec();
+    let pre = w.join(" ");
+    mask_docker_login_positional(&mut w);
+    let red = doctor::host::redact_argv(&w);
+    let masked = red != pre;
+    (red, masked)
+}
+
 /// One display line: `scrub_auth_spans` masks `key<sep>value`
 /// expressions argv-tokenization can't see, then CAD-108's shared
 /// `doctor::host::redact_argv` masks flag/env/URI/credential-shape
 /// values per token; `mask_docker_login_positional` covers `login
-/// -u`'s bare positional password. Process argv itself never reaches
-/// here — orphans display as `exe (arg count)`. A line nothing
-/// masked keeps its original whitespace.
+/// -u`'s bare positional password. A quoted run is one argv element's
+/// surface — whitespace inside it must not split it into independent
+/// tokens, or a secret *inside* a single element still prints
+/// (CAD-141): the interior scrubs as a unit and the whole blob masks
+/// when it differs. Process argv itself never reaches here — orphans
+/// display as `exe (arg count)`. A line nothing masked keeps its
+/// original whitespace.
 fn scrub_line(s: &str) -> String {
     let spanned = scrub_auth_spans(s);
-    let mut words: Vec<String> = spanned.split_whitespace().map(str::to_string).collect();
-    let joined = words.join(" ");
-    mask_docker_login_positional(&mut words);
-    let mut scrubbed = doctor::host::redact_argv(&words);
+    let b = spanned.as_bytes();
+    let mut changed = false;
+    let mut out = String::with_capacity(spanned.len());
+    let mut words: Vec<String> = Vec::new();
+    let mut pending_ws = false;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            pending_ws = !out.is_empty() || !words.is_empty();
+            i += 1;
+            continue;
+        }
+        // A quote with a matching close opens a blob — one argv
+        // element's worth of text, interior whitespace included.
+        if matches!(b[i], b'"' | b'\'') && spanned[i + 1..].contains(b[i] as char) {
+            if !words.is_empty() {
+                let (red, ch) = scrub_tokens(&words);
+                if pending_ws && !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(&red);
+                changed |= ch;
+                words.clear();
+            }
+            let q = b[i];
+            let mut j = i + 1;
+            while j < b.len() && b[j] != q {
+                j += 1;
+            }
+            let iw: Vec<String> = spanned[i + 1..j]
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            let (_red, ch) = scrub_tokens(&iw);
+            if pending_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_ws = false;
+            if ch && !iw.is_empty() {
+                // The element's interior masks — emit the whole blob
+                // masked, keeping its quotes.
+                changed = true;
+                out.push(q as char);
+                out.push_str("[REDACTED]");
+                if j < b.len() {
+                    out.push(q as char);
+                }
+            } else {
+                let end = if j < b.len() { j + 1 } else { j };
+                out.push_str(&spanned[i..end]);
+            }
+            i = if j < b.len() { j + 1 } else { j };
+            continue;
+        }
+        // A plain word — ends at whitespace or at a quote that opens
+        // a blob (an unmatched quote is literal text, not a blob).
+        let mut j = i;
+        while j < b.len()
+            && !b[j].is_ascii_whitespace()
+            && !(matches!(b[j], b'"' | b'\'') && spanned[j + 1..].contains(b[j] as char))
+        {
+            j += 1;
+        }
+        words.push(spanned[i..j].to_string());
+        i = j;
+    }
+    if !words.is_empty() {
+        let (red, ch) = scrub_tokens(&words);
+        if pending_ws && !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&red);
+        changed |= ch;
+    }
+    if !changed {
+        return spanned;
+    }
     // `auth:` is itself a header shape — the argv pass re-masks it
     // and keeps the span's own mask token, doubling the marker.
+    let mut scrubbed = out;
     while scrubbed.contains("[REDACTED] [REDACTED]") {
         scrubbed = scrubbed.replace("[REDACTED] [REDACTED]", "[REDACTED]");
     }
-    if scrubbed == joined {
-        spanned
-    } else {
-        scrubbed
-    }
+    scrubbed
 }
 
 /// The host scan with the command's cwd — `Scan::host` defaults to
@@ -1741,12 +1826,10 @@ mod tests {
             ),
             ("Authorization: ApiKey zzz", "Authorization: [REDACTED]"),
             ("Authorization: Negotiate YlBJ", "Authorization: [REDACTED]"),
-            // Quoted value: the span pass masks to the close quote;
-            // the argv pass then canonicalizes `--flag <masked>`,
-            // dropping the quotes it carried.
+            // Quoted value: mask to the close quote, keep the quotes.
             (
                 "cmd --auth-token \"Bearer sk-live-abc123\" --verbose",
-                "cmd --auth-token [REDACTED] --verbose",
+                "cmd --auth-token \"[REDACTED]\" --verbose",
             ),
             ("token 'sekret v2' done", "token '[REDACTED]' done"),
             // `key:`/`key =` text separators.
@@ -1812,6 +1895,38 @@ mod tests {
             // `=`/`:` imply a value — unconditional.
             ("password: hunter2", "password: [REDACTED]"),
             ("password = hunter2", "password = [REDACTED]"),
+        ] {
+            assert_eq!(scrub_line(line), want, "{line}");
+        }
+    }
+
+    #[test]
+    fn scrub_line_whitespace_blobs_mask_whole() {
+        // CAD-141: a quoted run is one argv element — a secret inside
+        // it masks the whole blob, never just the shaped word.
+        for (line, want) in [
+            // `flag value` inside one element — the span pass masks
+            // the value, the flag name stays (same convention as
+            // `--token [REDACTED]`).
+            (
+                "cmd \"--password hunter2\" rest",
+                "cmd \"--password [REDACTED]\" rest",
+            ),
+            // Header shape whose left side is no keyword.
+            (
+                "curl -H \"X-Custom: figd_abc123 tail\"",
+                "curl -H \"[REDACTED]\"",
+            ),
+            // A bare shaped token inside quotes (the quote would
+            // defeat the argv charset check).
+            ("x \"figd_secret0000\" y", "x \"[REDACTED]\" y"),
+            // Quoted prose stays prose.
+            (
+                "say \"token is expired\" twice",
+                "say \"token is expired\" twice",
+            ),
+            // An unmatched quote is literal text — `don't` is one word.
+            ("don't split on apostrophes", "don't split on apostrophes"),
         ] {
             assert_eq!(scrub_line(line), want, "{line}");
         }
