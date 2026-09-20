@@ -15514,7 +15514,7 @@ fn dispatch_degrades_on_memory_failures() {
     // D-2's title is sized so the kickoff body sits just under the
     // 4000-byte cap — the `Lessons:` suffix is what tips it over.
     let long_title = "x".repeat(3720);
-    for title in ["One".to_string(), long_title] {
+    for title in ["One".to_string(), long_title, "Three".to_string()] {
         assert!(cli(&["issue", "new", &title, "--project", "demo"]).0);
     }
     // One good accepted rule — matching works until the broken file.
@@ -15541,7 +15541,8 @@ fn dispatch_degrades_on_memory_failures() {
     std::fs::write(&note, "# kickoff").unwrap();
     let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
 
-    // Malformed memory file → match fails → degrade, dispatch lands.
+    // Malformed memory file → excluded from the match and named;
+    // the valid rule still reaches the kickoff.
     std::fs::write(
         pm_dir.join("demo/memory/broken.md"),
         "---\nid: [unclosed\n---\nbody\n",
@@ -15558,10 +15559,11 @@ fn dispatch_degrades_on_memory_failures() {
         "pm",
     ]);
     assert!(ok && out["dispatched"] == true, "{out}");
-    assert_eq!(out["lessons"], json!([]), "{out}");
-    assert_eq!(out["lessons_file"], Value::Null, "{out}");
+    assert_eq!(out["lessons"], json!(["good-rule"]), "{out}");
+    let lessons_file = out["lessons_file"].as_str().unwrap_or_default();
+    assert!(lessons_file.ends_with("-lessons.md"), "{out}");
     let err = out["lessons_error"].as_str().unwrap_or_default();
-    assert!(err.contains("memory match failed"), "{out}");
+    assert!(err.contains("broken.md"), "{out}");
     assert!(!out["message"].as_str().unwrap().is_empty());
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     let kick = show["messages"]
@@ -15570,8 +15572,8 @@ fn dispatch_degrades_on_memory_failures() {
         .iter()
         .find(|m| m["id"].as_str() == out["message"].as_str())
         .unwrap();
-    assert!(!kick["body"].as_str().unwrap().contains("Lessons:"));
-    assert!(!d.state.join("dispatch").exists());
+    assert!(kick["body"].as_str().unwrap().contains("Lessons:"));
+    assert!(Path::new(lessons_file).is_file());
 
     // Over-cap: the good rule matches, but the `Lessons:` suffix would
     // push the kickoff body past the 4000-byte pty cap → the suffix
@@ -15606,21 +15608,78 @@ fn dispatch_degrades_on_memory_failures() {
         "original long body sent: {}",
         sent.len()
     );
+    // No new lessons file — D-1's remains the only one — and no
+    // half-written .tmp residue.
+    let names: Vec<String> = std::fs::read_dir(d.state.join("dispatch"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        names.iter().filter(|n| n.ends_with("-lessons.md")).count(),
+        1,
+        "{names:?}"
+    );
+    assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
+
+    // Unwritable lessons dir: `<state>/dispatch` as a plain file →
+    // create_dir_all fails → dispatch still lands, the error is
+    // named, and nothing that looks like a lessons artifact exists.
+    std::fs::remove_dir_all(d.state.join("dispatch")).unwrap();
+    std::fs::write(d.state.join("dispatch"), "not a dir").unwrap();
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-3",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(ok && out["dispatched"] == true, "{out}");
+    assert_eq!(out["lessons"], json!([]), "{out}");
+    assert_eq!(out["lessons_file"], Value::Null, "{out}");
+    let err = out["lessons_error"].as_str().unwrap_or_default();
+    assert!(err.contains("unwritable"), "{out}");
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let kick = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_str() == out["message"].as_str())
+        .unwrap();
+    assert!(!kick["body"].as_str().unwrap().contains("Lessons:"));
     assert!(
-        !d.state.join("dispatch").exists(),
-        "no lessons file written"
+        d.state.join("dispatch").is_file(),
+        "the placeholder is untouched — no dir or file replaced it"
     );
 
-    // Briefing cap: ten fat accepted rules exceed both bounds — the
-    // section keeps ≤8 entries and ≤4 KiB of items.
+    // Briefing cap: an oversized first rule is skipped, not a stop —
+    // later smaller rules still list, ≤8 entries and ≤4 KiB hold,
+    // and the omission is counted. fat-rule-00's hand-edited 5 KiB
+    // fact alone exceeds the byte budget: under the old `break` it
+    // hid every rule after it.
     let mem_dir = pm_dir.join("demo/memory");
-    for i in 0..10 {
+    let rule = |id: &str, fact: &str| {
+        format!(
+            "---\nid: {id}\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  project: true\n---\n{fact}\n\n**Why:** w\n\n**How to apply:** h\n"
+        )
+    };
+    std::fs::write(
+        mem_dir.join("fat-rule-00.md"),
+        rule("fat-rule-00", &"z".repeat(5 * 1024)),
+    )
+    .unwrap();
+    std::fs::write(
+        mem_dir.join("fat-rule-01-tiny.md"),
+        rule("fat-rule-01-tiny", "t"),
+    )
+    .unwrap();
+    for i in 2..10 {
         std::fs::write(
             mem_dir.join(format!("fat-rule-{i:02}.md")),
-            format!(
-                "---\nid: fat-rule-{i:02}\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  project: true\n---\n{}\n\n**Why:** w\n\n**How to apply:** h\n",
-                "y".repeat(700)
-            ),
+            rule(&format!("fat-rule-{i:02}"), &"y".repeat(700)),
         )
         .unwrap();
     }
@@ -15640,6 +15699,11 @@ fn dispatch_degrades_on_memory_failures() {
     let listed = items.matches("- `fat-rule-").count();
     assert!((1..=8).contains(&listed), "{listed} rules in section");
     assert!(items.len() <= 4 * 1024 + 128, "{} bytes", items.len());
+    // The oversized rule never listed; the tiny rule after it did —
+    // proof the budget skip keeps scanning. The omission is counted.
+    assert!(!items.contains("fat-rule-00`"), "{items}");
+    assert!(items.contains("- `fat-rule-01-tiny`"), "{items}");
+    assert!(items.contains("accepted rule(s) omitted"), "{items}");
 }
 
 // ==== operator IX: cadence status, daemon restart, events tail ====
