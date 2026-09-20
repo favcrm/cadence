@@ -162,14 +162,22 @@ fn sel_row(lines: &[&str], i: usize) -> bool {
     l.len() != l.trim_start().len() && l.trim_start().starts_with('❯') && !boxed(lines, i)
 }
 
-/// The open option block as `(selected row, block start, block end)`:
-/// the contiguous run of rows around the highlighted `❯` row where an
-/// option row is `❯`-led at the highlight's indent or carries its
-/// text at the highlight's column (subject and context rows sit at
-/// other indents). A lone `❯` row is not a one-option menu — a real
-/// menu always lists at least one sibling option — so the block must
-/// reach at least two rows or it is transcript text, not a menu.
-fn option_block(lines: &[&str]) -> Option<(usize, usize, usize)> {
+/// The open option block as `(selected row, block start, block end,
+/// corroborated)`. The block is the contiguous run of rows around the
+/// highlighted `❯` row where an option row is `❯`-led at the
+/// highlight's indent or carries its text at the highlight's column
+/// (subject and context rows sit at other indents). A lone `❯` row is
+/// not a one-option menu — a real menu always lists at least one
+/// sibling option — so the block must reach at least two rows or it is
+/// transcript text, not a menu.
+///
+/// Even so, an indented transcript `❯` plus a same-column sibling
+/// satisfies the shape — the block is *corroborated* only by what a
+/// transcript cannot fake at the same indent: a numbered option inside
+/// the run, or the anchored menu legend directly below it (at most one
+/// blank row between, as real menus render). An uncorroborated block
+/// never sets `approval_menu` and is never answered.
+fn option_block(lines: &[&str]) -> Option<(usize, usize, usize, bool)> {
     // The LAST non-boxed `❯` row: a transcript `❯` echo above the menu
     // would otherwise be mistaken for the highlight.
     let sel = (0..lines.len()).rev().find(|i| sel_row(lines, *i))?;
@@ -201,7 +209,16 @@ fn option_block(lines: &[&str]) -> Option<(usize, usize, usize)> {
     while end + 1 < lines.len() && opt(end + 1) {
         end += 1;
     }
-    (end - start + 1 >= 2).then_some((sel, start, end))
+    if end - start + 1 < 2 {
+        return None;
+    }
+    let numbered = (start..=end).any(|i| option_line(lines[i]).is_some());
+    let legend_below = lines[end + 1..]
+        .iter()
+        .take(2)
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| claude_screen::HINT.iter().any(|h| hint_row(l, h)));
+    Some((sel, start, end, numbered || legend_below))
 }
 
 /// The line naming what the menu asks. A `Do you want to proceed?`
@@ -297,15 +314,30 @@ pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         claude_screen::ANCHOR.iter().any(|a| t.starts_with(a))
     });
     let numbered = numbered_block(&menu_lines);
-    // `highlighted` means a real option block — a lone `❯` row is a
-    // transcript echo, not a menu.
-    let highlighted = option_block(&menu_lines).is_some();
+    // `highlighted` means a real option block *with corroboration* —
+    // an indented `❯` plus a same-column sibling is transcript-fakeable,
+    // so the block alone never suffices (numbered rows inside it or the
+    // legend directly below are what count).
+    let highlighted = option_block(&menu_lines).is_some_and(|(.., c)| c);
     let hints = claude_screen::HINT
         .iter()
         .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
         .count();
-    let approval_menu = (anchor && (numbered.len() >= 2 || highlighted || hints >= 1))
-        || (hints >= 1 && (numbered.len() >= 2 || highlighted));
+    // A lone legend row is quotable text too — it corroborates only as
+    // a pair of distinct hints, or sitting within a row or two of the
+    // anchor it belongs to (a `cat`ed doc puts them far apart).
+    let hint_near_anchor = menu_lines.iter().enumerate().any(|(i, l)| {
+        claude_screen::HINT.iter().any(|h| hint_row(l, h))
+            && (i.saturating_sub(2)..=i + 2).any(|j| {
+                menu_lines.get(j).is_some_and(|a| {
+                    let t = a.trim_start();
+                    claude_screen::ANCHOR.iter().any(|s| t.starts_with(s))
+                })
+            })
+    });
+    let legend_ok = hints >= 2 || hint_near_anchor;
+    let approval_menu = (anchor && (numbered.len() >= 2 || highlighted || legend_ok))
+        || (legend_ok && (numbered.len() >= 2 || highlighted));
     let busy_marker = claude_screen::BUSY.iter().any(|m| tail.contains(m));
     // The input box is a `❯`-leading line whose previous row is the
     // `─` border — menu option lists lead with `❯` too but are never
@@ -749,12 +781,22 @@ impl TuiProfile for ClaudeProfile {
         // suffix below it. `option_block` requires a real sibling set
         // around an indented `❯` row, so a transcript `❯` echo beside
         // anchor text cannot be answered as a menu.
-        let (sel, start, end) = option_block(&region).ok_or_else(|| {
+        let (sel, start, end, corroborated) = option_block(&region).ok_or_else(|| {
             Error::rejected(
                 "cannot locate the option rows on this menu — answer \
                  it in the pane",
             )
         })?;
+        // An indentation-inferred block is transcript-fakeable — only
+        // a numbered option or the anchored legend directly below makes
+        // it a menu worth keying.
+        if !corroborated {
+            return Err(Error::rejected(
+                "the option block is inferred from indentation only — no \
+                 numbered option or legend corroborates it; answer it \
+                 in the pane",
+            ));
+        }
         let count = (end - start + 1) as u32;
         if n == 0 || n > count {
             return Err(Error::rejected(format!(
@@ -1109,5 +1151,51 @@ mod tests {
         let p = analyze_claude(screen, None);
         assert!(!p.approval_menu, "{p:?}");
         assert!(prof.approval_answer(screen, "1").is_err());
+    }
+
+    #[test]
+    fn indented_echo_with_a_sibling_is_not_a_menu() {
+        // Round-4 review: an *indented* transcript `❯` passes sel_row,
+        // and a transcript row landing at the same column reads as its
+        // sibling — the two-row block used to set `approval_menu` and
+        // `answer` then keyed a live input box. Indentation alone never
+        // corroborates: only a numbered option inside the run or the
+        // anchored legend directly below does.
+        let screen = "  Do you want to proceed? — I'll ask first.\n    ❯ npm run dev\n      vite v5 ready\n\n❯ \n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        let prof = profile();
+        let err = prof.approval_answer(screen, "2").unwrap_err();
+        assert!(err.to_string().contains("indentation only"), "{err}");
+    }
+
+    #[test]
+    fn legend_below_the_block_corroborates_it() {
+        // The same two-row block WITH the menu legend directly below
+        // is a real select — corroboration is what separates it from
+        // transcript text.
+        let screen = " ❯ npm run dev\n   vite v5 ready\n\n Enter to confirm · Esc to cancel\n";
+        let p = analyze_claude(screen, None);
+        assert!(p.approval_menu, "{p:?}");
+        let prof = profile();
+        assert_eq!(
+            prof.approval_answer(screen, "2").unwrap(),
+            vec!["Down", "Enter"]
+        );
+    }
+
+    #[test]
+    fn lone_legend_far_from_the_anchor_is_not_a_menu() {
+        // A `cat`ed doc can quote an anchor and a hint row far apart —
+        // one hint only corroborates beside the anchor it belongs to
+        // (within two rows); a stray `Esc to cancel` in scrollback is
+        // text, never a menu.
+        let screen = " Do you want to proceed?\n unrelated output row\n another row\n and one more\n Esc to cancel\n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        // …but the hint beside its anchor is a real menu's legend.
+        let screen = " Do you want to proceed?\n Esc to cancel\n ❯ 1. Yes\n   2. No\n";
+        let p = analyze_claude(screen, None);
+        assert!(p.approval_menu, "{p:?}");
     }
 }

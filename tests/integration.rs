@@ -3522,6 +3522,11 @@ if cmd == "capture-pane":
     # make the pane look busy, approval-blocked, etc.
     try: out += open(sess_path(name, "tui-state")).read()
     except FileNotFoundError: pass
+    # Real tmux only prints the pane with `-p` — without it the capture
+    # lands in the paste buffer and stdout stays empty. Emulate that so
+    # a dropped `-p` fails loudly here the way it does on a real pane.
+    if "-p" not in rest:
+        sys.exit(0)
     sys.stdout.write(out); sys.exit(0)
 if cmd == "load-buffer":
     open(os.path.join(state, "buffer"), "w").write(open(rest[-1]).read())
@@ -13630,6 +13635,42 @@ fn pty_idle_pane_menu_surfaces() {
     stall_sample(0);
 }
 
+/// A menu that closes and later reopens is a NEW approval — the same
+/// subject must fire `approval_menu` again. The event history is
+/// scoped to the open menu: it clears when the menu closes, so the
+/// second occurrence is never deduped away.
+#[test]
+fn pty_menu_event_refires_after_close() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let first = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(first["payload"]["line"], "$ printenv FOO", "{first}");
+
+    // Menu closes — the idle screen returns. The sampler must observe
+    // at least one non-menu frame before the reopen.
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+        if show["pane_menu"].is_null() {
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(20), "{show}");
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    // The same menu reopens — same subject — and fires again.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let events = wait_event_count(&d, "dv", "approval_menu", 2, 20);
+    assert_eq!(events[1]["payload"]["line"], "$ printenv FOO", "{events:?}");
+    stall_sample(0);
+}
+
 /// The answerer's identity is derived from the socket peer's pid
 /// walking its /proc ancestry into a pane — never from a `by` the
 /// client chose. A caller inside the target's own pane is refused
@@ -13666,7 +13707,7 @@ fn pty_answer_derives_caller_from_peer_pid() {
             json!({"alias": "dv", "choice": "8", "by": "operator"}),
         )
         .unwrap_err();
-    assert!(err.to_string().contains("its own approval menu"), "{err}");
+    assert!(err.to_string().contains("its own pane"), "{err}");
     let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
     assert!(!input.contains("<KEY"), "no key sent: {input}");
 
@@ -13698,6 +13739,67 @@ fn pty_answer_derives_caller_from_peer_pid() {
     assert_eq!(evs[1]["payload"]["by"], "operator", "{evs:?}");
     assert_eq!(evs[1]["payload"]["by_kind"], "operator", "{evs:?}");
     assert_eq!(evs[1]["payload"]["claimed_by"], "dv", "{evs:?}");
+}
+
+/// `setsid` detaches the caller from the pane's /proc ancestry — the
+/// self-approval guard must still see through it. The pane's own
+/// `CADENCE_ALIAS` env survives the detach, so `setsid env
+/// CADENCE_ALIAS=<self> cadence agent answer <self>` is refused rather
+/// than stamped `operator`. A detached caller carrying another pane's
+/// alias attributes to that pane — an agent, never an operator.
+#[test]
+fn pty_answer_setsid_cannot_launder_self_approval() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.register_devin_opts("peer", json!({}));
+    d.wait_agent("dv", "idle", 20);
+    d.wait_agent("peer", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    // The detached call names its own pane in env — refused, no key
+    // reaches the input, no event is stamped.
+    let out = std::process::Command::new("setsid")
+        .arg("env")
+        .arg("CADENCE_ALIAS=dv")
+        .arg(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "answer", "dv", "8"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "self-answer must refuse: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+    let events = d.rpc("agent_events", json!({"alias": "dv"})).unwrap();
+    assert!(
+        !events.to_string().contains("approval_answered"),
+        "self-answer must not stamp an event: {events}"
+    );
+
+    // Detached and carrying ANOTHER pane's env — stamps that pane as
+    // the agent, not `operator`.
+    let out = std::process::Command::new("setsid")
+        .arg("env")
+        .arg("CADENCE_ALIAS=peer")
+        .arg(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "answer", "dv", "8"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["by"], "peer", "{ev}");
+    assert_eq!(ev["payload"]["by_kind"], "agent", "{ev}");
 }
 
 /// A transient `capture-pane` failure inside the gate probe refuses
@@ -16347,6 +16449,19 @@ fn status_rows_probe_once_and_footer() {
         &pm_dir,
         &["issue", "set", "CAD-3", "owner=w1"],
     );
+    // The stall watch samples each new pty pane once at registration —
+    // the interval only gates REPEATS, so `stall_sample(3600)` cannot
+    // hold that first capture back. Under suite load the watch's first
+    // tick can land this late; wait it out so the window below counts
+    // only the status probes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while tmux_call_count(&mock, &d.state, "capture-pane") < 2 {
+        assert!(
+            deadline.elapsed() < Duration::from_secs(20),
+            "first stall samples for dv1/dv2 never landed"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
     let captures_before = tmux_call_count(&mock, &d.state, "capture-pane");
     let view = status_json(&d.state, &[], &[("CADENCE_PM_DIR", &pm_dir)]);
     let agents = view["agents"].as_array().unwrap();

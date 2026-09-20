@@ -51,7 +51,7 @@ Error kinds:
 | `agent_ready` | `alias, by?, force?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; probes the pane first and refuses a visibly busy one unless `force`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
-| `agent_answer` | `alias, choice, by?, note?` | `{state:"answered"}` — sends one menu-choice keystroke to a `pty` pane probing `approval_menu` (CLI: `cadence agent answer <alias> <choice> [--reason <text>]`); re-probes and refuses any other pane state, so the key can never land in a prompt or a running turn. `choice` is the option's index in the whole printed option block (top to bottom, independent of the highlighted row); the profile's keymap turns it into tmux keys — numbered menus take the digit, hotkeyed options their suffix, unnumbered selects arrows + Enter relative to the highlight. The answerer is derived from the socket peer's pid → pane ancestry — a caller inside the target's own pane is refused, inside another agent's pane stamps `by_kind:"agent"`, otherwise `operator`; a supplied `by` that disagrees is kept only as `claimed_by`. Records `approval_answered` with `by`/`by_kind`/`caller_pid`/`choice`/`line`/`note` and wakes the agent's delivery loop |
+| `agent_answer` | `alias, choice, by?, note?` | `{state:"answered"}` — sends one menu-choice keystroke to a `pty` pane probing `approval_menu` (CLI: `cadence agent answer <alias> <choice> [--reason <text>]`); re-probes and refuses any other pane state, so the key can never land in a prompt or a running turn. `choice` is the option's index in the whole printed option block (top to bottom, independent of the highlighted row); the profile's keymap turns it into tmux keys — numbered menus take the digit, hotkeyed options their suffix, unnumbered selects arrows + Enter relative to the highlight. The answerer is derived from the socket peer's pid — `/proc` ancestry into the pane roots plus the pane `CADENCE_ALIAS` env and the pane's pty fds (a `setsid` detach keeps both) — a caller inside or tied to the target's own pane is refused, inside another agent's pane stamps `by_kind:"agent"`, an ancestry walk that cannot complete refuses while the target pane is alive (never a derivation-failure `operator`), otherwise `operator`; a supplied `by` that disagrees is kept only as `claimed_by`. Records `approval_answered` with `by`/`by_kind`/`caller_pid`/`choice`/`line`/`note` and wakes the agent's delivery loop |
 | `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`, `silent_end_secs` (pty only); `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; null clears to the provider default) or `approval_policy` (codex; `never|on-request|on-failure|untrusted`, null clears) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit PTY ack/result; `sha` names the produced commit for task-attached kickoffs |
@@ -412,7 +412,20 @@ identity is derived, never claimed: the socket peer's pid walks its
 `/proc` ancestry into the recorded pane roots, so a CLI run inside an
 agent's pane IS that agent — a caller inside the target's own pane is
 refused (a pane must never approve its own prompt) and one inside
-another agent's pane records that alias with `by_kind:"agent"`.
+another agent's pane records that alias with `by_kind:"agent"`. The
+target's pane is checked first, then others in sorted order — a
+self-refusal never loses to map iteration order. Pane membership is
+three signals, not one: ancestry, the `CADENCE_ALIAS` env the peer
+still carries (a `setsid` detach keeps it), and a shared controlling
+pty via fd targets (detach keeps stdio) — so `setsid cadence agent
+answer <self>` cannot launder a self-approval into `operator`. A
+caller whose ancestry cannot be fully walked is never stamped
+`operator`: while the target's pane is alive the ambiguity is a
+refusal, after it is gone the stamp is `by:"unknown"` with
+`caller_pid` still recorded. (The documented residual is a maximal
+detach — `setsid` plus a scrubbed env plus redirected stdio; the same
+actor could `tmux send-keys` its own pane, so the guard targets
+accidents and the common detach, not a determined in-pane actor.)
 Anything else is `by:"operator"`; a supplied `by` that disagrees is
 kept as `claimed_by`, not an attribution. `approval_answered` records
 `by`, `by_kind`, `caller_pid`, `choice`, the menu line and the probe,
@@ -972,18 +985,23 @@ fences, cancels, or replays anything it observes.
   `approval_menu` while a message runs emits `{message, line}` once —
   the rising edge, never per sample — carrying the menu line (the
   command being approved) so the row names what's asked, and only
-  once per distinct line: a bounded history of fired lines survives
-  message transitions, so a flicker that closes and re-opens a seen
-  menu — or menus alternating subjects — does not re-fire. When no
-  turn is running the oldest `queued`/`submitting` head is tracked
-  instead — a menu that blocks its delivery emits the same event
-  marked `queued: true` — and a menu on a pane with nothing tracked
-  at all emits it marked `idle: true` with no `message` (the wait
-  belongs to no turn). `agent_list`/`agent_show` expose it as
-  `pane_menu` while it stays open (queued-head and idle-pane menus
-  included); the `status` PANE column renders `approval: <line>`; the
-  overview needs-me row (`kind: approval_menu`) gives the remedy
-  `cadence agent answer <alias> <choice>`.
+  once per open menu: a bounded history of fired lines survives
+  message transitions so alternating subjects do not re-fire, but the
+  history clears when the menu closes — the same subject re-requested
+  is a new wait and fires again. When no turn is running the oldest
+  `queued`/`submitting` head is tracked instead — a menu that blocks
+  its delivery emits the same event marked `queued: true` — and a
+  menu on a pane with nothing tracked at all emits it marked
+  `idle: true` with no `message` (the wait belongs to no turn).
+  `agent_list`/`agent_show` expose it as `pane_menu` while it stays
+  open (queued-head and idle-pane menus included); the `status` PANE
+  column renders `approval: <line>`; the overview needs-me row
+  (`kind: approval_menu`) gives the remedy `cadence agent answer
+  <alias> <choice>`. A needs-me row is a suggestion to *look*, never
+  proof a real menu exists — menu detection reads text shapes a
+  transcript can quote, so the remedy command is only safe because
+  `agent answer` re-probes the live screen and refuses anything that
+  is not a corroborated menu.
 - **`turn_silent_end`.** A still-`running` message whose pane probes
   idle for `silent_end_secs` over at least three consecutive samples —
   never one capture, never while a menu or a brokered request explains

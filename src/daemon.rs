@@ -89,8 +89,10 @@ const DEFAULT_STALL_SECS: u64 = 1800;
 /// `turn_silent_end` fires — long enough that a between-tools quiet
 /// spell never trips it.
 const DEFAULT_SILENT_END_SECS: u64 = 600;
-/// PTY screens are sampled at most this often while a turn runs — the
-/// bound is one capture per running pty agent per minute.
+/// PTY screens are sampled at most this often while the pane is live —
+/// a running turn for activity/silent-end bookkeeping, an idle pane for
+/// menu/draft surfacing. The bound is one capture per pty agent per
+/// minute.
 const SCREEN_SAMPLE: Duration = Duration::from_secs(60);
 
 /// Screen sampling interval: this daemon's `ServeOptions` value when
@@ -1748,6 +1750,71 @@ impl Shared {
         Ok(out)
     }
 
+    /// The caller's derived identity for pane-attention verbs
+    /// (`answer`), from three signals a client cannot choose:
+    /// `/proc` ancestry from the `SO_PEERCRED` pid (a pid that descends
+    /// from an agent's pane root IS that agent), the pane's own
+    /// `CADENCE_ALIAS` env the peer still carries (a `setsid` detach
+    /// keeps it), and a shared controlling pty via fd targets (detach
+    /// keeps stdio). A pane must never act on its own pane state: a
+    /// worker that can reach the socket could otherwise self-sanction
+    /// the very decision the menu exists to gate.
+    ///
+    /// Deterministic: the target's pane is checked first — self-refusal
+    /// never loses to map order — then the others sorted by alias.
+    /// Fails closed: a caller whose ancestry cannot be fully walked is
+    /// never stamped `operator` — while the target's pane is alive the
+    /// ambiguity is a refusal, after it is gone the stamp is `unknown`.
+    /// Returns `(by, by_kind)`; callers record `claimed_by` separately
+    /// when the supplied `by` disagrees.
+    fn derived_caller(
+        &self,
+        alias: &str,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<(String, &'static str)> {
+        let facts = self.store.pty_endpoint_facts().unwrap_or_default();
+        let chain = proc_ancestors(peer_pid);
+        let env_alias = caller_env_alias(peer_pid);
+        let member = |pane_pid: u32| -> bool {
+            chain.as_deref().is_some_and(|c| c.contains(&pane_pid))
+                || holds_pane_tty(peer_pid, pane_pid)
+        };
+        if let Some((_, pane_pid, _)) = facts.get(alias) {
+            if member(*pane_pid) || env_alias.as_deref() == Some(alias) {
+                return Err(Error::rejected(format!(
+                    "a pane cannot {verb} its own pane — the caller is tied \
+                     to the target's pane process",
+                )));
+            }
+        }
+        let mut others: Vec<(&String, &(String, u32, String))> =
+            facts.iter().filter(|(a, _)| a.as_str() != alias).collect();
+        others.sort_by_key(|(a, _)| *a);
+        for (a, (_, pane_pid, _)) in others {
+            if member(*pane_pid) || env_alias.as_deref() == Some(a.as_str()) {
+                return Ok((a.clone(), "agent"));
+            }
+        }
+        if chain.is_none() {
+            // The walk broke — the caller cannot be placed. While the
+            // target pane is alive that ambiguity is a refusal; never
+            // an `operator` stamp on a derivation failure.
+            if facts
+                .get(alias)
+                .is_some_and(|(_, pid, _)| std::fs::read_link(format!("/proc/{pid}")).is_ok())
+            {
+                return Err(Error::rejected(format!(
+                    "cannot derive the caller for `{verb}` — /proc could \
+                     not be walked while the target pane is alive; run it \
+                     from a shell attached to a pane or outside all panes",
+                )));
+            }
+            return Ok(("unknown".to_string(), "unknown"));
+        }
+        Ok(("operator".to_string(), "operator"))
+    }
+
     /// `agent answer`: one menu-choice keystroke to a pane currently
     /// probing `approval_menu` — the adapter re-probes and refuses
     /// anything else, so the key can never land in a prompt or a
@@ -1758,28 +1825,9 @@ impl Shared {
         let choice = required_str(params, "choice")?;
         let claimed_by = optional_str(params, "by");
         let note = optional_str(params, "note");
-        // The answerer's identity is DERIVED, never claimed: the socket
-        // peer's pid walks its /proc ancestry and a pid that descends
-        // from an agent's pane root IS that agent — a `by` field, an
-        // env alias, or a forked name cannot forge it. A pane must
-        // never approve its own prompt: a worker that can reach the
-        // socket could otherwise self-sanction the very decision the
-        // menu exists to gate.
-        let facts = self.store.pty_endpoint_facts().unwrap_or_default();
-        let caller = facts
-            .iter()
-            .find(|(_, (_, pid, _))| adapter::pty::descends_from(peer_pid, *pid))
-            .map(|(a, _)| a.clone());
-        if caller.as_deref() == Some(alias.as_str()) {
-            return Err(Error::rejected(
-                "a pane cannot answer its own approval menu — the caller \
-                 descends from the target's own pane process",
-            ));
-        }
-        let (by, by_kind) = match &caller {
-            Some(a) => (a.as_str(), "agent"),
-            None => ("operator", "operator"),
-        };
+        // The answerer's identity is DERIVED, never claimed — see
+        // `derived_caller` for the signals and the fail-closed rule.
+        let (by, by_kind) = self.derived_caller(&alias, peer_pid, "answer")?;
         let probe = self.adapter_for(&alias)?.answer_approval(choice)?;
         let mut detail = json!({
             "by": by,
@@ -3167,6 +3215,15 @@ impl Shared {
                     }
                     w.menu_line = Some(probe.reason.clone());
                 } else {
+                    // The menu closed — a re-request of the same
+                    // subject is a NEW wait and must re-fire, so the
+                    // fired-subject history resets with the menu. A
+                    // one-sample flicker between menu frames re-fires
+                    // a duplicate — noise is recoverable, a silently
+                    // missed approval is not.
+                    if w.menu_line.is_some() {
+                        w.menu_evented.clear();
+                    }
                     w.menu_line = None;
                     if probe.idle {
                         w.idle_samples = w.idle_samples.saturating_add(1);
@@ -3903,6 +3960,53 @@ fn check_peer(stream: &UnixStream) -> Result<u32> {
         return Err(Error::rejected("Socket peer is not the same user"));
     }
     Ok(cred.pid as u32)
+}
+
+/// The peer's ancestor chain (peer first, up to pid 1) — `None` when
+/// any `/proc` read fails mid-walk: an incomplete chain proves neither
+/// membership nor its absence, so callers must treat it as unverifiable
+/// rather than outside.
+fn proc_ancestors(mut pid: u32) -> Option<Vec<u32>> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while pid > 1 && seen.insert(pid) {
+        chain.push(pid);
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        pid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse().ok())?;
+    }
+    Some(chain)
+}
+
+/// The `CADENCE_ALIAS` the socket peer carries — pane env survives
+/// `setsid`, so a detached pane process still names its agent. An
+/// alias this daemon never registered means nothing (a stale or
+/// foreign daemon's env) — only registered panes match.
+fn caller_env_alias(peer_pid: u32) -> Option<String> {
+    let env = std::fs::read(format!("/proc/{peer_pid}/environ")).ok()?;
+    env.split(|b| *b == 0)
+        .filter_map(|kv| std::str::from_utf8(kv).ok())
+        .find_map(|kv| kv.strip_prefix("CADENCE_ALIAS="))
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+}
+
+/// Does `peer_pid` hold the pane's pty? A detached pane process loses
+/// its ancestry and controlling terminal but keeps stdio — the fd
+/// targets still name the pane's pts device. Redirected stdio is the
+/// documented residual (a maximal-effort detach), accepted because the
+/// same actor could `tmux send-keys` its own pane directly.
+fn holds_pane_tty(peer_pid: u32, pane_pid: u32) -> bool {
+    let pane_tty = (0..=2)
+        .filter_map(|fd| std::fs::read_link(format!("/proc/{pane_pid}/fd/{fd}")).ok())
+        .find(|p| p.to_string_lossy().starts_with("/dev/pts/"));
+    let Some(tty) = pane_tty else {
+        return false;
+    };
+    (0..=2)
+        .any(|fd| std::fs::read_link(format!("/proc/{peer_pid}/fd/{fd}")).is_ok_and(|p| p == tty))
 }
 
 fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
