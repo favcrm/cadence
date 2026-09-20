@@ -20761,6 +20761,47 @@ fn slot_restart_revalidates_holders() {
     slot_release(&d2, &live_tok, SELF_LANE, live_pid);
 }
 
+/// Regression for CI 35542407390: a planted pane row must survive a
+/// daemon restart's relaunch sweep untouched. The sweep relaunches
+/// every enabled actor-owning row; an actor whose open can't verify
+/// the planted pane exit-detaches it — clearing the pid/generation
+/// the caller-identity pane map resolves by — or a real open's
+/// `set_identity` overwrites it. Either way the next slot call fails
+/// closed ("descends from no registered pane"). plant_pane's rows are
+/// actorless (`inbox` pair) and `enabled=0`, so the sweep never
+/// touches them: the planted facts persist through the whole window.
+#[test]
+fn slot_planted_pane_row_survives_restart() {
+    let state = TempDir::new().unwrap();
+    let live_pid = std::process::id();
+    let d = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    plant_pane(&d, SELF_LANE, live_pid);
+    let g = slot_acquire(&d, "build", SELF_LANE, "r1");
+    assert_eq!(g["granted"], true, "{g}");
+    drop(d);
+    let d2 = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    plant_pane(&d2, SELF_LANE, live_pid);
+    // Hold the window where a relaunched actor would detach the row;
+    // with the fix no actor exists — nothing can land.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let conn = rusqlite::Connection::open(state.path().join("cadence.sqlite3")).unwrap();
+    let p: i64 = conn
+        .query_row("SELECT pid FROM agents WHERE alias=?", [SELF_LANE], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(p as u32, live_pid, "no actor clobbered the plant");
+    assert!(
+        !d2.events(SELF_LANE)
+            .iter()
+            .any(|e| e["kind"].as_str() == Some("attention")),
+        "no actor should ever have launched: {:?}",
+        d2.events(SELF_LANE)
+    );
+    let g = slot_acquire(&d2, "build", SELF_LANE, "r9");
+    assert_eq!(g["granted"], true, "{g}");
+}
+
 /// `starve_secs` promotes a long waiter ahead of a priority lane:
 /// priority wins inside the window, the starved waiter wins after it.
 /// The slot clock is injected — the test advances it instead of
