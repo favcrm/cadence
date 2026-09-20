@@ -18962,20 +18962,54 @@ fn run_audit(
     report: &Path,
     extra: &[&str],
 ) -> std::process::Output {
+    run_audit_full(state, pm, repo, Some(notes), Some(report), extra, None)
+}
+
+/// The plumbing behind `run_audit`: optional fixture paths (a `None`
+/// `--merge-report` exercises the live `gh` path) plus an optional
+/// PATH override so tests can remove `gh` entirely.
+fn run_audit_full(
+    state: &Path,
+    pm: &Path,
+    repo: &Path,
+    notes: Option<&Path>,
+    report: Option<&Path>,
+    extra: &[&str],
+    path_env: Option<&Path>,
+) -> std::process::Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
     cmd.arg("--state-dir")
         .arg(state)
         .arg("audit")
         .arg("--repo")
-        .arg(repo)
-        .arg("--notes-dir")
-        .arg(notes)
-        .arg("--merge-report")
-        .arg(report)
-        .args(extra)
-        .env("CADENCE_PM_DIR", pm)
-        .output()
-        .unwrap()
+        .arg(repo);
+    if let Some(n) = notes {
+        cmd.arg("--notes-dir").arg(n);
+    }
+    if let Some(r) = report {
+        cmd.arg("--merge-report").arg(r);
+    }
+    cmd.args(extra).env("CADENCE_PM_DIR", pm);
+    if let Some(p) = path_env {
+        cmd.env("PATH", p);
+    }
+    cmd.output().unwrap()
+}
+
+/// A PATH that resolves `git` (the audit shells it constantly) but
+/// has no `gh` — proving neither fixture mode nor the live path can
+/// accidentally reach the real CLI.
+fn path_without_gh(dir: &TempDir) -> PathBuf {
+    let bin = dir.path().join("no-gh-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for p in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let git = p.join("git");
+        if git.is_file() {
+            std::os::unix::fs::symlink(&git, bin.join("git")).unwrap();
+            return bin;
+        }
+    }
+    panic!("no git on PATH to link into {bin:?}");
 }
 
 fn verdict_note(notes: &Path, name: &str, head: &str, from: &str, class: &str) {
@@ -18998,19 +19032,25 @@ fn audit_reconstructs_clean_merge() {
     std::fs::create_dir_all(&state).unwrap();
     std::fs::create_dir_all(&pm).unwrap();
     // Every PR head carries a pass verdict note + SUCCESS status —
-    // the fully clean run.
+    // the fully clean run. Note filenames (11:59:xx) and status
+    // `created_at` predate `mergedAt` 12:00:0n — a post-merge verdict
+    // is post-hoc evidence, not a merge-time gate.
     let mut report_json: Value =
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     for (i, h) in heads.iter().enumerate() {
         verdict_note(
             &notes,
-            &format!("20260920-120{i}00-x-p{n}-verdict.md", i = i, n = i + 1),
+            &format!("20260920-1159{i}0-x-p{n}-verdict.md", i = i, n = i + 1),
             h,
             "qa-1",
             "auto",
         );
         report_json["statuses"][h] = json!({
-            "statuses": [{"context": "qa-verdict", "state": "SUCCESS"}]
+            "statuses": [{
+                "context": "qa-verdict", "state": "SUCCESS",
+                "created_at": "2026-09-20T11:59:30Z",
+                "creator": {"login": "qa-bot"}
+            }]
         });
     }
     std::fs::write(&report, report_json.to_string()).unwrap();
@@ -19044,25 +19084,46 @@ fn audit_flags_reviewer_equals_merger() {
     let pm = dir.path().join("pm");
     std::fs::create_dir_all(&state).unwrap();
     std::fs::create_dir_all(&pm).unwrap();
-    // Reviewer is the merger.
+    // The note's `From:` is an agent alias — it happens to spell the
+    // same string as the merger's GitHub login, which must NOT flag:
+    // the namespaces differ.
     verdict_note(
         &notes,
-        "20260920-120100-x-p3-verdict.md",
+        "20260920-115900-x-p3-verdict.md",
         &heads[2],
         "ops-1",
         "auto",
     );
     let mut report_json: Value =
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
-    report_json["statuses"] = json!({
-        heads[2].clone(): {"statuses":[{"context":"qa-verdict","state":"SUCCESS"}]}
-    });
+    let status = |login: &str| {
+        json!({
+            heads[2].clone(): {"statuses":[{
+                "context":"qa-verdict","state":"SUCCESS",
+                "created_at":"2026-09-20T11:59:30Z",
+                "creator":{"login":login}
+            }]}
+        })
+    };
+    report_json["statuses"] = status("qa-1");
     std::fs::write(&report, report_json.to_string()).unwrap();
 
+    // Alias collision alone: no flag.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("reviewer==merger"),
+        "note From: alias must not feed the flag:\n{text}"
+    );
+
+    // Same GitHub identity posted qa-verdict and merged: flag.
+    report_json["statuses"] = status("ops-1");
+    std::fs::write(&report, report_json.to_string()).unwrap();
     let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "flag must exit 1:\n{text}");
     assert!(text.contains("FLAG[reviewer==merger]"), "{text}");
+    assert!(text.contains("reviewer@gh ops-1"), "{text}");
 }
 
 #[test]
@@ -19111,7 +19172,7 @@ fn audit_json_shape_is_stable() {
     std::fs::create_dir_all(&pm).unwrap();
     verdict_note(
         &notes,
-        "20260920-120100-x-p1-verdict.md",
+        "20260920-115900-x-p1-verdict.md",
         &heads[0],
         "qa-1",
         "auto",
@@ -19148,7 +19209,10 @@ fn audit_json_shape_is_stable() {
         "reviewed_head",
         "contains_head",
         "qa_verdict_status",
+        "qa_verdict_creator",
+        "status_post_hoc",
         "verdict",
+        "verdict_post_hoc",
         "reviewer",
         "merger",
         "class",
@@ -19158,6 +19222,7 @@ fn audit_json_shape_is_stable() {
         "residue",
         "outcome",
         "flags",
+        "evidence_unavailable",
         "unknowns",
     ] {
         assert!(m.get(key).is_some(), "missing merges[].{key}: {m}");
@@ -19183,14 +19248,14 @@ fn audit_filters_since_class_project_limit() {
     std::fs::write(pm.join("alpha/CAD-1/issue.md"), "---\nid: CAD-1\n---\n").unwrap();
     verdict_note(
         &notes,
-        "20260920-120100-x-p1-verdict.md",
+        "20260920-115800-x-p1-verdict.md",
         &heads[0],
         "qa-1",
         "auto",
     );
     verdict_note(
         &notes,
-        "20260920-120200-x-p2-verdict.md",
+        "20260920-115810-x-p2-verdict.md",
         &heads[1],
         "qa-1",
         "human",
@@ -19242,8 +19307,18 @@ fn audit_fixture_never_shells_gh() {
     let pm = dir.path().join("pm");
     std::fs::create_dir_all(&state).unwrap();
     std::fs::create_dir_all(&pm).unwrap();
-    // PATH with no gh: fixture mode must not reach for it.
-    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--json"]);
+    // PATH really has no gh: if fixture mode shelled out anyway the
+    // spawn would fail and every row would report evidence gaps.
+    let path = path_without_gh(&dir);
+    let out = run_audit_full(
+        &state,
+        &pm,
+        &repo,
+        Some(&notes),
+        Some(&report),
+        &["--json"],
+        Some(&path),
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     let j: Value = serde_json::from_str(text.trim())
         .unwrap_or_else(|e| panic!("fixture mode must not call gh: {e}\n{text}"));
@@ -19256,4 +19331,181 @@ fn audit_fixture_never_shells_gh() {
         .filter(|m| m["pr"].as_u64().is_some())
         .count();
     assert_eq!(pr_rows, 3);
+    // No row reports a failed channel — the fixture answered everything.
+    assert!(
+        j["merges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["evidence_unavailable"].is_null()),
+        "a spawn attempt would surface as evidence_unavailable: {j}"
+    );
+}
+
+/// gh absent from PATH on the live path: every row is
+/// `unknown — evidence unavailable`, nothing flags, exit 0. Missing
+/// evidence is never an accusation.
+#[test]
+fn audit_gh_unavailable_is_unknown_not_flag() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, _heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // A github origin so the audit resolves a slug and really tries gh;
+    // a verdict note proves notes answered (fail) — the row must still
+    // not flag while gh itself is unreachable.
+    let g = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    };
+    g(&["remote", "add", "origin", "https://github.com/x/y"]);
+    // One non-PR direct push too — even it must not flag with gh down.
+    std::fs::write(repo.join("direct.txt"), "d").unwrap();
+    g(&["add", "."]);
+    g(&["commit", "-qm", "direct push"]);
+
+    let path = path_without_gh(&dir);
+    let out = run_audit_full(
+        &state,
+        &pm,
+        &repo,
+        Some(&notes),
+        None, // no --merge-report: the live gh path, with gh absent
+        &["--json"],
+        Some(&path),
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "unavailable evidence must not flag:\n{text}"
+    );
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("--json not one document: {e}\n{text}"));
+    let merges = j["merges"].as_array().unwrap();
+    assert!(!merges.is_empty());
+    for m in merges {
+        assert!(
+            m["flags"].as_array().unwrap().is_empty(),
+            "no flags on missing evidence: {m}"
+        );
+    }
+    // Every row that needed gh reports the gap with its reason.
+    let gap_rows = merges
+        .iter()
+        .filter(|m| !m["evidence_unavailable"].is_null())
+        .count();
+    assert!(
+        gap_rows >= merges.iter().filter(|m| m["pr"].is_u64()).count(),
+        "gh-down PR rows must carry evidence_unavailable: {j}"
+    );
+    assert_eq!(j["summary"]["flagged"].as_u64().unwrap(), 0);
+    // Suppress the unused-fixture warning — this test runs live.
+    let _ = report;
+}
+
+#[test]
+fn audit_evidence_unavailable_is_unknown_not_flag() {
+    let dir = TempDir::new().unwrap();
+    let (repo, _notes, report, _heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // The notes directory does not exist — a verdict note could be in
+    // it. `no-passing-verdict` must not fire: the row is unknown, and
+    // unknown rows exit 0.
+    let missing_notes = dir.path().join("no-such-notes");
+    let out = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &missing_notes,
+        &report,
+        &["--limit", "1"],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "missing evidence is unknown, not a flag:\n{text}"
+    );
+    assert!(!text.contains("FLAG["), "{text}");
+    assert!(text.contains("evidence unavailable"), "{text}");
+
+    // A PR absent from the fixture's `prs` list is likewise a data
+    // gap, not a verdict failure.
+    let mut report_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    report_json["prs"] = json!([]);
+    std::fs::write(&report, report_json.to_string()).unwrap();
+    let notes = dir.path().join("notes");
+    let out = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &notes,
+        &report,
+        &["--limit", "1", "--json"],
+    );
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{j}");
+    let m = &j["merges"][0];
+    assert!(
+        m["flags"].as_array().unwrap().is_empty(),
+        "evidence gaps must not flag: {m}"
+    );
+    assert!(
+        m["evidence_unavailable"]
+            .as_str()
+            .is_some_and(|s| s.contains("no merged PR")),
+        "gap reason must surface: {m}"
+    );
+}
+
+#[test]
+fn audit_post_hoc_verdict_does_not_clear_flag() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // The verdict note's filename timestamp is *after* the merge —
+    // evidence that arrived post-merge, not a merge-time review.
+    verdict_note(
+        &notes,
+        "20260920-130000-x-p3-verdict.md",
+        &heads[2],
+        "qa-1",
+        "auto",
+    );
+    let out = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &notes,
+        &report,
+        &["--limit", "1", "--json"],
+    );
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(out.status.code(), Some(1), "post-hoc pass must flag: {j}");
+    let m = &j["merges"][0];
+    assert_eq!(m["pr"].as_u64(), Some(3), "{j}");
+    assert_eq!(m["verdict_post_hoc"].as_bool(), Some(true), "{j}");
+    assert!(
+        m["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "no-passing-verdict"),
+        "post-hoc pass must not clear the flag: {m}"
+    );
 }

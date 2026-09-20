@@ -10,11 +10,14 @@ commits, the `qa-verdict` commit status, verdict and ops notes under
 and verdict tables — and nobody should have to re-derive a merge's
 provenance by hand.
 
-The command is **read-only**: it runs `git log`/`diff`/`patch-id`,
-`gh pr list`/`gh api …/status`, file reads, and a
+The command is **read-only**: it runs `git log --first-parent` /
+`diff`/`patch-id`, `gh pr list` plus `gh api …/statuses` (and
+`…/status` for the check-run fallback), file reads, and a
 `SQLITE_OPEN_READ_ONLY` open on `cadence.sqlite3`. Nothing is written
 at merge time and nothing is written by the audit itself — there is no
-bookkeeping to drift.
+bookkeeping to drift. Every subprocess is time-bounded; the per-head
+status calls run only for rows that survive `--since`/`--class`/
+`--project`, so `--limit` bounds the GitHub fan-out.
 
 ```bash
 cadence audit                          # every merge on the default branch
@@ -33,7 +36,7 @@ cadence audit --json --limit 50        # machine form for digests/tiles
 #63 session start|end: one-verb session gate and teardown (CAD-92)
     merge 33a6a82 · merged_at 2026-09-20T10:53:00Z · merger cc-syntax
     reviewed_head 7896dd27 · landed_head 7896dd273 · contains_head yes (patch-id match)
-    verdict pass · qa-verdict SUCCESS · reviewer qa-1
+    verdict pass · qa-verdict SUCCESS · reviewer qa-1 · reviewer@gh qa-bot
     class notify · trigger deletion and lifecycle paths; fourth review round
     gates suite=256/256 stress=none recorded flakes=none recorded
     auditor_check What an auditor should check after the merge: …
@@ -53,8 +56,11 @@ cadence audit --json --limit 50        # machine form for digests/tiles
   verdicts table). `pass (post-merge)` when the note's own timestamp
   post-dates the merge.
 - **qa-verdict** — the `qa-verdict` commit status on the *landed*
-  head. The status does not record which agent posted it, so reviewer
-  identity comes only from the note's `From:`.
+  head: its state, the GitHub `creator.login` that posted it
+  (`reviewer@gh` in text), and whether it post-dates the merge
+  (`(post-merge)`). The note's `From:` stays the display reviewer —
+  the status records the *GitHub* identity, the note records the
+  *agent* identity.
 - **class / trigger** — the verdict note's `Risk:` line.
 - **gates** — suite result, stress runs and disclosed flakes as
   recorded in the verdict note (`none recorded` when the note is
@@ -66,22 +72,67 @@ cadence audit --json --limit 50        # machine form for digests/tiles
   and `daemon_restart` (ops-merge notes and daemon events), `revert`
   (a later `Revert` commit naming this merge).
 
-A merge whose subject carries no `(#N)` is still listed as a `?` row —
-a direct push to the default branch is exactly what the audit should
-surface. The repository's root commit is exempt from flagging.
+Merge rows come from `git log --first-parent`: squash merges parse
+their `(#N)` suffix (anywhere in the subject — a trailing
+`(rebased)` marker does not hide it) and true merges parse
+`Merge pull request #N`. A commit whose subject carries no PR number
+is still listed as a `?` row — a direct push to the default branch is
+exactly what the audit should surface. The repository's root commit is
+exempt from flagging.
 
 ## The two flags
 
 Both print as `FLAG[…]` on the row and make the command exit **1**.
 
-- **`reviewer==merger`** — the identity that reviewed equals the
-  identity that merged (verdict note `From:` vs `mergedBy.login`,
-  case-insensitive). Self-merges are never legal.
+- **`reviewer==merger`** — the `qa-verdict` status's `creator.login`
+  equals `mergedBy.login` (case-insensitive). Self-merges are never
+  legal. The note `From:` never feeds this flag — it is an agent
+  alias, a different identity namespace.
 - **`no-passing-verdict`** — nothing proves a `pass` on the exact head
   that landed: no verdict note/table row bound to `headRefOid`, and
-  no `qa-verdict: SUCCESS` status on it. This fires on stale verdicts
-  (the PR was rebased after review), on absent verdicts, and on every
-  non-PR commit that isn't the root.
+  no `qa-verdict: SUCCESS` status on it. A verdict note or status
+  timestamped *after* the merge does not count — the question is what
+  was true at merge time. This fires on stale verdicts (the PR was
+  rebased after review), on absent verdicts, and on every non-PR
+  commit that isn't the root — but never when a needed source did not
+  answer.
+
+## Trust model
+
+The audit compares identities only inside one namespace:
+
+- **`mergedBy.login`** and a status's **`creator.login`** are GitHub
+  identities — authoritative for "who clicked merge" and "who posted
+  the status", and the only pair `reviewer==merger` compares.
+- A verdict note's **`From:`** is an agent alias. It renders as
+  `reviewer`, but an alias string-matching a GitHub login is a
+  coincidence of naming, not proof of self-review.
+
+One caveat on identity strength: notes can be written by any agent —
+a `From:` alias and even a `pass` verdict are forgeable, so a bound
+note satisfies `no-passing-verdict` but its alias never feeds
+`reviewer==merger`. A commit status is only as strong as its token:
+if QA posts `qa-verdict` and merges through the *same* GitHub account
+(a shared bot token), `reviewer==merger` fires on every such merge —
+correctly, and that is the finding: the attestation and the merge
+share one identity.
+
+What the audit **cannot** detect:
+
+- Whether the GitHub login that posted `qa-verdict` is the same human
+  as the agent alias in `From:` — the namespaces cannot be joined.
+  The flag answers the narrower question "did the merge's GitHub
+  actor also post its verdict status".
+- Evidence that was never written: a verbal approval leaves no trace
+  in any of the five sources.
+- What a source would have said when it did not answer — gh down,
+  notes dir unreadable, store unopenable, or the reviewed head absent
+  from the clone renders as `evidence unavailable`: the row is
+  unknown, unflagged, and the command still exits 0.
+
+`no-passing-verdict` therefore means "every reachable source answered,
+and none proves a pass bound to the landed head" — never "a source
+was down".
 
 ## `--json` shape (stable)
 
@@ -97,7 +148,8 @@ Both print as `FLAG[…]` on the row and make the command exit **1**.
       "merge_sha": "…", "merged_at": 1789…,
       "landed_head": "…", "reviewed_head": "…",
       "contains_head": "yes (patch-id match)",
-      "qa_verdict_status": "SUCCESS",
+      "qa_verdict_status": "SUCCESS", "qa_verdict_creator": "qa-bot",
+      "status_post_hoc": false,
       "verdict": "pass", "verdict_post_hoc": false,
       "reviewer": "qa-1", "merger": "cc-syntax",
       "class": "notify", "trigger": "…",
@@ -108,6 +160,7 @@ Both print as `FLAG[…]` on the row and make the command exit **1**.
       "outcome": {"tree_match": "…", "smoke": "…",
                   "daemon_restart": "…", "revert": "…"},
       "flags": [],
+      "evidence_unavailable": null,
       "unknowns": [{"field": "smoke", "reason": "…"}]
     }
   ],

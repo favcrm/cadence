@@ -2,7 +2,10 @@
 //! from data Cadence already stores, and flag the two patterns the PM
 //! must never have to hunt for by hand:
 //!
-//! - `reviewer==merger` — the same identity reviewed and merged.
+//! - `reviewer==merger` — the same *GitHub* identity reviewed and
+//!   merged (`qa-verdict` status `creator.login` vs `mergedBy.login`;
+//!   note `From:` is an agent alias — a different namespace, rendered
+//!   but never compared).
 //! - `no-passing-verdict` — no `pass` verdict bound to the exact head
 //!   that landed (`qa-verdict` status plus the verdict note must agree
 //!   on the squash-merged `headRefOid`).
@@ -15,7 +18,12 @@
 //! bookkeeping to keep in sync.
 //!
 //! Everything a source cannot prove is rendered `unknown` with the
-//! reason — the audit never guesses provenance.
+//! reason — the audit never guesses provenance. And when a source
+//! needed for the verdict question did not answer at all (gh down,
+//! notes dir unreadable, store unopenable, reviewed head not in the
+//! clone) the row is `evidence unavailable`, not an accusation: no
+//! flag, no exit-1. `no-passing-verdict` is reserved for sources that
+//! answered and said no.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,6 +44,10 @@ const DEFAULT_LIMIT: u64 = 200;
 /// How far past a merge to look for post-merge evidence (restarts,
 /// reverts, smoke runs) in events and ops notes.
 const POST_MERGE_WINDOW_SECS: f64 = 48.0 * 3600.0;
+/// Every subprocess the audit spawns is bounded — a wedged `gh` or a
+/// pathological repo must not hang a digest.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct AuditOptions {
     /// `--since 24h|7d|YYYY-MM-DD|<epoch>` — drop merges older than this.
@@ -79,12 +91,26 @@ struct Row {
     /// `qa-verdict` commit status on the landed head: `SUCCESS`,
     /// `FAILURE`, `PENDING`, …
     qa_verdict_status: Option<String>,
+    /// `creator.login` of whoever posted the `qa-verdict` status — the
+    /// GitHub-namespace identity the `reviewer==merger` flag compares
+    /// against `mergedBy.login`.
+    qa_verdict_creator: Option<String>,
+    /// The status post-dates the merge — post-hoc evidence, not a
+    /// merge-time gate.
+    status_post_hoc: bool,
+    /// Channels that could not be read (gh down, notes dir missing,
+    /// store unopenable, status fetch failed). Non-empty suppresses
+    /// `no-passing-verdict` — the row is unknown, not accused.
+    evidence_gaps: Vec<String>,
     /// Verdict recorded in a note or the verdicts table: `pass`,
     /// `fail`, `changes-requested`, …
     verdict: Option<String>,
     /// True when the bound verdict note's timestamp post-dates the
-    /// merge — a post-hoc pass still clears the flag but is shown.
+    /// merge — a post-hoc pass does not satisfy `no-passing-verdict`:
+    /// at merge time nothing had reviewed the head that landed.
     verdict_post_hoc: bool,
+    /// The verdict note's `From:` — an agent alias, display only. It
+    /// is never compared to `merger`: the namespaces differ.
     reviewer: Option<String>,
     merger: Option<String>,
     class: Option<String>,
@@ -163,6 +189,8 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
     };
 
     // 3. Notes index — one scan; match notes to merges by SHA mention.
+    //    `None` when the directory itself cannot be read: every row's
+    //    verdict evidence is then unavailable, not absent.
     let notes = note_index(&notes_dir);
 
     // 4. Daemon store, opened read-only — events + the verdicts table.
@@ -171,20 +199,19 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
     // 5. Tracker: issue id → project folder, for --project scoping.
     let pm = issue::default_dir().ok();
 
+    // Pass 1 — local/cached sources only (the pr list is one bulk call,
+    // already fetched): build the row, filter, cap. Per-row `gh api`
+    // status calls happen in pass 2 so `--limit` actually bounds them.
     let mut rows = Vec::new();
     for (merge_sha, at, parents, subject) in merges {
         if (at as f64) < since {
             continue;
         }
         let mut row = row_from_subject(&merge_sha, at, parents, &subject);
-        enrich_gh(&repo, &gh, &mut row);
-        enrich_store(&store, &mut row);
-        enrich_notes(&notes, &mut row);
+        enrich_gh_pr(&gh, &mut row);
+        enrich_notes(notes.as_deref(), &notes_dir, &mut row);
+        enrich_store(&store, &opts.state_dir.join(STORE_FILE), &mut row);
         enrich_tracker(pm.as_deref(), &mut row);
-        contains_head(&repo, &mut row);
-        post_merge(&branch_log, &store, &mut row);
-        finalize_unknowns(&mut row);
-        flag_row(&mut row);
         if class_filter
             .as_deref()
             .is_some_and(|c| row.class.as_deref() != Some(c))
@@ -199,10 +226,22 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
         rows.push(row);
     }
     // `--limit` caps in-window rows (newest-first) — applied after the
-    // since/class/project filters so an early cutoff can't hide them.
+    // since/class/project filters so an early cutoff can't hide them,
+    // and *before* any per-row `gh api` call so it bounds the fan-out.
     let limit = opts.limit.unwrap_or(DEFAULT_LIMIT);
     if limit > 0 {
         rows.truncate(limit as usize);
+    }
+
+    // Pass 2 — the rows that render get their per-head evidence:
+    // qa-verdict status (one `gh api` call each), merge-content check,
+    // post-merge outcomes, then flags.
+    for row in &mut rows {
+        enrich_status(gh.slug.as_deref(), &gh, row);
+        contains_head(&repo, row);
+        post_merge(&branch_log, &store, row);
+        finalize_unknowns(row);
+        flag_row(row);
     }
 
     let flagged = rows.iter().filter(|r| !r.flags.is_empty()).count();
@@ -216,11 +255,12 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
 
 // ---------- git ------------------------------------------------------
 
+/// Every subprocess runs under `run_bounded` — a hung `git` or `gh`
+/// cannot stall the audit.
 fn git(repo: &Path, args: &[String]) -> std::result::Result<String, String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args(args);
-    let out = cmd
-        .output()
+    let out = crate::proc::run_bounded(&mut cmd, GIT_TIMEOUT)
         .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
     if !out.status.success() {
         return Err(format!(
@@ -254,12 +294,14 @@ fn default_ref(repo: &Path) -> Result<String> {
 }
 
 /// `sha \x1f committer-epoch \x1f parent-count \x1f subject` per
-/// commit on the ref.
+/// first-parent commit on the ref — a real merge yields its merge
+/// commit, not one row per side-branch commit.
 fn merge_commits(repo: &Path, reference: &str) -> Result<Vec<(String, i64, usize, String)>> {
     let out = git(
         repo,
         &[
             "log".into(),
+            "--first-parent".into(),
             reference.into(),
             "--format=%H%x1f%ct%x1f%P%x1f%s".into(),
         ],
@@ -279,10 +321,25 @@ fn merge_commits(repo: &Path, reference: &str) -> Result<Vec<(String, i64, usize
         .collect())
 }
 
-/// The `(#NN)` suffix on a squash-merge subject.
+/// The PR number from a merge subject: `Merge pull request #N …` for
+/// real merges, `(#N)` anywhere for squashes (the last occurrence — a
+/// trailing ` (rebased)` marker does not hide it).
 fn pr_number(subject: &str) -> Option<u64> {
-    let tail = subject.trim().rsplit('(').next()?;
-    tail.strip_prefix('#')?.trim_end_matches(')').parse().ok()
+    if let Some(rest) = subject.trim_start().strip_prefix("Merge pull request #") {
+        return rest
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok();
+    }
+    subject
+        .rmatch_indices("(#")
+        .filter_map(|(i, _)| {
+            let tail = &subject[i + 2..];
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            (tail.as_bytes().get(digits.len()) == Some(&b')')).then(|| digits.parse().ok())?
+        })
+        .next()
 }
 
 /// `CAD-NN` issue ids mentioned anywhere in a subject.
@@ -339,6 +396,9 @@ struct Gh {
     prs: HashMap<u64, Value>,
     statuses: HashMap<String, Value>,
     error: Option<String>,
+    /// `owner/repo` — resolved once at startup; per-row status calls
+    /// reuse it instead of re-running `git remote get-url` per head.
+    slug: Option<String>,
     /// `--merge-report` set: every `gh` lookup resolves from the
     /// fixture — a miss is `unknown`, never a live call.
     fixture: bool,
@@ -357,7 +417,10 @@ fn github(repo: &Path) -> Result<Gh> {
             ..Default::default()
         });
     };
-    let mut gh = Gh::default();
+    let mut gh = Gh {
+        slug: Some(slug.clone()),
+        ..Default::default()
+    };
     let prs = gh_text(&[
         "pr".into(),
         "list".into(),
@@ -412,10 +475,9 @@ fn merge_fixture(path: &Path) -> Result<Gh> {
 }
 
 fn gh_text(args: &[String]) -> std::result::Result<String, String> {
-    let out = Command::new("gh")
-        .args(args)
-        .output()
-        .map_err(|e| format!("gh: {e}"))?;
+    let mut cmd = Command::new("gh");
+    cmd.args(args);
+    let out = crate::proc::run_bounded(&mut cmd, GH_TIMEOUT).map_err(|e| format!("gh: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "gh {}: {}",
@@ -426,46 +488,74 @@ fn gh_text(args: &[String]) -> std::result::Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// The `qa-verdict` context on one commit status payload. Status
-/// contexts report `success`, check runs `SUCCESS` — normalized to
-/// the uppercase StatusCheckRollup spelling.
-fn qa_verdict_state(status: &Value) -> Option<String> {
-    for ctx in status["statuses"].as_array()? {
+/// The `qa-verdict` context on one commit status payload: its state,
+/// the GitHub `creator.login` that posted it, and `created_at`. Status
+/// contexts report `success`, check runs `SUCCESS` — normalized to the
+/// uppercase StatusCheckRollup spelling.
+fn qa_verdict_state(status: &Value) -> Option<(String, Option<String>, Option<f64>)> {
+    for ctx in status["statuses"].as_array().into_iter().flatten() {
         if ctx["context"].as_str() == Some("qa-verdict") {
-            return ctx["state"].as_str().map(|s| s.to_uppercase());
+            let Some(state) = ctx["state"].as_str() else {
+                continue;
+            };
+            let at = ctx["created_at"].as_str().and_then(parse_iso);
+            return Some((
+                state.to_uppercase(),
+                ctx["creator"]["login"].as_str().map(str::to_string),
+                at.map(|t| t as f64),
+            ));
         }
     }
     // Check runs arrive under `check_runs` on some endpoints.
-    for run in status["check_runs"].as_array()? {
+    for run in status["check_runs"].as_array().into_iter().flatten() {
         if run["name"].as_str() == Some("qa-verdict") {
-            return run["conclusion"]
+            let Some(state) = run["conclusion"]
                 .as_str()
                 .or_else(|| run["status"].as_str())
-                .map(|s| s.to_uppercase());
+            else {
+                continue;
+            };
+            let at = run["started_at"]
+                .as_str()
+                .or_else(|| run["completed_at"].as_str())
+                .and_then(parse_iso);
+            return Some((
+                state.to_uppercase(),
+                run["user"]["login"]
+                    .as_str()
+                    .or_else(|| run["app"]["slug"].as_str())
+                    .map(str::to_string),
+                at.map(|t| t as f64),
+            ));
         }
     }
     None
 }
 
-fn enrich_gh(repo: &Path, gh: &Gh, row: &mut Row) {
+/// PR metadata from the one `gh pr list` call — merger, landed head,
+/// mergedAt, title. No network here; the per-sha status fetch happens
+/// post-filter in `enrich_status`.
+fn enrich_gh_pr(gh: &Gh, row: &mut Row) {
     let Some(n) = row.pr else { return };
     let Some(pr) = gh.prs.get(&n) else {
-        if let Some(e) = &gh.error {
-            row.unknowns
-                .push(("merged_by".into(), format!("gh unavailable: {e}")));
-            row.unknowns
-                .push(("landed_head".into(), format!("gh unavailable: {e}")));
-        } else {
-            row.unknowns.push((
-                "merged_by".into(),
-                format!("no merged PR #{n} in gh pr list"),
-            ));
-        }
+        let reason = gh
+            .error
+            .as_ref()
+            .map(|e| format!("gh unavailable: {e}"))
+            .unwrap_or_else(|| format!("no merged PR #{n} in gh pr list"));
+        row.unknowns.push(("merged_by".into(), reason.clone()));
+        row.evidence_gaps.push(reason);
         return;
     };
     row.title = pr["title"].as_str().unwrap_or(&row.title).to_string();
-    row.merger = pr["mergedBy"]["login"].as_str().map(str::to_string);
-    row.landed_head = pr["headRefOid"].as_str().map(str::to_string);
+    row.merger = pr["mergedBy"]["login"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    row.landed_head = pr["headRefOid"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     // gh's mergeCommit must be the commit git log shows — a mismatch
     // means the PR number in the subject points at a different merge.
     if let Some(mc) = pr["mergeCommit"]["oid"].as_str() {
@@ -486,33 +576,86 @@ fn enrich_gh(repo: &Path, gh: &Gh, row: &mut Row) {
     if row.landed_head.is_none() {
         row.unknowns
             .push(("landed_head".into(), "gh reports no headRefOid".into()));
+        // No head → the status channel cannot be queried.
+        row.evidence_gaps.push("gh reports no headRefOid".into());
     }
-    // `qa-verdict` on the exact landed head.
-    if let Some(head) = &row.landed_head {
-        let status = match gh.statuses.get(head) {
-            Some(s) => Some(s.clone()),
-            // Fixture mode never falls back to a live call.
-            None if gh.fixture => None,
-            None => gh_status(repo, head).ok().flatten(),
-        };
-        match status.as_ref().and_then(qa_verdict_state) {
-            Some(s) => row.qa_verdict_status = Some(s),
+}
+
+/// The per-row network call — `qa-verdict` status on the exact landed
+/// head. Runs only for rows that survive the filters, so a narrow
+/// `--since`/`--class`/`--limit` audit spends one API call per shown
+/// merge, not per in-window commit.
+fn enrich_status(slug: Option<&str>, gh: &Gh, row: &mut Row) {
+    // Direct pushes have no PR head — but the merge commit itself can
+    // still carry a `qa-verdict` status, so it is queried too.
+    let head = row
+        .landed_head
+        .clone()
+        .unwrap_or_else(|| row.merge_sha.clone());
+    if row.pr.is_some() && row.landed_head.is_none() {
+        return; // gap already recorded by enrich_gh_pr
+    }
+    let status = match gh.statuses.get(head.as_str()) {
+        Some(s) => Some(Ok(s.clone())),
+        // Fixture mode never falls back to a live call; a missing key
+        // is the fixture saying "no statuses on this head".
+        None if gh.fixture => None,
+        None => slug.map(|s| gh_status(s, head.as_str())),
+    };
+    match status {
+        Some(Err(e)) => {
+            row.evidence_gaps.push(format!("status fetch failed: {e}"));
+            row.unknowns.push((
+                "qa_verdict_status".into(),
+                format!("status fetch failed on {head}: {e}"),
+            ));
+        }
+        Some(Ok(v)) => match qa_verdict_state(&v) {
+            Some((state, creator, at)) => {
+                row.qa_verdict_status = Some(state);
+                row.qa_verdict_creator = creator;
+                row.status_post_hoc = match (at, row.merged_at) {
+                    (Some(at), Some(m)) => at > m,
+                    _ => false,
+                };
+            }
             None => row.unknowns.push((
                 "qa_verdict_status".into(),
                 format!("no qa-verdict status on {head}"),
             )),
-        }
+        },
+        None => {}
     }
 }
 
-fn gh_status(repo: &Path, sha: &str) -> std::result::Result<Option<Value>, String> {
-    let Some(slug) = slug(repo) else {
-        return Ok(None);
-    };
-    let text = gh_text(&["api".into(), format!("repos/{slug}/commits/{sha}/status")])?;
-    serde_json::from_str::<Value>(&text)
-        .map(Some)
-        .map_err(|e| format!("gh api status: unreadable ({e})"))
+/// The `qa-verdict` evidence for one head. Two endpoints, in order:
+/// `statuses/{ref}` is the only one that returns `creator.login` (the
+/// combined `/status` payload omits it), and the combined endpoint is
+/// the only one that reports check runs — the fallback when a
+/// qa-verdict was posted as a check run instead of a status.
+fn gh_status(slug: &str, sha: &str) -> std::result::Result<Value, String> {
+    let list = gh_text(&[
+        "api".into(),
+        format!("repos/{slug}/statuses/{sha}?per_page=100"),
+    ])?;
+    let list: Value =
+        serde_json::from_str(&list).map_err(|e| format!("gh api statuses: unreadable ({e})"))?;
+    let wrapped = json!({"statuses": list});
+    if qa_verdict_state(&wrapped).is_some() {
+        return Ok(wrapped);
+    }
+    let combined = gh_text(&[
+        "api".into(),
+        format!("repos/{slug}/commits/{sha}/status?per_page=100"),
+    ])?;
+    let combined: Value =
+        serde_json::from_str(&combined).map_err(|e| format!("gh api status: unreadable ({e})"))?;
+    if qa_verdict_state(&combined).is_some() {
+        return Ok(combined);
+    }
+    // Both endpoints answered and neither reports a qa-verdict — that
+    // is an answer, not a gap.
+    Ok(wrapped)
 }
 
 // ---------- notes ----------------------------------------------------
@@ -620,11 +763,12 @@ fn gate_is_stress(lower: &str) -> bool {
     false
 }
 
-fn note_index(dir: &Path) -> Vec<Note> {
+/// `None` when the notes directory itself cannot be read — distinct
+/// from an empty one: an unreadable directory is missing evidence, an
+/// empty one is an answered "no verdicts".
+fn note_index(dir: &Path) -> Option<Vec<Note>> {
     let mut notes = Vec::new();
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return notes;
-    };
+    let read = std::fs::read_dir(dir).ok()?;
     for ent in read.flatten() {
         let path = ent.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -638,7 +782,7 @@ fn note_index(dir: &Path) -> Vec<Note> {
         };
         notes.push(parse_note(&path, name, &text));
     }
-    notes
+    Some(notes)
 }
 
 fn parse_note(path: &Path, name: &str, text: &str) -> Note {
@@ -680,17 +824,31 @@ fn parse_note(path: &Path, name: &str, text: &str) -> Note {
         // All-digit tokens stay in this context (`5428215` is a real
         // abbrev; a date would not sit on a head line).
         if note.head_sha.is_none() {
-            if let Some(i) = lower.find("head") {
-                // `head` as a word — `ahead`/`overhead` don't count;
-                // the sha follows a separator (`head 5428215`,
-                // `head: `abc``, `head=…`).
-                let bounded = (i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphabetic())
-                    && t[i + 4..]
-                        .chars()
-                        .next()
+            // `head` as a word — `ahead`/`overhead` don't count; the
+            // sha follows a separator (`head 5428215`, `head: `abc``,
+            // `head=…`). Scan `t` directly with char-boundary-safe
+            // indexing — a lowercase offset cannot index `t`: `ẞ`/`İ`
+            // change byte length under `to_lowercase`.
+            for (i, c) in t.char_indices() {
+                if !c.eq_ignore_ascii_case(&'h') {
+                    continue;
+                }
+                let Some(seg) = t.get(i..i + 4) else { continue };
+                if !seg.eq_ignore_ascii_case("head") {
+                    continue;
+                }
+                let bounded = t[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_ascii_alphabetic())
+                    && t.get(i + 4..)
+                        .and_then(|s| s.chars().next())
                         .is_none_or(|c| !c.is_ascii_alphanumeric());
                 if bounded {
-                    note.head_sha = hex_shas_ctx(&t[i + 4..], true).into_iter().next();
+                    note.head_sha = t
+                        .get(i + 4..)
+                        .and_then(|s| hex_shas_ctx(s, true).into_iter().next());
+                    break;
                 }
             }
         }
@@ -842,19 +1000,23 @@ fn parse_note(path: &Path, name: &str, text: &str) -> Note {
 
 /// Hex tokens ≥7 chars in a blob. In general context all-digit tokens
 /// are excluded — note filenames carry `YYYYMMDD` stamps that are not
-/// SHAs. In a `head …` context (`head_sha`) all-digit tokens stay: a
-/// real abbrev can be all digits (`5428215`).
+/// SHAs — but all-letter tokens stay: `cabbebe` is a real abbrev. In a
+/// `head …` context (`head_sha`) all-digit tokens stay too: a real
+/// abbrev can be all digits (`5428215`).
 fn hex_shas(text: &str) -> Vec<String> {
     hex_shas_ctx(text, false)
 }
 
-fn hex_shas_ctx(text: &str, allow_digits: bool) -> Vec<String> {
+fn hex_shas_ctx(text: &str, head_ctx: bool) -> Vec<String> {
     let mut out = Vec::new();
     for word in text.split(|c: char| !(c.is_ascii_hexdigit())) {
-        if (7..=40).contains(&word.len())
-            && word.chars().any(|c| c.is_ascii_digit())
-            && (allow_digits || word.chars().any(|c| ('a'..='f').contains(&c)))
-        {
+        // General context requires an a-f letter: `YYYYMMDD` date
+        // stamps must not parse as SHAs, but all-letter abbrevs
+        // (`cabbebe`) are real. A `head …` context accepts any all-hex
+        // token — all-digit abbrevs (`5428215`) are real there too.
+        let ok = (7..=40).contains(&word.len())
+            && (head_ctx || word.chars().any(|c| ('a'..='f').contains(&c)));
+        if ok {
             out.push(word.to_string());
         }
     }
@@ -927,7 +1089,13 @@ fn ops_matches(note: &Note, row: &Row) -> bool {
     sha_hit(note, &row.merge_sha) || row.landed_head.as_deref().is_some_and(|h| sha_hit(note, h))
 }
 
-fn enrich_notes(notes: &[Note], row: &mut Row) {
+fn enrich_notes(notes: Option<&[Note]>, dir: &Path, row: &mut Row) {
+    let Some(notes) = notes else {
+        let reason = format!("notes dir {} unreadable", dir.display());
+        row.evidence_gaps.push(reason.clone());
+        row.unknowns.push(("verdict".into(), reason));
+        return;
+    };
     let verdict = notes
         .iter()
         .filter(|n| n.kind == "verdict" && verdict_matches(n, row))
@@ -1008,7 +1176,12 @@ fn finalize_unknowns(row: &mut Row) {
     add(
         "reviewer",
         row.reviewer.is_none(),
-        "no verdict note names this head; the qa-verdict status does not record its poster",
+        "no verdict note names this head",
+    );
+    add(
+        "qa_verdict_creator",
+        row.qa_verdict_status.is_some() && row.qa_verdict_creator.is_none(),
+        "the qa-verdict status records no creator.login",
     );
     add("merger", row.merger.is_none(), "no source records a merger");
     add(
@@ -1057,6 +1230,8 @@ struct StoreEvidence {
 fn store_evidence(path: &Path) -> StoreEvidence {
     let mut ev = StoreEvidence::default();
     if !path.exists() {
+        // A host that never ran the daemon has no store — the table
+        // is empty, not unreadable. No evidence gap.
         return ev;
     }
     let Ok(conn) =
@@ -1065,13 +1240,20 @@ fn store_evidence(path: &Path) -> StoreEvidence {
         return ev;
     };
     ev.opened = true;
-    if let Ok(mut st) = conn.prepare("SELECT sha, verdict, reviewer FROM verdicts") {
+    // Bounded reads — an audit must not pull a whole event history
+    // into memory; only recent verdicts and restart-kind events are
+    // evidence anyway.
+    if let Ok(mut st) =
+        conn.prepare("SELECT sha, verdict, reviewer FROM verdicts ORDER BY seq DESC LIMIT 5000")
+    {
         ev.verdicts = st
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .map(|rows| rows.flatten().collect())
             .unwrap_or_default();
     }
-    if let Ok(mut st) = conn.prepare("SELECT kind, at FROM events") {
+    if let Ok(mut st) = conn.prepare(
+        "SELECT kind, at FROM events WHERE kind LIKE '%restart%' ORDER BY seq DESC LIMIT 5000",
+    ) {
         ev.events = st
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .map(|rows| rows.flatten().collect())
@@ -1080,7 +1262,12 @@ fn store_evidence(path: &Path) -> StoreEvidence {
     ev
 }
 
-fn enrich_store(ev: &StoreEvidence, row: &mut Row) {
+fn enrich_store(ev: &StoreEvidence, path: &Path, row: &mut Row) {
+    if path.exists() && !ev.opened {
+        let reason = format!("store {} unreadable", path.display());
+        row.evidence_gaps.push(reason.clone());
+        row.unknowns.push(("verdict".into(), reason));
+    }
     for (sha, verdict, reviewer) in &ev.verdicts {
         let hit = row
             .landed_head
@@ -1117,10 +1304,14 @@ fn enrich_tracker(pm: Option<&Path>, row: &mut Row) {
 /// commits: ancestry. Squashes: the merge's patch-id vs the reviewed
 /// diff's patch-id.
 fn contains_head(repo: &Path, row: &mut Row) {
+    // Verify the *reviewed* head when a verdict named one — `headRefOid`
+    // is mutable (a push to an undeleted branch moves it), so the note's
+    // binding is the stable claim to check. With no note, the landed
+    // head is all there is.
     let Some(head) = row
-        .landed_head
+        .reviewed_head
         .clone()
-        .or_else(|| row.reviewed_head.clone())
+        .or_else(|| row.landed_head.clone())
     else {
         row.contains_head = "unknown (no head recorded)".into();
         return;
@@ -1178,34 +1369,40 @@ fn contains_head(repo: &Path, row: &mut Row) {
 }
 
 /// Stable patch-id for a diff range (`git diff <range> | git patch-id`).
+/// The `diff` half is `run_bounded`; `patch-id` reads a bounded in-memory
+/// buffer, so its unbounded-looking wait is CPU-only.
 fn patch_id(repo: &Path, range: &str) -> Option<String> {
+    use std::io::Write;
     let mut diff = Command::new("git");
-    let mut child = diff
-        .arg("-C")
-        .arg(repo)
-        .args(["diff", "--patch", range])
+    diff.arg("-C").arg(repo).args(["diff", "--patch", range]);
+    let out = crate::proc::run_bounded(&mut diff, GIT_TIMEOUT).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut pid = Command::new("git");
+    let mut child = pid
+        .arg("patch-id")
+        .arg("--stable")
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .ok()?;
-    let mut pid = Command::new("git");
-    let out = pid
-        .arg("patch-id")
-        .arg("--stable")
-        .stdin(child.stdout.take()?)
-        .output()
-        .ok()?;
-    let _ = child.wait();
+    child.stdin.take()?.write_all(&out.stdout).ok()?;
+    let out = child.wait_with_output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.split_whitespace().next().map(str::to_string)
 }
 
 /// Every `(sha, body)` on the default branch — scanned once for the
-/// per-row revert check in `post_merge`.
+/// per-row revert check in `post_merge`. Bounded: a revert of a merge
+/// older than the newest 10k commits is archaeological, not evidence.
 fn branch_log(repo: &Path, default_ref: &str) -> Vec<(String, String)> {
     git(
         repo,
         &[
             "log".into(),
+            "-n".into(),
+            "10000".into(),
             "--format=%H%x1f%B%x1e".into(),
             default_ref.into(),
         ],
@@ -1264,35 +1461,61 @@ fn post_merge(log: &[(String, String)], ev: &StoreEvidence, row: &mut Row) {
 // ---------- flags -----------------------------------------------------
 
 fn flag_row(row: &mut Row) {
-    let eq = |a: &Option<String>, b: &Option<String>| {
-        a.as_deref()
-            .zip(b.as_deref())
-            .is_some_and(|(x, y)| !x.is_empty() && x.eq_ignore_ascii_case(y))
-    };
-    if eq(&row.reviewer, &row.merger) {
+    // `reviewer==merger` compares GitHub identities only: the
+    // `qa-verdict` status's `creator.login` against `mergedBy.login`.
+    // A verdict note's `From:` is an agent alias — a different
+    // namespace that is rendered but never feeds the flag (an alias
+    // string-matching a login would be coincidence, not proof).
+    let same_identity = row
+        .qa_verdict_creator
+        .as_deref()
+        .zip(row.merger.as_deref())
+        .is_some_and(|(a, b)| !a.is_empty() && a.eq_ignore_ascii_case(b));
+    if same_identity {
         row.flags.push("reviewer==merger".into());
     }
     // A passing verdict on the exact head that landed: the verdict
     // note/table says pass AND the head it names is the squash-merged
     // `headRefOid` — or the `qa-verdict` commit status is SUCCESS on
-    // that head. Neither provable → flag.
+    // that head. A verdict written after the merge (or a status set
+    // post-merge) does not clear it: at merge time the head was
+    // unreviewed.
     let verdict_pass = row
         .verdict
         .as_deref()
-        .is_some_and(|v| v.eq_ignore_ascii_case("pass"));
+        .is_some_and(|v| v.eq_ignore_ascii_case("pass"))
+        && !row.verdict_post_hoc;
+    // Heads "agree" when the strings match — or when the merge-content
+    // check proved the reviewed change landed anyway (`headRefOid`
+    // moves if an undeleted branch is pushed; the patch-id is the
+    // stable evidence).
     let heads_agree = match (&row.reviewed_head, &row.landed_head) {
         (Some(r), Some(l)) => {
             r.len() >= 7
                 && (l.starts_with(&r[..r.len().min(l.len())])
                     || r.starts_with(&l[..l.len().min(r.len())]))
         }
+        // With no reviewed head recorded there is nothing to bind —
+        // the merge_sha is what a note would name.
+        (None, _) => true,
         _ => false,
-    };
+    } || row.contains_head.starts_with("yes");
     let status_ok = row
         .qa_verdict_status
         .as_deref()
-        .is_some_and(|s| s.eq_ignore_ascii_case("SUCCESS"));
-    if !(verdict_pass && heads_agree) && !status_ok && !row.is_root {
+        .is_some_and(|s| s.eq_ignore_ascii_case("SUCCESS"))
+        && !row.status_post_hoc;
+    // The flag is "sources answered and said no". When a channel the
+    // verdict could come through did not answer — gh down, notes dir
+    // unreadable, store unopenable, the reviewed head absent from the
+    // clone — the row is unknown, never an accusation.
+    let mut gaps = !row.evidence_gaps.is_empty();
+    if !heads_agree && row.reviewed_head.is_some() && row.contains_head.starts_with("unknown") {
+        // The note named a head we cannot verify against the merge —
+        // the binding question is unanswerable, not negative.
+        gaps = true;
+    }
+    if !(verdict_pass && heads_agree) && !status_ok && !row.is_root && !gaps {
         row.flags.push("no-passing-verdict".into());
     }
 }
@@ -1314,6 +1537,8 @@ fn row_json(row: &Row) -> Value {
         "reviewed_head": row.reviewed_head,
         "contains_head": row.contains_head,
         "qa_verdict_status": row.qa_verdict_status,
+        "qa_verdict_creator": row.qa_verdict_creator,
+        "status_post_hoc": row.status_post_hoc,
         "verdict": row.verdict,
         "verdict_post_hoc": row.verdict_post_hoc,
         "reviewer": row.reviewer,
@@ -1337,6 +1562,11 @@ fn row_json(row: &Row) -> Value {
             "revert": row.revert,
         },
         "flags": row.flags,
+        "evidence_unavailable": if row.evidence_gaps.is_empty() {
+            Value::Null
+        } else {
+            json!(row.evidence_gaps.join("; "))
+        },
         "unknowns": unknowns,
     })
 }
@@ -1402,6 +1632,12 @@ fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts
             .map(|n| format!("#{n}"))
             .unwrap_or_else(|| "?".into());
         println!("{pr} {}{}", row.title, flag);
+        if !row.evidence_gaps.is_empty() {
+            println!(
+                "    unknown — evidence unavailable: {}",
+                row.evidence_gaps.join("; ")
+            );
+        }
         println!(
             "    merge {} · merged_at {} · merger {}",
             &row.merge_sha[..9.min(row.merge_sha.len())],
@@ -1423,7 +1659,7 @@ fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts
             row.contains_head,
         );
         println!(
-            "    verdict {}{} · qa-verdict {} · reviewer {}",
+            "    verdict {}{} · qa-verdict {}{} · reviewer {} · reviewer@gh {}",
             or(&row.verdict),
             if row.verdict_post_hoc {
                 " (post-merge)"
@@ -1431,7 +1667,13 @@ fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts
                 ""
             },
             or(&row.qa_verdict_status),
+            if row.status_post_hoc {
+                " (post-merge)"
+            } else {
+                ""
+            },
             or(&row.reviewer),
+            or(&row.qa_verdict_creator),
         );
         println!(
             "    class {} · trigger {}",
@@ -1547,6 +1789,13 @@ mod tests {
             pr_number("session start|end: one-verb session gate (CAD-92) (#63)"),
             Some(63)
         );
+        // A trailing qualifier after the squash suffix must not hide
+        // the number; real merge commits parse the prefix form.
+        assert_eq!(pr_number("audit log (#63) (rebased)"), Some(63));
+        assert_eq!(
+            pr_number("Merge pull request #64 from favcrm/branch"),
+            Some(64)
+        );
         assert_eq!(pr_number("plain commit"), None);
         assert_eq!(pr_number("merge: no number (#)"), None);
     }
@@ -1588,5 +1837,140 @@ mod tests {
         let v = hex_shas("head `7896dd2735035c0c67e246039cb495231702941c` and main 07ca3013");
         assert!(v.contains(&"7896dd2735035c0c67e246039cb495231702941c".to_string()));
         assert!(v.contains(&"07ca3013".to_string()));
+        // All-letter abbrevs are real (`cabbebe`); all-digit tokens stay
+        // out of general context (filename dates) but count on a head line.
+        assert!(hex_shas("cabbebe").contains(&"cabbebe".to_string()));
+        assert!(hex_shas("20260920-141226").is_empty());
+        assert!(hex_shas_ctx("5428215", true).contains(&"5428215".to_string()));
+    }
+
+    fn head_line(text: &str) -> Option<String> {
+        parse_note(Path::new("/tmp/n-verdict.md"), "n-verdict.md", text).head_sha
+    }
+
+    #[test]
+    fn head_line_parses_forms() {
+        assert_eq!(
+            head_line("pass — head `7896dd2735035c0c67e246039cb495231702941c`").as_deref(),
+            Some("7896dd2735035c0c67e246039cb495231702941c")
+        );
+        assert_eq!(
+            head_line("pass — head: 5428215").as_deref(),
+            Some("5428215")
+        );
+        // `ahead`/`overhead` are not head lines.
+        assert_eq!(head_line("pass — ahead 7896dd2"), None);
+        // A case-changing multibyte char before `head` must not panic —
+        // `ẞ`.len() grows under to_lowercase, so lowercase offsets
+        // cannot index the original text.
+        assert_eq!(
+            head_line("verdict ẞ head 7896dd27").as_deref(),
+            Some("7896dd27")
+        );
+        assert_eq!(
+            head_line("verdict İ head 7896dd27").as_deref(),
+            Some("7896dd27")
+        );
+    }
+
+    fn flagged_row() -> Row {
+        Row {
+            pr: Some(1),
+            merge_sha: "ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab".into(),
+            landed_head: Some("7896dd2735035c0c67e246039cb495231702941c".into()),
+            contains_head: "yes (patch-id match)".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn flag_reviewer_eq_merger_uses_github_namespace() {
+        // Same GitHub login posted the qa-verdict status and merged —
+        // this is the only identity pair the flag compares.
+        let mut r = flagged_row();
+        r.merger = Some("cc-syntax".into());
+        r.qa_verdict_creator = Some("cc-syntax".into());
+        r.qa_verdict_status = Some("SUCCESS".into());
+        flag_row(&mut r);
+        assert!(r.flags.iter().any(|f| f == "reviewer==merger"));
+        assert!(!r.flags.iter().any(|f| f == "no-passing-verdict"));
+
+        // The note `From:` is an agent alias — matching the merger's
+        // login is coincidence, not proof. It must never flag.
+        let mut r = flagged_row();
+        r.merger = Some("qa-1".into());
+        r.reviewer = Some("qa-1".into());
+        r.qa_verdict_creator = Some("qa-bot".into());
+        r.qa_verdict_status = Some("SUCCESS".into());
+        flag_row(&mut r);
+        assert!(r.flags.is_empty(), "{:?}", r.flags);
+    }
+
+    #[test]
+    fn flag_no_passing_verdict_only_when_sources_answered() {
+        // Sources all answered, none proves a pass on the landed head.
+        let mut r = flagged_row();
+        flag_row(&mut r);
+        assert_eq!(r.flags, vec!["no-passing-verdict".to_string()]);
+
+        // gh down / notes unreadable → evidence unavailable, not an
+        // accusation: no flag.
+        let mut r = flagged_row();
+        r.evidence_gaps
+            .push("status fetch failed: gh: timeout".into());
+        flag_row(&mut r);
+        assert!(r.flags.is_empty());
+
+        // Reviewed head exists but isn't in the clone — the binding is
+        // unanswerable, not negative.
+        let mut r = flagged_row();
+        r.reviewed_head = Some("deadd00".into());
+        r.contains_head = "unknown (head not in local object store — never fetched)".into();
+        flag_row(&mut r);
+        assert!(r.flags.is_empty());
+
+        // A pass verdict on the landed head clears it.
+        let mut r = flagged_row();
+        r.verdict = Some("pass".into());
+        r.reviewed_head = r.landed_head.clone();
+        flag_row(&mut r);
+        assert!(r.flags.is_empty(), "{:?}", r.flags);
+
+        // A SUCCESS qa-verdict status clears it.
+        let mut r = flagged_row();
+        r.qa_verdict_status = Some("SUCCESS".into());
+        flag_row(&mut r);
+        assert!(r.flags.is_empty(), "{:?}", r.flags);
+    }
+
+    #[test]
+    fn flag_post_hoc_verdict_does_not_clear() {
+        // A pass verdict written after the merge proves nothing about
+        // merge-time review.
+        let mut r = flagged_row();
+        r.verdict = Some("pass".into());
+        r.reviewed_head = r.landed_head.clone();
+        r.verdict_post_hoc = true;
+        flag_row(&mut r);
+        assert!(r.flags.iter().any(|f| f == "no-passing-verdict"));
+
+        // Same for a status posted after the merge.
+        let mut r = flagged_row();
+        r.qa_verdict_status = Some("SUCCESS".into());
+        r.status_post_hoc = true;
+        flag_row(&mut r);
+        assert!(r.flags.iter().any(|f| f == "no-passing-verdict"));
+    }
+
+    #[test]
+    fn flag_root_commit_exempt() {
+        let mut r = Row {
+            is_root: true,
+            merge_sha: "ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab".into(),
+            contains_head: "unknown (no head recorded)".into(),
+            ..Default::default()
+        };
+        flag_row(&mut r);
+        assert!(r.flags.is_empty());
     }
 }
