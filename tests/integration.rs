@@ -13880,6 +13880,32 @@ fn pty_claude_quoted_menu_above_input_box_is_inert() {
     assert!(!input.contains("<KEY"), "no key sent: {input}");
 }
 
+/// Same class on the Devin profile (CAD-102 r6): a verbatim quoted
+/// menu above the live idle input box probes inert — the legend is
+/// transcript text, and the editable `❭` row vetoes the region —
+/// and `agent answer` refuses rather than keying the digit into the
+/// input line.
+#[test]
+fn pty_devin_quoted_menu_above_input_box_is_inert() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    atomic_write(
+        d.pane_file(&mock, "dv", "tui-state"),
+        "● The pane showed:\n\n  Allow this tool call?\n  ❭ 1 Yes  (Approve once)\n  · 2 Yes, allow `env` commands\n  · 8 No\n  ↑↓ select · ↵ confirm · esc cancel\n\n  So it is waiting.\n\n────────────────────\n❭ Ask Devin to build features, fix bugs, or work on your code\n────────────────────\nSWE-2 Max   Context: 43k / 262k\n",
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["approval_menu"], false, "{probe}");
+    assert_eq!(probe["idle"], true, "{probe}");
+    let err = d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "2"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("no approval menu"), "{err}");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+}
+
 /// A transient `capture-pane` failure inside the gate probe refuses
 /// the send like a busy pane — `gate_wait`, message still queued —
 /// never an actor-fatal provider error. The daemon survives and the
