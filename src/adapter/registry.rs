@@ -135,7 +135,13 @@ pub static SPECS: &[EndpointSpec] = &[
         resumable: true,
         resume_label: "codex resume --remote",
         live_settable_params: &["stall_secs"],
-        launch_params: &["session", "upstream", "agents_md", "stall_secs"],
+        launch_params: &[
+            "session",
+            "upstream",
+            "agents_md",
+            "stall_secs",
+            "approval_policy",
+        ],
         session_id_label: "Codex thread",
         respond_rejection: None,
         capabilities: &["managed_codex_stdio"],
@@ -159,7 +165,13 @@ pub static SPECS: &[EndpointSpec] = &[
         resumable: true,
         resume_label: "codex resume --remote",
         live_settable_params: &["stall_secs"],
-        launch_params: &["session", "upstream", "agents_md", "stall_secs"],
+        launch_params: &[
+            "session",
+            "upstream",
+            "agents_md",
+            "stall_secs",
+            "approval_policy",
+        ],
         session_id_label: "Codex thread",
         respond_rejection: None,
         capabilities: &["managed_codex_ws"],
@@ -648,7 +660,7 @@ pub fn claude_effort(level: &str) -> Result<()> {
 
 /// Launch params `agent set --next-launch` may change: stored for the
 /// next open, never pushed to the live process.
-const NEXT_LAUNCH_PARAMS: &[&str] = &["model", "effort"];
+const NEXT_LAUNCH_PARAMS: &[&str] = &["model", "effort", "approval_policy"];
 
 /// Validate one `agent set --next-launch` key: `model`/`effort` only,
 /// and only where the endpoint launches with that param. A null value
@@ -666,13 +678,15 @@ pub fn validate_next_launch_param(
         return Err(Error::rejected(format!(
             "'{key}' cannot be set for the next launch of a {provider}/{kind} \
              agent — --next-launch takes the launch params an endpoint \
-             declares (claude: model, effort; cursor: model). Recreate \
-             the agent to change wiring params like upstream or session"
+             declares (claude: model, effort; cursor: model; codex: \
+             approval_policy). Recreate the agent to change wiring \
+             params like upstream or session"
         )));
     }
     match (key, value) {
         (_, Value::Null) => Ok(()),
         ("effort", Value::String(level)) => claude_effort(level),
+        ("approval_policy", Value::String(policy)) => codex_approval_policy(policy),
         ("model", Value::String(m)) if !m.trim().is_empty() => Ok(()),
         _ => Err(Error::rejected(format!(
             "'{key}' needs a non-empty string value, or a bare key to clear it"
@@ -690,6 +704,25 @@ pub fn devin_permission_mode(mode: &str) -> Result<()> {
         Err(Error::rejected(format!(
             "unknown devin permission mode '{mode}' — expected one of: {}",
             DEVIN_PERMISSION_MODES.join(", ")
+        )))
+    }
+}
+
+/// The Codex app-server's `approvalPolicy` vocabulary for
+/// `thread/start`/`thread/resume` — `never` is the cadence worker
+/// posture: no approval round-trips to stall an unattended turn on.
+pub const CODEX_APPROVAL_POLICIES: &[&str] = &["never", "on-request", "on-failure", "untrusted"];
+
+/// Reject a Codex approval policy outside the four-value vocabulary —
+/// `agent_register`, `agent set --next-launch` and the adapter's open
+/// share this check, and the error always names every accepted value.
+pub fn codex_approval_policy(policy: &str) -> Result<()> {
+    if CODEX_APPROVAL_POLICIES.contains(&policy) {
+        Ok(())
+    } else {
+        Err(Error::rejected(format!(
+            "unknown codex approval_policy '{policy}' — expected one of: {}",
+            CODEX_APPROVAL_POLICIES.join(", ")
         )))
     }
 }
@@ -742,6 +775,19 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
                     return Err(Error::rejected(format!(
                         "devin permission_mode must be a string, one of: {}",
                         DEVIN_PERMISSION_MODES.join(", ")
+                    )))
+                }
+            }
+        }
+    }
+    if provider == "codex" {
+        if let Some(v) = params.get("approval_policy") {
+            match v.as_str() {
+                Some(policy) => codex_approval_policy(policy)?,
+                None => {
+                    return Err(Error::rejected(format!(
+                        "codex approval_policy must be a string, one of: {}",
+                        CODEX_APPROVAL_POLICIES.join(", ")
                     )))
                 }
             }
@@ -1068,6 +1114,86 @@ mod tests {
             &json!({"session": "c", "model": "g", "upstream": "pm", "auto_ready": "verified"})
         )
         .is_ok());
+    }
+
+    #[test]
+    fn codex_approval_policies_validated() {
+        for policy in CODEX_APPROVAL_POLICIES {
+            assert!(codex_approval_policy(policy).is_ok(), "{policy}");
+        }
+        // Everything else rejects — the error always lists the four
+        // accepted values so the caller can self-correct.
+        for bad in ["auto", "always", "bypass", "", "NEVER", "on_request"] {
+            let msg = codex_approval_policy(bad).unwrap_err().to_string();
+            for accepted in CODEX_APPROVAL_POLICIES {
+                assert!(
+                    msg.contains(accepted),
+                    "'{bad}' error missing '{accepted}': {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_launch_params_validated_at_register() {
+        // Both codex endpoints declare and enforce the same vocabulary.
+        for kind in ["managed", "managed-ws"] {
+            for policy in CODEX_APPROVAL_POLICIES {
+                assert!(
+                    validate_launch_params("codex", kind, &json!({"approval_policy": policy}))
+                        .is_ok(),
+                    "{kind} {policy}"
+                );
+            }
+            let msg = validate_launch_params("codex", kind, &json!({"approval_policy": "bogus"}))
+                .unwrap_err()
+                .to_string();
+            for accepted in CODEX_APPROVAL_POLICIES {
+                assert!(msg.contains(accepted), "missing '{accepted}': {msg}");
+            }
+            // Non-string values reject too; unrelated keys pass through.
+            assert!(validate_launch_params("codex", kind, &json!({"approval_policy": 1})).is_err());
+            assert!(validate_launch_params(
+                "codex",
+                kind,
+                &json!({"session": "s", "upstream": "pm", "stall_secs": 60})
+            )
+            .is_ok());
+        }
+        // Other providers pass the key through untouched.
+        assert!(
+            validate_launch_params("claude", "managed", &json!({"approval_policy": "bogus"}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn codex_approval_policy_is_next_launch_settable() {
+        for kind in ["managed", "managed-ws"] {
+            // A valid value stores for the next open; null clears it.
+            assert!(
+                validate_next_launch_param("codex", kind, "approval_policy", &json!("on-failure"))
+                    .is_ok(),
+                "{kind}"
+            );
+            assert!(
+                validate_next_launch_param("codex", kind, "approval_policy", &Value::Null).is_ok(),
+                "{kind}"
+            );
+            // A bogus value names all four accepted values.
+            let msg = validate_next_launch_param("codex", kind, "approval_policy", &json!("bogus"))
+                .unwrap_err()
+                .to_string();
+            for accepted in CODEX_APPROVAL_POLICIES {
+                assert!(msg.contains(accepted), "missing '{accepted}': {msg}");
+            }
+        }
+        // Endpoints that do not declare it refuse the key entirely.
+        let msg =
+            validate_next_launch_param("claude", "managed", "approval_policy", &json!("never"))
+                .unwrap_err()
+                .to_string();
+        assert!(msg.contains("cannot be set"), "{msg}");
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use super::link::Incoming;
+use super::registry;
 use super::stdio::{EnvScrub, StdioAdapter};
 use super::ws::WsAdapter;
 use super::{AdapterHooks, Identity, ProviderAdapter, ProviderEnv, ProviderRequest, TurnResult};
@@ -329,10 +330,30 @@ impl ProviderAdapter for CodexAdapter {
             )?;
             self.transport
                 .send(json!({"method": "initialized", "params": {}}))?;
+            // `approval_policy` rides params so resume replays it
+            // verbatim; a cadence-launched worker defaults to `never` —
+            // the same unattended posture the other providers run.
+            // Registration and `agent set --next-launch` already reject
+            // unknown values; validating again here keeps a hand-edited
+            // store from reaching the wire silently.
+            let approval_policy = match agent.params.as_ref().and_then(|p| p.get("approval_policy"))
+            {
+                Some(v) => {
+                    let policy = v.as_str().ok_or_else(|| {
+                        Error::rejected(format!(
+                            "codex approval_policy must be a string, one of: {}",
+                            registry::CODEX_APPROVAL_POLICIES.join(", ")
+                        ))
+                    })?;
+                    registry::codex_approval_policy(policy)?;
+                    policy
+                }
+                None => "never",
+            };
             let mut params = json!({
                 "cwd": agent.cwd,
                 "sandbox": agent.sandbox,
-                "approvalPolicy": "on-request",
+                "approvalPolicy": approval_policy,
             });
             if let Some(instructions) = &agent.instructions {
                 params["developerInstructions"] = json!(instructions);

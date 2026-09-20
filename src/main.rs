@@ -144,6 +144,11 @@ enum Commands {
         /// pm or worker.
         #[arg(long, default_value = "worker")]
         role: String,
+        /// Codex filesystem sandbox sent on `thread/start` [default:
+        /// workspace-write — a cadence-launched worker is writable;
+        /// read-only only when asked].
+        #[arg(long, value_parser = ["read-only", "workspace-write"])]
+        sandbox: Option<String>,
         /// File with reusable provider instructions.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
@@ -431,6 +436,13 @@ enum Commands {
         /// pm or worker.
         #[arg(long, default_value = "worker")]
         role: String,
+        /// Worker filesystem sandbox, recorded on registration. Codex
+        /// sends it on `thread/start`; for a codex worker the default
+        /// is workspace-write — `read-only` only when asked. Other
+        /// providers store the value without consuming it and keep the
+        /// read-only default.
+        #[arg(long, value_parser = ["read-only", "workspace-write"])]
+        sandbox: Option<String>,
         /// File with reusable provider instructions.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
@@ -2913,6 +2925,7 @@ fn run() -> Result<i32> {
             auto_ready,
             agents_md,
             false,
+            None,
             &ClaudeOpts::default(),
             &DevinOpts {
                 permission_mode,
@@ -2925,6 +2938,7 @@ fn run() -> Result<i32> {
             cwd,
             alias,
             role,
+            sandbox,
             instructions_file,
             worktree,
             bootstrap,
@@ -2946,6 +2960,7 @@ fn run() -> Result<i32> {
             false,
             agents_md,
             tui,
+            sandbox,
             &ClaudeOpts::default(),
             &DevinOpts::default(),
             &CursorOpts::default(),
@@ -2987,6 +3002,7 @@ fn run() -> Result<i32> {
             auto_ready,
             agents_md,
             tui,
+            None,
             &ClaudeOpts {
                 model,
                 effort,
@@ -3031,6 +3047,7 @@ fn run() -> Result<i32> {
             auto_ready,
             agents_md,
             false,
+            None,
             &ClaudeOpts::default(),
             &DevinOpts::default(),
             &CursorOpts {
@@ -3048,6 +3065,7 @@ fn run() -> Result<i32> {
             cwd,
             alias,
             role,
+            sandbox,
             instructions_file,
             worktree,
             no_bootstrap,
@@ -3072,6 +3090,7 @@ fn run() -> Result<i32> {
             cwd,
             alias,
             &role,
+            sandbox,
             instructions_file,
             worktree,
             no_bootstrap,
@@ -4227,6 +4246,8 @@ fn provider_launch(
     auto_ready: bool,
     agents_md: bool,
     tui: bool,
+    // `--sandbox`; `None` resolves per provider below.
+    sandbox: Option<String>,
     claude: &ClaudeOpts,
     devin: &DevinOpts,
     cursor: &CursorOpts,
@@ -4404,6 +4425,18 @@ fn provider_launch(
         params_obj.insert("agents_md".to_string(), Value::Bool(true));
     }
     let params = (!params_obj.is_empty()).then(|| Value::Object(params_obj).to_string());
+    // The sandbox rides the agent record; codex sends it on
+    // `thread/start`. A cadence-launched codex worker is writable by
+    // default — the same trust posture the other providers already run
+    // — and `read-only` remains available when explicitly asked.
+    let sandbox = sandbox.unwrap_or_else(|| {
+        if provider == "codex" {
+            "workspace-write"
+        } else {
+            "read-only"
+        }
+        .to_string()
+    });
     // Reopening an already-registered name keeps its stored params — a
     // requested upstream is not retro-applied to a pre-existing agent.
     let mut registered_fresh = false;
@@ -4412,7 +4445,7 @@ fn provider_launch(
         "agent_register",
         json!({"alias": alias, "provider": provider,
                "endpoint_kind": endpoint_kind, "cwd": cwd,
-               "role": role, "sandbox": "read-only",
+               "role": role, "sandbox": sandbox,
                "instructions": instructions, "params": params}),
     ) {
         Ok(_) => registered_fresh = true,
@@ -4533,6 +4566,7 @@ fn join_group(
     cwd: Option<PathBuf>,
     alias: Option<String>,
     role: &str,
+    sandbox: Option<String>,
     instructions_file: Option<PathBuf>,
     worktree: Option<String>,
     no_bootstrap: bool,
@@ -4584,6 +4618,7 @@ fn join_group(
         auto_ready,
         agents_md,
         tui,
+        sandbox,
         &claude_opts,
         &devin_opts,
         &cursor_opts,
