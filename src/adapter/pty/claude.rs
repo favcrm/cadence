@@ -93,6 +93,30 @@ fn option_line(line: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// A footer/legend row matching hint `h` — anchored on the trimmed
+/// row's leading text or a `·`-separated legend cell (`Enter to
+/// confirm · Esc to cancel`), so a transcript quoting the same words
+/// mid-line does not count.
+fn hint_row(l: &str, h: &str) -> bool {
+    l.contains(h) && (l.trim_start().starts_with(h) || l.contains(&format!("· {h}")))
+}
+
+/// True when row `i` is the boxed input line: a `❯`-led row whose
+/// previous row is the `─` border. Menu option lists lead with `❯`
+/// too but are never boxed.
+fn boxed(lines: &[&str], i: usize) -> bool {
+    i > 0 && {
+        let above = lines[i - 1].trim();
+        !above.is_empty() && above.chars().all(|c| c == claude_screen::BORDER)
+    }
+}
+
+/// The menu's highlighted option row: a `❯`-led row that is not the
+/// boxed input line.
+fn sel_row(lines: &[&str], i: usize) -> bool {
+    lines[i].trim_start().starts_with('❯') && !boxed(lines, i)
+}
+
 /// The line naming what the menu asks. A `Do you want to proceed?`
 /// prompt carries its detail rows above the question — the command
 /// first, then its description — so the furthest row inside the block
@@ -160,21 +184,33 @@ pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         .join("\n");
     // Menu evidence lives in the wider menu window — a permission
     // prompt plus a still-visible input box can push its rows above
-    // the busy anchor. Anchors decide alone; hints need real menu
-    // structure beside them (numbered options or a second hint).
-    let menu_lines: Vec<&str> = content.lines().rev().take(MENU_LINES).collect();
-    let anchor = menu_lines
-        .iter()
-        .any(|l| claude_screen::ANCHOR.iter().any(|a| l.contains(a)));
+    // the busy anchor. Anchors decide alone but only matched on the
+    // trimmed row's leading text; hints (footer fragments, matched
+    // row-anchored) need real menu structure beside them — numbered
+    // option rows or the highlighted `❯` option row — so a transcript
+    // quoting these strings stays text, never a menu.
+    let menu_lines: Vec<&str> = content
+        .lines()
+        .rev()
+        .take(MENU_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let anchor = menu_lines.iter().any(|l| {
+        let t = l.trim_start();
+        claude_screen::ANCHOR.iter().any(|a| t.starts_with(a))
+    });
     let options = menu_lines
         .iter()
         .filter(|l| option_line(l).is_some())
         .count();
+    let highlighted = (0..menu_lines.len()).any(|i| sel_row(&menu_lines, i));
     let hints = claude_screen::HINT
         .iter()
-        .filter(|h| menu_lines.iter().any(|l| l.contains(**h)))
+        .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
         .count();
-    let approval_menu = anchor || (options >= 2 && hints >= 1) || hints >= 2;
+    let approval_menu = anchor || (hints >= 1 && (options >= 2 || highlighted));
     let busy_marker = claude_screen::BUSY.iter().any(|m| tail.contains(m));
     // The input box is a `❯`-leading line whose previous row is the
     // `─` border — menu option lists lead with `❯` too but are never
@@ -569,45 +605,115 @@ impl TuiProfile for ClaudeProfile {
             ))
         })?;
         if !numbered.is_empty() {
-            if numbered.contains(&n) {
+            if !numbered.contains(&n) {
+                return Err(Error::rejected(format!(
+                    "no option {n} on this menu — it lists {}",
+                    numbered
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            // A single digit is one keypress. A multi-digit index
+            // must never reach tmux as one literal — `send-keys
+            // "10"` presses `1` then `0`, and a menu that selects
+            // on the first press would pick option 1 while `0`
+            // leaks as input. Navigate from the highlight instead.
+            if n < 10 {
                 return Ok(vec![n.to_string()]);
             }
-            return Err(Error::rejected(format!(
-                "no option {n} on this menu — it lists {}",
-                numbered
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
+            let sel = (0..region.len()).rev().find(|i| sel_row(&region, *i));
+            let cur = sel
+                .and_then(|i| option_line(region[i]))
+                .filter(|c| numbered.contains(c))
+                .ok_or_else(|| {
+                    Error::rejected(
+                        "cannot locate the highlighted option on this \
+                         menu — answer it in the pane",
+                    )
+                })?;
+            let want = numbered.iter().position(|o| *o == n).unwrap();
+            let at = numbered.iter().position(|o| *o == cur).unwrap();
+            let (dir, steps) = if want >= at {
+                ("Down", want - at)
+            } else {
+                ("Up", at - want)
+            };
+            let mut keys = vec![dir.to_string(); steps];
+            keys.push("Enter".to_string());
+            return Ok(keys);
         }
-        // Unnumbered select: option rows sit between the first
-        // `❯`-led row (skipping a boxed input line — its previous row
-        // is the `─` border) and the footer (hint-bearing) row.
-        let sel = region
-            .iter()
-            .enumerate()
-            .position(|(i, l)| {
-                l.trim_start().starts_with('❯')
-                    && !(i > 0
-                        && region[i - 1]
-                            .trim()
-                            .chars()
-                            .all(|c| c == claude_screen::BORDER)
-                        && !region[i - 1].trim().is_empty())
-            })
-            .ok_or_else(|| Error::rejected("no menu options on screen"))?;
-        let count = region[sel..]
-            .iter()
-            .take_while(|l| !claude_screen::HINT.iter().any(|h| l.contains(*h)))
-            .filter(|l| !l.trim().is_empty())
-            .count() as u32;
+        // Unnumbered select: the option block is the contiguous run of
+        // rows around the highlighted `❯` row — up and down, never
+        // just the suffix below it — where an option row is `❯`-led or
+        // carries its text at the highlighted row's column (the
+        // subject and context rows above sit at other indents). When
+        // the highlighted row cannot be found the answer refuses
+        // rather than walking blind.
+        // The LAST non-boxed `❯` row: a transcript `❯` echo above the
+        // menu would otherwise be mistaken for the highlight.
+        let sel = (0..region.len())
+            .rev()
+            .find(|i| sel_row(&region, *i))
+            .ok_or_else(|| {
+                Error::rejected(
+                    "cannot locate the option rows on this menu — answer \
+                     it in the pane",
+                )
+            })?;
+        // The column the highlighted option's text starts at — `❯` is
+        // one glyph plus its trailing space.
+        let sel_col = region[sel].find('❯').map(|b| b + 2).unwrap_or(0);
+        let opt = |i: usize| -> bool {
+            let l = region[i];
+            let t = l.trim_start();
+            // Blank, border and hint rows end the block. Anchor rows
+            // are *not* excluded — `Yes, I trust this folder` is both
+            // an anchor and a real option; subject rows sit at a
+            // different column than options anyway.
+            if t.is_empty()
+                || t.chars().all(|c| c == claude_screen::BORDER)
+                || claude_screen::HINT.iter().any(|h| hint_row(l, h))
+            {
+                return false;
+            }
+            t.starts_with('❯')
+                || (l.len() - t.len() == sel_col && !t.starts_with('$') && !t.starts_with("Tip:"))
+        };
+        let mut start = sel;
+        while start > 0 && opt(start - 1) {
+            start -= 1;
+        }
+        let mut end = sel;
+        while end + 1 < region.len() && opt(end + 1) {
+            end += 1;
+        }
+        let count = (end - start + 1) as u32;
+        // A lone `❯` row is not a one-option menu — a transcript echo
+        // can look like a highlight; a real menu always lists at
+        // least one sibling option.
+        if count < 2 {
+            return Err(Error::rejected(
+                "cannot locate the option rows on this menu — answer \
+                 it in the pane",
+            ));
+        }
         if n == 0 || n > count {
             return Err(Error::rejected(format!(
                 "no option {n} on this menu — it lists {count}"
             )));
         }
-        let mut keys = vec!["Down".to_string(); (n - 1) as usize];
+        // Navigate from the highlighted row — it is not necessarily
+        // the first option.
+        let want = (n - 1) as usize;
+        let cur = sel - start;
+        let (dir, steps) = if want >= cur {
+            ("Down", want - cur)
+        } else {
+            ("Up", cur - want)
+        };
+        let mut keys = vec![dir.to_string(); steps];
         keys.push("Enter".to_string());
         Ok(keys)
     }
@@ -619,7 +725,9 @@ impl TuiProfile for ClaudeProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze_claude, proc_start_ticks, STATUS_LINES};
+    use super::{analyze_claude, proc_start_ticks, ClaudeProfile, STATUS_LINES};
+    use crate::adapter::pty::profile::TuiProfile;
+    use std::path::PathBuf;
 
     /// Real captures from a live claude 2.1.275 pane (CAD-17),
     /// committed under tests/fixtures/claude-tui/.
@@ -775,5 +883,117 @@ mod tests {
         let stat =
             "1234 (node) S 1 1234 1234 0 -1 4194304 500 0 0 0 10 5 0 0 20 0 1 0 130881239 100 200";
         assert_eq!(proc_start_ticks(stat).as_deref(), Some("130881239"));
+    }
+
+    /// A profile for `approval_answer` tests — the method only reads
+    /// the screen, so the launch fields are dummies.
+    fn profile() -> ClaudeProfile {
+        ClaudeProfile {
+            sessions_dir: PathBuf::from("/tmp"),
+            command: "claude".to_string(),
+            model: None,
+            effort: None,
+            permission_mode: None,
+            allowed_tools: Vec::new(),
+            real: false,
+        }
+    }
+
+    /// The trust dialog's option block — ` Security guide` sits right
+    /// above the highlight at a different indent and must never count
+    /// as an option.
+    fn trust_menu() -> &'static str {
+        " Quick safety check: Is this a project you trust?\n \n Security guide\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n"
+    }
+
+    #[test]
+    fn unnumbered_answer_navigates_the_block() {
+        let prof = profile();
+        assert_eq!(
+            prof.approval_answer(trust_menu(), "2").unwrap(),
+            vec!["Down", "Enter"]
+        );
+        assert_eq!(
+            prof.approval_answer(trust_menu(), "1").unwrap(),
+            vec!["Enter"]
+        );
+    }
+
+    #[test]
+    fn answer_counts_options_above_the_highlight() {
+        // The highlight is on the SECOND printed option — `answer 1`
+        // must move Up to the first row, never confirm `No, exit`.
+        let screen = " Security guide\n   Yes, I trust this folder\n ❯ No, exit\n Enter to confirm · Esc to cancel\n";
+        let prof = profile();
+        assert_eq!(
+            prof.approval_answer(screen, "1").unwrap(),
+            vec!["Up", "Enter"]
+        );
+        assert_eq!(prof.approval_answer(screen, "2").unwrap(), vec!["Enter"]);
+    }
+
+    #[test]
+    fn answer_index_is_bounded_by_the_visible_block() {
+        let prof = profile();
+        for choice in ["3", "4000000000", "0"] {
+            assert!(
+                prof.approval_answer(trust_menu(), choice).is_err(),
+                "{choice} must refuse"
+            );
+        }
+        // Footer chrome with no option block refuses outright — never
+        // a blind arrow walk.
+        let footer_only = "transcript\n Enter to confirm · Esc to cancel\n";
+        assert!(prof.approval_answer(footer_only, "1").is_err());
+        assert!(prof.approval_answer(footer_only, "4000000000").is_err());
+    }
+
+    #[test]
+    fn multi_digit_answer_navigates_instead_of_typing() {
+        // `send-keys "10"` would press `1` (selecting option 1 on a
+        // digit-key menu) and leak `0` — a multi-digit index arrows
+        // from the highlighted row instead.
+        let menu = " Do you want to proceed?\n ❯ 1. Yes\n   2. A\n   3. B\n   4. C\n   5. D\n   6. E\n   7. F\n   8. G\n   9. H\n   10. No\n Enter to confirm · Esc to cancel\n";
+        let prof = profile();
+        assert_eq!(
+            prof.approval_answer(menu, "10").unwrap(),
+            vec!["Down", "Down", "Down", "Down", "Down", "Down", "Down", "Down", "Down", "Enter"]
+        );
+        assert_eq!(prof.approval_answer(menu, "3").unwrap(), vec!["3"]);
+        assert!(prof.approval_answer(menu, "11").is_err());
+        // A numbered menu with no `❯` highlight refuses rather than
+        // guessing where the arrows start from.
+        let no_highlight = " Do you want to proceed?\n   1. Yes\n   2. A\n   3. B\n   4. C\n   5. D\n   6. E\n   7. F\n   8. G\n   9. H\n   10. No\n Enter to confirm · Esc to cancel\n";
+        assert!(prof.approval_answer(no_highlight, "10").is_err());
+    }
+
+    #[test]
+    fn quoted_anchor_text_is_not_a_menu() {
+        // The anchor strings quoted mid-line in a transcript stay
+        // text — detection matches on the trimmed row's leading text.
+        let idle = fixture("idle.txt");
+        for quoted in [
+            "earlier it asked \"Do you want to proceed?\" — transcript",
+            "the log shows \"Quick safety check\" in passing",
+            "docs mention \"Yes, I trust this folder\" as an option",
+            "it printed \"Do you trust the files in this folder?\" once",
+        ] {
+            let p = analyze_claude(&format!("{idle}\n{quoted}"), Some((2, 0)));
+            assert!(!p.approval_menu, "{quoted}: {:?}", p);
+        }
+    }
+
+    #[test]
+    fn quoted_footer_text_is_not_a_menu() {
+        // Footer fragments mid-line are not menu rows — a menu needs
+        // the anchored legend or the `❯` highlight beside them.
+        let idle = fixture("idle.txt");
+        for quoted in [
+            "press \"Esc to cancel\" to dismiss it",
+            "or use \"Enter to confirm\" per the docs",
+        ] {
+            let p = analyze_claude(&format!("{idle}\n{quoted}"), Some((2, 0)));
+            assert!(!p.approval_menu, "{quoted}: {:?}", p);
+        }
     }
 }

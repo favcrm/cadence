@@ -201,6 +201,9 @@ struct StallWatch {
     /// `Some` is the menu-open flag: the rising edge fires
     /// `approval_menu` once per menu, and the views read the line.
     menu_line: Option<String>,
+    /// The line the last `approval_menu` event carried — a detection
+    /// flicker that re-rises on the same line must not re-fire.
+    menu_evented: Option<String>,
     /// `turn_silent_end` already fired for this message — the event
     /// is once per message, never twice.
     silent_end_sent: bool,
@@ -227,6 +230,7 @@ impl Default for StallWatch {
             idle_samples: 0,
             idle_since: None,
             menu_line: None,
+            menu_evented: None,
             silent_end_sent: false,
             last_probe: None,
             episodes: 0,
@@ -1745,9 +1749,26 @@ impl Shared {
         let choice = required_str(params, "choice")?;
         let by = optional_str(params, "by").unwrap_or("operator");
         let note = optional_str(params, "note");
+        // A pane must never approve its own prompt — a worker that can
+        // reach the socket could otherwise self-sanction the very
+        // decision the menu exists to gate. And `by` naming a live
+        // agent is stamped as one: the audit trail must not read an
+        // agent-sourced answer as a human operator's decision.
+        if by == alias {
+            return Err(Error::rejected(
+                "a pane cannot answer its own approval menu — `by` must \
+                 not be the agent's own alias",
+            ));
+        }
+        let by_kind = if self.store.agent(by).is_ok() {
+            "agent"
+        } else {
+            "operator"
+        };
         let probe = self.adapter_for(&alias)?.answer_approval(choice)?;
         let mut detail = json!({
             "by": by,
+            "by_kind": by_kind,
             "choice": choice,
             "line": probe.reason.clone(),
             "probe": probe.to_json(),
@@ -1757,6 +1778,10 @@ impl Shared {
         }
         let _ = self.store.event_public(&alias, "approval_answered", detail);
         self.wake();
+        // An answered menu may be exactly what a queued head waits
+        // behind — wake the delivery loop rather than leaving it to
+        // sit out the gate backoff.
+        self.notify_agent(&alias);
         Ok(json!({"alias": alias, "state": "answered", "choice": choice}))
     }
 
@@ -3001,51 +3026,73 @@ impl Shared {
     /// transition, if any. A turn that ends while stalled just ends —
     /// no recovery event is owed for a message that stopped running.
     fn stall_check(&self, alias: &str, ctl: &Arc<AgentCtl>) {
+        // The tracked head: the running turn when one is in flight,
+        // else the oldest still-waiting message — a pane menu that
+        // blocks its delivery must surface before any turn starts
+        // (queued-head tracking is menu detection only; stall and
+        // silent-end bookkeeping need a started turn).
         let running = match self.store.running_message(alias) {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                let mut w = ctl.stall.lock().unwrap();
-                w.message = None;
-                w.stalled_at = None;
-                w.sample_at = None;
-                w.settled = None;
-                w.previous = None;
-                w.candidate = None;
-                w.changed = 0;
-                return;
-            }
+            Ok(m) => m,
             Err(_) => return,
+        };
+        let tracked = match running {
+            Some(ref m) => m.clone(),
+            None => match self.store.queued_head(alias) {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    let mut w = ctl.stall.lock().unwrap();
+                    w.message = None;
+                    w.stalled_at = None;
+                    w.sample_at = None;
+                    w.settled = None;
+                    w.previous = None;
+                    w.candidate = None;
+                    w.changed = 0;
+                    w.menu_line = None;
+                    w.menu_evented = None;
+                    w.idle_samples = 0;
+                    w.idle_since = None;
+                    return;
+                }
+                Err(_) => return,
+            },
         };
         let Ok(agent) = self.store.agent(alias) else {
             return;
         };
         // Store reads stay outside the stall lock — `stall_budget`
         // takes the conn mutex and no other path holds it in reverse.
-        let budget = self.stall_budget(&agent, &running);
+        let budget = running
+            .as_ref()
+            .map(|m| self.stall_budget(&agent, m))
+            .unwrap_or(0);
         let ad = ctl.adapter.lock().unwrap().clone();
         let mut w = ctl.stall.lock().unwrap();
-        if w.message.as_deref() != Some(running.id.as_str()) {
+        if w.message.as_deref() != Some(tracked.id.as_str()) {
             *w = StallWatch {
-                message: Some(running.id.clone()),
+                message: Some(tracked.id.clone()),
                 ..StallWatch::default()
             };
         }
         // An open brokered request means the provider is silent by
         // design — a human is thinking. That wait is activity.
-        let pending_req = self
-            .pending
-            .lock()
-            .unwrap()
-            .values()
-            .any(|req| req.alias == alias);
+        let pending_req = running.is_some()
+            && self
+                .pending
+                .lock()
+                .unwrap()
+                .values()
+                .any(|req| req.alias == alias);
         if pending_req {
             w.activity = Instant::now();
         }
         // The adapter's own clock when it keeps one — managed
         // transcripts stamp every provider notification.
-        if let Some(at) = ad.as_ref().and_then(|a| a.activity_at()) {
-            if at > w.activity {
-                w.activity = at;
+        if running.is_some() {
+            if let Some(at) = ad.as_ref().and_then(|a| a.activity_at()) {
+                if at > w.activity {
+                    w.activity = at;
+                }
             }
         }
         // PTY screens have no transport clock: captures run on their
@@ -3075,13 +3122,18 @@ impl Shared {
             if let Some((hash, probe)) = landed {
                 // The verdict first: an open menu clears the idle
                 // streak and fires `approval_menu` on the rising edge
-                // only; an idle frame extends the streak; anything
-                // else (busy, draft) resets both clocks.
+                // only — and only once per distinct menu line, so a
+                // detection flicker cannot re-fire the same wait; an
+                // idle frame extends the streak; anything else (busy,
+                // draft) resets both clocks.
                 if probe.approval_menu {
                     w.idle_samples = 0;
                     w.idle_since = None;
-                    if w.menu_line.is_none() {
+                    if w.menu_line.is_none()
+                        && w.menu_evented.as_deref() != Some(probe.reason.as_str())
+                    {
                         menu_rise = Some(probe.reason.clone());
+                        w.menu_evented = Some(probe.reason.clone());
                     }
                     w.menu_line = Some(probe.reason.clone());
                 } else {
@@ -3096,7 +3148,11 @@ impl Shared {
                         w.idle_since = None;
                     }
                 }
-                if w.settled.as_deref() == Some(hash.as_str()) {
+                if running.is_none() {
+                    // Queued-head tracking is menu detection only —
+                    // the screen-hash churn below measures a turn's
+                    // activity and means nothing before it starts.
+                } else if w.settled.as_deref() == Some(hash.as_str()) {
                     // Still the settled screen — a candidate reverted
                     // without ever confirming; drop it.
                     w.candidate = None;
@@ -3148,7 +3204,11 @@ impl Shared {
             // never while a menu or a brokered request explains the
             // wait. The event fires once per message and flags it —
             // the message itself is never auto-resolved.
-            let end_budget = self.silent_end_budget(&agent);
+            let end_budget = if running.is_some() {
+                self.silent_end_budget(&agent)
+            } else {
+                0
+            };
             if !w.silent_end_sent
                 && end_budget > 0
                 && !pending_req
@@ -3173,7 +3233,9 @@ impl Shared {
             Stall(u64, Duration),
             Emit,
         }
-        let after = if let Some(stalled_at) = w.stalled_at {
+        let after = if running.is_none() {
+            After::Emit
+        } else if let Some(stalled_at) = w.stalled_at {
             if w.activity > stalled_at {
                 let episode = w.episodes;
                 w.stalled_at = None;
@@ -3190,16 +3252,20 @@ impl Shared {
         };
         drop(w);
         if let Some(line) = menu_rise {
-            self.approval_menu_fired(&agent, &running, &line);
+            self.approval_menu_fired(&agent, &tracked, &line, running.is_none());
         }
         if let Some((age, last_activity, probe)) = end_fire {
-            self.silent_end_fired(&agent, &running, age, last_activity, &probe);
+            if let Some(m) = running.as_ref() {
+                self.silent_end_fired(&agent, m, age, last_activity, &probe);
+            }
         }
         match after {
             After::Resume(at, episode) => {
-                self.stall_resumed(&agent, &running, at.elapsed(), episode)
+                self.stall_resumed(&agent, running.as_ref().unwrap(), at.elapsed(), episode)
             }
-            After::Stall(episode, silent) => self.stall_fired(&agent, &running, silent, episode),
+            After::Stall(episode, silent) => {
+                self.stall_fired(&agent, running.as_ref().unwrap(), silent, episode)
+            }
             After::Emit => {}
         }
     }
@@ -3299,10 +3365,15 @@ impl Shared {
 
     /// `approval_menu`: the sampled pane just showed an approval menu
     /// — recorded once per menu (the rising edge), carrying the menu
-    /// line so the row names what's being asked.
-    fn approval_menu_fired(&self, agent: &Agent, message: &Message, line: &str) {
+    /// line so the row names what's being asked. `queued` marks the
+    /// message as still-waiting rather than mid-turn: the menu is
+    /// what its delivery keeps backing off behind.
+    fn approval_menu_fired(&self, agent: &Agent, message: &Message, line: &str, queued: bool) {
         let (job_id, task_id) = self.message_scope(message);
         let mut payload = json!({"message": message.id, "line": line});
+        if queued {
+            payload["queued"] = json!(true);
+        }
         if let Some(t) = task_id {
             payload["task"] = json!(t);
         }
@@ -3433,12 +3504,24 @@ impl Shared {
     /// The live stall-watch facts a view renders while a message runs:
     /// silence age, the open `turn_stalled` episode, and the sampled
     /// pane verdict — the menu line while one's open, the idle
-    /// streak's age, and the once-fired silent-end flag. `None` when
-    /// the agent has no in-flight turn.
+    /// streak's age, and the once-fired silent-end flag. With no
+    /// in-flight turn the view only carries a menu line the queued
+    /// head is blocked behind; `None` when nothing is tracked at all.
     fn stall_view(&self, alias: &str) -> Option<StallView> {
-        let running = self.store.running_message(alias).ok()??;
+        let running = self.store.running_message(alias).ok()?;
         let ctl = self.lifecycle.lock().unwrap().agents.get(alias)?.clone();
         let w = ctl.stall.lock().unwrap();
+        let Some(running) = running else {
+            // A queued head behind an open menu: only the menu line
+            // is meaningful — nothing has started or ended.
+            return w.menu_line.clone().map(|line| StallView {
+                silent_secs: 0,
+                stalled: false,
+                menu: Some(line),
+                ended_secs: None,
+                silent_ended: false,
+            });
+        };
         if w.message.as_deref() == Some(running.id.as_str()) {
             return Some(StallView {
                 silent_secs: w.activity.elapsed().as_secs(),

@@ -3440,6 +3440,11 @@ hold_fmt = os.environ.get("MOCK_TMUX_HOLD_FMT", "")
 if hold and cmd == os.environ.get("MOCK_TMUX_HOLD_CMD", "display-message") \
         and (not hold_fmt or hold_fmt in rest):
     time.sleep(hold)
+# MOCK_TMUX_FAIL=<cmd> makes that subcommand die — deterministic
+# failure injection, e.g. a transient capture-pane outage while a
+# gate probe runs.
+if cmd and cmd == os.environ.get("MOCK_TMUX_FAIL", ""):
+    die("mock injected failure")
 if cmd == "new-session":
     name = rest[rest.index("-s") + 1]
     cwd = rest[rest.index("-c") + 1] if "-c" in rest else os.getcwd()
@@ -3532,6 +3537,8 @@ if cmd == "paste-buffer":
 if cmd == "send-keys":
     name = rest[rest.index("-t") + 1]
     for key in rest[rest.index("-t") + 2:]:
+        if key == "--":  # ends tmux option parsing — not a key
+            continue
         aappend(sess_path(name, "input"),
                 "<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
     sys.exit(0)
@@ -13495,6 +13502,173 @@ fn pty_silent_end_fires_once_and_recovers() {
         d.wait_message("w1", id, &["completed"], 10);
     }
     stall_sample(0);
+}
+
+/// A menu that opens BEFORE any turn starts — the pane sits blocked
+/// with a message still queued — must surface identically to a
+/// mid-turn one: `approval_menu` fires against the queued head
+/// (marked `queued`), the views carry `pane_menu`, the needs-me row
+/// names the answer command, and `agent answer` unblocks delivery.
+#[test]
+fn pty_queued_menu_surfaces_and_answers() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    // The menu opens first; the send behind it can only queue.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "blocked send", "message": "mq"}),
+    )
+    .unwrap();
+    assert_eq!(d.message_state("dv", "mq"), "queued");
+
+    // The queued head is tracked for menu detection: the event names
+    // the waiting message and marks it queued, the views carry the
+    // menu line with no running turn at all.
+    let rise = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(rise["payload"]["message"], "mq", "{rise}");
+    assert_eq!(rise["payload"]["queued"], true, "{rise}");
+    assert_eq!(rise["payload"]["line"], "$ printenv FOO", "{rise}");
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(show["pane_menu"], "$ printenv FOO", "{show}");
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    assert!(
+        needs.iter().any(|n| n["kind"] == "approval_menu"
+            && n["command"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("cadence agent answer dv ")),
+        "{needs:?}"
+    );
+
+    // A garbage index is rejected at the RPC — the count never
+    // reaches a key vector — and the daemon answers normally after.
+    let err = d
+        .rpc(
+            "agent_answer",
+            json!({"alias": "dv", "choice": "4000000000"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("no option 4000000000"), "{err}");
+    // And a menu whose option block cannot be parsed refuses rather
+    // than walking blind — the legend anchor alone, no option rows.
+    atomic_write(
+        d.pane_file(&mock, "dv", "tui-state"),
+        "↑↓ select · ↵ confirm · esc cancel\n⠸ Thinking · 5s (esc twice to interrupt)\n",
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["approval_menu"], true, "{probe}");
+    assert!(d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "1"}))
+        .is_err());
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    // Answering the menu unblocks the queued send — the pane claims
+    // cleanly once the operator's menu is gone. A real TUI consumes
+    // the answer key; the mock leaves it staged, so clear the input
+    // file the way an answered menu would.
+    d.rpc("agent_answer", json!({"alias": "dv", "choice": "8"}))
+        .unwrap();
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    atomic_write(d.pane_file(&mock, "dv", "input"), "");
+    d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
+    d.wait_message("dv", "mq", &["running"], 20);
+    let token = pty_token(&d, "dv", "mq");
+    d.rpc(
+        "message_report",
+        json!({"message": "mq", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "mq", &["completed"], 10);
+    stall_sample(0);
+}
+
+/// `agent answer` audit rules: a pane must never approve its own
+/// prompt (`by` equal to the agent's alias refuses), and an answer
+/// `by` a live agent is stamped `by_kind: "agent"` — never silently
+/// read as a human operator's decision.
+#[test]
+fn pty_answer_rejects_self_approval_and_stamps_agent() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.register_devin_opts("peer", json!({}));
+    d.wait_agent("dv", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    // Self-approval refuses before any key is sent.
+    let err = d
+        .rpc(
+            "agent_answer",
+            json!({"alias": "dv", "choice": "8", "by": "dv"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("its own approval menu"), "{err}");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+
+    // An answer `by` another live agent is stamped as agent-sourced;
+    // an operator string stamps `operator`.
+    d.rpc(
+        "agent_answer",
+        json!({"alias": "dv", "choice": "8", "by": "peer"}),
+    )
+    .unwrap();
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["by"], "peer", "{ev}");
+    assert_eq!(ev["payload"]["by_kind"], "agent", "{ev}");
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    d.rpc("agent_answer", json!({"alias": "dv", "choice": "1"}))
+        .unwrap();
+    let evs = wait_event_count(&d, "dv", "approval_answered", 2, 10);
+    assert_eq!(evs[1]["payload"]["by"], "operator", "{evs:?}");
+    assert_eq!(evs[1]["payload"]["by_kind"], "operator", "{evs:?}");
+}
+
+/// A transient `capture-pane` failure inside the gate probe refuses
+/// the send like a busy pane — `gate_wait`, message still queued —
+/// never an actor-fatal provider error. The daemon survives and the
+/// send delivers once the outage clears.
+#[test]
+fn pty_gate_probe_failure_is_a_gate_refusal() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    std::env::set_var("MOCK_TMUX_FAIL", "capture-pane");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "during outage", "message": "mf"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("dv", "gate_wait", 15);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("pane probe failed"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("dv", "mf"), "queued");
+    std::env::remove_var("MOCK_TMUX_FAIL");
+
+    d.wait_message("dv", "mf", &["running"], 20);
+    let token = pty_token(&d, "dv", "mf");
+    d.rpc(
+        "message_report",
+        json!({"message": "mf", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "mf", &["completed"], 10);
 }
 
 /// `agent answer` is a menu channel only: a pane with no menu refuses

@@ -249,6 +249,9 @@ impl TuiProfile for StubProfile {
     /// The stub's menu takes the choice as a single literal key —
     /// word characters only, so no option string can smuggle a key
     /// name the pane never asked for.
+    /// Test-only: accepts `C-c`/`BSpace`-style key names verbatim so a
+    /// test can assert exactly which keys the adapter would send —
+    /// real profiles run a fixed hotkey allowlist instead.
     fn approval_answer(&self, _screen: &str, choice: &str) -> Result<Vec<String>> {
         if choice.is_empty()
             || !choice

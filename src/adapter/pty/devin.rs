@@ -101,6 +101,24 @@ fn option_line(line: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// A footer/legend or option-label row matching hint `h` — anchored
+/// on a legend glyph (`↑↓ select`, `↵ confirm`), a `·`-separated
+/// legend cell (`· esc cancel`), an option row, or the trimmed row's
+/// leading text — so a transcript quoting the same words mid-line
+/// does not count.
+fn hint_row(l: &str, h: &str) -> bool {
+    if !l.contains(h) {
+        return false;
+    }
+    let t = l.trim_start();
+    t.starts_with(h)
+        || t.contains(&format!("· {h}"))
+        || option_line(l).is_some()
+        || t.starts_with('↑')
+        || t.starts_with('↓')
+        || t.starts_with('↵')
+}
+
 /// The line naming what the menu asks: the last non-blank row above
 /// the option list — a `└`-led command detail (`$ printenv FOO`) or a
 /// bare header (`Allow this tool call?`).
@@ -160,7 +178,7 @@ pub fn analyze_devin(screen: &str) -> Probe {
         .count();
     let hints = devin_screen::HINT
         .iter()
-        .filter(|h| menu_lines.iter().any(|l| l.contains(**h)))
+        .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
         .count();
     let approval_menu = footer || (options >= 2 && hints >= 1) || hints >= 2;
     let lines: Vec<&str> = screen.lines().collect();
@@ -405,25 +423,136 @@ impl TuiProfile for DevinProfile {
                  option's printed number"
             ))
         })?;
+        if n == 0 {
+            return Err(Error::rejected("menu indices start at 1"));
+        }
         if options.is_empty() {
-            if n == 0 {
-                return Err(Error::rejected("menu indices start at 1"));
+            // Unnumbered select: the option block is the contiguous
+            // run of `·`/`❭`-led rows around the `❭` highlight — up
+            // and down, never just the suffix below it, and never a
+            // blind count when no highlight row is on screen.
+            let region: Vec<&str> = screen
+                .trim_end()
+                .lines()
+                .rev()
+                .take(MENU_LINES)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let marker = |l: &&str| {
+                let t = l.trim_start();
+                t.starts_with('·') || t.starts_with('❭')
+            };
+            // The highlight row must have option rows or a legend
+            // right below it — the input box's `❭` is followed by the
+            // box's rules, not menu rows.
+            let sel = region
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(i, l)| {
+                    l.trim_start().starts_with('❭')
+                        && region[i + 1..]
+                            .iter()
+                            .find(|n| !n.trim().is_empty())
+                            .is_some_and(|n| {
+                                marker(n) || devin_screen::HINT.iter().any(|h| hint_row(n, h)) || {
+                                    let t = n.trim_start();
+                                    devin_screen::ANCHOR.iter().any(|a| t.starts_with(a))
+                                }
+                            })
+                })
+                .map(|(i, _)| i)
+                .ok_or_else(|| {
+                    Error::rejected(
+                        "cannot locate the option rows on this menu — \
+                         answer it in the pane",
+                    )
+                })?;
+            let mut start = sel;
+            while start > 0 && marker(&region[start - 1]) {
+                start -= 1;
             }
-            let mut keys = vec!["Down".to_string(); (n - 1) as usize];
+            let mut end = sel;
+            while end + 1 < region.len() && marker(&region[end + 1]) {
+                end += 1;
+            }
+            let count = (end - start + 1) as u32;
+            // A lone `❭` row is the input box, not a one-option menu —
+            // its next non-blank row being a legend made it look like
+            // a sel row, but a real menu always lists a `·` sibling.
+            if count < 2 {
+                return Err(Error::rejected(
+                    "cannot locate the option rows on this menu — \
+                     answer it in the pane",
+                ));
+            }
+            if n > count {
+                return Err(Error::rejected(format!(
+                    "no option {n} on this menu — it lists {count}"
+                )));
+            }
+            let want = (n - 1) as usize;
+            let cur = sel - start;
+            let (dir, steps) = if want >= cur {
+                ("Down", want - cur)
+            } else {
+                ("Up", cur - want)
+            };
+            let mut keys = vec![dir.to_string(); steps];
             keys.push("Enter".to_string());
             return Ok(keys);
         }
-        if options.contains(&n) {
+        if !options.contains(&n) {
+            return Err(Error::rejected(format!(
+                "no option {n} on this menu — it lists {}",
+                options
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        // A single digit is one keypress — the menu selects on it
+        // outright. A multi-digit index must never reach tmux as one
+        // literal: `send-keys "10"` presses `1` then `0`, and the
+        // first press alone would pick option 1 while `0` lands as
+        // stray input. Navigate from the highlighted row instead.
+        if n < 10 {
             return Ok(vec![n.to_string()]);
         }
-        Err(Error::rejected(format!(
-            "no option {n} on this menu — it lists {}",
-            options
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
+        let region: Vec<&str> = screen
+            .trim_end()
+            .lines()
+            .rev()
+            .take(MENU_LINES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let cur = region
+            .iter()
+            .rev()
+            .find(|l| l.trim_start().starts_with('❭'))
+            .and_then(|l| option_line(l))
+            .filter(|c| options.contains(c))
+            .ok_or_else(|| {
+                Error::rejected(
+                    "cannot locate the highlighted option on this menu — \
+                     answer it in the pane",
+                )
+            })?;
+        let want = options.iter().position(|o| *o == n).unwrap();
+        let at = options.iter().position(|o| *o == cur).unwrap();
+        let (dir, steps) = if want >= at {
+            ("Down", want - at)
+        } else {
+            ("Up", at - want)
+        };
+        let mut keys = vec![dir.to_string(); steps];
+        keys.push("Enter".to_string());
+        Ok(keys)
     }
 
     fn forbidden_prefixes(&self) -> &'static [char] {
@@ -531,6 +660,37 @@ Allow this tool call?
 · 7 Describe change to command
 · 8 No
 ↑↓ select · ↵ confirm · esc cancel";
+
+    /// A numbered menu with ten options — the highlight sits on
+    /// `❭ 1`, and option 10 must be arrowed to: `send-keys "10"`
+    /// would press `1` (selecting it outright) then leak `0`.
+    const LONG_MENU: &str = "\
+Allow this tool call?
+❭ 1 Yes
+· 2 B
+· 3 C
+· 4 D
+· 5 E
+· 6 F
+· 7 G
+· 8 H
+· 9 I
+· 10 No
+↑↓ select · ↵ confirm · esc cancel";
+
+    #[test]
+    fn multi_digit_answer_navigates_instead_of_typing() {
+        let prof = profile(None);
+        // Option 10 is nine rows below the highlighted option 1.
+        assert_eq!(
+            prof.approval_answer(LONG_MENU, "10").unwrap(),
+            vec!["Down", "Down", "Down", "Down", "Down", "Down", "Down", "Down", "Down", "Enter"]
+        );
+        // A single digit still takes its key.
+        assert_eq!(prof.approval_answer(LONG_MENU, "8").unwrap(), vec!["8"]);
+        // Beyond the printed list still refuses.
+        assert!(prof.approval_answer(LONG_MENU, "11").is_err());
+    }
 
     #[test]
     fn idle_prompt_is_pasteable() {
@@ -794,5 +954,73 @@ SWE-2 Max                                      Alt+Enter for multiline prompts";
         assert!(!p.idle && p.busy_marker);
         assert_eq!(p.reason, "tui is busy (guide watermark in the input line)");
         assert!(!p.input_nonempty);
+    }
+
+    /// An unnumbered select (`↓↑ to select` legend, `❭`-led
+    /// highlight, `·`-led options) for the answer tests.
+    fn unnumbered_menu() -> &'static str {
+        " Trust this directory?\n❭ Yes, trust it\n· No, keep asking\n↑↓ select · ↵ confirm · esc cancel\n"
+    }
+
+    #[test]
+    fn answer_on_unnumbered_menu_navigates_the_block() {
+        let prof = profile(None);
+        // The highlight sits on option 1 — Down once selects the
+        // second printed option.
+        assert_eq!(
+            prof.approval_answer(unnumbered_menu(), "2").unwrap(),
+            vec!["Down", "Enter"]
+        );
+        assert_eq!(
+            prof.approval_answer(unnumbered_menu(), "1").unwrap(),
+            vec!["Enter"]
+        );
+    }
+
+    #[test]
+    fn answer_counts_options_above_the_highlight() {
+        // The highlight is on the SECOND printed option — option 1 is
+        // the row above it, so `answer 1` moves Up, never Enter.
+        let screen = " Trust this directory?\n· Yes, trust it\n❭ No, keep asking\n↑↓ select · ↵ confirm · esc cancel\n";
+        let prof = profile(None);
+        assert_eq!(
+            prof.approval_answer(screen, "1").unwrap(),
+            vec!["Up", "Enter"]
+        );
+        assert_eq!(prof.approval_answer(screen, "2").unwrap(), vec!["Enter"]);
+    }
+
+    #[test]
+    fn answer_index_is_bounded_by_the_visible_block() {
+        let prof = profile(None);
+        // A huge index must never reach key allocation — the menu
+        // lists two options, so anything past 2 refuses.
+        for choice in ["3", "4000000000", "0"] {
+            assert!(
+                prof.approval_answer(unnumbered_menu(), choice).is_err(),
+                "{choice} must refuse"
+            );
+        }
+        // And a menu shape with no option block at all refuses
+        // outright — never a blind arrow walk.
+        let footer_only = "transcript\n↑↓ select · ↵ confirm · esc cancel\n";
+        assert!(
+            prof.approval_answer(footer_only, "1").is_err(),
+            "unparseable options must refuse"
+        );
+        assert!(prof.approval_answer(footer_only, "4000000000").is_err());
+    }
+
+    #[test]
+    fn quoted_legend_text_is_not_a_menu() {
+        // The same words mid-line in a transcript stay inert — only
+        // glyph-anchored legend rows and option rows count.
+        let screen = "\
+docs say \"esc cancel\" dismisses the prompt and that you can always allow tools
+❭ Ask Devin to build features
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                      Alt+Enter for multiline prompts";
+        let p = analyze_devin(screen);
+        assert!(p.idle && !p.approval_menu, "{:?}", p);
     }
 }
