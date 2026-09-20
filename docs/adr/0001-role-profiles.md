@@ -731,6 +731,15 @@ otherwise.
 
 Commands `qa-1` runs. Each maps to a statement in §2.
 
+**An empty result must never read as a pass.** Every check below that
+iterates or greps first asserts its input is non-empty, and the loop
+asserts it visited as many agents as were listed. This is not
+defensiveness for its own sake: CAD-138 records a live case on this host
+where a filtered `git diff --numstat` printed nothing for a diff of 19
+files, 2 740 insertions and 532 deletions — a net-deletion check that
+silently reads clean. Any acceptance check whose failure mode is
+"produced no output, therefore passed" inherits that bug.
+
 **Phase 1**
 
 ```bash
@@ -749,11 +758,17 @@ cadence join fable-cc claude --instructions-file docs/roles/qa.md
 test $? -ne 0                                      # until the channel exists
 
 # no dangling briefing pointer: this currently fails for all four role
-# agents and is the regression test for §1.1
-for a in $(cadence agent list | jq -r '.agents[].alias'); do
+# agents and is the regression test for §1.1.
+# NOTE the two guards — an empty agent list must not read as "pass".
+aliases=$(cadence agent list | jq -r '.agents[].alias')
+test -n "$aliases" || { echo "agent list returned nothing — check, not pass"; exit 1; }
+checked=0
+for a in $aliases; do
   p=$(cadence agent show "$a" | jq -r '.agent.briefing // empty')
   [ -z "$p" ] || test -f "$p" || { echo "dangling: $a -> $p"; exit 1; }
+  checked=$((checked + 1))
 done
+test "$checked" -eq "$(echo "$aliases" | wc -l)" || { echo "checked fewer agents than listed"; exit 1; }
 ```
 
 **Phase 2**
