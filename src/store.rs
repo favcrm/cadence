@@ -71,6 +71,10 @@ pub struct Agent {
     pub state: String,
     pub enabled: bool,
     pub error: Option<String>,
+    /// Row timestamps — `updated` is the last state write, which
+    /// `session end` measures idleness from.
+    pub created: f64,
+    pub updated: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +330,8 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         state: row.get("state")?,
         enabled: row.get::<_, i64>("enabled")? != 0,
         error: row.get("error")?,
+        created: row.get("created")?,
+        updated: row.get("updated")?,
     })
 }
 
@@ -355,6 +361,8 @@ impl Agent {
             "enabled": self.enabled, "error": self.error,
             "endpoint": self.endpoint, "params": self.params,
             "generation": self.generation,
+            // Last state write — `session end` measures idleness from it.
+            "updated": self.updated,
             // Dead = no live endpoint address: the row cannot be
             // attached or submitted to until it opens again.
             "dead": self.endpoint.is_none(),

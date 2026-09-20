@@ -4,7 +4,6 @@
 //! than pretending to work.
 
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -661,6 +660,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Session bookends — `start` runs the morning go/no-go gate
+    /// (host, binary, daemon, board, reconcile, inbox) and `end` runs
+    /// the evening sweep plus the handoff note. See docs/SESSION.md.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// What needs a human right now: merge-ready PRs, open approvals,
     /// fenced or stalled agents, review/unblocked issues, unread
     /// inboxes, a behind-tracker, deploy drift — each with the exact
@@ -1092,6 +1098,58 @@ enum SkillAction {
 }
 
 #[derive(Subcommand)]
+enum SessionAction {
+    /// Start-of-session gate: host, binary-vs-main, daemon, board,
+    /// reconcile, inbox — one screen, exit 0 ok / 1 warnings /
+    /// 2 failures. Read-only by default.
+    Start {
+        /// Scope tracker reads and repo scans to one project key.
+        #[arg(long)]
+        project: Option<String>,
+        /// Emit the check report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Perform only the reversible fixes: `daemon start`, `ui
+        /// start`, `ui tailscale start` when sharing is persisted.
+        /// Never restarts a running daemon, never removes anything.
+        #[arg(long)]
+        fix: bool,
+        /// Read the host report from this JSON file instead of
+        /// scanning — tests/debug; the run is labelled fixture-backed.
+        #[arg(long, hide = true)]
+        host_report: Option<PathBuf>,
+    },
+    /// End-of-session: `issue finish --merged` when this build has it,
+    /// stop agents idle past --idle-secs, `agent gc --older-than 1h`,
+    /// the host sweep (orphan test processes are reported, never
+    /// killed), and the handoff note under <state>/sessions/.
+    /// Never stops a busy agent; never stops the daemon.
+    End {
+        /// Scope tracker reads and repo scans to one project key.
+        #[arg(long)]
+        project: Option<String>,
+        /// Emit the step report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Print the plan — candidates listed, nothing changed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accepted for muscle memory — the merged sweep has no force
+        /// path; recorded as ignored in the run's notes.
+        #[arg(long)]
+        force_finish: bool,
+        /// An agent idle longer than this (seconds) may be stopped
+        /// [default 1800].
+        #[arg(long, default_value_t = 1800)]
+        idle_secs: u64,
+        /// Read the host report from this JSON file instead of
+        /// scanning — tests/debug; the run is labelled fixture-backed.
+        #[arg(long, hide = true)]
+        host_report: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum MessageAction {
     /// Enqueue a message; returns once it is durable.
     Send {
@@ -1302,57 +1360,6 @@ fn send_message(
     ))
 }
 
-/// Spawn `daemon run` detached; it survives the terminal via setsid.
-fn daemon_start(state_dir: &Path) -> Result<Value> {
-    let exe = std::env::current_exe()?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state_dir.join("daemon.log"))?;
-    let mut command = Command::new(exe);
-    command
-        .args(["--state-dir"])
-        .arg(state_dir)
-        .args(["daemon", "run"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log.try_clone()?))
-        .stderr(std::process::Stdio::from(log));
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn()?;
-    // Wait until the socket answers or the child exits.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match client::rpc(state_dir, "health", json!({})) {
-            Ok(health) => {
-                // If our child already exited, the socket belongs to a
-                // pre-existing daemon — report that honestly.
-                if child.try_wait().ok().flatten().is_some() {
-                    return Ok(json!({
-                        "state": "already_running",
-                        "socket": client::socket_path(state_dir),
-                        "health": health,
-                    }));
-                }
-                return Ok(json!({
-                    "state": "started",
-                    "pid": child.id(),
-                    "socket": client::socket_path(state_dir),
-                    "health": health,
-                }));
-            }
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 /// Has the daemon released the state-dir singleton? `serve` holds an
 /// exclusive `flock` on `cadence.lock` for its whole life; the kernel
 /// drops it only when the process exits, so a successful non-blocking
@@ -1560,7 +1567,7 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
              socket — inspect daemon.log before restarting",
         ));
     }
-    daemon_start(state_dir)?;
+    client::daemon_start(state_dir)?;
     // Wait until every agent that was live before leaves the
     // transitional states — `starting` (actor up, endpoint not open)
     // and `offline` (actor exited under shutdown). Stopped and fenced
@@ -2660,7 +2667,7 @@ fn run() -> Result<i32> {
             }
             DaemonAction::Start { resume } => {
                 std::fs::create_dir_all(&state_dir)?;
-                let mut result = daemon_start(&state_dir)?;
+                let mut result = client::daemon_start(&state_dir)?;
                 // --resume: once the daemon answers, sweep every agent
                 // with a stored thread and no live endpoint.
                 if resume {
@@ -3450,6 +3457,38 @@ fn run() -> Result<i32> {
             cwd: std::env::current_dir()?,
             state_dir,
         }),
+        Commands::Session { action } => match action {
+            SessionAction::Start {
+                project,
+                json,
+                fix,
+                host_report,
+            } => cadence_agent::session::run_start(&cadence_agent::session::StartOptions {
+                project,
+                json,
+                fix,
+                host_report,
+                cwd: std::env::current_dir()?,
+                state_dir,
+            }),
+            SessionAction::End {
+                project,
+                json,
+                dry_run,
+                force_finish,
+                idle_secs,
+                host_report,
+            } => cadence_agent::session::run_end(&cadence_agent::session::EndOptions {
+                project,
+                json,
+                dry_run,
+                force_finish,
+                idle_secs,
+                host_report,
+                cwd: std::env::current_dir()?,
+                state_dir,
+            }),
+        },
         Commands::Overview { json, watch } => run_overview(&state_dir, json, watch),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
