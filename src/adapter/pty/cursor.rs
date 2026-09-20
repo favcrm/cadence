@@ -286,12 +286,22 @@ fn chrome_row(l: &str) -> bool {
 /// never treat the input as an option row: a keyed row beside it
 /// cannot make it a highlight.
 fn prompt_row(lines: &[&str]) -> Option<usize> {
+    // Search `→` rows bottom-up, not just the last one — when the
+    // lowest `→` is a menu highlight (chrome below it) the input row
+    // is still the next `→` up that carries the input frame. A `→`
+    // row that fails the frame test is a menu row or a transcript
+    // echo, never the input.
     lines
         .iter()
-        .rposition(|l| l.trim_start().starts_with(cursor_screen::PROMPT))
-        .filter(|i| {
-            *i + 1 < lines.len() && lines.len() - i <= STATUS_LINES && !chrome_row(lines[i + 1])
+        .enumerate()
+        .rev()
+        .find(|(i, l)| {
+            l.trim_start().starts_with(cursor_screen::PROMPT)
+                && *i + 1 < lines.len()
+                && lines.len() - i <= STATUS_LINES
+                && !chrome_row(lines[i + 1])
         })
+        .map(|(i, _)| i)
 }
 
 /// The open option block as `(selected row, block start, block end)`.
@@ -316,7 +326,11 @@ fn menu_block(lines: &[&str], prompt: Option<usize>) -> Option<(usize, usize, us
                     .iter()
                     .find(|n| !n.trim().is_empty())
                     .is_some_and(|n| chrome_row(n))
-                    || (*i > 0 && keyed_row(lines[i - 1])))
+                    // The keyed-above path (a highlight on the frame's
+                    // last row) needs the `→` row's own `(key)` — an
+                    // unidentified input row has a keyed transcript row
+                    // above it too, but a draft never carries a hotkey.
+                    || (*i > 0 && keyed_row(lines[i - 1]) && hotkey(l).is_some()))
         })
         .map(|(i, _)| i)?;
     let mut start = sel;
@@ -327,18 +341,29 @@ fn menu_block(lines: &[&str], prompt: Option<usize>) -> Option<(usize, usize, us
     while end + 1 < lines.len() && keyed_row(lines[end + 1]) {
         end += 1;
     }
+    // A live menu renders in place of the input row — a menu-looking
+    // block sitting ABOVE a still-live `→` input line is a transcript
+    // quoting the pane verbatim, and `answer` would key the choice
+    // into the draft. The frame position is the corroboration the
+    // text alone cannot supply.
+    if prompt.is_some_and(|p| end < p) {
+        return None;
+    }
     Some((sel, start, end))
 }
 
 /// The option's `(hint)` hotkey as a tmux key name, from a fixed
 /// allowlist — the named keys Cursor prints plus the observed single
-/// characters `y`/`n`, and only when the `(key)` ends the row. Anything
-/// else (`(C-c)`, `(-l)`, `Ok(v)`, `f(1)`) is transcript text wearing
-/// the shape — not a menu key: the answer falls back to arrows + Enter
-/// instead.
+/// characters `y`/`n`, and only when the `(key)` ends the row AND is
+/// whitespace-separated from the label: `take(n)` is a function call,
+/// `Ok(v)`/`f(1)`/`(C-c)` are transcript text wearing the shape — not
+/// a menu key: the answer falls back to arrows + Enter instead.
 fn hotkey(row: &str) -> Option<String> {
     let inner = row.trim_end().strip_suffix(')')?;
-    let (_, hint) = inner.rsplit_once('(')?;
+    let (label, hint) = inner.rsplit_once('(')?;
+    if !label.ends_with(char::is_whitespace) {
+        return None;
+    }
     let hint = hint.trim();
     // `(esc or n)` lists alternatives — take the last.
     let hint = hint.rsplit(" or ").next().unwrap_or(hint);
@@ -1407,6 +1432,62 @@ mod tests {
         );
         let prof = screen_profile();
         assert!(prof.approval_answer(screen, "1").is_err());
+    }
+
+    #[test]
+    fn function_call_parens_are_not_key_hints() {
+        // Round-5 review: the allowlist alone left `let v = take(n)`
+        // keyed — `(n)` at end-of-row satisfied it. The hint paren
+        // must be a separate trailing token, whitespace-separated from
+        // the label — function-call parens never qualify.
+        for row in [
+            "    let v = take(n)",
+            "    return f(y)",
+            "    exit(status)",
+            "    Option::Some(esc)",
+        ] {
+            let screen = format!(" Run this command?\n{row}\n{row}\n  → Run (once) (y)\n");
+            assert!(
+                !analyze_cursor(&screen, None).approval_menu,
+                "{row} must not be a keyed row"
+            );
+        }
+        // Real whitespace-separated hints still parse.
+        for row in [
+            "    Run (once) (y)",
+            "    Skip (esc or n)",
+            "    Add to allowlist? (tab)",
+        ] {
+            let screen = format!(" Run this command?\n  → Run (once) (y)\n{row}\n");
+            let p = analyze_cursor(&screen, None);
+            assert!(p.approval_menu, "{row}");
+        }
+    }
+
+    #[test]
+    fn unidentified_input_row_cannot_become_sel() {
+        // Round-5 should-fix: when the input `→` row fails its frame
+        // test — the model bar is cut off the capture — `prompt_row`
+        // is None and the row used to become the block's selected
+        // option, letting `answer` send a bare Enter into a staged
+        // draft. The keyed-above path now needs the `→` row's own
+        // `(key)`, which a draft never carries.
+        let screen =
+            " Run this command?\n    Add Shell(whoami) to allowlist? (tab)\n  → deploy to prod\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        let prof = screen_profile();
+        assert!(prof.approval_answer(screen, "1").is_err());
+        // The same draft mid-frame (model bar visible) stays a draft.
+        let screen = " Run this command?\n    Add Shell(whoami) to allowlist? (tab)\n  → deploy to prod\n  Grok 4.6 · ~/repo\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu && p.input_nonempty, "{p:?}");
+        // And a draft ENDING in a key-looking suffix is still a draft
+        // — the `(y)` is typed text, never the row's own hotkey.
+        let screen = " Run this command?\n    Add Shell(whoami) to allowlist? (tab)\n  → deploy to prod (y)\n  Grok 4.6 · ~/repo\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu && p.input_nonempty, "{p:?}");
+        assert!(prof.approval_answer(screen, "y").is_err());
     }
 
     fn profile(dir: &std::path::Path, params: serde_json::Value) -> CursorProfile {

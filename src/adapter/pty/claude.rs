@@ -101,6 +101,9 @@ fn option_line(line: &str) -> Option<u32> {
 /// quoted in the transcript satisfies neither — it is never a menu's
 /// options.
 fn numbered_block(lines: &[&str]) -> Vec<u32> {
+    // Only rows below the live input box can be menu structure —
+    // a quoted menu sitting above the box is transcript text.
+    let lines = menu_window(lines);
     let mut runs: Vec<Vec<(usize, u32)>> = Vec::new();
     for (i, l) in lines.iter().enumerate() {
         if let Some(n) = option_line(l) {
@@ -162,6 +165,22 @@ fn sel_row(lines: &[&str], i: usize) -> bool {
     l.len() != l.trim_start().len() && l.trim_start().starts_with('❯') && !boxed(lines, i)
 }
 
+/// The live menu region is the rows BELOW the last boxed `❯` input
+/// prompt. A real permission menu renders in place of the box's
+/// interior — it can sit under a still-drawn prompt, but never above
+/// one: a transcript that quotes a menu verbatim always has the live
+/// input box below the quote. That frame position is the corroboration
+/// screen-local text cannot fake.
+fn menu_window<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    let floor = (0..lines.len())
+        .rev()
+        .find(|i| boxed(lines, *i) && lines[*i].trim_start().starts_with(claude_screen::PROMPT));
+    match floor {
+        Some(f) => &lines[f + 1..],
+        None => lines,
+    }
+}
+
 /// The open option block as `(selected row, block start, block end,
 /// corroborated)`. The block is the contiguous run of rows around the
 /// highlighted `❯` row where an option row is `❯`-led at the
@@ -178,6 +197,9 @@ fn sel_row(lines: &[&str], i: usize) -> bool {
 /// blank row between, as real menus render). An uncorroborated block
 /// never sets `approval_menu` and is never answered.
 fn option_block(lines: &[&str]) -> Option<(usize, usize, usize, bool)> {
+    // Only rows below the live input box can be menu structure —
+    // a quoted menu sitting above the box is transcript text.
+    let lines = menu_window(lines);
     // The LAST non-boxed `❯` row: a transcript `❯` echo above the menu
     // would otherwise be mistaken for the highlight.
     let sel = (0..lines.len()).rev().find(|i| sel_row(lines, *i))?;
@@ -301,6 +323,11 @@ pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         .into_iter()
         .rev()
         .collect();
+    // Only rows below the last boxed `❯` prompt can be menu structure:
+    // a transcript quoting a real menu sits above the still-live input
+    // box — the frame position is the corroboration its text cannot
+    // fake. The slice applies to every menu scan uniformly.
+    let menu_lines: &[&str] = menu_window(&menu_lines);
     // Natural-language anchors are ordinary sentence text — an
     // indented transcript row that starts with `Do you want to
     // proceed?` is identical in shape to the real prompt, so the
@@ -313,12 +340,12 @@ pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         let t = l.trim_start();
         claude_screen::ANCHOR.iter().any(|a| t.starts_with(a))
     });
-    let numbered = numbered_block(&menu_lines);
+    let numbered = numbered_block(menu_lines);
     // `highlighted` means a real option block *with corroboration* —
     // an indented `❯` plus a same-column sibling is transcript-fakeable,
     // so the block alone never suffices (numbered rows inside it or the
     // legend directly below are what count).
-    let highlighted = option_block(&menu_lines).is_some_and(|(.., c)| c);
+    let highlighted = option_block(menu_lines).is_some_and(|(.., c)| c);
     let hints = claude_screen::HINT
         .iter()
         .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
@@ -1197,5 +1224,28 @@ mod tests {
         let screen = " Do you want to proceed?\n Esc to cancel\n ❯ 1. Yes\n   2. No\n";
         let p = analyze_claude(screen, None);
         assert!(p.approval_menu, "{p:?}");
+    }
+
+    #[test]
+    fn quoted_menu_above_the_live_input_box_is_not_a_menu() {
+        // Round-5 review: corroboration is screen-local text, so an
+        // agent quoting the pane verbatim satisfies every textual
+        // check — anchor, a `❯`-led numbered run, the works. What the
+        // quote cannot fake is the frame: a live menu replaces the
+        // input box's interior, so a boxed `❯` prompt below the block
+        // proves the block is transcript. `answer` must refuse too —
+        // a digit keyed here lands in a live input line.
+        let screen = "● I reproduced it. The pane printed:\n\n    Do you want to proceed?\n    ❯ 1. Yes\n      2. No, and tell Claude what to do differently\n\n  So it is waiting on you.\n────────────────────\n❯ \n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        assert!(p.idle, "{p:?}");
+        let prof = profile();
+        assert!(prof.approval_answer(screen, "2").is_err());
+        // The same quote with the input box still populated — a draft
+        // under the quote must stay a draft, never a menu.
+        let screen = "● the pane printed:\n    Do you want to proceed?\n    ❯ 1. Yes\n      2. No\n────────────────────\n❯ half-typed reply\n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu && p.input_nonempty, "{p:?}");
+        assert!(prof.approval_answer(screen, "1").is_err());
     }
 }

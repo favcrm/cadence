@@ -13390,9 +13390,18 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
     assert_eq!(ev["payload"]["choice"], "8", "{ev}");
     assert_eq!(ev["payload"]["line"], "$ printenv FOO", "{ev}");
     // Identity is derived from the peer pid — the test process sits
-    // outside every pane, so `by` is operator and the supplied name
-    // survives only as a claim.
-    assert_eq!(ev["payload"]["by"], "operator", "{ev}");
+    // outside every pane, so `by` is `operator` when it holds a
+    // foreign terminal (a suite on a pty) and `unknown` when fully
+    // detached; the supplied name survives only as a claim.
+    let want = if (0..=2).any(|fd| {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
+    }) {
+        "operator"
+    } else {
+        "unknown"
+    };
+    assert_eq!(ev["payload"]["by"], want, "{ev}");
     assert_eq!(ev["payload"]["claimed_by"], "test-op", "{ev}");
     assert_eq!(ev["payload"]["probe"]["approval_menu"], true, "{ev}");
 
@@ -13726,8 +13735,11 @@ fn pty_answer_derives_caller_from_peer_pid() {
     assert_eq!(ev["payload"]["claimed_by"], "dv", "{ev}");
     assert_eq!(ev["payload"]["caller_pid"], me, "{ev}");
 
-    // Outside every pane the caller is an operator — a `by` naming
-    // the target is a claim, not an attribution.
+    // Outside every pane the caller is an operator only when it holds
+    // a foreign terminal — this test process inherits one when the
+    // suite runs on a pty, none under piped CI — and `unknown`
+    // otherwise. A `by` naming the target is a claim, not an
+    // attribution either way.
     set_pid("peer", 999_999_999);
     atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
     d.rpc(
@@ -13735,9 +13747,14 @@ fn pty_answer_derives_caller_from_peer_pid() {
         json!({"alias": "dv", "choice": "1", "by": "dv"}),
     )
     .unwrap();
+    let on_tty = (0..=2).any(|fd| {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
+    });
+    let want = if on_tty { "operator" } else { "unknown" };
     let evs = wait_event_count(&d, "dv", "approval_answered", 2, 10);
-    assert_eq!(evs[1]["payload"]["by"], "operator", "{evs:?}");
-    assert_eq!(evs[1]["payload"]["by_kind"], "operator", "{evs:?}");
+    assert_eq!(evs[1]["payload"]["by"], want, "{evs:?}");
+    assert_eq!(evs[1]["payload"]["by_kind"], want, "{evs:?}");
     assert_eq!(evs[1]["payload"]["claimed_by"], "dv", "{evs:?}");
 }
 
@@ -13800,6 +13817,67 @@ fn pty_answer_setsid_cannot_launder_self_approval() {
     let ev = d.wait_event("dv", "approval_answered", 10);
     assert_eq!(ev["payload"]["by"], "peer", "{ev}");
     assert_eq!(ev["payload"]["by_kind"], "agent", "{ev}");
+}
+
+/// A *full* detach — `env -u CADENCE_ALIAS setsid sh -c 'cadence agent
+/// answer <self> </dev/null >/dev/null 2>&1'` — clears ancestry, env
+/// and tty at once. The caller matches nothing, so the honest stamp is
+/// `unknown`, never `operator`: `operator` needs positive terminal
+/// evidence the detached process cannot carry.
+#[test]
+fn pty_answer_full_detach_stamps_unknown() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    let out = std::process::Command::new("setsid")
+        .arg("env")
+        .arg("-u")
+        .arg("CADENCE_ALIAS")
+        .arg(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "answer", "dv", "8"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "unmatched-but-unproven caller answers as unknown: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["by"], "unknown", "{ev}");
+    assert_eq!(ev["payload"]["by_kind"], "unknown", "{ev}");
+}
+
+/// A transcript that quotes a real menu verbatim — anchor, `❯`-led
+/// numbered run and all — cannot flip the pane: a live menu replaces
+/// the input box's interior, so the boxed `❯` prompt still rendered
+/// below the quote proves the menu-looking rows are text. The probe
+/// stays inert and `agent answer` refuses rather than keying a digit
+/// into the live input line.
+#[test]
+fn pty_claude_quoted_menu_above_input_box_is_inert() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
+    d.wait_agent("cl", "idle", 20);
+    atomic_write(
+        d.claude_pane_file(&mock, "cl", "tui-state"),
+        "● I reproduced it. The pane printed:\n\n    Do you want to proceed?\n    ❯ 1. Yes\n      2. No, and tell Claude what to do differently\n\n  So it is waiting on you.\n────────────────────\n❯ \n",
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "cl"})).unwrap();
+    assert_eq!(probe["approval_menu"], false, "{probe}");
+    assert_eq!(probe["idle"], true, "{probe}");
+    let err = d
+        .rpc("agent_answer", json!({"alias": "cl", "choice": "2"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("no approval menu"), "{err}");
+    let input =
+        std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
 }
 
 /// A transient `capture-pane` failure inside the gate probe refuses

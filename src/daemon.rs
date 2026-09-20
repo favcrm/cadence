@@ -1762,9 +1762,14 @@ impl Shared {
     ///
     /// Deterministic: the target's pane is checked first — self-refusal
     /// never loses to map order — then the others sorted by alias.
-    /// Fails closed: a caller whose ancestry cannot be fully walked is
-    /// never stamped `operator` — while the target's pane is alive the
-    /// ambiguity is a refusal, after it is gone the stamp is `unknown`.
+    /// Fails closed: the fleet map itself must load (a store error is
+    /// a refusal, never an empty map that skips the self-check), and a
+    /// caller whose ancestry cannot be fully walked is never stamped
+    /// `operator` — while the target's pane is alive the ambiguity is
+    /// a refusal, after it is gone the stamp is `unknown`. `operator`
+    /// requires positive terminal evidence — the peer holding a pty
+    /// that is no pane's; a fully detached caller (no ancestry hit, no
+    /// env alias, no tty) matches nothing and is honestly `unknown`.
     /// Returns `(by, by_kind)`; callers record `claimed_by` separately
     /// when the supplied `by` disagrees.
     fn derived_caller(
@@ -1773,7 +1778,7 @@ impl Shared {
         peer_pid: u32,
         verb: &str,
     ) -> Result<(String, &'static str)> {
-        let facts = self.store.pty_endpoint_facts().unwrap_or_default();
+        let facts = self.store.pty_endpoint_facts()?;
         let chain = proc_ancestors(peer_pid);
         let env_alias = caller_env_alias(peer_pid);
         let member = |pane_pid: u32| -> bool {
@@ -1796,23 +1801,12 @@ impl Shared {
                 return Ok((a.clone(), "agent"));
             }
         }
-        if chain.is_none() {
-            // The walk broke — the caller cannot be placed. While the
-            // target pane is alive that ambiguity is a refusal; never
-            // an `operator` stamp on a derivation failure.
-            if facts
-                .get(alias)
-                .is_some_and(|(_, pid, _)| std::fs::read_link(format!("/proc/{pid}")).is_ok())
-            {
-                return Err(Error::rejected(format!(
-                    "cannot derive the caller for `{verb}` — /proc could \
-                     not be walked while the target pane is alive; run it \
-                     from a shell attached to a pane or outside all panes",
-                )));
-            }
-            return Ok(("unknown".to_string(), "unknown"));
-        }
-        Ok(("operator".to_string(), "operator"))
+        // `/proc/<pid>` is a directory — `read_link` on it is always
+        // EINVAL, so liveness is a `metadata` existence check.
+        let target_alive = facts
+            .get(alias)
+            .is_some_and(|(_, pid, _)| std::fs::metadata(format!("/proc/{pid}")).is_ok());
+        unmatched_caller(chain.is_some(), target_alive, peer_on_tty(peer_pid), verb)
     }
 
     /// `agent answer`: one menu-choice keystroke to a pane currently
@@ -4009,6 +4003,47 @@ fn holds_pane_tty(peer_pid: u32, pane_pid: u32) -> bool {
         .any(|fd| std::fs::read_link(format!("/proc/{peer_pid}/fd/{fd}")).is_ok_and(|p| p == tty))
 }
 
+/// Does the peer hold a pty at all? Called only after every pane
+/// membership check fails, so any pts fd is foreign by definition —
+/// positive evidence of an interactive terminal, which is what
+/// `operator` means. A detached caller (`setsid … </dev/null >&2`)
+/// holds none.
+fn peer_on_tty(peer_pid: u32) -> bool {
+    (0..=2).any(|fd| {
+        std::fs::read_link(format!("/proc/{peer_pid}/fd/{fd}"))
+            .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
+    })
+}
+
+/// The caller matched no pane — place it honestly. A broken `/proc`
+/// walk (`walked == false`) proves neither membership nor its
+/// absence: a refusal while the target pane is alive, `unknown` once
+/// it is gone. A clean walk with no match is `operator` only with
+/// positive terminal evidence (`foreign_tty`); a detached caller is
+/// `unknown`, never `operator`.
+fn unmatched_caller(
+    walked: bool,
+    target_alive: bool,
+    foreign_tty: bool,
+    verb: &str,
+) -> Result<(String, &'static str)> {
+    if !walked {
+        if target_alive {
+            return Err(Error::rejected(format!(
+                "cannot derive the caller for `{verb}` — /proc could \
+                 not be walked while the target pane is alive; run it \
+                 from a shell attached to a pane or outside all panes",
+            )));
+        }
+        return Ok(("unknown".to_string(), "unknown"));
+    }
+    if foreign_tty {
+        Ok(("operator".to_string(), "operator"))
+    } else {
+        Ok(("unknown".to_string(), "unknown"))
+    }
+}
+
 fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
     let Ok(peer_pid) = check_peer(&stream) else {
         return;
@@ -4896,5 +4931,62 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert_eq!(events.last().unwrap().payload["i"], 4);
         assert_eq!(events.first().unwrap().payload["i"], 2);
+    }
+
+    /// CAD-102 r5: a caller whose `/proc` ancestry cannot be walked —
+    /// here a peer pid that no longer exists — must be REFUSED while
+    /// the target pane is alive. The r4 guard checked liveness with
+    /// `read_link("/proc/<pid>")`, which always fails EINVAL on a
+    /// directory, so the refusal never fired and the answer proceeded
+    /// stamped `unknown`.
+    #[test]
+    fn broken_walk_with_live_target_pane_is_refused() {
+        let (dir, shared) = shared();
+        register(&shared, dir.path(), "tgt");
+        // Give the agent a pty endpoint with a LIVE pane pid — this
+        // test process — so `pty_endpoint_facts` finds the target.
+        let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE agents SET endpoint_kind='pty', generation=1, pid=?1 \
+             WHERE alias='tgt'",
+            rusqlite::params![std::process::id() as i64],
+        )
+        .unwrap();
+        drop(conn);
+        // A dead peer pid: the first /proc read fails → chain is None.
+        let dead = u32::MAX - 42;
+        assert!(std::fs::metadata(format!("/proc/{dead}")).is_err());
+        let err = shared.derived_caller("tgt", dead, "answer").unwrap_err();
+        assert!(err.to_string().contains("could not be walked"), "{err}");
+    }
+
+    /// The unmatched-caller tail: a broken walk refuses only while the
+    /// target lives; a clean walk stamps `operator` solely on positive
+    /// terminal evidence — a detached caller is `unknown`, never
+    /// `operator`.
+    #[test]
+    fn unmatched_caller_is_fail_closed() {
+        // Broken walk: refused while the target pane lives.
+        assert!(unmatched_caller(false, true, false, "answer").is_err());
+        assert!(unmatched_caller(false, true, true, "answer").is_err());
+        // …and `unknown` once it is gone.
+        assert_eq!(
+            unmatched_caller(false, false, false, "answer").unwrap(),
+            ("unknown".to_string(), "unknown")
+        );
+        // Clean walk + foreign pty → operator.
+        assert_eq!(
+            unmatched_caller(true, true, true, "answer").unwrap(),
+            ("operator".to_string(), "operator")
+        );
+        // Clean walk + no terminal (a full setsid detach) → unknown.
+        assert_eq!(
+            unmatched_caller(true, true, false, "answer").unwrap(),
+            ("unknown".to_string(), "unknown")
+        );
+        assert_eq!(
+            unmatched_caller(true, false, false, "answer").unwrap(),
+            ("unknown".to_string(), "unknown")
+        );
     }
 }
