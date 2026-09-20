@@ -9,10 +9,13 @@
 //! everything ordinary, and a `(lane, kind)` whose requests have
 //! waited continuously longer than `starve_secs` (default 900) jumps
 //! to the front so priority can never starve a lane out. Seniority
-//! belongs to an *unserved* wait: it survives a caller re-queueing
-//! under a new request id, but every grant for that `(lane, kind)`
-//! restarts the clock — a lane can never keep an old anchor alive
-//! just by keeping one more request queued.
+//! belongs to an *unserved* wait and is carried by exactly one
+//! waiter — the lane's eldest for that kind: a caller re-queueing
+//! under a new request id inherits the anchor through a brief polling
+//! gap, but later arrivals of a burst stamp their own arrival, so a
+//! lane cannot multiply one anchor into N front-runners. Every grant
+//! for that `(lane, kind)` restarts the clock — a lane can never keep
+//! an old anchor alive just by keeping one more request queued.
 //!
 //! A slot is held by a daemon-minted token bound to (lane, pid,
 //! pid-starttime): `release` must name the holding caller, and a
@@ -180,7 +183,7 @@ pub type SlotEvent = (String, &'static str, Value);
 
 /// The two clocks a mutating call runs against: `mono` drives ages,
 /// expiry and ordering (NTP-proof); `wall` rides the persist file so
-/// a restart can restore hold age and seniority.
+/// a restart can restore hold age.
 #[derive(Clone, Copy)]
 pub struct SlotClock {
     pub mono: f64,
@@ -274,6 +277,17 @@ struct Reaped {
     reason: &'static str,
 }
 
+/// One `(lane, kind)` wait episode: `anchor` is the stamp the lane's
+/// eldest unserved waiter carries; `seen` is the last time the lane's
+/// queue for that kind held a waiter — once it has stayed empty for
+/// `WAITER_TTL_SECS` the episode ended and the next request anchors
+/// fresh.
+#[derive(Clone, Copy)]
+struct Seniority {
+    anchor: f64,
+    seen: f64,
+}
+
 /// The slot registry. In-memory for queue state (waiters re-poll
 /// after a restart), persisted for holds: `persist_path` is written
 /// on every hold change so a daemon restart can revalidate them
@@ -283,11 +297,13 @@ pub struct Slots {
     pub config: SlotConfig,
     waiting: Vec<SlotWait>,
     held: Vec<SlotHold>,
-    /// Unserved-wait start per `(lane, kind)` — the starvation clock
-    /// that survives a caller re-queuing under a new request_id but
-    /// NEVER a grant: `grant` removes the record, so the anchor can
-    /// only be as old as the lane's current post-serve wait.
-    seniority: HashMap<(String, SlotKind), f64>,
+    /// Unserved-wait episode per `(lane, kind)` — the starvation
+    /// clock that survives a caller re-queuing under a new
+    /// request_id but NEVER a grant: `grant` removes the record, so
+    /// the anchor can only be as old as the lane's current
+    /// post-serve wait. Only the lane's eldest waiter of a kind ever
+    /// inherits it — later arrivals stamp their own arrival.
+    seniority: HashMap<(String, SlotKind), Seniority>,
     persist_path: Option<PathBuf>,
 }
 
@@ -318,24 +334,20 @@ impl Slots {
 
     /// Grant-order rank: starved `(lane, kind)`s first, then priority
     /// lanes on test/suite, then plain FIFO — the key is
-    /// (rank, seniority). A waiter's ordering age is capped at
-    /// `starve_secs`: no anchor — however old — can rank ahead of a
-    /// request that has itself crossed the never-starve bound, so a
-    /// lane flooding the queue still yields within `starve_secs`.
+    /// (rank, queued_at). Stamps were clamped at ENQUEUE time
+    /// (`stamp_for`), not here — clamping at compare time would
+    /// collapse every starved waiter to the same key and let a
+    /// 901-second waiter tie a two-hour one; raw stamps keep rank 0
+    /// in true FIFO order.
     fn rank(&self, w: &SlotWait, now: f64) -> (u8, f64) {
-        let starve = self.config.starve_secs as f64;
-        // Effective seniority for ordering: older than `starve` ago
-        // collapses to the bound itself — every starved waiter ranks
-        // equal-eldest and grants go to whoever polls first.
-        let senior = w.queued_at.max(now - starve);
-        if now - w.queued_at >= starve {
-            (0, senior)
+        if now - w.queued_at >= self.config.starve_secs as f64 {
+            (0, w.queued_at)
         } else if matches!(w.kind, SlotKind::Test | SlotKind::Suite)
             && self.config.priority_lanes.iter().any(|l| l == &w.lane)
         {
-            (1, senior)
+            (1, w.queued_at)
         } else {
-            (2, senior)
+            (2, w.queued_at)
         }
     }
 
@@ -398,33 +410,83 @@ impl Slots {
         // — only the silence proves it walked away).
         self.waiting
             .retain(|w| pid_matches(w.pid, w.pid_start) && now - w.last_poll <= WAITER_TTL_SECS);
-        self.prune_seniority();
+        self.prune_seniority(now);
         if !dead.is_empty() {
             self.persist();
         }
         dead
     }
 
-    /// Seniority entries live only while a waiter keeps the
-    /// `(lane, kind)` queue non-empty — a lane whose waiters all
-    /// died or went silent starts its starvation clock fresh.
-    /// (The OTHER half of the rule lives in `grant`: a served lane's
-    /// record is cleared even when waiters remain.)
-    fn prune_seniority(&mut self) {
-        self.seniority.retain(|(lane, kind), _| {
-            self.waiting
+    /// A `(lane, kind)` episode stays alive while the lane keeps a
+    /// waiter of that kind queued — `seen` tracks its freshest
+    /// `last_poll` — and for `WAITER_TTL_SECS` after the lane's last
+    /// poll, so a caller re-queueing under a new request_id inside
+    /// that window keeps the lane's place. Past the TTL the lane has
+    /// gone quiet: the next request anchors fresh. (The OTHER half
+    /// of the rule lives in `grant`: a served lane's record is
+    /// cleared even when waiters remain.)
+    fn prune_seniority(&mut self, now: f64) {
+        let waiting = &self.waiting;
+        self.seniority.retain(|(lane, kind), s| {
+            let live = waiting
                 .iter()
-                .any(|w| w.lane == *lane && w.kind == *kind)
+                .filter(|w| w.lane == *lane && w.kind == *kind)
+                .map(|w| w.last_poll)
+                .reduce(f64::max);
+            match live {
+                Some(last_poll) => {
+                    s.seen = last_poll;
+                    true
+                }
+                None => now - s.seen <= WAITER_TTL_SECS,
+            }
         });
     }
 
-    /// The `(lane, kind)` anchor for a new waiter — an existing
-    /// unserved record wins (the lane's wait continues), else now.
-    fn seniority_of(&mut self, lane: &str, kind: SlotKind, now: f64) -> f64 {
-        *self
+    /// The `queued_at` a NEW waiter takes. Only the lane's eldest
+    /// unserved waiter of a kind inherits the episode anchor — later
+    /// arrivals of a burst stamp their own arrival and queue behind
+    /// it, so a lane cannot multiply one anchor into N front-runners.
+    /// The inherited stamp is clamped to the starvation bound HERE,
+    /// at stamp time: an episode older than `starve_secs` ranks
+    /// starved but never ahead of a genuinely older starved waiter.
+    fn stamp_for(&mut self, lane: &str, kind: SlotKind, now: f64) -> f64 {
+        let key = (lane.to_string(), kind);
+        if self
+            .waiting
+            .iter()
+            .any(|w| w.lane == lane && w.kind == kind)
+        {
+            // Behind the lane's eldest waiter — the anchor is not
+            // yours to carry.
+            return now;
+        }
+        let anchor = self
             .seniority
-            .entry((lane.to_string(), kind))
-            .or_insert(now)
+            .get(&key)
+            .map(|s| s.anchor)
+            .unwrap_or(now)
+            .max(now - self.config.starve_secs as f64);
+        self.seniority.insert(key, Seniority { anchor, seen: now });
+        anchor
+    }
+
+    /// What `stamp_for` would answer, without touching the episode —
+    /// a probe is read-only and must never arm an anchor for a lane
+    /// that hasn't actually queued.
+    fn peek_stamp(&self, lane: &str, kind: SlotKind, now: f64) -> f64 {
+        if self
+            .waiting
+            .iter()
+            .any(|w| w.lane == lane && w.kind == kind)
+        {
+            return now;
+        }
+        self.seniority
+            .get(&(lane.to_string(), kind))
+            .map(|s| s.anchor)
+            .unwrap_or(now)
+            .max(now - self.config.starve_secs as f64)
     }
 
     /// Atomic best-effort write of the hold registry — a reader never
@@ -514,6 +576,10 @@ impl Slots {
                 continue;
             }
             let Some(token) = h["token"].as_str().map(str::to_string) else {
+                eprintln!(
+                    "slots: dropping persisted hold with no token \
+                     ({lane} {kind:?} pid {pid}) — persist file truncated?"
+                );
                 continue;
             };
             self.held.push(SlotHold {
@@ -666,8 +732,9 @@ impl Slots {
             }
             // A fresh probe grants exactly when an enqueue would —
             // capacity free and the request next — but never joins
-            // the queue.
-            let senior = self.seniority_of(lane, kind, now);
+            // the queue and never touches seniority (`peek_stamp`
+            // only reads).
+            let senior = self.peek_stamp(lane, kind, now);
             let w = SlotWait {
                 request_id: request_id.to_string(),
                 kind,
@@ -683,7 +750,7 @@ impl Slots {
             let next = self.held_in(pool) < self.capacity(pool) && self.outranked(&ranks, idx) == 0;
             let position = self.outranked(&ranks, idx) + 1;
             self.waiting.pop();
-            self.prune_seniority();
+            self.prune_seniority(now);
             if next {
                 return Ok((self.grant(req, 0.0, clk, &mut events), events));
             }
@@ -720,7 +787,7 @@ impl Slots {
                          requests queued — let some grant or die first"
                     )));
                 }
-                let senior = self.seniority_of(lane, kind, now);
+                let senior = self.stamp_for(lane, kind, now);
                 self.waiting.push(SlotWait {
                     request_id: request_id.to_string(),
                     kind,
@@ -734,14 +801,19 @@ impl Slots {
             }
         };
         // The liveness stamp every poll owes — identity fields are
-        // the match key, so a re-poll only refreshes this.
+        // the match key, so a re-poll only refreshes this (and the
+        // episode's last-seen, so gap grace runs from the lane's
+        // real last poll rather than the last reap pass).
         self.waiting[idx].last_poll = now;
+        if let Some(s) = self.seniority.get_mut(&(lane.to_string(), kind)) {
+            s.seen = s.seen.max(now);
+        }
 
         let ranks = self.ranks(now);
         if self.held_in(pool) < self.capacity(pool) && self.outranked(&ranks, idx) == 0 {
             let wait_secs = (now - self.waiting[idx].queued_at).max(0.0);
             self.waiting.remove(idx);
-            self.prune_seniority();
+            self.prune_seniority(now);
             return Ok((self.grant(req, wait_secs, clk, &mut events), events));
         }
         // It must wait — but a caller holding the other pool may not
@@ -749,7 +821,7 @@ impl Slots {
         // is removed, never registered.
         if self.holds_other_pool(pool, lane, pid) {
             self.waiting.remove(idx);
-            self.prune_seniority();
+            self.prune_seniority(now);
             return Err(Error::rejected(format!(
                 "A caller holding a {} slot cannot queue for {} — \
                  release that hold first (hold-and-wait deadlock guard)",
@@ -1171,41 +1243,141 @@ mod tests {
         assert_eq!(q["wait_secs"], 10.0);
     }
 
-    /// Seniority measures an UNSERVED wait: a re-queued caller keeps
-    /// the lane's place, but every grant for that `(lane, kind)` ends
-    /// the anchor — a lane can never renew seniority by always having
-    /// one more request queued.
+    /// The episode anchor is carried by ONE waiter — the lane's
+    /// eldest unserved request of that kind. Later arrivals of a
+    /// burst stamp their own arrival, so a lane cannot multiply a
+    /// stale anchor into a queue of front-runners; the anchor
+    /// survives a brief polling gap (a requeue under a new
+    /// request_id keeps the lane's place) but dies with the first
+    /// serve for that `(lane, kind)`.
     #[test]
-    fn seniority_survives_requeue_but_not_a_grant() {
-        let mut s = slots(1, 1, 60, &["qa-1"]);
+    fn only_the_eldest_waiter_inherits_the_anchor() {
+        let mut s = slots(1, 1, 60, &[]);
         acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
-        // dev-2 waits on build from t=0, polling within the TTL.
+        // dev-2 waits on build from t=0 — its eldest waiter w1
+        // carries the t=0 anchor.
         acquire(&mut s, SlotKind::Build, "dev-2", "w1", 0.0);
-        for t in [20.0, 40.0, 55.0] {
-            acquire(&mut s, SlotKind::Build, "dev-2", "w1", t);
+        // qa-1 queues honestly at t=5.
+        acquire(&mut s, SlotKind::Build, "qa-1", "qb", 5.0);
+        // dev-2 bursts three more requests at t=10 — on the pre-r4
+        // head all three inherited t=0 and pinned qa-1 behind them;
+        // now they stamp their own arrival.
+        for req in ["w2", "w3", "w4"] {
+            acquire(&mut s, SlotKind::Build, "dev-2", req, 10.0);
         }
-        // A second dev-2 build request joins at t=70 — it inherits
-        // the still-unserved (dev-2, build) anchor at t=0, so it is
-        // ALREADY past the 60s starve bound and outranks a fresh
-        // priority waiter.
-        acquire(&mut s, SlotKind::Build, "dev-2", "w2", 70.0);
-        acquire(&mut s, SlotKind::Test, "qa-1", "w3", 71.0);
-        release_first(&mut s, "dev-1", 71.0);
-        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w1", 71.0);
-        assert_eq!(g["granted"], true, "seniority keeps w1 first");
-        // w2's stamp was baked before w1's serve — it wins once more.
-        release_first(&mut s, "dev-2", 72.0);
-        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w2", 72.0);
-        assert_eq!(g["granted"], true, "w2's baked anchor rides once");
-        // But the serve cleared (dev-2, build): a NEW dev-2 request
-        // anchors at its own arrival — it must NOT resurrect t=0.
-        // Priority w3 (waiting since t=71) now outranks it.
-        release_first(&mut s, "dev-2", 73.0);
-        acquire(&mut s, SlotKind::Build, "dev-2", "w4", 74.0);
-        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w4", 75.0);
-        assert_eq!(g["granted"], false, "post-serve request ranks honestly");
-        let g = acquire(&mut s, SlotKind::Test, "qa-1", "w3", 75.0);
-        assert_eq!(g["granted"], true, "priority outranks a fresh anchor");
+        release_first(&mut s, "dev-1", 20.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w1", 20.0);
+        assert_eq!(g["granted"], true, "the eldest keeps the anchor");
+        release_first(&mut s, "dev-2", 21.0);
+        let g = acquire(&mut s, SlotKind::Build, "qa-1", "qb", 21.0);
+        assert_eq!(g["granted"], true, "qa-1's t=5 beats the t=10 burst");
+        release_first(&mut s, "qa-1", 22.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w2", 22.0);
+        assert_eq!(g["granted"], true, "the burst follows in arrival order");
+    }
+
+    /// A requeue gap keeps the episode only while the lane's last
+    /// poll is still inside the waiter TTL: a caller whose process
+    /// dies mid-wait gets its anchor carried to the restarted
+    /// request, but a lane that just went quiet spent the window
+    /// already — the next request anchors fresh.
+    #[test]
+    fn anchor_survives_a_polling_gap_but_not_silence() {
+        let mut s = slots(1, 1, 60, &[]);
+        acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
+        // dev-2's caller is a real process that polls at t=20 and is
+        // then killed — the waiter reaps on pid death with a fresh
+        // last_poll, leaving one TTL of gap grace.
+        let child = Child::spawn();
+        acquire_pid(&mut s, SlotKind::Build, "dev-2", child.pid(), "w1", 0.0);
+        acquire_pid(&mut s, SlotKind::Build, "dev-2", child.pid(), "w1", 20.0);
+        child.reap();
+        // The requeue under a new request_id lands inside the window
+        // and inherits the t=0 anchor.
+        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w2", 25.0);
+        assert_eq!(g["wait_secs"], 25.0, "the requeue keeps the wait");
+        // But a lane that goes QUIET (alive pid, silent past the TTL)
+        // ends its episode — a later request anchors at arrival.
+        let mut s = slots(1, 1, 60, &[]);
+        acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
+        acquire(&mut s, SlotKind::Build, "dev-2", "w1", 0.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w2", 45.0);
+        assert_eq!(g["wait_secs"], 0.0, "silence spent the window");
+    }
+
+    /// Every serve ends the episode: after dev-2's eldest grants,
+    /// the `(dev-2, build)` anchor is gone — a new request stamps
+    /// its own arrival even inside the gap window.
+    #[test]
+    fn a_grant_still_ends_the_episode() {
+        let mut s = slots(1, 1, 60, &[]);
+        acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
+        acquire(&mut s, SlotKind::Build, "dev-2", "w1", 0.0);
+        acquire(&mut s, SlotKind::Build, "qa-1", "qb", 5.0);
+        release_first(&mut s, "dev-1", 10.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w1", 10.0);
+        assert_eq!(g["granted"], true, "anchor served the eldest");
+        release_first(&mut s, "dev-2", 12.0);
+        // qa-1 (t=5) grants next — dev-2's new request at t=13 must
+        // NOT resurrect the t=0 episode.
+        acquire(&mut s, SlotKind::Build, "dev-2", "w2", 13.0);
+        let g = acquire(&mut s, SlotKind::Build, "qa-1", "qb", 14.0);
+        assert_eq!(g["granted"], true, "post-serve request ranks honestly");
+    }
+
+    /// A probe is read-only: it must never arm a seniority anchor
+    /// for a lane that hasn't actually queued — otherwise a probe
+    /// would mint an anchor older than the lane's real first
+    /// request.
+    #[test]
+    fn a_probe_never_arms_an_anchor() {
+        let mut s = slots(1, 1, 60, &[]);
+        acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
+        // dev-2 probes at t=0 — this must NOT plant a t=0 anchor.
+        let p = s
+            .acquire(
+                SlotKind::Build,
+                "dev-2",
+                me(),
+                "p1",
+                true,
+                SlotClock::at(0.0, 0.0),
+            )
+            .unwrap()
+            .0;
+        assert_eq!(p["granted"], false);
+        // qa-1 queues honestly at t=5; dev-2 really queues at t=10.
+        acquire(&mut s, SlotKind::Build, "qa-1", "q1", 5.0);
+        acquire(&mut s, SlotKind::Build, "dev-2", "w1", 10.0);
+        release_first(&mut s, "dev-1", 20.0);
+        let g = acquire(&mut s, SlotKind::Build, "qa-1", "q1", 20.0);
+        assert_eq!(g["granted"], true, "qa-1's t=5 beats dev-2's real t=10");
+    }
+
+    /// Two waiters past `starve_secs` keep their FIFO order — the
+    /// starvation bound guarantees a grant, not a tie: a 2h waiter
+    /// still outranks a 901s one.
+    #[test]
+    fn starved_waiters_keep_their_order() {
+        let mut s = slots(1, 1, 60, &[]);
+        acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
+        // Two lanes waiting since t=0 and t=10 — at t=70 both are
+        // starved, but the elder still grants first. (Both re-poll
+        // inside the 30s waiter TTL so the original stamps hold.)
+        acquire(&mut s, SlotKind::Build, "dev-2", "w1", 0.0);
+        acquire(&mut s, SlotKind::Build, "dev-3", "x1", 10.0);
+        acquire(&mut s, SlotKind::Build, "dev-2", "w1", 25.0);
+        acquire(&mut s, SlotKind::Build, "dev-3", "x1", 35.0);
+        acquire(&mut s, SlotKind::Build, "dev-2", "w1", 50.0);
+        acquire(&mut s, SlotKind::Build, "dev-3", "x1", 60.0);
+        release_first(&mut s, "dev-1", 70.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-3", "x1", 70.0);
+        assert_eq!(g["granted"], false, "the elder starved waiter is first");
+        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w1", 70.0);
+        assert_eq!(g["granted"], true);
+        release_first(&mut s, "dev-2", 71.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-3", "x1", 71.0);
+        assert_eq!(g["granted"], true, "then the younger");
     }
 
     /// max_hold_secs reaps a forgotten hold — one caller can never

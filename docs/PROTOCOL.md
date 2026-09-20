@@ -1026,12 +1026,18 @@ builds. Grant order is FIFO with two modifiers: `test`/`suite`
 requests from a configured *priority lane* (`[host] priority_lanes` —
 the reviewer lane) outrank ordinary requests, and a `(lane, kind)`
 waiting continuously longer than `starve_secs` (default 900) jumps to
-the front. Seniority belongs to an *unserved* wait: a caller that
-re-queues under a new request id keeps the lane's accumulated wait,
-but every grant for that `(lane, kind)` restarts the anchor — a lane
-can never keep an old anchor alive by always having one more request
-queued — and a waiter's ordering age is capped at `starve_secs`, so
-any request is granted within the bound once it reaches the front.
+the front. Seniority belongs to an *unserved* wait and is carried by
+exactly one waiter — the lane's eldest for that kind: a caller that
+re-queues under a new request id keeps the lane's accumulated wait
+for up to one waiter TTL after its last poll, but later arrivals of
+a burst stamp their own arrival and queue behind it, so one lane can
+never multiply an old anchor into N front-running requests. Every
+grant for that `(lane, kind)` restarts the anchor — a lane can never
+keep an old anchor alive by always having one more request queued —
+and an inherited stamp is clamped to `starve_secs` at enqueue time,
+so rank 0 stays true FIFO: a two-hour waiter still beats a
+901-second one, and any request is granted within the bound once it
+reaches the front.
 
 A slot is a daemon-minted `slot-*` token bound to (lane, pid,
 pid-starttime): `release` must name the holding lane and pid, so one
