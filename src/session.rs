@@ -123,9 +123,11 @@ impl Row {
 /// inside quotes. A keyword counts only bounded by non-alphanumerics
 /// on both sides (`Authorization:` and `x-api-key` qualify; `monkey`,
 /// `author`, `keystore` don't — the unbounded scan ate the word after
-/// them). After `=`/`:`/whitespace the whole value expression becomes
-/// `[REDACTED]`: a quoted value to its close quote, an alpha-only
-/// scheme word plus the token after it, otherwise the next token.
+/// them) — except glued env names, which need an explicit `=`/`:` to
+/// count (`PGPASSWORD=hunter2` masks, `monkey business` stays prose).
+/// `=`/`:` and quoted values mask unconditionally; a whitespace-only
+/// separator masks only when the value `looks_secret` — `token is
+/// expired` and `pytest tests/auth test_x` are not credentials.
 fn scrub_auth_spans(s: &str) -> String {
     const KEYWORDS: &[&str] = &[
         "authorization",
@@ -144,6 +146,7 @@ fn scrub_auth_spans(s: &str) -> String {
         "auth",
         "cred",
         "pass",
+        "pwd",
         "key",
     ];
     let b = s.as_bytes();
@@ -154,7 +157,9 @@ fn scrub_auth_spans(s: &str) -> String {
         let kw = KEYWORDS.iter().find_map(|kw| {
             (i + kw.len() <= b.len()
                 && b[i..i + kw.len()].eq_ignore_ascii_case(kw.as_bytes())
-                && (i == 0 || !alnum(b[i - 1]))
+                && (i == 0
+                    || !alnum(b[i - 1])
+                    || (i + kw.len() < b.len() && matches!(b[i + kw.len()], b'=' | b':')))
                 && (i + kw.len() == b.len() || !alnum(b[i + kw.len()])))
             .then_some(kw.len())
         });
@@ -169,14 +174,18 @@ fn scrub_auth_spans(s: &str) -> String {
         while j < b.len() && matches!(b[j], b'=' | b':' | b' ' | b'\t') {
             j += 1;
         }
-        out.push_str(&s[i..j]);
         if j == i + kw || j >= b.len() {
+            out.push_str(&s[i..j]);
             i = j;
             continue;
         }
+        // `=`/`:` in the run means the value is implied — mask
+        // unconditionally. Whitespace-only means prose may follow;
+        // the value must look secret to mask.
+        let implied = s[i + kw..j].contains(['=', ':']);
         if b[j] == b'"' || b[j] == b'\'' {
             let q = b[j];
-            out.push(q as char);
+            out.push_str(&s[i..=j]);
             let mut k = j + 1;
             while k < b.len() && b[k] != q {
                 k += 1;
@@ -195,36 +204,48 @@ fn scrub_auth_spans(s: &str) -> String {
         }
         // An alpha-only first token is a scheme word (`Basic`,
         // `Bearer`, `Token`, `ApiKey`, `Negotiate`) — the credential
-        // itself is the token after it.
+        // itself is the token after it. Space-separated it must
+        // still look secret to mask.
         if s[j..k].bytes().all(|c| c.is_ascii_alphabetic()) {
-            let mut m = k;
-            while m < b.len() && b[m].is_ascii_whitespace() {
-                m += 1;
+            let mut m0 = k;
+            while m0 < b.len() && b[m0].is_ascii_whitespace() {
+                m0 += 1;
             }
+            let mut m = m0;
             while m < b.len() && !b[m].is_ascii_whitespace() {
                 m += 1;
             }
-            k = m;
+            if implied || looks_secret(&s[m0..m]) {
+                out.push_str(&s[i..j]);
+                out.push_str("[REDACTED]");
+                i = m;
+                continue;
+            }
+        } else if implied || looks_secret(&s[j..k]) {
+            // Keep a quote the value ran up against — `-H
+            // "Authorization: Basic x=="` eats through the close
+            // quote otherwise.
+            let quote = k > j && matches!(b[k - 1], b'"' | b'\'');
+            if quote {
+                k -= 1;
+            }
+            out.push_str(&s[i..j]);
+            out.push_str("[REDACTED]");
+            i = k;
+            continue;
         }
-        // Keep a quote the value ran up against — `-H "Authorization:
-        // Basic x=="` eats through the close quote otherwise.
-        let quote = k > j && matches!(b[k - 1], b'"' | b'\'');
-        if quote {
-            k -= 1;
-        }
-        out.push_str("[REDACTED]");
-        i = k;
+        // Not a credential use — emit through the separators and let
+        // the value text scan on its own.
+        out.push_str(&s[i..j]);
+        i = j;
     }
     out
 }
 
-/// Bare credential-shaped tokens become `[REDACTED]` even with no
-/// keyword pointing at them — the span pass only masks values a
-/// keyword names. Prefixes are the shapes seen in real argv (figma,
-/// github, openai/stripe-style, slack, AWS access keys, JWTs); a
-/// 12-char floor keeps short lookalikes out. Whitespace normalizes to
-/// single spaces — cosmetic, only for display text.
-fn scrub_token_shapes(s: &str) -> String {
+/// Whitespace-separator gate for `scrub_auth_spans` — is this token
+/// secret-looking enough to mask on a bare space? `hunter2` yes
+/// (length plus a digit), `expired`/`test_x`/`localhost` no.
+fn looks_secret(tok: &str) -> bool {
     const PREFIXES: &[&str] = &[
         "figd_",
         "ghp_",
@@ -242,39 +263,56 @@ fn scrub_token_shapes(s: &str) -> String {
         "AKIA",
         "ASIA",
     ];
-    let shaped = |seg: &str| {
-        seg.len() >= 12
-            && (PREFIXES.iter().any(|p| seg.starts_with(p))
-                || (seg.starts_with("eyJ") && seg.contains('.')))
-    };
-    s.split_whitespace()
-        .map(|tok| {
-            if shaped(tok.trim_matches(|c: char| matches!(c, '"' | '\''))) {
-                "[REDACTED]".to_string()
-            } else {
-                // `name=credential` — mask the value when the name
-                // carries no keyword the span pass would have caught.
-                match tok.rfind('=') {
-                    Some(i) if shaped(&tok[i + 1..]) => format!("{}[REDACTED]", &tok[..=i]),
-                    _ => tok.to_string(),
-                }
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let t = tok.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')'));
+    t.len() >= 12
+        || (t.len() >= 6 && t.bytes().any(|b| b.is_ascii_digit()))
+        || t.ends_with('=')
+        || PREFIXES.iter().any(|p| t.starts_with(p))
+        || (t.starts_with("eyJ") && t.contains('.'))
 }
 
-/// One display line through `scrub_auth_spans` then
-/// `scrub_token_shapes` — text (remedies quoting commands, running-turn
-/// heads, check details) can still carry secrets, so every row
-/// boundary scrubs before it renders or serializes. Process argv
-/// itself never reaches here — orphans display as `exe (arg count)`.
-/// The span pass masks `key<sep>value` expressions; the shape pass
-/// masks bare credential-shaped tokens with no keyword. Local until
-/// PR #64's `doctor::host::redact_argv` lands on main — then this
-/// delegates to the shared helper (CAD-108 follow-up).
+/// `docker login -u <user> <password>` — the password is positional:
+/// no keyword names it and a plain value carries no credential
+/// shape. Only the token after the `-u`/`--user` value masks, and
+/// only for `login`.
+fn mask_docker_login_positional(words: &mut [String]) {
+    let Some(login) = words.iter().position(|w| w == "login") else {
+        return;
+    };
+    let Some(u) = words.iter().position(|w| w == "-u" || w == "--user") else {
+        return;
+    };
+    if u <= login {
+        return;
+    }
+    if let Some(w) = words.get_mut(u + 2).filter(|w| !w.starts_with('-')) {
+        *w = "[REDACTED]".to_string();
+    }
+}
+
+/// One display line: `scrub_auth_spans` masks `key<sep>value`
+/// expressions argv-tokenization can't see, then CAD-108's shared
+/// `doctor::host::redact_argv` masks flag/env/URI/credential-shape
+/// values per token; `mask_docker_login_positional` covers `login
+/// -u`'s bare positional password. Process argv itself never reaches
+/// here — orphans display as `exe (arg count)`. A line nothing
+/// masked keeps its original whitespace.
 fn scrub_line(s: &str) -> String {
-    scrub_token_shapes(&scrub_auth_spans(s))
+    let spanned = scrub_auth_spans(s);
+    let mut words: Vec<String> = spanned.split_whitespace().map(str::to_string).collect();
+    let joined = words.join(" ");
+    mask_docker_login_positional(&mut words);
+    let mut scrubbed = doctor::host::redact_argv(&words);
+    // `auth:` is itself a header shape — the argv pass re-masks it
+    // and keeps the span's own mask token, doubling the marker.
+    while scrubbed.contains("[REDACTED] [REDACTED]") {
+        scrubbed = scrubbed.replace("[REDACTED] [REDACTED]", "[REDACTED]");
+    }
+    if scrubbed == joined {
+        spanned
+    } else {
+        scrubbed
+    }
 }
 
 /// The host scan with the command's cwd — `Scan::host` defaults to
@@ -1175,7 +1213,11 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         sweep
             .items
             .push("--force-finish ignored: issue finish --merged has no --force".to_string());
-        sweep.sev = Sev::Warn;
+        // The note lifts an otherwise-clean sweep to warn; a Fail
+        // stays Fail — downgrading it for display would lie.
+        if sweep.sev == Sev::Ok {
+            sweep.sev = Sev::Warn;
+        }
         done.finish_notes
             .push("--force-finish ignored: issue finish --merged has no --force".to_string());
     }
@@ -1200,10 +1242,11 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         }
         let cwd = a["cwd"].as_str().unwrap_or_default();
         !cwd.is_empty()
-            && sc
-                .repos
-                .iter()
-                .any(|(_, _, p)| Path::new(cwd).starts_with(p))
+            && sc.repos.iter().any(|(_, _, p)| {
+                // An empty declared repo path starts_with()s every
+                // cwd — that would scope the whole fleet.
+                !p.as_os_str().is_empty() && Path::new(cwd).starts_with(p)
+            })
     };
     let mut idle_row = Row::new("agents");
     let mut stop_candidates: Vec<String> = Vec::new();
@@ -1483,7 +1526,7 @@ fn handoff_md(
             md.push_str(&format!(
                 "- {slug}#{} {} — head {}, verdict {}, checks {}\n",
                 pr["number"].as_i64().unwrap_or(0),
-                pr["title"].as_str().unwrap_or(""),
+                scrub_line(pr["title"].as_str().unwrap_or("")),
                 pr["headRefOid"]
                     .as_str()
                     .unwrap_or("?")
@@ -1604,8 +1647,8 @@ fn handoff_md(
         for n in needs.iter().take(5) {
             md.push_str(&format!(
                 "- {} — {}\n",
-                n["title"].as_str().unwrap_or(""),
-                n["command"].as_str().unwrap_or("")
+                scrub_line(n["title"].as_str().unwrap_or("")),
+                scrub_line(n["command"].as_str().unwrap_or(""))
             ));
         }
     }
@@ -1636,9 +1679,11 @@ mod tests {
     use super::*;
 
     // These pin the session-side boundary — every display line goes
-    // through `scrub_line` before it renders or serializes. When PR
-    // #64's `doctor::host::redact_argv` lands, `scrub_line` delegates
-    // to it; these expectations stay the contract either way.
+    // through `scrub_line` before it renders or serializes.
+    // `scrub_line` is `scrub_auth_spans` (key<sep>value expressions
+    // argv-tokenization can't see) feeding `doctor::host::redact_argv`
+    // (CAD-108's shared per-token scrubber) plus the docker-login
+    // positional.
 
     #[test]
     fn scrub_line_redacts_flag_env_and_bare_shapes() {
@@ -1696,10 +1741,12 @@ mod tests {
             ),
             ("Authorization: ApiKey zzz", "Authorization: [REDACTED]"),
             ("Authorization: Negotiate YlBJ", "Authorization: [REDACTED]"),
-            // Quoted value: mask to the close quote, keep the quotes.
+            // Quoted value: the span pass masks to the close quote;
+            // the argv pass then canonicalizes `--flag <masked>`,
+            // dropping the quotes it carried.
             (
                 "cmd --auth-token \"Bearer sk-live-abc123\" --verbose",
-                "cmd --auth-token \"[REDACTED]\" --verbose",
+                "cmd --auth-token [REDACTED] --verbose",
             ),
             ("token 'sekret v2' done", "token '[REDACTED]' done"),
             // `key:`/`key =` text separators.
@@ -1708,6 +1755,78 @@ mod tests {
         ] {
             assert_eq!(scrub_line(line), want, "{line}");
         }
+    }
+
+    #[test]
+    fn scrub_line_covers_uri_env_glued_and_positional_shapes() {
+        for (line, want) in [
+            // Attached short flag — mysql's own argv shape.
+            ("mysql -uroot -pHunter2 db", "mysql -uroot -p[REDACTED] db"),
+            // URI userinfo keeps the user, masks the password.
+            (
+                "git clone https://alice:s3cr3t@github.com/x/y",
+                "git clone https://alice:[REDACTED]@github.com/x/y",
+            ),
+            // Glued env names — no separator before the keyword.
+            (
+                "env PGPASSWORD=hunter2 psql",
+                "env PGPASSWORD=[REDACTED] psql",
+            ),
+            ("env MYSQL_PWD=s3cr3t db", "env MYSQL_PWD=[REDACTED] db"),
+            ("GITHUBTOKEN=tok123 deploy", "GITHUBTOKEN=[REDACTED] deploy"),
+            // `docker login`'s password is positional — no keyword
+            // names it and a plain value carries no shape.
+            (
+                "docker login -u me s3cr3tvalue",
+                "docker login -u me [REDACTED]",
+            ),
+            (
+                "docker login --user me s3cr3tvalue",
+                "docker login --user me [REDACTED]",
+            ),
+        ] {
+            assert_eq!(scrub_line(line), want, "{line}");
+        }
+        // A registry argument after `-u <user>` is indistinguishable
+        // from the positional password — masking wins, safe side.
+        assert_eq!(
+            scrub_line("docker login -u me ghcr.io"),
+            "docker login -u me [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn scrub_line_space_separator_masks_only_secret_values() {
+        // Prose with a keyword in it must not lose the next word.
+        for keep in [
+            "token is expired",
+            "pytest tests/auth test_x",
+            "auth refresh flow finished",
+            "credential stuffing attacks",
+        ] {
+            assert_eq!(scrub_line(keep), keep, "{keep}");
+        }
+        for (line, want) in [
+            ("token hunter2", "token [REDACTED]"),
+            ("auth Bearer ghp_abcdefghijklmnopqrst", "auth [REDACTED]"),
+            // `=`/`:` imply a value — unconditional.
+            ("password: hunter2", "password: [REDACTED]"),
+            ("password = hunter2", "password = [REDACTED]"),
+        ] {
+            assert_eq!(scrub_line(line), want, "{line}");
+        }
+    }
+
+    #[test]
+    fn scrub_line_preserves_whitespace_when_nothing_masks() {
+        let keep = "a  b\tc   indented\ttext";
+        assert_eq!(scrub_line(keep), keep);
+        // The span pass edits in place — a masked line keeps its
+        // whitespace unless the argv pass had more to say.
+        assert_eq!(
+            scrub_line("a  b --token=hunter2x"),
+            "a  b --token=[REDACTED]"
+        );
     }
 
     #[test]

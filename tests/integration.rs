@@ -17915,6 +17915,15 @@ fn session_host_report_flag_labels_errors_and_env_is_dead() {
         !out.status.success() && msg.contains("/nonexistent/host.json"),
         "a bad fixture path must error naming the path:\n{msg}"
     );
+    // …before any mutation — no handoff was written.
+    assert!(
+        !state.join("sessions").exists()
+            || std::fs::read_dir(state.join("sessions"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "a bad fixture must fail before the handoff write"
+    );
     // Same for a parsable-path-but-not-JSON file.
     let garbage = tmp.path().join("not-json.json");
     std::fs::write(&garbage, "not json at all").unwrap();
@@ -17960,6 +17969,29 @@ fn session_host_report_flag_labels_errors_and_env_is_dead() {
         j["host_source"].as_str().unwrap_or_default(),
         format!("fixture {}", host.display()),
         "--json labels the fixture:\n{text}"
+    );
+    // `session start` takes the same flag and labels it the same way.
+    let out = run_session_host(&state, &pm, &repo, &["session", "start"], &host, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("real host not scanned"),
+        "session start labels the fixture:\n{text}"
+    );
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--json"],
+        &host,
+        &[],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("start --json not one document: {e}\n{text}"));
+    assert_eq!(
+        j["host_source"].as_str().unwrap_or_default(),
+        format!("fixture {}", host.display()),
+        "start --json labels the fixture:\n{text}"
     );
 
     // The old env var is dead: set it to a *failing* fixture and run

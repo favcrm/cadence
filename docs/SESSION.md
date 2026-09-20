@@ -393,7 +393,12 @@ alone), and `agent gc` is skipped outright because it is fleet-wide —
 the row says so. The host sweep is a report, not a gate: its findings
 cap at `warn` and never set exit 2 — a full disk is `session start`'s
 job to refuse. Only the run's own failures (a sweep RPC error, an
-unwritable handoff) exit 2.
+unwritable handoff) exit 2. Both verbs accept a hidden `--host-report
+<path>` that reads a saved `doctor --host` JSON report instead of
+scanning — tests and debug only; the run is labelled `fixture <path>
+— real host not scanned` in text and `host_source` in `--json`, an
+unreadable or unparsable file is a hard error, and no environment
+variable can substitute a fixture.
 
 What the run decides, for reference — the same judgments the checklist
 used to list by hand:
