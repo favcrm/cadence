@@ -18895,3 +18895,362 @@ fn issue_ls_survives_a_closed_downstream_pipe() {
         "the open-pipe failure still prints its error"
     );
 }
+// ---------- CAD-153: cadence audit -------------------------------------
+
+/// A repo whose default branch holds squash-merge subjects `… (#N)`
+/// plus the landed-head commits, so `contains_head` can patch-id
+/// compare. Returns (repo, notes, report, heads) — `heads[i]` is the
+/// headRefOid for PR i+1.
+fn audit_repo(dir: &TempDir) -> (PathBuf, PathBuf, PathBuf, Vec<String>) {
+    let repo = dir.path().join("repo");
+    let notes = dir.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    git_repo(&repo);
+    let g = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let branch = g(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let mut heads = Vec::new();
+    let mut prs = Vec::new();
+    for n in 1..=3u8 {
+        // The PR head: same change on a side branch.
+        g(&["checkout", "-qb", &format!("pr{n}")]);
+        std::fs::write(repo.join(format!("f{n}.txt")), format!("change {n}")).unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", &format!("work {n}")]);
+        let head = g(&["rev-parse", "HEAD"]);
+        // The squash merge: identical change on the default branch.
+        g(&["checkout", "-q", &branch]);
+        std::fs::write(repo.join(format!("f{n}.txt")), format!("change {n}")).unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", &format!("work {n} (CAD-{n}) (#{n})")]);
+        let merge = g(&["rev-parse", "HEAD"]);
+        prs.push(format!(
+            r#"{{"number":{n},"title":"work {n} (CAD-{n})","headRefOid":"{head}",
+              "mergeCommit":{{"oid":"{merge}"}},"mergedBy":{{"login":"ops-1"}},
+              "mergedAt":"2026-09-20T12:00:0{n}Z"}}"#
+        ));
+        heads.push(head);
+    }
+    let report = dir.path().join("merge-report.json");
+    std::fs::write(
+        &report,
+        format!("{{\"prs\":[{}],\"statuses\":{{}}}}", prs.join(",")),
+    )
+    .unwrap();
+    (repo, notes, report, heads)
+}
+
+/// `cadence audit` fully fixtured — `--merge-report` + `--notes-dir`
+/// replace gh and the notes tree, an empty state dir and PM dir keep
+/// the daemon store and tracker out.
+fn run_audit(
+    state: &Path,
+    pm: &Path,
+    repo: &Path,
+    notes: &Path,
+    report: &Path,
+    extra: &[&str],
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
+        .arg(state)
+        .arg("audit")
+        .arg("--repo")
+        .arg(repo)
+        .arg("--notes-dir")
+        .arg(notes)
+        .arg("--merge-report")
+        .arg(report)
+        .args(extra)
+        .env("CADENCE_PM_DIR", pm)
+        .output()
+        .unwrap()
+}
+
+fn verdict_note(notes: &Path, name: &str, head: &str, from: &str, class: &str) {
+    std::fs::write(
+        notes.join(name),
+        format!(
+            "# Verdict: pass\n> From: `{from}`\n\n## Verdict\npass — head `{head}`\n\n\
+             **Risk: {class} (test trigger)**\n\n**What an auditor should check:** the row.\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn audit_reconstructs_clean_merge() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // Every PR head carries a pass verdict note + SUCCESS status —
+    // the fully clean run.
+    let mut report_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    for (i, h) in heads.iter().enumerate() {
+        verdict_note(
+            &notes,
+            &format!("20260920-120{i}00-x-p{n}-verdict.md", i = i, n = i + 1),
+            h,
+            "qa-1",
+            "auto",
+        );
+        report_json["statuses"][h] = json!({
+            "statuses": [{"context": "qa-verdict", "state": "SUCCESS"}]
+        });
+    }
+    std::fs::write(&report, report_json.to_string()).unwrap();
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean rows must not flag:\n{text}"
+    );
+    assert!(text.contains("#1"), "{text}");
+    assert!(text.contains("reviewer qa-1"), "{text}");
+    assert!(text.contains("merger ops-1"), "{text}");
+    assert!(text.contains("contains_head yes"), "{text}");
+    assert!(text.contains("class auto"), "{text}");
+    assert!(text.contains("trigger test trigger"), "{text}");
+    assert!(!text.contains("FLAG"), "{text}");
+    // The root commit shows as a `?` row but is exempt from flags —
+    // it predates the PR process. Any *later* direct push would flag.
+    assert!(text.contains("? init"), "{text}");
+    // Read-only: the repo must be byte-identical afterwards.
+    assert_eq!(git_porcelain(&repo), "", "audit must not dirty the repo");
+}
+
+#[test]
+fn audit_flags_reviewer_equals_merger() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // Reviewer is the merger.
+    verdict_note(
+        &notes,
+        "20260920-120100-x-p3-verdict.md",
+        &heads[2],
+        "ops-1",
+        "auto",
+    );
+    let mut report_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    report_json["statuses"] = json!({
+        heads[2].clone(): {"statuses":[{"context":"qa-verdict","state":"SUCCESS"}]}
+    });
+    std::fs::write(&report, report_json.to_string()).unwrap();
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "flag must exit 1:\n{text}");
+    assert!(text.contains("FLAG[reviewer==merger]"), "{text}");
+}
+
+#[test]
+fn audit_flags_merge_with_no_verdict_on_head() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, _heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // Empty notes dir, empty statuses — nothing proves a pass.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--limit", "1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "verdict-less head must flag:\n{text}"
+    );
+    assert!(text.contains("FLAG[no-passing-verdict]"), "{text}");
+    assert!(text.contains("verdict unknown"), "{text}");
+    assert!(text.contains("reviewer unknown"), "{text}");
+    // The reasons must accompany the unknowns.
+    let jout = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &notes,
+        &report,
+        &["--limit", "1", "--json"],
+    );
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&jout.stdout)).unwrap();
+    let unknowns = j["merges"][0]["unknowns"].as_array().unwrap();
+    assert!(
+        unknowns.iter().any(|u| u["field"] == "verdict"),
+        "unknown verdict needs a reason: {j}"
+    );
+}
+
+#[test]
+fn audit_json_shape_is_stable() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    verdict_note(
+        &notes,
+        "20260920-120100-x-p1-verdict.md",
+        &heads[0],
+        "qa-1",
+        "auto",
+    );
+
+    let out = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &notes,
+        &report,
+        &["--since", "24h", "--json"],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("--json not one document: {e}\n{text}"));
+    assert_eq!(j["schema"].as_str().unwrap(), "cadence.audit/1");
+    for key in [
+        "repo",
+        "default_ref",
+        "since",
+        "filters",
+        "merges",
+        "summary",
+    ] {
+        assert!(j.get(key).is_some(), "missing top-level {key}: {j}");
+    }
+    let m = &j["merges"][0];
+    for key in [
+        "pr",
+        "title",
+        "merge_sha",
+        "landed_head",
+        "reviewed_head",
+        "contains_head",
+        "qa_verdict_status",
+        "verdict",
+        "reviewer",
+        "merger",
+        "class",
+        "trigger",
+        "gate_summary",
+        "auditor_check",
+        "residue",
+        "outcome",
+        "flags",
+        "unknowns",
+    ] {
+        assert!(m.get(key).is_some(), "missing merges[].{key}: {m}");
+    }
+    for key in ["tree_match", "smoke", "daemon_restart", "revert"] {
+        assert!(
+            m["outcome"].get(key).is_some(),
+            "missing outcome.{key}: {m}"
+        );
+    }
+    assert!(j["summary"]["rows"].as_u64().unwrap() >= 3);
+}
+
+#[test]
+fn audit_filters_since_class_project_limit() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    // Tracker: CAD-1 lives under project `alpha`.
+    std::fs::create_dir_all(pm.join("alpha").join("CAD-1")).unwrap();
+    std::fs::write(pm.join("alpha/CAD-1/issue.md"), "---\nid: CAD-1\n---\n").unwrap();
+    verdict_note(
+        &notes,
+        "20260920-120100-x-p1-verdict.md",
+        &heads[0],
+        "qa-1",
+        "auto",
+    );
+    verdict_note(
+        &notes,
+        "20260920-120200-x-p2-verdict.md",
+        &heads[1],
+        "qa-1",
+        "human",
+    );
+
+    // --since far future → no rows.
+    let out = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &notes,
+        &report,
+        &["--since", "2999-01-01"],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("0 merges") || text.contains("no merges"),
+        "{text}"
+    );
+
+    // --limit 2 → exactly two rows.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--limit", "2"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("(2 merges"), "{text}");
+
+    // --class auto → only the auto-classified row.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--class", "auto"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("#1"), "{text}");
+    assert!(!text.contains("#2"), "{text}");
+    // --class human → the human row only.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--class", "human"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("#2"), "{text}");
+    assert!(!text.contains("#1"), "{text}");
+
+    // --project alpha → only CAD-1's row.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--project", "alpha"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("#1"), "{text}");
+    assert!(!text.contains("#2"), "{text}");
+}
+
+#[test]
+fn audit_fixture_never_shells_gh() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, _heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // PATH with no gh: fixture mode must not reach for it.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--json"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("fixture mode must not call gh: {e}\n{text}"));
+    // 3 merge subjects + the init commit.
+    assert_eq!(j["merges"].as_array().unwrap().len(), 4);
+    let pr_rows = j["merges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["pr"].as_u64().is_some())
+        .count();
+    assert_eq!(pr_rows, 3);
+}

@@ -668,6 +668,38 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Reconstruct every merge on the default branch from stored
+    /// data — verdict notes, commit statuses, tracker folders, daemon
+    /// events — and flag `reviewer==merger` and merges with no passing
+    /// verdict on the exact landed head. Read-only; exits non-zero
+    /// when any row is flagged. See docs/AUDIT.md.
+    Audit {
+        /// Drop merges older than this: 24h, 7d, YYYY-MM-DD or epoch.
+        #[arg(long)]
+        since: Option<String>,
+        /// Keep rows classified auto, notify or human.
+        #[arg(long)]
+        class: Option<String>,
+        /// Keep rows whose tracker issue lives under project P.
+        #[arg(long)]
+        project: Option<String>,
+        /// Emit the payload as one stable JSON document (cadence.audit/1).
+        #[arg(long)]
+        json: bool,
+        /// Cap rows (0 = all; default 200).
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Audit this checkout instead of the cwd.
+        #[arg(long, hide = true)]
+        repo: Option<PathBuf>,
+        /// Fixture the notes directory (default /var/www/agent-notes).
+        #[arg(long, value_name = "PATH", hide = true)]
+        notes_dir: Option<PathBuf>,
+        /// Fixture replacing every `gh` call — the audit never shells
+        /// out when this is set.
+        #[arg(long, value_name = "PATH", hide = true)]
+        merge_report: Option<PathBuf>,
+    },
     /// What needs a human right now: merge-ready PRs, open approvals,
     /// fenced or stalled agents, review/unblocked issues, unread
     /// inboxes, a behind-tracker, deploy drift — each with the exact
@@ -3490,6 +3522,27 @@ fn run() -> Result<i32> {
                 state_dir,
             }),
         },
+        Commands::Audit {
+            since,
+            class,
+            project,
+            json,
+            limit,
+            repo,
+            notes_dir,
+            merge_report,
+        } => cadence_agent::audit::run(&cadence_agent::audit::AuditOptions {
+            since,
+            class,
+            project,
+            json,
+            limit,
+            repo,
+            notes_dir,
+            merge_report,
+            cwd: std::env::current_dir()?,
+            state_dir,
+        }),
         Commands::Overview { json, watch } => run_overview(&state_dir, json, watch),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }

@@ -4,6 +4,7 @@
 //! Unix-socket daemon defined in [`daemon`].
 
 pub mod adapter;
+pub mod audit;
 pub mod client;
 pub mod daemon;
 pub mod doctor;
