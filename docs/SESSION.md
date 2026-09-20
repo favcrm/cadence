@@ -44,10 +44,15 @@ cadence doctor --host --reclaim-plan
                               #  deletes; exit is still the worst check level.
                               #  The shared-cache command empties the shared
                               #  subdirs but keeps the dirs themselves (every
-                              #  lane symlinks into them); live-lane target
-                              #  bytes are listed separately under
-                              #  "freed with their lanes", outside the
-                              #  reclaimable total
+                              #  lane symlinks into them); a retired shared
+                              #  dir (e.g. examples) gets its own contents-
+                              #  clearing row; a shared cache whose cargo
+                              #  lock is held emits no command and counts
+                              #  nothing — that lock flag is a scan-time
+                              #  snapshot, recheck before running the plan;
+                              #  live-lane target bytes are listed
+                              #  separately under "freed with their lanes",
+                              #  outside the reclaimable total
 cadence ui start              # board at http://cadence.localhost:18000 behind the dev gateway
 cadence ui tailscale start    # optional: phone/laptop access at https://<dns>:9450 — tailnet-only, loopback bind unchanged
 cadence issue doctor          # tracker: hooks ours, lint clean, ahead/behind origin

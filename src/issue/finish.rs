@@ -720,7 +720,9 @@ pub fn run(
         "status": t.front.status,
     });
     if let Some(target) = &cargo_target {
-        out["cargo_target_exists"] = json!(Path::new(target).exists());
+        // `symlink_metadata` — a recorded path that is itself a
+        // symlink reports its own presence, not its target's.
+        out["cargo_target_exists"] = json!(Path::new(target).symlink_metadata().is_ok());
     }
     Ok(out)
 }

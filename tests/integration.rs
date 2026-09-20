@@ -15988,8 +15988,12 @@ impl SharedTarget {
     }
 
     fn cli_at(&self, cwd: &Path, args: &[&str]) -> (i32, String, String) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
+        self.cli_at_env(cwd, args, &[])
+    }
+
+    fn cli_at_env(&self, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.arg("--state-dir")
             .arg(&self.state)
             .args(args)
             .env("CADENCE_PM_DIR", &self.pm_dir)
@@ -16003,9 +16007,11 @@ impl SharedTarget {
                 ),
             )
             .env_remove("CADENCE_ALIAS")
-            .current_dir(cwd)
-            .output()
-            .unwrap();
+            .current_dir(cwd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).to_string(),
@@ -16345,7 +16351,24 @@ fn doctor_host_shared_target_and_reclaim_plan() {
     std::fs::create_dir_all(shared.join("debug")).unwrap();
     std::fs::write(shared.join("debug/dep.rlib"), vec![0_u8; 4096]).unwrap();
     // A per-lane target dir on D-1's worktree — the pre-CAD-95 layout.
+    // A commit past base keeps the lane live: a stale lane's whole
+    // dir is freed by its own row and emits no informational
+    // worktree-target row.
     let wt1 = s.worktree_of("D-1");
+    std::fs::write(wt1.join("wip.txt"), "x").unwrap();
+    s.git(&wt1, &["add", "-A"]);
+    s.git(
+        &wt1,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "wip",
+        ],
+    );
     std::fs::create_dir_all(wt1.join("target/debug")).unwrap();
     std::fs::write(wt1.join("target/debug/dep.rlib"), vec![0_u8; 2048]).unwrap();
 
@@ -16467,4 +16490,41 @@ fn reclaim_plan_command_keeps_lanes_buildable() {
     let bin = wt.join("target/debug/marker");
     let out = std::process::Command::new(&bin).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "warm");
+}
+
+/// `CARGO_TARGET_DIR` outranks every config file — with it exported,
+/// a planted farm would sit inert while every lane collided in the
+/// env dir, so `issue start` plants nothing and records the env's
+/// dir on the worktree ref.
+#[test]
+fn issue_start_honours_cargo_target_dir_env() {
+    let s = SharedTarget::new();
+    s.new_issue("Env");
+    let envdir = s.repo.join("env-target");
+    let (code, stdout, stderr) = s.cli_at_env(
+        &s.repo,
+        &["issue", "start", "D-1"],
+        &[("CARGO_TARGET_DIR", envdir.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let out: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        out["target_dir"].as_str().unwrap(),
+        envdir.to_string_lossy(),
+        "{out}"
+    );
+    // No farm — every build lands in the env dir instead.
+    let wt = s.worktree_of("D-1");
+    assert!(!wt.join("target/debug/deps").exists());
+    let show = s.cli(&["issue", "show", "D-1", "--json"]).1;
+    let wt_ref = show["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "worktree")
+        .unwrap();
+    assert_eq!(
+        wt_ref["cargo_target"].as_str().unwrap(),
+        envdir.to_string_lossy()
+    );
 }

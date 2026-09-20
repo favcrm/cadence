@@ -315,7 +315,13 @@ the `Issue: <ID>` trailer — as JSON.
   and printed as `target_dir`; a stale recorded value is corrected
   on re-start with its own commit. If a pre-existing cargo lock file
   is held by a running build, `issue start` refuses rather than
-  leaving the lane half-shared — retry when the lane is idle.
+  leaving the lane half-shared — the lock check runs before any of
+  the lane's artifacts move, so a live build loses nothing; retry
+  when the lane is idle. Pre-existing artifacts merge into the
+  shared dirs; a name already present stays the lane's copy under a
+  `<name>.local` sibling, and a path that is a symlink to somewhere
+  else — an operator's own link — is refused, not silently
+  half-shared.
 - One tracker commit records a `branch` ref (label = repo basename)
   and a `worktree` ref (absolute path), the status/owner updates and
   the CAD-42 `Issue:`/`Actor:` trailers under subject

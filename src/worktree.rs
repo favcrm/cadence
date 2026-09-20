@@ -109,16 +109,17 @@ pub fn shared_target_dir(root: &Path) -> PathBuf {
 /// uplifted binaries, uplifted rlibs, `.d` files — is unhashed and
 /// stays per-lane, which is what keeps one lane's `cargo test` from
 /// exec'ing another lane's `debug/cadence`.
-const SHARED_DEBUG_DIRS: [&str; 4] = ["deps", ".fingerprint", "build", "incremental"];
+pub(crate) const SHARED_DEBUG_DIRS: [&str; 4] = ["deps", ".fingerprint", "build", "incremental"];
 /// `examples/` is deliberately absent: cargo uplifts example binaries
 /// to `debug/examples/<name>` *unhashed*, so sharing it hands one lane
 /// another lane's example — the bug this farm exists to prevent. Any
 /// link an older cadence planted is unlinked on sight.
-const RETIRED_DEBUG_DIRS: [&str; 1] = ["examples"];
+pub(crate) const RETIRED_DEBUG_DIRS: [&str; 1] = ["examples"];
 /// Cargo's build locks (all three exist on modern toolchains) are
 /// shared too, so two lanes building at once serialise on cargo's own
 /// locking rather than racing writes into the shared `deps/`.
-const SHARED_DEBUG_FILES: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
+pub(crate) const SHARED_DEBUG_FILES: [&str; 3] =
+    [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
 
 /// Should the project's worktrees share the dep cache?
 /// `build: {target_dir: per-worktree}` in `project.yaml` opts a lane
@@ -153,18 +154,29 @@ fn config_target_dir(conf: &Path) -> Option<PathBuf> {
 }
 
 /// Where cargo will actually put this worktree's build output, per
-/// cargo's own config chain: `.cargo/config.toml` in the worktree and
-/// every ancestor up to `/`, then `$CARGO_HOME/config.toml` (default
-/// `~/.cargo/config.toml`) — first `build.target-dir` wins. An
-/// ancestor or home-level redirect applies to every lane exactly like
-/// a worktree-local one does, so it is honoured here too rather than
-/// planting a farm cargo would ignore. A `CARGO_TARGET_DIR` env still
-/// overrides the way it always has; the ref records the best-known
-/// effective dir.
+/// cargo's own precedence: `CARGO_TARGET_DIR` first (it outranks
+/// every config file; relative values are anchored to the worktree,
+/// the only sane cwd-independent reading), then `.cargo/config.toml`
+/// or legacy `.cargo/config` in the worktree and every ancestor up to
+/// `/`, then `$CARGO_HOME/config.toml` (default `~/.cargo/config.toml`)
+/// — first `build.target-dir` wins. An ancestor or home-level
+/// redirect applies to every lane exactly like a worktree-local one
+/// does, so it is honoured here too rather than planting a farm cargo
+/// would ignore.
 pub fn effective_target_dir(wt_dir: &Path) -> PathBuf {
+    if let Some(v) = std::env::var_os("CARGO_TARGET_DIR").filter(|v| !v.is_empty()) {
+        let dir = PathBuf::from(v);
+        return if dir.is_absolute() {
+            dir
+        } else {
+            wt_dir.join(dir)
+        };
+    }
     for dir in wt_dir.ancestors() {
-        if let Some(target) = config_target_dir(&dir.join(".cargo").join("config.toml")) {
-            return target;
+        for name in ["config.toml", "config"] {
+            if let Some(target) = config_target_dir(&dir.join(".cargo").join(name)) {
+                return target;
+            }
         }
     }
     let cargo_home = std::env::var_os("CARGO_HOME")
@@ -178,19 +190,83 @@ pub fn effective_target_dir(wt_dir: &Path) -> PathBuf {
     wt_dir.join("target")
 }
 
-/// Move every entry of `src` into `dst` (same filesystem — both live
-/// under the repo), skipping names already present in `dst`, then
-/// remove `src`. Folds a lane's existing real `deps/` into the shared
-/// cache before symlinking.
+/// Copy `src` — file, dir or symlink — to `dst`, recursively.
+fn copy_into(src: &Path, dst: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.file_type().is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)?;
+    } else if meta.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_into(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Remove `path` whatever its kind — file, dir or symlink.
+fn remove_any(path: &Path) -> Result<()> {
+    if path.symlink_metadata()?.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Copy every entry of `src` into `dst`, skipping names already
+/// present — the reverse of `merge_dir_into`. Used when a shared link
+/// is retired: the lane gets back whatever the cache holds without
+/// emptying it (another lane may still link there).
+fn copy_missing(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dest = dst.join(entry.file_name());
+        if !dest.exists() && !dest.is_symlink() {
+            copy_into(&entry.path(), &dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// Move every entry of `src` into `dst`, skipping names the cache
+/// already has. A `.cadence` dir on another filesystem (EXDEV) falls
+/// back to copy+remove. When `src` is empty it is removed; when a
+/// collision left entries behind, `src` is renamed aside to
+/// `<name>.local` — the lane's copy of a colliding artifact is never
+/// silently deleted.
 fn merge_dir_into(src: &Path, dst: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let dest = dst.join(entry.file_name());
-        if !dest.exists() {
-            std::fs::rename(entry.path(), &dest)?;
+        if dest.exists() || dest.is_symlink() {
+            continue;
+        }
+        match std::fs::rename(entry.path(), &dest) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+                copy_into(&entry.path(), &dest)?;
+                remove_any(&entry.path())?;
+            }
+            Err(e) => return Err(e.into()),
         }
     }
-    std::fs::remove_dir_all(src)?;
+    if src.read_dir()?.next().is_none() {
+        std::fs::remove_dir_all(src)?;
+    } else {
+        let kept = src.with_file_name(format!(
+            "{}.local",
+            src.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::rename(src, &kept)?;
+    }
     Ok(())
 }
 
@@ -254,6 +330,12 @@ pub fn configure_cargo_target(wt_dir: &Path, root: &Path, shared: bool) -> Resul
             if is_link_to(&link, &shared_debug.join(name)) {
                 std::fs::remove_file(&link)?;
                 std::fs::create_dir_all(&link)?;
+                // A retired dir's shared content comes back to the
+                // lane — the shared copy stays for any other lane
+                // still linking it.
+                if RETIRED_DEBUG_DIRS.contains(name) {
+                    copy_missing(&shared_debug.join(name), &link)?;
+                }
             }
         }
         for name in SHARED_DEBUG_FILES {
@@ -278,13 +360,36 @@ pub fn configure_cargo_target(wt_dir: &Path, root: &Path, shared: bool) -> Resul
     if effective != wt_dir.join("target") {
         return Ok(Some(effective));
     }
+    // Probe the lane's real lock files BEFORE anything moves: merging
+    // `deps/` etc. — or even retiring an old link — while a build
+    // holds the lock pulls files out from under rustc, and a refusal
+    // afterwards cannot put them back. All-or-nothing for data, not
+    // just for links.
+    for name in SHARED_DEBUG_FILES {
+        let link = wt_debug.join(name);
+        // Links (ours or foreign) are not real lock files — a live
+        // build always holds a real one.
+        if link.is_symlink() || !link.exists() {
+            continue;
+        }
+        if lock_held(&link)? {
+            return Err(Error::rejected(format!(
+                "{} is locked by a running cargo build — \
+                 retry `issue start` when the lane is idle",
+                link.display()
+            )));
+        }
+    }
     // An `examples` link planted under the r2 design shares unhashed
     // example binaries — retire it on sight, before it misleads a
-    // build.
+    // build. The lane gets a real dir seeded with whatever the shared
+    // copy already holds (copied, not moved — other r2-era lanes may
+    // still link it).
     let retired = wt_debug.join(RETIRED_DEBUG_DIRS[0]);
     if is_link_to(&retired, &shared_debug.join(RETIRED_DEBUG_DIRS[0])) {
         std::fs::remove_file(&retired)?;
         std::fs::create_dir_all(&retired)?;
+        copy_missing(&shared_debug.join(RETIRED_DEBUG_DIRS[0]), &retired)?;
     }
     let mut created: Vec<PathBuf> = Vec::new();
     let planted = (|| -> Result<()> {
@@ -296,13 +401,20 @@ pub fn configure_cargo_target(wt_dir: &Path, root: &Path, shared: bool) -> Resul
             if is_link_to(&link, &shared_sub) {
                 continue;
             }
-            if link.is_dir() && !link.is_symlink() {
+            if link.is_symlink() {
+                // A symlink to somewhere else is the operator's —
+                // leaving it while linking the rest would half-share
+                // the lane, so refuse loudly instead.
+                return Err(Error::rejected(format!(
+                    "{} is a symlink outside the shared cache — remove it \
+                     or set build.target_dir = \"per-worktree\" in project.yaml",
+                    link.display()
+                )));
+            }
+            if link.is_dir() {
                 // A real dir from a pre-shared build — fold its
                 // artifacts into the cache, then link.
                 merge_dir_into(&link, &shared_sub)?;
-            } else if link.exists() || link.is_symlink() {
-                // A symlink to somewhere else is the operator's.
-                continue;
             }
             std::os::unix::fs::symlink(&shared_sub, &link)?;
             created.push(link);
@@ -311,15 +423,20 @@ pub fn configure_cargo_target(wt_dir: &Path, root: &Path, shared: bool) -> Resul
             let link = wt_debug.join(name);
             let shared_file = shared_debug.join(name);
             std::fs::create_dir_all(&wt_debug)?;
-            if is_link_to(&link, &shared_file) || link.is_symlink() {
+            if is_link_to(&link, &shared_file) {
                 continue;
             }
+            if link.is_symlink() {
+                return Err(Error::rejected(format!(
+                    "{} is a symlink outside the shared cache — remove it \
+                     or set build.target_dir = \"per-worktree\" in project.yaml",
+                    link.display()
+                )));
+            }
             if link.exists() {
-                // A real lock file held by a running build: linking
-                // the rest while this stays private leaves the lane
-                // half-shared with no common lock — refuse the whole
-                // plant instead. An unprobeable file is refused too:
-                // it cannot be proven free.
+                // Re-probe: the pre-merge check ran first, but a build
+                // could have started during it — a held lock still
+                // refuses the whole plant.
                 if lock_held(&link)? {
                     return Err(Error::rejected(format!(
                         "{} is locked by a running cargo build — \
@@ -522,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn configure_leaves_foreign_symlinks() {
+    fn configure_refuses_foreign_symlinks() {
         let repo = git_repo();
         let wt = repo.path();
         let foreign = wt.join("elsewhere");
@@ -530,7 +647,16 @@ mod tests {
         let debug = wt.join("target/debug");
         std::fs::create_dir_all(&debug).unwrap();
         std::os::unix::fs::symlink(&foreign, debug.join("deps")).unwrap();
-        configure_cargo_target(wt, repo.path(), true).unwrap();
+        // A foreign `deps` link would leave the lane half-shared —
+        // refused loudly, and the link itself is untouched.
+        let e = configure_cargo_target(wt, repo.path(), true).unwrap_err();
+        assert!(e.to_string().contains("outside the shared cache"), "{e}");
+        assert_eq!(std::fs::read_link(debug.join("deps")).unwrap(), foreign);
+        // `per-worktree` opts out cleanly around it.
+        assert_eq!(
+            configure_cargo_target(wt, repo.path(), false).unwrap(),
+            Some(wt.join("target"))
+        );
         assert_eq!(std::fs::read_link(debug.join("deps")).unwrap(), foreign);
     }
 
@@ -554,9 +680,15 @@ mod tests {
     fn configure_refuses_half_shared_when_lock_held() {
         let repo = git_repo();
         let wt = repo.path();
-        // A pre-shared lane with a real lock file held by a "build".
+        // A pre-shared lane: real hashed dirs full of artifacts AND a
+        // lock file held by a "build". The refusal must come before
+        // any merge — every artifact stays in the lane.
         let debug = wt.join("target/debug");
-        std::fs::create_dir_all(&debug).unwrap();
+        for name in SHARED_DEBUG_DIRS {
+            let dir = debug.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("lane-artifact.rlib"), name).unwrap();
+        }
         let lock = debug.join(".cargo-lock");
         std::fs::write(&lock, "").unwrap();
         let f = std::fs::File::open(&lock).unwrap();
@@ -568,33 +700,88 @@ mod tests {
                 .contains("retry `issue start` when the lane is idle"),
             "{e}"
         );
-        // Nothing linked — the lane is never left half-shared.
+        // Nothing linked, nothing moved — the running build's files
+        // are exactly where cargo left them.
         for name in SHARED_DEBUG_DIRS.iter().chain(&SHARED_DEBUG_FILES) {
             assert!(!debug.join(name).is_symlink(), "{name}");
         }
+        for name in SHARED_DEBUG_DIRS {
+            assert_eq!(
+                std::fs::read_to_string(debug.join(name).join("lane-artifact.rlib")).unwrap(),
+                name,
+                "{name} artifacts moved under a held lock"
+            );
+        }
+        assert!(!shared_target_dir(repo.path())
+            .join("debug/deps/lane-artifact.rlib")
+            .exists());
         drop(f);
-        // And it plants cleanly once the build is done.
+        // And it plants cleanly once the build is done — artifacts
+        // merge into the cache, dirs become links.
         assert_eq!(
             configure_cargo_target(wt, repo.path(), true).unwrap(),
             Some(wt.join("target"))
         );
         assert!(debug.join("deps").is_symlink());
+        assert!(shared_target_dir(repo.path())
+            .join("debug/deps/lane-artifact.rlib")
+            .is_file());
     }
 
     #[test]
     fn configure_retires_shared_examples_link() {
         let repo = git_repo();
         let wt = repo.path();
-        // An r2-era farm: examples linked into the shared cache.
+        // An r2-era farm: examples linked into the shared cache, with
+        // an artifact already in it.
         let debug = wt.join("target/debug");
         let shared_ex = shared_target_dir(repo.path()).join("debug/examples");
         std::fs::create_dir_all(&debug).unwrap();
         std::fs::create_dir_all(&shared_ex).unwrap();
+        std::fs::write(shared_ex.join("myexample"), "built").unwrap();
         std::os::unix::fs::symlink(&shared_ex, debug.join("examples")).unwrap();
         configure_cargo_target(wt, repo.path(), true).unwrap();
-        // The examples link is gone — a real per-lane dir instead.
+        // The examples link is gone — a real per-lane dir instead —
+        // and its shared content was copied back, not lost.
         assert!(debug.join("examples").is_dir() && !debug.join("examples").is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(debug.join("examples/myexample")).unwrap(),
+            "built"
+        );
+        // The shared copy stays — another r2-era lane may still link it.
+        assert!(shared_ex.join("myexample").is_file());
         assert!(debug.join("deps").is_symlink());
+    }
+
+    #[test]
+    fn configure_merge_keeps_colliding_artifacts() {
+        let repo = git_repo();
+        let wt = repo.path();
+        // The lane and the cache both carry `dup.rlib` — the merge
+        // must not silently delete the lane's copy.
+        let debug = wt.join("target/debug");
+        let deps = debug.join("deps");
+        let shared_deps = shared_target_dir(repo.path()).join("debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::create_dir_all(&shared_deps).unwrap();
+        std::fs::write(deps.join("dup.rlib"), "lane's copy").unwrap();
+        std::fs::write(deps.join("own.rlib"), "lane only").unwrap();
+        std::fs::write(shared_deps.join("dup.rlib"), "shared copy").unwrap();
+        configure_cargo_target(wt, repo.path(), true).unwrap();
+        assert!(deps.is_symlink());
+        // `own.rlib` merged; the collision moved aside, not deleted.
+        assert_eq!(
+            std::fs::read_to_string(shared_deps.join("own.rlib")).unwrap(),
+            "lane only"
+        );
+        assert_eq!(
+            std::fs::read_to_string(shared_deps.join("dup.rlib")).unwrap(),
+            "shared copy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(debug.join("deps.local/dup.rlib")).unwrap(),
+            "lane's copy"
+        );
     }
 
     #[test]

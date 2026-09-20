@@ -1811,35 +1811,66 @@ fn check_worktrees(scan: &Scan) -> Check {
 
 // ---------- reclaim plan ----------
 
-/// What `--reclaim-plan` lists: a per-lane `target/` that pre-dates
-/// the shared cache, the shared cache itself (rebuilt lazily, freed
-/// only when no build holds one of cargo's lock files), and stale worktrees.
-/// A stale lane's own `target/` is already covered by its
-/// `worktree-target` row, so the stale row nets it out — the total
-/// never counts those bytes twice. Lane `target/` rows are
-/// informational: they free only when the lane itself goes away, so
-/// `reclaimable_bytes` excludes them and reports them separately as
+/// What `--reclaim-plan` lists: live lanes' `target/` dirs
+/// (informational — they free only when the lane does), the shared
+/// cache's reclaimable subdirs (cleared contents-only, and only when
+/// no build holds one of cargo's lock files), retired shared dirs an
+/// older cadence planted, and stale worktrees. The stale scan runs
+/// first: a stale lane's *whole* dir — `target/` included — is freed
+/// by that row's own `issue finish`/`worktree remove` command, so its
+/// bytes count toward `reclaimable_bytes` and it gets no separate
+/// informational row. Live-lane `target/` rows report separately as
 /// `freed_with_lanes_bytes` — the headline number is what the plan's
-/// own commands free today. Listing only: nothing here deletes or
-/// signals anything, and every emitted command is shell-quoted so a
-/// path with a space can never split into extra `rm -rf` arguments.
+/// own commands free today. A locked shared cache emits no freeing
+/// command, so its bytes stay out of the total too. Listing only:
+/// nothing here deletes or signals anything, and every emitted
+/// command is shell-quoted so a path with a space can never split
+/// into extra `rm -rf` arguments.
 pub fn reclaim_plan(scan: &Scan) -> Value {
+    use crate::worktree::{RETIRED_DEBUG_DIRS, SHARED_DEBUG_DIRS, SHARED_DEBUG_FILES};
     let mut rows: Vec<Value> = Vec::new();
     let Some(root) = repo_root(&scan.cwd) else {
-        return json!({"rows": rows, "reclaimable_bytes": 0,
+        return json!({"rows": rows, "reclaimable_bytes": 0, "freed_with_lanes_bytes": 0,
                       "skipped": format!("{} is not inside a git repo", scan.cwd.display())});
     };
     let wt_root = root.join(".cadence/wt");
-    let mut lane_targets: BTreeMap<PathBuf, (u64, bool)> = BTreeMap::new();
+    // Stale scan first — a stale lane's whole dir is freed by its own
+    // row's command, so it must not also emit an informational
+    // worktree-target row.
+    let mut stale_rows: Vec<Value> = Vec::new();
+    let mut stale_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    if wt_root.is_dir() {
+        let (stale, _remedies, _scanned) = stale_worktrees(scan, &root, &wt_root);
+        for s in stale {
+            let path = PathBuf::from(s["path"].as_str().unwrap_or_default());
+            stale_paths.insert(path.clone());
+            stale_rows.push(json!({
+                "kind": "stale-worktree",
+                "path": s["path"],
+                "bytes": s["bytes"],
+                "bytes_truncated": s["bytes_truncated"],
+                "filesystem": fs_label(&path),
+                "action": match s["issue"].as_str() {
+                    Some(id) => format!("cadence issue finish {id}"),
+                    None => format!(
+                        "git -C {} worktree remove {}",
+                        shell_quote(&root.display().to_string()),
+                        shell_quote(s["path"].as_str().unwrap_or("?"))
+                    ),
+                },
+                "why": s["why"],
+            }));
+        }
+    }
+    // Live lanes' target/ rows — informational, freed with the lane.
     if let Ok(entries) = std::fs::read_dir(&wt_root) {
         for ent in entries.flatten() {
-            if !ent.metadata().is_ok_and(|m| m.is_dir()) {
+            if !ent.metadata().is_ok_and(|m| m.is_dir()) || stale_paths.contains(&ent.path()) {
                 continue;
             }
             let target = ent.path().join("target");
             if target.is_dir() {
                 let (bytes, truncated) = dir_size(&target);
-                lane_targets.insert(ent.path(), (bytes, truncated));
                 let name = ent.file_name().to_string_lossy().to_string();
                 rows.push(json!({
                     "kind": "worktree-target",
@@ -1863,11 +1894,20 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
     }
     let shared = crate::worktree::shared_target_dir(&root);
     if shared.is_dir() {
-        let (bytes, truncated) = dir_size(&shared);
-        // Any of cargo's three lock files held means a build is live.
-        let locked = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"]
+        let d = shared.join("debug");
+        // `bytes` counts exactly what the emitted command frees: the
+        // contents of the shared subdirs — nothing else in the tree.
+        let mut bytes = 0_u64;
+        let mut truncated = false;
+        for name in SHARED_DEBUG_DIRS {
+            let (b, t) = dir_size(&d.join(name));
+            bytes += b;
+            truncated |= t;
+        }
+        // Any of cargo's lock files held means a build is live.
+        let locked = SHARED_DEBUG_FILES
             .iter()
-            .any(|name| file_locked(&shared.join("debug").join(name)));
+            .any(|name| file_locked(&d.join(name)));
         rows.push(json!({
             "kind": "shared-cargo-cache",
             "path": shared,
@@ -1876,62 +1916,62 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
             "filesystem": fs_label(&shared),
             "cargo_locked": locked,
             "action": if locked {
-                "a cargo build holds the shared lock — rerun the plan when lanes are idle".to_string()
+                // A snapshot flag — the lock may already be free by
+                // the time anyone reads this; the emitted command is
+                // withheld rather than risking a live build.
+                "a cargo build held the shared lock at scan time — \
+                 rerun the plan when lanes are idle".to_string()
             } else {
                 // Clear the *contents* of the hashed subdirs, never
                 // the dirs themselves: every lane symlinks to those
                 // dirs, and deleting them would leave the links
                 // dangling — cargo dies with EEXIST on the next
-                // build. `rm -rf 'dir'/*` is safe on an empty dir
-                // (the -f suppresses the unmatched glob). The r2-era
-                // shared `examples/` is left alone — no lane links it
-                // any more and its bytes count in the row total.
-                let d = shared.join("debug");
+                // build. `*` plus `.[!.]*` covers dotfiles too; on an
+                // empty dir both go unmatched and `-f` swallows the
+                // literal argument.
+                let globs = SHARED_DEBUG_DIRS
+                    .iter()
+                    .map(|name| {
+                        let q = shell_quote(&d.join(name).display().to_string());
+                        format!("{q}/* {q}/.[!.]*")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 format!(
-                    "rm -rf {}/* {}/* {}/* {}/*  # clears cached dep artifacts — \
-                     the dirs stay, so lanes keep building and rebuild lazily",
-                    shell_quote(&d.join("deps").display().to_string()),
-                    shell_quote(&d.join(".fingerprint").display().to_string()),
-                    shell_quote(&d.join("build").display().to_string()),
-                    shell_quote(&d.join("incremental").display().to_string()),
+                    "rm -rf {globs}  # clears cached dep artifacts — \
+                     the dirs stay, so lanes keep building and rebuild lazily"
                 )
             },
         }));
-    }
-    if wt_root.is_dir() {
-        let (stale, _remedies, _scanned) = stale_worktrees(scan, &root, &wt_root);
-        for s in stale {
-            // The lane's target/ is already a row above — count the
-            // rest of the worktree here, not those bytes again.
-            let path = PathBuf::from(s["path"].as_str().unwrap_or_default());
-            let (tgt_bytes, tgt_trunc) = lane_targets.get(&path).copied().unwrap_or((0, false));
-            let bytes = s["bytes"].as_u64().unwrap_or(0).saturating_sub(tgt_bytes);
-            let truncated = s["bytes_truncated"].as_bool().unwrap_or(false) || tgt_trunc;
-            rows.push(json!({
-                "kind": "stale-worktree",
-                "path": s["path"],
-                "bytes": bytes,
-                "target_bytes": tgt_bytes,
-                "bytes_truncated": truncated,
-                "filesystem": fs_label(&path),
-                "action": match s["issue"].as_str() {
-                    Some(id) => format!("cadence issue finish {id}"),
-                    None => format!(
-                        "git -C {} worktree remove {}",
-                        shell_quote(&root.display().to_string()),
-                        shell_quote(s["path"].as_str().unwrap_or("?"))
+        // Dirs an older cadence shared but none does now — the
+        // contents clear the same way; the dir itself stays for any
+        // lane whose r2-era link still points at it.
+        for name in RETIRED_DEBUG_DIRS {
+            let dir = d.join(name);
+            if dir.is_dir() && !dir.is_symlink() {
+                let (b, t) = dir_size(&dir);
+                let q = shell_quote(&dir.display().to_string());
+                rows.push(json!({
+                    "kind": "retired-shared-dir",
+                    "path": dir,
+                    "bytes": b,
+                    "bytes_truncated": t,
+                    "filesystem": fs_label(&dir),
+                    "action": format!(
+                        "rm -rf {q}/* {q}/.[!.]*  # retired shared dir no current lane links"
                     ),
-                },
-                "why": s["why"],
-            }));
+                }));
+            }
         }
     }
-    // Live-lane `target/` rows are informational — they free only
-    // when the lane is finished, so they are not part of what this
-    // plan could reclaim on its own.
+    rows.extend(stale_rows);
+    // `reclaimable_bytes` = what the emitted commands free today:
+    // every row except live-lane targets (freed with their lane) and
+    // a lock-blocked shared cache (no command emitted).
     let reclaimable: u64 = rows
         .iter()
         .filter(|r| r["kind"] != "worktree-target")
+        .filter(|r| !(r["kind"] == "shared-cargo-cache" && r["cargo_locked"] == json!(true)))
         .map(|r| r["bytes"].as_u64().unwrap_or(0))
         .sum();
     let with_lanes: u64 = rows
@@ -3031,7 +3071,24 @@ mod tests {
                 "cadence/cad-1-live",
             ],
         );
-        let lane_target = repo.join(".cadence/wt/cad-1-live/target");
+        let live = repo.join(".cadence/wt/cad-1-live");
+        // A commit past base keeps the lane genuinely live — a branch
+        // at base with a clean tree reads as stale.
+        std::fs::write(live.join("wip.txt"), "x").unwrap();
+        git(&live, &["add", "-A"]);
+        git(
+            &live,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "wip",
+            ],
+        );
+        let lane_target = live.join("target");
         real_bytes(&lane_target.join("dep.rlib"), 1024 * 1024);
         git(
             &repo,
@@ -3064,7 +3121,10 @@ mod tests {
         git(&repo, &["merge", "-q", "feat-gone"]);
         real_bytes(&gone.join("target/dep.rlib"), 512 * 1024);
         let shared = repo.join(".cadence/target/shared");
-        real_bytes(&shared.join("dep.rlib"), 2 * 1024 * 1024);
+        // Reclaimable bytes live in the shared subdirs — and a
+        // retired r2-era `examples/` gets its own row.
+        real_bytes(&shared.join("debug/deps/dep.rlib"), 2 * 1024 * 1024);
+        real_bytes(&shared.join("debug/examples/ex.bin"), 128 * 1024);
 
         let plan = reclaim_plan(&scan);
         let rows = plan["rows"].as_array().unwrap();
@@ -3072,7 +3132,8 @@ mod tests {
         assert!(
             kinds.contains(&"worktree-target")
                 && kinds.contains(&"shared-cargo-cache")
-                && kinds.contains(&"stale-worktree"),
+                && kinds.contains(&"stale-worktree")
+                && kinds.contains(&"retired-shared-dir"),
             "{kinds:?}"
         );
         // Live-lane target rows are informational — excluded from the
@@ -3091,16 +3152,11 @@ mod tests {
                 .map(|r| r["bytes"].as_u64().unwrap())
                 .sum::<u64>()
         );
-        // Every stale lane's target bytes live on its worktree-target
-        // row; the stale row carries the rest only — the two sum to
-        // the whole dir, never double-counting the target.
+        // A stale lane's whole dir — target/ included — is freed by
+        // its own row's command, so its bytes are the full dir.
         for stale in rows.iter().filter(|r| r["kind"] == "stale-worktree") {
             let (whole, _) = dir_size(Path::new(stale["path"].as_str().unwrap()));
-            assert_eq!(
-                stale["bytes"].as_u64().unwrap() + stale["target_bytes"].as_u64().unwrap(),
-                whole,
-                "{stale}"
-            );
+            assert_eq!(stale["bytes"].as_u64().unwrap(), whole, "{stale}");
         }
         let gone_row = rows
             .iter()
@@ -3108,7 +3164,13 @@ mod tests {
                 r["kind"] == "stale-worktree" && r["path"].as_str().unwrap().ends_with("feat-gone")
             })
             .unwrap();
-        assert_eq!(gone_row["target_bytes"].as_u64().unwrap(), 512 * 1024);
+        assert!(gone_row["bytes"].as_u64().unwrap() >= 512 * 1024);
+        // A stale lane never also emits an informational target row.
+        assert!(!rows.iter().any(|r| r["kind"] == "worktree-target"
+            && r["path"]
+                .as_str()
+                .unwrap()
+                .starts_with(gone.to_str().unwrap())));
         // A live lane's target row describes how it frees — it never
         // reads as "finish your in-progress work".
         let live = rows
@@ -3235,10 +3297,13 @@ mod tests {
             d.join("deps/marker").display().to_string()
         );
 
-        // A held .cargo-lock swaps the rm -rf for an idle note.
+        // A held .cargo-lock swaps the rm -rf for an idle note — and
+        // with no freeing command emitted, the row's bytes leave the
+        // reclaimable total too.
         let lock = shared.join("debug/.cargo-lock");
         std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         std::fs::write(&lock, "").unwrap();
+        std::fs::write(d.join("deps/cached2.o"), vec![7u8; 8192]).unwrap();
         let f = std::fs::File::open(&lock).unwrap();
         use std::os::unix::io::AsRawFd;
         assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) }, 0);
@@ -3255,6 +3320,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("cargo build"));
+        assert!(shared_row["bytes"].as_u64().unwrap() >= 8192);
+        let stale_bytes: u64 = plan["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "stale-worktree")
+            .map(|r| r["bytes"].as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            plan["reclaimable_bytes"].as_u64().unwrap(),
+            stale_bytes,
+            "locked shared row must not count toward the total"
+        );
         drop(f); // probe must see the lock released
         assert!(!file_locked(&lock));
     }
