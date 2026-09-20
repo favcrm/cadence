@@ -50,6 +50,11 @@ enum Commands {
         /// (plain doctor already prints JSON, so this is a no-op there).
         #[arg(long)]
         json: bool,
+        /// With --host, list what could be freed — stale worktrees,
+        /// per-lane target dirs, the shared cargo cache — with sizes
+        /// and the command. Never deletes anything.
+        #[arg(long, requires = "host")]
+        reclaim_plan: bool,
     },
     /// Manage the persistent controller.
     Daemon {
@@ -2605,9 +2610,13 @@ fn run() -> Result<i32> {
         None => client::state_dir()?,
     };
     match cli.command {
-        Commands::Doctor { host, json } => {
+        Commands::Doctor {
+            host,
+            json,
+            reclaim_plan,
+        } => {
             if host {
-                return cadence_agent::doctor::host::cli(&state_dir, json);
+                return cadence_agent::doctor::host::cli(&state_dir, json, reclaim_plan);
             }
             let report = cadence_agent::doctor::run(&state_dir)?;
             print_json(&report);

@@ -42,6 +42,12 @@ pub struct Ref {
     /// its own pair instead of every worktree the issue ever opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// `worktree` refs only: the effective cargo target dir for the
+    /// checkout — the shared cache or the worktree-local `target/`
+    /// when the project opted out — so `issue finish` and
+    /// `doctor --host` account for the right bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_target: Option<String>,
 }
 
 /// `issue.md` YAML frontmatter. No `project` field (the folder says

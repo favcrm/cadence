@@ -279,6 +279,49 @@ the `Issue: <ID>` trailer — as JSON.
 - The worktree is minted through the same helper as
   `cadence devin --worktree` (shared `src/worktree.rs`), including the
   `.gitignore` `.cadence/` rule — added only when missing.
+- The worktree's cargo builds share one dependency cache — only for
+  checkouts that are cargo packages: `issue start` links the
+  hashed-content subdirs of the lane's `target/debug/` — `deps`,
+  `.fingerprint`, `build`, `incremental` plus cargo's three lock
+  files (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`)
+  — into `<repo>/.cadence/target/shared/debug`, so dependency
+  artifacts compile once per host. `examples` is deliberately not
+  linked: cargo uplifts example binaries to unhashed
+  `debug/examples/<name>` paths, so sharing would hand one lane
+  another lane's example — the same hole as sharing `debug/` whole.
+  The lane's `debug/` itself stays a real dir, so uplifted binaries
+  like `debug/cadence` are per-lane files — one lane's `cargo test`
+  can never exec another lane's binary. Because the lock files are
+  shared, concurrent lanes serialise *whole builds* on cargo's own
+  locking: the second lane prints `Blocking waiting for file lock on
+  build directory` until the first finishes — dedup in exchange for
+  queueing, never parallel compiles into one dir. Sharing covers the
+  debug host target only: `--release` and `--target <triple>` outputs
+  stay per-lane, and a `RUSTFLAGS` change or `cargo clippy` run
+  rewrites shared fingerprints — lanes with differing flags will
+  thrash each other's cache entries (correct, but rebuild-y). A
+  `build: {target_dir: per-worktree}` section in `project.yaml`
+  keeps the lane fully private (a previously linked farm is
+  unlinked). A checkout with no `Cargo.toml` gets no farm at all —
+  no `target/` is created and a `target/debug/build` it already owns
+  is never moved. A `build.target-dir` anywhere in cargo's config
+  chain — the worktree's own `.cargo/config.toml`, an ancestor's, or
+  `$CARGO_HOME/config.toml` — overrides the whole mechanism: the
+  farm is not planted and the recorded `cargo_target` is the
+  operator's dir; nothing under `.cargo/` is ever written by
+  cadence, so a tracked config survives byte-for-byte. A
+  `CARGO_TARGET_DIR` env overrides the same way it always has. The
+  effective dir is recorded as `cargo_target` on the `worktree` ref
+  and printed as `target_dir`; a stale recorded value is corrected
+  on re-start with its own commit. If a pre-existing cargo lock file
+  is held by a running build, `issue start` refuses rather than
+  leaving the lane half-shared — the lock check runs before any of
+  the lane's artifacts move, so a live build loses nothing; retry
+  when the lane is idle. Pre-existing artifacts merge into the
+  shared dirs; a name already present stays the lane's copy under a
+  `<name>.local` sibling, and a path that is a symlink to somewhere
+  else — an operator's own link — is refused, not silently
+  half-shared.
 - One tracker commit records a `branch` ref (label = repo basename)
   and a `worktree` ref (absolute path), the status/owner updates and
   the CAD-42 `Issue:`/`Actor:` trailers under subject
@@ -356,8 +399,15 @@ worktree+branch pair. It refuses, naming what it found, while:
 Then it runs `git worktree remove`, deletes the local branch (with
 `--remote` the remote one too), and lands one tracker commit
 `<ID>: finish <branch>` that marks both refs `closed: true` — kept as
-history, so a later `issue log` still shows where the work lived. The
-issue's status is not touched: status follows the job or the PM.
+history, so a later `issue log` still shows where the work lived.
+`git worktree remove` takes the worktree dir and nothing else — the
+removal unlinks the lane's cache symlinks without following them, so
+the shared dep cache is never deleted here. When a `cargo_target`
+was recorded, the output reports it with `cargo_target_exists`, a
+literal check on the path after the removal (a target inside the
+worktree reports `false`; the field is omitted when nothing was
+recorded). The issue's status is not touched: status follows the job
+or the PM.
 `--force` overrides each refusal and is recorded — the `overrode`
 list in the output and a `Forced: true` trailer on the commit.
 `--keep-branch` removes only the worktree.

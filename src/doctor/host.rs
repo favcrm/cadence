@@ -313,9 +313,28 @@ pub fn render(report: &Value) -> String {
 }
 
 /// `doctor --host` end to end: scan this host, print the report, exit
-/// with the worst level. The single call `main.rs` makes.
-pub fn cli(state_dir: &Path, json_out: bool) -> Result<i32> {
-    let report = run(&Scan::host(state_dir));
+/// with the worst level. `--reclaim-plan` runs the same checks and
+/// appends what could be freed — a listing, never a deletion — so the
+/// command stays safe to swap into a watchdog loop without losing
+/// alerting; the exit code is still the worst check level.
+pub fn cli(state_dir: &Path, json_out: bool, reclaim: bool) -> Result<i32> {
+    let scan = Scan::host(state_dir);
+    let report = run(&scan);
+    if reclaim {
+        let plan = reclaim_plan(&scan);
+        if json_out {
+            let mut merged = report.clone();
+            merged["reclaim"] = plan;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&merged).unwrap_or_default()
+            );
+        } else {
+            print!("{}", render(&report));
+            print!("{}", render_reclaim(&plan));
+        }
+        return Ok(exit_code(&report));
+    }
     if json_out {
         println!(
             "{}",
@@ -349,13 +368,21 @@ fn human(bytes: u64) -> String {
 /// with a huge `target/` must not stall the report.
 const DIR_WALK_BUDGET: usize = 200_000;
 
-/// Total bytes under `path`; follows directories, never symlinks, and
-/// skips anything that vanishes or denies mid-walk — a watchdog walk
-/// races with the processes it watches. Returns `(bytes, truncated)`;
-/// a truncated walk is a lower bound, not the real size.
+/// Allocated bytes under `path` (`st_blocks`, so sparse files report
+/// what they really occupy and `du -sh` reconciles). Descends into
+/// real directories only — `ent.metadata()` never follows symlinks,
+/// so a lane's shared-cache links are not walked again here. Counts
+/// each inode once per call (cargo's hardlinked uplifts can't double
+/// up) and stays on the starting path's device, `du -x`-style, so a
+/// row's bytes are what `rm -rf` frees *on that filesystem*. Skips
+/// anything that vanishes or denies mid-walk — a watchdog walk races
+/// with the processes it watches. Returns `(bytes, truncated)`; a
+/// truncated walk is a lower bound, not the real size.
 fn dir_size(path: &Path) -> (u64, bool) {
-    let mut total = 0;
+    let mut total = 0u64;
     let mut visited = 0_usize;
+    let mut inodes = std::collections::HashSet::new();
+    let root_dev = std::fs::metadata(path).ok().map(|m| m.dev());
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -370,13 +397,56 @@ fn dir_size(path: &Path) -> (u64, bool) {
                 continue;
             };
             if meta.is_dir() {
-                stack.push(ent.path());
-            } else {
-                total += meta.len();
+                if root_dev.is_none_or(|d| meta.dev() == d) {
+                    stack.push(ent.path());
+                }
+            } else if inodes.insert((meta.dev(), meta.ino())) {
+                total += meta.blocks().saturating_mul(512);
             }
         }
     }
     (total, false)
+}
+
+/// POSIX single-quoting for a path emitted inside a shell command —
+/// `'a b'` and `'\''`-escaped, so `rm -rf <it>` can never split a
+/// path like `/home/ubuntu/My Project` into extra arguments. Paths
+/// made of only safe characters print bare for readability.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@%_+=:,./-".contains(c))
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The mount point a path lives on (longest-prefix match in
+/// `/proc/self/mounts`), so a reclaim row says which filesystem its
+/// bytes actually free. `None` off-Linux — the field is omitted.
+fn fs_label(path: &Path) -> Option<String> {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    let mut best: Option<String> = None;
+    for line in mounts.lines() {
+        let Some(mp) = line.split_whitespace().nth(1) else {
+            continue;
+        };
+        let mp = mp.replace("\\040", " ");
+        if canon.starts_with(&mp) && best.as_ref().is_none_or(|b| mp.len() > b.len()) {
+            best = Some(mp);
+        }
+    }
+    best
+}
+
+/// Is `path` under an exclusive flock right now? A non-blocking
+/// LOCK_EX attempt — success means free, and the `File` drop releases
+/// the probe lock immediately. Cargo's build-lock files answer "is a
+/// lane building" the way cargo itself does.
+fn file_locked(path: &Path) -> bool {
+    crate::worktree::file_locked(path)
 }
 
 /// Bounded read-only `git`; non-zero exits are data, not errors — a
@@ -535,7 +605,7 @@ fn eval_disk(fses: &[FsFree], t: &Thresholds) -> Check {
         .map(|f| {
             format!(
                 "du -xh --max-depth=1 {} | sort -h  # find the growth before writes fail",
-                f.path.display()
+                shell_quote(&f.path.display().to_string())
             )
         })
         .unwrap_or_default();
@@ -677,10 +747,13 @@ fn eval_provider_state(stores: &[StoreMeasure], t: &Thresholds) -> Check {
             if s.wal_bytes.is_some_and(|w| w > t.wal_warn_bytes) {
                 format!(
                     "sqlite3 {} 'PRAGMA wal_checkpoint(TRUNCATE);'",
-                    s.path.display()
+                    shell_quote(&s.path.display().to_string())
                 )
             } else {
-                format!("du -xh --max-depth=1 {} | sort -h", s.path.display())
+                format!(
+                    "du -xh --max-depth=1 {} | sort -h",
+                    shell_quote(&s.path.display().to_string())
+                )
             }
         })
         .collect::<Vec<_>>()
@@ -1470,13 +1543,17 @@ fn check_temp_dirs(scan: &Scan) -> Check {
         String::new()
     } else {
         format!(
-            "rm -rf {}{}  # leaked test/state dirs older than a day",
+            "rm -rf {}  # leaked test/state dirs older than a day{}",
             hits.iter()
                 .take(5)
-                .map(|(p, _)| p.display().to_string())
+                .map(|(p, _)| shell_quote(&p.display().to_string()))
                 .collect::<Vec<_>>()
                 .join(" "),
-            if hits.len() > 5 { " …" } else { "" }
+            if hits.len() > 5 {
+                format!(" ({} more not listed)", hits.len() - 5)
+            } else {
+                String::new()
+            }
         )
     };
     let value = json!({
@@ -1567,37 +1644,15 @@ fn tracker_closed(scan: &Scan, wt_path: &Path, id: Option<&str>) -> Option<bool>
     }))
 }
 
-fn check_worktrees(scan: &Scan) -> Check {
-    let name = "worktrees";
-    let threshold =
-        json!("warn: any worktree whose branch is merged or whose tracker ref is closed");
-    let Some(root) = repo_root(&scan.cwd) else {
-        return check(
-            name,
-            Level::Ok,
-            json!({"skipped": true}),
-            threshold,
-            format!("{} is not inside a git repo", scan.cwd.display()),
-            String::new(),
-        );
-    };
-    let wt_root = root.join(".cadence/wt");
-    if !wt_root.is_dir() {
-        return check(
-            name,
-            Level::Ok,
-            json!({"skipped": true}),
-            threshold,
-            format!("no .cadence/wt under {}", root.display()),
-            String::new(),
-        );
-    }
-    let branches = worktree_branches(&root);
-    let base = default_base(&root);
+/// The worktree staleness scan shared by the `worktrees` check and
+/// `--reclaim-plan`: `(<stale rows>, <remedy per row>, <dirs scanned>)`.
+fn stale_worktrees(scan: &Scan, root: &Path, wt_root: &Path) -> (Vec<Value>, Vec<String>, usize) {
+    let branches = worktree_branches(root);
+    let base = default_base(root);
     let mut stale: Vec<Value> = Vec::new();
     let mut remedies: Vec<String> = Vec::new();
     let mut scanned = 0_usize;
-    if let Ok(entries) = std::fs::read_dir(&wt_root) {
+    if let Ok(entries) = std::fs::read_dir(wt_root) {
         for ent in entries.flatten() {
             let Ok(meta) = ent.metadata() else {
                 continue;
@@ -1617,7 +1672,7 @@ fn check_worktrees(scan: &Scan) -> Check {
                 .as_deref()
                 .zip(base.as_deref())
                 .is_some_and(|(b, base)| {
-                    git_out(&root, &["merge-base", "--is-ancestor", b, base])
+                    git_out(root, &["merge-base", "--is-ancestor", b, base])
                         .is_some_and(|o| o.status.success())
                 });
             let id = issue_id_from_name(&wt_name);
@@ -1660,22 +1715,72 @@ fn check_worktrees(scan: &Scan) -> Check {
                 Some(id) => format!("cadence issue finish {id}"),
                 None => format!(
                     "git -C {} worktree remove {}",
-                    root.display(),
-                    path.display()
+                    shell_quote(&root.display().to_string()),
+                    shell_quote(&path.display().to_string())
                 ),
             });
         }
     }
+    (stale, remedies, scanned)
+}
+
+fn check_worktrees(scan: &Scan) -> Check {
+    let name = "worktrees";
+    let threshold =
+        json!("warn: any worktree whose branch is merged or whose tracker ref is closed");
+    let Some(root) = repo_root(&scan.cwd) else {
+        return check(
+            name,
+            Level::Ok,
+            json!({"skipped": true}),
+            threshold,
+            format!("{} is not inside a git repo", scan.cwd.display()),
+            String::new(),
+        );
+    };
+    let wt_root = root.join(".cadence/wt");
+    if !wt_root.is_dir() {
+        return check(
+            name,
+            Level::Ok,
+            json!({"skipped": true}),
+            threshold,
+            format!("no .cadence/wt under {}", root.display()),
+            String::new(),
+        );
+    }
+    let (stale, remedies, scanned) = stale_worktrees(scan, &root, &wt_root);
+    // The shared cargo cache counts once, at the repo level — it is
+    // not part of any worktree's own footprint.
+    let shared = crate::worktree::shared_target_dir(&root);
+    let shared_size = shared.is_dir().then(|| {
+        let (bytes, truncated) = dir_size(&shared);
+        json!({"path": shared, "bytes": bytes, "bytes_truncated": truncated})
+    });
     let level = if stale.is_empty() {
         Level::Ok
     } else {
         Level::Warn
     };
+    let shared_note = shared_size
+        .as_ref()
+        .map(|s| {
+            format!(
+                "; shared cargo cache {}{}",
+                if s["bytes_truncated"].as_bool().unwrap_or(false) {
+                    "at least "
+                } else {
+                    ""
+                },
+                human(s["bytes"].as_u64().unwrap_or(0))
+            )
+        })
+        .unwrap_or_default();
     let detail = if stale.is_empty() {
-        format!("{scanned} worktrees, none stale")
+        format!("{scanned} worktrees, none stale{shared_note}")
     } else {
         format!(
-            "{} of {} worktrees stale ({}{})",
+            "{} of {} worktrees stale ({}{}{})",
             stale.len(),
             scanned,
             if stale
@@ -1686,7 +1791,8 @@ fn check_worktrees(scan: &Scan) -> Check {
             } else {
                 ""
             },
-            human(stale.iter().map(|s| s["bytes"].as_u64().unwrap_or(0)).sum())
+            human(stale.iter().map(|s| s["bytes"].as_u64().unwrap_or(0)).sum()),
+            shared_note
         )
     };
     check(
@@ -1695,11 +1801,231 @@ fn check_worktrees(scan: &Scan) -> Check {
         json!({
             "scanned": scanned,
             "stale": stale,
+            "shared_cargo_target": shared_size,
         }),
         threshold,
         detail,
         remedies.into_iter().take(4).collect::<Vec<_>>().join("; "),
     )
+}
+
+// ---------- reclaim plan ----------
+
+/// What `--reclaim-plan` lists: live lanes' `target/` dirs
+/// (informational — they free only when the lane does), the shared
+/// cache's reclaimable subdirs (cleared contents-only, and only when
+/// no build holds one of cargo's lock files), retired shared dirs an
+/// older cadence planted, and stale worktrees. The stale scan runs
+/// first: a stale lane's *whole* dir — `target/` included — is freed
+/// by that row's own `issue finish`/`worktree remove` command, so its
+/// bytes count toward `reclaimable_bytes` and it gets no separate
+/// informational row. Live-lane `target/` rows report separately as
+/// `freed_with_lanes_bytes` — the headline number is what the plan's
+/// own commands free today. A locked shared cache emits no freeing
+/// command, so its bytes stay out of the total too. Listing only:
+/// nothing here deletes or signals anything, and every emitted
+/// command is shell-quoted so a path with a space can never split
+/// into extra `rm -rf` arguments.
+pub fn reclaim_plan(scan: &Scan) -> Value {
+    use crate::worktree::{RETIRED_DEBUG_DIRS, SHARED_DEBUG_DIRS, SHARED_DEBUG_FILES};
+    let mut rows: Vec<Value> = Vec::new();
+    let Some(root) = repo_root(&scan.cwd) else {
+        return json!({"rows": rows, "reclaimable_bytes": 0, "freed_with_lanes_bytes": 0,
+                      "skipped": format!("{} is not inside a git repo", scan.cwd.display())});
+    };
+    let wt_root = root.join(".cadence/wt");
+    // Stale scan first — a stale lane's whole dir is freed by its own
+    // row's command, so it must not also emit an informational
+    // worktree-target row.
+    let mut stale_rows: Vec<Value> = Vec::new();
+    let mut stale_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    if wt_root.is_dir() {
+        let (stale, _remedies, _scanned) = stale_worktrees(scan, &root, &wt_root);
+        for s in stale {
+            let path = PathBuf::from(s["path"].as_str().unwrap_or_default());
+            stale_paths.insert(path.clone());
+            stale_rows.push(json!({
+                "kind": "stale-worktree",
+                "path": s["path"],
+                "bytes": s["bytes"],
+                "bytes_truncated": s["bytes_truncated"],
+                "filesystem": fs_label(&path),
+                "action": match s["issue"].as_str() {
+                    Some(id) => format!("cadence issue finish {id}"),
+                    None => format!(
+                        "git -C {} worktree remove {}",
+                        shell_quote(&root.display().to_string()),
+                        shell_quote(s["path"].as_str().unwrap_or("?"))
+                    ),
+                },
+                "why": s["why"],
+            }));
+        }
+    }
+    // Live lanes' target/ rows — informational, freed with the lane.
+    if let Ok(entries) = std::fs::read_dir(&wt_root) {
+        for ent in entries.flatten() {
+            if !ent.metadata().is_ok_and(|m| m.is_dir()) || stale_paths.contains(&ent.path()) {
+                continue;
+            }
+            let target = ent.path().join("target");
+            if target.is_dir() {
+                let (bytes, truncated) = dir_size(&target);
+                let name = ent.file_name().to_string_lossy().to_string();
+                rows.push(json!({
+                    "kind": "worktree-target",
+                    "path": target,
+                    "bytes": bytes,
+                    "bytes_truncated": truncated,
+                    "filesystem": fs_label(&target),
+                    "action": match issue_id_from_name(&name) {
+                        // "Freed with the lane" — a live lane's target
+                        // is not a recommendation to finish its work.
+                        Some(id) => format!("freed with the lane — cadence issue finish {id} removes it"),
+                        None => format!(
+                            "freed with the lane — git -C {} worktree remove {}",
+                            shell_quote(&root.display().to_string()),
+                            shell_quote(&ent.path().display().to_string())
+                        ),
+                    },
+                }));
+            }
+        }
+    }
+    let shared = crate::worktree::shared_target_dir(&root);
+    if shared.is_dir() {
+        let d = shared.join("debug");
+        // `bytes` counts exactly what the emitted command frees: the
+        // contents of the shared subdirs — nothing else in the tree.
+        let mut bytes = 0_u64;
+        let mut truncated = false;
+        for name in SHARED_DEBUG_DIRS {
+            let (b, t) = dir_size(&d.join(name));
+            bytes += b;
+            truncated |= t;
+        }
+        // Any of cargo's lock files held means a build is live.
+        let locked = SHARED_DEBUG_FILES
+            .iter()
+            .any(|name| file_locked(&d.join(name)));
+        rows.push(json!({
+            "kind": "shared-cargo-cache",
+            "path": shared,
+            "bytes": bytes,
+            "bytes_truncated": truncated,
+            "filesystem": fs_label(&shared),
+            "cargo_locked": locked,
+            "action": if locked {
+                // A snapshot flag — the lock may already be free by
+                // the time anyone reads this; the emitted command is
+                // withheld rather than risking a live build.
+                "a cargo build held the shared lock at scan time — \
+                 rerun the plan when lanes are idle".to_string()
+            } else {
+                // Clear the *contents* of the hashed subdirs, never
+                // the dirs themselves: every lane symlinks to those
+                // dirs, and deleting them would leave the links
+                // dangling — cargo dies with EEXIST on the next
+                // build. `*` plus `.[!.]*` covers dotfiles too; on an
+                // empty dir both go unmatched and `-f` swallows the
+                // literal argument.
+                let globs = SHARED_DEBUG_DIRS
+                    .iter()
+                    .map(|name| {
+                        let q = shell_quote(&d.join(name).display().to_string());
+                        format!("{q}/* {q}/.[!.]*")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!(
+                    "rm -rf {globs}  # clears cached dep artifacts — \
+                     the dirs stay, so lanes keep building and rebuild lazily"
+                )
+            },
+        }));
+        // Dirs an older cadence shared but none does now — the
+        // contents clear the same way; the dir itself stays for any
+        // lane whose r2-era link still points at it.
+        for name in RETIRED_DEBUG_DIRS {
+            let dir = d.join(name);
+            if dir.is_dir() && !dir.is_symlink() {
+                let (b, t) = dir_size(&dir);
+                let q = shell_quote(&dir.display().to_string());
+                rows.push(json!({
+                    "kind": "retired-shared-dir",
+                    "path": dir,
+                    "bytes": b,
+                    "bytes_truncated": t,
+                    "filesystem": fs_label(&dir),
+                    "action": format!(
+                        "rm -rf {q}/* {q}/.[!.]*  # retired shared dir no current lane links"
+                    ),
+                }));
+            }
+        }
+    }
+    rows.extend(stale_rows);
+    // `reclaimable_bytes` = what the emitted commands free today:
+    // every row except live-lane targets (freed with their lane) and
+    // a lock-blocked shared cache (no command emitted).
+    let reclaimable: u64 = rows
+        .iter()
+        .filter(|r| r["kind"] != "worktree-target")
+        .filter(|r| !(r["kind"] == "shared-cargo-cache" && r["cargo_locked"] == json!(true)))
+        .map(|r| r["bytes"].as_u64().unwrap_or(0))
+        .sum();
+    let with_lanes: u64 = rows
+        .iter()
+        .filter(|r| r["kind"] == "worktree-target")
+        .map(|r| r["bytes"].as_u64().unwrap_or(0))
+        .sum();
+    json!({
+        "rows": rows,
+        "reclaimable_bytes": reclaimable,
+        "freed_with_lanes_bytes": with_lanes,
+    })
+}
+
+/// Text form of the plan: one line per reclaimable row, then the total.
+pub fn render_reclaim(plan: &Value) -> String {
+    let mut out = String::from("cadence doctor --host --reclaim-plan — nothing here is deleted\n");
+    if let Some(skipped) = plan["skipped"].as_str() {
+        out.push_str(&format!("skipped: {skipped}\n"));
+        return out;
+    }
+    if let Some(rows) = plan["rows"].as_array() {
+        for r in rows {
+            let size = if r["bytes_truncated"].as_bool().unwrap_or(false) {
+                format!("≥{}", human(r["bytes"].as_u64().unwrap_or(0)))
+            } else {
+                human(r["bytes"].as_u64().unwrap_or(0))
+            };
+            let fs = r["filesystem"]
+                .as_str()
+                .map(|f| format!(" on {f}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "{:<20} {:>10}  {}{}\n       {}\n",
+                r["kind"].as_str().unwrap_or("?"),
+                size,
+                r["path"].as_str().unwrap_or("?"),
+                fs,
+                r["action"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "total reclaimable: {}\n",
+        human(plan["reclaimable_bytes"].as_u64().unwrap_or(0))
+    ));
+    let with_lanes = plan["freed_with_lanes_bytes"].as_u64().unwrap_or(0);
+    if with_lanes > 0 {
+        out.push_str(&format!(
+            "target/ freed with their lanes: {} (not counted above)\n",
+            human(with_lanes)
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1827,6 +2153,10 @@ mod tests {
 
     fn init_repo(root: &Path) {
         git(root, &["init", "-q", "-b", "main", "."]);
+        // A real repo ignores build output — `target/` must not read
+        // as dirty.
+        std::fs::write(root.join(".gitignore"), "/target\n").unwrap();
+        git(root, &["add", "-A"]);
         git(
             root,
             &[
@@ -1837,7 +2167,6 @@ mod tests {
                 "commit",
                 "-qm",
                 "init",
-                "--allow-empty",
             ],
         );
     }
@@ -1857,6 +2186,13 @@ mod tests {
     fn sparse(path: &Path, bytes: u64) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::File::create(path).unwrap().set_len(bytes).unwrap();
+    }
+
+    /// `dir_size` measures allocated blocks (`du`-style) — a sparse
+    /// file reports ~0 — so tests that need real bytes write them.
+    fn real_bytes(path: &Path, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![7u8; bytes]).unwrap();
     }
 
     fn set_mtime_old(path: &Path, secs_ago: i64) {
@@ -2671,6 +3007,334 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["cad-1-x", "cad-2-y", "feat-a"]);
+    }
+
+    #[test]
+    fn worktrees_count_shared_target_once() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = scan.cwd.clone();
+        init_repo(&repo);
+        // Two live lanes, one shared cache — the cache's bytes land
+        // once in `shared_cargo_target`, never inside a lane's row.
+        for name in ["cad-1-a", "cad-2-b"] {
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    &format!(".cadence/wt/{name}"),
+                    "-b",
+                    &format!("cadence/{name}"),
+                ],
+            );
+        }
+        let shared = repo.join(".cadence/target/shared");
+        real_bytes(&shared.join("dep.rlib"), 4 * 1024 * 1024);
+        let c = check_worktrees(&scan);
+        let st = &c.value["shared_cargo_target"];
+        assert_eq!(
+            st["path"].as_str().unwrap(),
+            shared.to_string_lossy(),
+            "{st}"
+        );
+        assert_eq!(st["bytes"].as_u64().unwrap(), 4 * 1024 * 1024);
+        // Exactly one shared entry — a `stale` row per lane never
+        // carries the shared bytes with it.
+        assert!(c.value["stale"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["path"].as_str().unwrap() != shared.to_string_lossy()));
+        assert!(c.detail.contains("shared cargo cache"), "{}", c.detail);
+    }
+
+    #[test]
+    fn reclaim_plan_lists_without_deleting() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = scan.cwd.clone();
+        init_repo(&repo);
+        // A live lane with a per-lane target/, the shared cache, and
+        // a stale lane with its own target/ — all listed, none
+        // deleted, and the stale lane's bytes never count its
+        // target/ twice.
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                ".cadence/wt/cad-1-live",
+                "-b",
+                "cadence/cad-1-live",
+            ],
+        );
+        let live = repo.join(".cadence/wt/cad-1-live");
+        // A commit past base keeps the lane genuinely live — a branch
+        // at base with a clean tree reads as stale.
+        std::fs::write(live.join("wip.txt"), "x").unwrap();
+        git(&live, &["add", "-A"]);
+        git(
+            &live,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "wip",
+            ],
+        );
+        let lane_target = live.join("target");
+        real_bytes(&lane_target.join("dep.rlib"), 1024 * 1024);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                ".cadence/wt/feat-gone",
+                "-b",
+                "feat-gone",
+            ],
+        );
+        let gone = repo.join(".cadence/wt/feat-gone");
+        // Committed content keeps the tree clean past the merge; the
+        // ignored target/ adds reclaimable bytes without dirtying it.
+        real_bytes(&gone.join("notes.txt"), 64 * 1024);
+        git(&gone, &["add", "-A"]);
+        git(
+            &gone,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "notes",
+            ],
+        );
+        git(&repo, &["merge", "-q", "feat-gone"]);
+        real_bytes(&gone.join("target/dep.rlib"), 512 * 1024);
+        let shared = repo.join(".cadence/target/shared");
+        // Reclaimable bytes live in the shared subdirs — and a
+        // retired r2-era `examples/` gets its own row.
+        real_bytes(&shared.join("debug/deps/dep.rlib"), 2 * 1024 * 1024);
+        real_bytes(&shared.join("debug/examples/ex.bin"), 128 * 1024);
+
+        let plan = reclaim_plan(&scan);
+        let rows = plan["rows"].as_array().unwrap();
+        let kinds: Vec<&str> = rows.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+        assert!(
+            kinds.contains(&"worktree-target")
+                && kinds.contains(&"shared-cargo-cache")
+                && kinds.contains(&"stale-worktree")
+                && kinds.contains(&"retired-shared-dir"),
+            "{kinds:?}"
+        );
+        // Live-lane target rows are informational — excluded from the
+        // reclaimable total and surfaced on their own line instead.
+        assert_eq!(
+            plan["reclaimable_bytes"].as_u64().unwrap(),
+            rows.iter()
+                .filter(|r| r["kind"] != "worktree-target")
+                .map(|r| r["bytes"].as_u64().unwrap())
+                .sum::<u64>()
+        );
+        assert_eq!(
+            plan["freed_with_lanes_bytes"].as_u64().unwrap(),
+            rows.iter()
+                .filter(|r| r["kind"] == "worktree-target")
+                .map(|r| r["bytes"].as_u64().unwrap())
+                .sum::<u64>()
+        );
+        // A stale lane's whole dir — target/ included — is freed by
+        // its own row's command, so its bytes are the full dir.
+        for stale in rows.iter().filter(|r| r["kind"] == "stale-worktree") {
+            let (whole, _) = dir_size(Path::new(stale["path"].as_str().unwrap()));
+            assert_eq!(stale["bytes"].as_u64().unwrap(), whole, "{stale}");
+        }
+        let gone_row = rows
+            .iter()
+            .find(|r| {
+                r["kind"] == "stale-worktree" && r["path"].as_str().unwrap().ends_with("feat-gone")
+            })
+            .unwrap();
+        assert!(gone_row["bytes"].as_u64().unwrap() >= 512 * 1024);
+        // A stale lane never also emits an informational target row.
+        assert!(!rows.iter().any(|r| r["kind"] == "worktree-target"
+            && r["path"]
+                .as_str()
+                .unwrap()
+                .starts_with(gone.to_str().unwrap())));
+        // A live lane's target row describes how it frees — it never
+        // reads as "finish your in-progress work".
+        let live = rows
+            .iter()
+            .find(|r| r["kind"] == "worktree-target")
+            .unwrap();
+        assert!(live["action"]
+            .as_str()
+            .unwrap()
+            .contains("freed with the lane"));
+        // Every row names its action and filesystem; nothing deleted.
+        assert!(rows
+            .iter()
+            .all(|r| !r["action"].as_str().unwrap().is_empty()));
+        assert!(lane_target.is_dir() && shared.is_dir());
+        assert!(gone.is_dir());
+        let text = render_reclaim(&plan);
+        assert!(
+            text.contains("total reclaimable") && text.contains("shared-cargo-cache"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn reclaim_plan_quotes_paths_and_reports_lock() {
+        // A repo whose path contains a space — unquoted `rm -rf`
+        // would split it into extra arguments.
+        let root = tempfile::Builder::new()
+            .prefix("my proj ")
+            .tempdir()
+            .unwrap();
+        let mut scan = fake_scan(&root);
+        let repo = root.path().join("repo dir");
+        std::fs::create_dir_all(&repo).unwrap();
+        scan.cwd = repo.clone();
+        init_repo(&repo);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                ".cadence/wt/feat gone",
+                "-b",
+                "feat-gone",
+            ],
+        );
+        git(&repo, &["merge", "-q", "feat-gone"]);
+        let shared = repo.join(".cadence/target/shared");
+        real_bytes(&shared.join("dep.rlib"), 4096);
+
+        let plan = reclaim_plan(&scan);
+        let rows = plan["rows"].as_array().unwrap();
+        // Every emitted command's path args round-trip through a real
+        // shell word-split: `set -- <quoted>` must hand back exactly
+        // the original paths.
+        let actions: Vec<String> = rows
+            .iter()
+            .map(|r| r["action"].as_str().unwrap().to_string())
+            .collect();
+        let stale = actions
+            .iter()
+            .find(|a| a.contains("worktree remove"))
+            .expect("stale row")
+            .clone();
+        // The git -C line: `git -C <root> worktree remove <path>` —
+        // extract the two path args and ask `sh` to split them.
+        let (root_q, path_q) = stale
+            .strip_prefix("git -C ")
+            .unwrap()
+            .split_once(" worktree remove ")
+            .unwrap();
+        for (q, want) in [
+            (root_q, repo.display().to_string()),
+            (
+                path_q,
+                repo.join(".cadence/wt/feat gone").display().to_string(),
+            ),
+        ] {
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(format!("set -- {q}; printf %s \"$1\""))
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{stale}");
+        }
+        // The shared row's rm -rf clears *contents*, one quoted glob
+        // per shared subdir — run it through a real `sh` and prove
+        // the dirs themselves (every lane's symlink target) survive.
+        let rm = actions
+            .iter()
+            .find(|a| a.contains("rm -rf"))
+            .expect("shared row")
+            .clone();
+        let d = shared.join("debug");
+        for name in ["deps", ".fingerprint", "build", "incremental"] {
+            std::fs::create_dir_all(d.join(name)).unwrap();
+            std::fs::write(d.join(name).join("cached.o"), b"x").unwrap();
+        }
+        let rm_cmd = rm.split("  #").next().unwrap();
+        let out = Command::new("sh").arg("-c").arg(rm_cmd).output().unwrap();
+        assert!(out.status.success(), "{rm}");
+        for name in ["deps", ".fingerprint", "build", "incremental"] {
+            let dir = d.join(name);
+            assert!(dir.is_dir(), "{name} must survive for lane symlinks");
+            assert!(
+                std::fs::read_dir(&dir).unwrap().next().is_none(),
+                "{name} emptied"
+            );
+        }
+        // And the quoted glob args word-split correctly: the first
+        // arg expands inside the space-containing path.
+        std::fs::write(d.join("deps/marker"), b"x").unwrap();
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "set -- {}; printf %s \"$1\"",
+                rm_cmd.strip_prefix("rm -rf ").unwrap()
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            d.join("deps/marker").display().to_string()
+        );
+
+        // A held .cargo-lock swaps the rm -rf for an idle note — and
+        // with no freeing command emitted, the row's bytes leave the
+        // reclaimable total too.
+        let lock = shared.join("debug/.cargo-lock");
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, "").unwrap();
+        std::fs::write(d.join("deps/cached2.o"), vec![7u8; 8192]).unwrap();
+        let f = std::fs::File::open(&lock).unwrap();
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let plan = reclaim_plan(&scan);
+        let shared_row = plan["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "shared-cargo-cache")
+            .unwrap()
+            .clone();
+        assert!(shared_row["cargo_locked"].as_bool().unwrap());
+        assert!(shared_row["action"]
+            .as_str()
+            .unwrap()
+            .contains("cargo build"));
+        assert!(shared_row["bytes"].as_u64().unwrap() >= 8192);
+        let stale_bytes: u64 = plan["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "stale-worktree")
+            .map(|r| r["bytes"].as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            plan["reclaimable_bytes"].as_u64().unwrap(),
+            stale_bytes,
+            "locked shared row must not count toward the total"
+        );
+        drop(f); // probe must see the lock released
+        assert!(!file_locked(&lock));
     }
 
     #[test]
