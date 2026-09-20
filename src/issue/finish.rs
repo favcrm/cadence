@@ -698,23 +698,17 @@ pub fn run(
     pm.commit(&format!("{subject}\n\n{trailers}"))?;
 
     // Accounting only — `git worktree remove` takes the worktree dir
-    // and nothing else, so a cargo target outside it (the shared
-    // cache, or wherever an operator pointed `build.target-dir`) is
-    // never deleted here.
-    let cargo_target_kept = cargo_target.as_deref().is_some_and(|p| {
-        !removed_worktree
-            || wt_dir
-                .as_deref()
-                .is_none_or(|d| !Path::new(p).starts_with(d))
-    });
-
-    Ok(json!({
+    // and nothing else. `cargo_target_exists` is a literal check on
+    // the recorded path after the removal, emitted only when a target
+    // was recorded: a target inside the worktree reports false while
+    // the shared dep cache it linked into survives untouched (rm
+    // unlinks symlinks; it never follows them).
+    let mut out = json!({
         "issue": t.front.id,
         "finished": true,
         "worktree": wt_dir,
         "branch": branch,
         "cargo_target": cargo_target,
-        "cargo_target_kept": cargo_target_kept,
         "removed_worktree": removed_worktree,
         "deleted_branch": deleted_branch,
         "kept_branch": keep_branch,
@@ -724,7 +718,11 @@ pub fn run(
         "overrode": overridden,
         "merged_by": merged_by,
         "status": t.front.status,
-    }))
+    });
+    if let Some(target) = &cargo_target {
+        out["cargo_target_exists"] = json!(Path::new(target).exists());
+    }
+    Ok(out)
 }
 
 /// `issue finish --merged [--project P] [--remote] [--dry-run]` —

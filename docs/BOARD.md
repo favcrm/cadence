@@ -279,17 +279,27 @@ the `Issue: <ID>` trailer — as JSON.
 - The worktree is minted through the same helper as
   `cadence devin --worktree` (shared `src/worktree.rs`), including the
   `.gitignore` `.cadence/` rule — added only when missing.
-- The worktree's cargo builds share one cache: `issue start` writes
-  `build.target-dir = <repo>/.cadence/target/shared` into the
-  worktree's `.cargo/config.toml`, so every lane's dependency
-  artifacts compile once per host instead of once per worktree and
-  concurrent builds queue on cargo's own lock. A `build:
-  {target_dir: per-worktree}` section in `project.yaml` opts a lane
-  back onto its own `target/`; a `target-dir` the operator already
-  wrote in that file always wins. `.cargo/` is excluded through the repo's common
-  `info/exclude` (never `.gitignore`), so the generated config leaves
-  `git status` clean. The effective dir is recorded as `cargo_target`
-  on the `worktree` ref and printed as `target_dir`.
+- The worktree's cargo builds share one dependency cache: `issue
+  start` links the hashed-content subdirs of the lane's
+  `target/debug/` — `deps`, `.fingerprint`, `build`, `incremental`,
+  `examples` plus cargo's three lock files (`.cargo-lock`,
+  `.cargo-build-lock`, `.cargo-artifact-lock`) — into
+  `<repo>/.cadence/target/shared/debug`, so dependency artifacts
+  compile once per host and concurrent lanes queue on cargo's own
+  build lock. The lane's `debug/` itself stays a real dir, so
+  uplifted binaries like `debug/cadence` are per-lane files — one
+  lane's `cargo test` can never exec another lane's binary. A `build:
+  {target_dir: per-worktree}` section in `project.yaml` keeps the
+  lane fully private (a previously linked farm is unlinked). A
+  `build.target-dir` in the worktree's own `.cargo/config.toml`
+  overrides the whole mechanism — the farm is not planted and the
+  recorded `cargo_target` is the operator's dir; nothing under
+  `.cargo/` is ever written by cadence, so a tracked config survives
+  byte-for-byte. A `CARGO_TARGET_DIR` env or a config higher in
+  cargo's chain overrides the same way it always has. The effective
+  dir is recorded as `cargo_target` on the `worktree` ref and printed
+  as `target_dir`; a stale recorded value is corrected on re-start
+  with its own commit.
 - One tracker commit records a `branch` ref (label = repo basename)
   and a `worktree` ref (absolute path), the status/owner updates and
   the CAD-42 `Issue:`/`Actor:` trailers under subject
@@ -368,11 +378,14 @@ Then it runs `git worktree remove`, deletes the local branch (with
 `--remote` the remote one too), and lands one tracker commit
 `<ID>: finish <branch>` that marks both refs `closed: true` — kept as
 history, so a later `issue log` still shows where the work lived.
-`git worktree remove` takes the worktree dir and nothing else, so a
-recorded `cargo_target` outside it — the shared cache, or wherever an
-operator pointed `build.target-dir` — is never deleted; the output
-reports it as `cargo_target` with `cargo_target_kept: true`. The
-issue's status is not touched: status follows the job or the PM.
+`git worktree remove` takes the worktree dir and nothing else — the
+removal unlinks the lane's cache symlinks without following them, so
+the shared dep cache is never deleted here. When a `cargo_target`
+was recorded, the output reports it with `cargo_target_exists`, a
+literal check on the path after the removal (a target inside the
+worktree reports `false`; the field is omitted when nothing was
+recorded). The issue's status is not touched: status follows the job
+or the PM.
 `--force` overrides each refusal and is recorded — the `overrode`
 list in the output and a `Forced: true` trailer on the commit.
 `--keep-branch` removes only the worktree.

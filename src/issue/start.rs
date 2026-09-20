@@ -270,9 +270,46 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         }
         cargo_target = Some(worktree::configure_cargo_target(
             &wt_dir,
-            &worktree::target_dir_for(&project, &root, &wt_dir)?,
+            &root,
+            worktree::shared_deps_enabled(&project)?,
         )?);
-        // Idempotent: same issue, same names — no commit.
+        // Idempotent: same issue, same names — no commit, unless the
+        // recorded cargo target went stale (project config flipped,
+        // an older cadence recorded a different layout). The ref is
+        // corrected with a real commit, same as any ref edit.
+        let now = cargo_target
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let stale = front
+            .refs
+            .iter()
+            .find(|r| r.kind == "worktree" && r.path.as_deref() == Some(wt_str.as_str()))
+            .is_some_and(|r| r.cargo_target != now);
+        if stale {
+            let mut refreshed = front.clone();
+            if let Some(r) = refreshed
+                .refs
+                .iter_mut()
+                .find(|r| r.kind == "worktree" && r.path.as_deref() == Some(wt_str.as_str()))
+            {
+                r.cargo_target = cargo_target
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned());
+            }
+            let committed = write::save_front(&dir, &refreshed, &body).and_then(|_| {
+                write::commit(
+                    pm,
+                    &format!("{}: start {branch} (cargo_target refreshed)", front.id),
+                    &[front.id.as_str()],
+                    actor,
+                )
+            });
+            if let Err(e) = committed {
+                let _ = write::save_front(&dir, &front, &body);
+                return Err(e);
+            }
+            front = refreshed;
+        }
     } else {
         if branch_exists {
             return Err(Error::rejected(format!(
@@ -291,10 +328,23 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         }
         worktree::add(&root, &wt_dir, Some(&branch), &base_sha)?;
         worktree::ensure_cadence_ignored(&root)?;
-        cargo_target = Some(worktree::configure_cargo_target(
+        // A failed target setup leaves the lane behind — roll the git
+        // side back so a retry starts clean.
+        match worktree::configure_cargo_target(
             &wt_dir,
-            &worktree::target_dir_for(&project, &root, &wt_dir)?,
-        )?);
+            &root,
+            worktree::shared_deps_enabled(&project)?,
+        ) {
+            Ok(target) => cargo_target = Some(target),
+            Err(e) => {
+                let _ = git(
+                    &root,
+                    &["worktree", "remove", "--force", &wt_dir.to_string_lossy()],
+                );
+                let _ = git(&root, &["branch", "-D", &branch]);
+                return Err(e);
+            }
+        }
         created = true;
 
         let repo_label = root

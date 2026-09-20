@@ -38,9 +38,10 @@ cadence doctor --host         # host watchdog: disk free, provider WALs, pipe
                               #  stale worktrees (shared cargo cache counted
                               #  once) — read-only, exit 0/1/2
 cadence doctor --host --reclaim-plan
-                              # what could be freed — stale worktrees, per-lane
-                              #  target dirs, the shared cache — sizes + commands,
-                              #  never deletes
+                              # same checks plus what could be freed — stale
+                              #  worktrees, per-lane target dirs, the shared
+                              #  cache — sizes + shell-quoted commands, never
+                              #  deletes; exit is still the worst check level
 cadence ui start              # board at http://cadence.localhost:18000 behind the dev gateway
 cadence ui tailscale start    # optional: phone/laptop access at https://<dns>:9450 — tailnet-only, loopback bind unchanged
 cadence issue doctor          # tracker: hooks ours, lint clean, ahead/behind origin

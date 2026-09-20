@@ -92,20 +92,36 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// The shared cargo target dir for a repo — `<root>/.cadence/target/
-/// shared`. One cache for every `.cadence/wt` lane: dependency
-/// artifacts are built once per host instead of once per worktree.
+/// The shared cargo cache for a repo — `<root>/.cadence/target/
+/// shared`. One dependency-artifact store for every `.cadence/wt`
+/// lane: dependency artifacts are built once per host instead of once
+/// per worktree.
 pub fn shared_target_dir(root: &Path) -> PathBuf {
     root.join(".cadence").join("target").join("shared")
 }
 
-/// The effective cargo target dir for a worktree: the shared cache
-/// unless the project's `[build] target_dir = "per-worktree"` opts it
-/// back onto the classic per-lane `target/`.
-pub fn target_dir_for(project: &project::Project, root: &Path, wt_dir: &Path) -> Result<PathBuf> {
+/// The `debug/` children cargo fills with *hashed* names —
+/// `<name>-<metadata>.<ext>` keyed by package id (which includes the
+/// source path), features and profile — so two lanes' artifacts never
+/// share a filename. These are the dirs a worktree symlinks into the
+/// shared cache; cargo's build-lock files join them so concurrent
+/// lanes queue on cargo's own locking. Everything else under `debug/` —
+/// uplifted binaries, uplifted rlibs, `.d` files — is unhashed and
+/// stays per-lane, which is what keeps one lane's `cargo test` from
+/// exec'ing another lane's `debug/cadence`.
+const SHARED_DEBUG_DIRS: [&str; 5] = ["deps", ".fingerprint", "build", "incremental", "examples"];
+/// Cargo's build locks (all three exist on modern toolchains) are
+/// shared too, so two lanes building at once serialise on cargo's own
+/// locking rather than racing writes into the shared `deps/`.
+const SHARED_DEBUG_FILES: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
+
+/// Should the project's worktrees share the dep cache?
+/// `build: {target_dir: per-worktree}` in `project.yaml` opts a lane
+/// back onto fully-private build output; anything else is rejected.
+pub fn shared_deps_enabled(project: &project::Project) -> Result<bool> {
     match project.build.as_ref().and_then(|b| b.target_dir.as_deref()) {
-        None | Some("shared") => Ok(shared_target_dir(root)),
-        Some("per-worktree") => Ok(wt_dir.join("target")),
+        None | Some("shared") => Ok(true),
+        Some("per-worktree") => Ok(false),
         Some(other) => Err(Error::rejected(format!(
             "[build] target_dir = \"{other}\" in {}'s project.yaml — \
              expected \"shared\" or \"per-worktree\"",
@@ -114,86 +130,136 @@ pub fn target_dir_for(project: &project::Project, root: &Path, wt_dir: &Path) ->
     }
 }
 
-/// Point a worktree's cargo builds at `target`: merge
-/// `build.target-dir` into `<wt>/.cargo/config.toml` and mark `.cargo/`
-/// ignored in that worktree's own `info/exclude` — never the repo's
-/// `.gitignore` — so the dirty checks in `issue finish` and
-/// `doctor --host` still see a clean tree. An explicit `target-dir`
-/// the operator already wrote wins over ours; the return is the
-/// *effective* dir (theirs or ours) for the worktree ref.
-pub fn configure_cargo_target(wt_dir: &Path, target: &Path) -> Result<PathBuf> {
-    // `.cargo/` ignored via the repo's common `info/exclude` — for a
-    // linked worktree `--git-dir` is the private `worktrees/<name>`
-    // dir whose excludes are never consulted, while the common file
-    // covers every worktree and the main checkout alike. `git status
-    // --porcelain` stays clean without touching anything tracked.
-    if let Ok(gitdir) = git(wt_dir, &["rev-parse", "--git-common-dir"]) {
-        let gitdir = PathBuf::from(&gitdir);
-        let gitdir = if gitdir.is_absolute() {
-            gitdir
-        } else {
-            wt_dir.join(gitdir)
-        };
-        let exclude = gitdir.join("info").join("exclude");
-        let text = std::fs::read_to_string(&exclude).unwrap_or_default();
-        if !text.lines().any(|l| l.trim() == ".cargo/") {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&exclude)
+/// Where cargo will actually put this worktree's build output: an
+/// explicit `build.target-dir` in the worktree's own
+/// `.cargo/config.toml` wins (relative values resolve against the
+/// worktree, same as cargo resolves them); otherwise the default
+/// `<wt>/target`. The worktree-local file is the only one cadence
+/// inspects — a `CARGO_TARGET_DIR` env or a config higher in cargo's
+/// chain overrides the same way it always has; the ref records the
+/// best-known effective dir.
+pub fn effective_target_dir(wt_dir: &Path) -> PathBuf {
+    let conf = wt_dir.join(".cargo").join("config.toml");
+    if let Ok(text) = std::fs::read_to_string(&conf) {
+        if let Ok(doc) = toml::from_str::<toml::Table>(&text) {
+            if let Some(dir) = doc
+                .get("build")
+                .and_then(|b| b.get("target-dir"))
+                .and_then(|v| v.as_str())
             {
-                let _ = writeln!(f, ".cargo/");
+                let dir = PathBuf::from(dir);
+                return if dir.is_absolute() {
+                    dir
+                } else {
+                    wt_dir.join(dir)
+                };
             }
         }
     }
-    let cargo_dir = wt_dir.join(".cargo");
-    let conf = cargo_dir.join("config.toml");
-    let target_str = target.to_string_lossy().into_owned();
-    let mut doc: toml::Table = match std::fs::read_to_string(&conf) {
-        Ok(text) => toml::from_str(&text).map_err(|e| {
-            Error::rejected(format!(
-                "{} is not valid TOML — fix it or remove it: {e}",
-                conf.display()
-            ))
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-        Err(e) => return Err(e.into()),
-    };
-    // An explicit target-dir the operator already wrote wins — the
-    // file is still theirs; ours lands only when the key is absent.
-    let existing = doc
-        .get("build")
-        .and_then(|b| b.get("target-dir"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    match existing.as_deref() {
-        Some(existing) if existing != target_str => {
-            // Record the effective dir; a relative value resolves
-            // against the worktree, same as cargo resolves it.
-            let effective = PathBuf::from(existing);
-            Ok(if effective.is_absolute() {
-                effective
-            } else {
-                wt_dir.join(effective)
-            })
-        }
-        Some(_) => Ok(target.to_path_buf()),
-        None => {
-            let build = doc
-                .entry("build".to_string())
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-            let build = build.as_table_mut().ok_or_else(|| {
-                Error::rejected(format!("{} has a non-table [build]", conf.display()))
-            })?;
-            build.insert("target-dir".to_string(), toml::Value::String(target_str));
-            let rendered = toml::to_string(&doc)
-                .map_err(|e| Error::rejected(format!("could not write {}: {e}", conf.display())))?;
-            std::fs::create_dir_all(&cargo_dir)?;
-            std::fs::write(&conf, rendered)?;
-            Ok(target.to_path_buf())
+    wt_dir.join("target")
+}
+
+/// Move every entry of `src` into `dst` (same filesystem — both live
+/// under the repo), skipping names already present in `dst`, then
+/// remove `src`. Folds a lane's existing real `deps/` into the shared
+/// cache before symlinking.
+fn merge_dir_into(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dest = dst.join(entry.file_name());
+        if !dest.exists() {
+            std::fs::rename(entry.path(), &dest)?;
         }
     }
+    std::fs::remove_dir_all(src)?;
+    Ok(())
+}
+
+/// Is `link` a symlink pointing at `target`?
+fn is_link_to(link: &Path, target: &Path) -> bool {
+    link.symlink_metadata()
+        .ok()
+        .filter(|m| m.file_type().is_symlink())
+        .is_some_and(|_| std::fs::read_link(link).is_ok_and(|t| t == target))
+}
+
+/// Is `path` under an exclusive flock right now? A non-blocking
+/// LOCK_EX attempt — success means free, and the `File` drop releases
+/// the probe lock immediately.
+pub(crate) fn file_locked(path: &Path) -> bool {
+    let Ok(f) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+}
+
+/// Point a worktree's cargo builds at the shared dep cache: inside
+/// `<wt>/target/debug`, the hashed-content subdirs become symlinks to
+/// `<root>/.cadence/target/shared/debug/<name>` (merging any existing
+/// real dir first), while the lane's own `debug/` stays a real dir —
+/// uplifted binaries like `debug/cadence` are per-lane files, so one
+/// lane's `cargo test` can never exec another lane's binary. With
+/// `shared=false` a previously-planted farm is undone (links into our
+/// shared dir become empty real dirs) so a `per-worktree` lane is
+/// fully private again. Nothing under `.cargo/` is written or
+/// excluded — a tracked or hand-written `.cargo/config.toml` is never
+/// touched. Returns the effective target dir for the worktree ref.
+pub fn configure_cargo_target(wt_dir: &Path, root: &Path, shared: bool) -> Result<PathBuf> {
+    let effective = effective_target_dir(wt_dir);
+    let wt_target = wt_dir.join("target");
+    // An operator's `build.target-dir` redirects cargo elsewhere —
+    // the farm would sit inert, so it is not planted.
+    if effective != wt_target {
+        return Ok(effective);
+    }
+    let wt_debug = wt_target.join("debug");
+    let shared_debug = shared_target_dir(root).join("debug");
+    for name in SHARED_DEBUG_DIRS {
+        let link = wt_debug.join(name);
+        let shared_sub = shared_debug.join(name);
+        if shared {
+            std::fs::create_dir_all(&shared_sub)?;
+            std::fs::create_dir_all(&wt_debug)?;
+            if is_link_to(&link, &shared_sub) {
+                continue;
+            }
+            if link.is_dir() && !link.is_symlink() {
+                // A real dir from a pre-shared build — fold its
+                // artifacts into the cache, then link.
+                merge_dir_into(&link, &shared_sub)?;
+            } else if link.exists() || link.is_symlink() {
+                // A symlink to somewhere else is the operator's.
+                continue;
+            }
+            std::os::unix::fs::symlink(&shared_sub, &link)?;
+        } else if is_link_to(&link, &shared_sub) {
+            std::fs::remove_file(&link)?;
+            std::fs::create_dir_all(&link)?;
+        }
+    }
+    for name in SHARED_DEBUG_FILES {
+        let link = wt_debug.join(name);
+        let shared_file = shared_debug.join(name);
+        if shared {
+            std::fs::create_dir_all(&wt_debug)?;
+            if is_link_to(&link, &shared_file) || link.is_symlink() {
+                continue;
+            }
+            if link.exists() {
+                // A real lock file from a pre-shared build joins the
+                // shared lock — unless a build holds it right now.
+                if file_locked(&link) {
+                    continue;
+                }
+                std::fs::remove_file(&link)?;
+            }
+            std::os::unix::fs::symlink(&shared_file, &link)?;
+        } else if is_link_to(&link, &shared_file) {
+            std::fs::remove_file(&link)?;
+        }
+    }
+    Ok(effective)
 }
 
 #[cfg(test)]
@@ -235,15 +301,14 @@ mod tests {
         git(dir.path(), &["config", "user.email", "t@t"]);
         git(dir.path(), &["config", "user.name", "t"]);
         std::fs::write(dir.path().join("f"), "x").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
         git(dir.path(), &["add", "-A"]);
         git(dir.path(), &["commit", "-qm", "init"]);
         dir
     }
 
     #[test]
-    fn target_dir_defaults_to_shared() {
-        let t = TempDir::new().unwrap();
-        let (root, wt) = (t.path().join("repo"), t.path().join("repo/.cadence/wt/d-1"));
+    fn shared_deps_default_and_per_worktree() {
         for build in [
             None,
             Some(project::Build { target_dir: None }),
@@ -251,95 +316,132 @@ mod tests {
                 target_dir: Some("shared".to_string()),
             }),
         ] {
-            assert_eq!(
-                target_dir_for(&project_with(build), &root, &wt).unwrap(),
-                root.join(".cadence/target/shared")
-            );
+            assert!(shared_deps_enabled(&project_with(build)).unwrap());
         }
-    }
-
-    #[test]
-    fn target_dir_per_worktree_and_invalid() {
-        let t = TempDir::new().unwrap();
-        let (root, wt) = (t.path().join("repo"), t.path().join("repo/.cadence/wt/d-1"));
         let per = project_with(Some(project::Build {
             target_dir: Some("per-worktree".to_string()),
         }));
-        assert_eq!(target_dir_for(&per, &root, &wt).unwrap(), wt.join("target"));
+        assert!(!shared_deps_enabled(&per).unwrap());
         let bad = project_with(Some(project::Build {
             target_dir: Some("/somewhere/else".to_string()),
         }));
-        let e = target_dir_for(&bad, &root, &wt).unwrap_err();
+        let e = shared_deps_enabled(&bad).unwrap_err();
         assert!(e.to_string().contains("/somewhere/else"), "{e}");
     }
 
     #[test]
-    fn configure_writes_config_and_stays_clean() {
+    fn configure_plants_farm_and_stays_clean() {
         let repo = git_repo();
-        let target = repo.path().join(".cadence/target/shared");
-        let effective = configure_cargo_target(repo.path(), &target).unwrap();
-        assert_eq!(effective, target);
-        let conf = std::fs::read_to_string(repo.path().join(".cargo/config.toml")).unwrap();
-        assert!(
-            conf.contains(&format!("target-dir = \"{}\"", target.display())),
-            "{conf}"
-        );
-        // `.cargo/` is excluded via info/exclude — `git status` clean.
-        let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
-        assert!(exclude.lines().any(|l| l == ".cargo/"), "{exclude}");
-        assert_eq!(git(repo.path(), &["status", "--porcelain"]), "");
-        // Idempotent: a second pass changes nothing.
-        assert_eq!(
-            configure_cargo_target(repo.path(), &target).unwrap(),
-            target
-        );
-        assert_eq!(
-            std::fs::read_to_string(repo.path().join(".cargo/config.toml")).unwrap(),
-            conf
-        );
-        assert_eq!(git(repo.path(), &["status", "--porcelain"]), "");
+        let wt = repo.path();
+        let effective = configure_cargo_target(wt, repo.path(), true).unwrap();
+        assert_eq!(effective, wt.join("target"));
+        let debug = wt.join("target/debug");
+        for name in SHARED_DEBUG_DIRS {
+            let link = debug.join(name);
+            assert_eq!(
+                std::fs::read_link(&link).unwrap(),
+                shared_target_dir(repo.path()).join("debug").join(name),
+                "{name}"
+            );
+        }
+        for name in SHARED_DEBUG_FILES {
+            let link = debug.join(name);
+            assert_eq!(
+                std::fs::read_link(&link).unwrap(),
+                shared_target_dir(repo.path()).join("debug").join(name),
+                "{name}"
+            );
+        }
+        // `debug/` itself is a real dir — uplifted binaries are per-lane.
+        assert!(!debug.is_symlink());
+        // No `.cargo/` anywhere — a tracked config would be untouched.
+        assert!(!wt.join(".cargo").exists());
+        assert_eq!(git(wt, &["status", "--porcelain"]), "");
+        // Idempotent.
+        configure_cargo_target(wt, repo.path(), true).unwrap();
+        assert_eq!(git(wt, &["status", "--porcelain"]), "");
     }
 
     #[test]
-    fn configure_preserves_operator_target() {
+    fn configure_merges_existing_target_into_shared() {
         let repo = git_repo();
-        let cargo = repo.path().join(".cargo");
-        std::fs::create_dir_all(&cargo).unwrap();
-        // An absolute operator choice wins and is recorded verbatim.
-        std::fs::write(
-            cargo.join("config.toml"),
-            "[build]\ntarget-dir = \"/var/cache/mine\"\njobs = 2\n",
-        )
-        .unwrap();
-        let effective =
-            configure_cargo_target(repo.path(), &repo.path().join(".cadence/target/shared"))
-                .unwrap();
-        assert_eq!(effective, PathBuf::from("/var/cache/mine"));
-        let conf = std::fs::read_to_string(cargo.join("config.toml")).unwrap();
-        assert!(
-            conf.contains("/var/cache/mine") && conf.contains("jobs = 2"),
-            "{conf}"
+        let wt = repo.path();
+        // A pre-shared lane already built: real dirs with artifacts.
+        let debug = wt.join("target/debug");
+        std::fs::create_dir_all(debug.join("deps")).unwrap();
+        std::fs::write(debug.join("deps/libdep-abc.rlib"), "rlib").unwrap();
+        std::fs::create_dir_all(debug.join(".fingerprint/dep-abc")).unwrap();
+        std::fs::write(debug.join("probe"), "bin").unwrap();
+        configure_cargo_target(wt, repo.path(), true).unwrap();
+        let shared = shared_target_dir(repo.path()).join("debug");
+        // Artifacts moved into the cache; the lane's own bin stayed.
+        assert_eq!(
+            std::fs::read_to_string(shared.join("deps/libdep-abc.rlib")).unwrap(),
+            "rlib"
         );
-        // `.cargo/` was still excluded — the tree stays clean.
-        assert_eq!(git(repo.path(), &["status", "--porcelain"]), "");
+        assert!(shared.join(".fingerprint/dep-abc").is_dir());
+        assert_eq!(std::fs::read_to_string(debug.join("probe")).unwrap(), "bin");
+        assert!(debug.join("deps").is_symlink());
+    }
+
+    #[test]
+    fn configure_per_worktree_unplants_farm() {
+        let repo = git_repo();
+        let wt = repo.path();
+        configure_cargo_target(wt, repo.path(), true).unwrap();
+        let effective = configure_cargo_target(wt, repo.path(), false).unwrap();
+        assert_eq!(effective, wt.join("target"));
+        for name in SHARED_DEBUG_DIRS {
+            let p = wt.join("target/debug").join(name);
+            assert!(p.is_dir() && !p.is_symlink(), "{name}");
+        }
+        for name in SHARED_DEBUG_FILES {
+            assert!(!wt.join("target/debug").join(name).exists(), "{name}");
+        }
+        // The shared cache kept its dirs — nothing was deleted.
+        assert!(shared_target_dir(repo.path()).join("debug/deps").is_dir());
+    }
+
+    #[test]
+    fn configure_preserves_operator_target_dir_and_config() {
+        let repo = git_repo();
+        let wt = repo.path();
+        let cargo = wt.join(".cargo");
+        std::fs::create_dir_all(&cargo).unwrap();
+        let conf_text = "[build]\ntarget-dir = \"/var/cache/mine\"\njobs = 2\n";
+        std::fs::write(cargo.join("config.toml"), conf_text).unwrap();
+        git(wt, &["add", "-A"]);
+        git(wt, &["commit", "-qm", "cargo config"]);
+        let effective = configure_cargo_target(wt, repo.path(), true).unwrap();
+        assert_eq!(effective, PathBuf::from("/var/cache/mine"));
+        // Tracked config survives byte-for-byte; no farm planted.
+        assert_eq!(
+            std::fs::read_to_string(cargo.join("config.toml")).unwrap(),
+            conf_text
+        );
+        assert!(!wt.join("target").exists());
+        assert_eq!(git(wt, &["status", "--porcelain"]), "");
         // A relative operator choice resolves against the worktree.
         std::fs::write(
             cargo.join("config.toml"),
             "[build]\ntarget-dir = \"build-out\"\n",
         )
         .unwrap();
-        let effective = configure_cargo_target(repo.path(), Path::new("/ignored")).unwrap();
-        assert_eq!(effective, repo.path().join("build-out"));
+        let effective = configure_cargo_target(wt, repo.path(), true).unwrap();
+        assert_eq!(effective, wt.join("build-out"));
+        assert!(!wt.join("target").exists());
     }
 
     #[test]
-    fn configure_rejects_bad_toml() {
+    fn configure_leaves_foreign_symlinks() {
         let repo = git_repo();
-        let cargo = repo.path().join(".cargo");
-        std::fs::create_dir_all(&cargo).unwrap();
-        std::fs::write(cargo.join("config.toml"), "[build\nnot toml").unwrap();
-        assert!(configure_cargo_target(repo.path(), Path::new("/x")).is_err());
-        std::fs::write(cargo.join("config.toml"), "build = \"nope\"\n").unwrap();
-        assert!(configure_cargo_target(repo.path(), Path::new("/x")).is_err());
+        let wt = repo.path();
+        let foreign = wt.join("elsewhere");
+        std::fs::create_dir_all(&foreign).unwrap();
+        let debug = wt.join("target/debug");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::os::unix::fs::symlink(&foreign, debug.join("deps")).unwrap();
+        configure_cargo_target(wt, repo.path(), true).unwrap();
+        assert_eq!(std::fs::read_link(debug.join("deps")).unwrap(), foreign);
     }
 }
