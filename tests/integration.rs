@@ -47,10 +47,15 @@ impl TestDaemon {
 
     /// Start a daemon over a pre-seeded state directory.
     fn start_on(state: PathBuf) -> Self {
+        Self::start_on_opts(state, daemon_opts())
+    }
+
+    /// `start_on` with explicit daemon options — slot tests shrink the
+    /// pools or inject the clock this way.
+    fn start_on_opts(state: PathBuf, opts: daemon::ServeOptions) -> Self {
         suite_slot();
         let dir = TempDir::new().unwrap(); // keeps lifetime uniform
         let owned = state.clone();
-        let opts = daemon_opts();
         let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
         let daemon = Self {
             dir,
@@ -2177,6 +2182,7 @@ fn daemon_opts() -> daemon::ServeOptions {
         // Explicit defaults keep test daemons hermetic — a real pm.yaml
         // [host] table on the dev host must never leak into a test.
         slots: Some(cadence_agent::slots::SlotConfig::default()),
+        slot_clock: None,
     }
 }
 
@@ -17760,7 +17766,6 @@ fn issue_start_honours_cargo_target_dir_env() {
     );
 }
 
-
 // ---- session start|end: stub daemon socket, fixture pm + repo (CAD-92) ----
 
 /// Canned `agent_show` data for one alias. `flip` replaces the answer
@@ -20077,6 +20082,19 @@ fn audit_post_hoc_verdict_does_not_clear_flag() {
 /// A daemon with a shrunken slot config — hermetic (ServeOptions wins
 /// over pm.yaml, so no host config can leak in).
 fn slot_opts(build: usize, suite: usize, starve: u64, priority: &[&str]) -> daemon::ServeOptions {
+    slot_opts_clock(build, suite, starve, priority, None)
+}
+
+/// `slot_opts` with an injected slot clock: a shared counter the test
+/// advances instead of sleeping — starvation tests stay deterministic
+/// under host load.
+fn slot_opts_clock(
+    build: usize,
+    suite: usize,
+    starve: u64,
+    priority: &[&str],
+    clock: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) -> daemon::ServeOptions {
     daemon::ServeOptions {
         slots: Some(cadence_agent::slots::SlotConfig {
             build_slots: build,
@@ -20085,6 +20103,10 @@ fn slot_opts(build: usize, suite: usize, starve: u64, priority: &[&str]) -> daem
             priority_lanes: priority.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }),
+        slot_clock: clock.map(|c| {
+            std::sync::Arc::new(move || c.load(std::sync::atomic::Ordering::Relaxed) as f64)
+                as std::sync::Arc<dyn Fn() -> f64 + Send + Sync>
+        }),
         ..daemon_opts()
     }
 }
@@ -20092,10 +20114,25 @@ fn slot_opts(build: usize, suite: usize, starve: u64, priority: &[&str]) -> daem
 /// `slot_acquire` with the test process's pid — alive for the whole
 /// test, so the pid check never reaps a live waiter here.
 fn slot_acquire(d: &TestDaemon, kind: &str, lane: &str, req: &str) -> Value {
+    slot_acquire_pid(d, kind, lane, std::process::id(), req)
+}
+
+/// `slot_acquire` bound to an explicit pid.
+fn slot_acquire_pid(d: &TestDaemon, kind: &str, lane: &str, pid: u32, req: &str) -> Value {
     d.rpc(
         "slot_acquire",
-        json!({"kind": kind, "lane": lane, "pid": std::process::id(),
+        json!({"kind": kind, "lane": lane, "pid": pid,
                "request_id": req}),
+    )
+    .unwrap()
+}
+
+/// `slot_release` naming the holding (lane, pid) — the identity the
+/// grant was bound to.
+fn slot_release(d: &TestDaemon, token: &str, lane: &str, pid: u32) -> Value {
+    d.rpc(
+        "slot_release",
+        json!({"token": token, "lane": lane, "pid": pid}),
     )
     .unwrap()
 }
@@ -20109,13 +20146,20 @@ fn slot_acquire_queues_until_release() {
     d.register("dev-2");
     let g1 = slot_acquire(&d, "build", "dev-1", "r1");
     assert_eq!(g1["granted"], true);
-    assert_eq!(g1["token"], "r1");
+    let t1 = g1["token"].as_str().unwrap().to_string();
+    assert!(t1.starts_with("slot-"), "the daemon mints the token: {t1}");
     // The next acquire queues — answered, never hung.
     let q = slot_acquire(&d, "build", "dev-2", "r2");
     assert_eq!(q["granted"], false);
     assert_eq!(q["position"], 1);
-    let s = d.rpc("slot_status", json!({})).unwrap();
+    let s = d.rpc("slot_status", json!({"lane": "dev-2"})).unwrap();
     assert_eq!(s["pools"]["build"]["held"].as_array().unwrap().len(), 1);
+    // dev-1's hold shows identity only — never its token.
+    assert!(
+        s["pools"]["build"]["held"][0].get("token").is_none(),
+        "foreign token hidden: {}",
+        s["pools"]["build"]["held"][0]
+    );
     let waiting = s["waiting"].as_array().unwrap();
     assert_eq!(waiting.len(), 1);
     assert_eq!(waiting[0]["lane"], "dev-2");
@@ -20124,14 +20168,15 @@ fn slot_acquire_queues_until_release() {
     let q = slot_acquire(&d, "build", "dev-2", "r2");
     assert_eq!(q["position"], 1);
     // Release frees the pool; the waiter's next poll grants.
-    d.rpc("slot_release", json!({"token": "r1"})).unwrap();
+    slot_release(&d, &t1, "dev-1", std::process::id());
     let g2 = slot_acquire(&d, "build", "dev-2", "r2");
     assert_eq!(g2["granted"], true);
-    assert_eq!(g2["token"], "r2");
+    let t2 = g2["token"].as_str().unwrap().to_string();
+    assert_ne!(t2, t1, "each grant mints a fresh token");
     // And a re-poll of a granted id returns the same token (the CLI's
     // poll loop depends on this idempotency).
     let again = slot_acquire(&d, "build", "dev-2", "r2");
-    assert_eq!(again["token"], "r2");
+    assert_eq!(again["token"], t2);
     let kinds = |a: &str| {
         d.events(a)
             .iter()
@@ -20161,14 +20206,9 @@ fn slot_dead_holder_is_reaped() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    let g = d
-        .rpc(
-            "slot_acquire",
-            json!({"kind": "build", "lane": "dev-1", "pid": pid,
-                   "request_id": "r1"}),
-        )
-        .unwrap();
+    let g = slot_acquire_pid(&d, "build", "dev-1", pid, "r1");
     assert_eq!(g["granted"], true);
+    let token = g["token"].as_str().unwrap().to_string();
     child.kill().unwrap();
     child.wait().unwrap(); // reap the zombie so kill(pid,0) answers ESRCH
     let g2 = slot_acquire(&d, "build", "dev-2", "r2");
@@ -20182,30 +20222,161 @@ fn slot_dead_holder_is_reaped() {
         "{evs:?}"
     );
     // Releasing the dead token is now a named refusal, not a silent pass.
-    let err = d.rpc("slot_release", json!({"token": "r1"})).unwrap_err();
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": token, "lane": "dev-1", "pid": pid}),
+        )
+        .unwrap_err();
     assert!(err.to_string().contains("Unknown slot token"), "{err}");
+}
+
+/// BLOCKER: two callers sharing a request_id — the second queues, it
+/// never adopts the first's hold; a same-identity re-poll does.
+#[test]
+fn slot_duplicate_request_id_different_pid_queues() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let mut child = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .unwrap();
+    let other_pid = child.id();
+    let g1 = slot_acquire_pid(&d, "build", "dev-1", other_pid, "r1");
+    assert_eq!(g1["granted"], true);
+    // Same request_id from a different pid — a different caller:
+    // queued, never granted the first's hold.
+    let q = slot_acquire(&d, "build", "dev-1", "r1");
+    assert_eq!(q["granted"], false, "must not adopt another caller's hold");
+    let s = d.rpc("slot_status", json!({"lane": "dev-1"})).unwrap();
+    assert_eq!(s["waiting"].as_array().unwrap().len(), 1);
+    // The true holder re-polls and still gets its own token.
+    let again = slot_acquire_pid(&d, "build", "dev-1", other_pid, "r1");
+    assert_eq!(again["token"], g1["token"]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// BLOCKER: release binds to the holding (lane, pid) — a foreign
+/// caller's release is a named refusal and the hold survives.
+#[test]
+fn slot_release_foreign_caller_is_rejected() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let mut child = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let g = slot_acquire_pid(&d, "build", "dev-1", pid, "r1");
+    let token = g["token"].as_str().unwrap().to_string();
+    // dev-2 knows the token but owns neither lane nor pid — refused.
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": token, "lane": "dev-2", "pid": std::process::id()}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("another caller"), "{err}");
+    // The right lane with the wrong pid is refused too.
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": token, "lane": "dev-1", "pid": std::process::id()}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("another caller"), "{err}");
+    // The hold still stands — the pool stays full.
+    let q = slot_acquire(&d, "build", "dev-2", "r2");
+    assert_eq!(q["granted"], false, "failed release must not free the slot");
+    // And the true holder releases normally.
+    slot_release(&d, &token, "dev-1", pid);
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// BLOCKER: holds survive a daemon restart — persisted slots.json is
+/// revalidated at boot: live holders keep their slots (never
+/// re-granted), dead holders are dropped with a named reason.
+#[test]
+fn slot_restart_revalidates_holders() {
+    let state = TempDir::new().unwrap();
+    let opts = slot_opts(2, 1, 900, &[]);
+    let d = TestDaemon::start_on_opts(state.path().to_path_buf(), opts);
+    d.register("dev-1");
+    let mut children: Vec<std::process::Child> = (0..2)
+        .map(|_| {
+            std::process::Command::new("sleep")
+                .arg("600")
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let mut tokens = Vec::new();
+    for (i, c) in children.iter().enumerate() {
+        let g = slot_acquire_pid(&d, "build", "dev-1", c.id(), &format!("r{i}"));
+        assert_eq!(g["granted"], true);
+        tokens.push(g["token"].as_str().unwrap().to_string());
+    }
+    // One holder dies before the restart — it must be reaped at boot.
+    children[0].kill().unwrap();
+    children[0].wait().unwrap();
+    let live_pid = children[1].id();
+    drop(d); // shutdown → serve returns → state dir kept
+    let d2 = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    // The live hold survived with its token intact; the dead one's
+    // slot was reaped — one held, one free.
+    let s = d2.rpc("slot_status", json!({"lane": "dev-1"})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "one live holder survives: {held:?}");
+    assert_eq!(held[0]["token"], tokens[1]);
+    assert_eq!(held[0]["pid"], live_pid);
+    // The boot reap named the dead holder's cause on its lane.
+    let evs = d2.events("dev-1");
+    assert!(
+        evs.iter()
+            .any(|e| e["kind"].as_str() == Some("slot_released")
+                && e["payload"]["reason"].as_str() == Some("holder died")),
+        "{evs:?}"
+    );
+    // And an acquire never re-grants the survivor's slot — one free
+    // slot grants once, then the pool is full again.
+    let g = slot_acquire(&d2, "build", "dev-2", "r9");
+    assert_eq!(g["granted"], true);
+    let q = slot_acquire(&d2, "build", "dev-3", "r10");
+    assert_eq!(q["granted"], false, "restarted holds keep the pool bounded");
+    // The survivor still releases by its minted token.
+    slot_release(&d2, &tokens[1], "dev-1", live_pid);
+    children[1].kill().unwrap();
+    children[1].wait().unwrap();
 }
 
 /// `starve_secs` promotes a long waiter ahead of a priority lane:
 /// priority wins inside the window, the starved waiter wins after it.
+/// The slot clock is injected — the test advances it instead of
+/// sleeping, so timing stays exact under host load.
 #[test]
 fn slot_starve_promotes_long_waiter() {
-    let d = TestDaemon::start_opts(slot_opts(1, 1, 3, &["qa-1"]));
-    slot_acquire(&d, "build", "dev-1", "h1"); // holder
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let d = TestDaemon::start_opts(slot_opts_clock(1, 1, 3, &["qa-1"], Some(clock.clone())));
+    let me = std::process::id();
+    let h1 = slot_acquire(&d, "build", "dev-1", "h1")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     slot_acquire(&d, "build", "dev-2", "w1"); // ordinary waiter, first
     slot_acquire(&d, "test", "qa-1", "w2"); // priority waiter, second
-    d.rpc("slot_release", json!({"token": "h1"})).unwrap();
+    slot_release(&d, &h1, "dev-1", me);
     // Inside the starve window the reviewer lane's test wins.
     let g = slot_acquire(&d, "test", "qa-1", "w2");
     assert_eq!(g["granted"], true, "priority lane should outrank");
+    let w2 = g["token"].as_str().unwrap().to_string();
     // Once w1 has waited past starve_secs it outranks even a new
     // priority request — the never-starve bound.
-    thread::sleep(Duration::from_millis(3200));
+    clock.store(4, std::sync::atomic::Ordering::Relaxed);
     slot_acquire(&d, "test", "qa-1", "w3");
-    d.rpc("slot_release", json!({"token": "w2"})).unwrap();
+    slot_release(&d, &w2, "qa-1", me);
     let g = slot_acquire(&d, "build", "dev-2", "w1");
     assert_eq!(g["granted"], true, "starved waiter must outrank priority");
-    let s = d.rpc("slot_status", json!({})).unwrap();
+    let s = d.rpc("slot_status", json!({"lane": "qa-1"})).unwrap();
     let w3 = s["waiting"]
         .as_array()
         .unwrap()
@@ -20238,8 +20409,11 @@ fn slot_pools_are_independent() {
 #[test]
 fn build_slot_cli_acquire_release_status() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
-    slot_acquire(&d, "build", "dev-1", "r1"); // build pool full
     let home = TempDir::new().unwrap();
+    let t1 = slot_acquire(&d, "build", "dev-1", "r1")["token"]
+        .as_str()
+        .unwrap()
+        .to_string(); // build pool full
     let out = cadence_at(
         home.path(),
         &d.state,
@@ -20248,14 +20422,19 @@ fn build_slot_cli_acquire_release_status() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("No build slot free"), "{err}");
-    // Free it through the CLI, then take it through the CLI.
-    let out = cadence_at(home.path(), &d.state, &["build-slot", "release", "r1"]);
+    // Free it through the CLI — release names the holding lane; the
+    // default pid (the CLI's parent = this test) matches the hold.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "release", &t1, "--lane", "dev-1"],
+    );
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("released r1"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("released slot-"));
     let out = cadence_at(
         home.path(),
         &d.state,
@@ -20275,10 +20454,33 @@ fn build_slot_cli_acquire_release_status() {
         String::from_utf8_lossy(&out.stderr)
     );
     let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(token.len() >= 8, "bare token on stdout: {token:?}");
-    // The token round-trips: release by exactly what acquire printed.
-    let out = cadence_at(home.path(), &d.state, &["build-slot", "release", &token]);
+    assert!(
+        token.starts_with("slot-"),
+        "bare minted token on stdout: {token:?}"
+    );
+    // The token round-trips: release by exactly what acquire printed,
+    // same lane, same default pid.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "release", &token, "--lane", "dev-9"],
+    );
     assert!(out.status.success());
+    // A release under the wrong lane is refused.
+    let g = slot_acquire(&d, "build", "dev-1", "r9");
+    let t9 = g["token"].as_str().unwrap().to_string();
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "release", &t9, "--lane", "dev-2"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("another caller"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    slot_release(&d, &t9, "dev-1", std::process::id());
     // status --json shows the empty pool; bad kind is a named error.
     let out = cadence_at(home.path(), &d.state, &["build-slot", "status", "--json"]);
     let s: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -20397,7 +20599,7 @@ fn issue_start_writes_slot_env() {
     std::fs::write(&pm_yaml, yaml).unwrap();
     let (ok, out) = cli(&["issue", "start", "D-1"]);
     assert!(ok, "{out}");
-    let env_file = PathBuf::from(out["slot_env"].as_str().unwrap());
+    let env_file = PathBuf::from(out["slot_env"]["path"].as_str().unwrap());
     assert_eq!(
         env_file,
         Path::new(out["worktree"].as_str().unwrap()).join(".env")
@@ -20406,12 +20608,151 @@ fn issue_start_writes_slot_env() {
     assert!(text.contains("CARGO_BUILD_JOBS=7"), "{text}");
     assert!(text.contains("CADENCE_BUILD_SLOT="), "{text}");
     assert!(text.contains("cadence"), "{text}");
-    // A second start is idempotent and keeps foreign lines.
+    // Created 0600 — the file may hold build secrets someday.
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // A second start is idempotent and keeps foreign lines — and an
+    // existing file's mode survives the atomic rewrite.
     std::fs::write(&env_file, format!("OTHER=1\n{text}")).unwrap();
+    std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o640)).unwrap();
     let (ok, _) = cli(&["issue", "start", "D-1"]);
     assert!(ok);
     let text = std::fs::read_to_string(&env_file).unwrap();
     assert_eq!(text.matches("CARGO_BUILD_JOBS=").count(), 1, "{text}");
     assert!(text.contains("OTHER=1"), "{text}");
+    assert_eq!(
+        std::fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o640,
+        "existing mode preserved"
+    );
     drop(d);
+}
+
+/// `build-slot run` binds the hold to the REAL command process: the
+/// CLI acquires with its own pid then execs, so the slot's holder IS
+/// the running command — its exit frees the slot.
+#[test]
+fn build_slot_run_binds_the_real_process() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "build-slot",
+            "run",
+            "build",
+            "--wait-secs",
+            "5",
+            "--",
+            "sleep",
+            "30",
+        ])
+        .env("HOME", home.path())
+        .envs(test_env().vars())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // After exec the spawned pid IS `sleep 30` — the hold must bind
+    // to exactly that process, not a wrapper that already exited.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = d.rpc("slot_status", json!({"lane": "unknown"})).unwrap();
+        let held = s["pools"]["build"]["held"].as_array().unwrap();
+        if held
+            .iter()
+            .any(|h| h["pid"].as_u64() == Some(child.id() as u64))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "run never held the slot: {s}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The command's exit frees its slot on the next read.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let s = d.rpc("slot_status", json!({"lane": "unknown"})).unwrap();
+    assert!(
+        s["pools"]["build"]["held"].as_array().unwrap().is_empty(),
+        "the command's exit frees its slot: {s}"
+    );
+    // A short command exits cleanly through run.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "run",
+            "build",
+            "--wait-secs",
+            "5",
+            "--",
+            "true",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The CLI's queued path: `--wait-secs > 0` polls until a release
+/// frees the pool — and the default `--pid` binds the hold to the
+/// caller's parent (this test process), matching `acquire`'s doc.
+#[test]
+fn build_slot_cli_wait_then_grant() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let t1 = slot_acquire(&d, "build", "dev-1", "r1")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "build-slot",
+            "acquire",
+            "build",
+            "--wait-secs",
+            "15",
+            "--lane",
+            "dev-9",
+        ])
+        .env("HOME", home.path())
+        .envs(test_env().vars())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Let it queue — the waiter shows in status, then a release
+    // frees the pool and the next poll grants.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = d.rpc("slot_status", json!({"lane": "dev-9"})).unwrap();
+        if !s["waiting"].as_array().unwrap().is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "CLI never queued: {s}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    slot_release(&d, &t1, "dev-1", std::process::id());
+    let out = cli.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(token.starts_with("slot-"), "minted token: {token}");
+    // The default --pid bound the hold to the CLI's parent — the
+    // test process, still alive.
+    let s = d.rpc("slot_status", json!({"lane": "dev-9"})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held[0]["pid"].as_u64().unwrap() as u32, std::process::id());
+    slot_release(&d, &token, "dev-9", std::process::id());
 }

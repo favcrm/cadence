@@ -101,6 +101,18 @@ pub fn daemon_start(state_dir: &Path) -> Result<Value> {
 
 /// Send one request, return the result value or the wire error.
 pub fn rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
+    rpc_timeout(state_dir, method, params, Duration::from_secs(700))
+}
+
+/// `rpc` with a caller-chosen read bound — best-effort callers
+/// (status footer, doctor) must degrade in a second or two rather
+/// than hang a screen on a wedged daemon.
+pub fn rpc_timeout(
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
     let socket = socket_path(state_dir);
     let mut stream = UnixStream::connect(&socket).map_err(|_| {
         Error::internal(format!(
@@ -108,7 +120,7 @@ pub fn rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
             socket.display()
         ))
     })?;
-    stream.set_read_timeout(Some(Duration::from_secs(700)))?;
+    stream.set_read_timeout(Some(timeout))?;
     let request = proto::request(method, params);
     writeln!(stream, "{request}")?;
     let mut line = String::new();

@@ -115,6 +115,17 @@ fn epoch_secs() -> f64 {
         .as_secs_f64()
 }
 
+/// Monotonic seconds since an arbitrary process-local epoch — the
+/// slot clock. NTP steps and wall-clock jumps cannot age a waiter or
+/// expire a hold; the wall epoch rides alongside only for restart
+/// persistence.
+fn mono_secs() -> f64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+}
+
 /// Human silence duration for stall notices — `42s`, `12m 3s`, `1h 4m`.
 fn fmt_duration(secs: u64) -> String {
     if secs < 60 {
@@ -272,10 +283,13 @@ pub struct Shared {
     /// shutdown marker, so the next daemon can prove a marker belongs
     /// to the immediately preceding run (CAD-89).
     instance: String,
-    /// CAD-113 build-slot registry — in-memory by design: a restart
-    /// reaps every holder (dead pids, forgotten tokens), which is the
-    /// fail-closed semantics the slot service wants.
+    /// CAD-113 build-slot registry — holds persist to slots.json and
+    /// are revalidated at boot; the queue itself is in-memory (its
+    /// callers re-poll anyway).
     slots: Mutex<Slots>,
+    /// The slot clock — `mono_secs` in production, injectable so the
+    /// integration suite advances starvation/age without sleeping.
+    slot_clock: Arc<dyn Fn() -> f64 + Send + Sync>,
 }
 
 impl Shared {
@@ -290,7 +304,17 @@ impl Shared {
         let store = Store::open_adopting(&state_dir.join("cadence.sqlite3"), marker)?;
         let provider_log_dir = state_dir.join("agents");
         std::fs::create_dir_all(&provider_log_dir)?;
-        Ok(Arc::new(Self {
+        // CAD-113: slot holds persist under the state dir; restore
+        // revalidates them against live processes BEFORE the socket
+        // opens, so a restart never forgets or double-grants a hold.
+        let slot_clock = opts
+            .slot_clock
+            .clone()
+            .unwrap_or_else(|| Arc::new(mono_secs));
+        let mut slots = Slots::new(resolve_slot_config(opts));
+        slots.persist_to(state_dir.join("slots.json"));
+        let boot_events = slots.restore(crate::slots::SlotClock::at(slot_clock(), epoch_secs()));
+        let shared = Arc::new(Self {
             store,
             changed: Notify::new(),
             pending: Mutex::new(HashMap::new()),
@@ -304,8 +328,13 @@ impl Shared {
             started_at: epoch_secs(),
             stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
             instance,
-            slots: Mutex::new(Slots::new(resolve_slot_config(opts))),
-        }))
+            slots: Mutex::new(slots),
+            slot_clock,
+        });
+        // Holds dropped by boot-time revalidation get their release
+        // events now that the store-backed emitter exists.
+        shared.emit_slot_events(boot_events);
+        Ok(shared)
     }
 
     fn wake(&self) {
@@ -1162,7 +1191,7 @@ impl Shared {
             }
             "slot_acquire" => self.rpc_slot_acquire(params),
             "slot_release" => self.rpc_slot_release(params),
-            "slot_status" => Ok(self.rpc_slot_status()),
+            "slot_status" => Ok(self.rpc_slot_status(params)),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -1196,24 +1225,45 @@ impl Shared {
         // `probe` is the read-only fast-fail: it answers granted or
         // position without leaving a waiter in the queue.
         let probe = params["probe"].as_bool().unwrap_or(false);
-        let (result, events) =
-            self.slots
-                .lock()
-                .unwrap()
-                .acquire(kind, lane, pid, request_id, probe, epoch_secs())?;
+        let (result, events) = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .acquire(
+                kind,
+                lane,
+                pid,
+                request_id,
+                probe,
+                crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs()),
+            )?;
         self.emit_slot_events(events);
         Ok(result)
     }
 
+    /// `slot_release` — the release must name the holding (lane,
+    /// pid): a token alone is not authority to free another
+    /// caller's slot.
     fn rpc_slot_release(&self, params: &Value) -> Result<Value> {
         let token = required_str(params, "token")?;
-        let (result, events) = self.slots.lock().unwrap().release(token, epoch_secs())?;
+        let lane = optional_str(params, "lane").unwrap_or("unknown");
+        let pid = optional_u64(params, "pid").unwrap_or(0) as u32;
+        let (result, events) = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(token, lane, pid, (self.slot_clock)())?;
         self.emit_slot_events(events);
         Ok(result)
     }
 
-    fn rpc_slot_status(&self) -> Value {
-        let (status, events) = self.slots.lock().unwrap().status(epoch_secs());
+    fn rpc_slot_status(&self, params: &Value) -> Value {
+        let lane = optional_str(params, "lane").unwrap_or("unknown");
+        let (status, events) = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .status(lane, (self.slot_clock)());
         self.emit_slot_events(events);
         status
     }
@@ -3660,6 +3710,9 @@ pub struct ServeOptions {
     /// CAD-113 slot configuration: `Some` is verbatim (tests);
     /// `None` resolves `[host]` in pm.yaml, falling back to defaults.
     pub slots: Option<SlotConfig>,
+    /// The slot clock — `None` is `mono_secs`; tests inject a
+    /// counter they advance on demand instead of sleeping.
+    pub slot_clock: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
 }
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
@@ -3688,6 +3741,9 @@ fn resolve_slot_config(opts: &ServeOptions) -> SlotConfig {
         }
         if let Some(v) = o.priority_lanes {
             c.priority_lanes = v;
+        }
+        if let Some(v) = o.max_hold_secs {
+            c.max_hold_secs = v;
         }
     }
     c

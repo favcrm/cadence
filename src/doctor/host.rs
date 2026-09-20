@@ -138,12 +138,14 @@ pub struct HostOverrides {
     /// `jobs_per_lane` is the `CARGO_BUILD_JOBS` dispatch injects
     /// (default 4), `starve_secs` is the never-starve bound (default
     /// 900), `priority_lanes` are aliases whose test/suite requests
-    /// outrank ordinary ones (the reviewer lane).
+    /// outrank ordinary ones (the reviewer lane), `max_hold_secs`
+    /// reaps a forgotten hold (default 7200).
     pub build_slots: Option<u64>,
     pub suite_slots: Option<u64>,
     pub jobs_per_lane: Option<u64>,
     pub starve_secs: Option<u64>,
     pub priority_lanes: Option<Vec<String>>,
+    pub max_hold_secs: Option<u64>,
     /// Load watchdog: warn when load1 exceeds `load_warn_ratio`×cpus
     /// or io stall avg10 exceeds `io_stall_warn_pct`%.
     pub load_warn_ratio: Option<f64>,
@@ -336,7 +338,13 @@ impl Scan {
             now: SystemTime::now(),
             thresholds,
             linux: cfg!(target_os = "linux"),
-            slots: crate::client::rpc(state_dir, "slot_status", serde_json::json!({})).ok(),
+            slots: crate::client::rpc_timeout(
+                state_dir,
+                "slot_status",
+                serde_json::json!({"lane": crate::slots::default_lane()}),
+                std::time::Duration::from_secs(2),
+            )
+            .ok(),
             fs_probe: None,
             census: std::cell::OnceCell::new(),
         }

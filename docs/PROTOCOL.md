@@ -84,9 +84,9 @@ Error kinds:
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 | `agent_remove` | `alias` | deletes the agent + its history; refuses live endpoints |
 | `agent_gc` | `older_than?` | sweeps dead agents; `{removed:[alias]}` |
-| `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (the token). `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot |
-| `slot_release` | `token` | `{released:true,token,kind}` — unknown token is a named rejection |
-| `slot_status` | — | `{pools:{build,suite}:{capacity,held[]}, waiting[], config}` — also a reap pass: dead holders/waiters drop on the read |
+| `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (queue identity only — the daemon mints the `slot-*` token on grant). A re-poll adopts a hold only on an exact `(request_id, pid, lane, kind)` match; any other caller sharing the id queues. `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot |
+| `slot_release` | `token, lane?, pid?` | `{released:true,token,kind}` — the release must name the holding `(lane, pid)`; a foreign token is a named refusal, an unknown token a named rejection |
+| `slot_status` | `lane?` | `{pools:{build,suite}:{capacity,held[]}, waiting[], config}` — also a reap pass: dead holders/waiters drop on the read. The calling lane's holds include their `token`; other lanes' holds show identity only |
 
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
@@ -1009,7 +1009,10 @@ brokered claude approvals (see the managed claude section).
 ## Build slots (CAD-113)
 
 One bounded, fair, observable scheduler for cargo build/test work on a
-host, so lanes queue instead of thrashing. Wrap a build like
+host, so lanes queue instead of thrashing. The simplest consumer is
+`cadence build-slot run test -- cargo test --lib` — `run` acquires
+then *execs* the command, so the slot's holder is the real build
+process and its exit frees the slot. A manual wrap works too:
 `token=$(cadence build-slot acquire build --wait-secs 600); cargo build;
 cadence build-slot release $token` — the daemon owns the queue, the
 CLI only polls.
@@ -1019,22 +1022,43 @@ Two pools share one queue: `build`/`test` requests draw on
 1) — independent, so a queued full suite never starves ordinary
 builds. Grant order is FIFO with two modifiers: `test`/`suite`
 requests from a configured *priority lane* (`[host] priority_lanes` —
-the reviewer lane) outrank ordinary requests, and anything waiting
-longer than `starve_secs` (default 900) jumps to the front, so
-priority can never starve a lane out.
+the reviewer lane) outrank ordinary requests, and a `(lane, kind)`
+waiting continuously longer than `starve_secs` (default 900) jumps to
+the front — seniority rides the lane+kind, so a caller that re-queues
+under a new request id keeps its accumulated wait rather than
+restarting at the back.
 
-A slot is a token bound to a pid: `release` returns it, and a holder
-whose pid dies is reaped on the next acquire/status — a killed agent
-frees its slot, nothing is ever killed for one. Waiting is
-client-side: `slot_acquire` answers instantly with granted-or-position,
-and a polling caller keeps its place by refreshing `last_poll`; a
-request that goes silent past the waiter TTL (30s) or whose pid dies
-drops out of the queue. `probe:true` is the non-mutating read — it
-grants or reports position without ever joining the queue.
+A slot is a daemon-minted `slot-*` token bound to (lane, pid,
+pid-starttime): `release` must name the holding lane and pid, so one
+caller can never free another's hold. A re-poll whose `request_id`
+matches a hold adopts it only on an exact `(request_id, pid, lane,
+kind)` match — a second process sharing a natural request id queues
+like everyone else. A holder whose process dies or whose pid is
+recycled is reaped on the next acquire/status — a killed agent frees
+its slot, nothing is ever killed for one — and a hold past
+`max_hold_secs` (default 7200) is reaped as `hold expired` so a
+forgotten hold cannot wedge a pool. Waiting is client-side:
+`slot_acquire` answers instantly with granted-or-position, and a
+polling caller keeps its place by refreshing `last_poll`; a request
+that goes silent past the waiter TTL (30s) or whose pid dies drops
+out of the queue. `probe:true` is the non-mutating read — it grants
+or reports position without ever joining the queue. All slot ages
+ride a monotonic clock: an NTP step or suspend cannot age a waiter
+or expire a hold.
 
-The registry is in-memory on purpose: a daemon restart forgets every
-token and reaps every dead pid, which is the desired fail-closed
-semantics. `CADENCE_SUITE_LOCK` keeps working underneath as the
+Holds persist to `<state>/slots.json` (atomic, mode 0600) — the
+record is `(token, request_id, kind, lane, pid, pid-starttime,
+acquired_epoch)` plus the `(lane, kind)` seniority table. On daemon
+boot each persisted hold is revalidated: a hold survives restart only
+while its recorded process is still the same live process (pid +
+starttime), and the dead are dropped with a `slot_released` event
+(`holder died` / `pid recycled`) rather than silently re-granted.
+Waiters do not persist — their callers re-poll into the restored
+seniority table, so starvation order survives a restart too. One
+deadlock guard applies: a lane may never *queue* for one pool while
+holding a slot in the other — a grant that never waits is always
+allowed, so the safe order is simply "wait only while holding
+nothing". `CADENCE_SUITE_LOCK` keeps working underneath as the
 test-process suite slot — the daemon queue is the observable layer
 above it.
 
@@ -1045,21 +1069,26 @@ host:
   build_slots: 3        # concurrent build+test grants
   suite_slots: 1        # concurrent full-suite grants
   jobs_per_lane: 4      # CARGO_BUILD_JOBS `issue start`/`dispatch` injects
-  starve_secs: 900      # never-starve bound
+  starve_secs: 900      # never-starve bound on (lane, kind) seniority
+  max_hold_secs: 7200   # a forgotten hold is reaped past this
   priority_lanes: [qa-1]  # test/suite requests outrank ordinary ones
   load_warn_ratio: 1.0  # doctor --host load warn = ratio x cpus (fail 2x)
   io_stall_warn_pct: 30 # doctor --host io stall warn % (fail 60)
 ```
 
-`cadence issue start`/`dispatch` write `<worktree>/.env` with
-`CARGO_BUILD_JOBS=<jobs_per_lane>` and `CADENCE_BUILD_SLOT=<cadence
-binary>` so a worker never has to remember flags; existing foreign
-lines in `.env` are preserved. Observability: `slot_acquired` /
-`slot_waited` / `slot_released` events land on the requesting lane's
-event stream, `cadence status` carries a `slots:` footer line,
-`cadence build-slot status [--json]` shows holders and waiters, and
-`doctor --host`'s `load` check reports load, io stall and the queue.
-Nothing here kills a process or cancels anyone's work.
+`cadence issue start`/`dispatch` write `<worktree>/.env` atomically
+(mode 0600, existing modes and foreign lines preserved, symlinks
+refused) with `CARGO_BUILD_JOBS=<jobs_per_lane>` and
+`CADENCE_BUILD_SLOT=<cadence binary>` so a worker never has to
+remember flags. `build-slot run` exports `CADENCE_BUILD_SLOT_TOKEN` /
+`CADENCE_BUILD_SLOT_PID` / `CADENCE_BUILD_SLOT_LANE` to the command so
+a nested script can release its own hold early. Observability:
+`slot_acquired` / `slot_waited` / `slot_released` events land on the
+requesting lane's event stream, `cadence status` carries a `slots:`
+footer line, `cadence build-slot status [--json]` shows holders and
+waiters (your own lane's holds show tokens; others' show identity
+only), and `doctor --host`'s `load` check reports load, io stall and
+the queue. Nothing here kills a process or cancels anyone's work.
 
 ## Recovery
 
