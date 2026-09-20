@@ -189,25 +189,30 @@ fn auth_header(tok: &str) -> bool {
 
 /// Emit `[REDACTED]` for `toks[i]` (trailing whitespace kept) and
 /// keep eating while a quote the value opened stays unclosed —
-/// `--password "correct horse battery"` masks all three words.
+/// `--password "correct horse battery"` collapses the span to one
+/// marker inside the quotes.
 fn eat_value_at(toks: &[(&str, &str)], i: usize, out: &mut String) -> usize {
     let (tok, ws) = toks[i];
-    out.push_str(REDACTED);
-    out.push_str(ws);
-    let quote = match tok.chars().next() {
-        Some(q @ ('"' | '\'')) if tok.len() == q.len_utf8() || !tok.ends_with(q) => Some(q),
-        _ => None,
+    let Some(q) = tok.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+        out.push_str(REDACTED);
+        out.push_str(ws);
+        return i + 1;
     };
+    out.push(q);
+    out.push_str(REDACTED);
+    if tok.len() > q.len_utf8() && tok.ends_with(q) {
+        out.push(q);
+        out.push_str(ws);
+        return i + 1;
+    }
     let mut j = i + 1;
-    if let Some(q) = quote {
-        while j < toks.len() {
-            let (t, w) = toks[j];
-            out.push_str(REDACTED);
+    while j < toks.len() {
+        let (t, w) = toks[j];
+        j += 1;
+        if t.ends_with(q) {
+            out.push(q);
             out.push_str(w);
-            j += 1;
-            if t.ends_with(q) {
-                break;
-            }
+            break;
         }
     }
     j
@@ -256,21 +261,42 @@ fn scrub_line(line: &str, carry_eat: &mut bool, out: &mut String) {
         let (tok, ws) = toks[i];
         let bare = tok.trim_matches(|c| c == '"' || c == '\'');
 
-        // `Authorization:`/`Proxy-Authorization:` — mask the rest of
-        // the line; the scheme word is not the credential.
+        // `Authorization:`/`Proxy-Authorization:` — mask the
+        // credential; the scheme word is not secret. A quoted header
+        // (`-H "Authorization: …"`) stops the mask at the closing
+        // quote so trailing arguments survive; a bare header masks
+        // the rest of the line.
         if auth_header(tok) {
-            match bare.split_once(':') {
-                Some((name, _)) => {
-                    out.push_str(name);
-                    out.push_str(": ");
-                }
-                None => {
-                    out.push_str(tok);
-                    out.push(' ');
-                }
+            let q = tok.chars().next().filter(|c| matches!(c, '"' | '\''));
+            let name_end = bare.find([':', '=']).unwrap_or(bare.len());
+            if let Some(q) = q {
+                out.push(q);
             }
+            out.push_str(&bare[..name_end]);
+            out.push_str(": ");
             out.push_str(REDACTED);
-            break;
+            match q {
+                Some(q) if tok.len() > q.len_utf8() && tok.ends_with(q) => {
+                    out.push(q);
+                    out.push_str(ws);
+                    i += 1;
+                }
+                Some(q) => {
+                    let mut j = i + 1;
+                    while j < toks.len() {
+                        let (t, w) = toks[j];
+                        j += 1;
+                        if t.ends_with(q) {
+                            out.push(q);
+                            out.push_str(w);
+                            break;
+                        }
+                    }
+                    i = j;
+                }
+                None => break,
+            }
+            continue;
         }
 
         // `--password`, `-p`, `-u` — value is the next token (unless
@@ -811,6 +837,25 @@ mod tests {
             scrub_body("the key point is clear\nthe token was invalid"),
             "the key point is clear\nthe token was invalid"
         );
+    }
+
+    #[test]
+    fn scrub_body_quoted_header_keeps_trailing_args() {
+        let out =
+            scrub_body("curl -H \"Authorization: Basic dXNlcjpwYXNz\" https://api.example.com");
+        assert!(!out.contains("dXNlcjpwYXNz"), "{out}");
+        assert!(out.contains("https://api.example.com"), "{out}");
+        // A bare header line still masks to end-of-line.
+        let bare = scrub_body("Authorization: Bearer abc.def.ghi tail");
+        assert!(!bare.contains("abc.def.ghi"), "{bare}");
+        assert!(!bare.contains("tail"), "{bare}");
+    }
+
+    #[test]
+    fn scrub_body_collapses_quoted_span_to_one_marker() {
+        let out = scrub_body("--password \"correct horse battery\"");
+        assert!(!out.contains("horse"), "{out}");
+        assert_eq!(out.matches(REDACTED).count(), 1, "{out}");
     }
 
     #[test]
