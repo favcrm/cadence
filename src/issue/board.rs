@@ -941,6 +941,7 @@ mod tests {
             closed: None,
             worktree: None,
             cargo_target: None,
+            agent: None,
         }];
         let vs = views(Path::new("/no-notes"), vec![i]);
         let card = card_json(view_of(&vs, "CAD-1"));

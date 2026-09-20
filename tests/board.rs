@@ -1894,19 +1894,31 @@ fn post_commit_hook_refuses_mid_sequence_and_detached() {
 /// integration.rs wraps in TestDaemon, pared down to what the board
 /// routes need.
 struct UiDaemon {
-    state: TempDir,
+    state: PathBuf,
+    _tmp: Option<TempDir>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl UiDaemon {
     fn start() -> Self {
-        let state = TempDir::new().unwrap();
-        let owned = state.path().to_path_buf();
+        let tmp = TempDir::new().unwrap();
+        Self::serve(tmp.path().to_path_buf(), Some(tmp))
+    }
+
+    /// Serve on a caller-owned state dir — for fixtures whose `state`
+    /// the cli-under-test already points at.
+    fn start_on(state: PathBuf) -> Self {
+        Self::serve(state, None)
+    }
+
+    fn serve(state: PathBuf, tmp: Option<TempDir>) -> Self {
+        let owned = state.clone();
         let handle = thread::spawn(move || {
             let _ = daemon::serve(&owned);
         });
         let d = Self {
             state,
+            _tmp: tmp,
             handle: Some(handle),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1920,7 +1932,7 @@ impl UiDaemon {
     }
 
     fn rpc_opt(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
-        client::rpc(self.state.path(), method, params)
+        client::rpc(&self.state, method, params)
     }
 
     fn rpc(&self, method: &str, params: Value) -> Value {
@@ -1928,7 +1940,7 @@ impl UiDaemon {
     }
 
     fn state(&self) -> PathBuf {
-        self.state.path().to_path_buf()
+        self.state.clone()
     }
 }
 
@@ -4066,8 +4078,10 @@ fn issue_finish_daemon_down_force_and_idempotent() {
     let wt = repo.join(".cadence/wt/d-1-done");
     assert!(wt.is_dir());
 
-    // Owner 'operator' (start filled it) can't be checked — the
-    // daemon is down and finish refuses rather than guessing.
+    // A stale socket is a daemon that was there and stopped answering
+    // — owner 'operator' can't be checked and finish refuses rather
+    // than guessing.
+    std::fs::write(state.join("cadence.sock"), "stale").unwrap();
     let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1"]);
     assert!(!ok, "{err}");
     let msg = err["error"].as_str().unwrap();
@@ -4109,6 +4123,18 @@ fn issue_finish_daemon_down_force_and_idempotent() {
     assert!(front.contains("closed: true"), "{front}");
     assert!(front.contains("status: doing"), "status untouched: {front}");
 
+    // A cleanly stopped daemon removes its socket — that means "no
+    // agents", not "unreachable": the /proc and pane scans carry the
+    // check and a clean merged worktree finishes without --force.
+    std::fs::remove_file(state.join("cadence.sock")).unwrap();
+    assert!(cli(&pm, &state, &["issue", "new", "Idle", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-2"]).0);
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-2"]);
+    assert!(
+        ok && out["finished"] == true && out["overrode"] == json!([]),
+        "no daemon at all must not block a clean finish: {out}"
+    );
+
     // Second finish is a no-op, not an error.
     let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1"]);
     assert!(ok, "{out}");
@@ -4116,16 +4142,16 @@ fn issue_finish_daemon_down_force_and_idempotent() {
 
     // An issue never started has nothing to finish.
     assert!(cli(&pm, &state, &["issue", "new", "Never", "--project", "demo"]).0);
-    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-2"]);
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-3"]);
     assert!(!ok && err["error"].as_str().unwrap().contains("nothing to finish"));
 
     // --keep-branch leaves the local branch but still closes the refs.
     assert!(cli(&pm, &state, &["issue", "new", "Keep", "--project", "demo"]).0);
-    assert!(cli(&pm, &state, &["issue", "start", "D-3"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-4"]).0);
     let (ok, out) = cli(
         &pm,
         &state,
-        &["issue", "finish", "D-3", "--force", "--keep-branch"],
+        &["issue", "finish", "D-4", "--force", "--keep-branch"],
     );
     assert!(
         ok && out["kept_branch"] == true && out["deleted_branch"] == false,
@@ -4134,19 +4160,23 @@ fn issue_finish_daemon_down_force_and_idempotent() {
     assert!(
         git(
             &repo,
-            &["rev-parse", "--verify", "--quiet", "cadence/d-3-keep"]
+            &["rev-parse", "--verify", "--quiet", "cadence/d-4-keep"]
         )
         .0
     );
 }
 
-/// With no owner recorded (hand-edited history), the daemon check is
-/// skipped and the worktree-side guards are observable without one:
-/// a dirty worktree refuses listing the files, an unmerged+unpushed
-/// branch refuses, and finish succeeds once the branch is merged.
+/// With no owner recorded (hand-edited history), the owner check is
+/// skipped; the bound-message enumeration still needs a daemon that
+/// answers (an unanswerable enumeration refuses — a task-bound
+/// kickoff could hide anywhere). The worktree-side guards stay
+/// observable: a dirty worktree refuses listing the files, an
+/// unmerged+unpushed branch refuses, and finish succeeds once the
+/// branch is merged.
 #[test]
 fn issue_finish_dirty_and_unmerged_refusals() {
     let (_tmp, pm, state, repo) = start_fx();
+    let _d = UiDaemon::start_on(state.clone());
     assert!(
         cli(
             &pm,
@@ -4217,6 +4247,32 @@ fn issue_finish_dirty_and_unmerged_refusals() {
         .0
     );
     assert_eq!(commits(&pm), before + 1);
+
+    // Unmerged but pushed: a plain finish (no --remote) leaves the
+    // remote alone, so the pushed copy IS the survivability evidence
+    // — the local branch is deleted, not kept.
+    assert!(cli(&pm, &state, &["issue", "new", "Pushd", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-2"]).0);
+    assert!(cli(&pm, &state, &["issue", "set", "D-2", "owner="]).0);
+    let wt2 = repo.join(".cadence/wt/d-2-pushd");
+    std::fs::write(wt2.join("p.txt"), "x").unwrap();
+    git(&wt2, &["add", "-A"]);
+    git(&wt2, &["commit", "-qm", "pushed work"]);
+    let tip = git(&repo, &["rev-parse", "cadence/d-2-pushd"]).1;
+    git(
+        &repo,
+        &[
+            "update-ref",
+            "refs/remotes/origin/cadence/d-2-pushd",
+            tip.trim(),
+        ],
+    );
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-2"]);
+    assert!(
+        ok && out["finished"] == true && out["deleted_branch"] == true,
+        "pushed evidence alone still deletes the local on a plain finish: {out}"
+    );
+    assert!(!wt2.exists());
 }
 
 /// Drop the recorded owner (and commit the edit) so `issue finish`
@@ -4249,6 +4305,7 @@ fn strip_owner(pm: &Path, id: &str) {
 #[test]
 fn issue_finish_squash_cherry_and_ignored() {
     let (_tmp, pm, state, repo) = start_fx();
+    let _d = UiDaemon::start_on(state.clone());
     // The build-symlink rule lives in the repo's .gitignore, like the
     // real cadence repo.
     std::fs::write(repo.join(".gitignore"), "/ui/node_modules\n").unwrap();
@@ -4398,6 +4455,7 @@ fn issue_finish_squash_cherry_and_ignored() {
 #[test]
 fn issue_finish_pr_merge_via_gh() {
     let (_tmp, pm, state, repo) = start_fx();
+    let _d = UiDaemon::start_on(state.clone());
     git(
         &repo,
         &["remote", "add", "origin", "https://github.com/o/r.git"],
@@ -4419,15 +4477,33 @@ fn issue_finish_pr_merge_via_gh() {
     );
 
     // D-1: branch commits not on main, nothing pushed — but gh says
-    // a PR with this head is MERGED → finished, merged_by "pr".
+    // a PR whose recorded head IS this tip is MERGED → finished,
+    // merged_by "pr". A bare name match proves nothing (CAD-106):
+    // first answer with a head oid that does not cover the tip.
     assert!(cli(&pm, &state, &["issue", "new", "Pr", "--project", "demo"]).0);
     assert!(cli(&pm, &state, &["issue", "start", "D-1"]).0);
     let wt = repo.join(".cadence/wt/d-1-pr");
     std::fs::write(wt.join("p.txt"), "p").unwrap();
     git(&wt, &["add", "-A"]);
     git(&wt, &["commit", "-qm", "pr work"]);
+    let tip = git(&repo, &["rev-parse", "cadence/d-1-pr"]).1;
     strip_owner(&pm, "D-1");
-    set_gh("[{\"number\":7}]");
+    set_gh("[{\"number\":7,\"headRefOid\":\"0000000000000000000000000000000000000000\",\"baseRefName\":\"main\"}]");
+    let (ok, err) = cli_env(
+        &pm,
+        &state,
+        &["issue", "finish", "D-1"],
+        &[("PATH", path.as_str())],
+    );
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().contains("neither merged"),
+        "a stale headRefOid must not prove the merge: {err}"
+    );
+    assert!(wt.is_dir());
+    set_gh(&format!(
+        "[{{\"number\":7,\"headRefOid\":\"{tip}\",\"baseRefName\":\"main\"}}]"
+    ));
     let (ok, out) = cli_env(
         &pm,
         &state,
