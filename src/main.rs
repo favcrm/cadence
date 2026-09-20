@@ -1114,6 +1114,10 @@ enum SessionAction {
         /// Never restarts a running daemon, never removes anything.
         #[arg(long)]
         fix: bool,
+        /// Read the host report from this JSON file instead of
+        /// scanning — tests/debug; the run is labelled fixture-backed.
+        #[arg(long, hide = true)]
+        host_report: Option<PathBuf>,
     },
     /// End-of-session: `issue finish --merged` when this build has it,
     /// stop agents idle past --idle-secs, `agent gc --older-than 1h`,
@@ -1130,13 +1134,18 @@ enum SessionAction {
         /// Print the plan — candidates listed, nothing changed.
         #[arg(long)]
         dry_run: bool,
-        /// Pass --force to the merged-worktree finish (recorded).
+        /// Accepted for muscle memory — the merged sweep has no force
+        /// path; recorded as ignored in the run's notes.
         #[arg(long)]
         force_finish: bool,
         /// An agent idle longer than this (seconds) may be stopped
         /// [default 1800].
         #[arg(long, default_value_t = 1800)]
         idle_secs: u64,
+        /// Read the host report from this JSON file instead of
+        /// scanning — tests/debug; the run is labelled fixture-backed.
+        #[arg(long, hide = true)]
+        host_report: Option<PathBuf>,
     },
 }
 
@@ -3449,27 +3458,33 @@ fn run() -> Result<i32> {
             state_dir,
         }),
         Commands::Session { action } => match action {
-            SessionAction::Start { project, json, fix } => {
-                cadence_agent::session::run_start(&cadence_agent::session::StartOptions {
-                    project,
-                    json,
-                    fix,
-                    cwd: std::env::current_dir()?,
-                    state_dir,
-                })
-            }
+            SessionAction::Start {
+                project,
+                json,
+                fix,
+                host_report,
+            } => cadence_agent::session::run_start(&cadence_agent::session::StartOptions {
+                project,
+                json,
+                fix,
+                host_report,
+                cwd: std::env::current_dir()?,
+                state_dir,
+            }),
             SessionAction::End {
                 project,
                 json,
                 dry_run,
                 force_finish,
                 idle_secs,
+                host_report,
             } => cadence_agent::session::run_end(&cadence_agent::session::EndOptions {
                 project,
                 json,
                 dry_run,
                 force_finish,
                 idle_secs,
+                host_report,
                 cwd: std::env::current_dir()?,
                 state_dir,
             }),

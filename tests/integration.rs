@@ -17060,9 +17060,27 @@ fn run_session_env(
     cmd.output().unwrap()
 }
 
-/// A clean doctor-host report on disk — `CADENCE_SESSION_HOST_JSON`
-/// makes the verbs read it instead of scanning the real host, so the
-/// session tests are identical on a dev box and a 97%-full CI host.
+/// `run_session` with `--host-report <fixture>` appended — the flag,
+/// never an env var, carries the fixture so an ambient environment
+/// cannot soften the gate.
+fn run_session_host(
+    state: &Path,
+    pm: &Path,
+    cwd: &Path,
+    args: &[&str],
+    host: &Path,
+    envs: &[(&str, &Path)],
+) -> std::process::Output {
+    let mut v: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+    v.push("--host-report".to_string());
+    v.push(host.display().to_string());
+    let argrefs: Vec<&str> = v.iter().map(|a| a.as_str()).collect();
+    run_session_env(state, pm, cwd, &argrefs, envs)
+}
+
+/// A clean doctor-host report on disk — `--host-report` makes the
+/// verbs read it instead of scanning the real host, so the session
+/// tests are identical on a dev box and a 97%-full CI host.
 fn clean_host(dir: &Path) -> PathBuf {
     let f = dir.join("host-report.json");
     std::fs::write(&f, r#"{"level":"ok","checks":[]}"#).unwrap();
@@ -17110,8 +17128,7 @@ fn session_start_reports_failures_and_fix_only_starts_ui() {
     );
 
     let host = clean_host(dir.path());
-    let envs = [("CADENCE_SESSION_HOST_JSON", host.as_path())];
-    let out = run_session_env(&state, &pm, &repo, &["session", "start"], &envs);
+    let out = run_session_host(&state, &pm, &repo, &["session", "start"], &host, &[]);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -17145,7 +17162,14 @@ fn session_start_reports_failures_and_fix_only_starts_ui() {
         l.local_addr().unwrap().port()
     };
     std::fs::write(state.join("ui.json"), format!("{{\"port\": {port}}}")).unwrap();
-    let out = run_session_env(&state, &pm, &repo, &["session", "start", "--fix"], &envs);
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--fix"],
+        &host,
+        &[],
+    );
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -17259,14 +17283,18 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let envs = [
-        ("CADENCE_SESSION_HOST_JSON", host.as_path()),
-        ("PATH", Path::new(&path_env)),
-    ];
+    let envs = [("PATH", Path::new(&path_env))];
 
     // Dry run: names the stop candidates and the merged worktree,
     // changes nothing.
-    let out = run_session_env(&state, &pm, &repo, &["session", "end", "--dry-run"], &envs);
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--dry-run"],
+        &host,
+        &envs,
+    );
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -17314,11 +17342,12 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
     );
 
     // Real run: only the agent idle past --idle-secs is stopped.
-    let out = run_session_env(
+    let out = run_session_host(
         &state,
         &pm,
         &repo,
         &["session", "end", "--idle-secs", "1800"],
+        &host,
         &envs,
     );
     let text = format!(
@@ -17381,7 +17410,7 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
     assert!(md.contains("old-idle"), "stopped agent recorded:\n{md}");
 
     // A second real run the same day never overwrites the first.
-    let out = run_session_env(&state, &pm, &repo, &["session", "end"], &envs);
+    let out = run_session_host(&state, &pm, &repo, &["session", "end"], &host, &envs);
     // The host fixture is clean and nothing failed — this is a green
     // run outright, on any host.
     assert!(
@@ -17443,13 +17472,7 @@ fn session_end_stop_race_rechecks_show() {
         ],
     );
     let host = clean_host(tmp.path());
-    let out = run_session_env(
-        &state,
-        &pm,
-        &repo,
-        &["session", "end"],
-        &[("CADENCE_SESSION_HOST_JSON", host.as_path())],
-    );
+    let out = run_session_host(&state, &pm, &repo, &["session", "end"], &host, &[]);
     assert!(
         out.status.success(),
         "end failed:\n{}",
@@ -17607,12 +17630,13 @@ fn session_end_project_scopes_sweep() {
         ],
     );
     let host = clean_host(tmp.path());
-    let out = run_session_env(
+    let out = run_session_host(
         &state,
         &pm_dir,
         &repo_a,
         &["session", "end", "--project", "aaa"],
-        &[("CADENCE_SESSION_HOST_JSON", host.as_path())],
+        &host,
+        &[],
     );
     assert!(
         out.status.success(),
@@ -17674,14 +17698,14 @@ fn session_json_single_document_and_project_validation() {
     };
     std::fs::write(state.join("ui.json"), format!("{{\"port\": {port}}}")).unwrap();
     let host = clean_host(tmp.path());
-    let envs = [("CADENCE_SESSION_HOST_JSON", host.as_path())];
 
-    let out = run_session_env(
+    let out = run_session_host(
         &state,
         &pm,
         &repo,
         &["session", "start", "--fix", "--json"],
-        &envs,
+        &host,
+        &[],
     );
     let text = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str::<Value>(text.trim())
@@ -17694,7 +17718,14 @@ fn session_json_single_document_and_project_validation() {
     );
     let _ = run_session(&state, &pm, &repo, &["ui", "stop"]);
 
-    let out = run_session_env(&state, &pm, &repo, &["session", "end", "--json"], &envs);
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--json"],
+        &host,
+        &[],
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str::<Value>(text.trim())
         .unwrap_or_else(|e| panic!("end --json is not one document: {e}\n{text}"));
@@ -17704,7 +17735,7 @@ fn session_json_single_document_and_project_validation() {
         vec!["session", "start", "--project", "nosuch"],
         vec!["session", "end", "--project", "nosuch"],
     ] {
-        let out = run_session_env(&state, &pm, &repo, &args, &envs);
+        let out = run_session_host(&state, &pm, &repo, &args, &host, &[]);
         assert!(
             !out.status.success(),
             "{args:?} accepted an unknown project:\n{}",
@@ -17746,9 +17777,7 @@ fn session_end_host_fail_caps_at_warn() {
         "detail":"/ 97% full","remedy":"clean up"}]}"#,
     )
     .unwrap();
-    let envs = [("CADENCE_SESSION_HOST_JSON", host.as_path())];
-
-    let out = run_session_env(&state, &pm, &repo, &["session", "start"], &envs);
+    let out = run_session_host(&state, &pm, &repo, &["session", "start"], &host, &[]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -17756,7 +17785,7 @@ fn session_end_host_fail_caps_at_warn() {
         String::from_utf8_lossy(&out.stdout)
     );
 
-    let out = run_session_env(&state, &pm, &repo, &["session", "end"], &envs);
+    let out = run_session_host(&state, &pm, &repo, &["session", "end"], &host, &[]);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -17807,9 +17836,14 @@ fn session_end_orphans_report_exe_and_argc_never_argv() {
         ),
     )
     .unwrap();
-    let envs = [("CADENCE_SESSION_HOST_JSON", host.as_path())];
-
-    let out = run_session_env(&state, &pm, &repo, &["session", "end", "--dry-run"], &envs);
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--dry-run"],
+        &host,
+        &[],
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         text.contains("orphans: 2 orphaned pid(s)"),
@@ -17841,5 +17875,120 @@ fn session_end_orphans_report_exe_and_argc_never_argv() {
         out.status.code(),
         Some(1),
         "warn host, dry-run clean: exit 1:\n{text}"
+    );
+}
+
+/// Round-4 blocker: the host fixture is `--host-report`, never an env
+/// var — an ambient `CADENCE_SESSION_HOST_JSON` must not soften the
+/// gate, a bad fixture path is a hard error, and every fixture run is
+/// labelled in text and `--json`.
+#[test]
+fn session_host_report_flag_labels_errors_and_env_is_dead() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, notes) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("notes"),
+    );
+    for d in [&state, &pm, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    seed_pm(&pm, &repo, &notes);
+    seed_repo(&repo);
+    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+
+    // A bad fixture path errors — it never falls through to a real
+    // scan (that would read the real host with no signal).
+    let out = run_session(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--host-report", "/nonexistent/host.json"],
+    );
+    let msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() && msg.contains("/nonexistent/host.json"),
+        "a bad fixture path must error naming the path:\n{msg}"
+    );
+    // Same for a parsable-path-but-not-JSON file.
+    let garbage = tmp.path().join("not-json.json");
+    std::fs::write(&garbage, "not json at all").unwrap();
+    let out = run_session(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--host-report", garbage.to_str().unwrap()],
+    );
+    assert!(
+        !out.status.success(),
+        "an unparsable fixture must error:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A fixture run is labelled — in text and in --json.
+    let host = clean_host(tmp.path());
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--dry-run"],
+        &host,
+        &[],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("real host not scanned"),
+        "text output labels the fixture:\n{text}"
+    );
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--dry-run", "--json"],
+        &host,
+        &[],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("end --json not one document: {e}\n{text}"));
+    assert_eq!(
+        j["host_source"].as_str().unwrap_or_default(),
+        format!("fixture {}", host.display()),
+        "--json labels the fixture:\n{text}"
+    );
+
+    // The old env var is dead: set it to a *failing* fixture and run
+    // without the flag — the real host is scanned, the sentinel
+    // detail never appears, and host_source reports `scan`.
+    let sentinel = tmp.path().join("env-fixture.json");
+    std::fs::write(
+        &sentinel,
+        r#"{"level":"fail","checks":[{"name":"disk","level":"fail",
+        "detail":"SENTINEL-DISK-SHOULD-NEVER-APPEAR","remedy":"x"}]}"#,
+    )
+    .unwrap();
+    let out = run_session_env(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--json"],
+        &[("CADENCE_SESSION_HOST_JSON", sentinel.as_path())],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("SENTINEL-DISK-SHOULD-NEVER-APPEAR"),
+        "the env var must have no effect — it read the fixture:\n{text}"
+    );
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("end --json not one document: {e}\n{text}"));
+    assert_eq!(
+        j["host_source"].as_str().unwrap_or_default(),
+        "scan",
+        "env-set fixture must report a real scan:\n{text}"
     );
 }

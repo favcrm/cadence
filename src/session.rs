@@ -280,25 +280,41 @@ fn scrub_line(s: &str) -> String {
 /// The host scan with the command's cwd — `Scan::host` defaults to
 /// the process cwd, which is the same thing in practice but the
 /// explicit override keeps the option field honest.
+/// `fixture <path>` when the host report came from `--host-report`,
+/// `scan` when the real `doctor::host::run` ran — the `--json` payload
+/// labels it so no fixture run reads as a real scan.
+fn host_source(fixture: Option<&Path>) -> String {
+    fixture
+        .map(|p| format!("fixture {}", p.display()))
+        .unwrap_or_else(|| "scan".to_string())
+}
+
 fn host_scan_for(state_dir: PathBuf, cwd: PathBuf) -> doctor::host::Scan {
     let mut scan = doctor::host::Scan::host(&state_dir);
     scan.cwd = cwd;
     scan
 }
 
-/// The host report — normally `doctor::host::run`, overridden by the
-/// JSON fixture named in `CADENCE_SESSION_HOST_JSON` so tests can pin
-/// any disk/process state without touching the real host.
-fn host_report(scan: &doctor::host::Scan) -> Value {
-    if let Ok(path) = std::env::var("CADENCE_SESSION_HOST_JSON") {
-        if let Some(report) = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        {
-            return report;
+/// The host report — `doctor::host::run`, or the JSON fixture passed
+/// explicitly via `--host-report`. Not an env var: an ambient
+/// `CADENCE_*` must never soften the go/no-go gate, and an unreadable
+/// or unparsable fixture is a hard error — never a silent fallthrough
+/// to the real scan (a typo'd path would read the real host again with
+/// no signal, reintroducing the coupling the fixture exists to remove).
+fn host_report(scan: &doctor::host::Scan, fixture: Option<&Path>) -> Result<Value> {
+    match fixture {
+        None => Ok(doctor::host::run(scan)),
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| Error::rejected(format!("--host-report {}: {e}", path.display())))?;
+            serde_json::from_str(&text).map_err(|e| {
+                Error::rejected(format!(
+                    "--host-report {}: not a doctor --host report ({e})",
+                    path.display()
+                ))
+            })
         }
     }
-    doctor::host::run(scan)
 }
 
 /// Display detail for one check — the orphans check's own detail
@@ -372,9 +388,17 @@ fn orphan_items(c: &Value) -> Vec<String> {
 
 /// A `doctor --host` report as one Row: worst level wins, each non-ok
 /// check becomes an item with its remedy. Orphan checks get count-only
-/// details plus per-pid `exe (arg count)` items — no argv.
-fn host_row(name: &'static str, report: &Value) -> Row {
+/// details plus per-pid `exe (arg count)` items — no argv. A fixture
+/// (`--host-report`) is labelled in the row — no fixture run can be
+/// mistaken for a real scan.
+fn host_row(name: &'static str, report: &Value, fixture: Option<&Path>) -> Row {
     let mut row = Row::new(name);
+    if let Some(path) = fixture {
+        row.items.push(format!(
+            "fixture {} — real host not scanned",
+            path.display()
+        ));
+    }
     let level = match report["level"].as_str() {
         Some("fail") => Sev::Fail,
         Some("warn") => Sev::Warn,
@@ -680,6 +704,8 @@ pub struct StartOptions {
     pub project: Option<String>,
     pub json: bool,
     pub fix: bool,
+    /// `--host-report` fixture — debug/tests only; labelled in output.
+    pub host_report: Option<PathBuf>,
     pub cwd: PathBuf,
     pub state_dir: PathBuf,
 }
@@ -691,8 +717,11 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
     // ---- host: the CAD-72 watchdog — disk, WAL, pipes, orphans,
     // temp dirs, stale worktrees in one read-only scan ----
     let sc = scope(opts.project.as_deref())?;
-    let host_scan = host_report(&host_scan_for(opts.state_dir.clone(), opts.cwd.clone()));
-    let host = host_row("host", &host_scan);
+    let host_scan = host_report(
+        &host_scan_for(opts.state_dir.clone(), opts.cwd.clone()),
+        opts.host_report.as_deref(),
+    )?;
+    let host = host_row("host", &host_scan, opts.host_report.as_deref());
     rows.push(host);
 
     // ---- binary vs main ----
@@ -795,33 +824,44 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
         }
         Some(pid) => {
             let mut detail = format!("pid {pid}, :{port}");
-            if ui::health(&opts.state_dir).is_none() {
+            let unhealthy = ui::health(&opts.state_dir).is_none();
+            if unhealthy {
                 detail.push_str(", health probe failed");
             }
+            // `ts_live` is the post-fix truth: a persisted mapping that
+            // is not serving lifts the row to warn even after `--fix`
+            // ran something else (`board.fixed` set by `ui start` must
+            // not mask a dead mapping or an errored ts_start).
+            let mut ts_live = true;
             if let Some(ts) = &ui_opts.tailscale {
-                let live = ui::serve_has_target(&ts.target).unwrap_or(false);
-                if live {
-                    detail.push_str(&format!(", shared {}", ts.url()));
-                } else if opts.fix {
+                let mut live = ui::serve_has_target(&ts.target).unwrap_or(false);
+                if !live && opts.fix {
                     match ui::ts_start_quiet(&opts.state_dir, ts.https_port, ui_opts.read_only) {
                         Ok(_) => {
-                            board.fixed = Some(format!("ui tailscale start → {}", ts.url()));
-                            detail.push_str(&format!(", shared {}", ts.url()));
+                            live = ui::serve_has_target(&ts.target).unwrap_or(false);
+                            if live {
+                                board.fixed = Some(format!("ui tailscale start → {}", ts.url()));
+                                fixes.push(format!("ui tailscale start → {}", ts.url()));
+                            } else {
+                                fixes.push(
+                                    "ui tailscale start ran but the mapping is still not live"
+                                        .to_string(),
+                                );
+                            }
                         }
-                        Err(e) => detail.push_str(&format!(", tailscale fix failed: {e}")),
+                        Err(e) => fixes.push(format!("ui tailscale start failed: {e}")),
                     }
+                }
+                ts_live = live;
+                if live {
+                    detail.push_str(&format!(", shared {}", ts.url()));
                 } else {
                     detail.push_str(", tailscale mapping not live");
                 }
             }
-            let unhealthy = ui::health(&opts.state_dir).is_none();
-            let ts_missing = ui_opts.tailscale.is_some()
-                && board.fixed.is_none()
-                && !ui::serve_has_target(&ui_opts.tailscale.as_ref().unwrap().target)
-                    .unwrap_or(false);
             board = if unhealthy {
                 board.warn(detail, "cadence ui status")
-            } else if ts_missing {
+            } else if !ts_live {
                 board.warn(detail, "cadence ui tailscale start")
             } else {
                 board.ok(detail)
@@ -990,10 +1030,10 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
     rows.push(recon);
     rows.push(inbox);
 
-    finish_start(rows, opts.json)
+    finish_start(rows, opts.json, host_source(opts.host_report.as_deref()))
 }
 
-fn finish_start(rows: Vec<Row>, json_out: bool) -> Result<i32> {
+fn finish_start(rows: Vec<Row>, json_out: bool, host_source: String) -> Result<i32> {
     let worst = rows.iter().map(|r| r.sev).max().unwrap_or(Sev::Ok);
     let exit = match worst {
         Sev::Ok => 0,
@@ -1006,6 +1046,7 @@ fn finish_start(rows: Vec<Row>, json_out: bool) -> Result<i32> {
             serde_json::to_string_pretty(&json!({
                 "kind": "session-start",
                 "go": worst != Sev::Fail,
+                "host_source": host_source,
                 "checks": rows.iter().map(|r| r.json()).collect::<Vec<_>>(),
             }))
             .unwrap_or_default()
@@ -1032,6 +1073,8 @@ pub struct EndOptions {
     pub dry_run: bool,
     pub force_finish: bool,
     pub idle_secs: u64,
+    /// `--host-report` fixture — debug/tests only; labelled in output.
+    pub host_report: Option<PathBuf>,
     pub cwd: PathBuf,
     pub state_dir: PathBuf,
 }
@@ -1039,6 +1082,13 @@ pub struct EndOptions {
 pub fn run_end(opts: &EndOptions) -> Result<i32> {
     let now = itime::now_epoch();
     let sc = scope(opts.project.as_deref())?;
+    // A `--host-report` fixture is loaded (and validated) before any
+    // sweep, stop or gc can run — a bad path must not error *after*
+    // the mutations it was meant to observe.
+    let host_scan = host_report(
+        &host_scan_for(opts.state_dir.clone(), opts.cwd.clone()),
+        opts.host_report.as_deref(),
+    )?;
     let fl = fleet(&opts.state_dir);
     let mut rows: Vec<Row> = Vec::new();
     let mut done = EndActions::default();
@@ -1293,8 +1343,7 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     // a gate: a full disk is `warn` here — `session start` is where a
     // full host is correctly `fail` — so only this verb's own failures
     // (a sweep RPC error, an unwritable handoff) set exit 2. ----
-    let host_scan = host_report(&host_scan_for(opts.state_dir.clone(), opts.cwd.clone()));
-    let mut sweep_row = host_row("sweep", &host_scan);
+    let mut sweep_row = host_row("sweep", &host_scan, opts.host_report.as_deref());
     if sweep_row.sev == Sev::Fail {
         sweep_row.sev = Sev::Warn;
     }
@@ -1352,6 +1401,7 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             serde_json::to_string_pretty(&json!({
                 "kind": "session-end",
                 "dry_run": opts.dry_run,
+                "host_source": host_source(opts.host_report.as_deref()),
                 "steps": rows.iter().map(|r| r.json()).collect::<Vec<_>>(),
                 "stop_candidates": stop_candidates,
                 "stopped": done.stopped,
