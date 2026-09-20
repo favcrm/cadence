@@ -20177,22 +20177,30 @@ fn slot_opts_clock(
 
 /// Plant `alias` as a live pty pane rooted at `pid` — the endpoint
 /// facts the slot caller-identity derivation reads (CAD-113). The row
-/// stays otherwise inert: provider `fake` never spawns an actor.
+/// stays otherwise inert: registered as an actorless `inbox` pair and
+/// marked `enabled=0`, so neither a register-time `set_identity` nor a
+/// restart's relaunch sweep can overwrite or detach the planted facts.
 /// `slot_*` RPCs derive caller identity from `SO_PEERCRED` + /proc
 /// ancestry, so a test lane is only reachable from processes whose
 /// ancestry includes this pid.
 fn plant_pane(d: &TestDaemon, alias: &str, pid: u32) {
-    // `agent_register` on an existing alias errors — idempotent on a
-    // daemon restarted over a kept state dir.
+    // Register as an `inbox` mailbox: the pair owns no actor, so no
+    // async `set_identity` can land after this plant and overwrite
+    // the pid (`agent_register` on an existing alias errors —
+    // idempotent on a daemon restarted over a kept state dir). And
+    // `enabled=0` keeps a restarted daemon's relaunch sweep from
+    // spawning a pty actor for the row — its open cannot verify a
+    // planted pane and the exit-detach clears the pid the pane map
+    // resolves callers by (the CAD-113 CI flake).
     let _ = d.rpc(
         "agent_register",
-        json!({"alias": alias, "provider": "fake",
-               "endpoint_kind": "fake",
+        json!({"alias": alias, "provider": "inbox",
+               "endpoint_kind": "inbox",
                "cwd": d.dir.path().to_str().unwrap()}),
     );
     let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
     conn.execute(
-        "UPDATE agents SET endpoint_kind='pty', pid=?1, \
+        "UPDATE agents SET endpoint_kind='pty', pid=?1, enabled=0, \
             generation='planted', session_id='planted' WHERE alias=?2",
         rusqlite::params![pid as i64, alias],
     )
