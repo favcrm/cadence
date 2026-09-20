@@ -18790,3 +18790,67 @@ fn session_host_report_flag_labels_errors_and_env_is_dead() {
         "env-set fixture must report a real scan:\n{text}"
     );
 }
+
+/// CAD-146: piping output into a reader that closes early
+/// (`cadence … | head -12`) must exit 0 quietly. Rust ignores
+/// SIGPIPE, so the closed read end turns the next stdout write into
+/// EPIPE and `println!` panics — the startup panic hook turns exactly
+/// that failure into exit 0. The read end is dropped before the
+/// first write so the broken pipe is deterministic.
+#[test]
+fn issue_ls_survives_a_closed_downstream_pipe() {
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, home, state) = (
+        tmp.path().join("pm"),
+        tmp.path().join("home"),
+        tmp.path().join("state"),
+    );
+    for d in [&pm_dir, &home, &state] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    issue_cli(&home, &state, &pm_dir, &["issue", "init"]);
+    issue_cli(
+        &home,
+        &state,
+        &pm_dir,
+        &["issue", "project", "add", "demo", "--prefix", "D"],
+    );
+    // Enough issues that the listing overflows the 64KiB pipe buffer
+    // even if the drop raced the first writes — seeded directly since
+    // 400 `issue new`s would spend the test in pm git commits.
+    for i in 1..=400 {
+        let dir = pm_dir.join("demo").join(format!("D-{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("issue.md"),
+            format!(
+                "---\nid: D-{i}\ntitle: a reasonably long issue title \
+                 carrying some weight {i}\nstatus: backlog\npriority: P2\n\
+                 created: 2026-09-20T00:00:00Z\n---\n\nbody\n"
+            ),
+        )
+        .unwrap();
+    }
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["issue", "ls", "--json"])
+        .env("HOME", &home)
+        .env("CADENCE_PM_DIR", &pm_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The downstream reader is gone before the listing starts.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a closed pipe must exit 0, not panic or die by signal: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("Broken pipe"),
+        "the EPIPE must never reach the user: {stderr}"
+    );
+}

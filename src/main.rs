@@ -5091,7 +5091,32 @@ fn attach_command(state_dir: &Path, name: Option<String>, print: bool) -> Result
     attach_agent(state_dir, &alias, can_exec)
 }
 
+/// A downstream reader that closes early (`cadence … | head`) makes
+/// every further stdout write fail with EPIPE — Rust ignores SIGPIPE,
+/// so `println!` panics with "failed printing to stdout: Broken pipe"
+/// where a unix tool would exit quietly. Catch exactly that panic in
+/// the hook and exit 0 instead; every other panic still reports
+/// through the default hook. Set before `run`, so it covers `daemon
+/// run`/`ui run` too — their stdout is a log file or terminal, where
+/// the panic can never fire.
+fn install_broken_pipe_exit() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&'static str>().copied())
+            .unwrap_or_default();
+        if msg.starts_with("failed printing to std") && msg.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
+}
+
 fn main() {
+    install_broken_pipe_exit();
     let code = match run() {
         Ok(code) => code,
         Err(error) => {
