@@ -6456,6 +6456,70 @@ fn inbox_collects_direct_send_with_reply_to() {
 }
 
 #[test]
+fn inbox_read_receipt_keeps_history_without_waking_reviewer() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    d.register_inbox("obs");
+    d.register_claude("reviewer", Value::Null);
+    d.register("worker");
+    d.wait_agent("reviewer", "idle", 20);
+    d.wait_agent("worker", "idle", 10);
+
+    // A real worker result still lands in the mailbox and must survive the
+    // same drain alongside the acknowledgement-only message.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "worker", "text": "do work", "message": "work-1",
+               "reply_to": "obs"}),
+    )
+    .unwrap();
+    d.wait_message("worker", "work-1", &["completed"], 15);
+
+    // This is the actual receipt path: a mailbox message has a return
+    // address, then the consumer drains it. Completing the read must not
+    // manufacture a worker_result turn for the reviewer.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "obs", "text": "ack me", "message": "receipt-1",
+               "reply_to": "reviewer"}),
+    )
+    .unwrap();
+
+    let page = d.rpc("agent_inbox", json!({"alias": "obs"})).unwrap();
+    let drained = page["messages"].as_array().unwrap();
+    assert_eq!(drained.len(), 2, "{page}");
+    let work = drained
+        .iter()
+        .find(|m| m["source"] == "worker_result")
+        .expect("genuine worker result was not retained");
+    assert!(work["body"].as_str().unwrap().contains("work-1"));
+
+    // The consumed row remains the durable source of truth, including its
+    // receipt marker and original reply address.
+    let obs = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    let receipt = obs["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "receipt-1")
+        .expect("receipt row was not retained");
+    assert_eq!(receipt["state"], "completed");
+    assert_eq!(receipt["reply_to"], "reviewer");
+    assert_eq!(receipt["result"]["via"], "inbox_read");
+
+    // No routed copy means no queued reviewer prompt and no model turn.
+    let reviewer = d.rpc("agent_show", json!({"alias": "reviewer"})).unwrap();
+    assert!(
+        reviewer["messages"].as_array().unwrap().is_empty(),
+        "{reviewer}"
+    );
+    assert!(d
+        .events("reviewer")
+        .iter()
+        .all(|event| event["kind"] != "turn_started"));
+}
+
+#[test]
 fn inbox_lifecycle_guards() {
     let d = TestDaemon::start();
     d.register_inbox("obs");
