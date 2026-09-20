@@ -182,7 +182,46 @@ export interface AgentTask {
   task: string;
   task_state: string;
   issue: string;
+  /** Task title from the job ledger, when one was supplied. */
+  title?: string | null;
+  /** Job id/title/state are the source of current-work context. */
+  job?: string | null;
+  job_title?: string | null;
+  job_state?: string | null;
   message?: { id: string; task?: string; turn_id?: string; created?: string } | null;
+}
+
+export type UsageState =
+  | "available"
+  | "unknown"
+  | "stale"
+  | "error"
+  | "unavailable"
+  | "blocked";
+
+/** Account/pool-scoped provider allowance telemetry. Optional because the
+ * current daemon has no quota collector for most providers. */
+export interface UsageLimit {
+  state?: UsageState | string | null;
+  used?: number | null;
+  used_percent?: number | null;
+  remaining?: number | null;
+  limit?: number | null;
+  unit?: string | null;
+  window?: string | null;
+  window_seconds?: number | null;
+  reset_at?: string | null;
+  source?: string | null;
+  observed_at?: string | null;
+  updated_at?: string | null;
+  message?: string | null;
+  reason?: string | null;
+  pool?: {
+    id?: string | null;
+    label?: string | null;
+    agents?: string[];
+    count?: number | null;
+  } | null;
 }
 
 export interface Agent {
@@ -190,8 +229,21 @@ export interface Agent {
   provider: string;
   endpoint_kind: string;
   state: string;
+  role?: string | null;
   group: string;
   group_root?: boolean;
+  /** Provider evidence: reported effective value beside launch config. */
+  model?: string | null;
+  model_reported?: string | null;
+  model_configured?: string | null;
+  model_source?: string | null;
+  effort?: string | null;
+  effort_reported?: string | null;
+  effort_source?: string | null;
+  effort_applicable?: boolean | null;
+  /** Optional account/pool allowance view; absent means unavailable. */
+  quota?: UsageLimit | null;
+  usage_limit?: UsageLimit | null;
   running: number;
   queued: number;
   unknown: number;
@@ -245,6 +297,15 @@ export interface AgentDetail {
     thread_id?: string | null;
     session_id?: string | null;
     model?: string | null;
+    model_reported?: string | null;
+    model_configured?: string | null;
+    model_source?: string | null;
+    effort?: string | null;
+    effort_reported?: string | null;
+    effort_source?: string | null;
+    effort_applicable?: boolean | null;
+    quota?: UsageLimit | null;
+    usage_limit?: UsageLimit | null;
     pid?: number | null;
     state: string;
     enabled: boolean;

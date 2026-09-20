@@ -30,6 +30,9 @@ export default function App() {
   const [issues, setIssues] = useState<IssueCard[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<AgentsPayload | null>(null);
+  const [agentsLoading, setAgentsLoading] = useState(true);
+  const [agentsError, setAgentsError] = useState<string | null>(null);
+  const agentsLoaded = useRef(false);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
@@ -86,7 +89,19 @@ export default function App() {
         setFailed(null);
       })
       .catch((e) => setFailed(String(e.message ?? e)));
-    api.agents().then(setAgents).catch(() => setAgents(null));
+    // Keep the last good rows visible while stream/poll refreshes run. The
+    // loading state is for the first observation only; a failed refresh then
+    // becomes an explicit error over the cached rows instead of an empty UI.
+    if (!agentsLoaded.current) setAgentsLoading(true);
+    api
+      .agents()
+      .then((next) => {
+        setAgents(next);
+        agentsLoaded.current = true;
+        setAgentsError(null);
+      })
+      .catch((e) => setAgentsError(String(e.message ?? e)))
+      .finally(() => setAgentsLoading(false));
     if (tabRef.current === "overview") {
       api.overview().then(setOverview).catch(() => setOverview(null));
     }
@@ -386,7 +401,14 @@ export default function App() {
             onAgents={() => setTab("agents")}
           />
         )}
-        {tab === "agents" && <Agents payload={agents} onOpenIssue={openIssue} />}
+        {tab === "agents" && (
+          <Agents
+            payload={agents}
+            onOpenIssue={openIssue}
+            loading={agentsLoading}
+            error={agentsError}
+          />
+        )}
         {tab === "plan" && <Plan />}
         {tab === "memory" && <Memory project={project} onError={writeError} />}
       </div>
