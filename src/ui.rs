@@ -606,7 +606,7 @@ fn current_message_summary(m: &Value) -> Option<String> {
     }
     let mut summary: String = safe.chars().take(180).collect();
     if safe.chars().count() > 180 {
-        summary.push_str("…");
+        summary.push('…');
     }
     Some(summary)
 }
