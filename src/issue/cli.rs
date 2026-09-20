@@ -177,13 +177,19 @@ pub enum IssueAction {
         /// Issue id — required unless --merged.
         id: Option<String>,
         /// Override the in-use, dirty and unmerged refusals —
-        /// recorded on the finish commit and in the output.
+        /// recorded on the finish commit and in the output. A branch
+        /// whose tip no merge/push evidence covers is still kept, and
+        /// a probe made stale mid-finish refuses with "retry" — force
+        /// never retargets a stale probe or deletes uncovered work.
         #[arg(long, conflicts_with = "merged")]
         force: bool,
         /// Remove the worktree but keep the local branch.
         #[arg(long, conflicts_with = "merged")]
         keep_branch: bool,
-        /// Also delete the remote branch (`push origin --delete`).
+        /// Also delete the remote branch — only when merge evidence
+        /// covers the resolved `origin/<branch>` tip (unmerged or
+        /// origin-ahead branches keep both copies, noted in the row;
+        /// --force deletes anyway and records it).
         #[arg(long)]
         remote: bool,
         /// Sweep every merged+idle worktree in scope — one row per
@@ -807,6 +813,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 kind,
                 target,
                 label.as_deref(),
+                None,
                 None,
                 None,
                 "",

@@ -48,6 +48,11 @@ pub struct Ref {
     /// `doctor --host` account for the right bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cargo_target: Option<String>,
+    /// `message` refs only: the dispatch recipient — structured so
+    /// finish finds the agent holding the bound message without
+    /// parsing it back out of the display label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// `issue.md` YAML frontmatter. No `project` field (the folder says

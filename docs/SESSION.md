@@ -312,17 +312,28 @@ In this order:
    process with cwd inside it), while the tree is dirty, or while the
    branch is neither merged nor pushed, so it is safe by default. An
    owner busy in a DIFFERENT worktree, an unknown owner, or a queued
-   message on an inbox or dead owner does not block. To clear
-   everything at once after a batch of merges: `cadence issue finish
-   --merged --dry-run` prints the plan, then `cadence issue finish
-   --merged --remote` finishes every merged+idle worktree in the
-   project — one row each: `finished | would-finish | skipped(reason)
-   | refused(reason)` (`would-finish` is the dry-run preview of a
-   clean finish); the verb exits 1 when anything refused and never
-   forces. Without `--project` the sweep covers every project on the
-   board. Marking an issue `status=done` while its worktree ref is
-   still open prints a `worktree open: run cadence issue finish <ID>`
-   reminder, so the sweep is the usual follow-up.
+   message on an inbox or dead owner does not block. Deletion is
+   commit-bound: the local `branch -D` fires only when the branch tip
+   still equals the commit the merge/push evidence covered, and
+   `--remote` deletes `origin/<branch>` only when merge evidence
+   covers the resolved remote tip — an unmerged or origin-ahead
+   remote keeps BOTH copies (the row's `remote_note`/`branch_note`
+   say why), and `--force` deletes the remote anyway and records a
+   `remote-delete-uncovered` override. `--force` never deletes a tip
+   no evidence covers. A finish that raced a dispatch or a ref
+   change refuses with "retry" (nothing retries automatically — the
+   sweep records the row `refused` and exits 1); just rerun it. To
+   clear everything at once after a batch of merges: `cadence issue
+   finish --merged --dry-run` prints the plan, then `cadence issue
+   finish --merged --remote` finishes every merged+idle worktree in
+   the project — one row each: `finished | would-finish |
+   skipped(reason) | refused(reason)` (`would-finish` is the dry-run
+   preview of a clean finish); the verb exits 1 when anything
+   refused and never forces. Without `--project` the sweep covers
+   every project on the board. Marking an issue `status=done` while
+   its worktree ref is still open prints a `worktree open: run
+   cadence issue finish <ID>` reminder, so the sweep is the usual
+   follow-up.
 4. Restart the daemon. `cadence daemon restart` stops cleanly and
    starts a new process on the same state; the before/after table
    shows each agent's state, pane pid, and `TURN` — `kept` when a

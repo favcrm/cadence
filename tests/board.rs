@@ -1894,19 +1894,31 @@ fn post_commit_hook_refuses_mid_sequence_and_detached() {
 /// integration.rs wraps in TestDaemon, pared down to what the board
 /// routes need.
 struct UiDaemon {
-    state: TempDir,
+    state: PathBuf,
+    _tmp: Option<TempDir>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl UiDaemon {
     fn start() -> Self {
-        let state = TempDir::new().unwrap();
-        let owned = state.path().to_path_buf();
+        let tmp = TempDir::new().unwrap();
+        Self::serve(tmp.path().to_path_buf(), Some(tmp))
+    }
+
+    /// Serve on a caller-owned state dir — for fixtures whose `state`
+    /// the cli-under-test already points at.
+    fn start_on(state: PathBuf) -> Self {
+        Self::serve(state, None)
+    }
+
+    fn serve(state: PathBuf, tmp: Option<TempDir>) -> Self {
+        let owned = state.clone();
         let handle = thread::spawn(move || {
             let _ = daemon::serve(&owned);
         });
         let d = Self {
             state,
+            _tmp: tmp,
             handle: Some(handle),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1920,7 +1932,7 @@ impl UiDaemon {
     }
 
     fn rpc_opt(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
-        client::rpc(self.state.path(), method, params)
+        client::rpc(&self.state, method, params)
     }
 
     fn rpc(&self, method: &str, params: Value) -> Value {
@@ -1928,7 +1940,7 @@ impl UiDaemon {
     }
 
     fn state(&self) -> PathBuf {
-        self.state.path().to_path_buf()
+        self.state.clone()
     }
 }
 
@@ -4140,13 +4152,17 @@ fn issue_finish_daemon_down_force_and_idempotent() {
     );
 }
 
-/// With no owner recorded (hand-edited history), the daemon check is
-/// skipped and the worktree-side guards are observable without one:
-/// a dirty worktree refuses listing the files, an unmerged+unpushed
-/// branch refuses, and finish succeeds once the branch is merged.
+/// With no owner recorded (hand-edited history), the owner check is
+/// skipped; the bound-message enumeration still needs a daemon that
+/// answers (an unanswerable enumeration refuses — a task-bound
+/// kickoff could hide anywhere). The worktree-side guards stay
+/// observable: a dirty worktree refuses listing the files, an
+/// unmerged+unpushed branch refuses, and finish succeeds once the
+/// branch is merged.
 #[test]
 fn issue_finish_dirty_and_unmerged_refusals() {
     let (_tmp, pm, state, repo) = start_fx();
+    let _d = UiDaemon::start_on(state.clone());
     assert!(
         cli(
             &pm,
@@ -4249,6 +4265,7 @@ fn strip_owner(pm: &Path, id: &str) {
 #[test]
 fn issue_finish_squash_cherry_and_ignored() {
     let (_tmp, pm, state, repo) = start_fx();
+    let _d = UiDaemon::start_on(state.clone());
     // The build-symlink rule lives in the repo's .gitignore, like the
     // real cadence repo.
     std::fs::write(repo.join(".gitignore"), "/ui/node_modules\n").unwrap();
@@ -4398,6 +4415,7 @@ fn issue_finish_squash_cherry_and_ignored() {
 #[test]
 fn issue_finish_pr_merge_via_gh() {
     let (_tmp, pm, state, repo) = start_fx();
+    let _d = UiDaemon::start_on(state.clone());
     git(
         &repo,
         &["remote", "add", "origin", "https://github.com/o/r.git"],
@@ -4430,7 +4448,7 @@ fn issue_finish_pr_merge_via_gh() {
     git(&wt, &["commit", "-qm", "pr work"]);
     let tip = git(&repo, &["rev-parse", "cadence/d-1-pr"]).1;
     strip_owner(&pm, "D-1");
-    set_gh("[{\"number\":7,\"headRefOid\":\"0000000000000000000000000000000000000000\"}]");
+    set_gh("[{\"number\":7,\"headRefOid\":\"0000000000000000000000000000000000000000\",\"baseRefName\":\"main\"}]");
     let (ok, err) = cli_env(
         &pm,
         &state,
@@ -4443,7 +4461,9 @@ fn issue_finish_pr_merge_via_gh() {
         "a stale headRefOid must not prove the merge: {err}"
     );
     assert!(wt.is_dir());
-    set_gh(&format!("[{{\"number\":7,\"headRefOid\":\"{tip}\"}}]"));
+    set_gh(&format!(
+        "[{{\"number\":7,\"headRefOid\":\"{tip}\",\"baseRefName\":\"main\"}}]"
+    ));
     let (ok, out) = cli_env(
         &pm,
         &state,

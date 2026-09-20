@@ -75,27 +75,31 @@ fn ancestor(root: &Path, branch: &str, into: &str) -> bool {
     git(root, &["merge-base", "--is-ancestor", branch, into]).is_ok()
 }
 
-/// Why `branch` counts as merged into `into`, checked in order:
-/// plain ancestry; every branch commit already applied upstream
-/// (`git cherry` — the rebase/cherry-pick case); the branch's whole
-/// diff reverse-applying onto `into` (a squash merge); or a merged
-/// GitHub PR whose recorded head covers `tip`. The first match wins
-/// and is reported as `merged_by`.
-fn merge_rule(root: &Path, branch: &str, tip: &str, into: &str) -> Option<&'static str> {
-    if ancestor(root, branch, into) {
+/// Why `tip` counts as merged into `into`, checked in order: plain
+/// ancestry; every commit up to `tip` already applied upstream
+/// (`git cherry` — the rebase/cherry-pick case); the combined diff
+/// up to `tip` reverse-applying onto `into` (a squash merge); or a
+/// merged GitHub PR whose recorded head covers `tip`. All four are
+/// pinned to the SHA, never re-resolved by name — the evidence and
+/// the commit a `branch -D` deletes cannot disagree. `pr_head` is
+/// the head branch name the `pr` arm filters on (a remote-tracking
+/// tip still names the local head it was pushed from). The first
+/// match wins and is reported as `merged_by`.
+fn merge_rule(root: &Path, pr_head: &str, tip: &str, into: &str) -> Option<&'static str> {
+    if ancestor(root, tip, into) {
         return Some("ancestry");
     }
     // `+` = a commit with no patch-equivalent upstream; a listing
-    // with none means everything on the branch already landed.
-    if let Ok(marks) = git(root, &["cherry", into, branch]) {
+    // with none means everything up to `tip` already landed.
+    if let Ok(marks) = git(root, &["cherry", into, tip]) {
         if !marks.lines().any(|l| l.starts_with('+')) {
             return Some("cherry");
         }
     }
-    if patch_applied(root, branch, into) {
+    if patch_applied(root, tip, into) {
         return Some("patch");
     }
-    if pr_merged(root, branch, tip) {
+    if pr_merged(root, pr_head, tip, into) {
         return Some("pr");
     }
     None
@@ -105,13 +109,13 @@ fn merge_rule(root: &Path, branch: &str, tip: &str, into: &str) -> Option<&'stat
 /// merge-base reverse-applies cleanly onto `into`'s tree, `into`
 /// already holds that state. Runs against a temporary index — no
 /// worktree is ever touched.
-fn patch_applied(root: &Path, branch: &str, into: &str) -> bool {
-    let Ok(base) = git(root, &["merge-base", into, branch]) else {
+fn patch_applied(root: &Path, tip: &str, into: &str) -> bool {
+    let Ok(base) = git(root, &["merge-base", into, tip]) else {
         return false;
     };
     // Raw stdout bytes, not `git()`'s trimmed string — `git apply`
     // rejects a patch whose final newline was stripped as corrupt.
-    let diff = match git_out(root, &["diff", "--binary", &base, branch], &[]) {
+    let diff = match git_out(root, &["diff", "--binary", &base, tip], &[]) {
         Ok(o) if o.status.success() => o.stdout,
         _ => return false,
     };
@@ -159,15 +163,20 @@ fn patch_applied(root: &Path, branch: &str, into: &str) -> bool {
 /// ancestor of it (a local branch behind the merged head). When the
 /// PR's head commit is not a local object only equality can prove
 /// coverage — anything else falls through to the other evidence.
-/// `gh` needs a GitHub origin and a successful answer; any failure
-/// falls through: gh is a hint, never the only authority.
-fn pr_merged(root: &Path, branch: &str, tip: &str) -> bool {
+/// The PR's `baseRefName` must be the default ref — a PR merged into
+/// a stacked base is not merged into the default branch. `gh` needs
+/// a GitHub origin and a successful answer; any failure falls
+/// through: gh is a hint, never the only authority.
+fn pr_merged(root: &Path, branch: &str, tip: &str, into: &str) -> bool {
     let Ok(url) = git(root, &["remote", "get-url", "origin"]) else {
         return false;
     };
     if !url.contains("github.com") {
         return false;
     }
+    // `into` may be a remote-tracking name ("origin/main") — the PR
+    // base is a bare branch name.
+    let base_name = into.strip_prefix("origin/").unwrap_or(into);
     let mut cmd = Command::new("gh");
     cmd.args([
         "pr",
@@ -177,7 +186,7 @@ fn pr_merged(root: &Path, branch: &str, tip: &str) -> bool {
         "--state",
         "merged",
         "--json",
-        "number,headRefOid",
+        "number,headRefOid,baseRefName",
         "--limit",
         "10",
     ])
@@ -193,6 +202,7 @@ fn pr_merged(root: &Path, branch: &str, tip: &str) -> bool {
     };
     prs.as_array().is_some_and(|prs| {
         prs.iter()
+            .filter(|pr| pr["baseRefName"].as_str() == Some(base_name))
             .filter_map(|pr| pr["headRefOid"].as_str())
             .any(|oid| oid == tip || object_has(root, oid) && ancestor(root, tip, oid))
     })
@@ -466,23 +476,45 @@ fn branch_state(t: &Target) -> Branch {
 /// shared probe-error rules.
 enum AgentLookup {
     Shown(Value),
-    /// The daemon answered that the alias is unknown or absent — the
-    /// agent provably holds nothing in flight.
+    /// The daemon answered that the thing is absent — it provably
+    /// holds nothing in flight.
     Absent,
     /// A daemon-answered error that is neither a clean absence nor a
-    /// transport failure (Provider, OutcomeUnknown) — the check could
-    /// not be made.
+    /// transport failure (Provider, OutcomeUnknown, a Rejected we did
+    /// not anticipate) — the check could not be made.
     Inconclusive(Error),
     /// The daemon could not be reached at all.
     Unreachable(Error),
 }
 
+/// The error half of `AgentLookup`, reusable for the enumeration
+/// calls that have no `Shown` payload.
+enum ProbeError {
+    Absent,
+    Inconclusive(Error),
+    Unreachable(Error),
+}
+
+/// Classify a daemon rpc error: `Rejected` is an answer, but only the
+/// absence the caller asked about counts as `Absent` — any other
+/// rejection is inconclusive rather than silently "not there".
+/// `Internal` is a transport failure.
+fn classify_probe_error(e: Error, absent_marker: &str) -> ProbeError {
+    match e {
+        e @ Error::Internal(_) => ProbeError::Unreachable(e),
+        Error::Rejected(m) if m.contains(absent_marker) => ProbeError::Absent,
+        e => ProbeError::Inconclusive(e),
+    }
+}
+
 fn agent_lookup(state_dir: &Path, alias: &str) -> AgentLookup {
     match client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
         Ok(show) => AgentLookup::Shown(show),
-        Err(e @ Error::Internal(_)) => AgentLookup::Unreachable(e),
-        Err(Error::Rejected(_)) => AgentLookup::Absent,
-        Err(e) => AgentLookup::Inconclusive(e),
+        Err(e) => match classify_probe_error(e, "Unknown managed agent") {
+            ProbeError::Absent => AgentLookup::Absent,
+            ProbeError::Inconclusive(e) => AgentLookup::Inconclusive(e),
+            ProbeError::Unreachable(e) => AgentLookup::Unreachable(e),
+        },
     }
 }
 
@@ -522,12 +554,39 @@ fn survivability(t: &Target) -> (Option<&'static str>, Option<String>, Option<Bl
     }
 }
 
-/// One `daemon-unreachable` block no matter how many lookups fail.
-fn push_unreachable(blocks: &mut Vec<Block>, unreachable: &mut bool, reason: String) {
-    if !*unreachable {
-        *unreachable = true;
+/// Atomically delete `branch` iff its tip is exactly `tip` —
+/// `update-ref -d <ref> <tip>` is the compare-and-delete: a tip that
+/// moved (or a ref that vanished) fails and keeps its commits.
+fn delete_branch_at(root: &Path, branch: &str, tip: &str) -> bool {
+    git(
+        root,
+        &["update-ref", "-d", &format!("refs/heads/{branch}"), tip],
+    )
+    .is_ok()
+}
+
+/// Phase-2 staleness: a retargeted pair or a newly recorded in-scope
+/// message ref means the unlocked probe is stale — even --force does
+/// not retarget a probe. Returns the retry reason when stale.
+fn stale_probe_reason(probe: &Target, t: &Target) -> Option<String> {
+    if t.wt_dir != probe.wt_dir || t.branch != probe.branch {
+        Some(format!(
+            "{}'s worktree/branch refs changed during finish — retry",
+            t.front.id
+        ))
+    } else if !t.msg_refs.is_subset(&probe.msg_refs) {
+        Some("A dispatch was recorded during finish — retry".to_string())
+    } else {
+        None
+    }
+}
+
+/// One block of a kind no matter how many lookups raise it.
+fn push_once(blocks: &mut Vec<Block>, seen: &mut bool, tag: &str, reason: String) {
+    if !*seen {
+        *seen = true;
         blocks.push(Block {
-            tag: "daemon-unreachable".to_string(),
+            tag: tag.to_string(),
             reason,
         });
     }
@@ -552,12 +611,21 @@ fn inspect(state_dir: &Path, t: &Target) -> Check {
     let mut blocks = Vec::new();
     let mut pane_pid = None;
     let mut unreachable = false;
+    let mut inconclusive = false;
+    // Enumeration failures are META failures — "the check itself
+    // could not run". They report after the specific findings (a
+    // named owner, message, pid, dirty path) so the actionable
+    // reason always outranks the generic one.
+    let mut deferred = Vec::new();
+    let mut enum_unreachable = false;
+    let mut enum_inconclusive = false;
     // Every agent that could hold a message bound to this worktree:
     // the owner (whose pane tree also gets the cwd scan), each
-    // recipient an in-scope message ref names (`dispatch → <alias>` —
-    // a re-assigned issue leaves the earlier dispatchee's bound
-    // messages live), and the assignee of any task bound to the
-    // worktree.
+    // recipient an in-scope message ref names (the structured `agent`
+    // field, falling back to the `dispatch → <alias>` label for refs
+    // written before it — a re-assigned issue leaves the earlier
+    // dispatchee's bound messages live), and the assignee of any
+    // task bound to the worktree.
     let mut aliases: Vec<String> = Vec::new();
     if let Some(owner) = t.front.owner.as_deref() {
         push_alias(&mut aliases, owner);
@@ -569,41 +637,87 @@ fn inspect(state_dir: &Path, t: &Target) -> Check {
         .filter(|r| r.kind == "message")
         .filter(|r| r.path.as_deref().is_some_and(|p| t.msg_refs.contains(p)))
     {
-        if let Some(a) = r
-            .label
-            .as_deref()
-            .and_then(|l| l.strip_prefix("dispatch → "))
-        {
+        if let Some(a) = r.agent.as_deref().or_else(|| {
+            r.label
+                .as_deref()
+                .and_then(|l| l.strip_prefix("dispatch → "))
+        }) {
             push_alias(&mut aliases, a);
         }
     }
     // Task-bound coverage: a task kickoff lives on its assignee even
-    // when no issue ref recorded it. Enumeration is best-effort — a
-    // daemon that cannot answer holds no live messages we could miss,
-    // and the owner/recipient checks above already surface its health.
-    if let Ok(list) = client::rpc(state_dir, "agent_list", json!({})) {
-        for a in list["agents"].as_array().into_iter().flatten() {
-            for tid in a["tasks"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-            {
-                let Ok(ts) = client::rpc(state_dir, "task_show", json!({"task": tid})) else {
-                    continue;
-                };
-                let wt = ts["task"]["worktree"].as_str().unwrap_or_default();
-                let bound = t.wt_name.as_deref() == Some(wt)
-                    || t.wt_dir
-                        .as_deref()
-                        .is_some_and(|d| d.to_string_lossy() == wt);
-                if bound {
-                    if let Some(asg) = ts["task"]["assignee"].as_str() {
-                        push_alias(&mut aliases, asg);
+    // when no issue ref recorded it. The enumeration must not fail
+    // open — an agent_list transport error means a bound task could
+    // hide anywhere, so it blocks like any unreachable check.
+    match client::rpc(state_dir, "agent_list", json!({})) {
+        Ok(list) => {
+            for a in list["agents"].as_array().into_iter().flatten() {
+                for tid in a["tasks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    match client::rpc(state_dir, "task_show", json!({"task": tid})) {
+                        Ok(ts) => {
+                            let wt = ts["task"]["worktree"].as_str().unwrap_or_default();
+                            let bound = t.wt_name.as_deref() == Some(wt)
+                                || t.wt_dir
+                                    .as_deref()
+                                    .is_some_and(|d| d.to_string_lossy() == wt);
+                            if bound {
+                                if let Some(asg) = ts["task"]["assignee"].as_str() {
+                                    push_alias(&mut aliases, asg);
+                                }
+                            }
+                        }
+                        Err(e) => match classify_probe_error(e, "No such task") {
+                            ProbeError::Absent => {}
+                            ProbeError::Unreachable(e) => push_once(
+                                &mut deferred,
+                                &mut enum_unreachable,
+                                "daemon-unreachable",
+                                format!(
+                                    "Daemon unreachable while enumerating tasks ({e}) — \
+                                     a task-bound kickoff could be missed; rerun when the \
+                                     daemon is up or pass --force"
+                                ),
+                            ),
+                            ProbeError::Inconclusive(e) => push_once(
+                                &mut deferred,
+                                &mut enum_inconclusive,
+                                "agent-check-inconclusive",
+                                format!(
+                                    "Cannot enumerate tasks ({e}) — a task-bound kickoff \
+                                     could be missed; pass --force"
+                                ),
+                            ),
+                        },
                     }
                 }
             }
         }
+        Err(e @ Error::Internal(_)) => push_once(
+            &mut deferred,
+            &mut enum_unreachable,
+            "daemon-unreachable",
+            format!(
+                "Daemon unreachable while enumerating agents ({e}) — \
+                 a task-bound kickoff could be missed; rerun when the \
+                 daemon is up or pass --force"
+            ),
+        ),
+        // agent_list takes no alias — no rejection can mean "absent";
+        // anything else the daemon answered is inconclusive.
+        Err(e) => push_once(
+            &mut deferred,
+            &mut enum_inconclusive,
+            "agent-check-inconclusive",
+            format!(
+                "Cannot enumerate agents ({e}) — a task-bound kickoff \
+                 could be missed; pass --force"
+            ),
+        ),
     }
     for alias in &aliases {
         match agent_lookup(state_dir, alias) {
@@ -653,23 +767,26 @@ fn inspect(state_dir: &Path, t: &Target) -> Check {
                 }
             }
             AgentLookup::Absent => {}
-            AgentLookup::Unreachable(e) => push_unreachable(
+            AgentLookup::Unreachable(e) => push_once(
                 &mut blocks,
                 &mut unreachable,
+                "daemon-unreachable",
                 format!(
                     "Daemon unreachable while checking '{alias}' ({e}) — \
                      the agent checks cannot run; rerun when the daemon is \
                      up or pass --force"
                 ),
             ),
-            AgentLookup::Inconclusive(e) => blocks.push(Block {
-                tag: "agent-check-inconclusive".to_string(),
-                reason: format!(
+            AgentLookup::Inconclusive(e) => push_once(
+                &mut blocks,
+                &mut inconclusive,
+                "agent-check-inconclusive",
+                format!(
                     "Cannot check agent '{alias}' ({e}) — the daemon \
                      answered but the result is inconclusive; refusing \
                      to guess, pass --force"
                 ),
-            }),
+            ),
         }
     }
     // Any process standing in the worktree blocks it — an owner pane's
@@ -744,6 +861,15 @@ fn inspect(state_dir: &Path, t: &Target) -> Check {
     if let (_, _, Some(b)) = survivability(t) {
         blocks.push(b);
     }
+    // Meta-failures last: a named owner, message, pid, dirty path or
+    // unmerged branch is the actionable reason — "the enumeration
+    // itself could not run" reports only when nothing else did. A
+    // duplicate tag already reported is not pushed twice.
+    for b in deferred {
+        if !blocks.iter().any(|x| x.tag == b.tag) {
+            blocks.push(b);
+        }
+    }
     Check { blocks }
 }
 
@@ -809,15 +935,8 @@ pub fn run(
     };
     // A retargeted pair or a newly recorded message ref means the
     // probe is stale — even --force does not retarget a probe.
-    if t.wt_dir != probe.wt_dir || t.branch != probe.branch {
-        return Err(Error::rejected(format!(
-            "{id}'s worktree/branch refs changed during finish — retry"
-        )));
-    }
-    if !t.msg_refs.is_subset(&probe.msg_refs) {
-        return Err(Error::rejected(
-            "A dispatch was recorded during finish — retry".to_string(),
-        ));
+    if let Some(reason) = stale_probe_reason(&probe, &t) {
+        return Err(Error::rejected(reason));
     }
     // Re-verify survivability against the current tip: a commit that
     // landed mid-probe could uncover work the probe counted as
@@ -837,6 +956,41 @@ pub fn run(
     let branch = t.branch.clone();
     let root = t.root.clone();
     let cargo_target = t.cargo_target.clone();
+
+    // The --remote gate is decided BEFORE the local delete: the remote
+    // ref goes only when MERGE evidence covers its resolved tip —
+    // survivability's "pushed" is not enough (origin can hold commits
+    // no evidence covers — another agent pushing ahead — and an
+    // unmerged-but-pushed branch's last copy IS that remote). When
+    // the remote stays for lack of coverage and the local branch's
+    // only evidence was that remote, the local stays too — halving
+    // the last copies where the operator asked for none gone.
+    let remote_tip = if remote && !branch.is_empty() {
+        git(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/origin/{branch}"),
+            ],
+        )
+        .ok()
+    } else {
+        None
+    };
+    let remote_covered = remote_tip.as_deref().is_some_and(|rtip| {
+        merged_how.is_some()
+            && default_ref(&root)
+                .and_then(|d| merge_rule(&root, &branch, rtip, &d))
+                .is_some()
+    });
+    // "Pushed" was the local branch's only evidence — keeping the
+    // uncovered remote is what makes deleting the local safe; if the
+    // remote is kept AND the local's commits are its only other copy
+    // story, keep both (the row explains; --force overrides).
+    let keep_for_remote =
+        remote_tip.is_some() && !remote_covered && !force && merged_how.is_none() && tip.is_some();
 
     // Removal: the worktree first (frees the branch), then the branch
     // — and only the exact tip the evidence covered: a tip that moved
@@ -859,44 +1013,40 @@ pub fn run(
     let mut deleted_branch = false;
     let mut branch_note = Value::Null;
     if !keep_branch && !branch.is_empty() {
-        match tip {
-            Some(tip) => {
-                let now = git(
-                    &root,
-                    &[
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        &format!("refs/heads/{branch}"),
-                    ],
-                )
-                .ok();
-                if now.as_deref() == Some(tip.as_str()) {
-                    deleted_branch = git(&root, &["branch", "-D", &branch]).is_ok();
-                } else {
-                    branch_note = json!(
-                        "branch tip moved during finish — kept (its evidence \
-                         covered {tip})"
-                    );
+        if keep_for_remote {
+            branch_note = json!(format!(
+                "kept: 'origin/{branch}' is not covered by merge evidence — \
+                 deleting the local branch would leave one stray copy"
+            ));
+        } else {
+            match tip {
+                Some(tip) => {
+                    deleted_branch = delete_branch_at(&root, &branch, &tip);
+                    if !deleted_branch {
+                        branch_note = json!(format!(
+                            "branch tip moved during finish — kept (its \
+                             evidence covered {tip})"
+                        ));
+                    }
                 }
-            }
-            None => {
-                // tip=None: either the branch is already gone (nothing
-                // to say) or its tip has commits no evidence covers —
-                // never -D, even under --force.
-                if git(
-                    &root,
-                    &[
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        &format!("refs/heads/{branch}"),
-                    ],
-                )
-                .is_ok()
-                {
-                    branch_note =
-                        json!("branch tip has commits no merge/push evidence covers — kept");
+                None => {
+                    // tip=None: either the branch is already gone
+                    // (nothing to say) or its tip has commits no
+                    // evidence covers — never deleted, even --force.
+                    if git(
+                        &root,
+                        &[
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            &format!("refs/heads/{branch}"),
+                        ],
+                    )
+                    .is_ok()
+                    {
+                        branch_note =
+                            json!("branch tip has commits no merge/push evidence covers — kept");
+                    }
                 }
             }
         }
@@ -904,17 +1054,36 @@ pub fn run(
     let mut remote_deleted = false;
     let mut remote_note = Value::Null;
     if remote && !branch.is_empty() {
-        if git(&root, &["remote"])
+        if !git(&root, &["remote"])
             .unwrap_or_default()
             .lines()
             .any(|r| r == "origin")
         {
-            match git(&root, &["push", "origin", "--delete", &branch]) {
-                Ok(_) => remote_deleted = true,
-                Err(e) => remote_note = json!(e.to_string()),
-            }
-        } else {
             remote_note = json!("no 'origin' remote — nothing deleted");
+        } else {
+            match remote_tip {
+                None => {
+                    remote_note = json!(format!("no 'origin/{branch}' — nothing deleted"));
+                }
+                Some(_) => {
+                    if !remote_covered && !force {
+                        remote_note = json!(
+                            "remote branch kept: its tip is not covered by merge \
+                             evidence — pass --force to delete it anyway"
+                        );
+                    } else {
+                        match git(&root, &["push", "origin", "--delete", &branch]) {
+                            Ok(_) => {
+                                remote_deleted = true;
+                                if !remote_covered {
+                                    overridden.push("remote-delete-uncovered".to_string());
+                                }
+                            }
+                            Err(e) => remote_note = json!(e.to_string()),
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1056,6 +1225,7 @@ pub fn sweep(
                             row["deleted_branch"] = out["deleted_branch"].clone();
                             row["branch_note"] = out["branch_note"].clone();
                             row["remote_deleted"] = out["remote_deleted"].clone();
+                            row["remote_note"] = out["remote_note"].clone();
                         }
                         Err(e) => {
                             row["outcome"] = json!("refused");
@@ -1074,4 +1244,85 @@ pub fn sweep(
         "dry_run": dry_run,
         "project": project,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn repo() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let r = tmp.path();
+        git(r, &["init", "-b", "main"]).unwrap();
+        git(r, &["config", "user.email", "t@t"]).unwrap();
+        git(r, &["config", "user.name", "t"]).unwrap();
+        std::fs::write(r.join("f"), "one").unwrap();
+        git(r, &["add", "f"]).unwrap();
+        git(r, &["commit", "-m", "one"]).unwrap();
+        tmp
+    }
+
+    fn target(id: &str) -> Target {
+        Target {
+            front: Front::new(id, "t", "now"),
+            body: String::new(),
+            dir: PathBuf::new(),
+            wt_dir: None,
+            wt_name: None,
+            branch: "side".to_string(),
+            root: PathBuf::new(),
+            msg_refs: HashSet::new(),
+            cargo_target: None,
+        }
+    }
+
+    #[test]
+    fn delete_branch_at_is_compare_and_delete() {
+        let tmp = repo();
+        let r = tmp.path();
+        git(r, &["branch", "side"]).unwrap();
+        let tip = git(r, &["rev-parse", "side"]).unwrap();
+        // A second commit the evidence pretended to cover — deleting
+        // against IT must refuse and keep the real tip's commits.
+        std::fs::write(r.join("f"), "two").unwrap();
+        git(r, &["commit", "-am", "two"]).unwrap();
+        let other = git(r, &["rev-parse", "main"]).unwrap();
+        assert_ne!(tip, other);
+        assert!(!delete_branch_at(r, "side", &other));
+        assert_eq!(git(r, &["rev-parse", "side"]).unwrap(), tip);
+        // The exact covered tip deletes; the ref is then gone.
+        assert!(delete_branch_at(r, "side", &tip));
+        assert!(git(r, &["rev-parse", "--verify", "--quiet", "side"]).is_err());
+        // Deleting an absent ref is a no-op, not a crash.
+        assert!(!delete_branch_at(r, "side", &tip));
+    }
+
+    #[test]
+    fn stale_probe_flags_only_mid_probe_changes() {
+        let probe = target("CAD-1");
+        // Identical re-resolve — fresh.
+        assert!(stale_probe_reason(&probe, &target("CAD-1")).is_none());
+        // Retargeted worktree — stale.
+        let mut t = target("CAD-1");
+        t.wt_dir = Some(PathBuf::from("/elsewhere"));
+        assert!(stale_probe_reason(&probe, &t)
+            .unwrap()
+            .contains("changed during finish"));
+        // Retargeted branch — stale.
+        let mut t = target("CAD-1");
+        t.branch = "other".to_string();
+        assert!(stale_probe_reason(&probe, &t).is_some());
+        // A message ref recorded mid-probe — stale.
+        let mut t = target("CAD-1");
+        t.msg_refs.insert("new-msg".to_string());
+        assert!(stale_probe_reason(&probe, &t)
+            .unwrap()
+            .contains("dispatch was recorded"));
+        // A ref that vanished mid-probe is NOT stale — the probe saw
+        // strictly more than exists now, so it erred conservative.
+        let mut probe2 = target("CAD-1");
+        probe2.msg_refs.insert("gone".to_string());
+        assert!(stale_probe_reason(&probe2, &target("CAD-1")).is_none());
+    }
 }

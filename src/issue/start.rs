@@ -364,6 +364,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 closed: None,
                 worktree: None,
                 cargo_target: None,
+                agent: None,
             });
         }
         if !has_ref("worktree", &wt_str) {
@@ -377,6 +378,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 cargo_target: cargo_target
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned()),
+                agent: None,
             });
         }
         if matches!(new_front.status.as_str(), "backlog" | "ready") {

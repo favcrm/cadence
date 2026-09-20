@@ -877,6 +877,7 @@ pub fn add_ref(
     target: &str,
     label: Option<&str>,
     worktree: Option<&str>,
+    agent: Option<&str>,
     if_rev: Option<&str>,
     actor: &str,
 ) -> Result<Value> {
@@ -896,6 +897,7 @@ pub fn add_ref(
         closed: None,
         worktree: worktree.map(str::to_string),
         cargo_target: None,
+        agent: agent.map(str::to_string),
     };
     front.refs.push(r);
     save_front(&dir, &front, &body)?;

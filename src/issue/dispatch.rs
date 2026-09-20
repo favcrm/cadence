@@ -306,6 +306,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         &mid,
         Some(&format!("dispatch → {}", args.to)),
         started["worktree"].as_str(),
+        Some(&args.to),
         None,
         actor,
     )?;
@@ -351,8 +352,9 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     // A same-revision `task_dispatch` retry ignores the minted id and
     // returns the still-live kickoff's id — bind THAT message too so
     // the live one is never unbound. The pre-send ref stays as the
-    // attempt's history.
-    if message != mid {
+    // attempt's history. An absent `message` in the reply is `""` —
+    // never a ref target.
+    if !message.is_empty() && message != mid {
         write::add_ref(
             pm,
             id,
@@ -360,6 +362,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
             &message,
             Some(&format!("dispatch → {}", args.to)),
             started["worktree"].as_str(),
+            Some(&args.to),
             None,
             actor,
         )?;
