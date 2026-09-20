@@ -15264,6 +15264,148 @@ fn dispatch_injects_project_memory_lessons() {
     assert!(!text.contains("claude-only"), "{text}");
 }
 
+/// Explicit-axis matching resolves the current project from cwd and never
+/// searches sibling projects. An explicit `--project` remains available for
+/// callers whose cwd is outside a registered repo.
+#[test]
+fn memory_match_explicit_axes_stay_in_current_project() {
+    let tmp = TempDir::new().unwrap();
+    let pm_dir = tmp.path().join("pm");
+    let repo_a = tmp.path().join("repo-a");
+    let repo_b = tmp.path().join("repo-b");
+    let home = tmp.path().join("home");
+    for dir in [&pm_dir, &repo_a, &repo_b, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path| {
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "test@example.invalid"][..],
+            &["config", "user.name", "test"][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {:?}: {:?}", args, out);
+        }
+    };
+    git(&repo_a);
+    git(&repo_b);
+    let bin = Path::new(env!("CARGO_BIN_EXE_cadence"));
+    let run = |cwd: &Path, args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(tmp.path().join("state"))
+            .args(args)
+            .current_dir(cwd)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.parent().unwrap().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(run(&repo_a, &["issue", "init"]).0);
+    let repo_a_s = repo_a.to_str().unwrap();
+    let repo_b_s = repo_b.to_str().unwrap();
+    assert!(
+        run(
+            &repo_a,
+            &[
+                "issue",
+                "project",
+                "add",
+                "alpha",
+                "--prefix",
+                "A",
+                "--repo",
+                repo_a_s,
+                "--component",
+                "daemon",
+            ],
+        )
+        .0
+    );
+    assert!(
+        run(
+            &repo_a,
+            &[
+                "issue",
+                "project",
+                "add",
+                "beta",
+                "--prefix",
+                "B",
+                "--repo",
+                repo_b_s,
+                "--component",
+                "daemon",
+            ],
+        )
+        .0
+    );
+    let memory = |id: &str, fact: &str| {
+        format!(
+            "---\nid: {id}\ntype: rule\nstatus: accepted\nconfidence: high\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  components:\n    - daemon\n---\n{fact}\n\n**Why:** project boundary regression.\n\n**How to apply:** keep the project boundary.\n"
+        )
+    };
+    for (project, id, fact) in [
+        ("alpha", "alpha-daemon", "alpha fact"),
+        ("beta", "beta-daemon", "beta fact"),
+    ] {
+        let dir = pm_dir.join(project).join("memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.md")), memory(id, fact)).unwrap();
+    }
+
+    let (ok, out) = run(
+        &repo_a,
+        &["memory", "match", "--component", "daemon", "--json"],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["context"]["project"], "alpha", "{out}");
+    assert_eq!(out["matched"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out["matched"][0]["project"], "alpha", "{out}");
+    assert_eq!(out["matched"][0]["slug"], "alpha-daemon", "{out}");
+    assert_eq!(out["matched"][0]["fact"], "alpha fact", "{out}");
+
+    let (ok, out) = run(
+        &home,
+        &[
+            "memory",
+            "match",
+            "--project",
+            "beta",
+            "--component",
+            "daemon",
+            "--json",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["context"]["project"], "beta", "{out}");
+    assert_eq!(out["matched"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out["matched"][0]["slug"], "beta-daemon", "{out}");
+}
+
 /// Memory failures degrade, never sink a dispatch: a malformed memory
 /// file fails matching → no lessons + `lessons_error`; a `Lessons:`
 /// suffix that pushes the kickoff body over the pty cap is dropped
