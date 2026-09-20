@@ -439,13 +439,19 @@ prompt's title, `Run this command?`, the trust-dialog wordings) only
 decide beside real menu structure — a parsed option row, a qualified
 option block or the anchored legend — because an indented transcript
 row leading with the same words is identical in shape; numbered rows
-must additionally form a real menu run (a `❯`-led row inside, or the
-legend right after) so a quoted markdown list is never a menu's
-options. Option labels and lone legend fragments count only as a
-cluster beside that structure — transcript text quoting one stays
-inert. Cursor's option rows parse their trailing `(hint)` through the
-hotkey allowlist — `foo(bar)` is transcript text, not an option — and
-a `↓ more below`/`↑ more above` marker beside the block refuses the
+must additionally form a real menu run (an *indented* `❯`-led row
+inside — a column-0 `❯` is the input box or a transcript echo — or
+the legend right after) so a quoted markdown list is never a menu's
+options. A highlighted `❯`/`→` row only counts as menu structure when
+it sits inside a real option block — at least one sibling option —
+so transcript echoes of submitted prompts are never mistaken for a
+menu's highlight. Option labels and lone legend fragments count only
+as a cluster beside that structure — transcript text quoting one
+stays inert. Cursor's option rows parse their trailing `(hint)`
+through the hotkey allowlist — `foo(bar)` is transcript text, not an
+option — and sibling rows beside a `→` highlight must carry a key,
+since a menu highlights exactly one row. A `↓ more below`/`↑ more
+above` marker beside the block refuses the
 answer rather than picking a row whose index does not match the
 printed list. When
 a menu is open the probe's reason is the menu line itself — the

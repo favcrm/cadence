@@ -263,19 +263,30 @@ fn hint_row(l: &str, h: &str) -> bool {
         || opt_row(l)
 }
 
-/// Any menu-chrome row — an option or an anchored hint.
+/// An option row that is not the highlighted one: never `→`-led (a
+/// menu highlights exactly one row — a second `→` line is a transcript
+/// echo, not a sibling) and always carrying its `(key)` hint, so a
+/// bare transcript row cannot qualify.
+fn keyed_row(l: &str) -> bool {
+    !l.trim_start().starts_with('→') && hotkey(l).is_some()
+}
+
+/// Any menu-chrome row — a keyed sibling option or an anchored hint.
+/// A `→`-led row is deliberately not chrome: transcript echoes lead
+/// with `→` too, and only real structure may support a menu.
 fn chrome_row(l: &str) -> bool {
-    opt_row(l) || cursor_screen::HINT.iter().any(|h| hint_row(l, h))
+    keyed_row(l) || cursor_screen::HINT.iter().any(|h| hint_row(l, h))
 }
 
 /// The open option block as `(selected row, block start, block end)`.
 /// The selected row is the last `→`-led row with menu chrome directly
-/// below it — or the frame's last row with an option directly above
-/// (a highlighted final option has nothing below it) — while the
-/// input box's `→` is followed by the model/cwd bar. The block then
-/// extends over contiguous option rows up AND down: options printed
-/// above the highlighted row are part of the menu, so a choice counts
-/// the whole list in printed order, never just the suffix from `→`.
+/// below it — or the frame's last row with a keyed option directly
+/// above it (a highlighted final option has nothing below it) — while
+/// the input box's `→` is followed by the model/cwd bar. The block
+/// then extends over contiguous keyed rows up AND down: options
+/// printed above the highlighted row are part of the menu, so a
+/// choice counts the whole list in printed order, never just the
+/// suffix from `→`.
 fn menu_block(lines: &[&str]) -> Option<(usize, usize, usize)> {
     let sel = lines
         .iter()
@@ -288,15 +299,15 @@ fn menu_block(lines: &[&str]) -> Option<(usize, usize, usize)> {
                     .iter()
                     .find(|n| !n.trim().is_empty())
                     .is_some_and(|n| chrome_row(n))
-                    || (*i > 0 && opt_row(lines[i - 1])))
+                    || (*i > 0 && keyed_row(lines[i - 1])))
         })
         .map(|(i, _)| i)?;
     let mut start = sel;
-    while start > 0 && opt_row(lines[start - 1]) {
+    while start > 0 && keyed_row(lines[start - 1]) {
         start -= 1;
     }
     let mut end = sel;
-    while end + 1 < lines.len() && opt_row(lines[end + 1]) {
+    while end + 1 < lines.len() && keyed_row(lines[end + 1]) {
         end += 1;
     }
     Some((sel, start, end))
@@ -388,7 +399,10 @@ pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
         .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
         .count();
     let block = menu_block(&menu_lines);
-    let structure = block.is_some() || hints >= 1 || menu_lines.iter().any(|l| opt_row(l));
+    // Structure beside an anchor means a qualified option block or an
+    // anchored hint — a lone `→` row is the input box or a transcript
+    // echo, never menu evidence by itself.
+    let structure = block.is_some() || hints >= 1;
     let approval_menu = ((anchor || waiting) && structure) || (block.is_some() && hints >= 2);
     let lines: Vec<&str> = content.lines().collect();
     // Prompt search is anchored to the bottom `STATUS_LINES` rows —
@@ -1321,6 +1335,19 @@ mod tests {
         assert!(analyze_cursor(screen, None).approval_menu);
         // A marker ABOVE the block is the same truncation.
         let screen = " Run this command?\n   ↑ more above\n  → Add Shell(whoami) to allowlist? (tab)\n    Skip & tell the agent what to do instead (esc or n)\n";
+        assert!(prof.approval_answer(screen, "1").is_err());
+    }
+
+    #[test]
+    fn transcript_echoes_without_keys_are_not_a_menu() {
+        // Two adjacent `→` transcript echoes carry no `(key)` hint —
+        // every real option row advertises one, so a block of echoes
+        // must not qualify even with an anchor on screen.
+        let screen =
+            " Run this command?\n  → earlier submitted prompt\n  → another submitted prompt\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        let prof = screen_profile();
         assert!(prof.approval_answer(screen, "1").is_err());
     }
 

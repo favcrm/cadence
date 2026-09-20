@@ -119,9 +119,10 @@ fn numbered_block(lines: &[&str]) -> Vec<u32> {
         return Vec::new();
     };
     let end = run.last().unwrap().0;
-    let has_selected = run
-        .iter()
-        .any(|(i, _)| lines[*i].trim_start().starts_with('❯'));
+    // The `❯` must be a menu's indented highlight — a column-0 `❯`
+    // is a transcript echo of the operator's own input, never a menu
+    // option.
+    let has_selected = run.iter().any(|(i, _)| sel_row(lines, *i));
     let legend_after = lines[end + 1..]
         .iter()
         .find(|l| !l.trim().is_empty())
@@ -151,10 +152,56 @@ fn boxed(lines: &[&str], i: usize) -> bool {
     }
 }
 
-/// The menu's highlighted option row: a `❯`-led row that is not the
-/// boxed input line.
+/// The menu's highlighted option row: an *indented* `❯`-led row that
+/// is not the boxed input line. Menu rows sit inside the dialog's
+/// inset (` ❯ 1. Yes`); a column-0 `❯` row is the input box or a
+/// transcript echo of the operator's own submitted text — never a
+/// menu highlight.
 fn sel_row(lines: &[&str], i: usize) -> bool {
-    lines[i].trim_start().starts_with('❯') && !boxed(lines, i)
+    let l = lines[i];
+    l.len() != l.trim_start().len() && l.trim_start().starts_with('❯') && !boxed(lines, i)
+}
+
+/// The open option block as `(selected row, block start, block end)`:
+/// the contiguous run of rows around the highlighted `❯` row where an
+/// option row is `❯`-led at the highlight's indent or carries its
+/// text at the highlight's column (subject and context rows sit at
+/// other indents). A lone `❯` row is not a one-option menu — a real
+/// menu always lists at least one sibling option — so the block must
+/// reach at least two rows or it is transcript text, not a menu.
+fn option_block(lines: &[&str]) -> Option<(usize, usize, usize)> {
+    // The LAST non-boxed `❯` row: a transcript `❯` echo above the menu
+    // would otherwise be mistaken for the highlight.
+    let sel = (0..lines.len()).rev().find(|i| sel_row(lines, *i))?;
+    // The column the highlighted option's text starts at — `❯` is
+    // one glyph plus its trailing space.
+    let sel_indent = lines[sel].find('❯').unwrap_or(0);
+    let sel_col = sel_indent + 2;
+    let opt = |i: usize| -> bool {
+        let l = lines[i];
+        let t = l.trim_start();
+        // Blank, border and hint rows end the block. Anchor rows
+        // are *not* excluded — `Yes, I trust this folder` is both
+        // an anchor and a real option; subject rows sit at a
+        // different column than options anyway.
+        if t.is_empty()
+            || t.chars().all(|c| c == claude_screen::BORDER)
+            || claude_screen::HINT.iter().any(|h| hint_row(l, h))
+        {
+            return false;
+        }
+        (t.starts_with('❯') && l.find('❯') == Some(sel_indent))
+            || (l.len() - t.len() == sel_col && !t.starts_with('$') && !t.starts_with("Tip:"))
+    };
+    let mut start = sel;
+    while start > 0 && opt(start - 1) {
+        start -= 1;
+    }
+    let mut end = sel;
+    while end + 1 < lines.len() && opt(end + 1) {
+        end += 1;
+    }
+    (end - start + 1 >= 2).then_some((sel, start, end))
 }
 
 /// The line naming what the menu asks. A `Do you want to proceed?`
@@ -250,12 +297,14 @@ pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         claude_screen::ANCHOR.iter().any(|a| t.starts_with(a))
     });
     let numbered = numbered_block(&menu_lines);
-    let highlighted = (0..menu_lines.len()).any(|i| sel_row(&menu_lines, i));
+    // `highlighted` means a real option block — a lone `❯` row is a
+    // transcript echo, not a menu.
+    let highlighted = option_block(&menu_lines).is_some();
     let hints = claude_screen::HINT
         .iter()
         .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
         .count();
-    let approval_menu = (anchor && (!numbered.is_empty() || highlighted || hints >= 1))
+    let approval_menu = (anchor && (numbered.len() >= 2 || highlighted || hints >= 1))
         || (hints >= 1 && (numbered.len() >= 2 || highlighted));
     let busy_marker = claude_screen::BUSY.iter().any(|m| tail.contains(m));
     // The input box is a `❯`-leading line whose previous row is the
@@ -653,7 +702,9 @@ impl TuiProfile for ClaudeProfile {
                  option's printed number"
             ))
         })?;
-        if !numbered.is_empty() {
+        // A one-row "numbered run" is a stray `N.` line, not a menu —
+        // real menus list at least two options.
+        if numbered.len() >= 2 {
             if !numbered.contains(&n) {
                 return Err(Error::rejected(format!(
                     "no option {n} on this menu — it lists {}",
@@ -693,61 +744,18 @@ impl TuiProfile for ClaudeProfile {
             keys.push("Enter".to_string());
             return Ok(keys);
         }
-        // Unnumbered select: the option block is the contiguous run of
-        // rows around the highlighted `❯` row — up and down, never
-        // just the suffix below it — where an option row is `❯`-led or
-        // carries its text at the highlighted row's column (the
-        // subject and context rows above sit at other indents). When
-        // the highlighted row cannot be found the answer refuses
-        // rather than walking blind.
-        // The LAST non-boxed `❯` row: a transcript `❯` echo above the
-        // menu would otherwise be mistaken for the highlight.
-        let sel = (0..region.len())
-            .rev()
-            .find(|i| sel_row(&region, *i))
-            .ok_or_else(|| {
-                Error::rejected(
-                    "cannot locate the option rows on this menu — answer \
-                     it in the pane",
-                )
-            })?;
-        // The column the highlighted option's text starts at — `❯` is
-        // one glyph plus its trailing space.
-        let sel_col = region[sel].find('❯').map(|b| b + 2).unwrap_or(0);
-        let opt = |i: usize| -> bool {
-            let l = region[i];
-            let t = l.trim_start();
-            // Blank, border and hint rows end the block. Anchor rows
-            // are *not* excluded — `Yes, I trust this folder` is both
-            // an anchor and a real option; subject rows sit at a
-            // different column than options anyway.
-            if t.is_empty()
-                || t.chars().all(|c| c == claude_screen::BORDER)
-                || claude_screen::HINT.iter().any(|h| hint_row(l, h))
-            {
-                return false;
-            }
-            t.starts_with('❯')
-                || (l.len() - t.len() == sel_col && !t.starts_with('$') && !t.starts_with("Tip:"))
-        };
-        let mut start = sel;
-        while start > 0 && opt(start - 1) {
-            start -= 1;
-        }
-        let mut end = sel;
-        while end + 1 < region.len() && opt(end + 1) {
-            end += 1;
-        }
-        let count = (end - start + 1) as u32;
-        // A lone `❯` row is not a one-option menu — a transcript echo
-        // can look like a highlight; a real menu always lists at
-        // least one sibling option.
-        if count < 2 {
-            return Err(Error::rejected(
+        // Unnumbered select: navigate the whole printed option block
+        // up and down from the highlighted `❯` row — never just the
+        // suffix below it. `option_block` requires a real sibling set
+        // around an indented `❯` row, so a transcript `❯` echo beside
+        // anchor text cannot be answered as a menu.
+        let (sel, start, end) = option_block(&region).ok_or_else(|| {
+            Error::rejected(
                 "cannot locate the option rows on this menu — answer \
                  it in the pane",
-            ));
-        }
+            )
+        })?;
+        let count = (end - start + 1) as u32;
         if n == 0 || n > count {
             return Err(Error::rejected(format!(
                 "no option {n} on this menu — it lists {count}"
@@ -1081,5 +1089,25 @@ mod tests {
             prof.approval_answer(screen, "2").unwrap(),
             vec!["Down", "Enter"]
         );
+    }
+
+    #[test]
+    fn transcript_prompt_echoes_are_not_a_menu() {
+        // Captured verbatim from a live pane: a submitted prompt's
+        // `❯`-echo sits at column 0 and a wrapped continuation line
+        // can start with the anchor — together they once parsed as a
+        // two-row menu and livelocked sends. Column-0 `❯` rows are
+        // echoes or the input box, never a menu highlight.
+        let screen = "❯ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  Do you want to proceed?\n● API Error: safeguards flagged this message\n\n❯ \n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        let prof = profile();
+        assert!(prof.approval_answer(screen, "1").is_err());
+        // Two adjacent echoes still are not a menu: neither is the
+        // indented highlight a real option block needs.
+        let screen = "❯ first prompt\n❯ second prompt\n  Do you want to proceed?\n❯ \n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        assert!(prof.approval_answer(screen, "1").is_err());
     }
 }
