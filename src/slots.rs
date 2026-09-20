@@ -270,9 +270,11 @@ const MAX_WAITERS_PER_LANE: usize = 32;
 
 /// A hold `reap_dead` just dropped — `release` answers these softly
 /// (`released:false` + the reap reason) instead of calling them
-/// unknown tokens.
+/// unknown tokens — to the hold's own lane only, so a foreign caller
+/// can't probe whether a token ever existed.
 struct Reaped {
     token: String,
+    lane: String,
     kind: SlotKind,
     reason: &'static str,
 }
@@ -399,6 +401,7 @@ impl Slots {
             ));
             dead.push(Reaped {
                 token: h.token.clone(),
+                lane: h.lane.clone(),
                 kind: h.kind,
                 reason,
             });
@@ -853,9 +856,11 @@ impl Slots {
     /// (lane, pid) — so one caller can never release another's hold.
     /// A foreign token is a named refusal; an unknown token a named
     /// rejection — EXCEPT a token this very call just reaped, which
-    /// answers softly (`released:false` + the reap reason): a cleanup
-    /// path like `trap 'release $T' EXIT` should not hard-fail on a
-    /// hold the daemon already took back.
+    /// answers softly (`released:false` + the reap reason) to the
+    /// hold's own lane: a cleanup path like `trap 'release $T' EXIT`
+    /// should not hard-fail on a hold the daemon already took back,
+    /// and a foreign lane gets the hard unknown-token refusal so a
+    /// token's existence is never confirmed across lanes.
     pub fn release(
         &mut self,
         token: &str,
@@ -866,7 +871,7 @@ impl Slots {
         let mut events = Vec::new();
         let reaped = self.reap_dead(now, &mut events);
         let Some(h) = self.held.iter().find(|h| h.token == token) else {
-            if let Some(r) = reaped.iter().find(|r| r.token == token) {
+            if let Some(r) = reaped.iter().find(|r| r.token == token && r.lane == lane) {
                 return Ok((
                     json!({"released": false, "token": token,
                            "kind": r.kind.as_str(), "reason": r.reason}),
@@ -904,15 +909,17 @@ impl Slots {
     /// ages, and the resolved config. A status read is also a reap
     /// pass — a dead holder frees its slot on the next read, not some
     /// later sweep, so the queue can never jam behind a corpse.
-    /// `caller` sees its own lane's tokens; other lanes' holds show
-    /// identity only — a token never leaves its lane's view.
-    pub fn status(&mut self, caller: &str, now: f64) -> (Value, Vec<SlotEvent>) {
+    /// `caller` is the connection-derived identity: a hold's token
+    /// shows only when the caller IS the holder — same lane and the
+    /// hold's pid on the caller's own chain. Other processes see
+    /// identity only — a token never leaves its owner's view.
+    pub fn status(&mut self, caller: SlotCaller<'_>, now: f64) -> (Value, Vec<SlotEvent>) {
         let mut events = Vec::new();
         self.reap_dead(now, &mut events);
         (self.status_json(caller, now), events)
     }
 
-    fn status_json(&self, caller: &str, now: f64) -> Value {
+    fn status_json(&self, caller: SlotCaller<'_>, now: f64) -> Value {
         let pool_json = |pool: Pool| {
             json!({
                 "capacity": self.capacity(pool),
@@ -922,7 +929,7 @@ impl Slots {
                         let mut j = json!({"kind": h.kind.as_str(),
                                     "lane": h.lane, "pid": h.pid,
                                     "age_secs": (now - h.acquired_at).max(0.0)});
-                        if h.lane == caller {
+                        if h.lane == caller.lane && caller.pids.contains(&h.pid) {
                             j["token"] = json!(h.token);
                         }
                         j
@@ -967,6 +974,19 @@ struct SlotReq<'a> {
     request_id: &'a str,
 }
 
+/// The caller identity a status read runs as — connection-derived by
+/// the daemon, never asserted (CAD-113): `lane` is the registered
+/// pane the socket peer descends from and `pids` is every pid the
+/// caller may claim as a hold owner — the peer plus its /proc
+/// ancestors. A hold's token is visible only to its owner: same lane
+/// AND the hold's pid on the caller's own chain, so a lane-mate in a
+/// different process still cannot see it.
+#[derive(Clone, Copy)]
+pub struct SlotCaller<'a> {
+    pub lane: &'a str,
+    pub pids: &'a [u32],
+}
+
 /// Resolve the caller's slot lane the same way everywhere:
 /// `$CADENCE_ALIAS`, else `$USER`, else `unknown`.
 pub fn default_lane() -> String {
@@ -993,6 +1013,12 @@ mod tests {
     /// The test process's own pid — alive for the whole test.
     fn me() -> u32 {
         std::process::id()
+    }
+
+    /// A `status` caller owning exactly `pids` — the derived identity
+    /// the daemon hands down.
+    fn sc<'a>(lane: &'a str, pids: &'a [u32]) -> SlotCaller<'a> {
+        SlotCaller { lane, pids }
     }
 
     fn acquire(s: &mut Slots, kind: SlotKind, lane: &str, req: &str, now: f64) -> Value {
@@ -1126,7 +1152,7 @@ mod tests {
         assert!(err.to_string().contains("another caller"), "{err}");
         // The hold survives the failed releases.
         assert_eq!(
-            s.status("dev-1", 0.0).0["pools"]["build"]["held"]
+            s.status(sc("dev-1", &[other.pid()]), 0.0).0["pools"]["build"]["held"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -1168,7 +1194,7 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("Unknown slot token"), "{err}");
         // The reap emitted slot_released with the cause.
-        let (status, _) = s.status("dev-1", 2.0);
+        let (status, _) = s.status(sc("dev-1", &[pid]), 2.0);
         assert!(status["pools"]["build"]["held"]
             .as_array()
             .unwrap()
@@ -1455,8 +1481,10 @@ mod tests {
         assert_eq!(g["granted"], true, "free-pool grant never waits");
     }
 
-    /// status shows tokens only to their own lane — other lanes see
-    /// holder identity, never the token.
+    /// status shows a token only to the holding process's own chain —
+    /// same lane AND the hold's pid among the caller's claimable pids.
+    /// Other lanes, other processes — even a lane-mate in a different
+    /// process — see holder identity only.
     #[test]
     fn status_hides_foreign_tokens() {
         let mut s = slots(2, 1, 900, &[]);
@@ -1465,8 +1493,8 @@ mod tests {
         let b = acquire(&mut s, SlotKind::Build, "dev-2", "r2", 0.0);
         let t1 = a["token"].as_str().unwrap();
         let t2 = b["token"].as_str().unwrap();
-        // dev-1 sees its own token, never dev-2's.
-        let (s1, _) = s.status("dev-1", 0.0);
+        // The owner sees its own token, never a foreign one.
+        let (s1, _) = s.status(sc("dev-1", &[me(), other.pid()]), 0.0);
         let held = s1["pools"]["build"]["held"].as_array().unwrap();
         let mine = held.iter().find(|h| h["lane"] == "dev-1").unwrap();
         let theirs = held.iter().find(|h| h["lane"] == "dev-2").unwrap();
@@ -1475,8 +1503,13 @@ mod tests {
             theirs.get("token").is_none(),
             "foreign token hidden: {theirs}"
         );
+        // A lane-MATE in a different process owns nothing: same lane,
+        // pids not on the hold — its token stays hidden too.
+        let (s1b, _) = s.status(sc("dev-1", &[me()]), 0.0);
+        let held = s1b["pools"]["build"]["held"].as_array().unwrap();
+        assert!(held.iter().all(|h| h.get("token").is_none()));
         // An unaffiliated caller sees no tokens at all.
-        let (s2, _) = s.status("unknown", 0.0);
+        let (s2, _) = s.status(sc("unknown", &[me()]), 0.0);
         let held = s2["pools"]["build"]["held"].as_array().unwrap();
         assert!(held.iter().all(|h| h.get("token").is_none()));
         let _ = (t1, t2);
@@ -1592,7 +1625,7 @@ mod tests {
         let p = probe(&mut s, SlotKind::Build, "dev-2", "q1", 0.0);
         assert_eq!(p["granted"], false);
         assert_eq!(p["position"], 1);
-        assert!(s.status("dev-2", 1.0).0["waiting"]
+        assert!(s.status(sc("dev-2", &[me()]), 1.0).0["waiting"]
             .as_array()
             .unwrap()
             .is_empty());

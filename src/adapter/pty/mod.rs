@@ -304,6 +304,27 @@ pub(crate) fn descends_from(mut pid: u32, pane_pid: u32) -> bool {
     false
 }
 
+/// The process's /proc ancestry chain — itself first, then each PPid
+/// link up to (excluding) init. Fail-closed for connection-bound
+/// caller identity (CAD-113): an unreadable or malformed link yields
+/// `None`, never a partial chain — a caller whose ancestry cannot be
+/// verified must inherit no identity at all. A detached caller
+/// (`setsid`) reparents to init, so its chain is just itself — which
+/// no registered pane can match.
+pub(crate) fn caller_chain(mut pid: u32) -> Option<Vec<u32>> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while pid > 1 && seen.insert(pid) {
+        chain.push(pid);
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        pid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse().ok())?;
+    }
+    Some(chain)
+}
+
 /// A pty provider's forbidden input prefixes — the profile's own list,
 /// surfaced here so the briefing can warn without constructing a
 /// profile. Unknown providers get an empty list (no hazard asserted).

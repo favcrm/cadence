@@ -20111,13 +20111,146 @@ fn slot_opts_clock(
     }
 }
 
+/// Plant `alias` as a live pty pane rooted at `pid` — the endpoint
+/// facts the slot caller-identity derivation reads (CAD-113). The row
+/// stays otherwise inert: provider `fake` never spawns an actor.
+/// `slot_*` RPCs derive caller identity from `SO_PEERCRED` + /proc
+/// ancestry, so a test lane is only reachable from processes whose
+/// ancestry includes this pid.
+fn plant_pane(d: &TestDaemon, alias: &str, pid: u32) {
+    // `agent_register` on an existing alias errors — idempotent on a
+    // daemon restarted over a kept state dir.
+    let _ = d.rpc(
+        "agent_register",
+        json!({"alias": alias, "provider": "fake",
+               "endpoint_kind": "fake",
+               "cwd": d.dir.path().to_str().unwrap()}),
+    );
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET endpoint_kind='pty', pid=?1, \
+            generation='planted', session_id='planted' WHERE alias=?2",
+        rusqlite::params![pid as i64, alias],
+    )
+    .unwrap();
+}
+
+/// The lane every in-process `d.rpc` slot call derives: the test
+/// process's own pid planted as this alias's pane.
+const SELF_LANE: &str = "pane-self";
+
+/// Plant the test process itself as `SELF_LANE`'s pane — after this,
+/// `d.rpc` slot calls and `Command`-spawned cadence CLIs all run as
+/// that lane (their ancestry always includes the test pid).
+fn plant_self(d: &TestDaemon) {
+    plant_pane(d, SELF_LANE, std::process::id());
+}
+
+/// A long-lived `bash` whose pid is planted as a lane's pane:
+/// commands written to its stdin run as its children, so their
+/// socket-peer identity derives that lane — the only way to get a
+/// second connection identity in-process tests can't reach.
+struct LaneShell {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+    dir: TempDir,
+    seq: u64,
+}
+
+impl LaneShell {
+    fn spawn(home: &Path) -> LaneShell {
+        let mut child = std::process::Command::new("bash")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .env("HOME", home)
+            .envs(test_env().vars())
+            .spawn()
+            .unwrap();
+        LaneShell {
+            stdin: child.stdin.take().unwrap(),
+            stdout: BufReader::new(child.stdout.take().unwrap()),
+            child,
+            dir: TempDir::new().unwrap(),
+            seq: 0,
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Run a bash fragment under this lane; answer (exit code, output).
+    fn run(&mut self, cmd: &str) -> (i64, String) {
+        let tag = format!("__lane_rc_{}__", self.seq);
+        self.seq += 1;
+        // The bare `echo` first guarantees the marker opens a fresh
+        // line even when the command's output ends mid-line.
+        writeln!(self.stdin, "{{ {cmd} ; }} 2>&1; rc=$?; echo; echo {tag}$rc").unwrap();
+        self.stdin.flush().unwrap();
+        let mut out = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.stdout.read_line(&mut line).unwrap() > 0,
+                "lane shell exited while running: {cmd}"
+            );
+            if let Some(rc) = line.strip_prefix(&tag) {
+                return (rc.trim().parse().unwrap(), out);
+            }
+            out.push_str(&line);
+        }
+    }
+
+    /// `cadence <args>` run under this lane's identity.
+    fn cadence(&mut self, state: &Path, args: &str) -> (i64, String) {
+        self.run(&format!(
+            "{} --state-dir {} {args}",
+            env!("CARGO_BIN_EXE_cadence"),
+            state.display()
+        ))
+    }
+
+    /// One raw JSONL RPC under this lane's identity — the answer is
+    /// the wire frame (`{"ok":…, "result"|"error":…}`).
+    fn rpc(&mut self, state: &Path, method: &str, params: Value) -> Value {
+        let req = self.dir.path().join(format!("req-{}.json", self.seq));
+        std::fs::write(
+            &req,
+            cadence_agent::proto::request(method, params).to_string(),
+        )
+        .unwrap();
+        let (rc, out) = self.run(&format!(
+            "python3 -c 'import socket,sys;\
+             s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);\
+             s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");\
+             print(s.makefile().readline())' {} {}",
+            client::socket_path(state).display(),
+            req.display()
+        ));
+        assert_eq!(rc, 0, "lane rpc failed: {out}");
+        serde_json::from_str(out.trim()).unwrap()
+    }
+}
+
+impl Drop for LaneShell {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// `slot_acquire` with the test process's pid — alive for the whole
-/// test, so the pid check never reaps a live waiter here.
+/// test, so the pid check never reaps a live waiter here. The lane
+/// param is ignored by the daemon (identity is the connection's);
+/// callers pass SELF_LANE for honesty.
 fn slot_acquire(d: &TestDaemon, kind: &str, lane: &str, req: &str) -> Value {
     slot_acquire_pid(d, kind, lane, std::process::id(), req)
 }
 
-/// `slot_acquire` bound to an explicit pid.
+/// `slot_acquire` claiming an explicit pid — must be the test process
+/// or one of its /proc ancestors, or the daemon refuses.
 fn slot_acquire_pid(d: &TestDaemon, kind: &str, lane: &str, pid: u32, req: &str) -> Value {
     d.rpc(
         "slot_acquire",
@@ -20138,44 +20271,43 @@ fn slot_release(d: &TestDaemon, token: &str, lane: &str, pid: u32) -> Value {
 }
 
 /// N+1 acquires: the last queues until a release, FIFO order is kept,
-/// and slot events land on each lane's stream.
+/// and slot events land on the caller's stream. Every call here runs
+/// as `SELF_LANE` — identity is connection-derived (CAD-113).
 #[test]
 fn slot_acquire_queues_until_release() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
-    d.register("dev-1");
-    d.register("dev-2");
-    let g1 = slot_acquire(&d, "build", "dev-1", "r1");
+    plant_self(&d);
+    let g1 = slot_acquire(&d, "build", SELF_LANE, "r1");
     assert_eq!(g1["granted"], true);
     let t1 = g1["token"].as_str().unwrap().to_string();
     assert!(t1.starts_with("slot-"), "the daemon mints the token: {t1}");
     // The next acquire queues — answered, never hung.
-    let q = slot_acquire(&d, "build", "dev-2", "r2");
+    let q = slot_acquire(&d, "build", SELF_LANE, "r2");
     assert_eq!(q["granted"], false);
     assert_eq!(q["position"], 1);
-    let s = d.rpc("slot_status", json!({"lane": "dev-2"})).unwrap();
+    let s = d.rpc("slot_status", json!({})).unwrap();
     assert_eq!(s["pools"]["build"]["held"].as_array().unwrap().len(), 1);
-    // dev-1's hold shows identity only — never its token.
-    assert!(
-        s["pools"]["build"]["held"][0].get("token").is_none(),
-        "foreign token hidden: {}",
-        s["pools"]["build"]["held"][0]
+    // The owner sees its own token — the hold's pid is on its chain.
+    assert_eq!(
+        s["pools"]["build"]["held"][0]["token"], t1,
+        "the holding process's own chain sees its token"
     );
     let waiting = s["waiting"].as_array().unwrap();
     assert_eq!(waiting.len(), 1);
-    assert_eq!(waiting[0]["lane"], "dev-2");
+    assert_eq!(waiting[0]["lane"], SELF_LANE);
     // A re-poll keeps the original place — same request id, same
     // position, no second slot_waited.
-    let q = slot_acquire(&d, "build", "dev-2", "r2");
+    let q = slot_acquire(&d, "build", SELF_LANE, "r2");
     assert_eq!(q["position"], 1);
     // Release frees the pool; the waiter's next poll grants.
-    slot_release(&d, &t1, "dev-1", std::process::id());
-    let g2 = slot_acquire(&d, "build", "dev-2", "r2");
+    slot_release(&d, &t1, SELF_LANE, std::process::id());
+    let g2 = slot_acquire(&d, "build", SELF_LANE, "r2");
     assert_eq!(g2["granted"], true);
     let t2 = g2["token"].as_str().unwrap().to_string();
     assert_ne!(t2, t1, "each grant mints a fresh token");
     // And a re-poll of a granted id returns the same token (the CLI's
     // poll loop depends on this idempotency).
-    let again = slot_acquire(&d, "build", "dev-2", "r2");
+    let again = slot_acquire(&d, "build", SELF_LANE, "r2");
     assert_eq!(again["token"], t2);
     let kinds = |a: &str| {
         d.events(a)
@@ -20183,35 +20315,39 @@ fn slot_acquire_queues_until_release() {
             .map(|e| e["kind"].as_str().unwrap().to_string())
             .collect::<Vec<_>>()
     };
-    assert!(kinds("dev-1").contains(&"slot_acquired".to_string()));
-    assert!(kinds("dev-1").contains(&"slot_released".to_string()));
-    let dev2 = kinds("dev-2");
+    let own = kinds(SELF_LANE);
+    assert!(own.contains(&"slot_acquired".to_string()));
+    assert!(own.contains(&"slot_released".to_string()));
     assert_eq!(
-        dev2.iter().filter(|k| *k == "slot_waited").count(),
+        own.iter().filter(|k| *k == "slot_waited").count(),
         1,
-        "one slot_waited for the whole wait: {dev2:?}"
+        "one slot_waited for the whole wait: {own:?}"
     );
-    assert!(dev2.contains(&"slot_acquired".to_string()));
 }
 
 /// A holder whose pid dies frees its slot on the next acquire —
 /// nothing kills the work, the slot just stops being owed by a corpse.
+/// The hold binds to a lane shell's pid: killing the shell kills the
+/// hold's owner.
 #[test]
 fn slot_dead_holder_is_reaped() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
-    d.register("dev-1");
-    d.register("dev-2");
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    let g = slot_acquire_pid(&d, "build", "dev-1", pid, "r1");
-    assert_eq!(g["granted"], true);
-    let token = g["token"].as_str().unwrap().to_string();
-    child.kill().unwrap();
-    child.wait().unwrap(); // reap the zombie so kill(pid,0) answers ESRCH
-    let g2 = slot_acquire(&d, "build", "dev-2", "r2");
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let mut holder = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", holder.pid());
+    // The holder's child claims its own pane — `$$` in the shell is
+    // the planted pane pid itself.
+    let g = holder.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": holder.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(g["ok"], true, "{g}");
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    holder.child.kill().unwrap();
+    holder.child.wait().unwrap(); // reap the zombie so kill(pid,0) answers ESRCH
+    let g2 = slot_acquire(&d, "build", SELF_LANE, "r2");
     assert_eq!(g2["granted"], true, "dead holder's slot must free");
     // The reap names the cause on the dead lane's stream.
     let evs = d.events("dev-1");
@@ -20221,90 +20357,239 @@ fn slot_dead_holder_is_reaped() {
                 && e["payload"]["reason"].as_str() == Some("holder died")),
         "{evs:?}"
     );
-    // Releasing the dead token is now a named refusal, not a silent pass.
+    // Releasing the dead token is a named refusal, not a silent pass
+    // — and nobody can claim the dead pid anyway.
     let err = d
         .rpc(
             "slot_release",
-            json!({"token": token, "lane": "dev-1", "pid": pid}),
+            json!({"token": token, "pid": std::process::id()}),
         )
         .unwrap_err();
     assert!(err.to_string().contains("Unknown slot token"), "{err}");
 }
 
 /// BLOCKER: two callers sharing a request_id — the second queues, it
-/// never adopts the first's hold; a same-identity re-poll does.
+/// never adopts the first's hold; a same-identity re-poll does. The
+/// "different pid" is the test's own parent — a second pid on the
+/// connection's ancestry that may legitimately be claimed (CAD-113).
 #[test]
 fn slot_duplicate_request_id_different_pid_queues() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let other_pid = child.id();
-    let g1 = slot_acquire_pid(&d, "build", "dev-1", other_pid, "r1");
+    plant_self(&d);
+    let parent = std::os::unix::process::parent_id();
+    let g1 = slot_acquire_pid(&d, "build", SELF_LANE, parent, "r1");
     assert_eq!(g1["granted"], true);
-    // Same request_id from a different pid — a different caller:
+    // Same request_id claiming a different pid — a different caller:
     // queued, never granted the first's hold.
-    let q = slot_acquire(&d, "build", "dev-1", "r1");
+    let q = slot_acquire(&d, "build", SELF_LANE, "r1");
     assert_eq!(q["granted"], false, "must not adopt another caller's hold");
-    let s = d.rpc("slot_status", json!({"lane": "dev-1"})).unwrap();
+    let s = d.rpc("slot_status", json!({})).unwrap();
     assert_eq!(s["waiting"].as_array().unwrap().len(), 1);
     // The true holder re-polls and still gets its own token.
-    let again = slot_acquire_pid(&d, "build", "dev-1", other_pid, "r1");
+    let again = slot_acquire_pid(&d, "build", SELF_LANE, parent, "r1");
     assert_eq!(again["token"], g1["token"]);
-    child.kill().unwrap();
-    child.wait().unwrap();
 }
 
-/// BLOCKER: release binds to the holding (lane, pid) — a foreign
-/// caller's release is a named refusal and the hold survives.
+/// BLOCKER: release binds to the holding (lane, pid) — both derived
+/// from the connection now. A foreign lane's release is a named
+/// refusal; a claimed pid off the caller's own ancestry is refused
+/// before the token is even looked at. The hold survives both.
 #[test]
 fn slot_release_foreign_caller_is_rejected() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
-    let mut child = std::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    let g = slot_acquire_pid(&d, "build", "dev-1", pid, "r1");
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let mut foreign = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-2", foreign.pid());
+    let g = slot_acquire(&d, "build", SELF_LANE, "r1");
     let token = g["token"].as_str().unwrap().to_string();
-    // dev-2 knows the token but owns neither lane nor pid — refused.
-    let err = d
-        .rpc(
-            "slot_release",
-            json!({"token": token, "lane": "dev-2", "pid": std::process::id()}),
-        )
-        .unwrap_err();
-    assert!(err.to_string().contains("another caller"), "{err}");
-    // The right lane with the wrong pid is refused too.
-    let err = d
-        .rpc(
-            "slot_release",
-            json!({"token": token, "lane": "dev-1", "pid": std::process::id()}),
-        )
-        .unwrap_err();
-    assert!(err.to_string().contains("another caller"), "{err}");
+    // The foreign lane knows the token but its derived lane doesn't
+    // match the hold — refused. (The `pid` claim is honest here.)
+    let f = foreign.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": token, "pid": foreign.pid()}),
+    );
+    assert_eq!(f["ok"], false, "{f}");
+    assert!(
+        f["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("another caller"),
+        "{f}"
+    );
+    // A claimed pid off the caller's own chain — a sibling lane's pid
+    // is a live pid the shell does not descend from — is refused
+    // outright, before the token is even looked at.
+    let sibling = LaneShell::spawn(home.path());
+    let f = foreign.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": token, "pid": sibling.pid()}),
+    );
+    assert_eq!(f["ok"], false, "{f}");
+    assert!(
+        f["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot claim"),
+        "{f}"
+    );
     // The hold still stands — the pool stays full.
-    let q = slot_acquire(&d, "build", "dev-2", "r2");
+    let q = slot_acquire(&d, "build", SELF_LANE, "r2");
     assert_eq!(q["granted"], false, "failed release must not free the slot");
     // And the true holder releases normally.
-    slot_release(&d, &token, "dev-1", pid);
-    child.kill().unwrap();
-    child.wait().unwrap();
+    slot_release(&d, &token, SELF_LANE, std::process::id());
+}
+
+/// ACCEPTANCE: `slot_status` reveals a token only to the connection
+/// whose derived identity owns the hold — two real lanes. The owner
+/// sees its token; a foreign lane passing the owner's `lane` sees the
+/// hold but never the token (CAD-113 identity fork, option A).
+#[test]
+fn slot_status_reveals_tokens_only_to_the_owner() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut owner = LaneShell::spawn(home.path());
+    plant_pane(&d, "owner", owner.pid());
+    plant_self(&d); // the foreign observer
+    let g = owner.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": owner.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(g["result"]["granted"], true, "{g}");
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    // The owner's own status reveals its token — via the real CLI
+    // too: the cadence child derives this lane from its ancestry.
+    let s = owner.rpc(&d.state, "slot_status", json!({}));
+    let held = s["result"]["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held[0]["token"], token, "owner sees its own token");
+    let (rc, out) = owner.cadence(&d.state, "build-slot status --json");
+    assert_eq!(rc, 0, "{out}");
+    let cli: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        cli["pools"]["build"]["held"][0]["token"], token,
+        "owner CLI sees its own token"
+    );
+    // The foreign lane's status sees the hold but not the token —
+    // even naming the owner's lane in the request.
+    let s = d.rpc("slot_status", json!({"lane": "owner"})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1);
+    assert!(
+        held[0].get("token").is_none(),
+        "foreign caller must not see the token: {held:?}"
+    );
+    assert_eq!(held[0]["lane"], "owner");
+}
+
+/// ACCEPTANCE: a `slot_acquire` whose claimed `pid` is not the socket
+/// peer or one of its /proc ancestors is refused — the daemon never
+/// rebinds it (CAD-113 identity fork, option A).
+#[test]
+fn slot_acquire_refuses_a_pid_off_the_caller_chain() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut lane = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", lane.pid());
+    // A sibling lane's pid is live but off this caller's ancestry.
+    let other = LaneShell::spawn(home.path());
+    let r = lane.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": other.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot claim"),
+        "{r}"
+    );
+    // Nothing queued or held under either identity.
+    plant_self(&d);
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert!(s["waiting"].as_array().unwrap().is_empty());
+    assert!(s["pools"]["build"]["held"].as_array().unwrap().is_empty());
+    // An honest claim — the caller's own pid — grants normally.
+    let g = lane.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": lane.pid(), "request_id": "r2"}),
+    );
+    assert_eq!(g["result"]["granted"], true, "{g}");
+}
+
+/// ACCEPTANCE: a caller detached from every registered pane derives
+/// no identity at all — all three slot RPCs refuse it, and nothing is
+/// stamped `operator` (the PR-#71 fail-open pattern, closed here).
+#[test]
+fn slot_rpc_refuses_an_underivable_caller() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    // `stray` descends from the test process but nothing in its
+    // ancestry is a registered pty pane — no pane is planted for it.
+    let mut stray = LaneShell::spawn(home.path());
+    // `observer` is a real lane so we can inspect the pools afterward.
+    let mut observer = LaneShell::spawn(home.path());
+    plant_pane(&d, "observer", observer.pid());
+    for (method, params) in [
+        (
+            "slot_acquire",
+            json!({"kind": "build", "pid": stray.pid(), "request_id": "r1"}),
+        ),
+        (
+            "slot_release",
+            json!({"token": "slot-x", "pid": stray.pid()}),
+        ),
+        ("slot_status", json!({})),
+    ] {
+        let r = stray.rpc(&d.state, method, params);
+        assert_eq!(r["ok"], false, "{method}: {r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("caller identity underivable"),
+            "{method} must refuse identity-less callers: {r}"
+        );
+    }
+    // Nothing was recorded — and especially not as `operator`.
+    let s = observer.rpc(&d.state, "slot_status", json!({}));
+    assert_eq!(s["ok"], true, "{s}");
+    assert!(s["result"]["waiting"].as_array().unwrap().is_empty());
+    assert!(s["result"]["pools"]["build"]["held"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(
+        !s["result"].to_string().contains("operator"),
+        "no operator identity may appear: {}",
+        s["result"]
+    );
 }
 
 /// BLOCKER (r3): `slot_acquired` rides the victim's event stream —
 /// readable by any local caller via `agent_events`. It must never
 /// carry the token: token+lane+pid are the entire release credential,
-/// so a peer's stream can never be mined for one.
+/// so a peer's stream can never be mined for one. (r5: the victim is
+/// a real second connection identity — a lane shell.)
 #[test]
 fn slot_acquired_event_cannot_release_a_peers_hold() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
-    d.register("victim");
-    d.register("snoop");
-    let me = std::process::id();
-    let g = slot_acquire(&d, "build", "victim", "r1");
-    let token = g["token"].as_str().unwrap().to_string();
+    let home = TempDir::new().unwrap();
+    let mut victim = LaneShell::spawn(home.path());
+    plant_pane(&d, "victim", victim.pid());
+    plant_self(&d); // the snoop: every d.rpc runs as SELF_LANE
+    let g = victim.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": victim.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(g["ok"], true, "{g}");
+    let token = g["result"]["token"].as_str().unwrap().to_string();
     // The peer reads the victim's stream — sees the acquisition…
     let ev = d
         .events("victim")
@@ -20321,22 +20606,32 @@ fn slot_acquired_event_cannot_release_a_peers_hold() {
     let err = d
         .rpc(
             "slot_release",
-            json!({"token": "slot-guess", "lane": "victim", "pid": me}),
+            json!({"token": "slot-guess", "pid": std::process::id()}),
         )
         .unwrap_err();
     assert!(err.to_string().contains("Unknown slot token"), "{err}");
-    // Even the real token under a foreign lane is refused.
+    // Even the real token under a foreign identity is refused — the
+    // derived lane (pane-self) is not the hold's lane, whatever the
+    // request's `lane` field claims.
     let err = d
         .rpc(
             "slot_release",
-            json!({"token": token, "lane": "snoop", "pid": me}),
+            json!({"token": token, "lane": "victim", "pid": std::process::id()}),
         )
         .unwrap_err();
     assert!(err.to_string().contains("another caller"), "{err}");
+    // And status passing the victim's lane still shows no token.
     let s = d.rpc("slot_status", json!({"lane": "victim"})).unwrap();
-    assert_eq!(s["pools"]["build"]["held"].as_array().unwrap().len(), 1);
-    // The owner releases normally.
-    slot_release(&d, &token, "victim", me);
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1);
+    assert!(held[0].get("token").is_none(), "foreign token hidden");
+    // The owner releases normally under its own connection identity.
+    let r = victim.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": token, "pid": victim.pid()}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
 }
 
 /// BLOCKER: holds survive a daemon restart — persisted slots.json is
@@ -20345,35 +20640,36 @@ fn slot_acquired_event_cannot_release_a_peers_hold() {
 #[test]
 fn slot_restart_revalidates_holders() {
     let state = TempDir::new().unwrap();
-    let opts = slot_opts(2, 1, 900, &[]);
-    let d = TestDaemon::start_on_opts(state.path().to_path_buf(), opts);
-    d.register("dev-1");
-    let mut children: Vec<std::process::Child> = (0..2)
-        .map(|_| {
-            std::process::Command::new("sleep")
-                .arg("600")
-                .spawn()
-                .unwrap()
-        })
-        .collect();
-    let mut tokens = Vec::new();
-    for (i, c) in children.iter().enumerate() {
-        let g = slot_acquire_pid(&d, "build", "dev-1", c.id(), &format!("r{i}"));
-        assert_eq!(g["granted"], true);
-        tokens.push(g["token"].as_str().unwrap().to_string());
-    }
-    // One holder dies before the restart — it must be reaped at boot.
-    children[0].kill().unwrap();
-    children[0].wait().unwrap();
-    let live_pid = children[1].id();
+    let home = TempDir::new().unwrap();
+    let d = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    // Two holds: one bound to a lane shell that dies before the
+    // restart, one bound to the test process which outlives it.
+    let mut doomed = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", doomed.pid());
+    let g = doomed.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": doomed.pid(), "request_id": "r0"}),
+    );
+    assert_eq!(g["ok"], true, "{g}");
+    plant_self(&d);
+    let live = slot_acquire(&d, "build", SELF_LANE, "r1");
+    assert_eq!(live["granted"], true);
+    let live_tok = live["token"].as_str().unwrap().to_string();
+    let live_pid = std::process::id();
+    doomed.child.kill().unwrap();
+    doomed.child.wait().unwrap();
     drop(d); // shutdown → serve returns → state dir kept
     let d2 = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    // The agent rows persisted but a clean shutdown clears endpoint
+    // fields — re-stamp the live pane's facts before deriving.
+    plant_pane(&d2, SELF_LANE, live_pid);
     // The live hold survived with its token intact; the dead one's
     // slot was reaped — one held, one free.
-    let s = d2.rpc("slot_status", json!({"lane": "dev-1"})).unwrap();
+    let s = d2.rpc("slot_status", json!({})).unwrap();
     let held = s["pools"]["build"]["held"].as_array().unwrap();
     assert_eq!(held.len(), 1, "one live holder survives: {held:?}");
-    assert_eq!(held[0]["token"], tokens[1]);
+    assert_eq!(held[0]["token"], live_tok);
     assert_eq!(held[0]["pid"], live_pid);
     // The boot reap named the dead holder's cause on its lane.
     let evs = d2.events("dev-1");
@@ -20385,44 +20681,83 @@ fn slot_restart_revalidates_holders() {
     );
     // And an acquire never re-grants the survivor's slot — one free
     // slot grants once, then the pool is full again.
-    let g = slot_acquire(&d2, "build", "dev-2", "r9");
+    let g = slot_acquire(&d2, "build", SELF_LANE, "r9");
     assert_eq!(g["granted"], true);
-    let q = slot_acquire(&d2, "build", "dev-3", "r10");
+    let q = slot_acquire(&d2, "build", SELF_LANE, "r10");
     assert_eq!(q["granted"], false, "restarted holds keep the pool bounded");
     // The survivor still releases by its minted token.
-    slot_release(&d2, &tokens[1], "dev-1", live_pid);
-    children[1].kill().unwrap();
-    children[1].wait().unwrap();
+    slot_release(&d2, &live_tok, SELF_LANE, live_pid);
 }
 
 /// `starve_secs` promotes a long waiter ahead of a priority lane:
 /// priority wins inside the window, the starved waiter wins after it.
 /// The slot clock is injected — the test advances it instead of
-/// sleeping, so timing stays exact under host load.
+/// sleeping, so timing stays exact under host load. The waiter lanes
+/// are real connection identities — one lane shell each (CAD-113).
 #[test]
 fn slot_starve_promotes_long_waiter() {
     let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let d = TestDaemon::start_opts(slot_opts_clock(1, 1, 3, &["qa-1"], Some(clock.clone())));
-    let me = std::process::id();
-    let h1 = slot_acquire(&d, "build", "dev-1", "h1")["token"]
+    let home = TempDir::new().unwrap();
+    plant_self(&d);
+    let mut dev = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-2", dev.pid());
+    let mut qa = LaneShell::spawn(home.path());
+    plant_pane(&d, "qa-1", qa.pid());
+    let h1 = slot_acquire(&d, "build", SELF_LANE, "h1")["token"]
         .as_str()
         .unwrap()
         .to_string();
-    slot_acquire(&d, "build", "dev-2", "w1"); // ordinary waiter, first
-    slot_acquire(&d, "test", "qa-1", "w2"); // priority waiter, second
-    slot_release(&d, &h1, "dev-1", me);
+    // Ordinary waiter first, priority waiter second.
+    let w = dev.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": dev.pid(), "request_id": "w1"}),
+    );
+    assert_eq!(w["result"]["granted"], false, "{w}");
+    let w = qa.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "test", "pid": qa.pid(), "request_id": "w2"}),
+    );
+    assert_eq!(w["result"]["granted"], false, "{w}");
+    slot_release(&d, &h1, SELF_LANE, std::process::id());
     // Inside the starve window the reviewer lane's test wins.
-    let g = slot_acquire(&d, "test", "qa-1", "w2");
-    assert_eq!(g["granted"], true, "priority lane should outrank");
-    let w2 = g["token"].as_str().unwrap().to_string();
+    let g = qa.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "test", "pid": qa.pid(), "request_id": "w2"}),
+    );
+    assert_eq!(
+        g["result"]["granted"], true,
+        "priority lane should outrank: {g}"
+    );
+    let w2 = g["result"]["token"].as_str().unwrap().to_string();
     // Once w1 has waited past starve_secs it outranks even a new
     // priority request — the never-starve bound.
     clock.store(4, std::sync::atomic::Ordering::Relaxed);
-    slot_acquire(&d, "test", "qa-1", "w3");
-    slot_release(&d, &w2, "qa-1", me);
-    let g = slot_acquire(&d, "build", "dev-2", "w1");
-    assert_eq!(g["granted"], true, "starved waiter must outrank priority");
-    let s = d.rpc("slot_status", json!({"lane": "qa-1"})).unwrap();
+    let w = qa.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "test", "pid": qa.pid(), "request_id": "w3"}),
+    );
+    assert_eq!(w["result"]["granted"], false, "{w}");
+    let r = qa.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": w2, "pid": qa.pid()}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let g = dev.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": dev.pid(), "request_id": "w1"}),
+    );
+    assert_eq!(
+        g["result"]["granted"], true,
+        "starved waiter must outrank priority: {g}"
+    );
+    let s = d.rpc("slot_status", json!({})).unwrap();
     let w3 = s["waiting"]
         .as_array()
         .unwrap()
@@ -20433,20 +20768,35 @@ fn slot_starve_promotes_long_waiter() {
 }
 
 /// suite draws on its own pool — a full suite queue never jams the
-/// build lanes, and `test` shares the build pool.
+/// build lanes, and `test` shares the build pool. The two pool users
+/// claim different pids on this connection's own ancestry (CAD-113):
+/// the cross-pool deadlock guard keys on `(lane, pid)`, so the same
+/// process must never hold one pool while queueing the other.
 #[test]
 fn slot_pools_are_independent() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
-    assert_eq!(slot_acquire(&d, "suite", "qa-1", "s1")["granted"], true);
+    plant_self(&d);
+    let me = std::process::id();
+    let parent = std::os::unix::process::parent_id();
     assert_eq!(
-        slot_acquire(&d, "suite", "qa-1", "s2")["granted"],
+        slot_acquire_pid(&d, "suite", SELF_LANE, me, "s1")["granted"],
+        true
+    );
+    assert_eq!(
+        slot_acquire_pid(&d, "suite", SELF_LANE, me, "s2")["granted"],
         false,
         "second suite must queue"
     );
     // The suite pool being full does not touch build.
-    assert_eq!(slot_acquire(&d, "build", "dev-1", "b1")["granted"], true);
+    assert_eq!(
+        slot_acquire_pid(&d, "build", SELF_LANE, parent, "b1")["granted"],
+        true
+    );
     // test shares the build pool — now full too.
-    assert_eq!(slot_acquire(&d, "test", "dev-1", "t1")["granted"], false);
+    assert_eq!(
+        slot_acquire_pid(&d, "test", SELF_LANE, parent, "t1")["granted"],
+        false
+    );
 }
 
 /// The CLI: `--wait-secs 0` fails fast with a named error, a free slot
@@ -20455,8 +20805,9 @@ fn slot_pools_are_independent() {
 #[test]
 fn build_slot_cli_acquire_release_status() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
     let home = TempDir::new().unwrap();
-    let t1 = slot_acquire(&d, "build", "dev-1", "r1")["token"]
+    let t1 = slot_acquire(&d, "build", SELF_LANE, "r1")["token"]
         .as_str()
         .unwrap()
         .to_string(); // build pool full
@@ -20532,21 +20883,21 @@ fn build_slot_cli_acquire_release_status() {
         &["build-slot", "release", &token, "--lane", "dev-9"],
     );
     assert!(out.status.success());
-    // A release under the wrong lane is refused.
-    let g = slot_acquire(&d, "build", "dev-1", "r9");
+    // `--lane` is advisory only (CAD-113): the daemon derives the
+    // caller's lane from the connection, so a release naming another
+    // lane still acts on — and only on — the caller's own hold.
+    let g = slot_acquire(&d, "build", SELF_LANE, "r9");
     let t9 = g["token"].as_str().unwrap().to_string();
     let out = cadence_at(
         home.path(),
         &d.state,
         &["build-slot", "release", &t9, "--lane", "dev-2"],
     );
-    assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("another caller"),
-        "{}",
+        out.status.success(),
+        "own hold releases whatever --lane claims: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    slot_release(&d, &t9, "dev-1", std::process::id());
     // status --json shows the empty pool; bad kind is a named error.
     let out = cadence_at(home.path(), &d.state, &["build-slot", "status", "--json"]);
     let s: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -20572,9 +20923,10 @@ fn build_slot_cli_acquire_release_status() {
 #[test]
 fn status_footer_shows_slots() {
     let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
-    slot_acquire(&d, "build", "dev-1", "r1");
-    slot_acquire(&d, "build", "dev-2", "r2");
-    slot_acquire(&d, "build", "dev-3", "r3"); // the waiter
+    plant_self(&d);
+    slot_acquire(&d, "build", SELF_LANE, "r1");
+    slot_acquire(&d, "build", SELF_LANE, "r2");
+    slot_acquire(&d, "build", SELF_LANE, "r3"); // the waiter
     let home = TempDir::new().unwrap();
     let out = cadence_at(home.path(), &d.state, &["status"]);
     let text = String::from_utf8_lossy(&out.stdout);
@@ -20711,6 +21063,7 @@ fn issue_start_writes_slot_env() {
 #[test]
 fn build_slot_run_binds_the_real_process() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
     let home = TempDir::new().unwrap();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .arg("--state-dir")
@@ -20780,8 +21133,9 @@ fn build_slot_run_binds_the_real_process() {
 #[test]
 fn build_slot_cli_wait_then_grant() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
     let home = TempDir::new().unwrap();
-    let t1 = slot_acquire(&d, "build", "dev-1", "r1")["token"]
+    let t1 = slot_acquire(&d, "build", SELF_LANE, "r1")["token"]
         .as_str()
         .unwrap()
         .to_string();
@@ -20817,7 +21171,7 @@ fn build_slot_cli_wait_then_grant() {
         assert!(Instant::now() < deadline, "CLI never queued: {s}");
         thread::sleep(Duration::from_millis(50));
     }
-    slot_release(&d, &t1, "dev-1", std::process::id());
+    slot_release(&d, &t1, SELF_LANE, std::process::id());
     let out = cli.wait_with_output().unwrap();
     assert!(
         out.status.success(),
@@ -20827,9 +21181,11 @@ fn build_slot_cli_wait_then_grant() {
     let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(token.starts_with("slot-"), "minted token: {token}");
     // The explicit --pid bound the hold to the named pid — the test
-    // process, still alive.
-    let s = d.rpc("slot_status", json!({"lane": "dev-9"})).unwrap();
+    // process, still alive. The CLI's `--lane dev-9` was advisory:
+    // the derived lane is this pane's alias.
+    let s = d.rpc("slot_status", json!({})).unwrap();
     let held = s["pools"]["build"]["held"].as_array().unwrap();
     assert_eq!(held[0]["pid"].as_u64().unwrap() as u32, std::process::id());
-    slot_release(&d, &token, "dev-9", std::process::id());
+    assert_eq!(held[0]["lane"], SELF_LANE);
+    slot_release(&d, &token, SELF_LANE, std::process::id());
 }

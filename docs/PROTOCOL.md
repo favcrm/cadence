@@ -84,9 +84,9 @@ Error kinds:
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 | `agent_remove` | `alias` | deletes the agent + its history; refuses live endpoints |
 | `agent_gc` | `older_than?` | sweeps dead agents; `{removed:[alias]}` |
-| `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (queue identity only — the daemon mints the `slot-*` token on grant). A re-poll adopts a hold only on an exact `(request_id, pid, lane, kind)` match; any other caller sharing the id queues. `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot |
-| `slot_release` | `token, lane?, pid?` | `{released:true,token,kind}` — the release must name the holding `(lane, pid)`; a foreign token is a named refusal, a never-held token a named rejection, and a token just reaped this call answers `{released:false, reason}` (a `trap`-style cleanup never hard-fails) |
-| `slot_status` | `lane?` | `{pools:{build,suite}:{capacity,held[]}, waiting[], config}` — also a reap pass: dead holders/waiters drop on the read. The calling lane's holds include their `token`; other lanes' holds show identity only |
+| `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (queue identity only — the daemon mints the `slot-*` token on grant). Caller identity is connection-derived (below): `lane` is advisory, `pid` must be the socket peer or its ancestor. A re-poll adopts a hold only on an exact `(request_id, pid, lane, kind)` match; any other caller sharing the id queues. `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot |
+| `slot_release` | `token, lane?, pid?` | `{released:true,token,kind}` — the release must name the holding `(lane, pid)`, both derived from the connection (`lane` advisory, `pid` must be the peer or its ancestor); a foreign token is a named refusal, a never-held token a named rejection, and a token just reaped this call answers `{released:false, reason}` to its own lane (a `trap`-style cleanup never hard-fails) — foreign lanes get the same never-held rejection, so a token's existence is never probed across lanes |
+| `slot_status` | `lane?` | `{pools:{build,suite}:{capacity,held[]}, waiting[], config}` — also a reap pass: dead holders/waiters drop on the read. A hold's `token` shows only to the connection whose derived lane owns the hold and whose ancestry includes the hold's pid; everyone else sees identity only |
 
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
@@ -1019,6 +1019,23 @@ cargo build; cadence build-slot release $token` — `acquire` requires
 `$$` inside a shell wrapper) while `release` defaults it to the
 calling shell — the daemon owns the queue, the CLI only polls.
 
+Caller identity is bound to the connection, never to the request. On
+every `slot_*` RPC the daemon takes the peer's pid from `SO_PEERCRED`
+and walks `/proc` ancestry up to init; the caller's lane is the alias
+of the *nearest* registered pty pane on that chain (its own pane beats
+any outer one, so resolution never depends on map order). A request's
+`lane` field is advisory — it is never consulted for authority — and a
+`pid` field must name the socket peer itself or one of its ancestors
+(`acquire --pid $$` legitimately claims the invoking shell); anything
+else refuses rather than rebinds. The walk is fail-closed: an
+unreadable `/proc`, an incomplete chain, or no pane match refuses the
+call outright. There is no `operator` fallback — a caller detached
+from every registered pane holds no lane at all, so `setsid` or a
+detached helper cannot borrow an identity it was never given.
+`slot_status` applies the same rule to visibility: a hold's `token`
+appears only to the connection whose derived lane matches the hold
+*and* whose ancestry includes the hold's pid.
+
 Two pools share one queue: `build`/`test` requests draw on
 `build_slots` (default 3), `suite` requests on `suite_slots` (default
 1) — independent, so a queued full suite never starves ordinary
@@ -1040,7 +1057,8 @@ so rank 0 stays true FIFO: a two-hour waiter still beats a
 reaches the front.
 
 A slot is a daemon-minted `slot-*` token bound to (lane, pid,
-pid-starttime): `release` must name the holding lane and pid, so one
+pid-starttime): `release` must name the holding lane and pid — and
+because both come from the connection's own identity (above), one
 caller can never free another's hold. A re-poll whose `request_id`
 matches a hold adopts it only on an exact `(request_id, pid, lane,
 kind)` match — a second process sharing a natural request id queues
@@ -1102,12 +1120,16 @@ remember flags. `build-slot run` exports `CADENCE_BUILD_SLOT_TOKEN` /
 a nested script can release its own hold early. Observability:
 `slot_acquired` / `slot_waited` / `slot_released` events land on the
 requesting lane's event stream — and no event ever carries a token:
-a token returns only in the `slot_acquire` RPC reply, because lane
-streams are readable by any local caller and token+lane+pid are the
-whole release credential. `cadence status` carries a `slots:` footer
-line, `cadence build-slot status [--json]` shows holders and waiters
-(your own lane's holds show tokens; others' show identity only), and
+a token returns only in the `slot_acquire` RPC reply and in the
+holding connection's own `slot_status`, because lane streams are
+readable by any local caller and token+lane+pid are the whole release
+credential. `cadence status` carries a `slots:` footer line,
+`cadence build-slot status [--json]` shows holders and waiters (your
+own connection's holds show tokens; others' show identity only), and
 `doctor --host`'s `load` check reports load, io stall and the queue.
+A caller with no derivable pane identity — the operator's own shell
+included — sees the slot calls refused; the footers then simply omit
+the slot line rather than fail.
 Nothing here kills a process or cancels anyone's work.
 
 ## Recovery

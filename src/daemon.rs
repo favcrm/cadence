@@ -2,7 +2,9 @@
 //!
 //! The socket lives in a 0700 state directory and accepts only same-UID
 //! peers (`SO_PEERCRED`). That establishes same-user access — it is not a
-//! hostile same-user isolation boundary.
+//! hostile same-user isolation boundary. Slot RPCs additionally bind
+//! caller identity to the connection (CAD-113): the peer pid's /proc
+//! ancestry must reach a registered pane, or the call is refused.
 //!
 //! Each registered agent gets one actor thread that owns its provider
 //! adapter and serializes turns. The daemon relaunches enabled actors on
@@ -978,7 +980,14 @@ impl Shared {
 
     // ---- dispatch ----
 
-    pub fn dispatch(self: &Arc<Self>, method: &str, params: &Value) -> Result<Value> {
+    /// `peer_pid` is the connection's `SO_PEERCRED` pid — slot RPCs
+    /// bind their caller identity to it; every other method ignores it.
+    pub fn dispatch(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         match method {
             "health" => Ok(json!({
                 "state": "ready",
@@ -1189,9 +1198,9 @@ impl Shared {
                 let state = if started { "starting" } else { "attention" };
                 Ok(json!({"alias": alias, "state": state}))
             }
-            "slot_acquire" => self.rpc_slot_acquire(params),
-            "slot_release" => self.rpc_slot_release(params),
-            "slot_status" => Ok(self.rpc_slot_status(params)),
+            "slot_acquire" => self.rpc_slot_acquire(params, peer_pid),
+            "slot_release" => self.rpc_slot_release(params, peer_pid),
+            "slot_status" => self.rpc_slot_status(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -1209,19 +1218,72 @@ impl Shared {
         self.wake();
     }
 
+    /// The slot caller's connection-bound identity (CAD-113): `lane`
+    /// is the alias of the registered pane the socket peer descends
+    /// from — the NEAREST pane on the chain wins, so the caller's own
+    /// pane beats any outer one and resolution never depends on map
+    /// order — and the returned `Vec` is every pid the caller may bind
+    /// a hold to: the peer itself plus its /proc ancestors (`acquire
+    /// --pid $$` claims the invoking shell). Fail-closed: an
+    /// unreadable ancestry or no pane match refuses the call — there
+    /// is no `operator` fallback; a caller detached from every pane
+    /// holds no lane at all.
+    fn slot_caller(&self, peer_pid: u32) -> Result<(String, Vec<u32>)> {
+        let chain = adapter::pty::caller_chain(peer_pid).ok_or_else(|| {
+            Error::rejected(format!(
+                "Slot caller pid {peer_pid}: /proc ancestry unreadable — \
+                 caller identity underivable"
+            ))
+        })?;
+        let panes: HashMap<u32, String> = self
+            .store
+            .pty_endpoint_facts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
+            .collect();
+        let lane = chain
+            .iter()
+            .find_map(|p| panes.get(p))
+            .cloned()
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "Slot caller pid {peer_pid} descends from no registered \
+                     pane — caller identity underivable"
+                ))
+            })?;
+        Ok((lane, chain))
+    }
+
+    /// The pid a slot request may bind: the socket peer itself or one
+    /// of its /proc ancestors — anything else is a foreign pid and the
+    /// request is refused, not rebound. `pid` absent means the peer.
+    fn claimed_slot_pid(params: &Value, chain: &[u32], peer_pid: u32) -> Result<u32> {
+        let pid = optional_u64(params, "pid")
+            .map(|p| p as u32)
+            .unwrap_or(peer_pid);
+        if pid == 0 || !chain.contains(&pid) {
+            return Err(Error::rejected(format!(
+                "Slot caller pid {peer_pid} cannot claim pid {pid} — it is \
+                 not the connection peer or one of its ancestors"
+            )));
+        }
+        Ok(pid)
+    }
+
     /// Non-blocking slot acquire (CAD-113) — the caller polls with a
     /// stable `request_id`; each answer is granted-or-queue-position.
-    fn rpc_slot_acquire(&self, params: &Value) -> Result<Value> {
+    /// `lane`/`pid` are never taken from the request: identity is the
+    /// connection's, and a `pid` claim off the peer's own ancestry is
+    /// refused.
+    fn rpc_slot_acquire(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let (lane, chain) = self.slot_caller(peer_pid)?;
         let kind = SlotKind::parse(required_str(params, "kind")?)?;
         let request_id = required_str(params, "request_id")?;
         if request_id.len() > 128 {
             return Err(Error::rejected("Slot request_id must be <= 128 bytes"));
         }
-        let lane = optional_str(params, "lane").unwrap_or("unknown");
-        if lane.len() > 128 {
-            return Err(Error::rejected("Slot lane must be <= 128 bytes"));
-        }
-        let pid = optional_u64(params, "pid").unwrap_or(0) as u32;
+        let pid = Self::claimed_slot_pid(params, &chain, peer_pid)?;
         // `probe` is the read-only fast-fail: it answers granted or
         // position without leaving a waiter in the queue.
         let probe = params["probe"].as_bool().unwrap_or(false);
@@ -1231,7 +1293,7 @@ impl Shared {
             .unwrap_or_else(|e| e.into_inner())
             .acquire(
                 kind,
-                lane,
+                &lane,
                 pid,
                 request_id,
                 probe,
@@ -1243,29 +1305,37 @@ impl Shared {
 
     /// `slot_release` — the release must name the holding (lane,
     /// pid): a token alone is not authority to free another
-    /// caller's slot.
-    fn rpc_slot_release(&self, params: &Value) -> Result<Value> {
+    /// caller's slot. Both come from the connection: the lane is the
+    /// peer's derived pane and the pid must be on the peer's own
+    /// ancestry, so a caller can only ever name its own lineage.
+    fn rpc_slot_release(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let (lane, chain) = self.slot_caller(peer_pid)?;
         let token = required_str(params, "token")?;
-        let lane = optional_str(params, "lane").unwrap_or("unknown");
-        let pid = optional_u64(params, "pid").unwrap_or(0) as u32;
+        let pid = Self::claimed_slot_pid(params, &chain, peer_pid)?;
         let (result, events) = self
             .slots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .release(token, lane, pid, (self.slot_clock)())?;
+            .release(token, &lane, pid, (self.slot_clock)())?;
         self.emit_slot_events(events);
         Ok(result)
     }
 
-    fn rpc_slot_status(&self, params: &Value) -> Value {
-        let lane = optional_str(params, "lane").unwrap_or("unknown");
-        let (status, events) = self
-            .slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .status(lane, (self.slot_clock)());
+    /// `slot_status` — the pools and queue are public, but a hold's
+    /// token shows only to its owner: the caller whose derived lane
+    /// matches the hold and whose own ancestry includes the hold's
+    /// pid. A `lane` param is ignored — identity is the connection's.
+    fn rpc_slot_status(&self, _params: &Value, peer_pid: u32) -> Result<Value> {
+        let (lane, chain) = self.slot_caller(peer_pid)?;
+        let (status, events) = self.slots.lock().unwrap_or_else(|e| e.into_inner()).status(
+            crate::slots::SlotCaller {
+                lane: &lane,
+                pids: &chain,
+            },
+            (self.slot_clock)(),
+        );
         self.emit_slot_events(events);
-        status
+        Ok(status)
     }
 
     fn rpc_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -3622,8 +3692,9 @@ fn optional_i64(params: &Value, field: &str) -> Option<i64> {
     params.get(field).and_then(Value::as_i64)
 }
 
-/// Reject peers that are not the same Unix user.
-fn check_peer(stream: &UnixStream) -> Result<()> {
+/// Reject peers that are not the same Unix user; answer the peer's
+/// pid — slot RPCs derive their caller identity from it (CAD-113).
+fn check_peer(stream: &UnixStream) -> Result<u32> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -3645,13 +3716,13 @@ fn check_peer(stream: &UnixStream) -> Result<()> {
     if cred.uid != unsafe { libc::geteuid() } {
         return Err(Error::rejected("Socket peer is not the same user"));
     }
-    Ok(())
+    Ok(cred.pid as u32)
 }
 
 fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
-    if check_peer(&stream).is_err() {
+    let Ok(peer_pid) = check_peer(&stream) else {
         return;
-    }
+    };
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(_) => return,
@@ -3667,7 +3738,7 @@ fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                     .and_then(Value::as_str)
                     .ok_or_else(|| Error::rejected("Missing 'method'"))?;
                 let params = frame.get("params").cloned().unwrap_or(json!({}));
-                shared.dispatch(method, &params)
+                shared.dispatch(method, &params, peer_pid)
             });
         let frame = match response {
             Ok(result) => proto::ok(result),
