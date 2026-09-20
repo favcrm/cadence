@@ -877,6 +877,7 @@ pub fn add_ref(
     target: &str,
     label: Option<&str>,
     worktree: Option<&str>,
+    agent: Option<&str>,
     if_rev: Option<&str>,
     actor: &str,
 ) -> Result<Value> {
@@ -896,12 +897,37 @@ pub fn add_ref(
         closed: None,
         worktree: worktree.map(str::to_string),
         cargo_target: None,
+        agent: agent.map(str::to_string),
     };
     front.refs.push(r);
     save_front(&dir, &front, &body)?;
     commit(pm, &format!("{id}: ref {kind}"), &[id], actor)?;
     Ok(json!({"id": id, "ref": {"kind": kind, "target": target},
               "committed": true}))
+}
+
+/// Mark every open `<kind>` ref naming `target` closed — kept as
+/// history but no longer counted by `issue finish`. A dispatch whose
+/// send failed leaves its pre-recorded `message` ref orphaned;
+/// closing it keeps the attempt's history without letting it read as
+/// a live binding (or a "dispatch recorded during finish" stale
+/// reason) to a concurrent finish.
+pub fn close_ref(pm: &Pm, id: &str, kind: &str, target: &str, actor: &str) -> Result<()> {
+    let (_project, dir) = issue_dir(pm, id)?;
+    let _lock = pm.lock()?;
+    let (mut front, body) = load_front(&dir)?;
+    let mut hit = false;
+    for r in &mut front.refs {
+        if r.kind == kind && r.path.as_deref() == Some(target) && r.closed != Some(true) {
+            r.closed = Some(true);
+            hit = true;
+        }
+    }
+    if hit {
+        save_front(&dir, &front, &body)?;
+        commit(pm, &format!("{id}: ref {kind} closed"), &[id], actor)?;
+    }
+    Ok(())
 }
 
 /// `issue comment <ID> -m|--file` — one create-only file under
