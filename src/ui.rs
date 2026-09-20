@@ -26,6 +26,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::adapter::registry;
 use crate::client;
+use crate::doctor::host::redact_argv;
 use crate::error::{Error, Result};
 use crate::issue::{board, history, model, project, write as issue_write, Pm};
 use crate::proc::{self, BoundedError};
@@ -588,13 +589,37 @@ fn task_issue_map(state_dir: &Path) -> HashMap<String, TaskBinding> {
     map
 }
 
-/// One running message reduced for the board: id, task, turn token.
+/// Keep an ad-hoc current-message description useful without putting the
+/// queued prompt or provider credentials in browser JSON. The shared argv
+/// scrubber handles credential-shaped flags, headers, URIs and token forms;
+/// the character cap keeps one large prompt from becoming an agent row.
+fn current_message_summary(m: &Value) -> Option<String> {
+    let body = m["body"].as_str()?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let head: String = body.chars().take(512).collect();
+    let tokens: Vec<String> = head.split_whitespace().map(str::to_string).collect();
+    let safe = redact_argv(&tokens);
+    if safe.is_empty() {
+        return None;
+    }
+    let mut summary: String = safe.chars().take(180).collect();
+    if safe.chars().count() > 180 {
+        summary.push_str("…");
+    }
+    Some(summary)
+}
+
+/// One running message reduced for the board: id, task, turn token and a
+/// bounded redacted description for ad-hoc current work.
 fn running_json(m: &Value) -> Value {
     json!({
         "id": m["id"],
         "task": m["task_id"],
         "turn_id": m["turn_id"],
         "created": m["created"],
+        "summary": current_message_summary(m),
     })
 }
 
@@ -2786,7 +2811,8 @@ fn qr_term(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_type, static_file};
+    use super::{content_type, running_json, static_file};
+    use serde_json::json;
 
     /// Brand files sit at the dist root (Vite copies `ui/public/`); they
     /// must come back as themselves with an image type, never as the
@@ -2806,6 +2832,18 @@ mod tests {
         let (name, _) = static_file(Some(dist.path()), "/apple-touch-icon.png").unwrap();
         assert_eq!(content_type(&name), "image/png");
         assert!(static_file(Some(dist.path()), "/../favicon.svg").is_none());
+    }
+
+    #[test]
+    fn current_message_summary_is_bounded_and_redacted() {
+        let message = running_json(&json!({
+            "id": "m1",
+            "body": "investigate this issue password=super-secret and keep the useful context visible"
+        }));
+        let summary = message["summary"].as_str().unwrap();
+        assert!(summary.contains("investigate this issue"));
+        assert!(!summary.contains("super-secret"));
+        assert!(summary.chars().count() <= 181);
     }
 
     /// The embedded build answers the same three paths.

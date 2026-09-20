@@ -239,11 +239,19 @@ function WorkBlock({
   if (blocked) return <span className="text-fail">blocked by quota</span>;
   if (approval) return <span className="text-warn">waiting for approval</span>;
   if (agent.running > 0) {
+    const summaries = (agent.running_messages ?? [])
+      .map((message) => message.summary)
+      .filter((summary): summary is string => Boolean(summary))
+      .join(" · ");
     const ids = (agent.running_messages ?? [])
       .map((message) => message.id)
       .filter(Boolean)
       .join(" · ");
-    return <span className="text-info">ad-hoc running{ids ? ` · ${ids}` : ""}</span>;
+    return (
+      <span className="text-info" title={summaries || ids || "ad-hoc running"}>
+        ad-hoc running{summaries ? ` · ${summaries}` : ids ? ` · ${ids}` : ""}
+      </span>
+    );
   }
   if (agent.queued > 0) return <span className="text-info">{agent.queued} queued</span>;
   if (agent.unknown > 0) return <span className="text-fail">{agent.unknown} needs review</span>;
@@ -494,6 +502,11 @@ function AgentDrawer({
                             task {m.task}
                           </span>
                         )}
+                        {m.summary && (
+                          <span className="num text-micro text-ink-400 truncate" title={m.summary}>
+                            {m.summary}
+                          </span>
+                        )}
                         {m.created && (
                           <span className="num text-micro text-ink-500 ml-auto">
                             {fmtTime(m.created)}
@@ -586,6 +599,9 @@ export default function Agents({
     .slice()
     .sort((a, b) => rank(a) - rank(b) || a.alias.localeCompare(b.alias));
   const totals = payload?.totals;
+  // A refresh error is an observation about the new request. It must not
+  // erase the last successful rows already held in `payload`.
+  const showRows = payload !== null || (!loading && !error);
 
   return (
     <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
@@ -613,14 +629,14 @@ export default function Agents({
           loading agent observations…
         </div>
       )}
-      {!loading && error && (
+      {error && (
         <div className="card mb-4 px-4 py-5 text-secondary text-fail border-fail/40" role="alert">
           could not load agent observations — {error}
         </div>
       )}
 
       {/* Phone: stacked agent cards — the table's columns don't fit 390px. */}
-      {!loading && !error && <div className="sm:hidden space-y-2.5 reveal" style={{ animationDelay: "80ms" }}>
+      {showRows && <div className="sm:hidden space-y-2.5 reveal" style={{ animationDelay: "80ms" }}>
         {agents.map((a) => {
           const st = stateLabel(a);
           return (
@@ -728,7 +744,7 @@ export default function Agents({
         )}
       </div>}
 
-      {!loading && !error && <div className="hidden sm:block card overflow-hidden reveal" style={{ animationDelay: "80ms" }}>
+      {showRows && <div className="hidden sm:block card overflow-hidden reveal" style={{ animationDelay: "80ms" }}>
         <div className="overflow-x-auto">
         <table className="w-full min-w-[64rem] text-label">
           <thead>

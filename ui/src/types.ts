@@ -188,7 +188,13 @@ export interface AgentTask {
   job?: string | null;
   job_title?: string | null;
   job_state?: string | null;
-  message?: { id: string; task?: string; turn_id?: string; created?: string } | null;
+  message?: {
+    id: string;
+    task?: string;
+    turn_id?: string;
+    created?: string;
+    summary?: string | null;
+  } | null;
 }
 
 export type UsageState =
@@ -253,8 +259,20 @@ export interface Agent {
   on: string[];
   tasks?: AgentTask[];
   /** First running message, reduced. */
-  message?: { id: string; task?: string; turn_id?: string; created?: string } | null;
-  running_messages?: { id: string; task?: string; turn_id?: string; created?: string }[];
+  message?: {
+    id: string;
+    task?: string;
+    turn_id?: string;
+    created?: string;
+    summary?: string | null;
+  } | null;
+  running_messages?: {
+    id: string;
+    task?: string;
+    turn_id?: string;
+    created?: string;
+    summary?: string | null;
+  }[];
   /** The daemon's fence text — already names the recovery commands. */
   recovery?: string | null;
   /** Concrete resume command for a stopped pane, e.g. `devin -r devin-x`. */
@@ -321,7 +339,13 @@ export interface AgentDetail {
   };
   queued: number;
   unknown: number;
-  running: { id: string; task?: string; turn_id?: string; created?: string }[];
+  running: {
+    id: string;
+    task?: string;
+    turn_id?: string;
+    created?: string;
+    summary?: string | null;
+  }[];
   events: {
     seq: number;
     alias: string;
