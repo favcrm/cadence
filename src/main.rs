@@ -81,6 +81,13 @@ enum Commands {
         #[command(subcommand)]
         action: MessageAction,
     },
+    /// Record explicit operator approval evidence for the read-only audit.
+    /// These records never grant dispatch or merge authority. Message
+    /// queue state and worker output are not accepted as approval proof.
+    Approval {
+        #[command(subcommand)]
+        action: ApprovalAction,
+    },
     /// Launch a Devin official terminal as a managed agent (pty endpoint).
     /// `-r <session-slug>` resumes an existing Devin session, mirroring
     /// `devin -r`; without it a fresh session is launched and becomes
@@ -1869,6 +1876,38 @@ enum MessageAction {
         /// Why — recorded on the event, result and the routed notice.
         #[arg(long)]
         reason: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalAction {
+    /// Record an explicit approval bound to a full landed head SHA.
+    Record {
+        /// Stable id for retries and a later explicit revocation.
+        id: String,
+        /// Explicit operator identity/source; never inferred from a message.
+        #[arg(long)]
+        source: String,
+        /// Action being approved (the merge audit consumes `merge`).
+        #[arg(long)]
+        action: String,
+        /// Full 40-character lowercase commit SHA.
+        #[arg(long)]
+        head: String,
+        /// Human-readable scope retained as evidence and never widened.
+        #[arg(long)]
+        scope: String,
+    },
+    /// Record an explicit revocation for a prior approval id.
+    Revoke {
+        /// Approval id returned/recorded by `approval record`.
+        id: String,
+        /// Explicit operator identity/source; never inferred from a message.
+        #[arg(long)]
+        source: String,
+        /// Why the approval was revoked.
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -4538,6 +4577,36 @@ fn run() -> Result<i32> {
             };
             print_json(&result);
             Ok(if pending { 2 } else { 0 })
+        }
+        Commands::Approval { action } => {
+            let pane = std::env::var("CADENCE_ALIAS").ok();
+            let result = match action {
+                ApprovalAction::Record {
+                    id,
+                    source,
+                    action,
+                    head,
+                    scope,
+                } => client::rpc(
+                    &state_dir,
+                    "approval_record",
+                    json!({
+                        "id": id,
+                        "source": source,
+                        "action": action,
+                        "head": head,
+                        "scope": scope,
+                        "pane": pane,
+                    }),
+                )?,
+                ApprovalAction::Revoke { id, source, reason } => client::rpc(
+                    &state_dir,
+                    "approval_revoke",
+                    json!({"id": id, "source": source, "reason": reason, "pane": pane}),
+                )?,
+            };
+            print_json(&result);
+            Ok(0)
         }
         Commands::Events {
             alias,

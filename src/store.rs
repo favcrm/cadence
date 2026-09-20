@@ -222,6 +222,45 @@ fn automatic_quota_error(agent: &Agent) -> Option<String> {
     None
 }
 
+const APPROVAL_RECORDED_EVENT: &str = "approval_recorded";
+const APPROVAL_REVOKED_EVENT: &str = "approval_revoked";
+const APPROVAL_PROVENANCE: &str = "operator_explicit";
+
+fn approval_text(value: &str, what: &str, max: usize) -> Result<()> {
+    if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+        return Err(Error::rejected(format!(
+            "{what} must contain 1-{max} non-control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn approval_source(source: &str) -> Result<()> {
+    approval_text(source, "Approval source", 128)?;
+    // `user` is the default daemon message source, not an authenticated
+    // human identity. `daemon` is the event stream identity. Neither is
+    // accepted as the source of an explicit approval record.
+    if matches!(source, "user" | "daemon") {
+        return Err(Error::rejected(
+            "Approval source must identify an explicit operator; `user` and `daemon` are not proof of human approval",
+        ));
+    }
+    Ok(())
+}
+
+fn approval_head(head_sha: &str) -> Result<()> {
+    if head_sha.len() != 40
+        || !head_sha
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Error::rejected(
+            "Approval head must be the full 40-character lowercase hexadecimal SHA",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub seq: i64,
@@ -1613,6 +1652,107 @@ impl Store {
     pub fn event_public(&self, alias: &str, kind: &str, payload: Value) -> Result<()> {
         let conn = self.conn();
         Self::event(&conn, alias, kind, payload)
+    }
+
+    /// Find an approval event by its caller-supplied id. Approval
+    /// evidence lives in the daemon stream rather than an agent mailbox,
+    /// so deleting/cancelling a message cannot remove or revoke it.
+    fn approval_event(&self, conn: &Connection, kind: &str, id: &str) -> Result<Option<Value>> {
+        let mut stmt =
+            conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
+        let mut rows = stmt.query(params![Self::DAEMON_STREAM, kind])?;
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            if payload["approval_id"].as_str() == Some(id) {
+                return Ok(Some(payload));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Persist an explicit operator approval as audit evidence. This is
+    /// deliberately a write-only evidence primitive: dispatch, task
+    /// acceptance, and merge policy never consult it.
+    ///
+    /// The return value is `true` for a new event and `false` when the
+    /// exact same record id and payload were already stored.
+    pub fn record_approval(
+        &self,
+        approval_id: &str,
+        source: &str,
+        action: &str,
+        head_sha: &str,
+        scope: &str,
+    ) -> Result<bool> {
+        identifier(approval_id, "Approval id")?;
+        approval_source(source)?;
+        approval_text(action, "Approval action", 128)?;
+        approval_head(head_sha)?;
+        approval_text(scope, "Approval scope", 256)?;
+        let payload = json!({
+            "approval_id": approval_id,
+            "source": source,
+            "action": action,
+            "head_sha": head_sha,
+            "scope": scope,
+            "provenance": APPROVAL_PROVENANCE,
+        });
+
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        if let Some(old) = self.approval_event(&tx, APPROVAL_RECORDED_EVENT, approval_id)? {
+            if old == payload {
+                tx.commit()?;
+                return Ok(false);
+            }
+            return Err(Error::rejected(format!(
+                "Approval id '{approval_id}' already names different evidence"
+            )));
+        }
+        Self::event(&tx, Self::DAEMON_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Persist an explicit operator revocation. Revocation is separate
+    /// from message delivery state and must reference an existing
+    /// approval record. Identical retries are idempotent.
+    pub fn revoke_approval(&self, approval_id: &str, source: &str, reason: &str) -> Result<bool> {
+        identifier(approval_id, "Approval id")?;
+        approval_source(source)?;
+        approval_text(reason, "Approval revocation reason", 256)?;
+        let payload = json!({
+            "approval_id": approval_id,
+            "source": source,
+            "reason": reason,
+            "provenance": APPROVAL_PROVENANCE,
+        });
+
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        if self
+            .approval_event(&tx, APPROVAL_RECORDED_EVENT, approval_id)?
+            .is_none()
+        {
+            return Err(Error::rejected(format!(
+                "Approval id '{approval_id}' has no recorded approval to revoke"
+            )));
+        }
+        if let Some(old) = self.approval_event(&tx, APPROVAL_REVOKED_EVENT, approval_id)? {
+            if old == payload {
+                tx.commit()?;
+                return Ok(false);
+            }
+            return Err(Error::rejected(format!(
+                "Approval id '{approval_id}' already names different revocation evidence"
+            )));
+        }
+        Self::event(&tx, Self::DAEMON_STREAM, APPROVAL_REVOKED_EVENT, payload)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// `event_public` with job/task scope — the stall watch uses it so
@@ -5918,6 +6058,63 @@ mod tests {
         let (dup, state) = s.enqueue("a1", "hello", None, "m1", "user").unwrap();
         assert!(dup && state == "queued");
         assert!(s.enqueue("a1", "different", None, "m1", "user").is_err());
+    }
+
+    #[test]
+    fn approval_evidence_is_idempotent_and_separate_from_delivery() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "a1", &cwd);
+        assert!(s
+            .record_approval("approval-1", "operator", "merge", SHA40_A, "CAD-217/PR-1")
+            .unwrap());
+        assert!(!s
+            .record_approval("approval-1", "operator", "merge", SHA40_A, "CAD-217/PR-1")
+            .unwrap());
+        assert!(s
+            .record_approval("approval-1", "operator", "merge", SHA40_B, "CAD-217/PR-1")
+            .is_err());
+        assert!(s
+            .record_approval("approval-2", "operator", "merge", SHA40_B, "scope")
+            .is_ok());
+        assert!(s
+            .revoke_approval("approval-1", "operator", "head changed")
+            .unwrap());
+        assert!(!s
+            .revoke_approval("approval-1", "operator", "head changed")
+            .unwrap());
+        assert!(s
+            .revoke_approval("missing", "operator", "no record")
+            .is_err());
+        assert!(s
+            .record_approval("bad-source", "user", "merge", SHA40_A, "scope")
+            .is_err());
+        assert!(s
+            .record_approval("short-head", "operator", "merge", "aaaa", "scope")
+            .is_err());
+
+        // A cancelled delivery has its own mailbox event and cannot
+        // alter the daemon approval stream.
+        s.enqueue("a1", "approval phrase", None, "m-cancel", "user")
+            .unwrap();
+        s.cancel("m-cancel", "operator", Some("delivery withdrawn"))
+            .unwrap();
+        let approval_events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();
+        assert_eq!(
+            approval_events
+                .iter()
+                .filter(|e| e.kind == APPROVAL_RECORDED_EVENT)
+                .count(),
+            2
+        );
+        assert_eq!(
+            approval_events
+                .iter()
+                .filter(|e| e.kind == APPROVAL_REVOKED_EVENT)
+                .count(),
+            1
+        );
+        assert!(!approval_events.iter().any(|e| e.kind == "cancelled"));
     }
 
     #[test]

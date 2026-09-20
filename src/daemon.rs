@@ -1303,6 +1303,8 @@ impl Shared {
             "message_report" => self.rpc_message_report(params),
             "message_reconcile" => self.rpc_reconcile(params),
             "message_cancel" => self.rpc_cancel(params),
+            "approval_record" => self.rpc_approval_record(params),
+            "approval_revoke" => self.rpc_approval_revoke(params),
             "job_new" => self.rpc_job_new(params),
             "job_list" => self.rpc_job_list(params),
             "job_show" => self.rpc_job_show(params),
@@ -2776,6 +2778,58 @@ impl Shared {
         }
         self.wake();
         Ok(json!({"state": "cancelled", "message": message.to_json()}))
+    }
+
+    /// Record audit evidence outside the worker/dispatch authority path.
+    /// The CLI supplies a pane claim so a cadence worker cannot use this
+    /// operator-only surface; the store separately rejects ambiguous
+    /// `user`/`daemon` sources and validates the full head.
+    fn rpc_approval_record(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        if optional_str(params, "pane").is_some() {
+            return Err(Error::rejected(
+                "approval evidence is an operator action — run it outside a cadence pane",
+            ));
+        }
+        let id = required_str(params, "id")?;
+        let source = required_str(params, "source")?;
+        let action = required_str(params, "action")?;
+        let head = required_str(params, "head")?;
+        let scope = required_str(params, "scope")?;
+        let recorded = self
+            .store
+            .record_approval(id, source, action, head, scope)?;
+        self.wake();
+        Ok(json!({
+            "state": "recorded",
+            "duplicate": !recorded,
+            "approval_id": id,
+            "source": source,
+            "action": action,
+            "head_sha": head,
+            "scope": scope,
+        }))
+    }
+
+    /// Record explicit revocation evidence. Delivery cancellation never
+    /// reaches this method and therefore cannot revoke authorization.
+    fn rpc_approval_revoke(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        if optional_str(params, "pane").is_some() {
+            return Err(Error::rejected(
+                "approval evidence is an operator action — run it outside a cadence pane",
+            ));
+        }
+        let id = required_str(params, "id")?;
+        let source = required_str(params, "source")?;
+        let reason = required_str(params, "reason")?;
+        let revoked = self.store.revoke_approval(id, source, reason)?;
+        self.wake();
+        Ok(json!({
+            "state": "revoked",
+            "duplicate": !revoked,
+            "approval_id": id,
+            "source": source,
+            "reason": reason,
+        }))
     }
 
     /// The resume path shared by `agent_resume` and `agent_unfence`:
