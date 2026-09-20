@@ -268,11 +268,11 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                 branch
             )));
         }
-        cargo_target = Some(worktree::configure_cargo_target(
+        cargo_target = worktree::configure_cargo_target(
             &wt_dir,
             &root,
             worktree::shared_deps_enabled(&project)?,
-        )?);
+        )?;
         // Idempotent: same issue, same names — no commit, unless the
         // recorded cargo target went stale (project config flipped,
         // an older cadence recorded a different layout). The ref is
@@ -335,7 +335,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             &root,
             worktree::shared_deps_enabled(&project)?,
         ) {
-            Ok(target) => cargo_target = Some(target),
+            Ok(target) => cargo_target = target,
             Err(e) => {
                 let _ = git(
                     &root,

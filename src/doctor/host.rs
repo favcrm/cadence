@@ -1543,13 +1543,17 @@ fn check_temp_dirs(scan: &Scan) -> Check {
         String::new()
     } else {
         format!(
-            "rm -rf {}{}  # leaked test/state dirs older than a day",
+            "rm -rf {}  # leaked test/state dirs older than a day{}",
             hits.iter()
                 .take(5)
                 .map(|(p, _)| shell_quote(&p.display().to_string()))
                 .collect::<Vec<_>>()
                 .join(" "),
-            if hits.len() > 5 { " …" } else { "" }
+            if hits.len() > 5 {
+                format!(" ({} more not listed)", hits.len() - 5)
+            } else {
+                String::new()
+            }
         )
     };
     let value = json!({
@@ -1812,10 +1816,13 @@ fn check_worktrees(scan: &Scan) -> Check {
 /// only when no build holds one of cargo's lock files), and stale worktrees.
 /// A stale lane's own `target/` is already covered by its
 /// `worktree-target` row, so the stale row nets it out — the total
-/// never counts those bytes twice. Listing only: nothing here
-/// deletes or signals anything, and every emitted command is
-/// shell-quoted so a path with a space can never split into extra
-/// `rm -rf` arguments.
+/// never counts those bytes twice. Lane `target/` rows are
+/// informational: they free only when the lane itself goes away, so
+/// `reclaimable_bytes` excludes them and reports them separately as
+/// `freed_with_lanes_bytes` — the headline number is what the plan's
+/// own commands free today. Listing only: nothing here deletes or
+/// signals anything, and every emitted command is shell-quoted so a
+/// path with a space can never split into extra `rm -rf` arguments.
 pub fn reclaim_plan(scan: &Scan) -> Value {
     let mut rows: Vec<Value> = Vec::new();
     let Some(root) = repo_root(&scan.cwd) else {
@@ -1871,9 +1878,22 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
             "action": if locked {
                 "a cargo build holds the shared lock — rerun the plan when lanes are idle".to_string()
             } else {
+                // Clear the *contents* of the hashed subdirs, never
+                // the dirs themselves: every lane symlinks to those
+                // dirs, and deleting them would leave the links
+                // dangling — cargo dies with EEXIST on the next
+                // build. `rm -rf 'dir'/*` is safe on an empty dir
+                // (the -f suppresses the unmatched glob). The r2-era
+                // shared `examples/` is left alone — no lane links it
+                // any more and its bytes count in the row total.
+                let d = shared.join("debug");
                 format!(
-                    "rm -rf {}  # every lane rebuilds lazily; issue finish never touches it",
-                    shell_quote(&shared.display().to_string())
+                    "rm -rf {}/* {}/* {}/* {}/*  # clears cached dep artifacts — \
+                     the dirs stay, so lanes keep building and rebuild lazily",
+                    shell_quote(&d.join("deps").display().to_string()),
+                    shell_quote(&d.join(".fingerprint").display().to_string()),
+                    shell_quote(&d.join("build").display().to_string()),
+                    shell_quote(&d.join("incremental").display().to_string()),
                 )
             },
         }));
@@ -1906,10 +1926,23 @@ pub fn reclaim_plan(scan: &Scan) -> Value {
             }));
         }
     }
-    let reclaimable: u64 = rows.iter().map(|r| r["bytes"].as_u64().unwrap_or(0)).sum();
+    // Live-lane `target/` rows are informational — they free only
+    // when the lane is finished, so they are not part of what this
+    // plan could reclaim on its own.
+    let reclaimable: u64 = rows
+        .iter()
+        .filter(|r| r["kind"] != "worktree-target")
+        .map(|r| r["bytes"].as_u64().unwrap_or(0))
+        .sum();
+    let with_lanes: u64 = rows
+        .iter()
+        .filter(|r| r["kind"] == "worktree-target")
+        .map(|r| r["bytes"].as_u64().unwrap_or(0))
+        .sum();
     json!({
         "rows": rows,
         "reclaimable_bytes": reclaimable,
+        "freed_with_lanes_bytes": with_lanes,
     })
 }
 
@@ -1945,6 +1978,13 @@ pub fn render_reclaim(plan: &Value) -> String {
         "total reclaimable: {}\n",
         human(plan["reclaimable_bytes"].as_u64().unwrap_or(0))
     ));
+    let with_lanes = plan["freed_with_lanes_bytes"].as_u64().unwrap_or(0);
+    if with_lanes > 0 {
+        out.push_str(&format!(
+            "target/ freed with their lanes: {} (not counted above)\n",
+            human(with_lanes)
+        ));
+    }
     out
 }
 
@@ -3035,9 +3075,19 @@ mod tests {
                 && kinds.contains(&"stale-worktree"),
             "{kinds:?}"
         );
+        // Live-lane target rows are informational — excluded from the
+        // reclaimable total and surfaced on their own line instead.
         assert_eq!(
             plan["reclaimable_bytes"].as_u64().unwrap(),
             rows.iter()
+                .filter(|r| r["kind"] != "worktree-target")
+                .map(|r| r["bytes"].as_u64().unwrap())
+                .sum::<u64>()
+        );
+        assert_eq!(
+            plan["freed_with_lanes_bytes"].as_u64().unwrap(),
+            rows.iter()
+                .filter(|r| r["kind"] == "worktree-target")
                 .map(|r| r["bytes"].as_u64().unwrap())
                 .sum::<u64>()
         );
@@ -3145,26 +3195,44 @@ mod tests {
                 .unwrap();
             assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{stale}");
         }
-        // The shared row's rm -rf quotes too.
+        // The shared row's rm -rf clears *contents*, one quoted glob
+        // per shared subdir — run it through a real `sh` and prove
+        // the dirs themselves (every lane's symlink target) survive.
         let rm = actions
             .iter()
             .find(|a| a.contains("rm -rf"))
             .expect("shared row")
             .clone();
-        let rm_q = rm
-            .strip_prefix("rm -rf ")
-            .unwrap()
-            .split("  #")
-            .next()
-            .unwrap();
+        let d = shared.join("debug");
+        for name in ["deps", ".fingerprint", "build", "incremental"] {
+            std::fs::create_dir_all(d.join(name)).unwrap();
+            std::fs::write(d.join(name).join("cached.o"), b"x").unwrap();
+        }
+        let rm_cmd = rm.split("  #").next().unwrap();
+        let out = Command::new("sh").arg("-c").arg(rm_cmd).output().unwrap();
+        assert!(out.status.success(), "{rm}");
+        for name in ["deps", ".fingerprint", "build", "incremental"] {
+            let dir = d.join(name);
+            assert!(dir.is_dir(), "{name} must survive for lane symlinks");
+            assert!(
+                std::fs::read_dir(&dir).unwrap().next().is_none(),
+                "{name} emptied"
+            );
+        }
+        // And the quoted glob args word-split correctly: the first
+        // arg expands inside the space-containing path.
+        std::fs::write(d.join("deps/marker"), b"x").unwrap();
         let out = Command::new("sh")
             .arg("-c")
-            .arg(format!("set -- {rm_q}; printf %s \"$1\""))
+            .arg(format!(
+                "set -- {}; printf %s \"$1\"",
+                rm_cmd.strip_prefix("rm -rf ").unwrap()
+            ))
             .output()
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            shared.display().to_string()
+            d.join("deps/marker").display().to_string()
         );
 
         // A held .cargo-lock swaps the rm -rf for an idle note.

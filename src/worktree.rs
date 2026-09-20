@@ -109,7 +109,12 @@ pub fn shared_target_dir(root: &Path) -> PathBuf {
 /// uplifted binaries, uplifted rlibs, `.d` files — is unhashed and
 /// stays per-lane, which is what keeps one lane's `cargo test` from
 /// exec'ing another lane's `debug/cadence`.
-const SHARED_DEBUG_DIRS: [&str; 5] = ["deps", ".fingerprint", "build", "incremental", "examples"];
+const SHARED_DEBUG_DIRS: [&str; 4] = ["deps", ".fingerprint", "build", "incremental"];
+/// `examples/` is deliberately absent: cargo uplifts example binaries
+/// to `debug/examples/<name>` *unhashed*, so sharing it hands one lane
+/// another lane's example — the bug this farm exists to prevent. Any
+/// link an older cadence planted is unlinked on sight.
+const RETIRED_DEBUG_DIRS: [&str; 1] = ["examples"];
 /// Cargo's build locks (all three exist on modern toolchains) are
 /// shared too, so two lanes building at once serialise on cargo's own
 /// locking rather than racing writes into the shared `deps/`.
@@ -130,30 +135,44 @@ pub fn shared_deps_enabled(project: &project::Project) -> Result<bool> {
     }
 }
 
-/// Where cargo will actually put this worktree's build output: an
-/// explicit `build.target-dir` in the worktree's own
-/// `.cargo/config.toml` wins (relative values resolve against the
-/// worktree, same as cargo resolves them); otherwise the default
-/// `<wt>/target`. The worktree-local file is the only one cadence
-/// inspects — a `CARGO_TARGET_DIR` env or a config higher in cargo's
-/// chain overrides the same way it always has; the ref records the
-/// best-known effective dir.
+/// `build.target-dir` from one cargo config file, resolved the way
+/// cargo resolves it: relative values are relative to the directory
+/// that contains `.cargo/`. `None` on a missing, unreadable or
+/// target-dir-less file — a malformed config is the operator's
+/// problem, not a reason to fail `issue start`.
+fn config_target_dir(conf: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(conf).ok()?;
+    let doc = toml::from_str::<toml::Table>(&text).ok()?;
+    let dir = doc.get("build")?.get("target-dir")?.as_str()?;
+    let dir = PathBuf::from(dir);
+    Some(if dir.is_absolute() {
+        dir
+    } else {
+        conf.parent()?.parent()?.join(dir)
+    })
+}
+
+/// Where cargo will actually put this worktree's build output, per
+/// cargo's own config chain: `.cargo/config.toml` in the worktree and
+/// every ancestor up to `/`, then `$CARGO_HOME/config.toml` (default
+/// `~/.cargo/config.toml`) — first `build.target-dir` wins. An
+/// ancestor or home-level redirect applies to every lane exactly like
+/// a worktree-local one does, so it is honoured here too rather than
+/// planting a farm cargo would ignore. A `CARGO_TARGET_DIR` env still
+/// overrides the way it always has; the ref records the best-known
+/// effective dir.
 pub fn effective_target_dir(wt_dir: &Path) -> PathBuf {
-    let conf = wt_dir.join(".cargo").join("config.toml");
-    if let Ok(text) = std::fs::read_to_string(&conf) {
-        if let Ok(doc) = toml::from_str::<toml::Table>(&text) {
-            if let Some(dir) = doc
-                .get("build")
-                .and_then(|b| b.get("target-dir"))
-                .and_then(|v| v.as_str())
-            {
-                let dir = PathBuf::from(dir);
-                return if dir.is_absolute() {
-                    dir
-                } else {
-                    wt_dir.join(dir)
-                };
-            }
+    for dir in wt_dir.ancestors() {
+        if let Some(target) = config_target_dir(&dir.join(".cargo").join("config.toml")) {
+            return target;
+        }
+    }
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")));
+    if let Some(home) = cargo_home {
+        if let Some(target) = config_target_dir(&home.join("config.toml")) {
+            return target;
         }
     }
     wt_dir.join("target")
@@ -184,14 +203,27 @@ fn is_link_to(link: &Path, target: &Path) -> bool {
 }
 
 /// Is `path` under an exclusive flock right now? A non-blocking
-/// LOCK_EX attempt — success means free, and the `File` drop releases
-/// the probe lock immediately.
-pub(crate) fn file_locked(path: &Path) -> bool {
-    let Ok(f) = std::fs::File::open(path) else {
-        return false;
-    };
+/// LOCK_EX attempt — only EWOULDBLOCK means held (any other errno is
+/// just an unreadable file, not a build). Success means free, and the
+/// `File` drop releases the probe lock immediately. `Err` when the
+/// file can't even be opened (e.g. fd exhaustion) — callers that
+/// need certainty must not treat that as "unlocked".
+fn lock_held(path: &Path) -> Result<bool> {
+    let f = std::fs::File::open(path).map_err(|e| {
+        Error::rejected(format!(
+            "cannot probe {} ({e}) — retry `issue start` when the lane is idle",
+            path.display()
+        ))
+    })?;
     use std::os::unix::io::AsRawFd;
-    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    Ok(rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK))
+}
+
+/// Advisory lock check for diagnostics — a probe failure reads as
+/// "not locked" since the flag is informational only.
+pub(crate) fn file_locked(path: &Path) -> bool {
+    lock_held(path).unwrap_or(false)
 }
 
 /// Point a worktree's cargo builds at the shared dep cache: inside
@@ -204,21 +236,61 @@ pub(crate) fn file_locked(path: &Path) -> bool {
 /// shared dir become empty real dirs) so a `per-worktree` lane is
 /// fully private again. Nothing under `.cargo/` is written or
 /// excluded — a tracked or hand-written `.cargo/config.toml` is never
-/// touched. Returns the effective target dir for the worktree ref.
-pub fn configure_cargo_target(wt_dir: &Path, root: &Path, shared: bool) -> Result<PathBuf> {
-    let effective = effective_target_dir(wt_dir);
-    let wt_target = wt_dir.join("target");
-    // An operator's `build.target-dir` redirects cargo elsewhere —
-    // the farm would sit inert, so it is not planted.
-    if effective != wt_target {
-        return Ok(effective);
-    }
-    let wt_debug = wt_target.join("debug");
+/// touched.
+///
+/// Returns `Some(effective target dir)` for the worktree ref, or
+/// `None` when the checkout is not a cargo package — a repo with no
+/// `Cargo.toml` gets no `target/` created and nothing moved, so a
+/// Maven-style `target/debug/build` it already owns is left
+/// byte-identical. A failed plant removes the links it created so
+/// the lane is never left half-shared (artifacts already folded into
+/// the cache stay there; a retry re-links over them).
+pub fn configure_cargo_target(wt_dir: &Path, root: &Path, shared: bool) -> Result<Option<PathBuf>> {
+    let wt_debug = wt_dir.join("target").join("debug");
     let shared_debug = shared_target_dir(root).join("debug");
-    for name in SHARED_DEBUG_DIRS {
-        let link = wt_debug.join(name);
-        let shared_sub = shared_debug.join(name);
-        if shared {
+    if !shared {
+        for name in SHARED_DEBUG_DIRS.iter().chain(&RETIRED_DEBUG_DIRS) {
+            let link = wt_debug.join(name);
+            if is_link_to(&link, &shared_debug.join(name)) {
+                std::fs::remove_file(&link)?;
+                std::fs::create_dir_all(&link)?;
+            }
+        }
+        for name in SHARED_DEBUG_FILES {
+            let link = wt_debug.join(name);
+            if is_link_to(&link, &shared_debug.join(name)) {
+                std::fs::remove_file(&link)?;
+            }
+        }
+        return Ok(if wt_dir.join("Cargo.toml").is_file() {
+            Some(effective_target_dir(wt_dir))
+        } else {
+            None
+        });
+    }
+    if !wt_dir.join("Cargo.toml").is_file() {
+        return Ok(None);
+    }
+    let effective = effective_target_dir(wt_dir);
+    // An operator's `build.target-dir` — worktree-local, an ancestor's
+    // or the cargo-home one — redirects cargo elsewhere; the farm
+    // would sit inert, so it is not planted.
+    if effective != wt_dir.join("target") {
+        return Ok(Some(effective));
+    }
+    // An `examples` link planted under the r2 design shares unhashed
+    // example binaries — retire it on sight, before it misleads a
+    // build.
+    let retired = wt_debug.join(RETIRED_DEBUG_DIRS[0]);
+    if is_link_to(&retired, &shared_debug.join(RETIRED_DEBUG_DIRS[0])) {
+        std::fs::remove_file(&retired)?;
+        std::fs::create_dir_all(&retired)?;
+    }
+    let mut created: Vec<PathBuf> = Vec::new();
+    let planted = (|| -> Result<()> {
+        for name in SHARED_DEBUG_DIRS {
+            let link = wt_debug.join(name);
+            let shared_sub = shared_debug.join(name);
             std::fs::create_dir_all(&shared_sub)?;
             std::fs::create_dir_all(&wt_debug)?;
             if is_link_to(&link, &shared_sub) {
@@ -233,33 +305,44 @@ pub fn configure_cargo_target(wt_dir: &Path, root: &Path, shared: bool) -> Resul
                 continue;
             }
             std::os::unix::fs::symlink(&shared_sub, &link)?;
-        } else if is_link_to(&link, &shared_sub) {
-            std::fs::remove_file(&link)?;
-            std::fs::create_dir_all(&link)?;
+            created.push(link);
         }
-    }
-    for name in SHARED_DEBUG_FILES {
-        let link = wt_debug.join(name);
-        let shared_file = shared_debug.join(name);
-        if shared {
+        for name in SHARED_DEBUG_FILES {
+            let link = wt_debug.join(name);
+            let shared_file = shared_debug.join(name);
             std::fs::create_dir_all(&wt_debug)?;
             if is_link_to(&link, &shared_file) || link.is_symlink() {
                 continue;
             }
             if link.exists() {
-                // A real lock file from a pre-shared build joins the
-                // shared lock — unless a build holds it right now.
-                if file_locked(&link) {
-                    continue;
+                // A real lock file held by a running build: linking
+                // the rest while this stays private leaves the lane
+                // half-shared with no common lock — refuse the whole
+                // plant instead. An unprobeable file is refused too:
+                // it cannot be proven free.
+                if lock_held(&link)? {
+                    return Err(Error::rejected(format!(
+                        "{} is locked by a running cargo build — \
+                         retry `issue start` when the lane is idle",
+                        link.display()
+                    )));
                 }
                 std::fs::remove_file(&link)?;
             }
             std::os::unix::fs::symlink(&shared_file, &link)?;
-        } else if is_link_to(&link, &shared_file) {
-            std::fs::remove_file(&link)?;
+            created.push(link);
+        }
+        Ok(())
+    })();
+    if planted.is_err() {
+        for link in created {
+            if link.is_symlink() {
+                let _ = std::fs::remove_file(&link);
+            }
         }
     }
-    Ok(effective)
+    planted?;
+    Ok(Some(effective))
 }
 
 #[cfg(test)]
@@ -302,6 +385,12 @@ mod tests {
         git(dir.path(), &["config", "user.name", "t"]);
         std::fs::write(dir.path().join("f"), "x").unwrap();
         std::fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
+        // A cargo package — the farm only plants in cargo checkouts.
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"t\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
         git(dir.path(), &["add", "-A"]);
         git(dir.path(), &["commit", "-qm", "init"]);
         dir
@@ -334,7 +423,7 @@ mod tests {
         let repo = git_repo();
         let wt = repo.path();
         let effective = configure_cargo_target(wt, repo.path(), true).unwrap();
-        assert_eq!(effective, wt.join("target"));
+        assert_eq!(effective, Some(wt.join("target")));
         let debug = wt.join("target/debug");
         for name in SHARED_DEBUG_DIRS {
             let link = debug.join(name);
@@ -390,7 +479,7 @@ mod tests {
         let wt = repo.path();
         configure_cargo_target(wt, repo.path(), true).unwrap();
         let effective = configure_cargo_target(wt, repo.path(), false).unwrap();
-        assert_eq!(effective, wt.join("target"));
+        assert_eq!(effective, Some(wt.join("target")));
         for name in SHARED_DEBUG_DIRS {
             let p = wt.join("target/debug").join(name);
             assert!(p.is_dir() && !p.is_symlink(), "{name}");
@@ -413,7 +502,7 @@ mod tests {
         git(wt, &["add", "-A"]);
         git(wt, &["commit", "-qm", "cargo config"]);
         let effective = configure_cargo_target(wt, repo.path(), true).unwrap();
-        assert_eq!(effective, PathBuf::from("/var/cache/mine"));
+        assert_eq!(effective, Some(PathBuf::from("/var/cache/mine")));
         // Tracked config survives byte-for-byte; no farm planted.
         assert_eq!(
             std::fs::read_to_string(cargo.join("config.toml")).unwrap(),
@@ -428,7 +517,7 @@ mod tests {
         )
         .unwrap();
         let effective = configure_cargo_target(wt, repo.path(), true).unwrap();
-        assert_eq!(effective, wt.join("build-out"));
+        assert_eq!(effective, Some(wt.join("build-out")));
         assert!(!wt.join("target").exists());
     }
 
@@ -443,5 +532,94 @@ mod tests {
         std::os::unix::fs::symlink(&foreign, debug.join("deps")).unwrap();
         configure_cargo_target(wt, repo.path(), true).unwrap();
         assert_eq!(std::fs::read_link(debug.join("deps")).unwrap(), foreign);
+    }
+
+    #[test]
+    fn configure_skips_non_cargo_checkout() {
+        let dir = TempDir::new().unwrap();
+        let wt = dir.path();
+        // No Cargo.toml — and a pre-existing `target/debug/build`
+        // the lane owns (a Maven-style layout, say). The farm must
+        // not create, move or link anything.
+        let owned = wt.join("target/debug/build/artifact");
+        std::fs::create_dir_all(owned.parent().unwrap()).unwrap();
+        std::fs::write(&owned, "maven-out").unwrap();
+        let effective = configure_cargo_target(wt, wt, true).unwrap();
+        assert_eq!(effective, None);
+        assert_eq!(std::fs::read_to_string(&owned).unwrap(), "maven-out");
+        assert!(!wt.join("target/debug/deps").exists());
+    }
+
+    #[test]
+    fn configure_refuses_half_shared_when_lock_held() {
+        let repo = git_repo();
+        let wt = repo.path();
+        // A pre-shared lane with a real lock file held by a "build".
+        let debug = wt.join("target/debug");
+        std::fs::create_dir_all(&debug).unwrap();
+        let lock = debug.join(".cargo-lock");
+        std::fs::write(&lock, "").unwrap();
+        let f = std::fs::File::open(&lock).unwrap();
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let e = configure_cargo_target(wt, repo.path(), true).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("retry `issue start` when the lane is idle"),
+            "{e}"
+        );
+        // Nothing linked — the lane is never left half-shared.
+        for name in SHARED_DEBUG_DIRS.iter().chain(&SHARED_DEBUG_FILES) {
+            assert!(!debug.join(name).is_symlink(), "{name}");
+        }
+        drop(f);
+        // And it plants cleanly once the build is done.
+        assert_eq!(
+            configure_cargo_target(wt, repo.path(), true).unwrap(),
+            Some(wt.join("target"))
+        );
+        assert!(debug.join("deps").is_symlink());
+    }
+
+    #[test]
+    fn configure_retires_shared_examples_link() {
+        let repo = git_repo();
+        let wt = repo.path();
+        // An r2-era farm: examples linked into the shared cache.
+        let debug = wt.join("target/debug");
+        let shared_ex = shared_target_dir(repo.path()).join("debug/examples");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::create_dir_all(&shared_ex).unwrap();
+        std::os::unix::fs::symlink(&shared_ex, debug.join("examples")).unwrap();
+        configure_cargo_target(wt, repo.path(), true).unwrap();
+        // The examples link is gone — a real per-lane dir instead.
+        assert!(debug.join("examples").is_dir() && !debug.join("examples").is_symlink());
+        assert!(debug.join("deps").is_symlink());
+    }
+
+    #[test]
+    fn effective_target_dir_walks_ancestors() {
+        let parent = TempDir::new().unwrap();
+        let repo = parent.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // An ancestor's config redirects every lane under it — cargo
+        // walks ancestors, so cadence must see the same redirect.
+        std::fs::create_dir_all(parent.path().join(".cargo")).unwrap();
+        std::fs::write(
+            parent.path().join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"shared-out\"\n",
+        )
+        .unwrap();
+        let effective = effective_target_dir(&repo);
+        // Relative values resolve against the config's parent dir.
+        assert_eq!(effective, parent.path().join("shared-out"));
+        // A worktree-local config still wins over the ancestor's.
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        std::fs::write(
+            repo.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"/mine\"\n",
+        )
+        .unwrap();
+        assert_eq!(effective_target_dir(&repo), PathBuf::from("/mine"));
     }
 }

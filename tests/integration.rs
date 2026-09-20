@@ -13055,6 +13055,16 @@ fn dispatch_kickoff_and_finish_guards() {
     git(&repo, &["config", "user.email", "t@t"]);
     git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("f"), "x").unwrap();
+    // A cargo checkout — CAD-95 r3 plants the dep-cache farm only in
+    // repos with a Cargo.toml; this fixture wants the shared-farm
+    // assertions, so it declares itself a cargo package (build
+    // output gitignored, as real repos do).
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join(".gitignore"), "/target\n").unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "init"]);
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
@@ -16122,7 +16132,7 @@ fn issue_start_links_shared_cargo_deps() {
     assert!(ok, "{out}");
     let wt = s.worktree_of("D-1");
     let shared_debug = s.repo.join(".cadence/target/shared/debug");
-    for name in ["deps", ".fingerprint", "build", "incremental", "examples"] {
+    for name in ["deps", ".fingerprint", "build", "incremental"] {
         let link = wt.join("target/debug").join(name);
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
@@ -16130,6 +16140,10 @@ fn issue_start_links_shared_cargo_deps() {
             "{name}"
         );
     }
+    // `examples` is NOT shared — cargo uplifts example binaries to
+    // `debug/examples/<name>` unhashed, so a shared dir would hand one
+    // lane another lane's example.
+    assert!(!wt.join("target/debug/examples").is_symlink());
     for name in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
         let link = wt.join("target/debug").join(name);
         assert_eq!(
@@ -16387,4 +16401,70 @@ fn doctor_host_shared_target_and_reclaim_plan() {
     // `--reclaim-plan` without `--host` is a usage error.
     let (code, _, _) = s.cli_at(&s.repo, &["doctor", "--reclaim-plan"]);
     assert_ne!(code, 0);
+}
+
+/// The r3 acceptance case: the emitted shared-cache command is run
+/// through a real `sh` — it must empty the shared subdirs while
+/// leaving the directories themselves in place, so every lane's
+/// symlinks keep resolving and the lane still builds afterwards.
+/// (The r2 command deleted the dirs outright; every lane then died
+/// with `File exists (os error 17)` on its next build.)
+#[test]
+fn reclaim_plan_command_keeps_lanes_buildable() {
+    let s = SharedTarget::new();
+    s.new_issue("Warm");
+    let (ok, _) = s.cli(&["issue", "start", "D-1"]);
+    assert!(ok);
+    let wt = s.worktree_of("D-1");
+    s.set_marker(&wt, "warm");
+    s.cargo_build(&wt);
+    let shared_debug = s.repo.join(".cadence/target/shared/debug");
+    // Deps really landed in the cache through the links.
+    assert!(std::fs::read_dir(shared_debug.join("deps"))
+        .unwrap()
+        .next()
+        .is_some());
+
+    let (_code, stdout, _) = s.cli_at(&s.repo, &["doctor", "--host", "--reclaim-plan", "--json"]);
+    let report: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let row = report["reclaim"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "shared-cargo-cache")
+        .expect("shared row");
+    let action = row["action"].as_str().unwrap().to_string();
+    assert!(action.contains("rm -rf"), "{action}");
+    // Run exactly what the plan prints — comment and all — via `sh`.
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&action)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{action}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The symlink targets must still exist — dangling links are the
+    // bug this round fixes.
+    for name in ["deps", ".fingerprint", "build", "incremental"] {
+        let dir = shared_debug.join(name);
+        assert!(dir.is_dir(), "{name} deleted by the reclaim command");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "{name} should be emptied"
+        );
+        // And the lane's link resolves to a real dir, not dangling.
+        assert!(
+            wt.join("target/debug").join(name).is_dir(),
+            "{name} dangles"
+        );
+    }
+    // The lane still builds — cargo recreates what it needs inside
+    // the surviving dirs.
+    s.cargo_build(&wt);
+    let bin = wt.join("target/debug/marker");
+    let out = std::process::Command::new(&bin).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "warm");
 }

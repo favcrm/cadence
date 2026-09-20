@@ -279,27 +279,43 @@ the `Issue: <ID>` trailer — as JSON.
 - The worktree is minted through the same helper as
   `cadence devin --worktree` (shared `src/worktree.rs`), including the
   `.gitignore` `.cadence/` rule — added only when missing.
-- The worktree's cargo builds share one dependency cache: `issue
-  start` links the hashed-content subdirs of the lane's
-  `target/debug/` — `deps`, `.fingerprint`, `build`, `incremental`,
-  `examples` plus cargo's three lock files (`.cargo-lock`,
-  `.cargo-build-lock`, `.cargo-artifact-lock`) — into
-  `<repo>/.cadence/target/shared/debug`, so dependency artifacts
-  compile once per host and concurrent lanes queue on cargo's own
-  build lock. The lane's `debug/` itself stays a real dir, so
-  uplifted binaries like `debug/cadence` are per-lane files — one
-  lane's `cargo test` can never exec another lane's binary. A `build:
-  {target_dir: per-worktree}` section in `project.yaml` keeps the
-  lane fully private (a previously linked farm is unlinked). A
-  `build.target-dir` in the worktree's own `.cargo/config.toml`
-  overrides the whole mechanism — the farm is not planted and the
-  recorded `cargo_target` is the operator's dir; nothing under
-  `.cargo/` is ever written by cadence, so a tracked config survives
-  byte-for-byte. A `CARGO_TARGET_DIR` env or a config higher in
-  cargo's chain overrides the same way it always has. The effective
-  dir is recorded as `cargo_target` on the `worktree` ref and printed
-  as `target_dir`; a stale recorded value is corrected on re-start
-  with its own commit.
+- The worktree's cargo builds share one dependency cache — only for
+  checkouts that are cargo packages: `issue start` links the
+  hashed-content subdirs of the lane's `target/debug/` — `deps`,
+  `.fingerprint`, `build`, `incremental` plus cargo's three lock
+  files (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`)
+  — into `<repo>/.cadence/target/shared/debug`, so dependency
+  artifacts compile once per host. `examples` is deliberately not
+  linked: cargo uplifts example binaries to unhashed
+  `debug/examples/<name>` paths, so sharing would hand one lane
+  another lane's example — the same hole as sharing `debug/` whole.
+  The lane's `debug/` itself stays a real dir, so uplifted binaries
+  like `debug/cadence` are per-lane files — one lane's `cargo test`
+  can never exec another lane's binary. Because the lock files are
+  shared, concurrent lanes serialise *whole builds* on cargo's own
+  locking: the second lane prints `Blocking waiting for file lock on
+  build directory` until the first finishes — dedup in exchange for
+  queueing, never parallel compiles into one dir. Sharing covers the
+  debug host target only: `--release` and `--target <triple>` outputs
+  stay per-lane, and a `RUSTFLAGS` change or `cargo clippy` run
+  rewrites shared fingerprints — lanes with differing flags will
+  thrash each other's cache entries (correct, but rebuild-y). A
+  `build: {target_dir: per-worktree}` section in `project.yaml`
+  keeps the lane fully private (a previously linked farm is
+  unlinked). A checkout with no `Cargo.toml` gets no farm at all —
+  no `target/` is created and a `target/debug/build` it already owns
+  is never moved. A `build.target-dir` anywhere in cargo's config
+  chain — the worktree's own `.cargo/config.toml`, an ancestor's, or
+  `$CARGO_HOME/config.toml` — overrides the whole mechanism: the
+  farm is not planted and the recorded `cargo_target` is the
+  operator's dir; nothing under `.cargo/` is ever written by
+  cadence, so a tracked config survives byte-for-byte. A
+  `CARGO_TARGET_DIR` env overrides the same way it always has. The
+  effective dir is recorded as `cargo_target` on the `worktree` ref
+  and printed as `target_dir`; a stale recorded value is corrected
+  on re-start with its own commit. If a pre-existing cargo lock file
+  is held by a running build, `issue start` refuses rather than
+  leaving the lane half-shared — retry when the lane is idle.
 - One tracker commit records a `branch` ref (label = repo basename)
   and a `worktree` ref (absolute path), the status/owner updates and
   the CAD-42 `Issue:`/`Actor:` trailers under subject

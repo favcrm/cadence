@@ -41,7 +41,13 @@ cadence doctor --host --reclaim-plan
                               # same checks plus what could be freed — stale
                               #  worktrees, per-lane target dirs, the shared
                               #  cache — sizes + shell-quoted commands, never
-                              #  deletes; exit is still the worst check level
+                              #  deletes; exit is still the worst check level.
+                              #  The shared-cache command empties the shared
+                              #  subdirs but keeps the dirs themselves (every
+                              #  lane symlinks into them); live-lane target
+                              #  bytes are listed separately under
+                              #  "freed with their lanes", outside the
+                              #  reclaimable total
 cadence ui start              # board at http://cadence.localhost:18000 behind the dev gateway
 cadence ui tailscale start    # optional: phone/laptop access at https://<dns>:9450 — tailnet-only, loopback bind unchanged
 cadence issue doctor          # tracker: hooks ours, lint clean, ahead/behind origin
