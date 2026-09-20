@@ -15,6 +15,18 @@ pub struct Repo {
     pub remote: Option<String>,
 }
 
+/// `[build]` — per-project build knobs. `target_dir` picks how issue
+/// worktrees store cargo output: `"shared"` (default) links each
+/// lane's hashed `target/debug` subdirs into
+/// `<repo>/.cadence/target/shared`, `"per-worktree"` keeps the
+/// classic fully-private `target/` (the opt-out for hosts where the
+/// cargo lock queue costs more than the disk it saves).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Build {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_dir: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub key: String,
@@ -28,6 +40,8 @@ pub struct Project {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<Build>,
 }
 
 /// `~` → `$HOME`, else the path unchanged.

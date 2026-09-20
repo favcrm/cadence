@@ -13055,6 +13055,16 @@ fn dispatch_kickoff_and_finish_guards() {
     git(&repo, &["config", "user.email", "t@t"]);
     git(&repo, &["config", "user.name", "t"]);
     std::fs::write(repo.join("f"), "x").unwrap();
+    // A cargo checkout — CAD-95 r3 plants the dep-cache farm only in
+    // repos with a Cargo.toml; this fixture wants the shared-farm
+    // assertions, so it declares itself a cargo package (build
+    // output gitignored, as real repos do).
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join(".gitignore"), "/target\n").unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "init"]);
     let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
@@ -13166,6 +13176,19 @@ fn dispatch_kickoff_and_finish_guards() {
     assert_eq!(out["dispatched"], true);
     assert_eq!(out["created"], true);
     assert!(wt1.is_dir());
+    // CAD-95: dispatch goes through `issue start` — the worktree's
+    // hashed cargo subdirs are linked into the shared dep cache and
+    // the lane's own target dir is reported.
+    let shared = repo.join(".cadence/target/shared");
+    assert_eq!(
+        out["target_dir"].as_str().unwrap(),
+        wt1.join("target").to_string_lossy()
+    );
+    assert_eq!(
+        std::fs::read_link(wt1.join("target/debug/deps")).unwrap(),
+        shared.join("debug/deps")
+    );
+    assert!(!wt1.join(".cargo").exists());
     let msg_id = out["message"].as_str().unwrap().to_string();
     assert!(!msg_id.is_empty());
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
@@ -15883,4 +15906,625 @@ fn doctor_host_json_reports_six_checks() {
         _ => 0,
     };
     assert_eq!(code, expect, "level {worst} should exit {expect}");
+}
+
+// ---------- CAD-95: shared cargo target dir ----------
+
+/// pm + repo + home + state under one temp dir, a `cli` that runs the
+/// binary with the test env, and a `cli_at` that also sets cwd (the
+/// doctor checks scan the repo it is launched from).
+struct SharedTarget {
+    _tmp: TempDir,
+    pm_dir: PathBuf,
+    repo: PathBuf,
+    home: PathBuf,
+    state: PathBuf,
+    bin_dir: PathBuf,
+}
+
+impl SharedTarget {
+    fn new() -> Self {
+        let tmp = TempDir::new().unwrap();
+        let (pm_dir, repo, home, state) = (
+            tmp.path().join("pm"),
+            tmp.path().join("repo"),
+            tmp.path().join("home"),
+            tmp.path().join("state"),
+        );
+        for dir in [&pm_dir, &repo, &home, &state] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        // A real repo ignores its build output — `target/` must not
+        // read as dirty for `git status` or `issue finish`.
+        std::fs::write(repo.join(".gitignore"), "/target\n").unwrap();
+        // A tiny standalone bin crate so tests can build real per-lane
+        // binaries in the worktrees.
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"marker\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let s = Self {
+            _tmp: tmp,
+            pm_dir,
+            repo,
+            home,
+            state,
+            bin_dir,
+        };
+        assert!(s.cli(&["issue", "init"]).0);
+        let repo_s = s.repo.canonicalize().unwrap().to_str().unwrap().to_string();
+        assert!(
+            s.cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s])
+                .0
+        );
+        s
+    }
+
+    fn cli_at(&self, cwd: &Path, args: &[&str]) -> (i32, String, String) {
+        self.cli_at_env(cwd, args, &[])
+    }
+
+    fn cli_at_env(&self, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.arg("--state-dir")
+            .arg(&self.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &self.pm_dir)
+            .env("HOME", &self.home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .current_dir(cwd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+
+    fn cli(&self, args: &[&str]) -> (bool, Value) {
+        let (code, stdout, stderr) = self.cli_at(&self.repo, args);
+        let text = if stdout.is_empty() { stderr } else { stdout };
+        (
+            code == 0,
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    }
+
+    fn set_build_target_dir(&self, value: &str) {
+        let yaml_path = self.pm_dir.join("demo/project.yaml");
+        let yaml = std::fs::read_to_string(&yaml_path).unwrap();
+        // Drop any prior appended `build:` block before adding ours —
+        // serde rejects a duplicate field.
+        let kept: Vec<&str> = yaml
+            .lines()
+            .filter(|l| *l != "build:" && !l.starts_with("  target_dir:"))
+            .collect();
+        std::fs::write(
+            &yaml_path,
+            format!("{}\nbuild:\n  target_dir: {value}\n", kept.join("\n")),
+        )
+        .unwrap();
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.pm_dir)
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.pm_dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "cfg",
+            ])
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+    }
+
+    fn new_issue(&self, title: &str) {
+        assert!(self.cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+
+    fn worktree_of(&self, id: &str) -> PathBuf {
+        let show = self.cli(&["issue", "show", id, "--json"]).1;
+        show["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "worktree")
+            .and_then(|r| r["path"].as_str())
+            .map(PathBuf::from)
+            .expect("worktree ref")
+    }
+
+    fn git(&self, dir: &Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    /// `cargo build` the fixture's `marker` crate inside `wt`.
+    fn cargo_build(&self, wt: &Path) {
+        let o = std::process::Command::new("cargo")
+            .arg("build")
+            .arg("--quiet")
+            .current_dir(wt)
+            .env_remove("CARGO_TARGET_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "cargo build: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+
+    /// Write the marker crate's source so the built binary prints
+    /// `marker` — each lane carries a distinct build.
+    fn set_marker(&self, wt: &Path, marker: &str) {
+        std::fs::write(
+            wt.join("src/main.rs"),
+            format!("fn main() {{ println!(\"{marker}\"); }}\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// The default: `issue start` links the worktree's hashed-content
+/// cargo subdirs into `<repo>/.cadence/target/shared/debug` while
+/// keeping the lane's own `target/debug` real — uplifted binaries are
+/// per-lane. The effective dir is recorded on the worktree ref and
+/// the tree stays clean for `git status`.
+#[test]
+fn issue_start_links_shared_cargo_deps() {
+    let s = SharedTarget::new();
+    s.new_issue("Shared");
+    let (ok, out) = s.cli(&["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let wt = s.worktree_of("D-1");
+    let shared_debug = s.repo.join(".cadence/target/shared/debug");
+    for name in ["deps", ".fingerprint", "build", "incremental"] {
+        let link = wt.join("target/debug").join(name);
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            shared_debug.join(name),
+            "{name}"
+        );
+    }
+    // `examples` is NOT shared — cargo uplifts example binaries to
+    // `debug/examples/<name>` unhashed, so a shared dir would hand one
+    // lane another lane's example.
+    assert!(!wt.join("target/debug/examples").is_symlink());
+    for name in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
+        let link = wt.join("target/debug").join(name);
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            shared_debug.join(name),
+            "{name}"
+        );
+    }
+    // `debug/` itself is real — no `.cargo/` is written anywhere.
+    assert!(!wt.join("target/debug").is_symlink());
+    assert!(!wt.join(".cargo").exists());
+    assert_eq!(
+        out["target_dir"].as_str().unwrap(),
+        wt.join("target").to_string_lossy(),
+        "{out}"
+    );
+    assert_eq!(s.git(&wt, &["status", "--porcelain"]), "");
+    // The worktree ref records the effective target dir.
+    let show = s.cli(&["issue", "show", "D-1", "--json"]).1;
+    let wt_ref = show["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "worktree")
+        .unwrap();
+    assert_eq!(
+        wt_ref["cargo_target"].as_str().unwrap(),
+        wt.join("target").to_string_lossy()
+    );
+    assert!(show["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "branch")
+        .unwrap()["cargo_target"]
+        .is_null());
+    // Re-start is idempotent — same farm, same ref, no second commit.
+    let (ok, out) = s.cli(&["issue", "start", "D-1"]);
+    assert!(ok && out["created"] == false, "{out}");
+    assert_eq!(s.git(&wt, &["status", "--porcelain"]), "");
+    // Re-attach: remove the dir, keep refs — start re-plants the farm.
+    s.git(
+        &s.repo,
+        &["worktree", "remove", "--force", &wt.to_string_lossy()],
+    );
+    let (ok, out) = s.cli(&["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    assert!(wt.join("target/debug/deps").is_symlink());
+}
+
+/// Two lanes sharing the dep cache never share the uplifted binary:
+/// each lane's `target/debug/marker` is its own file, so a lane's
+/// `cargo test` execs its own code. This is the CAD-95 r2 acceptance
+/// case — a shared `build.target-dir` would hand lane A lane B's
+/// binary.
+#[test]
+fn lanes_share_deps_but_not_the_uplifted_binary() {
+    let s = SharedTarget::new();
+    s.new_issue("LaneA");
+    s.new_issue("LaneB");
+    assert!(s.cli(&["issue", "start", "D-1"]).0);
+    assert!(s.cli(&["issue", "start", "D-2"]).0);
+    let (wt_a, wt_b) = (s.worktree_of("D-1"), s.worktree_of("D-2"));
+    // Both lanes' hashed subdirs point into the one shared cache.
+    let shared_debug = s.repo.join(".cadence/target/shared/debug");
+    for wt in [&wt_a, &wt_b] {
+        assert_eq!(
+            std::fs::read_link(wt.join("target/debug/deps")).unwrap(),
+            shared_debug.join("deps")
+        );
+    }
+    // Lane A builds "lane-A"; lane B overwrites nothing of A's when
+    // it builds "lane-B".
+    s.set_marker(&wt_a, "lane-A");
+    s.cargo_build(&wt_a);
+    s.set_marker(&wt_b, "lane-B");
+    s.cargo_build(&wt_b);
+    for (wt, want) in [(&wt_a, "lane-A"), (&wt_b, "lane-B")] {
+        let bin = wt.join("target/debug/marker");
+        let out = std::process::Command::new(&bin).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want);
+    }
+    // Dep artifacts landed in the shared cache through the links.
+    let deps: Vec<String> = std::fs::read_dir(shared_debug.join("deps"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    assert!(deps.iter().any(|d| d.starts_with("marker-")), "{deps:?}");
+}
+
+/// A tracked `.cargo/config.toml` — the file a project ships — is
+/// never written, reserialized or excluded by `issue start`, and the
+/// clean tree it leaves is exactly what `issue finish` checks.
+#[test]
+fn issue_start_never_touches_tracked_cargo_config() {
+    let s = SharedTarget::new();
+    // A tracked config with real settings — target-dir is absent, so
+    // the effective dir stays `<wt>/target` and the farm plants.
+    let conf = "[build]\njobs = 2\n\n[target.'cfg(target_os = \"linux\")']\nrustflags = [\"-C\", \"link-arg=-Wl,-rpath,/x\"]\n";
+    std::fs::create_dir_all(s.repo.join(".cargo")).unwrap();
+    std::fs::write(s.repo.join(".cargo/config.toml"), conf).unwrap();
+    s.git(&s.repo, &["add", "-A"]);
+    s.git(&s.repo, &["commit", "-qm", "cargo config"]);
+    s.new_issue("Cfg");
+    let (ok, _) = s.cli(&["issue", "start", "D-1"]);
+    assert!(ok);
+    let wt = s.worktree_of("D-1");
+    assert_eq!(
+        std::fs::read_to_string(wt.join(".cargo/config.toml")).unwrap(),
+        conf,
+        "tracked config rewritten"
+    );
+    assert!(wt.join("target/debug/deps").is_symlink());
+    assert_eq!(s.git(&wt, &["status", "--porcelain"]), "");
+    // And a lane whose tree is genuinely clean must not be refused as
+    // dirty by finish's guard — the pre-r2 rewrite left it dirty.
+    let (ok, _) = s.cli(&["issue", "set", "D-1", "owner="]);
+    assert!(ok);
+    std::fs::write(wt.join("work.txt"), "x").unwrap();
+    s.git(&wt, &["add", "-A"]);
+    s.git(&wt, &["commit", "-qm", "work"]);
+    s.git(&s.repo, &["merge", "-q", "cadence/d-1-cfg"]);
+    let (ok, out) = s.cli(&["issue", "finish", "D-1"]);
+    assert!(ok && out["finished"] == true, "{out}");
+}
+
+/// `[build] target_dir = "per-worktree"` in project.yaml opts a lane
+/// back onto its own `target/`; anything else is a rejected config.
+#[test]
+fn issue_start_per_worktree_and_invalid_target_dir() {
+    let s = SharedTarget::new();
+    s.new_issue("Lane");
+    s.new_issue("Bad");
+    s.set_build_target_dir("per-worktree");
+    let (ok, out) = s.cli(&["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let wt = s.worktree_of("D-1");
+    assert_eq!(
+        out["target_dir"].as_str().unwrap(),
+        wt.join("target").to_string_lossy()
+    );
+    // No farm, no config — the lane is fully private.
+    assert!(!wt.join("target").exists());
+    assert!(!wt.join(".cargo").exists());
+
+    s.set_build_target_dir("bogus");
+    let (ok, err) = s.cli(&["issue", "start", "D-2"]);
+    assert!(!ok, "{err}");
+    assert!(err["error"].as_str().unwrap().contains("bogus"), "{err}");
+}
+
+/// `issue finish` removes the worktree but never the shared cache —
+/// the ref's `cargo_target` is reported with a literal `exists` check.
+#[test]
+fn issue_finish_keeps_shared_cargo_target() {
+    let s = SharedTarget::new();
+    s.new_issue("Done");
+    let shared = s.repo.join(".cadence/target/shared");
+    let (ok, _) = s.cli(&["issue", "start", "D-1"]);
+    assert!(ok);
+    std::fs::write(shared.join("dep.rlib"), "cached").unwrap();
+    // Ownerless — no daemon in this fixture, and finish's owner check
+    // only runs when an owner is recorded.
+    let (ok, _) = s.cli(&["issue", "set", "D-1", "owner="]);
+    assert!(ok);
+    let wt = s.worktree_of("D-1");
+    std::fs::write(wt.join("work.txt"), "x").unwrap();
+    s.git(&wt, &["add", "-A"]);
+    s.git(&wt, &["commit", "-qm", "work"]);
+    s.git(&s.repo, &["merge", "-q", "cadence/d-1-done"]);
+    let (ok, out) = s.cli(&["issue", "finish", "D-1"]);
+    assert!(ok && out["finished"] == true, "{out}");
+    // The lane's own target/ went with it — `cargo_target_exists` is
+    // the literal post-removal check, and the shared cache the lane
+    // linked into is still there (rm unlinks, never follows).
+    assert_eq!(
+        out["cargo_target"].as_str().unwrap(),
+        wt.join("target").to_string_lossy()
+    );
+    assert_eq!(out["cargo_target_exists"], false, "{out}");
+    assert!(shared.join("dep.rlib").is_file());
+    assert!(!wt.exists());
+}
+
+/// `doctor --host` counts the shared cache once at repo level, and
+/// `--reclaim-plan` lists candidates — stale lanes, per-lane targets,
+/// the shared cache — without deleting anything.
+#[test]
+fn doctor_host_shared_target_and_reclaim_plan() {
+    let s = SharedTarget::new();
+    s.new_issue("One");
+    s.new_issue("Two");
+    let (ok, _) = s.cli(&["issue", "start", "D-1"]);
+    assert!(ok);
+    let (ok, _) = s.cli(&["issue", "start", "D-2"]);
+    assert!(ok);
+    let shared = s.repo.join(".cadence/target/shared");
+    std::fs::create_dir_all(shared.join("debug")).unwrap();
+    std::fs::write(shared.join("debug/dep.rlib"), vec![0_u8; 4096]).unwrap();
+    // A per-lane target dir on D-1's worktree — the pre-CAD-95 layout.
+    // A commit past base keeps the lane live: a stale lane's whole
+    // dir is freed by its own row and emits no informational
+    // worktree-target row.
+    let wt1 = s.worktree_of("D-1");
+    std::fs::write(wt1.join("wip.txt"), "x").unwrap();
+    s.git(&wt1, &["add", "-A"]);
+    s.git(
+        &wt1,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "wip",
+        ],
+    );
+    std::fs::create_dir_all(wt1.join("target/debug")).unwrap();
+    std::fs::write(wt1.join("target/debug/dep.rlib"), vec![0_u8; 2048]).unwrap();
+
+    let (_code, stdout, _) = s.cli_at(&s.repo, &["doctor", "--host", "--json"]);
+    let report: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let wt_check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "worktrees")
+        .unwrap();
+    assert_eq!(
+        wt_check["value"]["shared_cargo_target"]["path"]
+            .as_str()
+            .unwrap(),
+        shared.to_string_lossy(),
+        "{wt_check}"
+    );
+    assert!(
+        wt_check["value"]["shared_cargo_target"]["bytes"]
+            .as_u64()
+            .unwrap()
+            >= 4096
+    );
+
+    let (code, stdout, _) = s.cli_at(&s.repo, &["doctor", "--host", "--reclaim-plan", "--json"]);
+    // The plan is the full report plus a `reclaim` section — the exit
+    // code is the worst check level, matching the plain report's.
+    let expected = match report["level"].as_str().unwrap() {
+        "fail" => 2,
+        "warn" => 1,
+        _ => 0,
+    };
+    assert_eq!(code, expected, "{stdout}");
+    let merged: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        merged["checks"].as_array().unwrap().len() == report["checks"].as_array().unwrap().len()
+    );
+    let plan = &merged["reclaim"];
+    let kinds: Vec<&str> = plan["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        kinds.contains(&"worktree-target") && kinds.contains(&"shared-cargo-cache"),
+        "{kinds:?}"
+    );
+    // Nothing deleted — both dirs still present.
+    assert!(wt1.join("target/debug/dep.rlib").is_file());
+    assert!(shared.join("debug/dep.rlib").is_file());
+    // `--reclaim-plan` without `--host` is a usage error.
+    let (code, _, _) = s.cli_at(&s.repo, &["doctor", "--reclaim-plan"]);
+    assert_ne!(code, 0);
+}
+
+/// The r3 acceptance case: the emitted shared-cache command is run
+/// through a real `sh` — it must empty the shared subdirs while
+/// leaving the directories themselves in place, so every lane's
+/// symlinks keep resolving and the lane still builds afterwards.
+/// (The r2 command deleted the dirs outright; every lane then died
+/// with `File exists (os error 17)` on its next build.)
+#[test]
+fn reclaim_plan_command_keeps_lanes_buildable() {
+    let s = SharedTarget::new();
+    s.new_issue("Warm");
+    let (ok, _) = s.cli(&["issue", "start", "D-1"]);
+    assert!(ok);
+    let wt = s.worktree_of("D-1");
+    s.set_marker(&wt, "warm");
+    s.cargo_build(&wt);
+    let shared_debug = s.repo.join(".cadence/target/shared/debug");
+    // Deps really landed in the cache through the links.
+    assert!(std::fs::read_dir(shared_debug.join("deps"))
+        .unwrap()
+        .next()
+        .is_some());
+
+    let (_code, stdout, _) = s.cli_at(&s.repo, &["doctor", "--host", "--reclaim-plan", "--json"]);
+    let report: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let row = report["reclaim"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "shared-cargo-cache")
+        .expect("shared row");
+    let action = row["action"].as_str().unwrap().to_string();
+    assert!(action.contains("rm -rf"), "{action}");
+    // Run exactly what the plan prints — comment and all — via `sh`.
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&action)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{action}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The symlink targets must still exist — dangling links are the
+    // bug this round fixes.
+    for name in ["deps", ".fingerprint", "build", "incremental"] {
+        let dir = shared_debug.join(name);
+        assert!(dir.is_dir(), "{name} deleted by the reclaim command");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "{name} should be emptied"
+        );
+        // And the lane's link resolves to a real dir, not dangling.
+        assert!(
+            wt.join("target/debug").join(name).is_dir(),
+            "{name} dangles"
+        );
+    }
+    // The lane still builds — cargo recreates what it needs inside
+    // the surviving dirs.
+    s.cargo_build(&wt);
+    let bin = wt.join("target/debug/marker");
+    let out = std::process::Command::new(&bin).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "warm");
+}
+
+/// `CARGO_TARGET_DIR` outranks every config file — with it exported,
+/// a planted farm would sit inert while every lane collided in the
+/// env dir, so `issue start` plants nothing and records the env's
+/// dir on the worktree ref.
+#[test]
+fn issue_start_honours_cargo_target_dir_env() {
+    let s = SharedTarget::new();
+    s.new_issue("Env");
+    let envdir = s.repo.join("env-target");
+    let (code, stdout, stderr) = s.cli_at_env(
+        &s.repo,
+        &["issue", "start", "D-1"],
+        &[("CARGO_TARGET_DIR", envdir.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let out: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        out["target_dir"].as_str().unwrap(),
+        envdir.to_string_lossy(),
+        "{out}"
+    );
+    // No farm — every build lands in the env dir instead.
+    let wt = s.worktree_of("D-1");
+    assert!(!wt.join("target/debug/deps").exists());
+    let show = s.cli(&["issue", "show", "D-1", "--json"]).1;
+    let wt_ref = show["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "worktree")
+        .unwrap();
+    assert_eq!(
+        wt_ref["cargo_target"].as_str().unwrap(),
+        envdir.to_string_lossy()
+    );
 }
