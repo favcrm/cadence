@@ -18916,6 +18916,9 @@ fn audit_repo(dir: &TempDir) -> (PathBuf, PathBuf, PathBuf, Vec<String>) {
         assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
+    // No global identity on CI runners.
+    g(&["config", "user.email", "t@t"]);
+    g(&["config", "user.name", "t"]);
     let branch = g(&["rev-parse", "--abbrev-ref", "HEAD"]);
     let mut heads = Vec::new();
     let mut prs = Vec::new();
