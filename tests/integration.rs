@@ -18853,4 +18853,43 @@ fn issue_ls_survives_a_closed_downstream_pipe() {
         !stderr.contains("panicked") && !stderr.contains("Broken pipe"),
         "the EPIPE must never reach the user: {stderr}"
     );
+
+    // But a verb that FAILS must keep its real exit code — the hook
+    // exits with the code the process already committed to, not a
+    // hard-coded 0. `issue show NOSUCH` writes its error to stderr;
+    // with both stream ends closed (`2>&1 | head -c 0`) that print
+    // panics on EPIPE and the answer must still be failure.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["issue", "show", "NOSUCH-9999"])
+        .env("HOME", &home)
+        .env("CADENCE_PM_DIR", &pm_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    let status = child.wait().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a failing verb keeps its failure code on a closed pipe"
+    );
+    // …and with the reader still open, the same failure exits the
+    // same way — the hook only fires when the pipe is gone.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["issue", "show", "NOSUCH-9999"])
+        .env("HOME", &home)
+        .env("CADENCE_PM_DIR", &pm_dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("NOSUCH-9999"),
+        "the open-pipe failure still prints its error"
+    );
 }

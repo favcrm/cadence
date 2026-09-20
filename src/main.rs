@@ -6,6 +6,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
@@ -5091,14 +5092,26 @@ fn attach_command(state_dir: &Path, name: Option<String>, print: bool) -> Result
     attach_agent(state_dir, &alias, can_exec)
 }
 
+/// The exit code the process has already committed to. The hook
+/// below exits with THIS, not a hard-coded 0: a failing verb whose
+/// own error print hits a closed pipe (`issue show NOSUCH 2>&1 |
+/// head -c 0`) must still exit 1, or `set -e` and `if cadence …`
+/// callers would read the failure as success.
+static INTENDED_EXIT: AtomicI32 = AtomicI32::new(0);
+
 /// A downstream reader that closes early (`cadence … | head`) makes
 /// every further stdout write fail with EPIPE — Rust ignores SIGPIPE,
 /// so `println!` panics with "failed printing to stdout: Broken pipe"
-/// where a unix tool would exit quietly. Catch exactly that panic in
-/// the hook and exit 0 instead; every other panic still reports
-/// through the default hook. Set before `run`, so it covers `daemon
-/// run`/`ui run` too — their stdout is a log file or terminal, where
-/// the panic can never fire.
+/// (wording verified against std on rustc 1.98.1 — a std release that
+/// rewords it turns this fix off silently) where a unix tool would
+/// exit quietly. Catch exactly that panic in the hook and exit with
+/// `INTENDED_EXIT` instead; every other panic still reports through
+/// the default hook. `process::exit` skips unwinding — `Drop`
+/// impls (a held pm lock, a temp dir) never run — which is safe for
+/// today's read-only verbs but is an assumption the next verb that
+/// takes a lock before printing will inherit silently. Set before
+/// `run`, so it covers `daemon run`/`ui run` too — their stdout is
+/// a log file or terminal, where the panic can never fire.
 fn install_broken_pipe_exit() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -5109,7 +5122,7 @@ fn install_broken_pipe_exit() {
             .or_else(|| payload.downcast_ref::<&'static str>().copied())
             .unwrap_or_default();
         if msg.starts_with("failed printing to std") && msg.contains("Broken pipe") {
-            std::process::exit(0);
+            std::process::exit(INTENDED_EXIT.load(Ordering::Relaxed));
         }
         default_hook(info);
     }));
@@ -5120,6 +5133,10 @@ fn main() {
     let code = match run() {
         Ok(code) => code,
         Err(error) => {
+            // Record the failure BEFORE the error print — if the
+            // eprintln itself hits a closed pipe, the hook must
+            // exit with the real code, not success.
+            INTENDED_EXIT.store(1, Ordering::Relaxed);
             eprintln!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -5130,6 +5147,7 @@ fn main() {
             1
         }
     };
+    INTENDED_EXIT.store(code, Ordering::Relaxed);
     std::process::exit(code);
 }
 
