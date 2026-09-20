@@ -2187,6 +2187,11 @@ for line in sys.stdin:
         if mode == "slow-init": time.sleep(30)
         emit({"id": mid, "result": {"serverInfo": {"name": "mock", "version": "0"}}})
     elif method in ("thread/start", "thread/resume"):
+        # Record the launch payload before answering so tests can read
+        # exactly what reached the wire (<pidfile>.requests).
+        with open(pidfile + ".requests", "a") as rf:
+            rf.write(json.dumps({"method": method,
+                                 "params": msg.get("params", {})}) + "\n")
         if mode == "bad-thread":
             emit({"id": mid, "result": {"thread": {}}})
         else:
@@ -2438,6 +2443,10 @@ def handle(conn):
             send_json(conn, {"id": mid, "result": {
                 "serverInfo": {"name": "mock-ws", "version": "0"}}})
         elif method in ("thread/start", "thread/resume"):
+            # Record the launch payload before answering (<pidfile>.requests).
+            with open(pidfile + ".requests", "a") as rf:
+                rf.write(json.dumps({"method": method,
+                                     "params": msg.get("params", {})}) + "\n")
             send_json(conn, {"id": mid, "result": {
                 "thread": {"id": "th-1", "sessionId": "s-1"}}})
         elif method == "turn/start":
@@ -2560,6 +2569,17 @@ impl Drop for MockCodex {
     }
 }
 
+/// The mock codex appends one `{"method","params"}` line per
+/// `thread/start`/`thread/resume` to `<pidfile>.requests` — read it to
+/// assert exactly what reached the wire.
+fn mock_requests(mock: &MockCodex) -> Vec<Value> {
+    std::fs::read_to_string(format!("{}.requests", mock.pidfile.display()))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
 fn pid_alive(path: &Path) -> bool {
     let Ok(pid) = std::fs::read_to_string(path) else {
         return true; // not written yet -> treat as alive until proven
@@ -2595,6 +2615,142 @@ fn wait_probe_idle(d: &TestDaemon, alias: &str, secs: u64) {
         }
         assert!(Instant::now() < deadline, "probe never read {alias} idle");
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    d.register_codex("w1");
+    d.wait_agent("w1", "idle", 15);
+    // A cadence-launched codex worker is unattended by default: the
+    // wire carries `never` even when no policy was stored, and the
+    // rpc-default `read-only` sandbox is what was sent.
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    assert_eq!(reqs[0]["method"], "thread/start");
+    assert_eq!(reqs[0]["params"]["approvalPolicy"], "never");
+    assert_eq!(reqs[0]["params"]["sandbox"], "read-only");
+    // Stop + resume reopens the thread: the same effective policy is
+    // replayed verbatim on `thread/resume`.
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 15);
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs.len(), 2, "{reqs:?}");
+    assert_eq!(reqs[1]["method"], "thread/resume");
+    assert_eq!(reqs[1]["params"]["approvalPolicy"], "never");
+    assert_eq!(reqs[1]["params"]["threadId"], "th-1");
+}
+
+#[test]
+fn codex_approval_policy_reaches_thread_start_verbatim() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "sandbox": "workspace-write",
+               "params": "{\"approval_policy\":\"on-failure\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "idle", 15);
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    assert_eq!(reqs[0]["method"], "thread/start");
+    assert_eq!(reqs[0]["params"]["approvalPolicy"], "on-failure");
+    assert_eq!(reqs[0]["params"]["sandbox"], "workspace-write");
+    let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["sandbox"], "workspace-write");
+}
+
+#[test]
+fn codex_approval_policy_rejected_at_register_and_next_launch() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    // Register: a bogus value is refused before it lands on the row,
+    // and the error names every accepted value.
+    let err = d
+        .rpc(
+            "agent_register",
+            json!({"alias": "w1", "provider": "codex",
+                   "endpoint_kind": "managed", "cwd": cwd,
+                   "params": "{\"approval_policy\":\"bogus\"}"}),
+        )
+        .unwrap_err()
+        .to_string();
+    for accepted in ["never", "on-request", "on-failure", "untrusted"] {
+        assert!(
+            err.contains(accepted),
+            "register error missing '{accepted}': {err}"
+        );
+    }
+    d.register_codex("w1");
+    d.wait_agent("w1", "idle", 15);
+    // `agent set --next-launch`: the same vocabulary is enforced, the
+    // same error lists all four.
+    let err = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "w1", "next_launch": true,
+                   "patch": {"approval_policy": "bogus"}}),
+        )
+        .unwrap_err()
+        .to_string();
+    for accepted in ["never", "on-request", "on-failure", "untrusted"] {
+        assert!(
+            err.contains(accepted),
+            "next-launch error missing '{accepted}': {err}"
+        );
+    }
+    // A valid next-launch value is stored and reaches the wire on the
+    // next open — resume replays it verbatim.
+    d.rpc(
+        "agent_set",
+        json!({"alias": "w1", "next_launch": true,
+               "patch": {"approval_policy": "untrusted"}}),
+    )
+    .unwrap();
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "idle", 15);
+    let reqs = mock_requests(&mock);
+    let last = reqs.last().unwrap();
+    assert_eq!(last["method"], "thread/resume");
+    assert_eq!(last["params"]["approvalPolicy"], "untrusted");
+}
+
+#[test]
+fn codex_approval_policy_rejected_at_open() {
+    // Params corrupted behind the daemon's back still cannot reach the
+    // wire — the adapter validates again inside `open`.
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("ok");
+    d.register_codex("w1");
+    d.wait_agent("w1", "idle", 15);
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET params='{\"approval_policy\":\"bogus\"}' WHERE alias='w1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    let agent = d.wait_agent("w1", "attention", 15);
+    let err = agent["error"].as_str().unwrap().to_string();
+    for accepted in ["never", "on-request", "on-failure", "untrusted"] {
+        assert!(
+            err.contains(accepted),
+            "open error missing '{accepted}': {err}"
+        );
     }
 }
 
@@ -10250,6 +10406,94 @@ fn cli_join_claude_tui_briefs_prefixes() {
     }
     // The group upstream is in params so results route to the PM.
     assert_eq!(agent["params"]["upstream"], "pm", "{agent}");
+}
+
+/// `join <pm> codex` records the worker's sandbox on the agent row and
+/// sends it on `thread/start` — `workspace-write` by default (the
+/// unattended-worker posture), `read-only` only when asked.
+#[test]
+fn cli_join_codex_sandbox_defaults_writable_and_flag_roundtrips() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    let pm_repo = d.dir.path().join("pmrepo");
+    git_repo(&pm_repo);
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": pm_repo}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 10);
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    // Default: a joined codex worker is writable — the same trust
+    // posture the other providers already run.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["join", "pm", "codex", "--alias", "wj", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let agent = d.wait_agent("wj", "idle", 20);
+    assert_eq!(agent["sandbox"], "workspace-write", "{agent}");
+    // Explicit `read-only` still round-trips.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "join",
+            "pm",
+            "codex",
+            "--alias",
+            "wr",
+            "--detach",
+            "--sandbox",
+            "read-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let agent = d.wait_agent("wr", "idle", 20);
+    assert_eq!(agent["sandbox"], "read-only", "{agent}");
+    // Both postures reached the wire on thread/start, paired with the
+    // default `never` approval policy.
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs.len(), 2, "{reqs:?}");
+    assert_eq!(reqs[0]["method"], "thread/start");
+    assert_eq!(reqs[0]["params"]["sandbox"], "workspace-write");
+    assert_eq!(reqs[0]["params"]["approvalPolicy"], "never");
+    assert_eq!(reqs[1]["params"]["sandbox"], "read-only");
+    assert_eq!(reqs[1]["params"]["approvalPolicy"], "never");
+    // A bogus value is a clap rejection naming both accepted values.
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "join",
+            "pm",
+            "codex",
+            "--alias",
+            "wb",
+            "--detach",
+            "--sandbox",
+            "bogus",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("read-only") && err.contains("workspace-write"),
+        "{err}"
+    );
 }
 
 // ── Cursor TUI profile through the generic adapter (CAD-56) ────────
