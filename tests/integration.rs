@@ -18895,3 +18895,341 @@ fn issue_ls_survives_a_closed_downstream_pipe() {
         "the open-pipe failure still prints its error"
     );
 }
+
+// ---------- CAD-136: report intake ----------
+
+/// pm + two repos (the `cadence` project and a `product` project) +
+/// home + state under one temp dir; `cli_at` runs the real binary with
+/// cwd control — report routing is decided by kind and cwd, so the
+/// fixture keeps both an inside-a-project cwd and a foreign one.
+struct ReportFx {
+    _tmp: TempDir,
+    pm_dir: PathBuf,
+    cadence_repo: PathBuf,
+    product_repo: PathBuf,
+    foreign_cwd: PathBuf,
+    home: PathBuf,
+    state: PathBuf,
+    bin_dir: PathBuf,
+}
+
+impl ReportFx {
+    fn new() -> Self {
+        let tmp = TempDir::new().unwrap();
+        let (pm_dir, cadence_repo, product_repo, foreign_cwd, home, state) = (
+            tmp.path().join("pm"),
+            tmp.path().join("cadence-repo"),
+            tmp.path().join("product-repo"),
+            tmp.path().join("nowhere"),
+            tmp.path().join("home"),
+            tmp.path().join("state"),
+        );
+        for dir in [&pm_dir, &home, &state, &foreign_cwd] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        git_repo(&cadence_repo);
+        git_repo(&product_repo);
+        let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let s = Self {
+            _tmp: tmp,
+            pm_dir,
+            cadence_repo,
+            product_repo,
+            foreign_cwd,
+            home,
+            state,
+            bin_dir,
+        };
+        assert!(s.cli(&["issue", "init"]).0);
+        for (key, prefix, repo) in [
+            ("cadence", "C", s.cadence_repo.clone()),
+            ("product", "P", s.product_repo.clone()),
+        ] {
+            let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+            let (ok, out) = s.cli(&[
+                "issue", "project", "add", key, "--prefix", prefix, "--repo", &repo_s,
+            ]);
+            assert!(ok, "project add {key}: {out}");
+        }
+        s
+    }
+
+    fn cli(&self, args: &[&str]) -> (bool, Value) {
+        self.cli_at(&self.product_repo, args)
+    }
+
+    fn cli_at(&self, cwd: &Path, args: &[&str]) -> (bool, Value) {
+        self.cli_at_env(cwd, args, &[]).2
+    }
+
+    /// `(success, stderr, parsed stdout-or-stderr-json)` — stderr kept
+    /// separate so refusal tests can assert on the message text.
+    fn cli_at_env(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> (bool, String, (bool, Value)) {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.arg("--state-dir")
+            .arg(&self.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &self.pm_dir)
+            .env("HOME", &self.home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .current_dir(cwd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let text = if out.stdout.is_empty() {
+            stderr.clone()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            stderr,
+            (
+                out.status.success(),
+                serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+            ),
+        )
+    }
+
+    fn issue_body(&self, project: &str, id: &str) -> String {
+        std::fs::read_to_string(self.pm_dir.join(project).join(id).join("issue.md")).unwrap()
+    }
+
+    fn tracker_log(&self, n: usize) -> String {
+        git_at(
+            &self.pm_dir,
+            &["log", &format!("-{n}"), "--format=%s%n%(trailers)"],
+        )
+    }
+}
+
+/// The routing contract: `question`, `feedback` and `bug` file into
+/// `cadence` from any cwd; `idea` files into the cwd's project (or
+/// --project) and refuses when neither resolves. Priorities default
+/// P3 except `bug` (P2); every issue carries `intake` + kind tags.
+#[test]
+fn report_routes_by_kind_and_defaults() {
+    let s = ReportFx::new();
+
+    // bug/question/feedback from the product repo all land in cadence.
+    for (kind, want_id) in [("bug", "C-1"), ("question", "C-2"), ("feedback", "C-3")] {
+        let (ok, out) = s.cli_at(&s.product_repo, &["report", "--kind", kind, "-m", "x"]);
+        assert!(ok && out["id"] == want_id, "{kind}: {out}");
+        assert_eq!(out["project"], "cadence");
+    }
+    // bug defaults P2, the rest P3; --priority overrides.
+    let (_, out) = s.cli(&["report", "show", "C-1"]);
+    assert_eq!(out["priority"], "P2");
+    let (_, out) = s.cli(&["report", "show", "C-2"]);
+    assert_eq!(out["priority"], "P3");
+    let (ok, out) = s.cli_at(
+        &s.product_repo,
+        &["report", "--kind", "bug", "--priority", "P0", "-m", "sev"],
+    );
+    assert!(ok && out["priority"] == "P0", "{out}");
+
+    // idea from the product repo lands in product.
+    let (ok, out) = s.cli_at(
+        &s.product_repo,
+        &["report", "--kind", "idea", "-m", "a product idea"],
+    );
+    assert!(
+        ok && out["id"] == "P-1" && out["project"] == "product",
+        "{out}"
+    );
+
+    // idea from a foreign cwd refuses, naming --project.
+    let (_, stderr, _) = s.cli_at_env(
+        &s.foreign_cwd,
+        &["report", "--kind", "idea", "-m", "stray idea"],
+        &[],
+    );
+    assert!(stderr.contains("--project"), "{stderr}");
+
+    // --project wins even for kinds that would otherwise route by cwd.
+    let (ok, out) = s.cli_at(
+        &s.product_repo,
+        &[
+            "report",
+            "--kind",
+            "idea",
+            "--project",
+            "cadence",
+            "-m",
+            "a cadence idea",
+        ],
+    );
+    assert!(ok && out["project"] == "cadence", "{out}");
+
+    // Tags: intake + kind on every issue; the commit carries the
+    // Actor trailer.
+    let body = s.issue_body("cadence", "C-1");
+    assert!(
+        body.contains("- bug") && body.contains("- intake"),
+        "{body}"
+    );
+    let log = s.tracker_log(6);
+    assert!(log.contains("Actor:"), "{log}");
+
+    // The default kind is feedback — `cadence report -m` files into
+    // cadence's project.
+    let (ok, out) = s.cli_at(&s.product_repo, &["report", "-m", "no kind"]);
+    assert!(
+        ok && out["kind"] == "feedback" && out["project"] == "cadence",
+        "{out}"
+    );
+}
+
+/// `--issue` attaches the report as a comment on the named issue and
+/// creates nothing new; the comment carries the kind and context.
+#[test]
+fn report_issue_attaches_comment() {
+    let s = ReportFx::new();
+    let (ok, out) = s.cli(&["issue", "new", "Target", "--project", "product"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+
+    let (ok, out) = s.cli(&[
+        "report",
+        "--issue",
+        &id,
+        "--kind",
+        "question",
+        "-m",
+        "what does the flag do?",
+    ]);
+    assert!(ok && out["id"] == id && out["kind"] == "question", "{out}");
+    let comments = s.pm_dir.join("product").join(&id).join("comments");
+    let comment = std::fs::read_dir(&comments)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let text = std::fs::read_to_string(comment).unwrap();
+    assert!(text.contains("what does the flag do?"), "{text}");
+    assert!(text.contains("## Report context"), "{text}");
+}
+
+/// A credential-shaped string in the report body is stored redacted —
+/// body, title and context all pass through the shared scrubber.
+#[test]
+fn report_redacts_credential_shapes() {
+    let s = ReportFx::new();
+    let secret = "ghp_".to_string() + &"a".repeat(36);
+    let (ok, out) = s.cli(&[
+        "report",
+        "--kind",
+        "bug",
+        "-m",
+        &format!("leaked {secret} in CI log"),
+    ]);
+    assert!(ok, "{out}");
+    let body = s.issue_body("cadence", out["id"].as_str().unwrap());
+    assert!(!body.contains(&secret), "{body}");
+    assert!(body.contains("[REDACTED]"), "{body}");
+}
+
+/// The Overview needs-me row appears while the issue sits in backlog
+/// and clears when it leaves — and `report ls` filters by kind and
+/// project.
+#[test]
+fn report_needs_me_row_and_ls_filters() {
+    let s = ReportFx::new();
+    let (ok, _) = s.cli_at(
+        &s.product_repo,
+        &["report", "--kind", "idea", "-m", "an idea"],
+    );
+    assert!(ok);
+    let (ok, _) = s.cli_at(&s.product_repo, &["report", "--kind", "bug", "-m", "a bug"]);
+    assert!(ok);
+
+    let view = overview_at(&s.home, &s.state, Some(&s.pm_dir), &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    let intake: Vec<&Value> = needs.iter().filter(|n| n["kind"] == "intake").collect();
+    assert_eq!(intake.len(), 2, "{needs:?}");
+    let commands: Vec<&str> = intake
+        .iter()
+        .filter_map(|n| n["command"].as_str())
+        .collect();
+    assert!(
+        commands.contains(&"cadence report show P-1"),
+        "{commands:?}"
+    );
+    assert!(
+        commands.contains(&"cadence report show C-1"),
+        "{commands:?}"
+    );
+
+    // `ls` filters: by kind and by project.
+    let (_, out) = s.cli(&["report", "ls", "--kind", "idea"]);
+    assert_eq!(out["count"], 1);
+    assert_eq!(out["reports"][0]["id"], "P-1");
+    let (_, out) = s.cli(&["report", "ls", "--project", "cadence"]);
+    assert_eq!(out["count"], 1);
+    assert_eq!(out["reports"][0]["id"], "C-1");
+
+    // Moving the issue off backlog clears the row.
+    let (ok, _) = s.cli(&["issue", "set", "P-1", "status=ready"]);
+    assert!(ok);
+    let view = overview_at(&s.home, &s.state, Some(&s.pm_dir), &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    assert_eq!(
+        needs.iter().filter(|n| n["kind"] == "intake").count(),
+        1,
+        "{needs:?}"
+    );
+}
+
+/// A report notifies the project's PM inbox — `team.yaml`
+/// `roles.pm.alias` names it (ADR 0001); absent any resolvable PM the
+/// report still files, with `notified` recording the miss.
+#[test]
+fn report_notifies_pm_inbox() {
+    let s = ReportFx::new();
+    let d = TestDaemon::start_on(s.state.clone());
+    d.register_inbox("pm");
+    // The daemon's own state dir is s.state — report and daemon agree.
+
+    // No team.yaml yet — no resolvable PM, still files fine.
+    let (ok, out) = s.cli(&["report", "--kind", "bug", "-m", "first"]);
+    assert!(ok && out["notified"].is_null(), "{out}");
+
+    // team.yaml declares the PM inbox — the report sends one line.
+    std::fs::write(
+        s.pm_dir.join("cadence").join("team.yaml"),
+        "roles:\n  pm:\n    kind: inbox\n    alias: pm\n",
+    )
+    .unwrap();
+    let (ok, out) = s.cli(&["report", "--kind", "bug", "-m", "second"]);
+    assert!(
+        ok && out["notified"]["sent"] == true && out["notified"]["to"] == "pm",
+        "{out}"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    assert_eq!(show["queued"].as_i64().unwrap(), 1);
+    let drained = d.rpc("agent_inbox", json!({"alias": "pm"})).unwrap();
+    let msgs = drained["messages"].as_array().unwrap();
+    assert!(
+        msgs[0]["body"].as_str().unwrap().contains("C-2"),
+        "{msgs:?}"
+    );
+}

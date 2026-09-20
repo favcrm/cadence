@@ -182,6 +182,24 @@ Two limits matter more than the issue graph:
 
 One issue, one worktree, one kickoff note, one message.
 
+An operator question, idea or bug report files the same way — one verb,
+routed by kind:
+
+```bash
+cadence report --kind bug -m "finish panics on empty refs"   # → the cadence project
+cadence report --kind idea -m "dark mode for the board"      # → the cwd's project
+cadence report ls --kind bug                                 # open intake
+```
+
+`question`, `feedback` and `bug` are about cadence itself and land in
+the `cadence` project from any directory; `idea` belongs to the project
+you are standing in (or `--project`, which always wins) and refuses when
+the cwd resolves to none. The issue lands in `backlog` tagged `intake`
+plus the kind — `P3`, `bug` `P2` — captures actor/cwd/repo/build with
+credential scrubbing, pings the project's PM inbox when one resolves
+(`team.yaml` `roles.pm.alias`), and holds an Overview row until it
+leaves backlog. `--issue <ID>` files the same text as a comment instead.
+
 ```bash
 cadence issue new --project cadence --priority P1 --component adapter "Title"
 cadence issue start CAD-60 --name short-slug --owner dev-a

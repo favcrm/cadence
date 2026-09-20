@@ -601,6 +601,46 @@ enum Commands {
         #[command(subcommand)]
         action: cadence_agent::issue::cli::IssueAction,
     },
+    /// File a report: a question, feedback, idea or bug becomes a
+    /// tracker issue with context — instead of dying in a terminal
+    /// scrollback. Routing is by kind, not by cwd: `question`,
+    /// `feedback` and `bug` are about cadence itself and file into the
+    /// `cadence` project from wherever you stand; `idea` belongs to the
+    /// project being worked on — the cwd's repo project, or --project
+    /// (which always wins). An `idea` with no resolvable project refuses
+    /// rather than landing a tool bug in a product backlog. The issue is
+    /// tagged `intake` plus the kind, lands in `backlog` (P3; `bug`
+    /// defaults P2), and surfaces as an Overview `needs_me` row until it
+    /// leaves backlog. One line also goes to the project's PM inbox when
+    /// one is resolvable. Context (actor, cwd, repo+branch, cadence and
+    /// daemon builds) is captured and credential-scrubbed. `--issue`
+    /// files the same text as a comment on an existing issue instead.
+    /// Exit 0 prints the issue id as JSON.
+    Report {
+        /// What this report is: question|feedback|idea|bug
+        /// [default: feedback].
+        #[arg(long, value_enum)]
+        kind: Option<cadence_agent::issue::report::Kind>,
+        /// Project key — always wins; required for `idea` when the cwd
+        /// resolves to no known project.
+        #[arg(long)]
+        project: Option<String>,
+        /// Attach the report as a comment on this issue instead of
+        /// creating one.
+        #[arg(long)]
+        issue: Option<String>,
+        /// Inline report text — first line is the issue title.
+        #[arg(short = 'm', conflicts_with = "file")]
+        text: Option<String>,
+        /// Read the report text from a file; else stdin.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// P0..P3 [default: P3; `bug` defaults P2].
+        #[arg(long)]
+        priority: Option<String>,
+        #[command(subcommand)]
+        action: Option<ReportAction>,
+    },
     /// Shared project memory: reviewed, scoped facts injected into
     /// dispatches and briefings. This CLI is the only writer.
     Memory {
@@ -1086,6 +1126,22 @@ enum AgentAction {
         #[arg(long)]
         older_than: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ReportAction {
+    /// List open intake: issues tagged `intake` that are not
+    /// done/dropped, newest first.
+    Ls {
+        /// Filter to one report kind.
+        #[arg(long, value_enum)]
+        kind: Option<cadence_agent::issue::report::Kind>,
+        /// Filter to one project key.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Print one intake issue — status, tags, body with context.
+    Show { id: String },
 }
 
 #[derive(Subcommand)]
@@ -3433,6 +3489,42 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
+        Commands::Report {
+            kind,
+            project,
+            issue,
+            text,
+            file,
+            priority,
+            action,
+        } => {
+            use cadence_agent::issue::report;
+            let pm = cadence_agent::issue::Pm::open_default()?;
+            match action {
+                Some(ReportAction::Ls { kind, project }) => {
+                    print_json(&report::ls(&pm, kind, project.as_deref())?);
+                }
+                Some(ReportAction::Show { id }) => {
+                    print_json(&report::show(&pm, &id)?);
+                }
+                None => {
+                    let body = read_body(text, file)?;
+                    let cwd = std::env::current_dir()?;
+                    print_json(&report::file(
+                        &pm,
+                        kind.unwrap_or(report::Kind::Feedback),
+                        project.as_deref(),
+                        issue.as_deref(),
+                        priority.as_deref(),
+                        &body,
+                        "",
+                        &state_dir,
+                        &cwd,
+                    )?);
+                }
+            }
+            Ok(0)
+        }
         Commands::Memory { action } => cadence_agent::memory::cli::run(&action, &state_dir),
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
         Commands::Status { group, json, watch } => {
