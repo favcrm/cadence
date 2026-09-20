@@ -51,7 +51,7 @@ Error kinds:
 | `agent_ready` | `alias, by?, force?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; probes the pane first and refuses a visibly busy one unless `force`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
-| `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`; `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; null clears to the provider default) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
+| `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`; `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; null clears to the provider default) or `approval_policy` (codex; `never|on-request|on-failure|untrusted`, null clears) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit PTY ack/result; `sha` names the produced commit for task-attached kickoffs |
 | `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?, sha?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice. A `sha` on `completed` binds like a worker `--sha` |
@@ -153,6 +153,21 @@ menu. `agent_register` validates the four values and rejects anything
 else; `agent set` cannot patch it live (the mode is launch-time only —
 relaunch or rejoin to change it). When the key is absent the flag is
 omitted entirely and Devin's own default applies.
+
+For provider `codex`, `{"approval_policy": "<policy>"}` selects the
+`approvalPolicy` sent on `thread/start`/`thread/resume` — `never`,
+`on-request`, `on-failure` or `untrusted` — replayed verbatim on every
+open like the other launch params. `agent_register` and
+`agent set --next-launch` reject anything else with an error naming all
+four, and the adapter validates once more before the wire. When the key
+is absent a cadence-launched worker sends `never`: no approval
+round-trips to stall an unattended turn on. The worker's filesystem
+posture is `sandbox` — `read-only` or `workspace-write`
+(`agent register --sandbox`; `cadence join --sandbox`; `cadence codex
+--sandbox`). A joined codex worker defaults to `workspace-write`
+scoped to its worktree cwd, `read-only` only when explicitly asked —
+paired with `approval_policy=never` that is the same trust posture the
+other providers already run under, not a new one.
 
 **Briefings.** Every launch path (`devin`, `codex`, `claude`, `join`) writes
 `$CADENCE_STATE_DIR/briefings/<root>/BRIEFING-<alias>.md` — under the
