@@ -663,10 +663,11 @@ workers under it) or a routed `reply_to` target.
 agent; the messages stay `queued` in SQLite — they survive daemon
 restarts and accrue while nothing reads them. `agent_inbox` drains:
 every `queued` message with `seq > after` is completed in one
-transaction with result `{"status":"completed","via":"inbox_read"}`,
-emits `inbox_read`, and any `reply_to` on a consumed message routes
-its result in the same transaction (a drained `reply_to` therefore
-lands on the replier's queue and wakes its actor). `wait>0`
+transaction with result `{"status":"completed","via":"inbox_read"}`
+and emits `inbox_read`. The `inbox_read` value is a local receipt, so it
+is never routed through `reply_to` or used to wake a reviewer; the
+consumed row and any genuine `worker_result` body remain durable and
+available to the mailbox consumer. `wait>0`
 long-polls on the daemon's change signal up to 30s, so a consumer
 blocks on the socket instead of polling — `cadence inbox <alias>
 [--after N] [--wait S]` prints one JSON object per consumed message

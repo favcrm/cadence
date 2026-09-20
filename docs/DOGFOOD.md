@@ -175,9 +175,10 @@ routed via `reply_to`, including as a group root collecting worker
 results) stay `queued` durably. `cadence inbox <alias>` drains them
 over the daemon socket — `--wait`/`--follow` block on the daemon's
 change signal rather than polling — and each consumed message
-completes `via=inbox_read`. A drained message with `reply_to` routes
-its result in the same transaction, so a consumer's answer can still
-wake the waiting actor. Lifecycle verbs refuse the things a mailbox
+completes `via=inbox_read`. That value is a durable local receipt and
+does not route through `reply_to`, so draining a mailbox cannot wake a
+reviewer for acknowledgement-only work. Genuine worker results remain
+durable in the mailbox for the consumer. Lifecycle verbs refuse the things a mailbox
 cannot do (`resume`, `stop` are rejected; `remove` deletes the
 mailbox outright).
 
