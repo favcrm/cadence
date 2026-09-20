@@ -136,6 +136,8 @@ pub static SPECS: &[EndpointSpec] = &[
         resume_label: "codex resume --remote",
         live_settable_params: &["stall_secs"],
         launch_params: &[
+            "model",
+            "effort",
             "session",
             "upstream",
             "agents_md",
@@ -166,6 +168,8 @@ pub static SPECS: &[EndpointSpec] = &[
         resume_label: "codex resume --remote",
         live_settable_params: &["stall_secs"],
         launch_params: &[
+            "model",
+            "effort",
             "session",
             "upstream",
             "agents_md",
@@ -678,14 +682,16 @@ pub fn validate_next_launch_param(
         return Err(Error::rejected(format!(
             "'{key}' cannot be set for the next launch of a {provider}/{kind} \
              agent — --next-launch takes the launch params an endpoint \
-             declares (claude: model, effort; cursor: model; codex: \
+             declares (claude: model, effort; cursor: model; codex: model, \
+             effort, \
              approval_policy). Recreate the agent to change wiring \
              params like upstream or session"
         )));
     }
     match (key, value) {
         (_, Value::Null) => Ok(()),
-        ("effort", Value::String(level)) => claude_effort(level),
+        ("effort", Value::String(level)) if provider == "claude" => claude_effort(level),
+        ("effort", Value::String(level)) if provider == "codex" => codex_effort(level),
         ("approval_policy", Value::String(policy)) => codex_approval_policy(policy),
         ("model", Value::String(m)) if !m.trim().is_empty() => Ok(()),
         _ => Err(Error::rejected(format!(
@@ -712,6 +718,25 @@ pub fn devin_permission_mode(mode: &str) -> Result<()> {
 /// `thread/start`/`thread/resume` — `never` is the cadence worker
 /// posture: no approval round-trips to stall an unattended turn on.
 pub const CODEX_APPROVAL_POLICIES: &[&str] = &["never", "on-request", "on-failure", "untrusted"];
+
+/// The Codex app-server effort vocabulary. The model metadata queried at
+/// open time is authoritative for the pair: for example, Luna supports
+/// `max` but does not advertise `ultra`, while Astra does.
+pub const CODEX_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+
+/// Reject an effort level outside the Codex app-server vocabulary. Whether
+/// a particular model supports that level is checked against `model/list`
+/// when the endpoint opens.
+pub fn codex_effort(level: &str) -> Result<()> {
+    if CODEX_EFFORTS.contains(&level) {
+        Ok(())
+    } else {
+        Err(Error::rejected(format!(
+            "unknown codex effort '{level}' — expected one of: {}",
+            CODEX_EFFORTS.join(", ")
+        )))
+    }
+}
 
 /// Reject a Codex approval policy outside the four-value vocabulary —
 /// `agent_register`, `agent set --next-launch` and the adapter's open
@@ -781,6 +806,23 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
         }
     }
     if provider == "codex" {
+        if let Some(v) = params.get("model") {
+            match v.as_str() {
+                Some(model) if !model.trim().is_empty() => {}
+                _ => return Err(Error::rejected("codex model must be a non-empty string")),
+            }
+        }
+        if let Some(v) = params.get("effort") {
+            match v.as_str() {
+                Some(level) => codex_effort(level)?,
+                None => {
+                    return Err(Error::rejected(format!(
+                        "codex effort must be a string, one of: {}",
+                        CODEX_EFFORTS.join(", ")
+                    )))
+                }
+            }
+        }
         if let Some(v) = params.get("approval_policy") {
             match v.as_str() {
                 Some(policy) => codex_approval_policy(policy)?,

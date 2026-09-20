@@ -144,6 +144,14 @@ enum Commands {
         /// pm or worker.
         #[arg(long, default_value = "worker")]
         role: String,
+        /// Codex model id (for example, gpt-5.6-luna). The app-server
+        /// model catalogue validates it when the endpoint opens.
+        #[arg(long)]
+        model: Option<String>,
+        /// Codex reasoning effort. The selected model's advertised
+        /// reasoning efforts are validated at open time.
+        #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max", "ultra"])]
+        effort: Option<String>,
         /// Codex filesystem sandbox sent on `thread/start` [default:
         /// workspace-write — a cadence-launched worker is writable;
         /// read-only only when asked].
@@ -462,11 +470,13 @@ enum Commands {
         /// resume). Off by default — joins leave the repo untouched.
         #[arg(long)]
         agents_md: bool,
-        /// Model flag for providers `claude` and `cursor` (e.g.
-        /// sonnet, haiku).
+        /// Model flag for providers `claude`, `cursor` and `codex` (e.g.
+        /// sonnet, haiku, gpt-5.6-luna).
         #[arg(long)]
         model: Option<String>,
-        /// Reasoning effort for provider `claude` (`--effort`).
+        /// Reasoning effort for providers `claude` and `codex` (`--effort`).
+        /// The selected Codex model's advertised efforts are validated at
+        /// open time.
         #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
         effort: Option<String>,
         /// Permission mode, replayed on resume. Claude takes its own
@@ -2940,12 +2950,15 @@ fn run() -> Result<i32> {
                 bypass,
             },
             &CursorOpts::default(),
+            &CodexOpts::default(),
         ),
         Commands::Codex {
             detach,
             cwd,
             alias,
             role,
+            model,
+            effort,
             sandbox,
             instructions_file,
             worktree,
@@ -2972,6 +2985,7 @@ fn run() -> Result<i32> {
             &ClaudeOpts::default(),
             &DevinOpts::default(),
             &CursorOpts::default(),
+            &CodexOpts { model, effort },
         ),
         Commands::Claude {
             tui,
@@ -3024,6 +3038,7 @@ fn run() -> Result<i32> {
             },
             &DevinOpts::default(),
             &CursorOpts::default(),
+            &CodexOpts::default(),
         ),
         Commands::Cursor {
             resume,
@@ -3063,6 +3078,7 @@ fn run() -> Result<i32> {
                 permission_mode,
                 bypass,
             },
+            &CodexOpts::default(),
         ),
         Commands::Join {
             group,
@@ -3106,7 +3122,7 @@ fn run() -> Result<i32> {
             agents_md,
             ClaudeOpts {
                 model: model.clone(),
-                effort,
+                effort: effort.clone(),
                 permission_mode: permission_mode.clone(),
                 allow,
                 bypass,
@@ -3125,10 +3141,11 @@ fn run() -> Result<i32> {
             // …and the cursor worker — its two-mode vocabulary is
             // validated in provider_launch the same way.
             CursorOpts {
-                model,
+                model: model.clone(),
                 permission_mode,
                 bypass,
             },
+            CodexOpts { model, effort },
         ),
         Commands::Attach { name, print } => attach_command(&state_dir, name, print),
         Commands::Resume { group, all, detach } => resume_command(&state_dir, group, all, detach),
@@ -4264,6 +4281,14 @@ struct CursorOpts {
     bypass: bool,
 }
 
+/// Codex app-server launch settings. They are stored in the agent params so
+/// the adapter can replay the same model and reasoning effort on resume.
+#[derive(Default)]
+struct CodexOpts {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
 /// `cadence devin [-r slug]` / `cadence codex` / `cadence claude`:
 /// register the provider's endpoint, wait for it to open, then attach
 /// this terminal by default where the kind has an attachable surface.
@@ -4291,6 +4316,7 @@ fn provider_launch(
     claude: &ClaudeOpts,
     devin: &DevinOpts,
     cursor: &CursorOpts,
+    codex: &CodexOpts,
 ) -> Result<i32> {
     // `--tui` selects the provider's pty endpoint where one exists;
     // otherwise the launch kind comes from the registry's default.
@@ -4450,6 +4476,15 @@ fn provider_launch(
         if let Some(mode) = mode {
             registry::cursor_permission_mode(mode)?;
             params_obj.insert("permission_mode".to_string(), json!(mode));
+        }
+    }
+    if provider == "codex" {
+        if let Some(model) = &codex.model {
+            params_obj.insert("model".to_string(), json!(model));
+        }
+        if let Some(effort) = &codex.effort {
+            registry::codex_effort(effort)?;
+            params_obj.insert("effort".to_string(), json!(effort));
         }
     }
     if auto_ready {
@@ -4615,6 +4650,7 @@ fn join_group(
     claude_opts: ClaudeOpts,
     devin_opts: DevinOpts,
     cursor_opts: CursorOpts,
+    codex_opts: CodexOpts,
 ) -> Result<i32> {
     // Validate the provider before any work — the registry names the
     // supported launch verbs in the rejection.
@@ -4662,6 +4698,7 @@ fn join_group(
         &claude_opts,
         &devin_opts,
         &cursor_opts,
+        &codex_opts,
     )
 }
 

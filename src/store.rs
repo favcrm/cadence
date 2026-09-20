@@ -61,6 +61,9 @@ pub struct Agent {
     pub thread_id: Option<String>,
     pub session_id: Option<String>,
     pub model: Option<String>,
+    /// Provider-confirmed reasoning effort from the most recent open.
+    /// Requested/configured effort remains in `params`.
+    pub effort: Option<String>,
     pub pid: Option<i64>,
     pub endpoint: Option<String>,
     /// Endpoint-specific registration options (`{"session": …}` for pty).
@@ -321,6 +324,7 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         thread_id: row.get("thread_id")?,
         session_id: row.get("session_id")?,
         model: row.get("model")?,
+        effort: row.get("effort")?,
         pid: row.get("pid")?,
         endpoint: row.get("endpoint")?,
         params: row
@@ -351,6 +355,7 @@ impl Agent {
             // model beside the configured launch params, with an
             // unconfigured model named as the provider's default.
             "model_reported": self.model,
+            "model_effective": self.model,
             "model_configured": self.param_str("model"),
             "model_source": if self.param_str("model").is_some() {
                 "configured"
@@ -358,6 +363,16 @@ impl Agent {
                 "provider default"
             },
             "effort": self.param_str("effort"),
+            "effort_configured": self.param_str("effort"),
+            "effort_reported": self.effort,
+            "effort_effective": self.effort,
+            "effort_source": if self.effort.is_some() {
+                "provider reported"
+            } else if self.param_str("effort").is_some() {
+                "unknown"
+            } else {
+                "provider default"
+            },
             "enabled": self.enabled, "error": self.error,
             "endpoint": self.endpoint, "params": self.params,
             "generation": self.generation,
@@ -479,7 +494,7 @@ impl Store {
                     endpoint_kind TEXT NOT NULL, role TEXT NOT NULL,
                     cwd TEXT NOT NULL, sandbox TEXT NOT NULL,
                     instructions TEXT, thread_id TEXT, session_id TEXT,
-                    model TEXT, pid INTEGER,
+                    model TEXT, effort TEXT, pid INTEGER,
                     state TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
                     error TEXT, created REAL NOT NULL, updated REAL NOT NULL);
                  CREATE TABLE IF NOT EXISTS messages(
@@ -645,6 +660,22 @@ impl Store {
                 tx.execute_batch("ALTER TABLE jobs ADD COLUMN stall_secs INTEGER")?;
             }
             tx.execute("UPDATE schema_version SET version=6", [])?;
+            tx.commit()?;
+        }
+        if version < 7 {
+            // v7: provider-confirmed reasoning effort. Requested effort
+            // stays in the endpoint params; this column records what the
+            // provider reported for the latest successful open.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(agents)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !columns.iter().any(|c| c == "effort") {
+                tx.execute_batch("ALTER TABLE agents ADD COLUMN effort TEXT")?;
+            }
+            tx.execute("UPDATE schema_version SET version=7", [])?;
             tx.commit()?;
         }
         let store = Self {
@@ -1817,12 +1848,13 @@ impl Store {
         params.extend(kept_ids.iter().map(|k| k.to_string().into()));
         tx.execute(&sql, rusqlite::params_from_iter(params))?;
         tx.execute(
-            "UPDATE agents SET thread_id=?,session_id=?,model=?,pid=?,
+            "UPDATE agents SET thread_id=?,session_id=?,model=?,effort=?,pid=?,
                 endpoint=?,generation=?,state='idle',updated=? WHERE alias=?",
             params![
                 id.thread_id,
                 id.session_id,
                 id.model,
+                id.effort,
                 id.pid as i64,
                 id.endpoint,
                 id.generation,
@@ -1835,7 +1867,8 @@ impl Store {
             alias,
             "ready",
             json!({"thread_id": id.thread_id, "session_id": id.session_id,
-                   "model": id.model, "pid": id.pid, "endpoint": id.endpoint,
+                   "model": id.model, "effort": id.effort, "pid": id.pid,
+                   "endpoint": id.endpoint,
                    "generation": id.generation}),
         )?;
         for e in adopted.unwrap_or_default() {
@@ -3543,6 +3576,7 @@ mod tests {
                     thread_id: "th".into(),
                     session_id: "s".into(),
                     model: None,
+                    effort: None,
                     pid: 1,
                     endpoint: Some("ws://x".into()),
                     generation: None,
@@ -3572,7 +3606,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         Store::open(&db).unwrap();
     }
 
@@ -3637,7 +3671,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 6);
+            assert_eq!(v, 7);
         }
         // Half-applied: v4 objects present but version rolled back —
         // reopening must converge, not fail on duplicates.
@@ -3672,7 +3706,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 6);
+            assert_eq!(v, 7);
         }
     }
 
