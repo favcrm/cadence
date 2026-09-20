@@ -13523,7 +13523,11 @@ fn pty_queued_menu_surfaces_and_answers() {
         json!({"alias": "dv", "text": "blocked send", "message": "mq"}),
     )
     .unwrap();
-    assert_eq!(d.message_state("dv", "mq"), "queued");
+    // `queued` or `submitting` — the delivery loop may have already
+    // claimed the head and be gate-waiting on the menu; it cannot be
+    // running while the pane shows a menu.
+    let st = d.message_state("dv", "mq");
+    assert!(st == "queued" || st == "submitting", "{st}");
 
     // The queued head is tracked for menu detection: the event names
     // the waiting message and marks it queued, the views carry the
