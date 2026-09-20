@@ -6,7 +6,7 @@
 - Deciders: operator (schema location, enforcement scope), PM (ticket order)
 - Issues: CAD-76 (this), CAD-75 (parent epic), CAD-78, CAD-79, CAD-110
 - Supersedes: nothing. First ADR.
-- **Code citations are pinned to `07ca301` (main, 2026-09-20).** Line
+- **Code citations are pinned to `33a6a82` (main, 2026-09-20).** Line
   numbers move; the claims are what matter. Re-locate by the quoted
   symbol or comment rather than trusting a line number after main moves.
 
@@ -28,13 +28,13 @@ Taken from the live host on 2026-09-19, not inferred:
 
 | Claim | Evidence |
 |---|---|
-| `role` is a write-only field with two legal values | Validated once, at `store.rs:1028` — `if !matches!(new.role, "pm" \| "worker")`; `daemon.rs:1146` defaults it to `"worker"`; six `clap` flags default to `"worker"` (`main.rs:94,145,201,294,437,948`) and the flag is a bare `String` with no `value_parser`, so a bad role fails at the daemon, not at parse. |
-| Nothing reads it back | `row_agent` reads the column (`store.rs:313`), `to_json` echoes it (`store.rs:340`), and no branch anywhere consumes it. Group and PM identity are derived entirely from `params.upstream`. The only consumer in the tree is cosmetic: `{a?.role ?? "agent"}` in `ui/src/components/Agents.tsx:106`. Audit N9 confirmed. |
+| `role` is a write-only field with two legal values | Validated once, in `register_agent` (`store.rs:1036`) — `if !matches!(new.role, "pm" \| "worker")`; `daemon.rs:1146` defaults it to `"worker"`; six `clap` flags default to `"worker"` (`main.rs:93,144,200,293,436,954`) and the flag is a bare `String` with no `value_parser`, so a bad role fails at the daemon, not at parse. |
+| Nothing reads it back | `row_agent` reads the column (`store.rs:312`), `Agent::to_json` echoes it (`store.rs:343`), and no branch anywhere consumes it. Group and PM identity are derived entirely from `params.upstream`. The only consumer in the tree is cosmetic: `{a?.role ?? "agent"}` in `ui/src/components/Agents.tsx:106`. Audit N9 confirmed. |
 | Every role agent is literally a "worker" | `cadence agent list`: `arch-1`, `qa-1`, `ops-1`, `rsch-1`, `devin-c`, `devin-d` all report `role: worker`. The reviewer and the DevOps agent are indistinguishable from a coder to the daemon. |
 | Role identity is not persisted anywhere else | `params` for `qa-1` and `arch-1` are exactly `{effort, model, permission_mode, upstream}`. Nothing says "reviewer". |
 | Briefings did not reach their agents | `cadence agent show qa-1` advertises `briefing: …/briefings/fable-cc/BRIEFING-qa-1.md`. That file **does not exist**. Same for `ops-1`, `arch-1`, `rsch-1`. The only file in the briefings tree is `BRIEFING-ci-claude.md`. |
-| The agent record has no instructions to show | `cadence agent show qa-1` has no `instructions` key. `Agent::to_json` (`store.rs:337-362`) omits the column, and `rpc_show` (`daemon.rs:980-1006`) does not add it — although `store.rs:1038` accepts and length-caps `NewAgent.instructions` at 32 000 chars. |
-| It is not the only dead role field | `tasks.role TEXT NOT NULL DEFAULT 'implementer'` (`store.rs:567`) is commented "reviewer/merger are M3b" and is display-only too. Two write-only role fields already; CAD-78 should make one of them real, not add a third. |
+| The agent record has no instructions to show | `cadence agent show qa-1` has no `instructions` key. `Agent::to_json` (`store.rs:343`) omits the column, and `rpc_show` (`daemon.rs:980-1006`) does not add it — although `store.rs:1048` accepts and length-caps `NewAgent.instructions` at 32 000 chars. |
+| It is not the only dead role field | the `tasks` DDL's `role TEXT NOT NULL DEFAULT 'implementer'` (`store.rs:575`) is commented "reviewer/merger are M3b" and is display-only too. Two write-only role fields already; CAD-78 should make one of them real, not add a third. |
 | Consequence, observed | Each of the four role agents had to be told in its kickoff message to go and read a file path. The operating model was delivered by hand, per agent, per session. That is CAD-110. |
 
 Two facts settle questions that would otherwise need debate:
@@ -59,7 +59,7 @@ CAD-110 reads as "`--instructions-file` is silently ignored **with
 depends on the difference:
 
 - `--instructions-file` is read **unconditionally**, before and
-  independent of any bootstrap decision (`main.rs:4325`), and stored on
+  independent of any bootstrap decision (`main.rs:4364`), and stored on
   the agent record.
 - The stored value has **exactly one reader in the whole codebase**:
   `adapter/codex.rs:358-359`, which maps it to codex's
@@ -67,12 +67,12 @@ depends on the difference:
 - Therefore for `provider = claude | devin | cursor`, the text is stored
   and **never read at all** — with or without `--no-bootstrap`. Claude's
   argv builder (`adapter/claude.rs:106-158`) reads only `params.*`; no
-  pty profile touches it; `briefing_body` (`main.rs:4757-4898`) never
+  pty profile touches it; `briefing_body` (`main.rs:4796-4937`) never
   references it either. There is no code path where the
   `--instructions-file` content and the briefing meet.
 - `--no-bootstrap` separately suppresses the *other* channel: it sets
-  `BriefMode::Off` (`main.rs:4610-4616`), so the single gate at
-  `main.rs:4499-4509` never calls `brief_agent`, and the briefing file,
+  `BriefMode::Off` (`main.rs:4649-4655`), so the single gate at
+  `main.rs:4538-4548` never calls `brief_agent`, and the briefing file,
   the AGENTS.md block and the durable `bootstrap-<alias>` message are all
   skipped.
 
@@ -87,9 +87,9 @@ CAD-110's scope (§8.5).
 `docs/TEAM.md` says the reviewer never merges. The daemon cannot observe
 that, because **merging does not go through cadence** — by design, so far.
 There is no `cadence land` and no `cadence merge` anywhere in the tree.
-`main.rs:832` states the policy: "Cadence never runs git merges itself."
+`main.rs:839` states the policy: "Cadence never runs git merges itself."
 `job accept --merged-sha` records a merge *claim* after the fact, and
-`overview.rs:757` prints
+`overview.rs:771` prints
 `gh pr merge <n> --squash --admin --match-head-commit <head>` for a human
 to copy. A rule like "a reviewer cannot merge" is unenforceable against a
 process that can invoke an unrelated binary.
@@ -279,7 +279,7 @@ own risk class. Phase 1 is Option B verbatim.**
 |---|---|---|---|
 | 1 | `scripts/team-up.sh`; CAD-110 fail-closed (refuse a no-op `--instructions-file` — both the flag combination and the providers with no reader — and verify the advertised briefing path exists) | D1, part of D2 | `auto` for the script; `human` for the join/briefing change (trigger 1) |
 | 2 | `team.yaml` schema + `cadence join --role` + `team up\|down\|show` with drift report; `role` becomes a real value; briefing text attached to the agent record and replayed | D1, D2, D5 | mostly `auto`; the `role` validation and instructions replay are `human` (triggers 1, 2) |
-| 3a | Route qa-1's review through `job verdict` so the self-review gate that already exists (`store.rs:2662`, §5.4) is on the live path; widen it from `tasks.assignee` to git authorship | D3, partly | `human` (trigger 1) |
+| 3a | Route qa-1's review through `job verdict` so the self-review gate that already exists (`store.rs:2670`, §5.4) is on the live path; widen it from `tasks.assignee` to git authorship | D3, partly | `human` (trigger 1) |
 | 3b | Capability checks on cadence verbs | D3 | `human` (triggers 1, 2) |
 | 3c | `cadence land` (CAD-79) owns the `gh` call; `land.actor != verdicts.reviewer`; approval records pinned to a full SHA | D3, D4 | `human` (triggers 1, 2, 6) |
 
@@ -380,7 +380,7 @@ does not map to an accepted key is a refusal, not a silent drop:
 
 - **`kind` is not a flag.** `join` selects the pty endpoint with `--tui`
   and otherwise takes `registry::default_kind(provider)`
-  (`main.rs:4267`). `kind: pty` in a profile therefore expands to
+  (`main.rs:4306`). `kind: pty` in a profile therefore expands to
   `--tui`, and `kind: managed` to its absence. Likewise `provider` is a
   **positional** argument to `join`, not `--provider`.
 - **`effort` is Claude-only *inside cadence*, but not outside it.** In
@@ -388,14 +388,14 @@ does not map to an accepted key is a refusal, not a silent drop:
   `codex` has neither `effort` nor `model`, and `devin` has neither. So
   `defaults.effort: high` inherited by a `devin` role would be *rejected
   at register* today. Legal Claude values are `low|medium|high|xhigh|max`
-  (`registry.rs:633`). What the providers themselves support is a
+  (`registry.rs:646`). What the providers themselves support is a
   different and messier story — §5.1.1, from `rsch-1`'s note, and it
   changes the schema.
 - **`sandbox` must be a profile field — and `join --sandbox` now exists.**
   When this ADR was drafted, `join` hardcoded `sandbox: "read-only"`, so a
   joined codex worker could never be `workspace-write` and a `dev` role on
   codex was unexpressible. That was filed as CAD-126 and **shipped in #72**
-  (`join --sandbox`, `main.rs:439-445`), so the profile field now has a flag
+  (`join --sandbox`, `main.rs:438-444`), so the profile field now has a flag
   to expand into. `sandbox` remains one of the few fields that *is* read
   back — `adapter/codex.rs:355` passes it into codex `thread/start`,
   alongside the new `approvalPolicy` from the same PR, which is a further
@@ -407,7 +407,7 @@ does not map to an accepted key is a refusal, not a silent drop:
   `team up` should validate all three against the provider, since a typo
   in a committed file that only fails at spawn time is the silent-failure
   shape the charter argues against.
-- **`--bypass` conflicts with `--permission-mode`** (`main.rs:483`), so a
+- **`--bypass` conflicts with `--permission-mode`** (`main.rs:482`), so a
   profile expresses one or the other, never both.
 
 - **`briefing` is a path in the product repo**, resolved against the
@@ -496,10 +496,10 @@ a reconciler that fights live work.
 
 The reason is mechanical, not philosophical: most launch params are
 launch-time only, and the code is strict about it. `registry::
-validate_live_param` (`adapter/registry.rs:593-629`) admits exactly
+validate_live_param` (`adapter/registry.rs:605-640`) admits exactly
 `auto_ready` (pty) and `stall_secs`; `NEXT_LAUNCH_PARAMS`
-(`adapter/registry.rs:651`) admits exactly `model` and `effort`, and only
-for the *next* launch. `docs/PROTOCOL.md` says the rest — "relaunch or
+(`adapter/registry.rs:663`) admits `model`, `effort` and — since #72 —
+`approval_policy`, and only for the *next* launch. `docs/PROTOCOL.md` says the rest — "relaunch or
 rejoin to change it".
 So "the yaml always wins" necessarily means *killing and relaunching
 agents to converge* — a destructive loop over agents that may be
@@ -522,15 +522,15 @@ and the missing capability. An unknown capability name in `team.yaml` is
 a parse error — a typo must not read as "no restriction" (fail closed).
 
 **Where the role and its capabilities are stored is not free.** They
-cannot go in `params`: `store.rs:1046-1054` caps the whole JSON object at
+cannot go in `params`: `store.rs:1057` caps the whole JSON object at
 4 000 characters, and `validate_launch_params` rejects any key an endpoint
 does not declare, so `capabilities` would be refused at register. So
 phase 2 needs either a widened `agents.role` (a real value from the
-declared set, replacing the `pm|worker` check at `store.rs:1028`) plus a
+declared set, replacing the `pm|worker` check at `store.rs:1036`) plus a
 resolved-capabilities column, or a small `agent_roles` table. Either is a
 store-version change, which is risk-class trigger 2 — and it is the
 reason phase 2 cannot be purely additive. The upside is already paid for:
-`Store::recover` (`store.rs:664-773`) preserves `role`, `instructions`
+`Store::recover` (`store.rs:672-781`) preserves `role`, `instructions`
 and `params` across a restart, clearing only `pid`, `endpoint` and
 `generation`, so role identity survives a daemon restart for free.
 
@@ -580,7 +580,7 @@ Three things to borrow, none of which need a remote authority:
 code, and the workflow the team actually runs goes around it.**
 
 `Store::record_verdict` refuses a self-review outright
-(`store.rs:2662-2667`):
+(`store.rs:2670-2675`):
 
 ```rust
 if task.assignee.as_deref() == Some(reviewer) {
@@ -591,7 +591,7 @@ if task.assignee.as_deref() == Some(reviewer) {
 }
 ```
 
-It is tested (`tests/integration.rs:9126`,
+It is tested (`tests/integration.rs:9129`,
 `verdict_rejects_every_bad_shape`) and documented as A4 "reviewer
 independence" (`docs/JOBS.md:204-209`). It is backed by real actor
 handling in `rpc_task_verdict` (`daemon.rs:2304-2323`): inside a pane the
@@ -609,7 +609,7 @@ performs never reaches it**:
 - `qa-1` publishes a note to `/var/www/agent-notes/` and sends `ops-1` a
   message. Prose, not a row in `verdicts`.
 - `ops-1` merges with the `gh pr merge … --match-head-commit` line that
-  `overview.rs:757` prints for a human to copy.
+  `overview.rs:771` prints for a human to copy.
 
 Consequently the enforced predicate sits idle beside the real pipeline.
 That reframes phase 3 and makes it much cheaper than it looked:
@@ -620,10 +620,10 @@ That reframes phase 3 and makes it much cheaper than it looked:
 
 | Rule | Status today | Work |
 |---|---|---|
-| An author may not pass its own work | **enforced** against `tasks.assignee` (`store.rs:2662`) | route qa-1's verdict through `job verdict` instead of a note |
+| An author may not pass its own work | **enforced** against `tasks.assignee` (`store.rs:2670`) | route qa-1's verdict through `job verdict` instead of a note |
 | …including when the author is not the assignee | **gap**: the check compares aliases, not git authorship, so an alias that wrote the commits but is not the assignee passes | also compare against the PR head's author/pusher. GitLab splits this into two booleans — `allow_author_approval` and `allow_committer_approval` — which is the right shape: authorship and having-pushed are different disqualifications |
 | Only a `review`-capable role may verdict | not expressible — `agents.role` is dead (§1.1) | capability check (§5.3) |
-| A reviewer may not land | no `land` verb exists at all | CAD-79 owns the `gh` call; then `land.actor != verdict.reviewer`, using the `verdicts.reviewer` column that already exists (`store.rs:581-591`) |
+| A reviewer may not land | no `land` verb exists at all | CAD-79 owns the `gh` call; then `land.actor != verdict.reviewer`, using the `verdicts.reviewer` column that already exists (`store.rs:589-599`) |
 | A class-`human` merge needs operator approval | not enforced; the phrase is prose in a queue | approval records, below |
 | The proposer of a lesson may not accept it | **enforced**, and it is the only role-shaped gate in the tree: `require_curator` (`memory/mod.rs:344-369`) refuses when `params.upstream` is non-null — "you are a worker" | replace the `upstream`-is-non-null proxy with a real capability once roles exist |
 
@@ -649,7 +649,7 @@ pane-identity test `daemon.rs:2312-2317` already applies to `'operator'`
 makes guardrails 3 and 4 mechanical instead of procedural.
 
 A third write-only role field is worth noting before it grows: `tasks.role
-TEXT NOT NULL DEFAULT 'implementer'` (`store.rs:567`), commented
+TEXT NOT NULL DEFAULT 'implementer'` (`store.rs:575`), commented
 "reviewer/merger are M3b", is display-only. CAD-78 should make *that*
 field real rather than adding a fourth.
 
@@ -802,7 +802,7 @@ cadence team show --file /tmp/bad-team.yaml; test $? -ne 0
 
 ```bash
 # D3, 3a: the gate that already exists is now on the live path.
-# This already passes today in isolation (tests/integration.rs:9126);
+# This already passes today in isolation (tests/integration.rs:9129);
 # the check is that the real review reaches it.
 cadence job verdict <task> --sha <head> --pass   # as the task assignee -> refused:
                                                  # "cannot verdict its own revision"
