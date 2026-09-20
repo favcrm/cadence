@@ -601,6 +601,12 @@ enum Commands {
         #[command(subcommand)]
         action: cadence_agent::issue::cli::IssueAction,
     },
+    /// Relay local report issues to explicitly configured GitHub projects
+    /// and poll actionable comments without model turns.
+    Intake {
+        #[command(subcommand)]
+        action: IntakeAction,
+    },
     /// Shared project memory: reviewed, scoped facts injected into
     /// dispatches and briefings. This CLI is the only writer.
     Memory {
@@ -690,6 +696,58 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
+}
+
+#[derive(Subcommand)]
+enum IntakeAction {
+    /// Write or update one project's relay configuration.  The relay is
+    /// disabled unless --enable is explicitly supplied.
+    Configure {
+        /// PM project key whose local intake issues are published.
+        project: String,
+        /// GitHub owner/name. URLs, tokens and credential-shaped values are
+        /// rejected.
+        repo: String,
+        /// Explicitly enable this project.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        /// Explicitly disable this project while retaining its state.
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        /// Minimum seconds between non-model polls.
+        #[arg(long, default_value_t = cadence_agent::issue::relay::DEFAULT_POLL_SECONDS,
+              value_parser = clap::value_parser!(u64).range(1..))]
+        poll_seconds: u64,
+        /// Permit on-demand PM dispatch after quota/agent checks.  A sync
+        /// still needs its separate --dispatch flag.
+        #[arg(long)]
+        dispatch: bool,
+        /// PM alias to receive actionable comments.
+        #[arg(long)]
+        pm: Option<String>,
+        /// GitHub login used for self-echo suppression.
+        #[arg(long)]
+        actor: Option<String>,
+    },
+    /// Show config, heartbeat, delivery receipts, cursors and durable action
+    /// states. This never contacts GitHub or a provider.
+    Status {
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one poll with --once, or keep a cheap non-model polling loop.
+    Sync {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        once: bool,
+        /// Permit configured, quota-checked actionable PM dispatches.
+        #[arg(long)]
+        dispatch: bool,
+    },
+    /// Make one receipt eligible for the next sync attempt.
+    Retry { project: String, report: String },
 }
 
 #[derive(Subcommand)]
@@ -3433,6 +3491,65 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
+        Commands::Intake { action } => match action {
+            IntakeAction::Configure {
+                project,
+                repo,
+                enable,
+                disable,
+                poll_seconds,
+                dispatch,
+                pm,
+                actor,
+            } => {
+                if enable == disable {
+                    return Err(Error::rejected(
+                        "intake configure requires exactly one of --enable or --disable",
+                    ));
+                }
+                let result = cadence_agent::issue::relay::configure(
+                    &state_dir,
+                    &project,
+                    &repo,
+                    enable,
+                    poll_seconds,
+                    dispatch,
+                    pm,
+                    actor,
+                )?;
+                print_json(&result);
+                Ok(0)
+            }
+            IntakeAction::Status { project, .. } => {
+                print_json(&cadence_agent::issue::relay::status(
+                    &state_dir,
+                    project.as_deref(),
+                )?);
+                Ok(0)
+            }
+            IntakeAction::Sync {
+                project,
+                once,
+                dispatch,
+            } => {
+                let pm = cadence_agent::issue::Pm::open_default()?;
+                let result = cadence_agent::issue::relay::run_loop(
+                    &pm.dir,
+                    &state_dir,
+                    project.as_deref(),
+                    dispatch,
+                    once,
+                )?;
+                print_json(&result);
+                Ok(0)
+            }
+            IntakeAction::Retry { project, report } => {
+                print_json(&cadence_agent::issue::relay::retry(
+                    &state_dir, &project, &report,
+                )?);
+                Ok(0)
+            }
+        },
         Commands::Memory { action } => cadence_agent::memory::cli::run(&action, &state_dir),
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
         Commands::Status { group, json, watch } => {
