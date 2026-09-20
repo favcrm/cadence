@@ -2157,6 +2157,20 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Bound a non-agent event stream to its newest `keep` rows — the
+    /// daemon's `wal_checkpointed` stream has no agents row, so the
+    /// agent-removal `DELETE` never reaches it.
+    pub fn prune_stream(&self, alias: &str, keep: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
+                 SELECT seq FROM events WHERE alias=?1
+                 ORDER BY seq DESC LIMIT ?2)",
+            params![alias, keep],
+        )?;
+        Ok(())
+    }
+
     /// Latest event seq for `agent_show`'s cursor.
     pub fn event_cursor(&self, alias: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();

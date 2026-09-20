@@ -16869,7 +16869,7 @@ fn overview_drift_reports_commits_after_build() {
 /// measures is its own business — this only proves the surface runs
 /// and reports honestly, never which level comes back.
 #[test]
-fn doctor_host_json_reports_six_checks() {
+fn doctor_host_json_reports_all_checks() {
     let dir = TempDir::new().unwrap();
     let state = dir.path().join("state");
     let home = dir.path().join("home");
@@ -16901,6 +16901,8 @@ fn doctor_host_json_reports_six_checks() {
             "disk",
             "provider-state",
             "pipes",
+            "memory",
+            "processes",
             "orphans",
             "temp-dirs",
             "worktrees"

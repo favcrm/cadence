@@ -126,6 +126,12 @@ pub struct HostOverrides {
     /// The daemon checkpoints a provider store's WAL past this size
     /// (CAD-132); `doctor --host` keeps reporting it either way.
     pub wal_max_bytes: Option<u64>,
+    /// `wal_checkpoint: false` opts the daemon's WAL watch out
+    /// entirely — cadence then never writes to another tool's store.
+    pub wal_checkpoint: Option<bool>,
+    /// `wal_dry_run: true` records `wal_checkpoint_pending` events for
+    /// what the watcher *would* checkpoint instead of touching the db.
+    pub wal_dry_run: Option<bool>,
 }
 
 /// Every threshold in one place; `pm.yaml [host]` overrides any subset.
@@ -148,6 +154,8 @@ pub struct Thresholds {
     pub swap_warn_pct: f64,
     pub swap_fail_pct: f64,
     pub wal_max_bytes: u64,
+    pub wal_checkpoint: bool,
+    pub wal_dry_run: bool,
 }
 
 impl Default for Thresholds {
@@ -170,6 +178,8 @@ impl Default for Thresholds {
             swap_warn_pct: 20.0,
             swap_fail_pct: 5.0,
             wal_max_bytes: GIB,
+            wal_checkpoint: true,
+            wal_dry_run: false,
         }
     }
 }
@@ -229,6 +239,12 @@ impl Thresholds {
             if let Some(v) = o.wal_max_bytes {
                 t.wal_max_bytes = v;
             }
+            if let Some(v) = o.wal_checkpoint {
+                t.wal_checkpoint = v;
+            }
+            if let Some(v) = o.wal_dry_run {
+                t.wal_dry_run = v;
+            }
         }
         t
     }
@@ -253,6 +269,9 @@ pub struct Scan {
     /// Injectable statvfs — tests substitute fabricated free-space
     /// answers so no check ever depends on the host's real disks.
     pub(crate) fs_probe: Option<fn(&Path) -> Option<FsFree>>,
+    /// The `/proc` census is one walk per `run` — `memory` consults
+    /// it for remedies and `processes` reports it; lazily shared here.
+    pub(crate) census: std::cell::OnceCell<Census>,
 }
 
 impl Scan {
@@ -284,6 +303,7 @@ impl Scan {
             thresholds,
             linux: cfg!(target_os = "linux"),
             fs_probe: None,
+            census: std::cell::OnceCell::new(),
         }
     }
 }
@@ -813,6 +833,9 @@ fn eval_provider_state(stores: &[StoreMeasure], t: &Thresholds) -> Check {
                 "store_bytes": s.store_bytes,
                 "wal_bytes": s.wal_bytes,
                 "level": s.level.as_str(),
+                // What the daemon's WAL watch would checkpoint under
+                // `[host] wal_max_bytes` — the preview surface.
+                "over_checkpoint_limit": s.wal_bytes.is_some_and(|w| w > t.wal_max_bytes),
             })
         })
         .collect::<Vec<_>>();
@@ -1054,7 +1077,12 @@ fn comm_family(comm: &str) -> String {
         "postgres",
         "redis",
     ] {
-        if c.starts_with(family) {
+        // Exact match or a `-`/`_` boundary — `nodemon` is not `node`,
+        // `chrome_crashpad` and `chrome-sandbox` are chrome.
+        if c == *family
+            || c.strip_prefix(family)
+                .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('_'))
+        {
             return family.to_string();
         }
     }
@@ -1086,11 +1114,17 @@ struct GroupAgg {
 /// family — all users, not just ours: the leaked sessions that
 /// starved this host were root's.
 #[derive(Default)]
-struct Census {
+pub(crate) struct Census {
     groups: BTreeMap<String, GroupAgg>,
     procs: u64,
     unreadable: u64,
     vanished: u64,
+}
+
+/// The shared census — one `/proc` walk per `run`, reused by the
+/// `processes` check and any `memory` remedy in the same report.
+fn census_of(scan: &Scan) -> &Census {
+    scan.census.get_or_init(|| proc_census(scan))
 }
 
 fn proc_census(scan: &Scan) -> Census {
@@ -1190,9 +1224,9 @@ fn check_memory(scan: &Scan) -> Check {
     let t = &scan.thresholds;
     let threshold = json!(format!(
         "warn: available <{}% RAM or swap free <{}%; fail: available <{}% \
-         or swap free <{}%; committed > limit refuses allocations under \
-         enforcing overcommit",
-        t.mem_warn_pct, t.swap_warn_pct, t.mem_fail_pct, t.swap_fail_pct
+         or (swap free <{}% with available <{}%); committed > limit is a \
+         fail only under strict overcommit (mode 2)",
+        t.mem_warn_pct, t.swap_warn_pct, t.mem_fail_pct, t.swap_fail_pct, t.mem_warn_pct
     ));
     if !scan.linux {
         return check(
@@ -1218,11 +1252,16 @@ fn check_memory(scan: &Scan) -> Check {
     let mut level = Level::Ok;
 
     let mut parts = Vec::new();
+    // `avail_low` feeds the combined swap leg — swap exhaustion alone
+    // is a warning; swap exhaustion *with* low MemAvailable is the
+    // CAD-154 incident shape and is the fail.
+    let mut avail_low = false;
     if let Some(avail) = mem.available {
         let pct = avail as f64 * 100.0 / mem.total as f64;
+        avail_low = pct < t.mem_warn_pct;
         let leg = if pct < t.mem_fail_pct {
             Level::Fail
-        } else if pct < t.mem_warn_pct {
+        } else if avail_low {
             Level::Warn
         } else {
             Level::Ok
@@ -1239,7 +1278,12 @@ fn check_memory(scan: &Scan) -> Check {
     match (mem.swap_total, mem.swap_free) {
         (Some(total), Some(free)) if total > 0 => {
             let pct = free as f64 * 100.0 / total as f64;
-            let leg = if pct < t.swap_fail_pct {
+            // Swap exhausted while RAM is still available is the
+            // steady state of a long-lived host — warn, not fail. The
+            // fail needs both legs of the incident: swap <fail AND
+            // MemAvailable already low. With MemAvailable absent the
+            // other half can't be seen, so swap alone stays the vote.
+            let leg = if pct < t.swap_fail_pct && (avail_low || mem.available.is_none()) {
                 Level::Fail
             } else if pct < t.swap_warn_pct {
                 Level::Warn
@@ -1256,10 +1300,12 @@ fn check_memory(scan: &Scan) -> Check {
         (Some(0), _) | (None, _) => parts.push("no swap".to_string()),
         _ => {}
     }
-    // Commitment over CommitLimit means the kernel may refuse fork/
-    // malloc — the CAD-154 EAGAIN. Mode 1 (always overcommit) never
-    // enforces the limit, so the overshoot is reported but not
-    // alarmed; mode 0 refused in practice, mode 2 refuses by design.
+    // Committed_AS vs CommitLimit is only a hard signal under strict
+    // overcommit (mode 2), where the kernel refuses once the limit
+    // passes. Under the default heuristic (0) CommitLimit is advisory
+    // — Committed_AS routinely exceeds it on a healthy host — and
+    // mode 1 never enforces. An unreadable sysctl cannot prove
+    // enforcement is off, so it warns rather than fails.
     let mut commit_over = false;
     if let (Some(committed), Some(limit)) = (mem.committed, mem.commit_limit) {
         commit_over = committed > limit;
@@ -1274,25 +1320,22 @@ fn check_memory(scan: &Scan) -> Check {
             human(committed),
             human(limit),
         ));
-        if commit_over && overcommit != Some(1) {
-            // An unreadable sysctl cannot prove the kernel won't
-            // refuse — warn rather than fail.
-            level = level.max(if overcommit.is_none() {
-                Level::Warn
-            } else {
-                Level::Fail
+        if commit_over {
+            level = level.max(match overcommit {
+                Some(2) => Level::Fail,
+                None => Level::Warn,
+                _ => Level::Ok,
             });
         }
     }
     let mut detail = parts.join("; ");
-    if commit_over {
-        detail.push_str(" — fork()/malloc headroom exhausted");
+    if commit_over && overcommit == Some(2) {
+        detail.push_str(" — fork()/malloc refused (strict overcommit)");
     }
     // The remedy names the biggest process groups — counts, ages,
     // resident bytes — and never kills anything itself.
     let remedy = if level > Level::Ok {
-        let census = proc_census(scan);
-        let groups = top_groups(&census, 3);
+        let groups = top_groups(census_of(scan), 3);
         if groups.is_empty() {
             "inspect `ps aux --sort=-rss | head` — cadence never kills".to_string()
         } else {
@@ -1338,8 +1381,8 @@ fn check_processes(scan: &Scan) -> Check {
             String::new(),
         );
     }
-    let census = proc_census(scan);
-    let top = top_groups(&census, 5);
+    let census = census_of(scan);
+    let top = top_groups(census, 5);
     let mut detail = format!("{} procs", census.procs);
     if !top.is_empty() {
         detail.push_str(&format!(
@@ -1428,14 +1471,29 @@ pub(crate) fn wal_sibling(db: &Path) -> Option<PathBuf> {
     Some(db.with_file_name(format!("{}-wal", db.file_name()?.to_string_lossy())))
 }
 
+/// What `find_wals` walked to. `truncated` is the honest signal that
+/// the caps stopped the walk before every `*-wal` was reached — a
+/// `~/.claude/projects` on a busy host is exactly the store that can
+/// exceed them.
+#[derive(Default)]
+pub(crate) struct WalScan {
+    pub dbs: Vec<PathBuf>,
+    pub truncated: bool,
+}
+
 /// `*.db`/`*.sqlite`/`*.sqlite3` WAL siblings under `root`, returning
 /// the DB paths (a `*-wal` file's presence means the store is in WAL
-/// mode already). Depth- and entry-capped — a giant store walk must
-/// not stall the daemon's tick.
-pub(crate) fn find_wals(root: &Path) -> Vec<PathBuf> {
+/// mode already). Depth-capped; the *matched-db* count is capped so a
+/// dirent-heavy root can't starve the match set, and truncation is
+/// reported rather than silent.
+pub(crate) fn find_wals(root: &Path) -> WalScan {
     const MAX_DEPTH: u8 = 4;
-    const MAX_ENTRIES: usize = 1_024;
-    let mut out = Vec::new();
+    const MAX_DBS: usize = 1_024;
+    // Dirent safety bound, far above any real store: a runaway walk
+    // must not stall the daemon's tick, but hitting this reports
+    // truncation instead of quietly missing the fat WAL.
+    const MAX_VISITED: usize = 65_536;
+    let mut scan = WalScan::default();
     let mut stack = vec![(root.to_path_buf(), 0_u8)];
     let mut visited = 0_usize;
     while let Some((dir, depth)) = stack.pop() {
@@ -1443,10 +1501,13 @@ pub(crate) fn find_wals(root: &Path) -> Vec<PathBuf> {
             continue;
         };
         for ent in entries.flatten() {
-            if visited >= MAX_ENTRIES {
-                return out;
+            if scan.dbs.len() >= MAX_DBS || visited >= MAX_VISITED {
+                scan.truncated = true;
+                return scan;
             }
             visited += 1;
+            // DirEntry::metadata does not follow links — a symlinked
+            // dir inside a root is skipped rather than descended.
             let Ok(meta) = ent.metadata() else {
                 continue;
             };
@@ -1461,11 +1522,11 @@ pub(crate) fn find_wals(root: &Path) -> Vec<PathBuf> {
                 continue;
             };
             if stem.ends_with(".db") || stem.ends_with(".sqlite") || stem.ends_with(".sqlite3") {
-                out.push(dir.join(stem));
+                scan.dbs.push(dir.join(stem));
             }
         }
     }
-    out
+    scan
 }
 
 // ---------- orphaned work ----------
@@ -2608,6 +2669,7 @@ mod tests {
                     total: 1_000 * GIB,
                 })
             }),
+            census: std::cell::OnceCell::new(),
         };
         for d in [
             &scan.proc_root,
@@ -2902,10 +2964,9 @@ mod tests {
             "{}",
             c.detail
         );
-        assert!(c.detail.contains("fork()"), "{}", c.detail);
+        // The fail comes from exhausted swap *with* low available —
+        // the commit overshoot is an advisory item under mode 0.
         assert!(c.value["committed_over_limit"].as_bool().unwrap());
-        // ~11% available is under the 15% warn; ~1% swap is under the
-        // 5% fail — both legs plus the commit leg all fire.
         assert!(c.remedy.contains("cadence never kills"), "{}", c.remedy);
     }
 
@@ -2954,7 +3015,9 @@ mod tests {
             Some(0),
         );
         assert_eq!(check_memory(&scan).level, Level::Fail);
-        // Swap free 15% (<20 warn) → warn; 4% → fail.
+        // Swap free 15% (<20 warn) → warn. Swap at 4% with RAM to
+        // spare is still only warn — swap exhaustion alone is the
+        // steady state of a long-lived host, not a failure.
         write_meminfo(
             &scan,
             &format!(
@@ -2978,6 +3041,20 @@ mod tests {
             ),
             Some(0),
         );
+        assert_eq!(check_memory(&scan).level, Level::Warn);
+        // Swap exhausted AND available low together — the incident
+        // shape — is the fail.
+        write_meminfo(
+            &scan,
+            &format!(
+                "MemTotal: {} kB\nMemAvailable: {} kB\nSwapTotal: {} kB\nSwapFree: {} kB\n",
+                kb(100),
+                kb(10),
+                kb(20),
+                kb(20) / 25
+            ),
+            Some(0),
+        );
         assert_eq!(check_memory(&scan).level, Level::Fail);
     }
 
@@ -2996,10 +3073,16 @@ mod tests {
         assert!(c.detail.contains("overcommit_memory=always"));
         // overcommit_memory=2 (strict): refusing allocations now.
         write_meminfo(&scan, base, Some(2));
-        assert_eq!(check_memory(&scan).level, Level::Fail);
-        // overcommit_memory=0 (heuristic): refused in practice (EAGAIN).
+        let c = check_memory(&scan);
+        assert_eq!(c.level, Level::Fail, "{}", c.detail);
+        assert!(c.detail.contains("strict overcommit"), "{}", c.detail);
+        // overcommit_memory=0 (heuristic): CommitLimit is advisory —
+        // over-limit is a normal steady state, reported not alarmed.
         write_meminfo(&scan, base, Some(0));
-        assert_eq!(check_memory(&scan).level, Level::Fail);
+        let c = check_memory(&scan);
+        assert_eq!(c.level, Level::Ok, "{}", c.detail);
+        assert!(c.detail.contains("overcommit_memory=heuristic"));
+        assert!(c.value["committed_over_limit"].as_bool().unwrap());
         // Sysctl unreadable: cannot prove enforcement — warn, not fail.
         write_meminfo(&scan, base, None);
         let c = check_memory(&scan);
@@ -3127,7 +3210,9 @@ mod tests {
         // Not a sqlite store — ignored.
         real_bytes(&codex.join("notes.txt-wal"), 8);
         let found = find_wals(root.path());
+        assert!(!found.truncated);
         let names: Vec<String> = found
+            .dbs
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
@@ -3135,7 +3220,7 @@ mod tests {
         assert!(names.contains(&"state_1.sqlite".to_string()), "{names:?}");
         assert!(names.contains(&"queue_1.db".to_string()), "{names:?}");
         assert!(names.contains(&"sess.sqlite3".to_string()), "{names:?}");
-        assert_eq!(found.len(), 4, "{names:?}");
+        assert_eq!(found.dbs.len(), 4, "{names:?}");
     }
 
     #[test]
@@ -3146,6 +3231,36 @@ mod tests {
         assert!(roots[0].root.ends_with("devin/cli"));
         assert!(roots[1].root.ends_with(".codex"));
         assert!(roots[2].root.ends_with(".claude/projects"));
+    }
+
+    /// A symlinked dir inside a provider root is not descended — the
+    /// walk must stay inside the root it was given.
+    #[test]
+    fn find_wals_skips_symlinked_dirs() {
+        let root = TempDir::new().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        real_bytes(&real.join("a.db-wal"), 8);
+        std::os::unix::fs::symlink(&real, root.path().join("link")).unwrap();
+        let found = find_wals(root.path());
+        assert_eq!(
+            found.dbs.len(),
+            1,
+            "the same wal must not be found twice through the link"
+        );
+    }
+
+    /// Hitting the matched-db cap reports truncation rather than
+    /// silently returning a partial watch list.
+    #[test]
+    fn find_wals_reports_truncation() {
+        let root = TempDir::new().unwrap();
+        for i in 0..1030 {
+            real_bytes(&root.path().join(format!("s{i}.db-wal")), 4);
+        }
+        let found = find_wals(root.path());
+        assert!(found.truncated, "1024-cap must surface");
+        assert_eq!(found.dbs.len(), 1024);
     }
 
     // ---------- pipes ----------

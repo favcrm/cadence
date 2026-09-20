@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -2569,23 +2570,35 @@ impl Shared {
     /// CAD-132: a provider WAL once grew 0 → 30 GiB in four hours and
     /// twice took the disk under 4 GiB. The daemon now checkpoints
     /// known provider stores itself — PASSIVE then TRUNCATE — whenever
-    /// the WAL passes `[host] wal_max_bytes` AND the owning provider
-    /// has no live turn. A busy TRUNCATE is simply retried next tick;
-    /// a store mid-turn is never touched.
+    /// the WAL passes `[host] wal_max_bytes`, has been quiet for
+    /// `WAL_QUIET_SECS`, and the owning provider has no in-flight
+    /// cadence turn. A deferred checkpoint is retried next tick. The
+    /// sleep is sub-stepped so `closing` lands within ~200ms, not
+    /// after a whole tick.
     fn run_wal_watch(self: &Arc<Self>) {
+        let mut watch = WalWatch::default();
         while !self.closing.load(Ordering::SeqCst) {
-            self.wal_tick();
-            std::thread::sleep(WAL_TICK);
+            self.wal_tick(&mut watch);
+            let deadline = Instant::now() + WAL_TICK;
+            while !self.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
     }
 
-    /// One pass: threshold re-read each tick so a `pm.yaml` edit
+    /// One pass: thresholds re-read each tick so a `pm.yaml` edit
     /// applies without a restart; the busy-provider set comes from
-    /// the live store.
-    fn wal_tick(&self) {
-        let home = std::env::var_os("HOME")
+    /// the live store. `[host] wal_checkpoint: false` opts the whole
+    /// watcher out; `wal_dry_run: true` records intent, never writes.
+    fn wal_tick(&self, watch: &mut WalWatch) {
+        let Some(home) = std::env::var_os("HOME")
             .map(PathBuf::from)
-            .unwrap_or_default();
+            .filter(|h| !h.as_os_str().is_empty())
+        else {
+            // HOME unset → provider roots would resolve against the
+            // daemon's cwd; there is nothing to watch.
+            return;
+        };
         let data_home = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"));
@@ -2593,11 +2606,22 @@ impl Shared {
         let pm_dir = crate::issue::default_dir()
             .ok()
             .filter(|d| d.join("pm.yaml").is_file());
-        let max = crate::doctor::host::host_thresholds(pm_dir.as_deref()).wal_max_bytes;
+        let t = crate::doctor::host::host_thresholds(pm_dir.as_deref());
+        if !t.wal_checkpoint {
+            return;
+        }
         let Ok(busy) = self.store.busy_providers() else {
             return;
         };
-        wal_pass(&roots, &busy, max, &self.store);
+        wal_pass(
+            &roots,
+            &busy,
+            t.wal_max_bytes,
+            WAL_QUIET_SECS,
+            t.wal_dry_run,
+            &self.store,
+            watch,
+        );
     }
 
     /// One watch pass: refresh every owned agent's activity evidence,
@@ -2995,65 +3019,144 @@ impl Shared {
 
 // ---------- provider WAL auto-checkpoint (CAD-132) ----------
 
-/// What a TRUNCATE attempt learned.
+/// What a TRUNCATE attempt learned. Contention under
+/// `busy_timeout(0)` arrives as an error, and a non-WAL database
+/// reports `(0, -1, -1)` — both mean "leave it for the next tick",
+/// so they share one variant.
 enum Checkpoint {
     /// The WAL checkpointed and truncated — record the event.
     Done,
-    /// A reader or writer held the WAL — try again next tick.
-    Busy,
-    /// Open or pragma failed (locked, missing, not a db) — same.
-    Failed,
+    /// Busy, locked, not a WAL store, or open failed — all deferred.
+    Deferred,
 }
 
 /// `PRAGMA wal_checkpoint(PASSIVE)` then `(TRUNCATE)` on `db` — a
-/// second connection to the provider's own store, opened with no busy
-/// timeout so a contended file defers instead of stalling the watch.
-/// PASSIVE moves frames out while readers run; TRUNCATE then frees
-/// the file unless someone is mid-snapshot.
+/// second connection to the provider's own store. READ_WRITE without
+/// CREATE: `find_wals` derives the db path from a `-wal` stem, and an
+/// orphan `foo.db-wal` must never *create* `foo.db` in a provider's
+/// directory. No busy timeout — a contended file defers instead of
+/// stalling the watch. PASSIVE moves frames out while readers run;
+/// TRUNCATE then frees the file unless someone is mid-snapshot.
 fn checkpoint_wal(db: &Path) -> Checkpoint {
-    let Ok(conn) = rusqlite::Connection::open(db) else {
-        return Checkpoint::Failed;
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Checkpoint::Deferred;
     };
     let _ = conn.busy_timeout(Duration::ZERO);
     // PASSIVE's own result is advisory — TRUNCATE does the real work.
     let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
     match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-        r.get::<_, i64>(0)
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
     }) {
-        Ok(0) => Checkpoint::Done,
-        Ok(_) => Checkpoint::Busy,
-        Err(_) => Checkpoint::Failed,
+        // (busy=0, log>=0): a real WAL store checkpointed. (0,-1,-1)
+        // is a journal_mode=DELETE db answering the pragma — a stale
+        // leftover -wal, not something we shrank: no event is owed.
+        Ok((0, log)) if log >= 0 => Checkpoint::Done,
+        Ok(_) | Err(_) => Checkpoint::Deferred,
     }
 }
 
-/// One watch pass over `roots`: each `*-wal` over `max_bytes` whose
-/// provider has no in-flight turn gets checkpointed. Roots are
-/// enumerated fresh each call so a store appearing or a provider
-/// going busy between ticks lands on the next pass. Emits one
-/// `wal_checkpointed` event per successful TRUNCATE — the before and
-/// after sizes are the evidence.
+/// Seconds a WAL must go unwritten before the watcher calls the
+/// store idle — the gate against writers cadence cannot see
+/// (interactive terminals, another daemon, provider background jobs).
+const WAL_QUIET_SECS: u64 = 60;
+
+/// Keep this many `daemon` events — the stream has no agents row, so
+/// agent-removal pruning never reaches it; unbounded growth in a
+/// feature whose purpose is bounding growth would be embarrassing.
+const DAEMON_EVENTS_KEEP: i64 = 200;
+
+/// Cross-tick watch state: `pending` dedupes dry-run events (one per
+/// db per crossing, cleared when it drops under the limit), and
+/// `truncated_seen` keeps a stuck scan from re-eventing every tick.
+#[derive(Default)]
+struct WalWatch {
+    pending: HashSet<PathBuf>,
+    truncated_seen: bool,
+}
+
+/// One watch pass over `roots`: each `*-wal` over `max_bytes`, quiet
+/// for `quiet_secs`, owned by this uid and not a symlink, whose
+/// provider has no in-flight *cadence* turn gets checkpointed — the
+/// busy gate is a courtesy over cadence's own store; SQLite's locking
+/// and the quiet-window are what protect data. `dry_run` records
+/// `wal_checkpoint_pending` instead of touching the db.
 fn wal_pass(
     roots: &[crate::doctor::host::WalRoot],
     busy: &HashSet<String>,
     max_bytes: u64,
+    quiet_secs: u64,
+    dry_run: bool,
     store: &Store,
+    watch: &mut WalWatch,
 ) {
+    let uid = unsafe { libc::geteuid() };
+    let mut truncated = false;
     for root in roots {
         if busy.contains(root.provider) {
             continue;
         }
-        for db in crate::doctor::host::find_wals(&root.root) {
+        let scan = crate::doctor::host::find_wals(&root.root);
+        truncated |= scan.truncated;
+        for db in scan.dbs {
             let Some(wal) = crate::doctor::host::wal_sibling(&db) else {
                 continue;
             };
-            let Some(before) = std::fs::metadata(&wal).ok().map(|m| m.len()) else {
+            // symlink_metadata + uid: a root-run daemon checkpointing
+            // a user's db would leave root-owned -wal/-shm the provider
+            // then cannot open; a symlinked store is never ours to
+            // write through.
+            let Ok(wal_meta) = std::fs::symlink_metadata(&wal) else {
+                watch.pending.remove(&db);
                 continue;
             };
+            let Ok(db_meta) = std::fs::symlink_metadata(&db) else {
+                // Orphan -wal with no db beside it — never create one.
+                watch.pending.remove(&db);
+                continue;
+            };
+            if wal_meta.is_symlink()
+                || db_meta.is_symlink()
+                || wal_meta.uid() != uid
+                || db_meta.uid() != uid
+            {
+                continue;
+            }
+            let before = wal_meta.len();
             if before <= max_bytes {
+                watch.pending.remove(&db);
+                continue;
+            }
+            // Recently-written WAL: some writer is live — defer.
+            let quiet = wal_meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|ago| ago >= Duration::from_secs(quiet_secs));
+            if !quiet {
+                continue;
+            }
+            if dry_run {
+                if watch.pending.insert(db.clone()) {
+                    let _ = store.event_public(
+                        DAEMON_ALIAS,
+                        "wal_checkpoint_pending",
+                        json!({
+                            "provider": root.provider,
+                            "store": root.label,
+                            "db": db,
+                            "wal_bytes_before": before,
+                            "dry_run": true,
+                        }),
+                    );
+                }
                 continue;
             }
             match checkpoint_wal(&db) {
                 Checkpoint::Done => {
+                    watch.pending.remove(&db);
                     let after = std::fs::metadata(&wal).ok().map(|m| m.len()).unwrap_or(0);
                     let _ = store.event_public(
                         DAEMON_ALIAS,
@@ -3067,13 +3170,23 @@ fn wal_pass(
                         }),
                     );
                 }
-                // Busy or failed: leave it for the next tick — a
-                // checkpoint is maintenance, never worth blocking or
-                // erroring over.
-                Checkpoint::Busy | Checkpoint::Failed => {}
+                Checkpoint::Deferred => {}
             }
         }
     }
+    if truncated {
+        if !watch.truncated_seen {
+            let _ = store.event_public(
+                DAEMON_ALIAS,
+                "wal_scan_truncated",
+                json!({"reason": "find_wals hit its cap — a runaway WAL may be unwatched"}),
+            );
+        }
+        watch.truncated_seen = true;
+    } else {
+        watch.truncated_seen = false;
+    }
+    let _ = store.prune_stream(DAEMON_ALIAS, DAEMON_EVENTS_KEEP);
 }
 
 fn ctl_finished(ctl: &AgentCtl) -> bool {
@@ -3673,6 +3786,19 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// `quiet_secs = 0` makes a just-written WAL "quiet" — tests then
+    /// exercise the checkpoint itself; the live daemon passes
+    /// `WAL_QUIET_SECS`.
+    fn pass(
+        roots: &[crate::doctor::host::WalRoot],
+        busy: &HashSet<String>,
+        max_bytes: u64,
+        shared: &Shared,
+        watch: &mut WalWatch,
+    ) {
+        wal_pass(roots, busy, max_bytes, 0, false, &shared.store, watch);
+    }
+
     /// Idle provider, WAL over the limit: PASSIVE+TRUNCATE frees the
     /// file and a `wal_checkpointed` event carries before/after bytes.
     #[test]
@@ -3688,7 +3814,8 @@ mod tests {
             label: "codex store",
             root,
         }];
-        wal_pass(&roots, &HashSet::new(), 1, &shared.store);
+        let mut watch = WalWatch::default();
+        pass(&roots, &HashSet::new(), 1, &shared, &mut watch);
         assert_eq!(wal_size(&db), 0, "TRUNCATE frees the wal");
         let events = shared.store.events_tail(DAEMON_ALIAS, 10).unwrap();
         let ev = events
@@ -3741,7 +3868,8 @@ mod tests {
             label: "codex store",
             root,
         }];
-        wal_pass(&roots, &busy, 1, &shared.store);
+        let mut watch = WalWatch::default();
+        pass(&roots, &busy, 1, &shared, &mut watch);
         assert_eq!(wal_size(&db), before, "busy provider is untouched");
         assert!(shared
             .store
@@ -3756,7 +3884,7 @@ mod tests {
             .unwrap();
         let busy = shared.store.busy_providers().unwrap();
         assert!(!busy.contains("codex"), "{busy:?}");
-        wal_pass(&roots, &busy, 1, &shared.store);
+        pass(&roots, &busy, 1, &shared, &mut watch);
         assert_eq!(wal_size(&db), 0);
     }
 
@@ -3780,7 +3908,8 @@ mod tests {
             label: "devin store",
             root,
         }];
-        wal_pass(&roots, &HashSet::new(), 1, &shared.store);
+        let mut watch = WalWatch::default();
+        pass(&roots, &HashSet::new(), 1, &shared, &mut watch);
         assert_eq!(wal_size(&db), before, "busy wal is left alone");
         assert!(shared
             .store
@@ -3791,7 +3920,7 @@ mod tests {
         // Reader finishes — the retry completes the checkpoint.
         reader.execute_batch("END").unwrap();
         drop(reader);
-        wal_pass(&roots, &HashSet::new(), 1, &shared.store);
+        pass(&roots, &HashSet::new(), 1, &shared, &mut watch);
         assert_eq!(wal_size(&db), 0);
     }
 
@@ -3808,12 +3937,211 @@ mod tests {
             label: "claude store",
             root,
         }];
-        wal_pass(&roots, &HashSet::new(), u64::MAX, &shared.store);
+        let mut watch = WalWatch::default();
+        pass(&roots, &HashSet::new(), u64::MAX, &shared, &mut watch);
         assert_eq!(wal_size(&db), before);
         assert!(shared
             .store
             .events_tail(DAEMON_ALIAS, 10)
             .unwrap()
             .is_empty());
+    }
+
+    /// A WAL written moments ago means a writer cadence cannot see is
+    /// live — the quiet-window defers, no matter what busy_providers
+    /// says.
+    #[test]
+    fn wal_pass_defers_to_quiet_window() {
+        let (dir, shared) = shared();
+        let root = dir.path().join("devin");
+        std::fs::create_dir_all(&root).unwrap();
+        let (db, _writer) = wal_db(&root, "sessions.db");
+        let before = wal_size(&db);
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "devin",
+            label: "devin store",
+            root,
+        }];
+        let mut watch = WalWatch::default();
+        // quiet_secs=60, wal mtime=now → deferred, untouched, no event.
+        wal_pass(
+            &roots,
+            &HashSet::new(),
+            1,
+            60,
+            false,
+            &shared.store,
+            &mut watch,
+        );
+        assert_eq!(wal_size(&db), before);
+        assert!(shared
+            .store
+            .events_tail(DAEMON_ALIAS, 10)
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != "wal_checkpointed"));
+    }
+
+    /// An orphan `foo.db-wal` must never create `foo.db` — the
+    /// checkpoint connection opens READ_WRITE without CREATE.
+    #[test]
+    fn wal_pass_never_creates_a_db() {
+        let (dir, shared) = shared();
+        let root = dir.path().join("codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("ghost.sqlite");
+        std::fs::write(root.join("ghost.sqlite-wal"), vec![0u8; 4096]).unwrap();
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "codex",
+            label: "codex store",
+            root,
+        }];
+        let mut watch = WalWatch::default();
+        pass(&roots, &HashSet::new(), 1, &shared, &mut watch);
+        assert!(!db.exists(), "orphan -wal must not conjure a db");
+    }
+
+    /// A `journal_mode=DELETE` db with a stale leftover `-wal`: sqlite's
+    /// open-time recovery sees the wal, prunes it, and the pragma
+    /// returns (0,0,0) — the file IS freed, so Done+event is honest.
+    /// (The (0,-1,-1) non-WAL result is only reachable if the wal
+    /// vanished between scan and open — the guard stays for that.)
+    #[test]
+    fn wal_pass_stale_wal_is_reclaimed() {
+        let (dir, shared) = shared();
+        let root = dir.path().join("devin");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("sessions.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(conn);
+        std::fs::write(root.join("sessions.db-wal"), vec![0u8; 8192]).unwrap();
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "devin",
+            label: "devin store",
+            root,
+        }];
+        let mut watch = WalWatch::default();
+        pass(&roots, &HashSet::new(), 1, &shared, &mut watch);
+        assert_eq!(wal_size(&db), 0, "stale wal is reclaimed");
+        let events = shared.store.events_tail(DAEMON_ALIAS, 10).unwrap();
+        let ev = events
+            .iter()
+            .find(|e| e.kind == "wal_checkpointed")
+            .expect("stale wal reclaim is a real freeing event");
+        assert_eq!(ev.payload["wal_bytes_before"], 8192);
+        assert_eq!(ev.payload["wal_bytes_after"], 0);
+    }
+
+    /// A symlinked WAL is never ours to write through — the guard
+    /// leaves it alone even when the target is a real hot WAL.
+    #[test]
+    fn wal_pass_skips_symlinked_wal() {
+        let (dir, shared) = shared();
+        let root = dir.path().join("codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let (db, _writer) = wal_db(&root, "state_1.sqlite");
+        let real_wal = crate::doctor::host::wal_sibling(&db).unwrap();
+        let staged = dir.path().join("real-wal-copy");
+        std::fs::rename(&real_wal, &staged).unwrap();
+        std::os::unix::fs::symlink(&staged, &real_wal).unwrap();
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "codex",
+            label: "codex store",
+            root,
+        }];
+        let mut watch = WalWatch::default();
+        pass(&roots, &HashSet::new(), 1, &shared, &mut watch);
+        assert!(
+            std::fs::symlink_metadata(&real_wal).unwrap().is_symlink(),
+            "symlink wal must be left in place"
+        );
+        assert!(shared
+            .store
+            .events_tail(DAEMON_ALIAS, 10)
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != "wal_checkpointed"));
+    }
+
+    /// `wal_dry_run` records `wal_checkpoint_pending` once per db per
+    /// crossing — a second pass over the same WAL does not re-emit.
+    #[test]
+    fn wal_pass_dry_run_events_once() {
+        let (dir, shared) = shared();
+        let root = dir.path().join("devin");
+        std::fs::create_dir_all(&root).unwrap();
+        let (db, _writer) = wal_db(&root, "sessions.db");
+        let before = wal_size(&db);
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "devin",
+            label: "devin store",
+            root,
+        }];
+        let mut watch = WalWatch::default();
+        wal_pass(
+            &roots,
+            &HashSet::new(),
+            1,
+            0,
+            true,
+            &shared.store,
+            &mut watch,
+        );
+        wal_pass(
+            &roots,
+            &HashSet::new(),
+            1,
+            0,
+            true,
+            &shared.store,
+            &mut watch,
+        );
+        assert_eq!(wal_size(&db), before, "dry run never writes");
+        let events = shared.store.events_tail(DAEMON_ALIAS, 10).unwrap();
+        let pending: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "wal_checkpoint_pending")
+            .collect();
+        assert_eq!(pending.len(), 1, "one pending event, not one per tick");
+        assert_eq!(pending[0].payload["wal_bytes_before"], before);
+        // Back under the limit clears the dedupe — a later crossing
+        // reports again.
+        checkpoint_wal(&db);
+        wal_pass(
+            &roots,
+            &HashSet::new(),
+            1,
+            0,
+            true,
+            &shared.store,
+            &mut watch,
+        );
+        let n: usize = shared
+            .store
+            .events_tail(DAEMON_ALIAS, 10)
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "wal_checkpoint_pending")
+            .count();
+        assert_eq!(n, 1, "still one — under the limit emitted nothing");
+    }
+
+    /// The daemon stream is bounded: more than DAEMON_EVENTS_KEEP
+    /// events leaves exactly `keep` newest rows.
+    #[test]
+    fn daemon_stream_is_pruned() {
+        let (_dir, shared) = shared();
+        for i in 0..5 {
+            let _ = shared
+                .store
+                .event_public(DAEMON_ALIAS, "wal_checkpointed", json!({"i": i}));
+        }
+        shared.store.prune_stream(DAEMON_ALIAS, 3).unwrap();
+        let events = shared.store.events_tail(DAEMON_ALIAS, 10).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events.last().unwrap().payload["i"], 4);
+        assert_eq!(events.first().unwrap().payload["i"], 2);
     }
 }
