@@ -3,8 +3,12 @@
 //! grew to 53 GB and filled the disk (OPS-4), ~2,850 open FIFOs that
 //! pushed the user past `fs.pipe-user-pages-soft` so every new pipe
 //! came out clamped to one page (CAD-61), test binaries from deleted
-//! worktrees still running days later, and temp state dirs leaking
-//! from test runs.
+//! worktrees still running days later, temp state dirs leaking
+//! from test runs, and memory commitment exhaustion — `Committed_AS`
+//! three times over `CommitLimit` made `fork()` fail with EAGAIN
+//! while every check was green (CAD-154); a per-family process census
+//! names the group that ate it (CAD-154) and the daemon checkpoints
+//! provider WALs itself while their provider idles (CAD-132).
 //!
 //! Every check reports `ok | warn | fail` with the measured value, the
 //! threshold it was compared against, and a `remedy` — the exact
@@ -113,6 +117,15 @@ pub struct HostOverrides {
     pub temp_min_age_secs: Option<u64>,
     pub temp_warn_count: Option<u64>,
     pub temp_warn_bytes: Option<u64>,
+    /// `MemAvailable` as a percent of `MemTotal` — warn/fail below.
+    pub mem_warn_pct: Option<f64>,
+    pub mem_fail_pct: Option<f64>,
+    /// `SwapFree` as a percent of `SwapTotal` — warn/fail below.
+    pub swap_warn_pct: Option<f64>,
+    pub swap_fail_pct: Option<f64>,
+    /// The daemon checkpoints a provider store's WAL past this size
+    /// (CAD-132); `doctor --host` keeps reporting it either way.
+    pub wal_max_bytes: Option<u64>,
 }
 
 /// Every threshold in one place; `pm.yaml [host]` overrides any subset.
@@ -130,6 +143,11 @@ pub struct Thresholds {
     pub temp_min_age_secs: u64,
     pub temp_warn_count: u64,
     pub temp_warn_bytes: u64,
+    pub mem_warn_pct: f64,
+    pub mem_fail_pct: f64,
+    pub swap_warn_pct: f64,
+    pub swap_fail_pct: f64,
+    pub wal_max_bytes: u64,
 }
 
 impl Default for Thresholds {
@@ -147,6 +165,11 @@ impl Default for Thresholds {
             temp_min_age_secs: 86_400,
             temp_warn_count: 5,
             temp_warn_bytes: 512 * MIB,
+            mem_warn_pct: 15.0,
+            mem_fail_pct: 5.0,
+            swap_warn_pct: 20.0,
+            swap_fail_pct: 5.0,
+            wal_max_bytes: GIB,
         }
     }
 }
@@ -191,6 +214,21 @@ impl Thresholds {
             if let Some(v) = o.temp_warn_bytes {
                 t.temp_warn_bytes = v;
             }
+            if let Some(v) = o.mem_warn_pct {
+                t.mem_warn_pct = v;
+            }
+            if let Some(v) = o.mem_fail_pct {
+                t.mem_fail_pct = v;
+            }
+            if let Some(v) = o.swap_warn_pct {
+                t.swap_warn_pct = v;
+            }
+            if let Some(v) = o.swap_fail_pct {
+                t.swap_fail_pct = v;
+            }
+            if let Some(v) = o.wal_max_bytes {
+                t.wal_max_bytes = v;
+            }
         }
         t
     }
@@ -230,7 +268,7 @@ impl Scan {
         let pm_dir = crate::issue::default_dir()
             .ok()
             .filter(|d| d.join("pm.yaml").is_file());
-        let thresholds = Thresholds::resolve(pm_dir.as_deref().and_then(host_overrides));
+        let thresholds = host_thresholds(pm_dir.as_deref());
         Scan {
             proc_root: PathBuf::from("/proc"),
             temp_dir: std::env::temp_dir(),
@@ -258,13 +296,21 @@ fn host_overrides(pm_dir: &Path) -> Option<HostOverrides> {
     serde_yaml::from_value(yaml.get("host")?.clone()).ok()
 }
 
-/// All six checks against `scan`; the report is one JSON object whose
+/// Resolved `[host]` thresholds — shared by `Scan::host` and the
+/// daemon's WAL watcher so both read one config table.
+pub(crate) fn host_thresholds(pm_dir: Option<&Path>) -> Thresholds {
+    Thresholds::resolve(pm_dir.and_then(host_overrides))
+}
+
+/// All eight checks against `scan`; the report is one JSON object whose
 /// `level` is the worst check level.
 pub fn run(scan: &Scan) -> Value {
     let checks = [
         check_disk(scan),
         check_provider_state(scan),
         check_pipes(scan),
+        check_memory(scan),
+        check_processes(scan),
         check_orphans(scan),
         check_temp_dirs(scan),
         check_worktrees(scan),
@@ -653,7 +699,7 @@ fn store_level(store: u64, wal: Option<u64>, t: &Thresholds) -> Level {
 /// One sqlite store (file + `-wal` sibling), absent both = skipped.
 fn sqlite_store(label: &'static str, db: &Path, t: &Thresholds) -> Option<StoreMeasure> {
     let store = file_size(db);
-    let wal = file_size(&db.with_file_name(format!("{}-wal", db.file_name()?.to_string_lossy())));
+    let wal = wal_sibling(db).and_then(|w| file_size(&w));
     if store.is_none() && wal.is_none() {
         return None;
     }
@@ -918,6 +964,508 @@ fn check_pipes(scan: &Scan) -> Check {
         "vanished": stats.vanished,
     });
     check(name, level, value, threshold, detail, remedy)
+}
+
+// ---------- memory commitment + process census (linux) ----------
+
+/// `/proc/meminfo`, the fields the watchdog needs. `Option` fields
+/// distinguish "absent" from a real zero — a kernel too old for
+/// `MemAvailable` must not read as "0 bytes free".
+#[derive(Default)]
+struct MemInfo {
+    total: u64,
+    available: Option<u64>,
+    swap_total: Option<u64>,
+    swap_free: Option<u64>,
+    committed: Option<u64>,
+    commit_limit: Option<u64>,
+}
+
+/// Parse `Key: NNN kB` lines from `proc_root/meminfo`. `None` when the
+/// file is unreadable or `MemTotal` is missing.
+fn read_meminfo(proc_root: &Path) -> Option<MemInfo> {
+    let text = std::fs::read_to_string(proc_root.join("meminfo")).ok()?;
+    let mut m = MemInfo::default();
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(kb) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let bytes = kb.saturating_mul(1024);
+        match key.trim() {
+            "MemTotal" => m.total = bytes,
+            "MemAvailable" => m.available = Some(bytes),
+            "SwapTotal" => m.swap_total = Some(bytes),
+            "SwapFree" => m.swap_free = Some(bytes),
+            "Committed_AS" => m.committed = Some(bytes),
+            "CommitLimit" => m.commit_limit = Some(bytes),
+            _ => {}
+        }
+    }
+    (m.total > 0).then_some(m)
+}
+
+/// `/proc/<pid>/stat`: (comm, utime+stime jiffies, starttime jiffies,
+/// rss bytes). `comm` is the kernel name — the census groups on it;
+/// fields after the last `)` are positional and safe.
+fn proc_stat(pid_dir: &Path) -> Option<(String, u64, u64, u64)> {
+    let text = std::fs::read_to_string(pid_dir.join("stat")).ok()?;
+    let (head, rest) = text.rsplit_once(')')?;
+    let comm = head.split_once('(')?.1.trim().to_string();
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = f.get(11)?.parse().ok()?;
+    let stime: u64 = f.get(12)?.parse().ok()?;
+    let start_jiffies: u64 = f.get(19)?.parse().ok()?;
+    let rss_pages: i64 = f.get(21)?.parse().ok()?;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+    let rss = if rss_pages > 0 {
+        (rss_pages as u64).saturating_mul(page)
+    } else {
+        0
+    };
+    Some((comm, utime.saturating_add(stime), start_jiffies, rss))
+}
+
+/// Coalesce comm variants into the family an operator thinks in —
+/// `chrome`, `chrome_crashpad` and `chrome-sandbox` are one group.
+fn comm_family(comm: &str) -> String {
+    let c = comm.trim_end_matches("(deleted)").trim().to_lowercase();
+    for family in [
+        "chrome",
+        "chromium",
+        "firefox",
+        "node",
+        "deno",
+        "cargo",
+        "rustc",
+        "rust-analyzer",
+        "claude",
+        "devin",
+        "codex",
+        "cadence",
+        "python",
+        "tmux",
+        "postgres",
+        "redis",
+    ] {
+        if c.starts_with(family) {
+            return family.to_string();
+        }
+    }
+    c
+}
+
+/// The oldest process seen in a group, for the census line.
+#[derive(Clone)]
+struct OldestProc {
+    pid: u32,
+    age_secs: u64,
+    cpu_secs: u64,
+    idle: bool,
+}
+
+#[derive(Default)]
+struct GroupAgg {
+    count: u64,
+    rss_bytes: u64,
+    uids: BTreeSet<u32>,
+    /// Oldest process overall.
+    oldest: Option<OldestProc>,
+    /// Oldest *idle* process — long-lived at near-zero CPU is the
+    /// leaked-session shape CAD-154 watches for.
+    oldest_idle: Option<OldestProc>,
+}
+
+/// One pass over `proc_root` grouping every readable pid by comm
+/// family — all users, not just ours: the leaked sessions that
+/// starved this host were root's.
+#[derive(Default)]
+struct Census {
+    groups: BTreeMap<String, GroupAgg>,
+    procs: u64,
+    unreadable: u64,
+    vanished: u64,
+}
+
+fn proc_census(scan: &Scan) -> Census {
+    let mut census = Census::default();
+    let uptime = proc_uptime(&scan.proc_root);
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    let Ok(pids) = std::fs::read_dir(&scan.proc_root) else {
+        return census;
+    };
+    for ent in pids.flatten() {
+        let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(meta) = ent.metadata() else {
+            census.vanished += 1;
+            continue;
+        };
+        let Some((comm, cpu_jiffies, start_jiffies, rss)) = proc_stat(&ent.path()) else {
+            // A pid that vanished mid-scan is normal; an unreadable
+            // stat is hidepid or a race — counted either way.
+            if ent.path().exists() {
+                census.unreadable += 1;
+            } else {
+                census.vanished += 1;
+            }
+            continue;
+        };
+        let age = uptime.map(|u| (u as u64).saturating_sub(start_jiffies / hz));
+        let cpu_secs = cpu_jiffies / hz;
+        // "Idle": alive over an hour at under ~1% duty — the leaked
+        // browser sessions of CAD-154 burned nothing for days.
+        let idle =
+            age.is_some_and(|a| a >= 3_600) && cpu_secs.saturating_mul(100) <= age.unwrap_or(0);
+        let group = census.groups.entry(comm_family(&comm)).or_default();
+        group.count += 1;
+        group.rss_bytes += rss;
+        group.uids.insert(meta.uid());
+        census.procs += 1;
+        if let Some(age_secs) = age {
+            let proc = OldestProc {
+                pid,
+                age_secs,
+                cpu_secs,
+                idle,
+            };
+            if group.oldest.as_ref().is_none_or(|o| age_secs > o.age_secs) {
+                group.oldest = Some(proc.clone());
+            }
+            if idle
+                && group
+                    .oldest_idle
+                    .as_ref()
+                    .is_none_or(|o| age_secs > o.age_secs)
+            {
+                group.oldest_idle = Some(proc);
+            }
+        }
+    }
+    census
+}
+
+/// Top `n` groups by resident bytes — the remedy names these.
+fn top_groups(census: &Census, n: usize) -> Vec<(&String, &GroupAgg)> {
+    let mut groups: Vec<(&String, &GroupAgg)> = census.groups.iter().collect();
+    groups.sort_by_key(|(_, g)| std::cmp::Reverse(g.rss_bytes));
+    groups.truncate(n);
+    groups
+}
+
+/// `"chrome ×28 12.4 GiB (oldest 50h idle)"` — one group's census line.
+fn group_line(name: &str, g: &GroupAgg) -> String {
+    let mut out = format!("{name} ×{} {}", g.count, human(g.rss_bytes));
+    // The idle oldest tells the leak story when there is one.
+    let oldest = g.oldest_idle.as_ref().or(g.oldest.as_ref());
+    if let Some(o) = oldest {
+        out.push_str(&format!(
+            " (oldest {}h, pid {}{}{})",
+            o.age_secs / 3600,
+            o.pid,
+            if o.idle { ", idle" } else { "" },
+            if g.uids.len() == 1 && g.uids.contains(&0) {
+                ", as root"
+            } else {
+                ""
+            }
+        ));
+    }
+    out
+}
+
+/// Memory pressure: `MemAvailable` and `SwapFree` against their
+/// thresholds, `Committed_AS` against `CommitLimit` with the
+/// overcommit mode named. Commitment over the limit is the CAD-154
+/// failure — `fork()`/`malloc` refusal reads as EAGAIN, not ENOMEM.
+fn check_memory(scan: &Scan) -> Check {
+    let name = "memory";
+    let t = &scan.thresholds;
+    let threshold = json!(format!(
+        "warn: available <{}% RAM or swap free <{}%; fail: available <{}% \
+         or swap free <{}%; committed > limit refuses allocations under \
+         enforcing overcommit",
+        t.mem_warn_pct, t.swap_warn_pct, t.mem_fail_pct, t.swap_fail_pct
+    ));
+    if !scan.linux {
+        return check(
+            name,
+            Level::Ok,
+            json!({"skipped": true}),
+            threshold,
+            "memory pressure is linux-only".to_string(),
+            String::new(),
+        );
+    }
+    let Some(mem) = read_meminfo(&scan.proc_root) else {
+        return check(
+            name,
+            Level::Ok,
+            json!({"skipped": true}),
+            threshold,
+            "no readable meminfo".to_string(),
+            String::new(),
+        );
+    };
+    let overcommit = read_u64_file(&scan.proc_root.join("sys/vm/overcommit_memory"));
+    let mut level = Level::Ok;
+
+    let mut parts = Vec::new();
+    if let Some(avail) = mem.available {
+        let pct = avail as f64 * 100.0 / mem.total as f64;
+        let leg = if pct < t.mem_fail_pct {
+            Level::Fail
+        } else if pct < t.mem_warn_pct {
+            Level::Warn
+        } else {
+            Level::Ok
+        };
+        level = level.max(leg);
+        parts.push(format!(
+            "available {} ({pct:.0}% of {})",
+            human(avail),
+            human(mem.total)
+        ));
+    } else {
+        parts.push("MemAvailable absent".to_string());
+    }
+    match (mem.swap_total, mem.swap_free) {
+        (Some(total), Some(free)) if total > 0 => {
+            let pct = free as f64 * 100.0 / total as f64;
+            let leg = if pct < t.swap_fail_pct {
+                Level::Fail
+            } else if pct < t.swap_warn_pct {
+                Level::Warn
+            } else {
+                Level::Ok
+            };
+            level = level.max(leg);
+            parts.push(format!(
+                "swap free {} ({pct:.0}% of {})",
+                human(free),
+                human(total)
+            ));
+        }
+        (Some(0), _) | (None, _) => parts.push("no swap".to_string()),
+        _ => {}
+    }
+    // Commitment over CommitLimit means the kernel may refuse fork/
+    // malloc — the CAD-154 EAGAIN. Mode 1 (always overcommit) never
+    // enforces the limit, so the overshoot is reported but not
+    // alarmed; mode 0 refused in practice, mode 2 refuses by design.
+    let mut commit_over = false;
+    if let (Some(committed), Some(limit)) = (mem.committed, mem.commit_limit) {
+        commit_over = committed > limit;
+        let mode = match overcommit {
+            Some(0) => "heuristic",
+            Some(1) => "always",
+            Some(2) => "strict",
+            Some(_) | None => "unknown",
+        };
+        parts.push(format!(
+            "committed {} vs limit {} (overcommit_memory={mode})",
+            human(committed),
+            human(limit),
+        ));
+        if commit_over && overcommit != Some(1) {
+            // An unreadable sysctl cannot prove the kernel won't
+            // refuse — warn rather than fail.
+            level = level.max(if overcommit.is_none() {
+                Level::Warn
+            } else {
+                Level::Fail
+            });
+        }
+    }
+    let mut detail = parts.join("; ");
+    if commit_over {
+        detail.push_str(" — fork()/malloc headroom exhausted");
+    }
+    // The remedy names the biggest process groups — counts, ages,
+    // resident bytes — and never kills anything itself.
+    let remedy = if level > Level::Ok {
+        let census = proc_census(scan);
+        let groups = top_groups(&census, 3);
+        if groups.is_empty() {
+            "inspect `ps aux --sort=-rss | head` — cadence never kills".to_string()
+        } else {
+            format!(
+                "largest groups: {}; restart or close the offenders — cadence never kills",
+                groups
+                    .iter()
+                    .map(|(name, g)| group_line(name, g))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        }
+    } else {
+        String::new()
+    };
+    let value = json!({
+        "mem_total_bytes": mem.total,
+        "mem_available_bytes": mem.available,
+        "swap_total_bytes": mem.swap_total,
+        "swap_free_bytes": mem.swap_free,
+        "committed_bytes": mem.committed,
+        "commit_limit_bytes": mem.commit_limit,
+        "committed_over_limit": commit_over,
+        "overcommit_memory": overcommit,
+    });
+    check(name, level, value, threshold, detail, remedy)
+}
+
+/// The process-group census — informational: per-family counts, total
+/// resident bytes and the oldest idle instance, so a leaked session
+/// is visible before it starves the host. Never alarms; `memory`
+/// carries the thresholds.
+fn check_processes(scan: &Scan) -> Check {
+    let name = "processes";
+    let threshold = json!("informational — no threshold");
+    if !scan.linux {
+        return check(
+            name,
+            Level::Ok,
+            json!({"skipped": true}),
+            threshold,
+            "process census is linux-only".to_string(),
+            String::new(),
+        );
+    }
+    let census = proc_census(scan);
+    let top = top_groups(&census, 5);
+    let mut detail = format!("{} procs", census.procs);
+    if !top.is_empty() {
+        detail.push_str(&format!(
+            ": {}",
+            top.iter()
+                .map(|(name, g)| group_line(name, g))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    if census.unreadable + census.vanished > 0 {
+        detail.push_str(&format!(
+            "; {} unreadable, {} vanished mid-scan",
+            census.unreadable, census.vanished
+        ));
+    }
+    let groups: Vec<Value> = census
+        .groups
+        .iter()
+        .map(|(name, g)| {
+            json!({
+                "group": name,
+                "count": g.count,
+                "rss_bytes": g.rss_bytes,
+                "uids": g.uids,
+                "oldest": g.oldest.as_ref().map(|o| json!({
+                    "pid": o.pid,
+                    "age_secs": o.age_secs,
+                    "cpu_secs": o.cpu_secs,
+                    "idle": o.idle,
+                })),
+                "oldest_idle": g.oldest_idle.as_ref().map(|o| json!({
+                    "pid": o.pid,
+                    "age_secs": o.age_secs,
+                    "cpu_secs": o.cpu_secs,
+                })),
+            })
+        })
+        .collect();
+    let value = json!({
+        "procs": census.procs,
+        "groups": groups,
+        "unreadable": census.unreadable,
+        "vanished": census.vanished,
+    });
+    check(name, Level::Ok, value, threshold, detail, String::new())
+}
+
+// ---------- provider WAL roots (shared with the daemon watcher) ----------
+
+/// One provider's sqlite watch root: `*-wal` files anywhere under it
+/// are checkpoint candidates. The daemon watches these; the provider
+/// name is what the "no live turn" gate checks.
+pub(crate) struct WalRoot {
+    pub provider: &'static str,
+    pub label: &'static str,
+    pub root: PathBuf,
+}
+
+/// The roots the daemon's WAL watcher scans — the same provider
+/// stores `provider-state` reports on (devin `sessions.db`, the codex
+/// dir's `*.sqlite`, claude projects' nested dbs).
+pub(crate) fn wal_roots(home: &Path, data_home: &Path) -> Vec<WalRoot> {
+    vec![
+        WalRoot {
+            provider: "devin",
+            label: "devin sessions.db",
+            root: data_home.join("devin/cli"),
+        },
+        WalRoot {
+            provider: "codex",
+            label: "codex sessions",
+            root: home.join(".codex"),
+        },
+        WalRoot {
+            provider: "claude",
+            label: "claude projects",
+            root: home.join(".claude/projects"),
+        },
+    ]
+}
+
+/// The `<db>-wal` sibling cadence and sqlite both write next to the
+/// main file.
+pub(crate) fn wal_sibling(db: &Path) -> Option<PathBuf> {
+    Some(db.with_file_name(format!("{}-wal", db.file_name()?.to_string_lossy())))
+}
+
+/// `*.db`/`*.sqlite`/`*.sqlite3` WAL siblings under `root`, returning
+/// the DB paths (a `*-wal` file's presence means the store is in WAL
+/// mode already). Depth- and entry-capped — a giant store walk must
+/// not stall the daemon's tick.
+pub(crate) fn find_wals(root: &Path) -> Vec<PathBuf> {
+    const MAX_DEPTH: u8 = 4;
+    const MAX_ENTRIES: usize = 1_024;
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0_u8)];
+    let mut visited = 0_usize;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for ent in entries.flatten() {
+            if visited >= MAX_ENTRIES {
+                return out;
+            }
+            visited += 1;
+            let Ok(meta) = ent.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                if depth < MAX_DEPTH {
+                    stack.push((ent.path(), depth + 1));
+                }
+                continue;
+            }
+            let name = ent.file_name().to_string_lossy().to_string();
+            let Some(stem) = name.strip_suffix("-wal") else {
+                continue;
+            };
+            if stem.ends_with(".db") || stem.ends_with(".sqlite") || stem.ends_with(".sqlite3") {
+                out.push(dir.join(stem));
+            }
+        }
+    }
+    out
 }
 
 // ---------- orphaned work ----------
@@ -2281,6 +2829,325 @@ mod tests {
         assert_eq!(stores.len(), 2); // absent stores skipped
     }
 
+    // ---------- memory + census ----------
+
+    /// Write a fabricated `/proc/meminfo` (values in kB, like the real
+    /// file) plus the overcommit sysctl.
+    fn write_meminfo(scan: &Scan, meminfo: &str, overcommit: Option<u64>) {
+        std::fs::write(scan.proc_root.join("meminfo"), meminfo).unwrap();
+        if let Some(mode) = overcommit {
+            std::fs::create_dir_all(scan.proc_root.join("sys/vm")).unwrap();
+            std::fs::write(
+                scan.proc_root.join("sys/vm/overcommit_memory"),
+                format!("{mode}\n"),
+            )
+            .unwrap();
+        } else {
+            let _ = std::fs::remove_file(scan.proc_root.join("sys/vm/overcommit_memory"));
+        }
+    }
+
+    /// proc/<pid>/stat with a real comm, cpu jiffies and rss pages —
+    /// the census's whole input. Age comes from the shared 1e6s uptime.
+    fn add_proc(
+        proc: &Path,
+        pid: u32,
+        comm: &str,
+        age_secs: u64,
+        cpu_secs: u64,
+        rss_pages: u64,
+    ) -> PathBuf {
+        let dir = proc.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        let starttime = (1_000_000_u64.saturating_sub(age_secs)) * hz;
+        // Post-comm fields, positions 3..: state S, fields 4-13 zero,
+        // utime(14)/stime(15) carry the cpu, fields 16-21 filler,
+        // starttime(22), vsize(23)=0, rss(24).
+        std::fs::write(
+            dir.join("stat"),
+            format!(
+                "{pid} ({comm}) S 0 0 0 0 0 0 0 0 0 0 {utime} {stime} 0 0 0 1 0 0 {starttime} 0 {rss_pages}",
+                utime = cpu_secs * hz,
+                stime = 0,
+            ),
+        )
+        .unwrap();
+        std::fs::write(proc.join("uptime"), "1000000.00 0.00\n").unwrap();
+        dir
+    }
+
+    /// The measured CAD-154 incident: 3.6 GiB available of ~32 GiB,
+    /// 208 MiB of 20 GiB swap free, Committed_AS ~99.9 GiB against a
+    /// ~35.4 GiB CommitLimit with heuristic overcommit — fork() was
+    /// already returning EAGAIN while every check was green.
+    #[test]
+    fn memory_incident_numbers_fail() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        write_meminfo(
+            &scan,
+            "MemTotal:       33554432 kB\n\
+             MemAvailable:    3774873 kB\n\
+             SwapTotal:      20971520 kB\n\
+             SwapFree:         212992 kB\n\
+             Committed_AS:  104752742 kB\n\
+             CommitLimit:    37119590 kB\n",
+            Some(0),
+        );
+        let c = check_memory(&scan);
+        assert_eq!(c.level, Level::Fail, "{}", c.detail);
+        assert!(
+            c.detail.contains("overcommit_memory=heuristic"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("fork()"), "{}", c.detail);
+        assert!(c.value["committed_over_limit"].as_bool().unwrap());
+        // ~11% available is under the 15% warn; ~1% swap is under the
+        // 5% fail — both legs plus the commit leg all fire.
+        assert!(c.remedy.contains("cadence never kills"), "{}", c.remedy);
+    }
+
+    #[test]
+    fn memory_threshold_edges() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let kb = |gib: u64| gib * 1024 * 1024;
+        // Exactly at warn (15%) with swap comfy → ok.
+        write_meminfo(
+            &scan,
+            &format!(
+                "MemTotal: {t} kB\nMemAvailable: {} kB\nSwapTotal: {s} kB\nSwapFree: {} kB\n",
+                kb(15) + kb(15) / 100 + 1024,
+                kb(10),
+                t = kb(100),
+                s = kb(20)
+            ),
+            Some(0),
+        );
+        let c = check_memory(&scan);
+        assert_eq!(c.level, Level::Ok, "{}", c.detail);
+        // 14% available → warn; no commit fields → commit leg silent.
+        write_meminfo(
+            &scan,
+            &format!(
+                "MemTotal: {} kB\nMemAvailable: {} kB\nSwapTotal: {} kB\nSwapFree: {} kB\n",
+                kb(100),
+                kb(14),
+                kb(20),
+                kb(10)
+            ),
+            Some(0),
+        );
+        assert_eq!(check_memory(&scan).level, Level::Warn);
+        // 4% available → fail.
+        write_meminfo(
+            &scan,
+            &format!(
+                "MemTotal: {} kB\nMemAvailable: {} kB\nSwapTotal: {} kB\nSwapFree: {} kB\n",
+                kb(100),
+                kb(4),
+                kb(20),
+                kb(10)
+            ),
+            Some(0),
+        );
+        assert_eq!(check_memory(&scan).level, Level::Fail);
+        // Swap free 15% (<20 warn) → warn; 4% → fail.
+        write_meminfo(
+            &scan,
+            &format!(
+                "MemTotal: {} kB\nMemAvailable: {} kB\nSwapTotal: {} kB\nSwapFree: {} kB\n",
+                kb(100),
+                kb(90),
+                kb(20),
+                kb(3)
+            ),
+            Some(0),
+        );
+        assert_eq!(check_memory(&scan).level, Level::Warn);
+        write_meminfo(
+            &scan,
+            &format!(
+                "MemTotal: {} kB\nMemAvailable: {} kB\nSwapTotal: {} kB\nSwapFree: {} kB\n",
+                kb(100),
+                kb(90),
+                kb(20),
+                kb(20) / 25
+            ),
+            Some(0),
+        );
+        assert_eq!(check_memory(&scan).level, Level::Fail);
+    }
+
+    #[test]
+    fn memory_commit_leg_modes() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        // Comfy memory, commitment over the limit — the mode decides.
+        let base = "MemTotal: 104857600 kB\nMemAvailable: 83886080 kB\n\
+                    SwapTotal: 20971520 kB\nSwapFree: 20971520 kB\n\
+                    Committed_AS: 60000000 kB\nCommitLimit: 40000000 kB\n";
+        // overcommit_memory=1 (always): over-limit is benign — no fail.
+        write_meminfo(&scan, base, Some(1));
+        let c = check_memory(&scan);
+        assert_eq!(c.level, Level::Ok, "{}", c.detail);
+        assert!(c.detail.contains("overcommit_memory=always"));
+        // overcommit_memory=2 (strict): refusing allocations now.
+        write_meminfo(&scan, base, Some(2));
+        assert_eq!(check_memory(&scan).level, Level::Fail);
+        // overcommit_memory=0 (heuristic): refused in practice (EAGAIN).
+        write_meminfo(&scan, base, Some(0));
+        assert_eq!(check_memory(&scan).level, Level::Fail);
+        // Sysctl unreadable: cannot prove enforcement — warn, not fail.
+        write_meminfo(&scan, base, None);
+        let c = check_memory(&scan);
+        assert_eq!(c.level, Level::Warn, "{}", c.detail);
+        assert!(c.detail.contains("overcommit_memory=unknown"));
+        // Under the limit: quiet regardless of mode.
+        write_meminfo(
+            &scan,
+            "MemTotal: 104857600 kB\nMemAvailable: 83886080 kB\n\
+             SwapTotal: 20971520 kB\nSwapFree: 20971520 kB\n\
+             Committed_AS: 10000000 kB\nCommitLimit: 40000000 kB\n",
+            Some(2),
+        );
+        assert_eq!(check_memory(&scan).level, Level::Ok);
+    }
+
+    #[test]
+    fn memory_no_swap_and_missing_meminfo() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        // No meminfo at all → skipped, not a false fail.
+        let c = check_memory(&scan);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.value["skipped"].as_bool().unwrap());
+        // A host with no swap: the leg reports "no swap", no fail.
+        write_meminfo(
+            &scan,
+            "MemTotal: 104857600 kB\nMemAvailable: 83886080 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
+            Some(0),
+        );
+        let c = check_memory(&scan);
+        assert_eq!(c.level, Level::Ok, "{}", c.detail);
+        assert!(c.detail.contains("no swap"), "{}", c.detail);
+        // Off-linux the whole check skips.
+        let mut scan = fake_scan(&root);
+        scan.linux = false;
+        assert!(check_memory(&scan).value["skipped"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn memory_remedy_names_biggest_groups() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        write_meminfo(
+            &scan,
+            "MemTotal: 33554432 kB\nMemAvailable: 1572864 kB\n",
+            Some(0),
+        );
+        // Leaked browser tree: 3 chrome pids, 50h old, ~0 cpu.
+        for pid in [11, 12, 13] {
+            add_proc(&scan.proc_root, pid, "chrome", 180_000, 0, 200_000);
+        }
+        add_proc(&scan.proc_root, 20, "node", 60, 30, 10_000);
+        let c = check_memory(&scan);
+        assert_eq!(c.level, Level::Fail);
+        assert!(c.remedy.contains("chrome ×3"), "{}", c.remedy);
+        assert!(c.remedy.contains("oldest 50h"), "{}", c.remedy);
+        assert!(c.remedy.contains("idle"), "{}", c.remedy);
+        // Remedies name offenders; cadence never kills.
+        assert!(c.remedy.contains("cadence never kills"), "{}", c.remedy);
+    }
+
+    #[test]
+    fn census_groups_and_oldest_idle() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        // Leaked tree: root-owned old chrome at ~zero cpu, plus a busy
+        // node and a young claude.
+        let euid = unsafe { libc::geteuid() };
+        for (pid, comm) in [(11, "chrome"), (12, "chrome_crashpad"), (13, "chrome")] {
+            add_proc(&scan.proc_root, pid, comm, 180_000, 0, 100_000);
+        }
+        add_proc(&scan.proc_root, 20, "node", 120, 90, 50_000);
+        add_proc(&scan.proc_root, 30, "claude", 30, 5, 20_000);
+        let census = proc_census(&scan);
+        assert_eq!(census.procs, 5);
+        let chrome = &census.groups["chrome"];
+        assert_eq!(chrome.count, 3);
+        assert!(chrome.uids.contains(&euid));
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        assert_eq!(chrome.rss_bytes, 3 * 100_000 * page);
+        let oldest = chrome.oldest_idle.as_ref().unwrap();
+        assert_eq!(oldest.age_secs, 180_000);
+        assert!(oldest.idle);
+        // node burned 90 cpu-seconds in 120 — busy, not idle.
+        assert!(census.groups["node"].oldest_idle.is_none());
+        assert_eq!(census.groups["node"].oldest.as_ref().unwrap().age_secs, 120);
+        let c = check_processes(&scan);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.detail.contains("chrome ×3"), "{}", c.detail);
+        assert!(c.detail.contains("50h"), "{}", c.detail);
+    }
+
+    #[test]
+    fn census_family_normalization() {
+        assert_eq!(comm_family("chrome_crashpad"), "chrome");
+        assert_eq!(comm_family("Chrome"), "chrome");
+        assert_eq!(comm_family("node"), "node");
+        assert_eq!(comm_family("rust-analyzer"), "rust-analyzer");
+        assert_eq!(comm_family("weird-daemon"), "weird-daemon");
+    }
+
+    #[test]
+    fn census_skipped_off_linux() {
+        let root = TempDir::new().unwrap();
+        let mut scan = fake_scan(&root);
+        scan.linux = false;
+        let c = check_processes(&scan);
+        assert!(c.value["skipped"].as_bool().unwrap());
+    }
+
+    // ---------- WAL roots ----------
+
+    #[test]
+    fn find_wals_walks_provider_roots() {
+        let root = TempDir::new().unwrap();
+        let codex = root.path().join("codex");
+        // devin's store, a codex *.sqlite, a nested claude db.
+        let devin_cli = root.path().join("devin/cli");
+        std::fs::create_dir_all(&devin_cli).unwrap();
+        std::fs::write(devin_cli.join("sessions.db-wal"), "x").unwrap();
+        real_bytes(&codex.join("state_1.sqlite-wal"), 8);
+        real_bytes(&codex.join("queue_1.db-wal"), 8);
+        real_bytes(&root.path().join("claude/proj/sub/sess.sqlite3-wal"), 8);
+        // Not a sqlite store — ignored.
+        real_bytes(&codex.join("notes.txt-wal"), 8);
+        let found = find_wals(root.path());
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"sessions.db".to_string()), "{names:?}");
+        assert!(names.contains(&"state_1.sqlite".to_string()), "{names:?}");
+        assert!(names.contains(&"queue_1.db".to_string()), "{names:?}");
+        assert!(names.contains(&"sess.sqlite3".to_string()), "{names:?}");
+        assert_eq!(found.len(), 4, "{names:?}");
+    }
+
+    #[test]
+    fn wal_roots_cover_the_three_providers() {
+        let roots = wal_roots(Path::new("/home/u"), Path::new("/data"));
+        let providers: Vec<&str> = roots.iter().map(|r| r.provider).collect();
+        assert_eq!(providers, ["devin", "codex", "claude"]);
+        assert!(roots[0].root.ends_with("devin/cli"));
+        assert!(roots[1].root.ends_with(".codex"));
+        assert!(roots[2].root.ends_with(".claude/projects"));
+    }
+
     // ---------- pipes ----------
 
     #[test]
@@ -3359,7 +4226,7 @@ mod tests {
     }
 
     #[test]
-    fn run_emits_all_six_checks() {
+    fn run_emits_all_checks() {
         let root = TempDir::new().unwrap();
         let mut scan = fake_scan(&root);
         scan.pm_dir = None; // nothing anywhere — cleanest possible host
@@ -3376,6 +4243,8 @@ mod tests {
                 "disk",
                 "provider-state",
                 "pipes",
+                "memory",
+                "processes",
                 "orphans",
                 "temp-dirs",
                 "worktrees"
@@ -3397,17 +4266,22 @@ mod tests {
         assert!(host_overrides(&pm).is_none());
         std::fs::write(
             pm.join("pm.yaml"),
-            "schema: 1\nhost:\n  wal_fail_bytes: 5\n  temp_warn_count: 2\n",
+            "schema: 1\nhost:\n  wal_fail_bytes: 5\n  temp_warn_count: 2\n  mem_warn_pct: 25\n  wal_max_bytes: 4096\n",
         )
         .unwrap();
         let o = host_overrides(&pm).unwrap();
         assert_eq!(o.wal_fail_bytes, Some(5));
         assert_eq!(o.temp_warn_count, Some(2));
+        assert_eq!(o.mem_warn_pct, Some(25.0));
+        assert_eq!(o.wal_max_bytes, Some(4096));
         let t = Thresholds::resolve(Some(o));
         assert_eq!(t.wal_fail_bytes, 5);
         assert_eq!(t.temp_warn_count, 2);
+        assert_eq!(t.mem_warn_pct, 25.0);
+        assert_eq!(t.wal_max_bytes, 4096);
         assert_eq!(t.disk_warn_pct, 15.0); // untouched keys keep defaults
-                                           // A pm.yaml without the table is fine too.
+        assert_eq!(t.mem_fail_pct, 5.0);
+        // A pm.yaml without the table is fine too.
         std::fs::write(pm.join("pm.yaml"), "schema: 1\n").unwrap();
         assert!(host_overrides(&pm).is_none());
     }

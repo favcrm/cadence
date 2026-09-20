@@ -70,6 +70,13 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 /// Stall watch cadence — `silent_secs` stays live without a store read
 /// per agent becoming pressure.
 const STALL_TICK: Duration = Duration::from_secs(2);
+/// Provider WAL watch cadence — at the ~2 MiB/s a runaway devin WAL
+/// wrote, a one-minute tick bounds overshoot past `wal_max_bytes` to
+/// ~128 MiB.
+const WAL_TICK: Duration = Duration::from_secs(60);
+/// The daemon's own event stream — `wal_checkpointed` lands here.
+/// Readable via `cadence events daemon`; not a sendable alias.
+const DAEMON_ALIAS: &str = Store::DAEMON_STREAM;
 /// `stall_secs` when neither the job nor the agent sets one.
 const DEFAULT_STALL_SECS: u64 = 1800;
 /// PTY screens are sampled at most this often while a turn runs — the
@@ -1240,7 +1247,14 @@ impl Shared {
     }
 
     fn rpc_events(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let raw = required_str(params, "alias")?;
+        // The daemon stream has no agents row — read-only, so a plain
+        // match suffices; every other RPC keeps resolving to an agent.
+        let alias = if raw == DAEMON_ALIAS {
+            raw.to_string()
+        } else {
+            self.resolve_alias(raw)?
+        };
         let after = optional_i64(params, "after").unwrap_or(0);
         if after < 0 {
             return Err(Error::rejected("Event cursor must be nonnegative"));
@@ -2552,6 +2566,40 @@ impl Shared {
         }
     }
 
+    /// CAD-132: a provider WAL once grew 0 → 30 GiB in four hours and
+    /// twice took the disk under 4 GiB. The daemon now checkpoints
+    /// known provider stores itself — PASSIVE then TRUNCATE — whenever
+    /// the WAL passes `[host] wal_max_bytes` AND the owning provider
+    /// has no live turn. A busy TRUNCATE is simply retried next tick;
+    /// a store mid-turn is never touched.
+    fn run_wal_watch(self: &Arc<Self>) {
+        while !self.closing.load(Ordering::SeqCst) {
+            self.wal_tick();
+            std::thread::sleep(WAL_TICK);
+        }
+    }
+
+    /// One pass: threshold re-read each tick so a `pm.yaml` edit
+    /// applies without a restart; the busy-provider set comes from
+    /// the live store.
+    fn wal_tick(&self) {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        let roots = crate::doctor::host::wal_roots(&home, &data_home);
+        let pm_dir = crate::issue::default_dir()
+            .ok()
+            .filter(|d| d.join("pm.yaml").is_file());
+        let max = crate::doctor::host::host_thresholds(pm_dir.as_deref()).wal_max_bytes;
+        let Ok(busy) = self.store.busy_providers() else {
+            return;
+        };
+        wal_pass(&roots, &busy, max, &self.store);
+    }
+
     /// One watch pass: refresh every owned agent's activity evidence,
     /// then compare its silence against the resolved budget.
     fn stall_tick(&self) {
@@ -2945,6 +2993,89 @@ impl Shared {
     }
 }
 
+// ---------- provider WAL auto-checkpoint (CAD-132) ----------
+
+/// What a TRUNCATE attempt learned.
+enum Checkpoint {
+    /// The WAL checkpointed and truncated — record the event.
+    Done,
+    /// A reader or writer held the WAL — try again next tick.
+    Busy,
+    /// Open or pragma failed (locked, missing, not a db) — same.
+    Failed,
+}
+
+/// `PRAGMA wal_checkpoint(PASSIVE)` then `(TRUNCATE)` on `db` — a
+/// second connection to the provider's own store, opened with no busy
+/// timeout so a contended file defers instead of stalling the watch.
+/// PASSIVE moves frames out while readers run; TRUNCATE then frees
+/// the file unless someone is mid-snapshot.
+fn checkpoint_wal(db: &Path) -> Checkpoint {
+    let Ok(conn) = rusqlite::Connection::open(db) else {
+        return Checkpoint::Failed;
+    };
+    let _ = conn.busy_timeout(Duration::ZERO);
+    // PASSIVE's own result is advisory — TRUNCATE does the real work.
+    let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        r.get::<_, i64>(0)
+    }) {
+        Ok(0) => Checkpoint::Done,
+        Ok(_) => Checkpoint::Busy,
+        Err(_) => Checkpoint::Failed,
+    }
+}
+
+/// One watch pass over `roots`: each `*-wal` over `max_bytes` whose
+/// provider has no in-flight turn gets checkpointed. Roots are
+/// enumerated fresh each call so a store appearing or a provider
+/// going busy between ticks lands on the next pass. Emits one
+/// `wal_checkpointed` event per successful TRUNCATE — the before and
+/// after sizes are the evidence.
+fn wal_pass(
+    roots: &[crate::doctor::host::WalRoot],
+    busy: &HashSet<String>,
+    max_bytes: u64,
+    store: &Store,
+) {
+    for root in roots {
+        if busy.contains(root.provider) {
+            continue;
+        }
+        for db in crate::doctor::host::find_wals(&root.root) {
+            let Some(wal) = crate::doctor::host::wal_sibling(&db) else {
+                continue;
+            };
+            let Some(before) = std::fs::metadata(&wal).ok().map(|m| m.len()) else {
+                continue;
+            };
+            if before <= max_bytes {
+                continue;
+            }
+            match checkpoint_wal(&db) {
+                Checkpoint::Done => {
+                    let after = std::fs::metadata(&wal).ok().map(|m| m.len()).unwrap_or(0);
+                    let _ = store.event_public(
+                        DAEMON_ALIAS,
+                        "wal_checkpointed",
+                        json!({
+                            "provider": root.provider,
+                            "store": root.label,
+                            "db": db,
+                            "wal_bytes_before": before,
+                            "wal_bytes_after": after,
+                        }),
+                    );
+                }
+                // Busy or failed: leave it for the next tick — a
+                // checkpoint is maintenance, never worth blocking or
+                // erroring over.
+                Checkpoint::Busy | Checkpoint::Failed => {}
+            }
+        }
+    }
+}
+
 fn ctl_finished(ctl: &AgentCtl) -> bool {
     ctl.thread
         .lock()
@@ -3321,6 +3452,12 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_stall_watch());
     }
+    // WAL watch: provider stores checkpointed while their provider
+    // idles — CAD-132, the 30 GiB sessions.db-wal that ate the disk.
+    {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_wal_watch());
+    }
     while !shared.closing.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -3511,5 +3648,172 @@ mod tests {
         assert_eq!(stopped["state"], "stopped");
         let again = shared.rpc_stop(&json!({"alias": "w1"})).unwrap();
         assert_eq!(again["state"], "stopped");
+    }
+
+    // ---------- CAD-132: provider WAL watch ----------
+
+    /// A WAL-mode db whose writer connection stays open — closing the
+    /// last connection auto-checkpoints, which would erase the fixture.
+    fn wal_db(dir: &Path, name: &str) -> (PathBuf, rusqlite::Connection) {
+        let db = dir.join(name);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(x BLOB);
+             INSERT INTO t VALUES (randomblob(262144));",
+        )
+        .unwrap();
+        (db, conn)
+    }
+
+    fn wal_size(db: &Path) -> u64 {
+        crate::doctor::host::wal_sibling(db)
+            .and_then(|w| std::fs::metadata(w).ok())
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Idle provider, WAL over the limit: PASSIVE+TRUNCATE frees the
+    /// file and a `wal_checkpointed` event carries before/after bytes.
+    #[test]
+    fn wal_pass_checkpoints_idle_provider() {
+        let (dir, shared) = shared();
+        let root = dir.path().join("codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let (db, _writer) = wal_db(&root, "state_1.sqlite");
+        let before = wal_size(&db);
+        assert!(before > 1, "fixture must produce a real WAL");
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "codex",
+            label: "codex store",
+            root,
+        }];
+        wal_pass(&roots, &HashSet::new(), 1, &shared.store);
+        assert_eq!(wal_size(&db), 0, "TRUNCATE frees the wal");
+        let events = shared.store.events_tail(DAEMON_ALIAS, 10).unwrap();
+        let ev = events
+            .iter()
+            .find(|e| e.kind == "wal_checkpointed")
+            .expect("wal_checkpointed event");
+        assert_eq!(ev.payload["provider"], "codex");
+        assert_eq!(ev.payload["store"], "codex store");
+        assert_eq!(ev.payload["wal_bytes_before"], before);
+        assert_eq!(ev.payload["wal_bytes_after"], 0);
+    }
+
+    /// A provider with a `submitting`/`running` turn is never
+    /// checkpointed — the WAL keeps growing until the turn ends.
+    /// The busy set here comes from the real store query, so the
+    /// enqueue→submitting path is covered end to end.
+    #[test]
+    fn wal_pass_skips_busy_provider() {
+        let (dir, shared) = shared();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "op1",
+                provider: "codex",
+                endpoint_kind: "pty",
+                role: "worker",
+                cwd: dir.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .enqueue("op1", "do work", None, "m-wal-1", "test")
+            .unwrap();
+        let Take::Message(msg) = shared.store.take_queued("op1").unwrap() else {
+            panic!("queued message must be taken");
+        };
+        shared.store.mark_running(&msg.id, "pty-1-wal").unwrap();
+        let busy = shared.store.busy_providers().unwrap();
+        assert!(busy.contains("codex"), "{busy:?}");
+
+        let root = dir.path().join("codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let (db, _writer) = wal_db(&root, "state_1.sqlite");
+        let before = wal_size(&db);
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "codex",
+            label: "codex store",
+            root,
+        }];
+        wal_pass(&roots, &busy, 1, &shared.store);
+        assert_eq!(wal_size(&db), before, "busy provider is untouched");
+        assert!(shared
+            .store
+            .events_tail(DAEMON_ALIAS, 10)
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != "wal_checkpointed"));
+        // Once the turn ends the next pass checkpoints.
+        shared
+            .store
+            .finish(&msg, "completed", &json!({"status": "completed"}), None)
+            .unwrap();
+        let busy = shared.store.busy_providers().unwrap();
+        assert!(!busy.contains("codex"), "{busy:?}");
+        wal_pass(&roots, &busy, 1, &shared.store);
+        assert_eq!(wal_size(&db), 0);
+    }
+
+    /// A reader mid-snapshot makes TRUNCATE return busy — the pass
+    /// defers quietly and the next tick (after the reader) completes.
+    #[test]
+    fn wal_pass_busy_reader_retries_next_tick() {
+        let (dir, shared) = shared();
+        let root = dir.path().join("devin");
+        std::fs::create_dir_all(&root).unwrap();
+        let (db, _writer) = wal_db(&root, "sessions.db");
+        let before = wal_size(&db);
+        // A second connection holding an open read transaction pins
+        // the WAL — TRUNCATE reports busy.
+        let reader = rusqlite::Connection::open(&db).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM t;")
+            .unwrap();
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "devin",
+            label: "devin store",
+            root,
+        }];
+        wal_pass(&roots, &HashSet::new(), 1, &shared.store);
+        assert_eq!(wal_size(&db), before, "busy wal is left alone");
+        assert!(shared
+            .store
+            .events_tail(DAEMON_ALIAS, 10)
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != "wal_checkpointed"));
+        // Reader finishes — the retry completes the checkpoint.
+        reader.execute_batch("END").unwrap();
+        drop(reader);
+        wal_pass(&roots, &HashSet::new(), 1, &shared.store);
+        assert_eq!(wal_size(&db), 0);
+    }
+
+    /// Under the limit a WAL is left alone — no checkpoint, no event.
+    #[test]
+    fn wal_pass_ignores_small_wals() {
+        let (dir, shared) = shared();
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let (db, _writer) = wal_db(&root, "sess.db");
+        let before = wal_size(&db);
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "claude",
+            label: "claude store",
+            root,
+        }];
+        wal_pass(&roots, &HashSet::new(), u64::MAX, &shared.store);
+        assert_eq!(wal_size(&db), before);
+        assert!(shared
+            .store
+            .events_tail(DAEMON_ALIAS, 10)
+            .unwrap()
+            .is_empty());
     }
 }
