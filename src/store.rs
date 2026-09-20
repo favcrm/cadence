@@ -2051,13 +2051,25 @@ impl Store {
     /// Event log page for the `events` API; cursor is the last seq seen.
     pub fn events(&self, alias: &str, after: i64, limit: i64) -> Result<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
-        self.agent_in(&conn, alias)?;
+        self.events_alias_in(&conn, alias)?;
         let mut stmt = conn.prepare(
             "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
              WHERE alias=? AND seq>? ORDER BY seq LIMIT ?",
         )?;
         let rows = stmt.query_map(params![alias, after, limit], row_event)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Event streams that exist without an `agents` row — the daemon
+    /// writes `wal_checkpointed` here. Only the events read path
+    /// accepts it; sends still require a registered alias.
+    pub const DAEMON_STREAM: &str = "daemon";
+
+    fn events_alias_in(&self, conn: &Connection, alias: &str) -> Result<()> {
+        if alias == Self::DAEMON_STREAM {
+            return Ok(());
+        }
+        self.agent_in(conn, alias).map(|_| ())
     }
 
     /// The `job events` view: every scoped event for the job across
@@ -2077,7 +2089,7 @@ impl Store {
     /// index gives for free; reversing costs one Vec pass.
     pub fn events_tail(&self, alias: &str, limit: i64) -> Result<Vec<Event>> {
         let conn = self.conn.lock().unwrap();
-        self.agent_in(&conn, alias)?;
+        self.events_alias_in(&conn, alias)?;
         let mut stmt = conn.prepare(
             "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
              WHERE alias=? ORDER BY seq DESC LIMIT ?",
@@ -2130,6 +2142,33 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Providers with at least one in-flight turn — the WAL watcher
+    /// refuses to checkpoint a store whose provider is mid-turn.
+    pub fn busy_providers(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT a.provider FROM agents a
+             JOIN messages m ON m.alias = a.alias
+             WHERE m.state IN ('submitting','running')",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Bound a non-agent event stream to its newest `keep` rows — the
+    /// daemon's `wal_checkpointed` stream has no agents row, so the
+    /// agent-removal `DELETE` never reaches it.
+    pub fn prune_stream(&self, alias: &str, keep: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
+                 SELECT seq FROM events WHERE alias=?1
+                 ORDER BY seq DESC LIMIT ?2)",
+            params![alias, keep],
+        )?;
+        Ok(())
     }
 
     /// Latest event seq for `agent_show`'s cursor.

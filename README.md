@@ -150,9 +150,12 @@ cadence review <PR>             # the reviewer's mechanical routine: detached
 
 cadence doctor --host           # read-only host watchdog: disk free, provider
                                 #  store/WAL growth, per-user pipe pressure,
-                                #  orphaned processes from deleted worktrees,
-                                #  leaked temp dirs, stale worktrees — each
-                                #  finding carries its remedy; exit 0/1/2
+                                #  memory commitment (Committed_AS vs
+                                #  CommitLimit — the fork EAGAIN mode) and a
+                                #  process-group census, orphaned processes
+                                #  from deleted worktrees, leaked temp dirs,
+                                #  stale worktrees — each finding carries its
+                                #  remedy; exit 0/1/2
                                 #  (--json for machines; pm.yaml [host] tunes)
 ```
 

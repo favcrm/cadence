@@ -65,7 +65,12 @@ checklist used to run by hand:
 ```bash
 cadence daemon start          # or: cadence doctor, if anything looks off
 cadence doctor --host         # host watchdog: disk free, provider WALs, pipe
-                              #  pressure, orphaned processes, leaked temp dirs,
+                              #  pressure, memory (MemAvailable, swap free,
+                              #  Committed_AS vs CommitLimit with overcommit
+                              #  mode — strict-mode overshoot fails; heuristic
+                              #  overshoot is informational), a process-group
+                              #  census (counts, RSS, oldest idle),
+                              #  orphaned processes, leaked temp dirs,
                               #  stale worktrees (shared cargo cache counted
                               #  once) — read-only, exit 0/1/2
 cadence doctor --host --reclaim-plan
@@ -93,6 +98,26 @@ cadence issue doctor          # tracker: hooks ours, lint clean, ahead/behind or
 `remedy` — the exact command an operator would run. A non-zero exit is
 a finding, not an error: fix or dismiss before dispatching workers
 onto a host whose disk, pipes or orphans are already degrading lanes.
+
+Provider WALs are the one thing the daemon maintains itself: every
+minute it checkpoints any known provider store (devin `sessions.db`,
+codex `*.sqlite`, claude projects) whose `-wal` exceeds
+`[host] wal_max_bytes` (default 1 GiB) — PASSIVE then TRUNCATE. The
+safety gates, honestly scoped: the WAL must be **quiet** (unwritten
+for ~60s — this is what excludes writers cadence cannot see, like an
+interactive `claude`/`devin` in a terminal), owned by the daemon's
+uid, not a symlink, and its provider must have no in-flight *cadence*
+turn (`submitting`/`running` in cadence's own store — a courtesy
+gate, since SQLite's locking is what actually protects the data).
+TRUNCATE cannot lose committed frames; a busy or failed attempt just
+defers to the next tick. Successes record `wal_checkpointed` on the
+`daemon` event stream (`cadence events daemon`) with before/after
+bytes. Opt out with `[host] wal_checkpoint: false`; preview with
+`wal_dry_run: true` (emits `wal_checkpoint_pending`, never writes) —
+`doctor --host` also flags stores `over_checkpoint_limit`.
+`pm.yaml [host]` also tunes `mem_warn_pct`/`mem_fail_pct` (15/5) and
+`swap_warn_pct`/`swap_fail_pct` (20/5) — and note `Committed_AS` over
+`CommitLimit` under heuristic overcommit is normal, not a failure.
 
 Slice the backlog before you plan rather than scrolling it.
 `cadence issue ls --open` is everything still live; narrow it with
