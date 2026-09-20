@@ -159,7 +159,10 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
             for tag in &front.tags {
                 if !model::valid_tag(tag) {
                     lint.err(format!("{id}: bad tag grammar '{tag}'"));
-                } else if !project.tags.is_empty() && !project.tags.contains(tag) {
+                } else if !project.tags.is_empty()
+                    && !project.tags.contains(tag)
+                    && !model::system_tag(tag)
+                {
                     lint.err(format!("{id}: unknown tag '{tag}'"));
                 }
             }

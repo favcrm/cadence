@@ -626,8 +626,9 @@ enum Commands {
         #[arg(long)]
         project: Option<String>,
         /// Attach the report as a comment on this issue instead of
-        /// creating one.
-        #[arg(long)]
+        /// creating one — `--project`/`--priority` are unused here and
+        /// rejected rather than silently ignored.
+        #[arg(long, conflicts_with_all = ["project", "priority"])]
         issue: Option<String>,
         /// Inline report text — first line is the issue title.
         #[arg(short = 'm', conflicts_with = "file")]
@@ -1349,19 +1350,29 @@ impl ReconcileStatus {
 }
 
 fn read_body(text: Option<String>, file: Option<PathBuf>) -> Result<String> {
+    read_body_capped(text, file, u64::MAX)
+}
+
+/// `read_body` with a byte bound on the *read* — a giant `--file` or
+/// stdin paste is refused before it is fully buffered (`report`
+/// passes [`cadence_agent::issue::report::BODY_MAX`]; the cap error
+/// itself comes from `report::file`).
+fn read_body_capped(text: Option<String>, file: Option<PathBuf>, max: u64) -> Result<String> {
     if let Some(text) = text {
         return Ok(text);
     }
     if let Some(file) = file {
         let mut body = String::new();
-        std::fs::File::open(&file)?.read_to_string(&mut body)?;
+        std::fs::File::open(&file)?
+            .take(max + 1)
+            .read_to_string(&mut body)?;
         return Ok(body);
     }
     if atty_stdin() {
         return Err(Error::rejected("Provide --text or --file"));
     }
     let mut body = String::new();
-    std::io::stdin().read_to_string(&mut body)?;
+    std::io::stdin().take(max + 1).read_to_string(&mut body)?;
     Ok(body)
 }
 
@@ -3508,7 +3519,7 @@ fn run() -> Result<i32> {
                     print_json(&report::show(&pm, &id)?);
                 }
                 None => {
-                    let body = read_body(text, file)?;
+                    let body = read_body_capped(text, file, report::BODY_MAX as u64)?;
                     let cwd = std::env::current_dir()?;
                     print_json(&report::file(
                         &pm,

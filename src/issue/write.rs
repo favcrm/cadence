@@ -194,7 +194,10 @@ fn check_component(project: &project::Project, component: &str) -> Result<()> {
 pub(crate) fn check_tags(project: &project::Project, tags: &[String]) -> Result<Vec<String>> {
     let tags = model::normalize_tags(tags)?;
     if !project.tags.is_empty() {
-        if let Some(unknown) = tags.iter().find(|t| !project.tags.contains(t)) {
+        if let Some(unknown) = tags
+            .iter()
+            .find(|t| !project.tags.contains(t) && !model::system_tag(t))
+        {
             return Err(Error::rejected(format!(
                 "Unknown tag '{unknown}' — {} declares: {}",
                 project.key,

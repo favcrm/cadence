@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::adapter::registry;
 use crate::client;
-use crate::issue::{self, board, project};
+use crate::issue::{self, board, project, report};
 use crate::proc::run_bounded;
 
 /// Git identity baked in by build.rs — `unknown` when git or a repo
@@ -643,6 +643,7 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
         for v in &views {
             status_of.insert(v.issue.front.id.clone(), v.status.clone());
         }
+        let mut intake: Vec<Item> = Vec::new();
         for v in &views {
             let id = v.issue.front.id.as_str();
             let project = v.issue.project.as_str();
@@ -694,12 +695,18 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
                 let kind_tag = v
                     .issue
                     .front
-                    .tags
-                    .iter()
-                    .find(|t| *t != "intake")
-                    .map(String::as_str)
+                    .kind
+                    .as_deref()
+                    .or_else(|| {
+                        v.issue
+                            .front
+                            .tags
+                            .iter()
+                            .find(|t| *t != "intake")
+                            .map(String::as_str)
+                    })
                     .unwrap_or("intake");
-                needs.push(item(
+                intake.push(item(
                     85,
                     "intake",
                     &format!("{id} {kind_tag} report — {}", v.issue.front.title),
@@ -710,6 +717,23 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
                 ));
             }
         }
+        // Cap the intake block — hundreds of untriaged reports must not
+        // bury real work. Oldest first, then one summary row.
+        intake.sort_by_key(|i| std::cmp::Reverse(i.age));
+        if intake.len() > report::NEEDS_ME_CAP {
+            let extra = intake.len() - report::NEEDS_ME_CAP;
+            intake.truncate(report::NEEDS_ME_CAP);
+            intake.push(item(
+                85,
+                "intake",
+                &format!("… {extra} more intake reports"),
+                0,
+                "",
+                None,
+                "cadence report ls",
+            ));
+        }
+        needs.extend(intake);
         for p in project::list(&pm.dir).unwrap_or_default() {
             let mut open_by_status = serde_json::Map::new();
             let mut oldest_review: Option<i64> = None;

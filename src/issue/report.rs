@@ -14,11 +14,22 @@
 //! `backlog` (see `src/overview.rs`). The report never fails because
 //! notification did — the issue file is the durable record.
 //!
-//! Anything written — body, cwd, repo, actor — passes through the
-//! shared argv scrubber (`doctor::host::redact_argv` applied per
-//! whitespace token): a report must never carry a credential.
+//! Hygiene: bodies are capped ([`BODY_MAX`] bytes, [`TITLE_MAX`]
+//! chars on the title), control characters other than `\n`/`\t` are
+//! stripped before anything is stored, and the PM line goes through
+//! the same control-free contract as `kickoff_body`. Credential
+//! hygiene is best-effort, not absolute — argv-shaped context fields
+//! (`cwd`, `repo`, `remote`, `actor`) still pass through the shared
+//! `doctor::host::redact_argv` scrubber, while free prose gets
+//! `scrub_body`: `key: value` / `key = value` / `key is value`
+//! forms, `--flag value` and `-u user:pass`, `Authorization:` /
+//! `Proxy-Authorization:` header lines (the scheme word must not
+//! shield the credential), URI query parameters, PEM blocks, and the
+//! per-token credential shapes. Prose has no flag convention — a
+//! bare `hunter2` after no keyword survives; do not paste secrets.
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -26,6 +37,20 @@ use crate::client;
 use crate::doctor::host::redact_argv;
 use crate::error::{Error, Result};
 use crate::issue::{board, model, project, time, write, Pm};
+use crate::proc::run_bounded;
+
+/// Stored body cap — a paste bigger than this is refused, not
+/// truncated silently, because a partial stack trace reads like a
+/// complete one.
+pub const BODY_MAX: usize = 32 * 1024;
+/// Title cap — the first line is the issue title, shown on every
+/// board row and PM heads-up.
+const TITLE_MAX: usize = 200;
+/// `needs_me` shows at most this many intake rows plus a summary row.
+pub const NEEDS_ME_CAP: usize = 10;
+const REDACTED: &str = "[REDACTED]";
+/// `git rev-parse` inside `context_block` must never wedge the verb.
+const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// `report`'s kinds — the routing key. `value_enum` keeps clap in
 /// sync; `as_str` is the stored tag/comment kind.
@@ -59,11 +84,334 @@ impl Kind {
     }
 }
 
-/// A credential-shaped token inside any captured string is replaced
-/// before it reaches the tracker. Whitespace-split so `k=v`, `--k=v`
-/// and bare token shapes all hit the same scrubber as process argv.
+/// C0/C1/DEL control characters never reach the tracker or a
+/// terminal — `\n` and `\t` survive because the body needs its line
+/// structure and indentation; `\r` and everything else go.
+fn strip_controls(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
+/// One line, control-free — the same contract `kickoff_body`'s
+/// `clean()` enforces on dispatch text that lands on a pty.
+fn clean_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A credential-shaped token inside an argv-shaped field (cwd, repo,
+/// remote, actor, daemon build) is replaced before it reaches the
+/// tracker — the shared process-list scrubber.
 fn scrub(text: &str) -> String {
     redact_argv(&text.split_whitespace().collect::<Vec<_>>())
+}
+
+/// One whitespace-run-delimited token paired with the whitespace that
+/// follows it — preserved byte-for-byte so line structure, blank
+/// lines and indentation survive scrubbing.
+fn tokens(s: &str) -> Vec<(&str, &str)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut start = None;
+    for (i, c) in s.char_indices() {
+        match (start, c.is_whitespace()) {
+            (None, false) => start = Some(i),
+            (Some(st), true) => {
+                spans.push((st, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(st) = start {
+        spans.push((st, s.len()));
+    }
+    spans
+        .iter()
+        .enumerate()
+        .map(|(k, (a, b))| {
+            let end = spans.get(k + 1).map(|(na, _)| *na).unwrap_or(s.len());
+            (&s[*a..*b], &s[*b..end])
+        })
+        .collect()
+}
+
+/// Does `name` name a credential? Probed through the canonical word
+/// list by offering the shared scrubber a synthetic `--name=x` flag:
+/// the mask fires iff `secret_name` holds, so prose `key:`/`key=`
+/// forms share the argv vocabulary instead of duplicating it.
+fn name_is_secret(name: &str) -> bool {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return false;
+    }
+    let probe = format!("--{name}=x");
+    redact_argv(std::slice::from_ref(&probe)) != probe
+}
+
+/// A standalone credential shape — ghp_/sk_/AKIA/JWT, 32+ entropy,
+/// `scheme://user:pass@host` userinfo, `-u<user:pass>` glued shorts —
+/// probed per token through the shared scrubber.
+fn standalone_secret(tok: &str) -> bool {
+    redact_argv(&[tok.to_string()]) != tok
+}
+
+/// `-x`/`--name` carrying no inline `=` whose name is
+/// credential-bearing (`--password`, `-p`, `-u`, `-a` — argv parity).
+fn secret_flag(tok: &str) -> bool {
+    let bare = tok.trim_matches(|c| c == '"' || c == '\'');
+    if !bare.starts_with('-') || bare.len() < 2 || bare.contains('=') {
+        return false;
+    }
+    let name = bare.trim_start_matches('-');
+    name_is_secret(name) || (!bare.starts_with("--") && matches!(name, "p" | "a" | "u"))
+}
+
+/// `Authorization:`/`Proxy-Authorization:` — the scheme word
+/// (`Basic`/`Bearer`) must not shield the credential after it, so the
+/// rest of the line is masked whole.
+fn auth_header(tok: &str) -> bool {
+    let bare = tok.trim_matches(|c| c == '"' || c == '\'');
+    let head = bare
+        .split([':', '='])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(head.as_str(), "authorization" | "proxy-authorization")
+}
+
+/// Emit `[REDACTED]` for `toks[i]` (trailing whitespace kept) and
+/// keep eating while a quote the value opened stays unclosed —
+/// `--password "correct horse battery"` masks all three words.
+fn eat_value_at(toks: &[(&str, &str)], i: usize, out: &mut String) -> usize {
+    let (tok, ws) = toks[i];
+    out.push_str(REDACTED);
+    out.push_str(ws);
+    let quote = match tok.chars().next() {
+        Some(q @ ('"' | '\'')) if tok.len() == q.len_utf8() || !tok.ends_with(q) => Some(q),
+        _ => None,
+    };
+    let mut j = i + 1;
+    if let Some(q) = quote {
+        while j < toks.len() {
+            let (t, w) = toks[j];
+            out.push_str(REDACTED);
+            out.push_str(w);
+            j += 1;
+            if t.ends_with(q) {
+                break;
+            }
+        }
+    }
+    j
+}
+
+/// `?name=value&…` inside a token — mask each query parameter whose
+/// name is credential-bearing or whose value is a credential shape.
+fn mask_query_params(tok: &str) -> String {
+    let Some(q) = tok.find('?') else {
+        return tok.to_string();
+    };
+    let (head, query) = tok.split_at(q + 1);
+    let mut out = String::from(head);
+    for pair in query.split('&') {
+        if !out.ends_with(['?', '&']) {
+            out.push('&');
+        }
+        match pair.split_once('=') {
+            Some((name, val)) if name_is_secret(name) || standalone_secret(val) => {
+                out.push_str(name);
+                out.push('=');
+                out.push_str(REDACTED);
+            }
+            _ => out.push_str(pair),
+        }
+    }
+    out
+}
+
+/// Scrub one line of free prose, whitespace preserved. `carry_eat`
+/// carries a pending `key:`/`key=` value across the line boundary so
+/// `password:\n  hunter2` still masks `hunter2`.
+fn scrub_line(line: &str, carry_eat: &mut bool, out: &mut String) {
+    let toks = tokens(line);
+    // Leading whitespace is indentation — verbatim.
+    let lead = line
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(line.len());
+    out.push_str(&line[..lead]);
+    let mut i = 0;
+    if *carry_eat && i < toks.len() {
+        *carry_eat = false;
+        i = eat_value_at(&toks, i, out);
+    }
+    while i < toks.len() {
+        let (tok, ws) = toks[i];
+        let bare = tok.trim_matches(|c| c == '"' || c == '\'');
+
+        // `Authorization:`/`Proxy-Authorization:` — mask the rest of
+        // the line; the scheme word is not the credential.
+        if auth_header(tok) {
+            match bare.split_once(':') {
+                Some((name, _)) => {
+                    out.push_str(name);
+                    out.push_str(": ");
+                }
+                None => {
+                    out.push_str(tok);
+                    out.push(' ');
+                }
+            }
+            out.push_str(REDACTED);
+            break;
+        }
+
+        // `--password`, `-p`, `-u` — value is the next token (unless
+        // that token is itself a secret flag, argv parity).
+        if secret_flag(tok) {
+            out.push_str(tok);
+            out.push_str(ws);
+            if toks.get(i + 1).is_some_and(|(n, _)| !secret_flag(n)) {
+                i = eat_value_at(&toks, i + 1, out);
+            } else {
+                *carry_eat = i + 1 >= toks.len();
+                i += 1;
+            }
+            continue;
+        }
+
+        // URI query parameters — `https://api/x?api_key=abcd1234`.
+        if bare.contains('?') && bare.contains('=') {
+            let masked = mask_query_params(bare);
+            if masked != bare {
+                out.push_str(&masked);
+                out.push_str(ws);
+                i += 1;
+                continue;
+            }
+        }
+
+        // `name=value` / `name:value` glued forms — only when a
+        // non-empty value follows the separator; `key=`/`key:` alone
+        // fall through to the trailing-separator rule, which eats the
+        // next token.
+        if let Some(eq) = bare.find('=') {
+            if eq + 1 < bare.len() && name_is_secret(bare[..eq].trim_start_matches('-')) {
+                out.push_str(&bare[..eq + 1]);
+                out.push_str(REDACTED);
+                out.push_str(ws);
+                i += 1;
+                continue;
+            }
+        }
+        if let Some(c) = bare.find(':') {
+            if c + 1 < bare.len() && name_is_secret(&bare[..c]) {
+                out.push_str(&bare[..c]);
+                out.push(':');
+                out.push_str(REDACTED);
+                out.push_str(ws);
+                i += 1;
+                continue;
+            }
+        }
+
+        // `key:`/`key=` trailing separator — value is the next token.
+        if (bare.ends_with(':') || bare.ends_with('='))
+            && bare.len() > 1
+            && name_is_secret(&bare[..bare.len() - 1])
+        {
+            out.push_str(tok);
+            out.push_str(ws);
+            if toks.get(i + 1).is_some_and(|(n, _)| !secret_flag(n)) {
+                i = eat_value_at(&toks, i + 1, out);
+            } else {
+                *carry_eat = i + 1 >= toks.len();
+                i += 1;
+            }
+            continue;
+        }
+
+        // Bare secret word — `password is hunter2`, `token <shape>`.
+        // A connector (`is`, `=`, `:`) makes the following token the
+        // value unconditionally; without one, only a credential-shaped
+        // neighbour is masked — `the key point` stays prose.
+        if !bare.starts_with('-') && name_is_secret(bare) {
+            out.push_str(tok);
+            out.push_str(ws);
+            if let Some((ntok, nws)) = toks.get(i + 1) {
+                let nlow = ntok.trim_matches('"').to_ascii_lowercase();
+                if matches!(nlow.as_str(), "is" | "=" | ":") {
+                    out.push_str(ntok);
+                    out.push_str(nws);
+                    if toks.get(i + 2).is_some_and(|(n, _)| !secret_flag(n)) {
+                        i = eat_value_at(&toks, i + 2, out);
+                    } else {
+                        *carry_eat = i + 2 >= toks.len();
+                        i += 2;
+                    }
+                    continue;
+                }
+                if standalone_secret(ntok) {
+                    out.push_str(REDACTED);
+                    out.push_str(nws);
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // Ordinary token — per-token shapes (`ghp_…`, JWTs, in-token
+        // `Key: value`, URI userinfo) via the shared scrubber.
+        out.push_str(&redact_argv(&[tok.to_string()]));
+        out.push_str(ws);
+        i += 1;
+    }
+}
+
+/// Free-prose credential pass — applied to the report body. Line
+/// structure is preserved exactly; PEM blocks mask line-by-line.
+fn scrub_body(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_pem = false;
+    let mut carry_eat = false;
+    for chunk in text.split_inclusive('\n') {
+        let (line, eol) = match chunk.strip_suffix('\n') {
+            Some(l) => (l, "\n"),
+            None => (chunk, ""),
+        };
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("-----BEGIN ") {
+            in_pem = true;
+        }
+        if in_pem {
+            out.push_str(REDACTED);
+            out.push_str(eol);
+            if trimmed.starts_with("-----END ") {
+                in_pem = false;
+            }
+            continue;
+        }
+        scrub_line(line, &mut carry_eat, &mut out);
+        out.push_str(eol);
+    }
+    out
+}
+
+/// `s` truncated to `max` chars on a char boundary.
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max).collect()
 }
 
 /// The routing decision: which project the report files into.
@@ -98,6 +446,16 @@ fn actor_of() -> String {
         .unwrap_or_else(|| "operator".to_string())
 }
 
+/// Bounded `cmd` stdout — a wedged `git` must not hang the verb.
+fn out(cmd: &mut std::process::Command) -> Option<String> {
+    let o = run_bounded(cmd, GIT_TIMEOUT).ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 /// The automatic context block — everything an issue needs to locate
 /// the reporter's world without another round-trip. Daemon build comes
 /// from `daemon_info`; unreachable records that fact, never fails.
@@ -105,15 +463,11 @@ fn context_block(state_dir: &Path, cwd: &Path) -> String {
     let mut lines = vec![format!("- actor: {}", scrub(&actor_of()))];
     lines.push(format!("- cwd: {}", scrub(&cwd.to_string_lossy())));
     if let Some((root, remote)) = project::repo_identity(cwd) {
-        let branch = std::process::Command::new("git")
+        let branch = out(std::process::Command::new("git")
             .arg("-C")
             .arg(&root)
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
+            .args(["rev-parse", "--abbrev-ref", "HEAD"]))
+        .unwrap_or_default();
         let mut repo = format!("- repo: {}", scrub(&root.to_string_lossy()));
         if !branch.is_empty() {
             repo.push_str(&format!(" (branch {})", scrub(&branch)));
@@ -162,18 +516,51 @@ fn pm_inbox(pm: &Pm, project: &project::Project, state_dir: &Path) -> Option<Str
     None
 }
 
-/// Best-effort one-line heads-up to the PM inbox. The return value is
-/// what the caller records — failures are data, never report errors.
-fn notify_pm(state_dir: &Path, inbox: Option<&str>, line: &str, reply_to: Option<&str>) -> Value {
+/// `agent_send`'s message-id charset is lowercase letters, digits and
+/// hyphens — the idempotency key is built inside it so a retried send
+/// dedupes instead of double-notifying.
+fn msg_key(parts: &[&str]) -> String {
+    let mut s = String::from("report-notify");
+    for p in parts {
+        for c in p.chars() {
+            let c = c.to_ascii_lowercase();
+            let c = if c.is_ascii_alphanumeric() { c } else { '-' };
+            if !(c == '-' && s.ends_with('-')) {
+                s.push(c);
+            }
+        }
+        if !s.ends_with('-') {
+            s.push('-');
+        }
+    }
+    cap_chars(s.trim_end_matches('-'), 64)
+}
+
+/// Best-effort one-line heads-up to the PM inbox. `key` is the
+/// idempotency key — stable per issue/comment so a retried send
+/// dedupes instead of double-notifying. The return value is what the
+/// caller records — failures are data, never report errors. The line
+/// itself is control-free (`clean_line`), the same contract
+/// `kickoff_body` keeps for pty-bound text.
+fn notify_pm(
+    state_dir: &Path,
+    inbox: Option<&str>,
+    line: &str,
+    reply_to: Option<&str>,
+    msg_key: &str,
+) -> Value {
     let Some(alias) = inbox else {
         return json!(null);
     };
     match client::rpc(
         state_dir,
         "agent_send",
-        json!({"alias": alias, "text": line, "reply_to": reply_to}),
+        json!({"alias": alias, "text": clean_line(line), "reply_to": reply_to,
+               "message": msg_key}),
     ) {
-        Ok(_) => json!({"to": alias, "sent": true}),
+        Ok(r) => {
+            json!({"to": alias, "sent": true, "duplicate": r["duplicate"].as_bool()})
+        }
         Err(e) => json!({"to": alias, "sent": false, "error": e.to_string()}),
     }
 }
@@ -192,10 +579,25 @@ pub fn file(
     state_dir: &Path,
     cwd: &Path,
 ) -> Result<Value> {
-    let body = scrub(body);
+    if body.len() > BODY_MAX {
+        return Err(Error::rejected(format!(
+            "Report body exceeds the {} KB cap — trim it or `--issue` it onto an existing issue",
+            BODY_MAX / 1024
+        )));
+    }
+    let body = strip_controls(body);
     if body.trim().is_empty() {
         return Err(Error::rejected("Report body is empty — pass -m or --file"));
     }
+    // Title comes from the ORIGINAL first line, before the prose
+    // scrubber — then it is scrubbed (single line) and capped.
+    let title = cap_chars(scrub_body(first_line(&body)).trim_end(), TITLE_MAX);
+    let rest = body
+        .split_once('\n')
+        .map(|x| x.1)
+        .unwrap_or("")
+        .trim_matches('\n');
+    let rest = scrub_body(rest);
     let context = context_block(state_dir, cwd);
     let reporter = std::env::var("CADENCE_ALIAS")
         .ok()
@@ -203,17 +605,26 @@ pub fn file(
 
     // --issue: the report lands as a comment on an existing issue —
     // no new issue, no routing decision; the issue's own project holds
-    // it. The PM heads-up still goes out.
+    // it. The PM heads-up still goes out (keyed on the comment file,
+    // so a retried send dedupes). `--issue` is also the retry path for
+    // a missed heads-up: it reuses the issue rather than duplicating it.
     if let Some(id) = issue_id {
-        let text = format!("{body}\n\n{context}");
+        let body_text = if rest.is_empty() {
+            title.clone()
+        } else {
+            format!("{title}\n\n{rest}")
+        };
+        let text = format!("{body_text}\n\n{context}");
         let out = write::add_comment(pm, id, &text, None, Some(kind.as_str()), None, actor)?;
         let (proj, _) = write::issue_dir(pm, id)?;
         let inbox = pm_inbox(pm, &proj, state_dir);
+        let comment = out["comment"].as_str().unwrap_or("comment");
         let notified = notify_pm(
             state_dir,
             inbox.as_deref(),
-            &format!("{id}: {} comment — {}", kind.as_str(), first_line(&body)),
+            &format!("{id}: {} comment — {}", kind.as_str(), title),
             reporter.as_deref(),
+            &msg_key(&[id, comment]),
         );
         let mut out = out;
         out["kind"] = json!(kind.as_str());
@@ -225,13 +636,13 @@ pub fn file(
     let project = target_project(pm, kind, project_flag, cwd)?;
     let priority = priority.unwrap_or_else(|| kind.default_priority());
     model::check_priority(priority)?;
+    // `intake`+kind are system vocabulary — `check_tags` exempts them
+    // from a project's declared `tags:` allowlist.
     let tags = write::check_tags(&project, &["intake".to_string(), kind.as_str().to_string()])?;
 
-    let title = first_line(&body);
     if title.is_empty() {
         return Err(Error::rejected("Report needs a first line as its title"));
     }
-    let rest = body.split_once('\n').map(|x| x.1).unwrap_or("").trim();
     let issue_body = if rest.is_empty() {
         format!("{title}\n\n{context}")
     } else {
@@ -251,9 +662,10 @@ pub fn file(
             dir.display()
         )));
     }
-    let mut front = model::Front::new(&id, title, &time::iso(time::now_epoch()));
+    let mut front = model::Front::new(&id, &title, &time::iso(time::now_epoch()));
     front.priority = priority.to_string();
     front.tags = tags;
+    front.kind = Some(kind.as_str().to_string());
     std::fs::create_dir_all(dir.join("comments"))?;
     std::fs::create_dir_all(dir.join("artifacts"))?;
     write::save_front(&dir, &front, &issue_body)?;
@@ -275,6 +687,7 @@ pub fn file(
         inbox.as_deref(),
         &format!("{id}: new {} — {}", kind.as_str(), title),
         reporter.as_deref(),
+        &msg_key(&[&id]),
     );
     Ok(json!({
         "id": id, "project": project.key, "kind": kind.as_str(),
@@ -287,32 +700,38 @@ fn first_line(body: &str) -> &str {
     body.lines().next().unwrap_or("").trim()
 }
 
+/// The intake kind — its own frontmatter field since round 2; the
+/// tag scan is only a fallback for issues filed before it existed.
+fn report_kind(front: &model::Front) -> String {
+    front
+        .kind
+        .clone()
+        .or_else(|| front.tags.iter().find(|t| *t != "intake").cloned())
+        .unwrap_or_default()
+}
+
 /// `cadence report ls [--kind K] [--project P]` — open intake: issues
-/// tagged `intake` that are not done/dropped, newest first.
+/// tagged `intake` that are not done/dropped by the *derived* status
+/// (notes roll-ups count, same as the overview row), newest first.
 pub fn ls(pm: &Pm, kind: Option<Kind>, project: Option<&str>) -> Result<Value> {
     let issues = board::load_all(&pm.dir, None)?;
-    let mut rows: Vec<Value> = issues
+    let views = board::views(&pm.config.notes_dir(), issues);
+    let mut rows: Vec<Value> = views
         .iter()
-        .filter(|i| i.front.tags.iter().any(|t| t == "intake"))
-        .filter(|i| !matches!(i.front.status.as_str(), "done" | "dropped"))
-        .filter(|i| {
-            kind.map(|k| i.front.tags.iter().any(|t| t == k.as_str()))
+        .filter(|v| v.issue.front.tags.iter().any(|t| t == "intake"))
+        .filter(|v| !matches!(v.status.as_str(), "done" | "dropped"))
+        .filter(|v| {
+            kind.map(|k| report_kind(&v.issue.front) == k.as_str())
                 .unwrap_or(true)
         })
-        .filter(|i| project.map(|p| i.project == p).unwrap_or(true))
-        .map(|i| {
-            let kind_tag = i
-                .front
-                .tags
-                .iter()
-                .find(|t| *t != "intake")
-                .cloned()
-                .unwrap_or_default();
+        .filter(|v| project.map(|p| v.issue.project == p).unwrap_or(true))
+        .map(|v| {
             json!({
-                "id": i.front.id, "project": i.project, "kind": kind_tag,
-                "status": i.front.status, "priority": i.front.priority,
-                "title": i.front.title, "created": i.front.created,
-                "owner": i.front.owner,
+                "id": v.issue.front.id, "project": v.issue.project,
+                "kind": report_kind(&v.issue.front),
+                "status": v.status, "priority": v.issue.front.priority,
+                "title": v.issue.front.title, "created": v.issue.front.created,
+                "owner": v.issue.front.owner,
             })
         })
         .collect();
@@ -321,15 +740,21 @@ pub fn ls(pm: &Pm, kind: Option<Kind>, project: Option<&str>) -> Result<Value> {
 }
 
 /// `cadence report show <ID>` — one intake issue, body included.
+/// Refuses non-intake issues: they belong to `issue` verbs.
 pub fn show(pm: &Pm, id: &str) -> Result<Value> {
     let issue = board::find_issue(&pm.dir, id)?;
-    let body = issue.body;
+    if !issue.front.tags.iter().any(|t| t == "intake") {
+        return Err(Error::rejected(format!(
+            "{id} is not an intake issue — use `cadence issue` verbs for tracker issues"
+        )));
+    }
     Ok(json!({
         "id": issue.front.id, "project": issue.project,
+        "kind": report_kind(&issue.front),
         "status": issue.front.status, "priority": issue.front.priority,
         "title": issue.front.title, "tags": issue.front.tags,
         "owner": issue.front.owner, "created": issue.front.created,
-        "body": body,
+        "body": issue.body,
     }))
 }
 
@@ -338,12 +763,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scrub_redacts_token_and_flag_shapes() {
+    fn scrub_args_redacts_token_and_flag_shapes() {
         let secret = format!("ghp_{}", "a".repeat(36));
         let out = scrub(&format!("leaked {secret} and --api-key={secret}"));
         assert!(!out.contains(&secret), "{out}");
-        assert!(out.contains("[REDACTED]"), "{out}");
+        assert!(out.contains(REDACTED), "{out}");
         assert_eq!(scrub("ordinary words only"), "ordinary words only");
+    }
+
+    #[test]
+    fn scrub_body_preserves_lines_and_indents() {
+        let body = "Steps to reproduce:\n\n    1. run `cadence status`\n\t2. see error\n";
+        let out = scrub_body(body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn scrub_body_redacts_prose_secret_forms() {
+        for (row, gone) in [
+            (
+                "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+                "dXNlcjpwYXNzd29yZA==",
+            ),
+            ("--password \"correct horse battery\"", "horse"),
+            ("-u \"admin:hunter 2\"", "admin:hunter"),
+            ("the db password is hunter2", "hunter2"),
+            ("https://api/x?api_key=abcd1234", "abcd1234"),
+            (
+                "api_key = aGVsbG8td29ybGQtc2VjcmV0",
+                "aGVsbG8td29ybGQtc2VjcmV0",
+            ),
+        ] {
+            let out = scrub_body(row);
+            assert!(!out.contains(gone), "{row:?} → {out:?}");
+        }
+    }
+
+    #[test]
+    fn scrub_body_masks_pem_and_keeps_prose() {
+        let pem = "key material:\n-----BEGIN RSA PRIVATE KEY-----\nabc123\n-----END RSA PRIVATE KEY-----\ndone";
+        let out = scrub_body(pem);
+        assert!(!out.contains("abc123"), "{out}");
+        assert!(!out.contains("PRIVATE KEY"), "{out}");
+        // Ordinary prose is untouched — `key point`, `keyboard`,
+        // `the token was invalid` carry no value to mask.
+        assert_eq!(
+            scrub_body("the key point is clear\nthe token was invalid"),
+            "the key point is clear\nthe token was invalid"
+        );
+    }
+
+    #[test]
+    fn scrub_body_eats_across_line_break() {
+        let out = scrub_body("password:\n  hunter2 rest");
+        assert!(!out.contains("hunter2"), "{out}");
+    }
+
+    #[test]
+    fn strip_controls_keeps_structure() {
+        let out = strip_controls("a\x1b[2Jb\x07c\x00d\te\nf\rg");
+        assert_eq!(out, "a[2Jbcd\te\nfg");
     }
 
     #[test]

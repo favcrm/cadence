@@ -195,10 +195,21 @@ cadence report ls --kind bug                                 # open intake
 the `cadence` project from any directory; `idea` belongs to the project
 you are standing in (or `--project`, which always wins) and refuses when
 the cwd resolves to none. The issue lands in `backlog` tagged `intake`
-plus the kind — `P3`, `bug` `P2` — captures actor/cwd/repo/build with
-credential scrubbing, pings the project's PM inbox when one resolves
-(`team.yaml` `roles.pm.alias`), and holds an Overview row until it
-leaves backlog. `--issue <ID>` files the same text as a comment instead.
+plus the kind — `P3`, `bug` `P2`, both exempt from a project's `tags:`
+allowlist — captures actor/cwd/repo/build with credential scrubbing,
+pings the project's PM inbox when one resolves (`team.yaml`
+`roles.pm.alias`), and holds an Overview row until it leaves backlog
+(the row block caps at ten plus a summary). `--issue <ID>` files the
+same text as a comment instead (`--project`/`--priority` are rejected
+there, not ignored).
+
+Bodies keep their lines and indentation — the title is the first line,
+capped at 200 chars, and bodies over 32 KB are refused. Control
+characters are stripped before anything is stored or sent to the PM.
+Secrets are scrubbed best-effort — `key: value`/`key = value` forms,
+`--flag value`, `Authorization:` headers, URI query params, PEM blocks
+and credential-shaped tokens are masked, but prose has no flag
+convention: do not paste secrets.
 
 ```bash
 cadence issue new --project cadence --priority P1 --component adapter "Title"
