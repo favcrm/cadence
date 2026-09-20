@@ -976,7 +976,8 @@ ready gate) an explicit verified readiness claim. It then delegates to
 the existing `task_dispatch` transaction, including its group,
 revision, lease and idempotency checks. The periodic observer never
 dispatches, interrupts, resumes, accepts approvals, or changes worker
-state.
+state. `monitor_dispatch` does not select backlog work autonomously; quotas,
+fairness, reviewer capacity, and lease recovery remain outside this slice.
 
 ## Approvals
 

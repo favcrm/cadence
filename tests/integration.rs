@@ -18963,19 +18963,53 @@ fn issue_ls_survives_a_closed_downstream_pipe() {
 // ==================== persistent monitors (CAD-176) ====================
 
 #[test]
-fn monitor_migration_follows_provider_effort_v7() {
+fn monitor_migration_from_v6_bridges_provider_effort_before_v8() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("cadence.sqlite3");
     let store = Store::open(&path).unwrap();
     drop(store);
-    // Model the post-PR80 database: the v7 effort column exists, while the
-    // monitor tables have not been created yet. CAD-176 owns the next slot.
+    // Model a v6 database before either change: CAD-176 must reserve the v7
+    // column contract before advancing directly to its v8 tables.
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         "DROP TABLE monitor_alerts;
          DROP TABLE monitor_tasks;
          DROP TABLE monitors;
-         ALTER TABLE agents ADD COLUMN effort TEXT;
+         ALTER TABLE agents DROP COLUMN effort;
+         UPDATE schema_version SET version=6;",
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&path).unwrap();
+    assert!(store.monitors().unwrap().is_empty());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(agents)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 8);
+    assert!(columns.iter().any(|column| column == "effort"));
+}
+
+#[test]
+fn monitor_migration_after_provider_effort_v7_is_v8() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cadence.sqlite3");
+    let store = Store::open(&path).unwrap();
+    drop(store);
+    // Model PR80 first: v7 owns the effort column and CAD-176 owns the next
+    // slot. Reopening must add monitors without touching the v7 contract.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE monitor_alerts;
+         DROP TABLE monitor_tasks;
+         DROP TABLE monitors;
          UPDATE schema_version SET version=7;",
     )
     .unwrap();
@@ -18983,10 +19017,18 @@ fn monitor_migration_follows_provider_effort_v7() {
     let store = Store::open(&path).unwrap();
     assert!(store.monitors().unwrap().is_empty());
     let conn = rusqlite::Connection::open(&path).unwrap();
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(agents)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, 8);
+    assert!(columns.iter().any(|column| column == "effort"));
 }
 
 #[test]

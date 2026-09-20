@@ -33,9 +33,11 @@ Implement the smallest daemon-owned supervision slice that is absent from PR #71
   scope, matching open project binding, acceptance text, a live idle
   actor, no approval/queue/competing-work conflict, and readiness where
   gated. Retries reuse an existing live kickoff through the current
-  idempotent dispatch transaction; the periodic observer never dispatches.
-- **AC-006**: Focused integration tests cover v8 migration after a
-  post-PR80 v7 store, persistent coverage/heartbeat/alert dedupe/restart,
+  idempotent dispatch transaction. This is an explicit caller handoff, not
+  autonomous backlog selection; the periodic observer never dispatches.
+- **AC-006**: Focused integration tests cover both migration orders (the
+  monitor v8 bridge from a pre-PR80 v6 store and monitor v8 after a PR80 v7
+  store), persistent coverage/heartbeat/alert dedupe/restart,
   acknowledgement, and guarded dispatch. Ops owns the full suite and
   rollout review.
 
@@ -126,7 +128,10 @@ Implement the smallest daemon-owned supervision slice that is absent from PR #71
 - **TEST-005**: Acknowledge one alert and verify it remains durable with an explicit acknowledgement event.
 - **TEST-006**: Dispatch a covered eligible task once, repeat the request, and verify the existing kickoff ID/deduplication behavior is preserved.
 - **TEST-007**: Verify explicit dispatch rejects absent acceptance, missing project binding, fenced/dead/native-busy/approval-gated workers, and competing unfinished work without enqueueing a message.
-- **TEST-008**: Run `cargo fmt --all -- --check`, focused `cargo clippy --all-targets --all-features -- -D warnings`, and the focused integration test filter under the admitted build constraints.
+- **TEST-008**: Exercise both v6→v8 and v7→v8 upgrade orders, then run
+  `cargo fmt --all -- --check`, focused `cargo clippy --all-targets
+  --all-features -- -D warnings`, and the focused integration test filter
+  under the admitted build constraints.
 
 ## 7. Risks & Assumptions
 

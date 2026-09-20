@@ -785,12 +785,23 @@ impl Store {
         }
         if version < 8 {
             // v8: daemon-owned supervision registrations. PR #80 owns v7
-            // for provider-confirmed effort, so this remains safe when that
-            // migration lands before CAD-176. Coverage is a separate table
-            // so the observer never expands a project name
-            // into implicit task membership. Alert uniqueness binds one
-            // monitor to one observed event fingerprint across restarts.
+            // for provider-confirmed effort. Preserve that v7 schema contract
+            // when CAD-176 lands first: a later v7 migration will be skipped
+            // at version 8, so the prerequisite column must already exist.
+            // This bridge carries schema compatibility only; provider effort
+            // reporting remains owned by v7. Coverage is a separate table so
+            // the observer never expands a project name into implicit task
+            // membership. Alert uniqueness binds one monitor to one observed
+            // event fingerprint across restarts.
+            let agent_columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(agents)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
             let tx = conn.unchecked_transaction()?;
+            if !agent_columns.iter().any(|column| column == "effort") {
+                tx.execute_batch("ALTER TABLE agents ADD COLUMN effort TEXT")?;
+            }
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS monitors(
                     id TEXT PRIMARY KEY,
