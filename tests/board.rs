@@ -6143,6 +6143,108 @@ fn memory_load_errors_surface_in_cli_and_api() {
     );
 }
 
+/// An absent memory dir is a valid empty store; a path that exists
+/// but cannot be enumerated (here: a file where the dir should be)
+/// is an explicit load error — never silently empty.
+#[test]
+fn memory_absent_dir_empty_unreadable_dir_errors() {
+    let (_t, pm, state, _repo) = mem_fx();
+
+    // Absent: `mem` has no memory/ dir yet — clean empty, no errors.
+    let (ok, out, err) = cli_out_err(&pm, &state, &["memory", "ls", "--project", "mem", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["memories"].as_array().unwrap().len(), 0, "{v}");
+    assert_eq!(v["load_errors"].as_array().unwrap().len(), 0, "{v}");
+
+    // A file where the dir should be: read_dir fails ENOTDIR → error.
+    std::fs::write(pm.join("mem/memory"), "not a dir").unwrap();
+    let (ok, out, err) = cli_out_err(&pm, &state, &["memory", "ls", "--project", "mem", "--json"]);
+    assert!(ok, "{err}");
+    let v: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["memories"].as_array().unwrap().len(), 0, "{v}");
+    let errs = v["load_errors"].as_array().unwrap();
+    assert_eq!(errs.len(), 1, "{v}");
+    assert!(errs[0].as_str().unwrap().contains("cannot list"), "{v}");
+    assert!(err.contains("failed to load"), "{err}");
+
+    // The API surfaces the same split — HTTP stays 200, the error is
+    // in-band next to the (empty) records.
+    let (port, _ui) = spawn_ui(&pm, &state);
+    let host = format!("127.0.0.1:{port}");
+    let (status, body) = http(port, "GET", "/api/memories?project=mem", &host);
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["memories"].as_array().unwrap().len(), 0, "{v}");
+    assert!(
+        v["memory_errors"][0]
+            .as_str()
+            .unwrap()
+            .contains("cannot list"),
+        "{v}"
+    );
+}
+
+/// A hand-edited over-complex path glob bypasses write-time
+/// validation — so load quarantines it with an error before matching
+/// can ever run it. Valid siblings still list and match.
+#[test]
+fn memory_overcomplex_glob_quarantined_at_load() {
+    let (_t, pm, state, _repo) = mem_fx();
+    let (ok, out) = propose(&pm, &state, "good-rule", "rule", &["--scope-project"]);
+    assert!(ok, "{out}");
+    let (ok, out) = accept(&pm, &state, "good-rule");
+    assert!(ok, "{out}");
+    // The evil file is accepted and project-scoped — it would match
+    // everything; its hand-edited glob quarantines it instead.
+    std::fs::write(
+        pm.join("mem/memory/evil-glob.md"),
+        "---\nid: evil-glob\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nscope:\n  project: true\n  paths:\n    - \"**a**a**a**\"\n---\nfact\n\n**Why:** w\n\n**How to apply:** h\n",
+    )
+    .unwrap();
+
+    let (ok, out) = mem_cli(&pm, &state, &["ls", "--project", "mem", "--json"]);
+    assert!(ok, "{out}");
+    let slugs: Vec<&str> = out["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(slugs, vec!["good-rule"], "{out}");
+    let errs = out["load_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(errs.contains("evil-glob"), "{errs}");
+    assert!(errs.contains("too complex"), "{errs}");
+    assert!(errs.contains("quarantined"), "{errs}");
+
+    // Match — `evil-glob` never reaches glob_match; the good rule
+    // still applies. The test completing is the bounded-execution
+    // proof (a matched `**a**a**a**` could otherwise hang).
+    let (ok, out) = mem_cli(&pm, &state, &["match", "--path", "src/x.rs", "--json"]);
+    assert!(ok, "{out}");
+    let slugs: Vec<&str> = out["matched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(slugs, vec!["good-rule"], "{out}");
+    assert!(
+        out["load_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("evil-glob")),
+        "{out}"
+    );
+}
+
 /// Lint bounds the fact block in bytes, not just lines, and refuses
 /// path scopes whose `**` recursion could backtrack exponentially.
 #[test]

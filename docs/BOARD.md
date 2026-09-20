@@ -472,17 +472,25 @@ Injection happens in two places:
   and `lessons_file` in the JSON. `--no-lessons` skips it; `--job`
   kickoffs are daemon-templated and never carry the file. Memory
   failures degrade, never sink the dispatch (the worktree already
-  exists): a file that fails matching, an unwritable lessons file, or
-  a suffix that would push the kickoff body over the pty cap all yield
-  no lessons and a `lessons_error` string naming the reason.
+  exists): a memory file that fails to load is excluded and named
+  while valid lessons still inject, and an unwritable lessons file or
+  a suffix that would push the kickoff body over the pty cap drops the
+  file — every case carries a `lessons_error` string naming the
+  reason. The lessons file is written via tmp + rename, so a failed
+  write never leaves a partial artifact.
 - `agent bootstrap`/`join` briefings gain a
   `## Project memory — accepted rules (<project>)` section listing the
   project's accepted `rule`s for the worker's cwd — ≤ 8 entries and
-  ≤ 4 KiB, same bound as the dispatch lessons file.
+  ≤ 4 KiB, same bound as the dispatch lessons file. An over-budget
+  rule is skipped, not a stop; omitted rules are counted.
 
 Memory readers skip files that fail to load and report them: `ls`,
 `ls --stale` and `match` warn once on stderr and include `load_errors`
-in `--json`; the API returns `memory_errors`.
+in `--json`; the API returns `memory_errors`. An absent `memory/` dir
+is a valid empty store; a directory that exists but cannot be
+enumerated is a load error. Write-time glob bounds are re-applied at
+load — a hand-edited over-complex path scope is quarantined with an
+error before it can reach matching.
 
 Staleness: `ls --stale` flags an accepted memory not verified within
 the `--days` window (30 default), or whose path globs match files
