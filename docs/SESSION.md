@@ -315,14 +315,21 @@ In this order:
    message on an inbox or dead owner does not block. Deletion is
    commit-bound: the local `branch -D` fires only when the branch tip
    still equals the commit the merge/push evidence covered, and
-   `--remote` deletes `origin/<branch>` only when merge evidence
-   covers the resolved remote tip — an unmerged or origin-ahead
-   remote keeps BOTH copies (the row's `remote_note`/`branch_note`
-   say why), and `--force` deletes the remote anyway and records a
-   `remote-delete-uncovered` override. `--force` never deletes a tip
-   no evidence covers. A finish that raced a dispatch or a ref
-   change refuses with "retry" (nothing retries automatically — the
-   sweep records the row `refused` and exits 1); just rerun it. To
+   `--remote` fetches `origin/<branch>` first and deletes only when
+   merge evidence covers the FETCHED remote tip — an unmerged or
+   origin-ahead remote keeps BOTH copies (the row's
+   `remote_note`/`branch_note` say why). The delete is leased on the
+   fetched tip (`push --force-with-lease`), so a remote that moved
+   since the fetch refuses the push rather than losing commits this
+   host never saw. `--force` deletes the remote anyway and records a
+   `remote-delete-uncovered` override, but never deletes a tip no
+   evidence covers. A daemon that is simply not running (no socket)
+   is "no agents" — the /proc and pane scans carry the check and a
+   clean merged worktree finishes without `--force`; a stale socket
+   is a daemon that stopped answering and still refuses. A finish
+   that raced a dispatch or a ref change refuses with "retry"
+   (nothing retries automatically — the sweep records the row
+   `refused` and exits 1); just rerun it. To
    clear everything at once after a batch of merges: `cadence issue
    finish --merged --dry-run` prints the plan, then `cadence issue
    finish --merged --remote` finishes every merged+idle worktree in

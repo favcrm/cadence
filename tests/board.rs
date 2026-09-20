@@ -4078,8 +4078,10 @@ fn issue_finish_daemon_down_force_and_idempotent() {
     let wt = repo.join(".cadence/wt/d-1-done");
     assert!(wt.is_dir());
 
-    // Owner 'operator' (start filled it) can't be checked — the
-    // daemon is down and finish refuses rather than guessing.
+    // A stale socket is a daemon that was there and stopped answering
+    // — owner 'operator' can't be checked and finish refuses rather
+    // than guessing.
+    std::fs::write(state.join("cadence.sock"), "stale").unwrap();
     let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-1"]);
     assert!(!ok, "{err}");
     let msg = err["error"].as_str().unwrap();
@@ -4121,6 +4123,18 @@ fn issue_finish_daemon_down_force_and_idempotent() {
     assert!(front.contains("closed: true"), "{front}");
     assert!(front.contains("status: doing"), "status untouched: {front}");
 
+    // A cleanly stopped daemon removes its socket — that means "no
+    // agents", not "unreachable": the /proc and pane scans carry the
+    // check and a clean merged worktree finishes without --force.
+    std::fs::remove_file(state.join("cadence.sock")).unwrap();
+    assert!(cli(&pm, &state, &["issue", "new", "Idle", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-2"]).0);
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-2"]);
+    assert!(
+        ok && out["finished"] == true && out["overrode"] == json!([]),
+        "no daemon at all must not block a clean finish: {out}"
+    );
+
     // Second finish is a no-op, not an error.
     let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1"]);
     assert!(ok, "{out}");
@@ -4128,16 +4142,16 @@ fn issue_finish_daemon_down_force_and_idempotent() {
 
     // An issue never started has nothing to finish.
     assert!(cli(&pm, &state, &["issue", "new", "Never", "--project", "demo"]).0);
-    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-2"]);
+    let (ok, err) = cli(&pm, &state, &["issue", "finish", "D-3"]);
     assert!(!ok && err["error"].as_str().unwrap().contains("nothing to finish"));
 
     // --keep-branch leaves the local branch but still closes the refs.
     assert!(cli(&pm, &state, &["issue", "new", "Keep", "--project", "demo"]).0);
-    assert!(cli(&pm, &state, &["issue", "start", "D-3"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-4"]).0);
     let (ok, out) = cli(
         &pm,
         &state,
-        &["issue", "finish", "D-3", "--force", "--keep-branch"],
+        &["issue", "finish", "D-4", "--force", "--keep-branch"],
     );
     assert!(
         ok && out["kept_branch"] == true && out["deleted_branch"] == false,
@@ -4146,7 +4160,7 @@ fn issue_finish_daemon_down_force_and_idempotent() {
     assert!(
         git(
             &repo,
-            &["rev-parse", "--verify", "--quiet", "cadence/d-3-keep"]
+            &["rev-parse", "--verify", "--quiet", "cadence/d-4-keep"]
         )
         .0
     );
@@ -4233,6 +4247,32 @@ fn issue_finish_dirty_and_unmerged_refusals() {
         .0
     );
     assert_eq!(commits(&pm), before + 1);
+
+    // Unmerged but pushed: a plain finish (no --remote) leaves the
+    // remote alone, so the pushed copy IS the survivability evidence
+    // — the local branch is deleted, not kept.
+    assert!(cli(&pm, &state, &["issue", "new", "Pushd", "--project", "demo"]).0);
+    assert!(cli(&pm, &state, &["issue", "start", "D-2"]).0);
+    assert!(cli(&pm, &state, &["issue", "set", "D-2", "owner="]).0);
+    let wt2 = repo.join(".cadence/wt/d-2-pushd");
+    std::fs::write(wt2.join("p.txt"), "x").unwrap();
+    git(&wt2, &["add", "-A"]);
+    git(&wt2, &["commit", "-qm", "pushed work"]);
+    let tip = git(&repo, &["rev-parse", "cadence/d-2-pushd"]).1;
+    git(
+        &repo,
+        &[
+            "update-ref",
+            "refs/remotes/origin/cadence/d-2-pushd",
+            tip.trim(),
+        ],
+    );
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-2"]);
+    assert!(
+        ok && out["finished"] == true && out["deleted_branch"] == true,
+        "pushed evidence alone still deletes the local on a plain finish: {out}"
+    );
+    assert!(!wt2.exists());
 }
 
 /// Drop the recorded owner (and commit the edit) so `issue finish`

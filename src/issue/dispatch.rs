@@ -188,7 +188,11 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     // nothing, say so. The ref label names the worker it went to, so
     // a re-dispatch to a DIFFERENT worker is still caught.
     let mut live: Option<Value> = None;
-    for r in front.refs.iter().filter(|r| r.kind == "message") {
+    for r in front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "message" && r.closed != Some(true))
+    {
         let Some(mid) = r.path.as_deref() else {
             continue;
         };
@@ -311,6 +315,12 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         actor,
     )?;
     let send_failed = |e: Error| -> Error {
+        // The ref recorded pre-send is an orphan — no live message
+        // will ever carry `mid`. Close it so it stays history without
+        // counting as a binding (or a mid-finish "dispatch recorded"
+        // stale reason) for a concurrent finish; best-effort — the
+        // send error is the one that matters.
+        let _ = write::close_ref(pm, id, "message", &mid, actor);
         let _ = write::add_comment(
             pm,
             id,

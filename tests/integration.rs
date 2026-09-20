@@ -13795,16 +13795,37 @@ fn dispatch_records_ref_before_send() {
     ]);
     assert!(!ok, "{err}");
 
-    // The binding landed anyway — before the send.
+    // The binding landed anyway — before the send — and the failed
+    // send closed it: kept as history, never a live binding.
     let issue = cli(&["issue", "show", "D-1", "--json"]).1;
-    let mid = issue["refs"]
+    let mref = issue["refs"]
         .as_array()
         .unwrap()
         .iter()
         .find(|r| r["kind"] == "message")
-        .and_then(|r| r["path"].as_str().map(String::from))
         .expect("the message ref must be recorded before the send");
+    let mid = mref["path"].as_str().unwrap().to_string();
     assert!(!mid.is_empty());
+    assert_eq!(
+        mref["closed"], true,
+        "a failed send closes its orphan ref: {issue}"
+    );
+    // A second dispatch is not a duplicate — the closed ref is not a
+    // live kickoff, so the retry sends fresh rather than refusing.
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-1",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(
+        ok && out["dispatched"] == true,
+        "the closed orphan must not read as an in-flight dispatch: {out}"
+    );
 
     // A stale ref binds nothing: the forced finish still works and
     // the dead ref never becomes a bound-message block.
@@ -14087,28 +14108,33 @@ fn finish_guard_per_worktree() {
     git(&wt_g, &["commit", "-qm", "g work"]);
     git(&repo, &["merge", "-q", "cadence/d-5-ghost"]);
     // The probe runs WITHOUT the pm lock: with the lock file held, a
-    // daemon-down finish still returns the owner-check refusal — it
-    // never waits on (or times out against) the lock.
+    // stale-socket daemon (it was there and stopped answering) still
+    // returns the unreachable refusal — it never waits on (or times
+    // out against) the lock.
     std::fs::write(pm_dir.join(".write.lock"), "held").unwrap();
     let dead_state = tmp.path().join("deadstate");
     std::fs::create_dir_all(&dead_state).unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .arg("--state-dir")
-        .arg(&dead_state)
-        .args(["issue", "finish", "D-5"])
-        .env("CADENCE_PM_DIR", &pm_dir)
-        .env("HOME", &home)
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .env_remove("CADENCE_ALIAS")
-        .output()
-        .unwrap();
+    std::fs::write(dead_state.join("cadence.sock"), "stale").unwrap();
+    let cli_on = |state_dir: &Path, args: &[&str]| -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(state_dir)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap()
+    };
+    let out = cli_on(&dead_state, &["issue", "finish", "D-5"]);
     std::fs::remove_file(pm_dir.join(".write.lock")).unwrap();
     let text = format!(
         "{}{}",
@@ -14120,12 +14146,29 @@ fn finish_guard_per_worktree() {
         text.contains("unreachable") && !text.contains("locked"),
         "the probe must not wait on the pm lock: {text}"
     );
-    let (ok, out) = cli(&["issue", "finish", "D-5"]);
+    // A cleanly stopped daemon removes its socket: the same finish on
+    // a socket-less state dir is "no agents", and the /proc + pane
+    // scans carry the check — no --force needed.
+    std::fs::remove_file(dead_state.join("cadence.sock")).unwrap();
+    let out = cli_on(&dead_state, &["issue", "finish", "D-5", "--json"]);
+    let nod = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
-        ok && out["finished"] == true && out["overrode"] == json!([]),
+        out.status.success(),
+        "no daemon at all must not block a clean merged finish: {nod}"
+    );
+    let out: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert!(
+        out["finished"] == true && out["overrode"] == json!([]),
         "unknown owner must not block: {out}"
     );
     assert!(!wt_g.exists());
+    // A second finish is the idempotent no-op.
+    let (ok, out) = cli(&["issue", "finish", "D-5"]);
+    assert!(ok && out["finished"] == false, "already finished: {out}");
 
     // D-6: a bound live message must be found on the agent that
     // HOLDS it, not only the current owner — re-assigning the issue
@@ -14398,41 +14441,72 @@ fn finish_merged_sweep() {
     // A ghost owner the daemon has never heard of is ABSENT, not
     // unreachable — the row would finish.
     assert_eq!(outcome("D-5").0, "would-finish", "{plan}");
-    // …and the fail-open the round-2 review closed: with NO daemon at
-    // all the same rows refuse — the enumeration itself could not be
-    // completed, so a bound task could hide anywhere.
+    // …and the fail-open the round-2 review closed, now split by how
+    // the daemon is absent. A STALE socket — a daemon that was there
+    // and stopped answering — still refuses the enumeration: a bound
+    // task could hide anywhere. No socket at all is a cleanly stopped
+    // daemon: "no agents", and the /proc + pane scans carry the check.
     let dead_state = tmp.path().join("deadstate");
     std::fs::create_dir_all(&dead_state).unwrap();
-    let dead = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .arg("--state-dir")
-        .arg(&dead_state)
-        .args(["issue", "finish", "--merged", "--dry-run", "--json"])
-        .env("CADENCE_PM_DIR", &pm_dir)
-        .env("HOME", &home)
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
+    std::fs::write(dead_state.join("cadence.sock"), "stale").unwrap();
+    let sweep_on = |state_dir: &Path| -> (i32, Value) {
+        let dead = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(state_dir)
+            .args(["issue", "finish", "--merged", "--dry-run", "--json"])
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            dead.status.code().unwrap_or(-1),
+            serde_json::from_str(String::from_utf8_lossy(&dead.stdout).trim()).unwrap_or_else(
+                |_| {
+                    panic!(
+                        "not json: {}{}",
+                        String::from_utf8_lossy(&dead.stdout),
+                        String::from_utf8_lossy(&dead.stderr)
+                    )
+                },
             ),
         )
-        .env_remove("CADENCE_ALIAS")
-        .output()
-        .unwrap();
-    assert_eq!(dead.status.code(), Some(1));
-    let dead_plan: Value =
-        serde_json::from_str(String::from_utf8_lossy(&dead.stdout).trim()).unwrap();
+    };
+    let (code, dead_plan) = sweep_on(&dead_state);
+    assert_eq!(code, 1);
     let dead_rows = dead_plan["rows"].as_array().unwrap();
-    let d1 = dead_rows.iter().find(|r| r["issue"] == "D-1").unwrap();
-    assert_eq!(d1["outcome"], "refused", "{dead_plan}");
-    assert!(
-        d1["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("unreachable"),
-        "a dead daemon refuses the enumeration: {dead_plan}"
-    );
+    for id in ["D-1", "D-5"] {
+        let row = dead_rows.iter().find(|r| r["issue"] == id).unwrap();
+        assert_eq!(row["outcome"], "refused", "{dead_plan}");
+        assert!(
+            row["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unreachable"),
+            "a stale-socket daemon refuses the enumeration: {dead_plan}"
+        );
+    }
+    // The same rows on a socket-less dir — the daemon is simply not
+    // running, so nothing enumerates and nothing refuses for it.
+    std::fs::remove_file(dead_state.join("cadence.sock")).unwrap();
+    let (code, gone_plan) = sweep_on(&dead_state);
+    assert_eq!(code, 1, "{gone_plan}"); // D-2/D-4 still refuse on their own
+    let gone_rows = gone_plan["rows"].as_array().unwrap();
+    for id in ["D-1", "D-5"] {
+        let row = gone_rows.iter().find(|r| r["issue"] == id).unwrap();
+        assert_eq!(
+            row["outcome"], "would-finish",
+            "no daemon at all means no agents — {id} is clean: {gone_plan}"
+        );
+    }
     // Nothing changed: dirs exist, refs open, tracker untouched.
     for slug in [
         "d-1-merged",
@@ -14514,6 +14588,7 @@ fn finish_merged_sweep() {
         "Remoteunm",
         "Remoteahead",
         "Remoteforce",
+        "Remotestale",
     ] {
         assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
     }
@@ -14659,7 +14734,7 @@ fn finish_merged_sweep() {
         .unwrap()
         .to_string();
     git(&repo, &["remote", "set-url", "origin", &remote_s]);
-    for id in ["D-9", "D-10", "D-11", "D-12"] {
+    for id in ["D-9", "D-10", "D-11", "D-12", "D-13"] {
         let (ok, out) = cli(&["issue", "start", id]);
         assert!(ok, "{out}");
         let (ok, _) = cli(&["issue", "set", id, "owner="]);
@@ -14798,6 +14873,52 @@ fn finish_merged_sweep() {
         "--force deletes the uncovered remote and records it: {out}"
     );
     assert!(!remote_has("d-12-remoteforce"));
+
+    // D-13: the tracking ref is stale — synced at tip A, then the
+    // SERVER advanced the branch to B while refs/remotes/origin still
+    // names A. The pre-delete fetch must reveal B; the stale tracking
+    // ref can never prove coverage. Remote kept, B survives, and the
+    // row explains.
+    commit_in("d-13-remotestale", "r13.txt");
+    let tip13a = sha(&repo, "cadence/d-13-remotestale");
+    push("d-13-remotestale");
+    git(&repo, &["merge", "-q", "cadence/d-13-remotestale"]);
+    git(&wt("d-13-remotestale"), &["checkout", "-q", "-b", "scr13"]);
+    commit_in("d-13-remotestale", "ahead.txt");
+    let tip13b = sha(&repo, "scr13");
+    git(
+        &wt("d-13-remotestale"),
+        &[
+            "push",
+            "-q",
+            "origin",
+            "scr13:refs/heads/cadence/d-13-remotestale",
+        ],
+    );
+    git(
+        &wt("d-13-remotestale"),
+        &["checkout", "-q", "cadence/d-13-remotestale"],
+    );
+    // Push updated the tracking ref to B — force it back to A, the
+    // stale view a fetch must correct before the gate reads it.
+    track("d-13-remotestale", &tip13a);
+    let (ok, out) = cli(&["issue", "finish", "D-13", "--remote"]);
+    assert!(
+        ok && out["finished"] == true
+            && out["deleted_branch"] == true
+            && out["remote_deleted"] == false
+            && out["remote_note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("kept"),
+        "a stale tracking ref must not authorize remote deletion: {out}"
+    );
+    assert!(remote_has("d-13-remotestale"), "B must survive: {out}");
+    assert_eq!(
+        sha(&remote_git, "refs/heads/cadence/d-13-remotestale"),
+        tip13b,
+        "the server-side advance survives intact"
+    );
 }
 
 /// `dispatch` renders matching accepted memories into

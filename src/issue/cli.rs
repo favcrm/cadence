@@ -183,13 +183,17 @@ pub enum IssueAction {
         /// never retargets a stale probe or deletes uncovered work.
         #[arg(long, conflicts_with = "merged")]
         force: bool,
-        /// Remove the worktree but keep the local branch.
+        /// Remove the worktree but keep the local branch — with
+        /// --remote the remote branch is still deleted when its
+        /// evidence gate passes.
         #[arg(long, conflicts_with = "merged")]
         keep_branch: bool,
-        /// Also delete the remote branch — only when merge evidence
-        /// covers the resolved `origin/<branch>` tip (unmerged or
+        /// Also delete the remote branch — the remote tip is fetched
+        /// fresh and must be covered by merge evidence (unmerged or
         /// origin-ahead branches keep both copies, noted in the row;
-        /// --force deletes anyway and records it).
+        /// --force deletes anyway and records it). The delete is
+        /// leased on the fetched tip: a remote that moved since
+        /// refuses the push rather than losing unseen commits.
         #[arg(long)]
         remote: bool,
         /// Sweep every merged+idle worktree in scope — one row per
@@ -644,6 +648,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 *remote,
                 "",
                 state_dir,
+                None,
             )?);
             Ok(0)
         }
