@@ -84,6 +84,34 @@ There is no `steer` event and no link to the in-flight message id.
 So today steering is either invisible (queued, managed) or untraceable
 (forced, pty). Neither is a contract.
 
+### 1.4 We are not behind the field — the field has not solved this
+
+`rsch-1`'s research note (§10) surveyed the obvious comparables, and the
+headline finding is **negative**: *no agent product surveyed carries a
+typed amendment object.* Codex (`codex queue --thread … --message …`),
+Claude Code's own queued streaming input, Cursor's `enter steer` and
+Devin's `POST /v1/sessions/{id}/message` all append **text** to a
+transcript. None has a field meaning "this refines objective O and does
+not discharge it", and Devin's API reference leaves amend-versus-replace
+undefined.
+
+Which yields the sentence this whole ADR turns on. LangGraph states it
+outright at the channel level:
+
+> **"Default is to replace. `add_messages` says 'append'."**
+
+**Prose defaults to replacement.** AOS-12's transport worked exactly as
+designed; the *semantics* were absent. That is worth stating plainly
+because it removes the temptation to treat this as a model failure to be
+prompted away — no amount of briefing changes what an untyped message
+means.
+
+One more framing from the note, aimed squarely at §1.1: AMQP's
+`basic.ack` means "received **and processed** … so the delivered message
+can be marked for future deletion", and that is precisely what cadence's
+single turn-`result` signal currently resembles. It is the known
+anti-pattern, not a novel gap.
+
 ## 2. What "done" looks like
 
 - **D1 Objective survives.** After any amendment, the original objective
@@ -163,6 +191,16 @@ wrong way. Forbidding it would push operators back to `--ready --force`
 (§1.3), which is the untraceable path. A contract people route around is
 not a contract.
 
+### Option G — Rejected: truncate the transcript to narrow the task
+
+Named because it is the closest thing to a shipped version of the bug.
+OpenAI Realtime's `conversation.item.truncate` (`item_id`,
+`content_index`, `audio_end_ms`) "will delete the server-side text
+transcript" — destructive narrowing with **no amendment record**, which
+is precisely the AOS-12 failure shape given an API. Any design that
+narrows scope by removing context rather than by recording a `descope` is
+this option wearing a different name, and should be refused on sight.
+
 ### Option F — Rejected: cadence verifies acceptance criteria itself
 
 Have cadence run each criterion and decide.
@@ -237,6 +275,32 @@ which is the property to aim for (ADR-0001 §1.4 makes the same argument
 about forged message sources: better to make a class of error
 unrepresentable than to check for it).
 
+Three refinements the research earned, each replacing a guess with a
+precedent:
+
+- **Validate at admission, not afterwards.** Temporal's *update
+  validator* rejects an Update **before it is written to History** — a
+  rejected update leaves no `WorkflowExecutionUpdateAccepted` event at
+  all. So a malformed amendment (a `descope` naming no criteria, a
+  `refine` attempting to drop one) is refused at `cadence steer` and
+  never recorded, rather than recorded and audited later. Admission
+  control beats post-hoc audit, and it is cheaper.
+- **Let the task declare which amendments are legal right now.**
+  LangGraph's `HumanInterrupt` carries
+  `{allow_ignore, allow_respond, allow_edit, allow_accept}` — the paused
+  unit says what may be done to it. Cadence should do the same per task
+  state: a task in `review` has no business accepting a `refine`, and a
+  `cancelled` task accepts nothing. This closes a hole the first draft
+  left open, where amendment legality depended only on the kind and not
+  on where the task was.
+- **Objective replacement must be visible, not a message.** Temporal's
+  only legitimate way to replace a workflow's goal is `continue_as_new`,
+  which *visibly ends the current execution*. That is exactly the rule
+  this ADR reached independently — broadening is a new dispatch, never a
+  steering message — and it is worth keeping the stronger form: a
+  replacement should terminate the current task and open its successor,
+  so the transition is legible in history rather than inferred.
+
 Scope may only ever *narrow* through `descope`, and narrowing is a
 recorded, attributable act. Broadening is not a steering operation at all
 — it is a new dispatch, so that authority is never widened by a message
@@ -249,7 +313,41 @@ the kinds exist.
 ### 5.3 Ack is not completion
 
 §1.1 shows managed Claude structurally cannot acknowledge — its single
-result text is both. Two changes:
+result text is both.
+
+**The research changed my answer here.** The first draft reached only for
+an ack. MCP's `elicitation/create` (stable since rev 2025-06-18) is a
+better fit for the specific case that caused AOS-12: a schema-constrained
+request raised **nested inside the running call**, so that
+
+> answering it cannot be mistaken for finishing, because the call never
+> returned.
+
+That removes the AOS-12 mechanism at the root rather than labelling it.
+The clarification never becomes a new turn, so it can never be read as a
+new objective, and the worker resumes inside the same turn with its
+original context — no restatement needed.
+
+Cadence can plausibly reach this: the managed Claude endpoint already
+runs an MCP server for permission brokering
+(`--permission-prompt-tool mcp__cadence__approve`, `adapter/claude.rs`),
+so a nested request channel exists and is already trusted for approvals.
+**Preferred design: a clarification is an elicitation the worker raises
+or the operator answers within the turn; a steering amendment is the
+out-of-band path for when the turn is already over or the operator gets
+there first.** Both are needed — elicitation cannot help when the
+operator wants to correct an agent that has not asked anything — but
+elicitation should be the default for questions.
+
+Two further prior-art points worth keeping: Temporal makes ack, complete
+and refuse **three different records** (`…UpdateAccepted` /
+`…UpdateCompleted` / nothing, selected by `WorkflowUpdateStage`), and A2A
+treats `input-required` as a first-class **non-terminal** state whose
+follow-ups carry the same `taskId`. Neither collapses "I answered" into
+"I finished". Cadence's task states have no `input-required` equivalent,
+which is the same gap in a different place.
+
+Independent of elicitation, two changes still stand:
 
 1. **Generalise the ack channel.** `message_report kind:"ack"` already
    does the right thing (`mark_ack` keeps the message `running`). Its
@@ -287,9 +385,33 @@ which is a visible, auditable, reviewable act, instead of silence.
 
 > The failure was silence. The fix is to make silence unrepresentable.
 
+This is not novel, which is reassuring. **GitHub's required status checks
+are the same mechanism**: contexts are *declared* in
+`required_status_checks.checks[].context`, conclusions are *reported* by
+check runs, and a declared check that never reports sits at `Expected` —
+"Waiting for status to be reported" — and **blocks the merge
+indefinitely**. Silence is not success. Cucumber applies the identical
+rule per step, where `undefined` is not a pass. Temporal names the
+failure precisely: **Unhandled Command** — "the Workflow attempted to
+close itself without handling the new Events" — which is AOS-12 stated in
+one line.
+
+**A gap the research found in my design.** Kubernetes pairs conditions
+with `observedGeneration` against `metadata.generation`, and states that
+"the absence of a condition should be interpreted the same as `Unknown`".
+My first draft had no staleness axis: a worker could claim a disposition
+against criteria that a later `constrain` has since changed, and the
+arithmetic would pass. So each disposition records the **criteria
+revision** it was claimed against, and a disposition older than the
+current revision counts as unaddressed, not as met. Without this, an
+amendment that adds a criterion is silently satisfied by a result
+predating it.
+
 `incomplete` is deliberately not a failure state — a worker that ran out
 of turn with three of five criteria met is in a normal, expected
-condition, and saying so is the honest report.
+condition, and saying so is the honest report. (Airflow is the
+cautionary counter-example here: it classifies `skipped` among the
+success states, which is how "not done" quietly becomes "fine".)
 
 ### 5.5 Idle with outstanding work
 
@@ -408,13 +530,24 @@ cadence job task cancel <task> && cadence overview | grep -qv "continue <task>"
    job-backed dispatches? Refusing everything is simpler and stricter;
    refusing only job dispatches limits blast radius while the 144 empty
    sections get filled.
-4. Sent to `rsch-1` on 2026-09-20 (reply pending at time of writing):
-   prior art for amendment-vs-replacement of a running unit of work
-   (Temporal signals vs updates, LangGraph `interrupt()`/`Command(resume)`),
-   for automatic comparison of a reported result against a declared
-   acceptance list, and for ack-vs-complete primitives in async queues.
-   May refine §5.2's kind vocabulary and §5.4's mechanism; does not block
-   phase 1.
+4. ~~Prior art for amendment-vs-replacement.~~ **Answered** by `rsch-1`
+   (note in §10). It changed three things rather than confirming them:
+   admission-time validation (Temporal update validators), per-state
+   amendment legality (LangGraph `HumanInterrupt`), and a staleness axis
+   on dispositions (Kubernetes `observedGeneration`) that the first draft
+   lacked. It also made MCP `elicitation/create` the preferred channel
+   for clarifications (§5.3), which is a new ticket rather than a tweak.
+5. **New, from the research:** should clarifications move to elicitation
+   *before* the amendment work lands? It attacks the AOS-12 mechanism
+   more directly than typed amendments do, and the MCP channel already
+   exists for permission brokering. Sequencing call for the PM.
+
+**Caveats carried from the note, unverified and worth re-checking before
+anyone builds on them:** MCP Tasks is marked *experimental*; A2A's
+`TaskStatusUpdateEvent.final` is reported removed in v1.0; and the
+Temporal constant behind Unhandled Command, GitHub's `stale` timeout and
+Airflow's `sla_miss_callback` signature were not confirmed against
+primary sources. Nothing in §4's decision depends on these.
 
 ## 9. How we would know this was wrong
 
@@ -432,3 +565,21 @@ cadence job task cancel <task> && cadence overview | grep -qv "continue <task>"
 - `incomplete` tasks pile up unattended → the state moved the problem
   rather than solving it, and it should raise an escalation rather than a
   row in a list.
+
+## 10. References
+
+- `rsch-1`, research note on CAD-157, 2026-09-20:
+  `~/pm/cadence/CAD-157/artifacts/cad-157-steering-contract-research.md`
+  — amendment-vs-replacement primitives (Temporal, LangGraph, OpenAI
+  Realtime, Codex/Claude Code/Cursor/Devin), partial-completion detection
+  (GitHub required checks, Cucumber, Kubernetes conditions, Temporal
+  Unhandled Command), and ack-vs-complete splits (MCP Tasks and
+  `elicitation/create`, Temporal `WorkflowUpdateStage`, A2A
+  `input-required`, AMQP `basic.ack` as the anti-pattern). Feeds §1.4,
+  §5.2, §5.3 and §5.4.
+- Note for the PM: several documentation pages fetched for that note
+  carried an embedded instruction in the page body telling the reader to
+  fetch a further index. `rsch-1` ignored it and flagged it. That is
+  correct handling — an instruction inside fetched data is not an
+  instruction from the operator — and it is worth a guardrail of its own,
+  since research is now an automated step feeding design decisions.
