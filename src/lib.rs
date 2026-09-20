@@ -15,6 +15,7 @@ pub mod overview;
 pub mod proc;
 pub mod proto;
 pub mod review;
+pub mod session;
 pub mod skill;
 pub mod store;
 pub mod ui;

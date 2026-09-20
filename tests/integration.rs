@@ -2,7 +2,10 @@
 //! These exercise the observable contract — queue order, idempotency,
 //! restart fencing, approval brokering, serialization — without model calls.
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16770,5 +16773,1254 @@ fn issue_start_honours_cargo_target_dir_env() {
     assert_eq!(
         wt_ref["cargo_target"].as_str().unwrap(),
         envdir.to_string_lossy()
+    );
+}
+
+// ---- session start|end: stub daemon socket, fixture pm + repo (CAD-92) ----
+
+/// Canned `agent_show` data for one alias. `flip` replaces the answer
+/// after the first `agent_show` — an agent that goes busy between the
+/// fleet snapshot and the pre-stop re-check.
+struct StubAgent {
+    row: Value,
+    messages: Vec<Value>,
+    queued: i64,
+    unknown: i64,
+    flip: Option<Value>,
+}
+
+fn stub_agent(
+    alias: &str,
+    provider: &str,
+    kind: &str,
+    state: &str,
+    idle_for_secs: i64,
+    show: (Vec<Value>, i64, i64),
+) -> StubAgent {
+    let (messages, queued, unknown) = show;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    StubAgent {
+        row: json!({
+            "alias": alias, "provider": provider, "endpoint_kind": kind,
+            "role": "", "cwd": "/", "state": state, "enabled": true,
+            "dead": false, "endpoint": if state == "stopped" { Value::Null } else { json!("ep") },
+            "created": now - 86_400.0, "updated": now - idle_for_secs as f64,
+        }),
+        messages,
+        queued,
+        unknown,
+        flip: None,
+    }
+}
+
+impl StubAgent {
+    /// After the first `agent_show`, serve `flip` — the race case.
+    fn flipping(mut self, flip: Value) -> Self {
+        self.flip = Some(flip);
+        self
+    }
+    /// The agent's working directory — `--project` membership is
+    /// issue-owner first, cwd-under-repo second.
+    fn with_cwd(mut self, cwd: &Path) -> Self {
+        self.row["cwd"] = json!(cwd.to_str().unwrap_or("/"));
+        self
+    }
+}
+
+/// The daemon wire protocol on `<state>/cadence.sock` with canned
+/// answers — the session verbs under test connect exactly like they
+/// would to the real daemon. `calls` records `(method, params)` so a
+/// test can prove `--dry-run` mutated nothing and which agent a stop
+/// actually named.
+struct StubDaemon {
+    calls: Arc<Mutex<Vec<(String, Value)>>>,
+    _thread: JoinHandle<()>,
+}
+
+fn stub_daemon(state: &Path, build_commit: &str, agents: Vec<StubAgent>) -> StubDaemon {
+    std::fs::create_dir_all(state).unwrap();
+    let listener = UnixListener::bind(state.join("cadence.sock")).unwrap();
+    let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+    let calls_t = Arc::clone(&calls);
+    let rows: Vec<Value> = agents.iter().map(|a| a.row.clone()).collect();
+    let mut shows: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut flips: std::collections::HashMap<String, (Arc<Mutex<u32>>, Value)> =
+        std::collections::HashMap::new();
+    for a in agents {
+        let alias = a.row["alias"].as_str().unwrap().to_string();
+        shows.insert(
+            alias.clone(),
+            json!({
+                "agent": a.row, "messages": a.messages,
+                "queued": a.queued, "unknown": a.unknown,
+                "event_cursor": 0,
+            }),
+        );
+        if let Some(flip) = a.flip {
+            flips.insert(alias, (Arc::new(Mutex::new(0)), flip));
+        }
+    }
+    let info = json!({
+        "build_commit": build_commit,
+        "build_time": "2026-01-01T00:00:00Z",
+        "started_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 - 600,
+    });
+    let thread = thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { continue };
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                continue;
+            }
+            let req: Value = serde_json::from_str(&line).unwrap_or_default();
+            let method = req["method"].as_str().unwrap_or_default().to_string();
+            calls_t
+                .lock()
+                .unwrap()
+                .push((method.clone(), req["params"].clone()));
+            let params = &req["params"];
+            let result = match method.as_str() {
+                "health" => json!({"ok": true, "version": 1}),
+                "daemon_info" => info.clone(),
+                "agent_list" => json!({"agents": rows}),
+                "agent_show" => {
+                    let alias = params["alias"].as_str().unwrap_or_default();
+                    if let Some((n, flip)) = flips.get(alias) {
+                        let mut n = n.lock().unwrap();
+                        *n += 1;
+                        if *n >= 2 {
+                            flip.clone()
+                        } else {
+                            shows.get(alias).cloned().unwrap_or_default()
+                        }
+                    } else {
+                        shows
+                            .get(alias)
+                            .cloned()
+                            .unwrap_or_else(|| json!({"messages": [], "queued": 0, "unknown": 0}))
+                    }
+                }
+                "agent_requests" => json!({"requests": []}),
+                "agent_probe" => json!({"idle": true}),
+                "agent_stop" => json!({"alias": params["alias"], "state": "stopped"}),
+                "agent_gc" => json!({"removed": []}),
+                _ => {
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"ok": false, "error": {"kind": "rejected",
+                              "message": format!("Unknown method {method}")}})
+                    );
+                    continue;
+                }
+            };
+            let _ = writeln!(stream, "{}", json!({"ok": true, "result": result}));
+        }
+    });
+    StubDaemon {
+        calls,
+        _thread: thread,
+    }
+}
+
+fn stub_calls(sd: &StubDaemon) -> Vec<(String, Value)> {
+    sd.calls.lock().unwrap().clone()
+}
+
+/// `<pm>` with one project pointing at `repo`, one `doing` issue
+/// owned by an alias the stub does not serve, a second `doing` issue
+/// with branch+worktree refs to `repo`'s merged `.cadence/wt/tst-7-done`
+/// (what `issue start` records), and an empty notes dir. The pm dir is
+/// a git repo — `issue finish` commits ref-closures into it.
+fn seed_pm(pm: &Path, repo: &Path, notes: &Path) {
+    std::fs::create_dir_all(pm.join("tst")).unwrap();
+    std::fs::create_dir_all(notes).unwrap();
+    std::fs::write(
+        pm.join("pm.yaml"),
+        format!(
+            "schema: 1\nnotes_dir: {}\nstatuses:\n- backlog\n- ready\n- doing\n- review\n- done\n- dropped\n",
+            notes.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pm.join("tst/project.yaml"),
+        format!(
+            "key: tst\nprefix: TST\nrepos:\n- path: {}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    let issue = pm.join("tst/TST-9");
+    std::fs::create_dir_all(&issue).unwrap();
+    std::fs::write(
+        issue.join("issue.md"),
+        "---\nid: TST-9\ntitle: ghost-owned doing issue\nstatus: doing\n\
+         priority: P2\nowner: ghost-agent\ncreated: 2026-01-01T00:00:00Z\n---\n\nbody\n",
+    )
+    .unwrap();
+    let wt = repo.join(".cadence/wt/tst-7-done");
+    let done = pm.join("tst/TST-7");
+    std::fs::create_dir_all(&done).unwrap();
+    std::fs::write(
+        done.join("issue.md"),
+        format!(
+            "---\nid: TST-7\ntitle: merged worktree\nstatus: doing\npriority: P2\n\
+             created: 2026-01-01T00:00:00Z\nrefs:\n\
+             - kind: branch\n  path: cadence/tst-7-done\n\
+             - kind: worktree\n  path: {}\n---\n\nbody\n",
+            wt.display()
+        ),
+    )
+    .unwrap();
+    // `issue finish` commits the ref-closure — the pm dir must be a
+    // real git repo with an identity.
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "seed"],
+    ] {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(pm)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+}
+
+/// A git repo with a merged `cadence/tst-7-done` worktree and a plain
+/// `.cadence/wt/tst-88-ghost` dir — one merge candidate, one orphan.
+fn seed_repo(repo: &Path) {
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    std::fs::create_dir_all(repo).unwrap();
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@x"]);
+    git(&["config", "user.name", "test"]);
+    std::fs::write(repo.join("f.txt"), "x").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "init"]);
+    git(&["branch", "cadence/tst-7-done"]);
+    git(&[
+        "worktree",
+        "add",
+        ".cadence/wt/tst-7-done",
+        "cadence/tst-7-done",
+    ]);
+    std::fs::create_dir_all(repo.join(".cadence/wt/tst-88-ghost")).unwrap();
+}
+
+/// `cadence <args>` against the fixture state dir + pm dir, cwd at the
+/// fixture repo. Output captured; the stub answers daemon RPCs.
+fn run_session(state: &Path, pm: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
+    run_session_env(state, pm, cwd, args, &[])
+}
+
+/// `run_session` with extra env pairs — the host-report fixture and a
+/// stubbed `gh` on PATH ride in through here.
+fn run_session_env(
+    state: &Path,
+    pm: &Path,
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &Path)],
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
+        .arg(state)
+        .args(args)
+        .env("CADENCE_PM_DIR", pm)
+        .current_dir(cwd);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+/// `run_session` with `--host-report <fixture>` appended — the flag,
+/// never an env var, carries the fixture so an ambient environment
+/// cannot soften the gate.
+fn run_session_host(
+    state: &Path,
+    pm: &Path,
+    cwd: &Path,
+    args: &[&str],
+    host: &Path,
+    envs: &[(&str, &Path)],
+) -> std::process::Output {
+    let mut v: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+    v.push("--host-report".to_string());
+    v.push(host.display().to_string());
+    let argrefs: Vec<&str> = v.iter().map(|a| a.as_str()).collect();
+    run_session_env(state, pm, cwd, &argrefs, envs)
+}
+
+/// A clean doctor-host report on disk — `--host-report` makes the
+/// verbs read it instead of scanning the real host, so the session
+/// tests are identical on a dev box and a 97%-full CI host.
+fn clean_host(dir: &Path) -> PathBuf {
+    let f = dir.join("host-report.json");
+    std::fs::write(&f, r#"{"level":"ok","checks":[]}"#).unwrap();
+    f
+}
+
+#[test]
+fn session_start_reports_failures_and_fix_only_starts_ui() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    let repo = dir.path().join("repo");
+    seed_pm(&pm, &repo, &dir.path().join("notes"));
+    seed_repo(&repo);
+    let sd = stub_daemon(
+        &state,
+        "stale-build-000",
+        vec![
+            stub_agent(
+                "w1",
+                "fake",
+                "fake",
+                "attention",
+                700,
+                (
+                    vec![json!({"id": "m-unk", "state": "unknown", "body": "lost turn"})],
+                    0,
+                    1,
+                ),
+            ),
+            stub_agent(
+                "pm-inbox",
+                "inbox",
+                "inbox",
+                "idle",
+                700,
+                (
+                    vec![json!({"id": "k1", "state": "queued", "body": "kickoff"})],
+                    2,
+                    0,
+                ),
+            ),
+        ],
+    );
+
+    let host = clean_host(dir.path());
+    let out = run_session_host(&state, &pm, &repo, &["session", "start"], &host, &[]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(2), "expected no-go exit 2:\n{text}");
+    assert!(
+        text.contains("stale-build-000"),
+        "stale daemon build:\n{text}"
+    );
+    assert!(text.contains("m-unk"), "unknown message named:\n{text}");
+    assert!(text.contains("tst-88-ghost"), "orphan worktree:\n{text}");
+    assert!(text.contains("pm-inbox"), "unread inbox:\n{text}");
+    assert!(
+        text.contains("TST-9"),
+        "doing issue with dead owner:\n{text}"
+    );
+    // Nothing was fixed or mutated without --fix.
+    assert!(!state.join("ui.pid").exists());
+    for (m, _) in stub_calls(&sd) {
+        assert!(
+            !matches!(m.as_str(), "agent_stop" | "agent_gc"),
+            "read-only start mutated: {m}"
+        );
+    }
+
+    // --fix: a free port persisted in ui.json lets the real binary
+    // spawn `ui run`; the stub daemon must be left untouched.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    std::fs::write(state.join("ui.json"), format!("{{\"port\": {port}}}")).unwrap();
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--fix"],
+        &host,
+        &[],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !state.join("ui.pid").exists() {
+        assert!(Instant::now() < deadline, "ui never started:\n{text}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Nothing else: the daemon was reachable, so no daemon start (the
+    // log file it would create is absent) and no mutating RPCs.
+    assert!(
+        !state.join("daemon.log").exists(),
+        "daemon was started:\n{text}"
+    );
+    for (m, _) in stub_calls(&sd) {
+        assert!(
+            !matches!(m.as_str(), "agent_stop" | "agent_gc" | "agent_send"),
+            "--fix mutated: {m}"
+        );
+    }
+    let stop = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["ui", "stop"])
+        .output()
+        .unwrap();
+    assert!(stop.status.success());
+}
+
+#[test]
+fn session_end_dry_run_plans_real_run_stops_only_idle() {
+    suite_slot();
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    let repo = dir.path().join("repo");
+    seed_pm(&pm, &repo, &dir.path().join("notes"));
+    seed_repo(&repo);
+    let sd = stub_daemon(
+        &state,
+        cadence_agent::overview::BUILD_COMMIT,
+        vec![
+            stub_agent("old-idle", "fake", "fake", "idle", 7200, (vec![], 0, 0)),
+            stub_agent("fresh-idle", "fake", "fake", "idle", 60, (vec![], 0, 0)),
+            // `state: idle` with a running message — the message, not
+            // the state field, is what keeps it alive (running_msg).
+            stub_agent(
+                "idle-running",
+                "fake",
+                "fake",
+                "idle",
+                7200,
+                (
+                    vec![json!({"id": "m-ir", "state": "running",
+                             "body": "claimed mid-run", "started": 1.0})],
+                    0,
+                    0,
+                ),
+            ),
+            stub_agent(
+                "busy-one",
+                "fake",
+                "fake",
+                "busy",
+                7200,
+                (
+                    vec![json!({"id": "m-run", "state": "running",
+                             "body": "long turn", "started": 1.0})],
+                    0,
+                    0,
+                ),
+            ),
+            stub_agent(
+                "queued-one",
+                "fake",
+                "fake",
+                "idle",
+                7200,
+                (
+                    vec![json!({"id": "m-q", "state": "queued", "body": "queued"})],
+                    1,
+                    0,
+                ),
+            ),
+            stub_agent("pm-inbox", "inbox", "inbox", "idle", 7200, (vec![], 2, 0)),
+        ],
+    );
+    let host = clean_host(dir.path());
+    // A stub `gh` first on PATH: a dry run must never invoke it —
+    // the gh cache is read, not refreshed.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh_called = dir.path().join("gh-called");
+    std::fs::write(
+        bin.join("gh"),
+        format!(
+            "#!/bin/sh\necho called >> '{}'\nexit 1\n",
+            gh_called.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let envs = [("PATH", Path::new(&path_env))];
+
+    // Dry run: names the stop candidates and the merged worktree,
+    // changes nothing.
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--dry-run"],
+        &host,
+        &envs,
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("old-idle"),
+        "dry-run names idle agent:\n{text}"
+    );
+    assert!(
+        text.contains("tst-7-done"),
+        "dry-run names merged worktree:\n{text}"
+    );
+    assert!(
+        !text.contains("fresh-idle"),
+        "dry-run must not list a still-active agent:\n{text}"
+    );
+    for (m, _) in stub_calls(&sd) {
+        assert!(
+            !matches!(m.as_str(), "agent_stop" | "agent_gc"),
+            "dry-run mutated: {m}"
+        );
+    }
+    // A dry run writes nothing — no sessions/ dir, and the markdown is
+    // previewed to stdout instead.
+    let sessions = state.join("sessions");
+    assert!(
+        !sessions.exists() || std::fs::read_dir(&sessions).unwrap().next().is_none(),
+        "dry-run wrote a handoff file: {:?}",
+        sessions
+    );
+    assert!(
+        text.contains("would write") && text.contains("## open PRs"),
+        "dry-run previews the handoff, writes nothing:\n{text}"
+    );
+    // Nothing at all was written — no handoff, no gh cache, no `gh`
+    // subprocess at all.
+    assert!(
+        !gh_called.exists(),
+        "dry-run invoked gh — a dry run writes nothing, cache included"
+    );
+    assert!(
+        !state.join("overview-gh.json").exists(),
+        "dry-run wrote the gh cache"
+    );
+
+    // Real run: only the agent idle past --idle-secs is stopped.
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--idle-secs", "1800"],
+        &host,
+        &envs,
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stops: Vec<(String, Value)> = stub_calls(&sd)
+        .into_iter()
+        .filter(|(m, _)| m == "agent_stop")
+        .collect();
+    assert_eq!(stops.len(), 1, "exactly one stop:\n{text}");
+    assert_eq!(
+        stops[0].1["alias"].as_str().unwrap_or_default(),
+        "old-idle",
+        "the stop names only the idle agent:\n{text}"
+    );
+    // `idle-running` was state-idle but carries a running message —
+    // never stopped.
+    for (m, p) in stub_calls(&sd) {
+        if m == "agent_stop" {
+            assert_ne!(
+                p["alias"].as_str().unwrap_or_default(),
+                "idle-running",
+                "an agent with a running message was stopped:\n{text}"
+            );
+        }
+    }
+    assert!(
+        stub_calls(&sd).iter().any(|(m, _)| m == "agent_gc"),
+        "agent gc ran:\n{text}"
+    );
+    assert!(text.contains("old-idle"));
+    // S6: the real-run candidate count is finished+refused — the same
+    // set the dry run counts, not every sweep row incl. skips.
+    assert!(
+        text.contains("1 finished of 1 candidate(s)"),
+        "finish count uses the same set dry-run does:\n{text}"
+    );
+
+    // The handoff note landed with the required sections.
+    let sessions = state.join("sessions");
+    let notes: Vec<PathBuf> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(notes.len(), 1, "one handoff file: {notes:?}");
+    let md = std::fs::read_to_string(&notes[0]).unwrap();
+    for section in [
+        "## open PRs",
+        "## running turns",
+        "## queued kickoffs",
+        "## issues in review",
+        "## done this run",
+        "## next session first",
+    ] {
+        assert!(md.contains(section), "handoff missing {section}:\n{md}");
+    }
+    assert!(md.contains("old-idle"), "stopped agent recorded:\n{md}");
+
+    // A second real run the same day never overwrites the first.
+    let out = run_session_host(&state, &pm, &repo, &["session", "end"], &host, &envs);
+    // The host fixture is clean and nothing failed — this is a green
+    // run outright, on any host.
+    assert!(
+        out.status.success(),
+        "second end failed:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let notes: Vec<PathBuf> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(
+        notes.len(),
+        2,
+        "two handoff files, none overwritten: {notes:?}"
+    );
+}
+
+/// Round-2 B1: the initial `fleet()` snapshot is only a candidate list.
+/// If an agent turns busy between the snapshot and the stop, `session
+/// end` re-shows it and must not stop it.
+#[test]
+fn session_end_stop_race_rechecks_show() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, notes) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("notes"),
+    );
+    for d in [&state, &pm, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    seed_pm(&pm, &repo, &notes);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    // First agent_show: an idle, stop-worthy candidate. Second show —
+    // the pre-stop re-check — the agent has turned busy with a running
+    // message. No agent_stop may be issued for it.
+    let flip_show = json!({
+        "agent": {
+            "alias": "racy", "provider": "fake", "endpoint_kind": "fake",
+            "endpoint": "ep", "state": "busy", "dead": false,
+            "updated": now,
+        },
+        "messages": [{"id": "m-racy", "state": "running",
+                      "body": "dispatched mid-sweep", "started": now}],
+        "queued": 0, "unknown": 0, "event_cursor": 0,
+    });
+    let sd = stub_daemon(
+        &state,
+        cadence_agent::overview::BUILD_COMMIT,
+        vec![
+            stub_agent("racy", "fake", "fake", "idle", 7200, (vec![], 0, 0)).flipping(flip_show),
+            stub_agent("calm", "fake", "fake", "idle", 7200, (vec![], 0, 0)),
+        ],
+    );
+    let host = clean_host(tmp.path());
+    let out = run_session_host(&state, &pm, &repo, &["session", "end"], &host, &[]);
+    assert!(
+        out.status.success(),
+        "end failed:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let stops: Vec<(String, Value)> = stub_calls(&sd)
+        .into_iter()
+        .filter(|(m, _)| m == "agent_stop")
+        .collect();
+    assert_eq!(
+        stops.len(),
+        1,
+        "only the still-idle agent was stopped:\n{text}"
+    );
+    assert_eq!(
+        stops[0].1["alias"].as_str().unwrap_or_default(),
+        "calm",
+        "the raced agent must never be stopped:\n{text}"
+    );
+    assert!(
+        text.contains("racy") && text.contains("skip"),
+        "the skipped re-check is reported:\n{text}"
+    );
+    // ...once: a skipped candidate is one annotated row, not a bare
+    // candidate line plus a second `— skipped` line.
+    assert_eq!(
+        text.matches("racy").count(),
+        1,
+        "the skipped alias listed twice:\n{text}"
+    );
+    // Contract: the re-check was a second agent_show for racy.
+    let shows = stub_calls(&sd)
+        .iter()
+        .filter(|(m, p)| m == "agent_show" && p["alias"] == "racy")
+        .count();
+    assert!(
+        shows >= 2,
+        "racy was re-shown {shows}x before the stop decision"
+    );
+}
+
+/// Round-2 B3: --project scopes the finish sweep; other projects'
+/// merged worktrees are never touched.
+#[test]
+fn session_end_project_scopes_sweep() {
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, home, state) = (
+        tmp.path().join("pm"),
+        tmp.path().join("home"),
+        tmp.path().join("state"),
+    );
+    let repo_a = tmp.path().join("repo-a");
+    let repo_b = tmp.path().join("repo-b");
+    for dir in [&pm_dir, &home, &state, &repo_a, &repo_b] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    for repo in [&repo_a, &repo_b] {
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "t@t"]);
+        git(repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-qm", "init"]);
+    }
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli_raw = |args: &[&str]| -> (i32, String, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let (code, stdout, stderr) = cli_raw(args);
+        (
+            code == 0,
+            serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|_| panic!("{args:?} not json ({stderr}): {stdout}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let ra = repo_a.canonicalize().unwrap().to_str().unwrap().to_string();
+    let rb = repo_b.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "aaa", "--prefix", "A", "--repo", &ra]).0);
+    assert!(cli(&["issue", "project", "add", "bbb", "--prefix", "B", "--repo", &rb]).0);
+    assert!(cli(&["issue", "new", "one", "--project", "aaa"]).0);
+    assert!(cli(&["issue", "new", "two", "--project", "bbb"]).0);
+    for id in ["A-1", "B-1"] {
+        let (ok, out) = cli(&["issue", "start", id]);
+        assert!(ok, "{out}");
+        let (ok, _) = cli(&["issue", "set", id, "owner="]);
+        assert!(ok);
+    }
+    // A-1's owner is the second way an agent belongs to the project —
+    // cwd-under-repo is the first.
+    let (ok, out) = cli(&["issue", "set", "A-1", "owner=a-owned"]);
+    assert!(ok, "{out}");
+    let wt_a = repo_a.join(".cadence/wt/a-1-one");
+    let wt_b = repo_b.join(".cadence/wt/b-1-two");
+    for (wt, file) in [(&wt_a, "a.txt"), (&wt_b, "b.txt")] {
+        std::fs::write(wt.join(file), "x").unwrap();
+        git(wt, &["add", "-A"]);
+        git(wt, &["commit", "-qm", "work"]);
+    }
+    git(&repo_a, &["merge", "-q", "cadence/a-1-one"]);
+    git(&repo_b, &["merge", "-q", "cadence/b-1-two"]);
+    assert!(wt_a.exists() && wt_b.exists(), "fixture wts exist");
+
+    // Fleet: `a-idle` works under repo_a, `a-owned` owns A-1 outright,
+    // `b-idle` works under repo_b — all idle past the threshold.
+    let sd = stub_daemon(
+        &state,
+        cadence_agent::overview::BUILD_COMMIT,
+        vec![
+            stub_agent("a-idle", "fake", "fake", "idle", 7200, (vec![], 0, 0))
+                .with_cwd(&repo_a.canonicalize().unwrap()),
+            stub_agent("a-owned", "fake", "fake", "idle", 7200, (vec![], 0, 0)),
+            stub_agent("b-idle", "fake", "fake", "idle", 7200, (vec![], 0, 0))
+                .with_cwd(&repo_b.canonicalize().unwrap()),
+        ],
+    );
+    let host = clean_host(tmp.path());
+    let out = run_session_host(
+        &state,
+        &pm_dir,
+        &repo_a,
+        &["session", "end", "--project", "aaa"],
+        &host,
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "scoped end failed:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !wt_a.exists(),
+        "scoped run left project aaa's merged worktree"
+    );
+    assert!(wt_b.exists(), "scoped run removed project bbb's worktree");
+    // --project scopes the stops too: aaa's agents stopped, bbb's left
+    // running and reported as out-of-scope.
+    let mut stopped: Vec<String> = stub_calls(&sd)
+        .into_iter()
+        .filter(|(m, _)| m == "agent_stop")
+        .filter_map(|(_, p)| p["alias"].as_str().map(str::to_string))
+        .collect();
+    stopped.sort();
+    assert_eq!(stopped, vec!["a-idle", "a-owned"], "scoped stops:\n{text}");
+    assert!(
+        text.contains("outside project 'aaa'"),
+        "the out-of-scope agent is reported:\n{text}"
+    );
+    // `agent_gc` is fleet-wide — under --project it is skipped, and the
+    // row says so rather than overreaching into bbb's agents.
+    assert!(
+        !stub_calls(&sd).iter().any(|(m, _)| m == "agent_gc"),
+        "fleet-wide gc ran under --project:\n{text}"
+    );
+    assert!(
+        text.contains("gc is fleet-wide — skipped under --project aaa"),
+        "the gc row says which:\n{text}"
+    );
+}
+
+/// Round-2 S7 + nit: `--json` stdout is exactly one JSON document, and
+/// an unknown `--project` is rejected like `issue ls --project`.
+#[test]
+fn session_json_single_document_and_project_validation() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, notes) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("notes"),
+    );
+    for d in [&state, &pm, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    seed_pm(&pm, &repo, &notes);
+    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+    // `ui.json` seeded with a free port so `start --fix` actually starts
+    // the UI — the path that used to pollute the composed JSON.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    std::fs::write(state.join("ui.json"), format!("{{\"port\": {port}}}")).unwrap();
+    let host = clean_host(tmp.path());
+
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--fix", "--json"],
+        &host,
+        &[],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str::<Value>(text.trim())
+        .unwrap_or_else(|e| panic!("start --fix --json is not one document: {e}\n{text}"));
+    // `--fix` actually started the UI — without this the test goes
+    // vacuous: a silently no-op fix still prints one clean document.
+    assert!(
+        state.join("ui.pid").exists(),
+        "start --fix did not start the UI (no ui.pid):\n{text}"
+    );
+    let _ = run_session(&state, &pm, &repo, &["ui", "stop"]);
+
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--json"],
+        &host,
+        &[],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str::<Value>(text.trim())
+        .unwrap_or_else(|e| panic!("end --json is not one document: {e}\n{text}"));
+
+    // Unknown project is an error, not an empty sweep.
+    for args in [
+        vec!["session", "start", "--project", "nosuch"],
+        vec!["session", "end", "--project", "nosuch"],
+    ] {
+        let out = run_session_host(&state, &pm, &repo, &args, &host, &[]);
+        assert!(
+            !out.status.success(),
+            "{args:?} accepted an unknown project:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let msg = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(msg.contains("nosuch"), "{args:?}: {msg}");
+    }
+}
+
+/// Round-3 B1: the host sweep in `session end` is a report, not a
+/// gate — a `fail`-level host caps at `warn` (exit 1) while `session
+/// start` correctly treats the same host as a no-go (exit 2). The
+/// fixture pins the state; the real host is never read.
+#[test]
+fn session_end_host_fail_caps_at_warn() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, notes) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("notes"),
+    );
+    for d in [&state, &pm, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    seed_pm(&pm, &repo, &notes);
+    seed_repo(&repo);
+    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+    // A `fail` host — the 97%-full disk that broke these tests.
+    let host = tmp.path().join("host-fail.json");
+    std::fs::write(
+        &host,
+        r#"{"level":"fail","checks":[{"name":"disk","level":"fail",
+        "detail":"/ 97% full","remedy":"clean up"}]}"#,
+    )
+    .unwrap();
+    let out = run_session_host(&state, &pm, &repo, &["session", "start"], &host, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "start must still no-go on a fail host:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = run_session_host(&state, &pm, &repo, &["session", "end"], &host, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "end caps the host report at warn, exit 1:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("sweep     warn") || text.contains("sweep warn"),
+        "the sweep row shows warn, not fail:\n{text}"
+    );
+}
+
+/// Addendum §1: session output never prints process argv — every
+/// scrubber leaks some shape, so orphans display as `exe (arg count)`.
+/// The fixture plants a credential in `head`; it must not appear.
+/// `pid = self` gives a readable cmdline; `u32::MAX` gives the
+/// unavailable path.
+#[test]
+fn session_end_orphans_report_exe_and_argc_never_argv() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, notes) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("notes"),
+    );
+    for d in [&state, &pm, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    seed_pm(&pm, &repo, &notes);
+    seed_repo(&repo);
+    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+    let me = std::process::id();
+    let host = tmp.path().join("host-orphans.json");
+    std::fs::write(
+        &host,
+        format!(
+            r#"{{"level":"warn","checks":[{{"name":"orphans","level":"warn",
+            "detail":"2: pid {me} (1h npm exec --api-key=figd_PLANTEDLEAK --stdio)",
+            "remedy":"kill {me} 4294967295",
+            "value":{{"pids":[
+                {{"pid":{me},"head":"npm exec --api-key=figd_PLANTEDLEAK --stdio",
+                  "reasons":["cwd/exe under a deleted .cadence/wt worktree"]}},
+                {{"pid":4294967295,"head":"./hung-test-binary --secret=hunter2",
+                  "reasons":["cargo test binary older than an hour"]}}
+            ]}}}}]}}"#
+        ),
+    )
+    .unwrap();
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--dry-run"],
+        &host,
+        &[],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("orphans: 2 orphaned pid(s)"),
+        "count-only detail replaces the argv-bearing one:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("orphan pid {me} — integration-")),
+        "self pid shows the executable basename:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("orphan pid {me} — integration-")) && text.contains(" arg(s))"),
+        "the argument count is shown:\n{text}"
+    );
+    assert!(
+        text.contains("orphan pid 4294967295 — (argv unavailable)"),
+        "an unreadable cmdline degrades without head:\n{text}"
+    );
+    for leaked in [
+        "figd_PLANTEDLEAK",
+        "hunter2",
+        "--api-key",
+        "--secret",
+        "npm exec",
+        "hung-test-binary",
+    ] {
+        assert!(!text.contains(leaked), "argv leaked as {leaked:?}:\n{text}");
+    }
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "warn host, dry-run clean: exit 1:\n{text}"
+    );
+}
+
+/// Round-4 blocker: the host fixture is `--host-report`, never an env
+/// var — an ambient `CADENCE_SESSION_HOST_JSON` must not soften the
+/// gate, a bad fixture path is a hard error, and every fixture run is
+/// labelled in text and `--json`.
+#[test]
+fn session_host_report_flag_labels_errors_and_env_is_dead() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, notes) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("notes"),
+    );
+    for d in [&state, &pm, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    seed_pm(&pm, &repo, &notes);
+    seed_repo(&repo);
+    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+
+    // A bad fixture path errors — it never falls through to a real
+    // scan (that would read the real host with no signal).
+    let out = run_session(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--host-report", "/nonexistent/host.json"],
+    );
+    let msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() && msg.contains("/nonexistent/host.json"),
+        "a bad fixture path must error naming the path:\n{msg}"
+    );
+    // …before any mutation — no handoff was written.
+    assert!(
+        !state.join("sessions").exists()
+            || std::fs::read_dir(state.join("sessions"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "a bad fixture must fail before the handoff write"
+    );
+    // Same for a parsable-path-but-not-JSON file.
+    let garbage = tmp.path().join("not-json.json");
+    std::fs::write(&garbage, "not json at all").unwrap();
+    let out = run_session(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--host-report", garbage.to_str().unwrap()],
+    );
+    assert!(
+        !out.status.success(),
+        "an unparsable fixture must error:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A fixture run is labelled — in text and in --json.
+    let host = clean_host(tmp.path());
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--dry-run"],
+        &host,
+        &[],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("real host not scanned"),
+        "text output labels the fixture:\n{text}"
+    );
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--dry-run", "--json"],
+        &host,
+        &[],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("end --json not one document: {e}\n{text}"));
+    assert_eq!(
+        j["host_source"].as_str().unwrap_or_default(),
+        format!("fixture {}", host.display()),
+        "--json labels the fixture:\n{text}"
+    );
+    // `session start` takes the same flag and labels it the same way.
+    let out = run_session_host(&state, &pm, &repo, &["session", "start"], &host, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("real host not scanned"),
+        "session start labels the fixture:\n{text}"
+    );
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--json"],
+        &host,
+        &[],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("start --json not one document: {e}\n{text}"));
+    assert_eq!(
+        j["host_source"].as_str().unwrap_or_default(),
+        format!("fixture {}", host.display()),
+        "start --json labels the fixture:\n{text}"
+    );
+
+    // The old env var is dead: set it to a *failing* fixture and run
+    // without the flag — the real host is scanned, the sentinel
+    // detail never appears, and host_source reports `scan`.
+    let sentinel = tmp.path().join("env-fixture.json");
+    std::fs::write(
+        &sentinel,
+        r#"{"level":"fail","checks":[{"name":"disk","level":"fail",
+        "detail":"SENTINEL-DISK-SHOULD-NEVER-APPEAR","remedy":"x"}]}"#,
+    )
+    .unwrap();
+    let out = run_session_env(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end", "--json"],
+        &[("CADENCE_SESSION_HOST_JSON", sentinel.as_path())],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("SENTINEL-DISK-SHOULD-NEVER-APPEAR"),
+        "the env var must have no effect — it read the fixture:\n{text}"
+    );
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("end --json not one document: {e}\n{text}"));
+    assert_eq!(
+        j["host_source"].as_str().unwrap_or_default(),
+        "scan",
+        "env-set fixture must report a real scan:\n{text}"
     );
 }

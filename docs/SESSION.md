@@ -28,10 +28,41 @@ cadence agent register pm --provider inbox     # the PM seat
 cadence inbox pm --follow                      # blocks; one JSON object per routed result
 ```
 
-## 2. Start of session checklist
+## 2. Start of session
 
 ```bash
 export CADENCE_SUITE_LOCK="$HOME/.local/state/cadence/suite.lock"   # one path per host, in every shell and agent env
+cadence session start         # the gate below as one verb — exit 0 go / 1 warnings / 2 no-go
+cadence session start --fix   # same, plus the reversible fixes only:
+                              #  daemon start, ui start, ui tailscale start
+```
+
+`session start` runs, in order: `host` (`doctor --host`), `binary`
+(the running build's commit vs the repo's default ref), `daemon`
+(reachable, and its build matches the binary's), `board` (the detached
+UI, plus the persisted tailscale mapping when there is one),
+`reconcile` (unknown messages, fenced agents, `doing` issues with no
+live owner, open PRs on `cadence/` branches with no local worktree,
+`.cadence/wt/*` dirs with neither an open PR nor an open issue) and
+`inbox` (unread mailbox queues). Every line prints `ok`/`warn`/`fail`
+with a one-line remedy; `--fix` only ever starts things, never
+restarts a running daemon, never removes anything. `--project <key>`
+scopes the tracker reads and repo scans to one project — an unknown
+key is an error, same as `issue ls --project`.
+
+Then bring the workers back:
+
+```bash
+cadence issue sync            # pull other hosts' tracker writes before you plan
+cadence agent list --all      # who exists; `resumable: true` agents can come back
+cadence resume <pm>           # bring the group's workers back on their saved sessions
+cadence overview              # one screen: what needs a human, exact commands, deploy drift
+```
+
+What `session start` covers, for reference — the same checks the
+checklist used to run by hand:
+
+```bash
 cadence daemon start          # or: cadence doctor, if anything looks off
 cadence doctor --host         # host watchdog: disk free, provider WALs, pipe
                               #  pressure, orphaned processes, leaked temp dirs,
@@ -56,10 +87,6 @@ cadence doctor --host --reclaim-plan
 cadence ui start              # board at http://cadence.localhost:18000 behind the dev gateway
 cadence ui tailscale start    # optional: phone/laptop access at https://<dns>:9450 — tailnet-only, loopback bind unchanged
 cadence issue doctor          # tracker: hooks ours, lint clean, ahead/behind origin
-cadence issue sync            # pull other hosts' tracker writes before you plan
-cadence agent list --all      # who exists; `resumable: true` agents can come back
-cadence resume <pm>           # bring the group's workers back on their saved sessions
-cadence overview              # one screen: what needs a human, exact commands, deploy drift
 ```
 
 `doctor --host` never kills or deletes; each warn/fail carries a
@@ -337,6 +364,44 @@ agent's note is not the operator's authorization; surface it and leave
 it unclaimed.
 
 ## 9. End of session
+
+```bash
+cadence session end            # the sweep below as one verb — plan, apply, hand off
+cadence session end --dry-run  # the plan only: idle agents, merged worktrees, gc
+```
+
+`session end` runs the same merged-worktree sweep as `issue finish
+--merged` (`--force-finish` is recorded but ignored — the sweep never
+forces), then stops every agent idle past `--idle-secs` (default 1800)
+that has nothing queued, no running message and no busy pane —
+re-checking each one live immediately before the stop so an agent
+that claimed work mid-sweep is skipped, never killed mid-turn. It then
+runs `agent gc --older-than 1h`, reports orphan test processes and
+disk state (never kills; process argv is never printed — orphans show
+the executable name and argument count), and writes the
+handoff note to `<state>/sessions/<YYYYMMDDTHHMMSSZ>-end.md` —
+timestamped, so a same-day rerun never overwrites. `--dry-run` writes
+nothing — not even the gh cache — the row names the file it would
+write and the markdown prints to stdout (or the `--json` payload's
+`handoff_md`). It never stops a busy agent and never stops the daemon
+while work is live.
+
+`--project <key>` scopes the whole run, not just the sweep: stops are
+restricted to that project's agents (its issue owners plus agents whose
+cwd lives under its repo checkouts — the rest are reported and left
+alone), and `agent gc` is skipped outright because it is fleet-wide —
+the row says so. The host sweep is a report, not a gate: its findings
+cap at `warn` and never set exit 2 — a full disk is `session start`'s
+job to refuse. Only the run's own failures (a sweep RPC error, an
+unwritable handoff) exit 2. Both verbs accept a hidden `--host-report
+<path>` that reads a saved `doctor --host` JSON report instead of
+scanning — tests and debug only; the run is labelled `fixture <path>
+— real host not scanned` in text and `host_source` in `--json`, an
+unreadable or unparsable file is a hard error, and no environment
+variable can substitute a fixture.
+
+What the run decides, for reference — the same judgments the checklist
+used to list by hand:
 
 - Every open PR has a verdict or a follow-up kickoff; no loop ends on a
   worker's self-report.

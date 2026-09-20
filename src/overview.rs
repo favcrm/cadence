@@ -483,6 +483,16 @@ fn build_repo_match(projects: &[project::Project]) -> Option<(String, PathBuf)> 
 /// — that just empties the tracker sections); `state_dir` names the
 /// runtime dir (daemon socket + the gh cache).
 pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
+    overview_inner(state_dir, pm_dir, false)
+}
+
+/// The overview with the gh block served from the cache only — a dry
+/// run must write nothing, cache included, so it never fetches.
+pub(crate) fn overview_cached(state_dir: &Path, pm_dir: &Path) -> Value {
+    overview_inner(state_dir, pm_dir, true)
+}
+
+fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
     let now = now_epoch();
     let mut needs: Vec<Item> = Vec::new();
 
@@ -609,7 +619,11 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
     }
     slugs.sort();
     slugs.dedup();
-    let (gh_repos, gh_state) = github(state_dir, &slugs);
+    let (gh_repos, gh_state) = if cache_only {
+        github_repos_cached(state_dir, &slugs)
+    } else {
+        github(state_dir, &slugs)
+    };
     // Lowercased headRefName of every open PR — an issue in review
     // counts as "has a PR" when a `cadence/<id-lowercase>-…` branch is
     // open, even without an explicit `pr` ref.
@@ -859,6 +873,48 @@ pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
         "daemon": daemon,
         "generated_at": now,
     })
+}
+
+// ---------- shared with `cadence session` ----------
+
+/// `session`'s reconcile/handoff share the gh fetch (and its cache)
+/// rather than re-running `gh pr list` — same slug set, same data.
+pub(crate) fn github_repos(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Value>, Value) {
+    github(state_dir, slugs)
+}
+
+/// The cache body only — never fetches, never writes. `session end
+/// --dry-run` must write nothing at all, cache included, so it reads
+/// what a previous real fetch left and reports `unavailable` when the
+/// cache is empty or covers a different slug set.
+pub(crate) fn github_repos_cached(
+    state_dir: &Path,
+    slugs: &[String],
+) -> (HashMap<String, Value>, Value) {
+    match read_cache(&cache_file(state_dir)) {
+        Some(c) if c.slugs == slugs => (c.repos, json!({"state": "cached", "at": c.at})),
+        _ => (HashMap::new(), json!({"state": "unavailable"})),
+    }
+}
+
+/// Drift of an arbitrary commit against the repo's default ref —
+/// `session start` measures the *binary* build this way.
+pub(crate) fn drift_of(repo: &Path, commit: &str) -> Value {
+    compute_drift(repo, commit)
+}
+
+/// Which tracker project owns the repo this binary was built from.
+pub(crate) fn build_repo_match_pub(projects: &[project::Project]) -> Option<(String, PathBuf)> {
+    build_repo_match(projects)
+}
+
+/// Verdict + checks on a PR rollup, for the session-end handoff.
+pub(crate) fn verdict_state_pub(rollup: &[Value]) -> Option<String> {
+    verdict_state(rollup)
+}
+
+pub(crate) fn checks_green_pub(rollup: &[Value]) -> bool {
+    checks_green(rollup)
 }
 
 #[cfg(test)]
