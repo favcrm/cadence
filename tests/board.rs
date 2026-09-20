@@ -5846,7 +5846,18 @@ fn memory_match_ranking() {
     assert_eq!(slugs, vec!["r-project", "r-low"], "{slugs:?}");
 
     // Explicit-axis match without an issue.
-    let (ok, out) = mem_cli(&pm, &state, &["match", "--component", "other", "--json"]);
+    let (ok, out) = mem_cli(
+        &pm,
+        &state,
+        &[
+            "match",
+            "--project",
+            "mem",
+            "--component",
+            "other",
+            "--json",
+        ],
+    );
     assert!(ok, "{out}");
     let slugs: Vec<&str> = out["matched"]
         .as_array()
@@ -6226,7 +6237,11 @@ fn memory_overcomplex_glob_quarantined_at_load() {
     // Match — `evil-glob` never reaches glob_match; the good rule
     // still applies. The test completing is the bounded-execution
     // proof (a matched `**a**a**a**` could otherwise hang).
-    let (ok, out) = mem_cli(&pm, &state, &["match", "--path", "src/x.rs", "--json"]);
+    let (ok, out) = mem_cli(
+        &pm,
+        &state,
+        &["match", "--project", "mem", "--path", "src/x.rs", "--json"],
+    );
     assert!(ok, "{out}");
     let slugs: Vec<&str> = out["matched"]
         .as_array()
