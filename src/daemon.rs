@@ -1738,13 +1738,6 @@ impl Shared {
         loop {
             let messages = self.store.inbox_drain(&alias, after)?;
             if !messages.is_empty() || self.closing.load(Ordering::SeqCst) {
-                // Consuming a message with a return address routed its
-                // result — the target actor must not wait out its poll.
-                for m in &messages {
-                    if let Some(target) = &m.reply_to {
-                        self.notify_agent(target);
-                    }
-                }
                 self.wake();
                 let cursor = messages.last().map(|m| m.seq).unwrap_or(after);
                 return Ok(json!({

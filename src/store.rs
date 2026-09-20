@@ -1599,6 +1599,15 @@ impl Store {
     /// target in the caller's transaction. Routed deliveries get a
     /// deterministic id and no `reply_to`, so they cannot create loops.
     fn route_result(&self, tx: &Connection, message: &Message, result: &Value) -> Result<()> {
+        // Reading a mailbox completes its row with a local receipt. That
+        // receipt is durable history, not worker output: routing it through
+        // reply_to would synthesize a worker_result and wake a reviewer for
+        // work that never happened. Genuine worker results still route from
+        // finish(), while the original inbox row remains available to the
+        // consumer with its full body and source.
+        if result.get("via").and_then(Value::as_str) == Some("inbox_read") {
+            return Ok(());
+        }
         let Some(target) = &message.reply_to else {
             return Ok(());
         };
@@ -2127,8 +2136,8 @@ impl Store {
 
     /// Drain an inbox agent's queue: every `queued` message with
     /// `seq > after`, oldest first, is completed `via=inbox_read` in one
-    /// transaction — including `reply_to` routing, so consuming a direct
-    /// send with a return address still delivers the result.
+    /// transaction. The receipt is local mailbox history; `route_result`
+    /// deliberately does not turn it into a synthetic worker notification.
     pub fn inbox_drain(&self, alias: &str, after: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;

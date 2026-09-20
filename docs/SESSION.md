@@ -291,8 +291,10 @@ Rules that were learned the hard way (now encoded in the command):
 - **Stress new tests that wait on daemon state**, five to ten times in
   isolation. One green full run missed a real race.
 - **When main moved under the PR, gate the merge result.** If the
-  author rebases meanwhile, `git diff <gated tree> <new head>` being
-  empty lets you re-issue the verdict for the new head.
+  author rebases meanwhile, `rtk proxy git diff <gated tree> <new head>`
+  being empty lets you re-issue the verdict for the new head (through
+  `rtk proxy` — the filtered form can print nothing for a real diff,
+  CAD-138).
 - **A schema migration gets a rehearsal**: `sqlite3 <live db> ".backup
   copy.db"`, disable every agent in the copy (`update agents set
   enabled=0`), open it with the PR binary. The report flags it; the

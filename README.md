@@ -215,6 +215,9 @@ spec file, `job dispatch` sends a task's kickoff to a group worker, and
 delivery axis — the job layer tracks the work axis on top. See
 [docs/JOBS.md](docs/JOBS.md).
 On GitHub the reviewer binds the same verdict to the PR head with `scripts/qa-verdict.sh` ([verdict gate](docs/DOGFOOD.md#reviewer-verdict-gate)).
+`cadence audit` reconstructs every merge's provenance from that stored
+evidence and flags self-merges and verdict-less heads — see
+[docs/AUDIT.md](docs/AUDIT.md).
 
 ```bash
 cadence job new --pm pm --spec spec.md --issue CAD-26
