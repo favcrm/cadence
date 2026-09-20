@@ -595,6 +595,13 @@ enum Commands {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// Daemon-owned persistent supervision registrations and local alerts.
+    /// Monitor state describes the observer; delivery remains explicitly
+    /// unconfigured in this bounded increment.
+    Monitor {
+        #[command(subcommand)]
+        action: MonitorAction,
+    },
     /// The issue board: folders under the PM dir (`~/pm` or
     /// `CADENCE_PM_DIR`); this CLI is the only writer.
     Issue {
@@ -855,6 +862,52 @@ enum JobAction {
         #[command(subcommand)]
         action: TaskAction,
     },
+}
+
+#[derive(Subcommand)]
+enum MonitorAction {
+    /// Register an explicit project/task coverage set. Delivery remains
+    /// local and unconfigured; --dispatch only enables the guarded manual
+    /// handoff into existing job dispatch.
+    Register {
+        monitor: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long = "task", required = true)]
+        tasks: Vec<String>,
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        interval_secs: u64,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        dispatch: bool,
+    },
+    /// List persistent monitor registrations and their separate delivery state.
+    List,
+    /// Show one monitor's heartbeat, cursor, coverage, and alert counts.
+    Show { monitor: String },
+    /// Record an explicit caller heartbeat; this is not a worker-health claim.
+    Heartbeat { monitor: String },
+    /// List durable local alerts for one monitor.
+    Alerts {
+        monitor: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long)]
+        open: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+    },
+    /// Acknowledge one local alert.
+    Ack {
+        monitor: String,
+        #[arg(long)]
+        alert: i64,
+    },
+    /// Turn monitoring off for this registration. History is retained.
+    Stop { monitor: String },
+    /// Explicitly pass one covered, eligible task to existing job dispatch.
+    Dispatch { monitor: String, task: String },
 }
 
 #[derive(Subcommand)]
@@ -3398,6 +3451,7 @@ fn run() -> Result<i32> {
             }
         }
         Commands::Job { action } => run_job(&state_dir, &action),
+        Commands::Monitor { action } => run_monitor(&state_dir, &action),
         Commands::Dispatch {
             issue,
             to,
@@ -3493,6 +3547,71 @@ fn run() -> Result<i32> {
         Commands::Overview { json, watch } => run_overview(&state_dir, json, watch),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
+}
+
+/// The `cadence monitor` tree — thin RPC wrappers. Monitor state and
+/// safety checks live in the daemon so every caller sees one contract.
+fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i32> {
+    let rpc = |method: &str, params: Value| client::rpc(state_dir, method, params);
+    let pane = std::env::var("CADENCE_ALIAS").ok();
+    match action {
+        MonitorAction::Register {
+            monitor,
+            project,
+            tasks,
+            interval_secs,
+            owner,
+            dispatch,
+        } => {
+            print_json(&rpc(
+                "monitor_register",
+                json!({"monitor": monitor, "project": project,
+                       "tasks": tasks, "interval_secs": interval_secs,
+                       "owner": owner.as_deref().or(pane.as_deref())
+                           .unwrap_or("operator"),
+                       "dispatch_enabled": dispatch}),
+            )?);
+        }
+        MonitorAction::List => print_json(&rpc("monitor_list", json!({}))?),
+        MonitorAction::Show { monitor } => {
+            print_json(&rpc("monitor_show", json!({"monitor": monitor}))?);
+        }
+        MonitorAction::Heartbeat { monitor } => {
+            print_json(&rpc("monitor_heartbeat", json!({"monitor": monitor}))?);
+        }
+        MonitorAction::Alerts {
+            monitor,
+            after,
+            open,
+            limit,
+        } => {
+            print_json(&rpc(
+                "monitor_alerts",
+                json!({"monitor": monitor, "after": after,
+                       "open": open, "limit": limit}),
+            )?);
+        }
+        MonitorAction::Ack { monitor, alert } => {
+            print_json(&rpc(
+                "monitor_alert_ack",
+                json!({"monitor": monitor, "alert": alert,
+                       "by": pane.as_deref().unwrap_or("operator")}),
+            )?);
+        }
+        MonitorAction::Stop { monitor } => {
+            print_json(&rpc(
+                "monitor_stop",
+                json!({"monitor": monitor, "pane": pane}),
+            )?);
+        }
+        MonitorAction::Dispatch { monitor, task } => {
+            print_json(&rpc(
+                "monitor_dispatch",
+                json!({"monitor": monitor, "task": task, "pane": pane}),
+            )?);
+        }
+    }
+    Ok(0)
 }
 
 /// The `cadence job` tree — thin RPC wrappers. Validation, transitions

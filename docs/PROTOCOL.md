@@ -69,6 +69,14 @@ Error kinds:
 | `task_fail` | `task, reason, by?` | `{task}` — mark unrecoverable |
 | `task_reopen` | `task, pane?` | `{task}` — `blocked|verified|failed → draft`, `revision` resets |
 | `task_cancel` | `task, by?` | `{task}` — cancels the task; a `queued`/`submitting` kickoff cancels in the same tx, a `running` one completes on its own |
+| `monitor_register` | `monitor, project, tasks[], interval_secs?, owner?, dispatch_enabled?` | `{monitor, duplicate}` — registers an explicit task coverage set; the first check is `degraded`, then `active`; delivery stays separately `unconfigured` |
+| `monitor_list` | — | `{monitors:[Monitor]}` — durable observer registrations and explicit coverage |
+| `monitor_show` | `monitor` | `{monitor:Monitor}` — heartbeat, last successful check, durable event cursor, coverage and alert counts |
+| `monitor_heartbeat` | `monitor` | `{monitor:Monitor}` — records the caller's monitor heartbeat; it is not a worker-health claim |
+| `monitor_alerts` | `monitor, after?, open?, limit?` | `{monitor, alerts:[MonitorAlert], cursor}` — reads local durable alerts |
+| `monitor_alert_ack` | `monitor, alert, by?` | `{alert:MonitorAlert}` — acknowledges one local alert; history remains durable |
+| `monitor_stop` | `monitor` | `{monitor:Monitor}` — turns one registration off without deleting coverage or alert history |
+| `monitor_dispatch` | `monitor, task` | `{monitor, task, message, duplicate, queued_behind_dead}` — explicit operator handoff through the existing guarded job-dispatch transaction; never called by the observer |
 | `job_cancel` | `job, by?` | `{job}` — cancels the job + every non-terminal task |
 | `job_close` | `job, by?` | `{job}` — legal only when every task is `done` |
 | `agent_unfence` | `alias, status?, note?, by?, resume?` | reconciles every `unknown` on the agent (default `interrupted`); `{alias, reconciled:[id], resumed, pane?, state, error?}` — `resume:true` also starts the actor and waits (bounded ~30s) for its open; `pane` is pty-only: `adopted`/`respawned`/`none` |
@@ -839,7 +847,9 @@ gate_wait, submitted, session_minted, session_resume_failed,
 session_persist_failed,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
 params_updated, reconciled, relaunch_skipped, attention,
-turn_stalled, turn_resumed, stop_requested`. `wait>0` long-polls
+turn_stalled, turn_resumed, monitor_registered, monitor_alert,
+monitor_alert_ack, monitor_degraded, monitor_dispatch, monitor_off,
+stop_requested`. `wait>0` long-polls
 up to 30s.
 
 Two page shapes. Forward paging sends `after` — rows above the cursor,
@@ -933,6 +943,40 @@ Full semantics live in `docs/JOBS.md`. The wire contract in brief:
   a reconcile to `completed` takes the normal completion edge), and
   from `blocked` only with a `--to` reassign. A live kickoff returns
   `duplicate:true` with the live message id.
+
+## Persistent monitoring
+
+`monitor_register` creates a daemon-owned observer whose scope is the
+listed task ids. A project name never expands coverage implicitly: every
+task must belong to a job whose explicit `repo` equals `project`, and a
+registration with the same id is idempotent only when all settings and
+coverage match. Monitor rows, coverage, alert state and the event cursor
+are stored in SQLite and survive a daemon restart.
+
+The monitor watch runs local SQLite checks on a bounded cadence. A
+successful pass records `heartbeat_at`, `last_check_at`,
+`last_success_at`, `next_check_at`, and the durable event cursor and moves
+the observer from `degraded` to `active`. A failed pass records
+`degraded` and the error. These fields describe observer execution only;
+the daemon does not infer that a worker or provider is healthy from a
+missing event, an idle row, or a successful database read.
+
+Only concrete, task-scoped events from the monitor's explicit coverage
+can create alerts. `(monitor, event fingerprint)` is unique, so a crash
+or restart can repeat a read without creating a duplicate alert. Alerts
+are local records with `open`/`acknowledged` state. Delivery is reported
+separately as `{configured:false,state:"unconfigured"}` in this bounded
+increment; no provider, GitHub, or production notification is activated.
+
+`monitor_dispatch` is a caller-requested safety gate. It requires an
+active monitor, explicit dispatch opt-in, covered draft/revising task,
+acceptance text, matching open project, explicit assignee, live idle
+actor, no pending approval or queued work, and (where the endpoint has a
+ready gate) an explicit verified readiness claim. It then delegates to
+the existing `task_dispatch` transaction, including its group,
+revision, lease and idempotency checks. The periodic observer never
+dispatches, interrupts, resumes, accepts approvals, or changes worker
+state.
 
 ## Approvals
 
