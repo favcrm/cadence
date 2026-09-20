@@ -16822,6 +16822,12 @@ impl StubAgent {
         self.flip = Some(flip);
         self
     }
+    /// The agent's working directory — `--project` membership is
+    /// issue-owner first, cwd-under-repo second.
+    fn with_cwd(mut self, cwd: &Path) -> Self {
+        self.row["cwd"] = json!(cwd.to_str().unwrap_or("/"));
+        self
+    }
 }
 
 /// The daemon wire protocol on `<state>/cadence.sock` with canned
@@ -17030,14 +17036,37 @@ fn seed_repo(repo: &Path) {
 /// `cadence <args>` against the fixture state dir + pm dir, cwd at the
 /// fixture repo. Output captured; the stub answers daemon RPCs.
 fn run_session(state: &Path, pm: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .arg("--state-dir")
+    run_session_env(state, pm, cwd, args, &[])
+}
+
+/// `run_session` with extra env pairs — the host-report fixture and a
+/// stubbed `gh` on PATH ride in through here.
+fn run_session_env(
+    state: &Path,
+    pm: &Path,
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &Path)],
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
         .arg(state)
         .args(args)
         .env("CADENCE_PM_DIR", pm)
-        .current_dir(cwd)
-        .output()
-        .unwrap()
+        .current_dir(cwd);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+/// A clean doctor-host report on disk — `CADENCE_SESSION_HOST_JSON`
+/// makes the verbs read it instead of scanning the real host, so the
+/// session tests are identical on a dev box and a 97%-full CI host.
+fn clean_host(dir: &Path) -> PathBuf {
+    let f = dir.join("host-report.json");
+    std::fs::write(&f, r#"{"level":"ok","checks":[]}"#).unwrap();
+    f
 }
 
 #[test]
@@ -17080,7 +17109,9 @@ fn session_start_reports_failures_and_fix_only_starts_ui() {
         ],
     );
 
-    let out = run_session(&state, &pm, &repo, &["session", "start"]);
+    let host = clean_host(dir.path());
+    let envs = [("CADENCE_SESSION_HOST_JSON", host.as_path())];
+    let out = run_session_env(&state, &pm, &repo, &["session", "start"], &envs);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -17114,7 +17145,7 @@ fn session_start_reports_failures_and_fix_only_starts_ui() {
         l.local_addr().unwrap().port()
     };
     std::fs::write(state.join("ui.json"), format!("{{\"port\": {port}}}")).unwrap();
-    let out = run_session(&state, &pm, &repo, &["session", "start", "--fix"]);
+    let out = run_session_env(&state, &pm, &repo, &["session", "start", "--fix"], &envs);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -17204,10 +17235,38 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
             stub_agent("pm-inbox", "inbox", "inbox", "idle", 7200, (vec![], 2, 0)),
         ],
     );
+    let host = clean_host(dir.path());
+    // A stub `gh` first on PATH: a dry run must never invoke it —
+    // the gh cache is read, not refreshed.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh_called = dir.path().join("gh-called");
+    std::fs::write(
+        bin.join("gh"),
+        format!(
+            "#!/bin/sh\necho called >> '{}'\nexit 1\n",
+            gh_called.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let envs = [
+        ("CADENCE_SESSION_HOST_JSON", host.as_path()),
+        ("PATH", Path::new(&path_env)),
+    ];
 
     // Dry run: names the stop candidates and the merged worktree,
     // changes nothing.
-    let out = run_session(&state, &pm, &repo, &["session", "end", "--dry-run"]);
+    let out = run_session_env(&state, &pm, &repo, &["session", "end", "--dry-run"], &envs);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -17243,13 +17302,24 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
         text.contains("would write") && text.contains("## open PRs"),
         "dry-run previews the handoff, writes nothing:\n{text}"
     );
+    // Nothing at all was written — no handoff, no gh cache, no `gh`
+    // subprocess at all.
+    assert!(
+        !gh_called.exists(),
+        "dry-run invoked gh — a dry run writes nothing, cache included"
+    );
+    assert!(
+        !state.join("overview-gh.json").exists(),
+        "dry-run wrote the gh cache"
+    );
 
     // Real run: only the agent idle past --idle-secs is stopped.
-    let out = run_session(
+    let out = run_session_env(
         &state,
         &pm,
         &repo,
         &["session", "end", "--idle-secs", "1800"],
+        &envs,
     );
     let text = format!(
         "{}{}",
@@ -17282,6 +17352,12 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
         "agent gc ran:\n{text}"
     );
     assert!(text.contains("old-idle"));
+    // S6: the real-run candidate count is finished+refused — the same
+    // set the dry run counts, not every sweep row incl. skips.
+    assert!(
+        text.contains("1 finished of 1 candidate(s)"),
+        "finish count uses the same set dry-run does:\n{text}"
+    );
 
     // The handoff note landed with the required sections.
     let sessions = state.join("sessions");
@@ -17305,12 +17381,11 @@ fn session_end_dry_run_plans_real_run_stops_only_idle() {
     assert!(md.contains("old-idle"), "stopped agent recorded:\n{md}");
 
     // A second real run the same day never overwrites the first.
-    let out = run_session(&state, &pm, &repo, &["session", "end"]);
-    // warnings are fine — the host sweep reads the real host — but a
-    // hard failure (2) is not.
-    assert_ne!(
-        out.status.code().unwrap_or(-1),
-        2,
+    let out = run_session_env(&state, &pm, &repo, &["session", "end"], &envs);
+    // The host fixture is clean and nothing failed — this is a green
+    // run outright, on any host.
+    assert!(
+        out.status.success(),
         "second end failed:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
@@ -17367,10 +17442,16 @@ fn session_end_stop_race_rechecks_show() {
             stub_agent("calm", "fake", "fake", "idle", 7200, (vec![], 0, 0)),
         ],
     );
-    let out = run_session(&state, &pm, &repo, &["session", "end"]);
-    assert_ne!(
-        out.status.code().unwrap_or(-1),
-        2,
+    let host = clean_host(tmp.path());
+    let out = run_session_env(
+        &state,
+        &pm,
+        &repo,
+        &["session", "end"],
+        &[("CADENCE_SESSION_HOST_JSON", host.as_path())],
+    );
+    assert!(
+        out.status.success(),
         "end failed:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
@@ -17392,6 +17473,13 @@ fn session_end_stop_race_rechecks_show() {
     assert!(
         text.contains("racy") && text.contains("skip"),
         "the skipped re-check is reported:\n{text}"
+    );
+    // ...once: a skipped candidate is one annotated row, not a bare
+    // candidate line plus a second `— skipped` line.
+    assert_eq!(
+        text.matches("racy").count(),
+        1,
+        "the skipped alias listed twice:\n{text}"
     );
     // Contract: the re-check was a second agent_show for racy.
     let shows = stub_calls(&sd)
@@ -17490,6 +17578,10 @@ fn session_end_project_scopes_sweep() {
         let (ok, _) = cli(&["issue", "set", id, "owner="]);
         assert!(ok);
     }
+    // A-1's owner is the second way an agent belongs to the project —
+    // cwd-under-repo is the first.
+    let (ok, out) = cli(&["issue", "set", "A-1", "owner=a-owned"]);
+    assert!(ok, "{out}");
     let wt_a = repo_a.join(".cadence/wt/a-1-one");
     let wt_b = repo_b.join(".cadence/wt/b-1-two");
     for (wt, file) in [(&wt_a, "a.txt"), (&wt_b, "b.txt")] {
@@ -17501,25 +17593,61 @@ fn session_end_project_scopes_sweep() {
     git(&repo_b, &["merge", "-q", "cadence/b-1-two"]);
     assert!(wt_a.exists() && wt_b.exists(), "fixture wts exist");
 
-    // Empty fleet — the sweep is all that matters here.
-    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
-    let out = run_session(
+    // Fleet: `a-idle` works under repo_a, `a-owned` owns A-1 outright,
+    // `b-idle` works under repo_b — all idle past the threshold.
+    let sd = stub_daemon(
+        &state,
+        cadence_agent::overview::BUILD_COMMIT,
+        vec![
+            stub_agent("a-idle", "fake", "fake", "idle", 7200, (vec![], 0, 0))
+                .with_cwd(&repo_a.canonicalize().unwrap()),
+            stub_agent("a-owned", "fake", "fake", "idle", 7200, (vec![], 0, 0)),
+            stub_agent("b-idle", "fake", "fake", "idle", 7200, (vec![], 0, 0))
+                .with_cwd(&repo_b.canonicalize().unwrap()),
+        ],
+    );
+    let host = clean_host(tmp.path());
+    let out = run_session_env(
         &state,
         &pm_dir,
         &repo_a,
         &["session", "end", "--project", "aaa"],
+        &[("CADENCE_SESSION_HOST_JSON", host.as_path())],
     );
-    assert_ne!(
-        out.status.code().unwrap_or(-1),
-        2,
+    assert!(
+        out.status.success(),
         "scoped end failed:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
         !wt_a.exists(),
         "scoped run left project aaa's merged worktree"
     );
     assert!(wt_b.exists(), "scoped run removed project bbb's worktree");
+    // --project scopes the stops too: aaa's agents stopped, bbb's left
+    // running and reported as out-of-scope.
+    let mut stopped: Vec<String> = stub_calls(&sd)
+        .into_iter()
+        .filter(|(m, _)| m == "agent_stop")
+        .filter_map(|(_, p)| p["alias"].as_str().map(str::to_string))
+        .collect();
+    stopped.sort();
+    assert_eq!(stopped, vec!["a-idle", "a-owned"], "scoped stops:\n{text}");
+    assert!(
+        text.contains("outside project 'aaa'"),
+        "the out-of-scope agent is reported:\n{text}"
+    );
+    // `agent_gc` is fleet-wide — under --project it is skipped, and the
+    // row says so rather than overreaching into bbb's agents.
+    assert!(
+        !stub_calls(&sd).iter().any(|(m, _)| m == "agent_gc"),
+        "fleet-wide gc ran under --project:\n{text}"
+    );
+    assert!(
+        text.contains("gc is fleet-wide — skipped under --project aaa"),
+        "the gc row says which:\n{text}"
+    );
 }
 
 /// Round-2 S7 + nit: `--json` stdout is exactly one JSON document, and
@@ -17545,14 +17673,28 @@ fn session_json_single_document_and_project_validation() {
         l.local_addr().unwrap().port()
     };
     std::fs::write(state.join("ui.json"), format!("{{\"port\": {port}}}")).unwrap();
+    let host = clean_host(tmp.path());
+    let envs = [("CADENCE_SESSION_HOST_JSON", host.as_path())];
 
-    let out = run_session(&state, &pm, &repo, &["session", "start", "--fix", "--json"]);
+    let out = run_session_env(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--fix", "--json"],
+        &envs,
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str::<Value>(text.trim())
         .unwrap_or_else(|e| panic!("start --fix --json is not one document: {e}\n{text}"));
+    // `--fix` actually started the UI — without this the test goes
+    // vacuous: a silently no-op fix still prints one clean document.
+    assert!(
+        state.join("ui.pid").exists(),
+        "start --fix did not start the UI (no ui.pid):\n{text}"
+    );
     let _ = run_session(&state, &pm, &repo, &["ui", "stop"]);
 
-    let out = run_session(&state, &pm, &repo, &["session", "end", "--json"]);
+    let out = run_session_env(&state, &pm, &repo, &["session", "end", "--json"], &envs);
     let text = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str::<Value>(text.trim())
         .unwrap_or_else(|e| panic!("end --json is not one document: {e}\n{text}"));
@@ -17562,7 +17704,7 @@ fn session_json_single_document_and_project_validation() {
         vec!["session", "start", "--project", "nosuch"],
         vec!["session", "end", "--project", "nosuch"],
     ] {
-        let out = run_session(&state, &pm, &repo, &args);
+        let out = run_session_env(&state, &pm, &repo, &args, &envs);
         assert!(
             !out.status.success(),
             "{args:?} accepted an unknown project:\n{}",
@@ -17575,4 +17717,55 @@ fn session_json_single_document_and_project_validation() {
         );
         assert!(msg.contains("nosuch"), "{args:?}: {msg}");
     }
+}
+
+/// Round-3 B1: the host sweep in `session end` is a report, not a
+/// gate — a `fail`-level host caps at `warn` (exit 1) while `session
+/// start` correctly treats the same host as a no-go (exit 2). The
+/// fixture pins the state; the real host is never read.
+#[test]
+fn session_end_host_fail_caps_at_warn() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, notes) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("notes"),
+    );
+    for d in [&state, &pm, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    seed_pm(&pm, &repo, &notes);
+    seed_repo(&repo);
+    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+    // A `fail` host — the 97%-full disk that broke these tests.
+    let host = tmp.path().join("host-fail.json");
+    std::fs::write(
+        &host,
+        r#"{"level":"fail","checks":[{"name":"disk","level":"fail",
+        "detail":"/ 97% full","remedy":"clean up"}]}"#,
+    )
+    .unwrap();
+    let envs = [("CADENCE_SESSION_HOST_JSON", host.as_path())];
+
+    let out = run_session_env(&state, &pm, &repo, &["session", "start"], &envs);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "start must still no-go on a fail host:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = run_session_env(&state, &pm, &repo, &["session", "end"], &envs);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "end caps the host report at warn, exit 1:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("sweep     warn") || text.contains("sweep warn"),
+        "the sweep row shows warn, not fail:\n{text}"
+    );
 }

@@ -371,19 +371,28 @@ cadence session end --dry-run  # the plan only: idle agents, merged worktrees, g
 ```
 
 `session end` runs the same merged-worktree sweep as `issue finish
---merged` (`--project` scopes it to one project, `--force-finish` is
-recorded but ignored — the sweep never forces), then stops every
-agent idle past `--idle-secs` (default 1800) that has nothing queued,
-no running message and no busy pane — re-checking each one live
-immediately before the stop so an agent that claimed work mid-sweep
-is skipped, never killed mid-turn. It then runs `agent gc --older-than
-1h`, reports orphan test processes and disk state (never kills; argv
-secrets are redacted), and writes the handoff note to
-`<state>/sessions/<YYYYMMDDTHHMMSSZ>-end.md` — timestamped, so a same-day
-rerun never overwrites. `--dry-run` writes nothing: the row names the
-file it would write and the markdown prints to stdout (or the `--json`
-payload's `handoff_md`). It never stops a busy agent and never stops
-the daemon while work is live.
+--merged` (`--force-finish` is recorded but ignored — the sweep never
+forces), then stops every agent idle past `--idle-secs` (default 1800)
+that has nothing queued, no running message and no busy pane —
+re-checking each one live immediately before the stop so an agent
+that claimed work mid-sweep is skipped, never killed mid-turn. It then
+runs `agent gc --older-than 1h`, reports orphan test processes and
+disk state (never kills; argv secrets are redacted), and writes the
+handoff note to `<state>/sessions/<YYYYMMDDTHHMMSSZ>-end.md` —
+timestamped, so a same-day rerun never overwrites. `--dry-run` writes
+nothing — not even the gh cache — the row names the file it would
+write and the markdown prints to stdout (or the `--json` payload's
+`handoff_md`). It never stops a busy agent and never stops the daemon
+while work is live.
+
+`--project <key>` scopes the whole run, not just the sweep: stops are
+restricted to that project's agents (its issue owners plus agents whose
+cwd lives under its repo checkouts — the rest are reported and left
+alone), and `agent gc` is skipped outright because it is fleet-wide —
+the row says so. The host sweep is a report, not a gate: its findings
+cap at `warn` and never set exit 2 — a full disk is `session start`'s
+job to refuse. Only the run's own failures (a sweep RPC error, an
+unwritable handoff) exit 2.
 
 What the run decides, for reference — the same judgments the checklist
 used to list by hand:

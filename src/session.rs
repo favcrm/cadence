@@ -26,7 +26,7 @@
 //! `daemon_info`, `ui status`, overview's needs-me rows, the tracker
 //! views, `issue finish`'s sweep — never re-computed here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -109,73 +109,171 @@ impl Row {
     fn json(&self) -> Value {
         json!({
             "name": self.name, "severity": self.sev.name(),
-            "detail": redact_text(&self.detail), "remedy": self.remedy,
-            "fixed": self.fixed,
-            "items": self.items.iter().map(|i| redact_text(i)).collect::<Vec<_>>(),
+            "detail": scrub_line(&self.detail),
+            "remedy": self.remedy.as_deref().map(scrub_line),
+            "fixed": self.fixed.as_deref().map(scrub_line),
+            "items": self.items.iter().map(|i| scrub_line(i)).collect::<Vec<_>>(),
         })
     }
 }
 
-/// Process argv — doctor's orphan `head` strings are full command
-/// lines and can carry live credentials. The value of any argument
-/// whose name matches `(?i)(key|token|secret|password|passwd|auth)`
-/// becomes `REDACTED`, in `--flag=value`, `--flag value` and
-/// `NAME=value` shapes alike. Over-redaction is the safe direction.
-fn redact_text(s: &str) -> String {
-    const KW: [&str; 6] = ["key", "token", "secret", "password", "passwd", "auth"];
+/// `key<sep>value` credential spans that argv shape can't see — text
+/// like `Authorization: Basic <cred>` or `--auth-token "Bearer <tok>"`,
+/// where the value may be a two-token `scheme credential` pair or sit
+/// inside quotes. A keyword counts only bounded by non-alphanumerics
+/// on both sides (`Authorization:` and `x-api-key` qualify; `monkey`,
+/// `author`, `keystore` don't — the unbounded scan ate the word after
+/// them). After `=`/`:`/whitespace the whole value expression becomes
+/// `[REDACTED]`: a quoted value to its close quote, an alpha-only
+/// scheme word plus the token after it, otherwise the next token.
+fn scrub_auth_spans(s: &str) -> String {
+    const KEYWORDS: &[&str] = &[
+        "authorization",
+        "credentials",
+        "credential",
+        "password",
+        "passwd",
+        "passphrase",
+        "apikey",
+        "bearer",
+        "secret",
+        "token",
+        "access",
+        "cookie",
+        "private",
+        "auth",
+        "cred",
+        "pass",
+        "key",
+    ];
     let b = s.as_bytes();
+    let alnum = |c: u8| c.is_ascii_alphanumeric();
     let mut out = String::with_capacity(s.len());
-    let (mut last, mut i) = (0usize, 0usize);
+    let mut i = 0;
     while i < b.len() {
-        let kw_len = KW
-            .iter()
-            .filter(|kw| {
-                b.len() - i >= kw.len() && b[i..i + kw.len()].eq_ignore_ascii_case(kw.as_bytes())
-            })
-            .map(|kw| kw.len())
-            .max();
-        let Some(kl) = kw_len else {
-            i += 1;
+        let kw = KEYWORDS.iter().find_map(|kw| {
+            (i + kw.len() <= b.len()
+                && b[i..i + kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+                && (i == 0 || !alnum(b[i - 1]))
+                && (i + kw.len() == b.len() || !alnum(b[i + kw.len()])))
+            .then_some(kw.len())
+        });
+        let Some(kw) = kw else {
+            let n = s[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&s[i..i + n]);
+            i += n;
             continue;
         };
-        // After the key: any name-suffix chars, then a separator —
-        // `=`, `:`, or whitespace — then the value.
-        let mut j = i + kl;
-        while j < b.len() && b[j] != b'=' && b[j] != b':' && !b[j].is_ascii_whitespace() {
+        // A keyword counts only with a separator and a value after it.
+        let mut j = i + kw;
+        while j < b.len() && matches!(b[j], b'=' | b':' | b' ' | b'\t') {
             j += 1;
         }
-        if j >= b.len() {
-            break;
+        out.push_str(&s[i..j]);
+        if j == i + kw || j >= b.len() {
+            i = j;
+            continue;
         }
-        let mut k = j + 1;
-        while k < b.len() && b[k].is_ascii_whitespace() {
+        if b[j] == b'"' || b[j] == b'\'' {
+            let q = b[j];
+            out.push(q as char);
+            let mut k = j + 1;
+            while k < b.len() && b[k] != q {
+                k += 1;
+            }
+            out.push_str("[REDACTED]");
+            if k < b.len() {
+                out.push(q as char);
+                k += 1;
+            }
+            i = k;
+            continue;
+        }
+        let mut k = j;
+        while k < b.len() && !b[k].is_ascii_whitespace() {
             k += 1;
         }
-        if k >= b.len() {
-            break;
-        }
-        // Token end — and for `auth: Bearer <tok>` the scheme word is
-        // not the secret; the token after it is.
-        let mut e = k;
-        while e < b.len() && !b[e].is_ascii_whitespace() {
-            e += 1;
-        }
-        if s[k..e].eq_ignore_ascii_case("bearer") {
-            // The scheme word isn't the secret — eat it and the token.
-            while e < b.len() && b[e].is_ascii_whitespace() {
-                e += 1;
+        // An alpha-only first token is a scheme word (`Basic`,
+        // `Bearer`, `Token`, `ApiKey`, `Negotiate`) — the credential
+        // itself is the token after it.
+        if s[j..k].bytes().all(|c| c.is_ascii_alphabetic()) {
+            let mut m = k;
+            while m < b.len() && b[m].is_ascii_whitespace() {
+                m += 1;
             }
-            while e < b.len() && !b[e].is_ascii_whitespace() {
-                e += 1;
+            while m < b.len() && !b[m].is_ascii_whitespace() {
+                m += 1;
             }
+            k = m;
         }
-        out.push_str(&s[last..k]);
-        out.push_str("REDACTED");
-        last = e;
-        i = e;
+        // Keep a quote the value ran up against — `-H "Authorization:
+        // Basic x=="` eats through the close quote otherwise.
+        let quote = k > j && matches!(b[k - 1], b'"' | b'\'');
+        if quote {
+            k -= 1;
+        }
+        out.push_str("[REDACTED]");
+        i = k;
     }
-    out.push_str(&s[last..]);
     out
+}
+
+/// Bare credential-shaped tokens become `[REDACTED]` even with no
+/// keyword pointing at them — the span pass only masks values a
+/// keyword names. Prefixes are the shapes seen in real argv (figma,
+/// github, openai/stripe-style, slack, AWS access keys, JWTs); a
+/// 12-char floor keeps short lookalikes out. Whitespace normalizes to
+/// single spaces — cosmetic, only for display text.
+fn scrub_token_shapes(s: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "figd_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "sk-",
+        "xoxa-",
+        "xoxb-",
+        "xoxp-",
+        "xoxr-",
+        "xoxs-",
+        "AKIA",
+        "ASIA",
+    ];
+    let shaped = |seg: &str| {
+        seg.len() >= 12
+            && (PREFIXES.iter().any(|p| seg.starts_with(p))
+                || (seg.starts_with("eyJ") && seg.contains('.')))
+    };
+    s.split_whitespace()
+        .map(|tok| {
+            if shaped(tok.trim_matches(|c: char| matches!(c, '"' | '\''))) {
+                "[REDACTED]".to_string()
+            } else {
+                // `name=credential` — mask the value when the name
+                // carries no keyword the span pass would have caught.
+                match tok.rfind('=') {
+                    Some(i) if shaped(&tok[i + 1..]) => format!("{}[REDACTED]", &tok[..=i]),
+                    _ => tok.to_string(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One display line through `scrub_auth_spans` then
+/// `scrub_token_shapes` — text (orphan cmdline heads, remedies quoting
+/// commands, running-turn heads) is secret-bearing, so every row
+/// boundary scrubs before it renders or serializes. The span pass
+/// masks `key<sep>value` expressions; the shape pass masks bare
+/// credential-shaped tokens with no keyword. Local until PR #64's
+/// `doctor::host::redact_argv` lands on main — then this delegates to
+/// the shared helper (CAD-108 follow-up).
+fn scrub_line(s: &str) -> String {
+    scrub_token_shapes(&scrub_auth_spans(s))
 }
 
 /// The host scan with the command's cwd — `Scan::host` defaults to
@@ -185,6 +283,21 @@ fn host_scan_for(state_dir: PathBuf, cwd: PathBuf) -> doctor::host::Scan {
     let mut scan = doctor::host::Scan::host(&state_dir);
     scan.cwd = cwd;
     scan
+}
+
+/// The host report — normally `doctor::host::run`, overridden by the
+/// JSON fixture named in `CADENCE_SESSION_HOST_JSON` so tests can pin
+/// any disk/process state without touching the real host.
+fn host_report(scan: &doctor::host::Scan) -> Value {
+    if let Ok(path) = std::env::var("CADENCE_SESSION_HOST_JSON") {
+        if let Some(report) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        {
+            return report;
+        }
+    }
+    doctor::host::run(scan)
 }
 
 /// A `doctor --host` report as one Row: worst level wins, each non-ok
@@ -238,17 +351,17 @@ fn print_row(r: &Row) {
         "{:<9} {:<4} {}",
         r.name,
         r.sev.name(),
-        redact_text(&r.detail)
+        scrub_line(&r.detail)
     );
     if let Some(rem) = &r.remedy {
-        line.push_str(&format!(" — {}", redact_text(rem)));
+        line.push_str(&format!(" — {}", scrub_line(rem)));
     }
     println!("{line}");
     for i in &r.items {
-        println!("           · {}", redact_text(i));
+        println!("           · {}", scrub_line(i));
     }
     if let Some(f) = &r.fixed {
-        println!("           fixed: {f}");
+        println!("           fixed: {}", scrub_line(f));
     }
 }
 
@@ -317,35 +430,48 @@ fn running_msg(show: &Value, now: i64) -> Option<(String, String, i64)> {
     })
 }
 
-/// The full "may be stopped" test, run against one agent's row and its
-/// `agent_show` — used for the initial candidate list AND re-applied
-/// against a fresh `agent_show` immediately before every `agent_stop`,
-/// so an agent that claimed work while the sweep ran is skipped rather
-/// than killed mid-turn.
-fn stoppable(state_dir: &Path, agent: &Value, show: &Value, idle_secs: u64, now: i64) -> bool {
-    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
+/// Whether an agent is safe to stop right now — the one predicate the
+/// candidate pass (against the fleet snapshot) and the pre-stop
+/// re-check (against a fresh `agent_show` taken immediately before
+/// every `agent_stop`) share, so they can never drift again: an agent
+/// that claimed work while the sweep ran is skipped, never killed
+/// mid-turn. `Busy` means live work showed (a running message, or a
+/// pane that wouldn't probe idle); `No` means it simply wasn't a
+/// candidate. RPC/probe failures fail closed as `No`/`Busy`, never
+/// `Yes`.
+enum Stop {
+    Yes,
+    Busy,
+    No,
+}
+
+fn stoppable(state_dir: &Path, agent: &Value, show: &Value, idle_secs: u64, now: i64) -> Stop {
+    if running_msg(show, now).is_some() {
+        return Stop::Busy;
+    }
     if agent["state"].as_str() != Some("idle")
         || agent["dead"].as_bool().unwrap_or(false)
         || show["queued"].as_i64().unwrap_or(0) > 0
-        || running_msg(show, now).is_some()
     {
-        return false;
+        return Stop::No;
     }
     let updated = agent["updated"].as_f64().unwrap_or(now as f64) as i64;
     if now - updated < idle_secs as i64 {
-        return false;
+        return Stop::No;
     }
     // Never stop a busy pane: a live pty endpoint must probe idle.
-    if kind == "pty" && agent["endpoint"].is_string() {
-        return client::rpc(
+    if agent["endpoint_kind"].as_str().unwrap_or_default() == "pty" && agent["endpoint"].is_string()
+    {
+        let idle = client::rpc(
             state_dir,
             "agent_probe",
             json!({"alias": agent["alias"].as_str().unwrap_or_default()}),
         )
         .map(|p| p["idle"].as_bool().unwrap_or(false))
         .unwrap_or(false);
+        return if idle { Stop::Yes } else { Stop::Busy };
     }
-    true
+    Stop::Yes
 }
 
 /// Tracker projects and views for `scope` (`None` = all projects), plus
@@ -411,11 +537,21 @@ fn scope(project: Option<&str>) -> Result<Scope> {
 /// The `cadence/<wt-name>` open-PR branch names, lowercased, plus the
 /// full per-slug `prs` payload for the handoff — one `gh` fetch shared
 /// with the overview cache.
-fn gh_open(state_dir: &Path, sc: &Scope) -> (Vec<String>, HashMap<String, Value>) {
+fn gh_open(
+    state_dir: &Path,
+    sc: &Scope,
+    cache_only: bool,
+) -> (Vec<String>, HashMap<String, Value>) {
     let mut slugs: Vec<String> = sc.repos.iter().filter_map(|(_, s, _)| s.clone()).collect();
     slugs.sort();
     slugs.dedup();
-    let (repos, _state) = overview::github_repos(state_dir, &slugs);
+    // A dry run writes nothing — the gh cache included — so it reads
+    // whatever a previous real fetch left instead of refreshing.
+    let (repos, _state) = if cache_only {
+        overview::github_repos_cached(state_dir, &slugs)
+    } else {
+        overview::github_repos(state_dir, &slugs)
+    };
     let mut branches = Vec::new();
     for data in repos.values() {
         for pr in data["prs"].as_array().cloned().unwrap_or_default() {
@@ -482,7 +618,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
     // ---- host: the CAD-72 watchdog — disk, WAL, pipes, orphans,
     // temp dirs, stale worktrees in one read-only scan ----
     let sc = scope(opts.project.as_deref())?;
-    let host_scan = doctor::host::run(&host_scan_for(opts.state_dir.clone(), opts.cwd.clone()));
+    let host_scan = host_report(&host_scan_for(opts.state_dir.clone(), opts.cwd.clone()));
     let host = host_row("host", &host_scan);
     rows.push(host);
 
@@ -719,7 +855,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
         // Open PR on a cadence/<wt> branch whose local worktree is gone
         // (only checked where the PR's repo has a declared checkout —
         // the worktree may legitimately live on another host).
-        let (pr_branches, gh_repos) = gh_open(&opts.state_dir, &sc);
+        let (pr_branches, gh_repos) = gh_open(&opts.state_dir, &sc, false);
         for (slug, data) in &gh_repos {
             let Some((_, _, root)) = sc
                 .repos
@@ -825,10 +961,6 @@ pub struct EndOptions {
     pub idle_secs: u64,
     pub cwd: PathBuf,
     pub state_dir: PathBuf,
-    /// Whether this build's CLI accepts `issue finish --merged --force`
-    /// (probed in main.rs). The library sweep has no force path — this
-    /// only decides whether `--force-finish` is reported as ignored.
-    pub merged_force: bool,
 }
 
 pub fn run_end(opts: &EndOptions) -> Result<i32> {
@@ -894,10 +1026,13 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
                         would + refused
                     )
                 } else {
+                    // The same candidate set the dry run counts —
+                    // finished + refused; `skipped` rows were never
+                    // candidates, so they can't join the denominator.
                     format!(
                         "{} finished of {} candidate(s)",
                         done.finished.len(),
-                        srows.len()
+                        done.finished.len() + refused
                     )
                 };
                 if refused > 0 {
@@ -910,25 +1045,47 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             }
         },
     }
-    // --force-finish honesty: the sweep has no force path — say so
-    // rather than reporting a force that never ran.
-    if opts.force_finish && !opts.merged_force {
+    // --force-finish honesty: `issue finish --merged` has no --force
+    // (the flag conflicts with --merged outright) — say so rather than
+    // reporting a force that never ran.
+    if opts.force_finish {
         sweep
             .items
             .push("--force-finish ignored: issue finish --merged has no --force".to_string());
         sweep.sev = Sev::Warn;
         done.finish_notes
             .push("--force-finish ignored: issue finish --merged has no --force".to_string());
-    } else if opts.force_finish {
-        done.finish_notes
-            .push("finish ran with --force (recorded)".to_string());
     }
     rows.push(sweep);
 
     // ---- idle agents ----
+    // --project scopes the stop sweep to that project's agents: the
+    // owners of its issues plus any agent whose cwd lives under one of
+    // its repo checkouts — everything else is left running.
+    let owners: HashSet<&str> = sc
+        .views
+        .iter()
+        .filter_map(|v| v.issue.front.owner.as_deref())
+        .collect();
+    let in_scope = |a: &Value| -> bool {
+        if opts.project.is_none() {
+            return true;
+        }
+        let alias = a["alias"].as_str().unwrap_or_default();
+        if owners.contains(alias) {
+            return true;
+        }
+        let cwd = a["cwd"].as_str().unwrap_or_default();
+        !cwd.is_empty()
+            && sc
+                .repos
+                .iter()
+                .any(|(_, _, p)| Path::new(cwd).starts_with(p))
+    };
     let mut idle_row = Row::new("agents");
     let mut stop_candidates: Vec<String> = Vec::new();
     let mut busy = 0u32;
+    let mut out_of_scope = 0u32;
     if fl.reachable {
         for a in &fl.agents {
             let alias = a["alias"].as_str().unwrap_or_default();
@@ -937,34 +1094,18 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             if !registry::has_actor(provider, kind) {
                 continue;
             }
-            let show = fl.shows.get(alias).cloned().unwrap_or_default();
-            let queued = show["queued"].as_i64().unwrap_or(0);
-            let running = running_msg(&show, now);
-            if running.is_some() {
-                busy += 1;
-                continue;
-            }
-            if a["state"].as_str() != Some("idle")
-                || a["dead"].as_bool().unwrap_or(false)
-                || queued > 0
-            {
-                continue;
-            }
-            let updated = a["updated"].as_f64().unwrap_or(now as f64) as i64;
-            if now - updated < opts.idle_secs as i64 {
-                continue;
-            }
-            // Never stop a busy pane: a live pty endpoint must probe idle.
-            if kind == "pty" && a["endpoint"].is_string() {
-                let idle = client::rpc(&opts.state_dir, "agent_probe", json!({"alias": alias}))
-                    .map(|p| p["idle"].as_bool().unwrap_or(false))
-                    .unwrap_or(false);
-                if !idle {
-                    busy += 1;
-                    continue;
+            if !in_scope(a) {
+                if a["state"].as_str() == Some("idle") {
+                    out_of_scope += 1;
                 }
+                continue;
             }
-            stop_candidates.push(alias.to_string());
+            let show = fl.shows.get(alias).cloned().unwrap_or_default();
+            match stoppable(&opts.state_dir, a, &show, opts.idle_secs, now) {
+                Stop::Yes => stop_candidates.push(alias.to_string()),
+                Stop::Busy => busy += 1,
+                Stop::No => {}
+            }
         }
     }
     if !fl.reachable {
@@ -989,38 +1130,46 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             items: stop_candidates.clone(),
         };
         if !opts.dry_run {
-            for alias in &stop_candidates {
+            for (i, alias) in stop_candidates.iter().enumerate() {
                 // The fleet snapshot is stale — the finish sweep ran
                 // git/gh per worktree. Re-verify against a live
                 // agent_show before stopping: an agent that claimed
                 // work meanwhile is skipped, never killed mid-turn.
                 let still = client::rpc(&opts.state_dir, "agent_show", json!({"alias": alias}))
                     .map(|show| {
-                        stoppable(
-                            &opts.state_dir,
-                            &show["agent"],
-                            &show,
-                            opts.idle_secs,
-                            itime::now_epoch(),
+                        matches!(
+                            stoppable(
+                                &opts.state_dir,
+                                &show["agent"],
+                                &show,
+                                opts.idle_secs,
+                                itime::now_epoch(),
+                            ),
+                            Stop::Yes
                         )
                     })
                     .unwrap_or(false);
                 if !still {
                     done.stop_skipped.push(alias.clone());
-                    idle_row
-                        .items
-                        .push(format!("{alias} — skipped: busy or changed during the run"));
+                    idle_row.items[i] =
+                        format!("{alias} — skipped: busy or changed during the run");
                     continue;
                 }
                 match client::rpc(&opts.state_dir, "agent_stop", json!({"alias": alias})) {
                     Ok(_) => done.stopped.push(alias.clone()),
                     Err(e) => {
-                        idle_row.items.push(format!("stop {alias} failed: {e}"));
+                        idle_row.items[i] = format!("{alias} — stop failed: {e}");
                         failures += 1;
                     }
                 }
             }
         }
+    }
+    if out_of_scope > 0 {
+        idle_row.items.push(format!(
+            "{out_of_scope} idle agent(s) outside project '{}' left alone",
+            opts.project.as_deref().unwrap_or_default()
+        ));
     }
     rows.push(idle_row);
 
@@ -1028,6 +1177,11 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     let mut gc_row = Row::new("gc");
     if !fl.reachable {
         gc_row = gc_row.ok("skipped — daemon unreachable");
+    } else if let Some(p) = opts.project.as_deref() {
+        // `agent_gc` has no scope parameter — it sweeps the whole
+        // fleet. Under --project that's another project's agents, so
+        // skip it and say so rather than overreach.
+        gc_row = gc_row.ok(format!("gc is fleet-wide — skipped under --project {p}"));
     } else if opts.dry_run {
         let cands: Vec<String> = fl
             .agents
@@ -1062,9 +1216,15 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     rows.push(gc_row);
 
     // ---- host sweep: the CAD-72 watchdog again — orphans are
-    // reported, never killed; disk state rides along ----
-    let host_scan = doctor::host::run(&host_scan_for(opts.state_dir.clone(), opts.cwd.clone()));
+    // reported, never killed; disk state rides along. A report, not
+    // a gate: a full disk is `warn` here — `session start` is where a
+    // full host is correctly `fail` — so only this verb's own failures
+    // (a sweep RPC error, an unwritable handoff) set exit 2. ----
+    let host_scan = host_report(&host_scan_for(opts.state_dir.clone(), opts.cwd.clone()));
     let mut sweep_row = host_row("sweep", &host_scan);
+    if sweep_row.sev == Sev::Fail {
+        sweep_row.sev = Sev::Warn;
+    }
     if sweep_row.detail == "host clean" {
         sweep_row.detail = "clean".to_string();
     }
@@ -1102,7 +1262,7 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     // ---- handoff: --dry-run writes nothing — the row names the file
     // it would write and the markdown goes to stdout / the json
     // payload. Real runs use a timestamped name and never overwrite.
-    let (_, gh_repos) = gh_open(&opts.state_dir, &sc);
+    let (_, gh_repos) = gh_open(&opts.state_dir, &sc, opts.dry_run);
     let md = handoff_md(opts, &fl, &sc, &gh_repos, &done, now);
     let mut handoff_path = PathBuf::new();
     let mut handoff_preview = None;
@@ -1250,13 +1410,21 @@ fn handoff_md(
     let mut queued_lines = String::new();
     for a in &fl.agents {
         let alias = a["alias"].as_str().unwrap_or_default();
-        let show = fl.shows.get(alias).cloned().unwrap_or_default();
+        if done.stopped.iter().any(|s| s == alias) {
+            continue;
+        }
+        // Post-sweep truth, not the pre-sweep snapshot: an agent that
+        // claimed work during the run (the `stop_skipped` list) shows
+        // here as running, and one we just stopped is absent.
+        let show = if opts.dry_run {
+            fl.shows.get(alias).cloned().unwrap_or_default()
+        } else {
+            client::rpc(&opts.state_dir, "agent_show", json!({"alias": alias}))
+                .unwrap_or_else(|_| fl.shows.get(alias).cloned().unwrap_or_default())
+        };
         if let Some((id, head, age)) = running_msg(&show, now) {
             any_run = true;
-            md.push_str(&format!(
-                "- {alias}: {id} ({age}s) {}\n",
-                redact_text(&head)
-            ));
+            md.push_str(&format!("- {alias}: {id} ({age}s) {}\n", scrub_line(&head)));
         }
         let queued = show["queued"].as_i64().unwrap_or(0);
         if queued > 0 {
@@ -1328,7 +1496,13 @@ fn handoff_md(
 
     md.push_str("\n## next session first\n");
     let pm_dir = issue::default_dir().unwrap_or_default();
-    let view = overview::overview(&opts.state_dir, &pm_dir);
+    // Dry-run: the cache-only overview — a dry run writes nothing,
+    // cache included.
+    let view = if opts.dry_run {
+        overview::overview_cached(&opts.state_dir, &pm_dir)
+    } else {
+        overview::overview(&opts.state_dir, &pm_dir)
+    };
     let needs = view["needs_me"].as_array().cloned().unwrap_or_default();
     if needs.is_empty() {
         md.push_str("- nothing queued on a human\n");
@@ -1367,65 +1541,110 @@ fn handoff_md(
 mod tests {
     use super::*;
 
-    #[test]
-    fn redact_text_covers_every_key_and_shape() {
-        // = and : separators, each key, case-insensitive.
-        for (k, sep) in [
-            ("key", "="),
-            ("token", "="),
-            ("secret", "="),
-            ("password", "="),
-            ("passwd", "="),
-            ("auth", "="),
-            ("Key", "="),
-            ("TOKEN", ":"),
-            ("api-key", "="),
-            ("x-api-token", "="),
-            ("oauth_secret", ":"),
-        ] {
-            let s = format!("prog --{k}{sep}s3cr3t-value rest");
-            assert!(s.contains("s3cr3t-value"), "fixture broken: {s}");
-            let out = redact_text(&s);
-            assert!(
-                !out.contains("s3cr3t-value") && out.contains("REDACTED"),
-                "{k}{sep} not redacted: {out}"
-            );
-        }
-        // Non-secret args survive untouched.
-        let keep = "prog --verbose --limit=30 --name=fable";
-        assert_eq!(redact_text(keep), keep);
-        // A key-shaped flag with no value stays — nothing follows it.
-        let flag = "prog --key value"; // 'value' after space is NOT redacted (only =/: binds)
-        let _ = flag;
-    }
+    // These pin the session-side boundary — every display line goes
+    // through `scrub_line` before it renders or serializes. When PR
+    // #64's `doctor::host::redact_argv` lands, `scrub_line` delegates
+    // to it; these expectations stay the contract either way.
 
     #[test]
-    fn redact_text_handles_figma_style_flag() {
-        let s = "npm exec figma-developer-mcp --figma-api-key=figd_ABC123 --stdio";
-        let out = redact_text(s);
+    fn scrub_line_redacts_flag_env_and_bare_shapes() {
+        // The observed figma argv — flag=value form.
         assert_eq!(
-            out,
-            "npm exec figma-developer-mcp --figma-api-key=REDACTED --stdio"
+            scrub_line("npm exec figma-developer-mcp --figma-api-key=figd_ABC123 --stdio"),
+            "npm exec figma-developer-mcp --figma-api-key=[REDACTED] --stdio"
         );
+        // `--flag value`, `NAME=value`, and a bare credential token
+        // with no flag name at all — the shape catches it.
+        for (line, want) in [
+            (
+                "cmd --token s3cr3t --verbose",
+                "cmd --token [REDACTED] --verbose",
+            ),
+            (
+                "env GITHUB_TOKEN=ghp_XYZ run",
+                "env GITHUB_TOKEN=[REDACTED] run",
+            ),
+            (
+                "pid 9 leaked figd_TESTTOKEN00000000000000000000000 here",
+                "pid 9 leaked [REDACTED] here",
+            ),
+            ("auth: Bearer ghp_abcdefghijklmnopqrst", "auth: [REDACTED]"),
+            // AWS access-key id and JWT shapes, no keyword at all.
+            (
+                "leaked AKIAIOSFODNN7EXAMPLE in argv",
+                "leaked [REDACTED] in argv",
+            ),
+            (
+                "head eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.rTwpG2U8x9 tail",
+                "head [REDACTED] tail",
+            ),
+        ] {
+            assert_eq!(scrub_line(line), want, "{line}");
+        }
+        // Ordinary text passes through untouched.
+        let keep = "disk: /tmp 12.4% free (30.6 GiB) — du -xh --max-depth=1 /tmp | sort -h";
+        assert_eq!(scrub_line(keep), keep);
     }
 
     #[test]
-    fn redact_text_multibyte_does_not_panic() {
-        // A multibyte char right where a byte-slice compare could split
-        // a UTF-8 boundary — the old str-index impl panicked here.
-        let s = "pröc --token=töken";
-        let out = redact_text(s);
-        assert!(out.contains("REDACTED") && !out.contains("töken"));
+    fn scrub_line_redacts_auth_schemes_and_quoted_values() {
+        // The observed leak: a non-Bearer scheme left the credential
+        // after the masked scheme word. The whole `scheme credential`
+        // expression is masked now, whatever the scheme.
+        for (line, want) in [
+            (
+                "curl -H Authorization: Basic dXNlcjpwYXNzd29yZA== https://api.example.com",
+                "curl -H Authorization: [REDACTED] https://api.example.com",
+            ),
+            (
+                "Authorization: Token abc123def456",
+                "Authorization: [REDACTED]",
+            ),
+            ("Authorization: ApiKey zzz", "Authorization: [REDACTED]"),
+            ("Authorization: Negotiate YlBJ", "Authorization: [REDACTED]"),
+            // Quoted value: mask to the close quote, keep the quotes.
+            (
+                "cmd --auth-token \"Bearer sk-live-abc123\" --verbose",
+                "cmd --auth-token \"[REDACTED]\" --verbose",
+            ),
+            ("token 'sekret v2' done", "token '[REDACTED]' done"),
+            // `key:`/`key =` text separators.
+            ("secret_key: hunter2 rest", "secret_key: [REDACTED] rest"),
+            ("api-key = abc123 rest", "api-key = [REDACTED] rest"),
+        ] {
+            assert_eq!(scrub_line(line), want, "{line}");
+        }
     }
 
     #[test]
-    fn row_json_redacts_detail_and_items() {
-        let mut r = Row::new("sweep").ok("done");
-        r.detail = "orphan --token=abc123".into();
+    fn scrub_line_keyword_needs_word_boundaries() {
+        // Keywords inside ordinary words must not cost the next word —
+        // the unbounded scan ate it (`monkey`, `author`, `keystore`).
+        for keep in [
+            "the monkey ate the sandwich",
+            "the author wrote the docs",
+            "keystore files on disk",
+        ] {
+            assert_eq!(scrub_line(keep), keep, "{keep}");
+        }
+    }
+
+    #[test]
+    fn scrub_line_multibyte_is_safe() {
+        let out = scrub_line("pröc --token=tök rest");
+        assert!(out.contains("[REDACTED]") && !out.contains("tök"));
+    }
+
+    #[test]
+    fn row_json_redacts_detail_remedy_fixed_and_items() {
+        let mut r = Row::new("sweep").warn("orphan --token=abc123", "kill --secret=hunter2");
+        r.fixed = Some("restarted --api-key=zzz".into());
         r.items = vec!["pid 9 --secret=hunter2".into(), "clean".into()];
         let j = r.json();
-        assert_eq!(j["detail"], "orphan --token=REDACTED");
-        assert_eq!(j["items"][0], "pid 9 --secret=REDACTED");
+        assert_eq!(j["detail"], "orphan --token=[REDACTED]");
+        assert_eq!(j["remedy"], "kill --secret=[REDACTED]");
+        assert_eq!(j["fixed"], "restarted --api-key=[REDACTED]");
+        assert_eq!(j["items"][0], "pid 9 --secret=[REDACTED]");
         assert_eq!(j["items"][1], "clean");
     }
 }

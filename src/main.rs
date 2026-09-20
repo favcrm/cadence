@@ -3472,20 +3472,11 @@ fn run() -> Result<i32> {
                 idle_secs,
                 cwd: std::env::current_dir()?,
                 state_dir,
-                merged_force: probe_finish_force(),
             }),
         },
         Commands::Overview { json, watch } => run_overview(&state_dir, json, watch),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
-}
-
-/// Whether this build's CLI accepts `issue finish --merged --force` —
-/// the sweep itself is the library call `issue::finish::sweep`, which
-/// has no force path; this probe only decides whether `session end
-/// --force-finish` is honoured or reported as ignored.
-fn probe_finish_force() -> bool {
-    Cli::try_parse_from(["cadence", "issue", "finish", "--merged", "--force"]).is_ok()
 }
 
 /// The `cadence job` tree — thin RPC wrappers. Validation, transitions
