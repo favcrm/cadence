@@ -13234,10 +13234,11 @@ fn stall_secs_zero_disables_and_live_set_rearms() {
     assert_eq!(e["payload"]["message"], "m-zero", "{e}");
 }
 
-/// The ticker only samples panes while a turn runs: captures stop when
-/// nothing is in flight.
+/// The ticker samples every live pty pane — idle included, so an
+/// approval menu raised with no message in flight still surfaces —
+/// and stops only when the agent does.
 #[test]
-fn pty_stall_sampling_stops_when_nothing_runs() {
+fn pty_stall_sampling_runs_while_the_pane_lives() {
     let d = TestDaemon::start();
     let mock = d.mock_stub();
     stall_sample(1);
@@ -13250,14 +13251,8 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
             .unwrap_or_default()
             .len()
     };
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "do work", "message": "ms6"}),
-    )
-    .unwrap();
-    d.wait_message("w1", "ms6", &["running"], 15);
-    // While the turn runs, captures grow — poll, don't assume a tick
-    // landed inside a fixed sleep.
+    // Nothing has ever been sent — an idle-but-live pane still
+    // samples: the approval-menu watch needs the frames.
     let baseline = captures();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut grew = false;
@@ -13268,7 +13263,7 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
         }
         thread::sleep(Duration::from_millis(200));
     }
-    assert!(grew, "no samples while a turn runs: {baseline}");
+    assert!(grew, "idle pane was never sampled: {baseline}");
 
     // Stopping the pane mid-sampling returns promptly — the ticker
     // never holds the adapter across a capture.
@@ -13288,7 +13283,7 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
     assert_eq!(
         captures(),
         idle_count,
-        "capture-pane ran while nothing was running"
+        "capture-pane ran after the agent stopped"
     );
     stall_sample(0);
 }
@@ -13389,7 +13384,11 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
     let ev = d.wait_event("dv", "approval_answered", 10);
     assert_eq!(ev["payload"]["choice"], "8", "{ev}");
     assert_eq!(ev["payload"]["line"], "$ printenv FOO", "{ev}");
-    assert_eq!(ev["payload"]["by"], "test-op", "{ev}");
+    // Identity is derived from the peer pid — the test process sits
+    // outside every pane, so `by` is operator and the supplied name
+    // survives only as a claim.
+    assert_eq!(ev["payload"]["by"], "operator", "{ev}");
+    assert_eq!(ev["payload"]["claimed_by"], "test-op", "{ev}");
     assert_eq!(ev["payload"]["probe"]["approval_menu"], true, "{ev}");
 
     // With the menu cleared (operator closed it), the surviving claim
@@ -13590,46 +13589,111 @@ fn pty_queued_menu_surfaces_and_answers() {
     stall_sample(0);
 }
 
-/// `agent answer` audit rules: a pane must never approve its own
-/// prompt (`by` equal to the agent's alias refuses), and an answer
-/// `by` a live agent is stamped `by_kind: "agent"` — never silently
-/// read as a human operator's decision.
+/// A menu raised on a pane with NO message at all still surfaces —
+/// the stall watch samples idle panes, the event fires `idle: true`
+/// and attributes no message, and the needs-me row names the remedy.
 #[test]
-fn pty_answer_rejects_self_approval_and_stamps_agent() {
+fn pty_idle_pane_menu_surfaces() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    // Nothing was ever sent — the menu arrives on a quiet pane.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let rise = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(rise["payload"]["idle"], true, "{rise}");
+    assert_eq!(rise["payload"]["line"], "$ printenv FOO", "{rise}");
+    assert!(rise["payload"]["message"].is_null(), "{rise}");
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(show["pane_menu"], "$ printenv FOO", "{show}");
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    assert!(
+        needs.iter().any(|n| n["kind"] == "approval_menu"
+            && n["command"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("cadence agent answer dv ")),
+        "{needs:?}"
+    );
+
+    // The operator can answer it straight away.
+    d.rpc("agent_answer", json!({"alias": "dv", "choice": "8"}))
+        .unwrap();
+    stall_sample(0);
+}
+
+/// The answerer's identity is derived from the socket peer's pid
+/// walking its /proc ancestry into a pane — never from a `by` the
+/// client chose. A caller inside the target's own pane is refused
+/// outright; inside another agent's pane it stamps that agent.
+#[test]
+fn pty_answer_derives_caller_from_peer_pid() {
     let d = TestDaemon::start();
     let mock = d.mock_devin();
     d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
     d.register_devin_opts("peer", json!({}));
     d.wait_agent("dv", "idle", 20);
+    d.wait_agent("peer", "idle", 20);
     atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
 
-    // Self-approval refuses before any key is sent.
+    // Point a pane pid at this test process and every RPC it makes
+    // descends from that pane — the unforgeable "caller is inside
+    // the agent" signal.
+    let me = std::process::id() as i64;
+    let set_pid = |alias: &str, pid: i64| {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE agents SET pid=?1 WHERE alias=?2",
+            rusqlite::params![pid, alias],
+        )
+        .unwrap();
+    };
+
+    // Self-approval refuses before any key is sent — even with `by`
+    // claiming to be an operator.
+    set_pid("dv", me);
     let err = d
         .rpc(
             "agent_answer",
-            json!({"alias": "dv", "choice": "8", "by": "dv"}),
+            json!({"alias": "dv", "choice": "8", "by": "operator"}),
         )
         .unwrap_err();
     assert!(err.to_string().contains("its own approval menu"), "{err}");
     let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
     assert!(!input.contains("<KEY"), "no key sent: {input}");
 
-    // An answer `by` another live agent is stamped as agent-sourced;
-    // an operator string stamps `operator`.
+    // A caller inside ANOTHER agent's pane stamps that agent; a `by`
+    // claiming otherwise is kept only as a claim.
+    set_pid("dv", 999_999_999);
+    set_pid("peer", me);
     d.rpc(
         "agent_answer",
-        json!({"alias": "dv", "choice": "8", "by": "peer"}),
+        json!({"alias": "dv", "choice": "8", "by": "dv"}),
     )
     .unwrap();
     let ev = d.wait_event("dv", "approval_answered", 10);
     assert_eq!(ev["payload"]["by"], "peer", "{ev}");
     assert_eq!(ev["payload"]["by_kind"], "agent", "{ev}");
+    assert_eq!(ev["payload"]["claimed_by"], "dv", "{ev}");
+    assert_eq!(ev["payload"]["caller_pid"], me, "{ev}");
+
+    // Outside every pane the caller is an operator — a `by` naming
+    // the target is a claim, not an attribution.
+    set_pid("peer", 999_999_999);
     atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
-    d.rpc("agent_answer", json!({"alias": "dv", "choice": "1"}))
-        .unwrap();
+    d.rpc(
+        "agent_answer",
+        json!({"alias": "dv", "choice": "1", "by": "dv"}),
+    )
+    .unwrap();
     let evs = wait_event_count(&d, "dv", "approval_answered", 2, 10);
     assert_eq!(evs[1]["payload"]["by"], "operator", "{evs:?}");
     assert_eq!(evs[1]["payload"]["by_kind"], "operator", "{evs:?}");
+    assert_eq!(evs[1]["payload"]["claimed_by"], "dv", "{evs:?}");
 }
 
 /// A transient `capture-pane` failure inside the gate probe refuses
@@ -13643,6 +13707,11 @@ fn pty_gate_probe_failure_is_a_gate_refusal() {
     d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
     d.wait_agent("dv", "idle", 20);
 
+    // `MOCK_TMUX_FAIL` is process-global — a parallel test's mock
+    // calls could trip on it inside this window. The outage is
+    // seconds-long and the failure mode (a gate retry) is benign, so
+    // the knob stays env-global rather than growing a per-pane
+    // failure file.
     std::env::set_var("MOCK_TMUX_FAIL", "capture-pane");
     d.rpc(
         "agent_send",

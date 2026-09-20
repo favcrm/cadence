@@ -239,7 +239,10 @@ fn opt_row(l: &str) -> bool {
         let rest = rest.trim();
         !rest.is_empty() && !cursor_screen::PLACEHOLDERS.contains(&rest)
     } else {
-        t.ends_with(')') && t.contains('(')
+        // A bare option row must carry a real menu key in its trailing
+        // `(hint)` — transcript text like `foo(bar)` would otherwise
+        // satisfy the shape and fake an option block under a `→` row.
+        hotkey(l).is_some()
     }
 }
 
@@ -267,11 +270,12 @@ fn chrome_row(l: &str) -> bool {
 
 /// The open option block as `(selected row, block start, block end)`.
 /// The selected row is the last `→`-led row with menu chrome directly
-/// below it — a menu always shows more than one row, while the input
-/// box's `→` is followed by the model/cwd bar. The block then extends
-/// over contiguous option rows up AND down: options printed above the
-/// highlighted row are part of the menu, so a choice counts the whole
-/// list in printed order, never just the suffix from `→`.
+/// below it — or the frame's last row with an option directly above
+/// (a highlighted final option has nothing below it) — while the
+/// input box's `→` is followed by the model/cwd bar. The block then
+/// extends over contiguous option rows up AND down: options printed
+/// above the highlighted row are part of the menu, so a choice counts
+/// the whole list in printed order, never just the suffix from `→`.
 fn menu_block(lines: &[&str]) -> Option<(usize, usize, usize)> {
     let sel = lines
         .iter()
@@ -280,10 +284,11 @@ fn menu_block(lines: &[&str]) -> Option<(usize, usize, usize)> {
         .find(|(i, l)| {
             opt_row(l)
                 && l.trim_start().starts_with('→')
-                && lines[i + 1..]
+                && (lines[i + 1..]
                     .iter()
                     .find(|n| !n.trim().is_empty())
                     .is_some_and(|n| chrome_row(n))
+                    || (*i > 0 && opt_row(lines[i - 1])))
         })
         .map(|(i, _)| i)?;
     let mut start = sel;
@@ -353,11 +358,13 @@ pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
     let content = screen.trim_end();
     // Menu evidence lives in the wider menu window — the permission
     // select plus still-visible status chrome can push its rows above
-    // the busy anchor. Anchors decide alone but only matched on the
-    // trimmed row's leading text; `Waiting for approval` sits mid-row
-    // on the `$ cmd …` status line, so it needs the option block
-    // beside it, and so does a hint cluster — a transcript quoting
-    // any of these strings stays text, never a menu.
+    // the busy anchor. Natural-language anchors are ordinary sentence
+    // text, so even matched on the trimmed row's leading text they
+    // decide only beside real menu structure: a parsed option row or
+    // the anchored legend — an indented transcript line quoting
+    // `Run this command?` stays inert. `Waiting for approval` sits
+    // mid-row on the `$ cmd …` status line, same rule. A hint cluster
+    // without an anchor still needs the `→` option block.
     let menu_lines: Vec<&str> = content
         .lines()
         .rev()
@@ -380,7 +387,9 @@ pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
         .iter()
         .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
         .count();
-    let approval_menu = anchor || (menu_block(&menu_lines).is_some() && (waiting || hints >= 2));
+    let block = menu_block(&menu_lines);
+    let structure = block.is_some() || hints >= 1 || menu_lines.iter().any(|l| opt_row(l));
+    let approval_menu = ((anchor || waiting) && structure) || (block.is_some() && hints >= 2);
     let lines: Vec<&str> = content.lines().collect();
     // Prompt search is anchored to the bottom `STATUS_LINES` rows —
     // the input row lives there on every real frame — and can never
@@ -899,6 +908,24 @@ impl TuiProfile for CursorProfile {
             )
         })?;
         let options = &lines[menu_top + start..=menu_top + end];
+        // A `↓ more below`/`↑ more above` marker beside the block
+        // means the visible list is a window onto a longer one —
+        // `answer 1` would hit the first *visible* option, not the
+        // first printed one. Refuse rather than pick the wrong row.
+        let scroll_marker = |l: &str| {
+            let t = l.trim_start();
+            t.contains("more below") || t.contains("more above")
+        };
+        let truncated = (start > 0 && scroll_marker(lines[menu_top + start - 1]))
+            || lines
+                .get(menu_top + end + 1)
+                .is_some_and(|l| scroll_marker(l));
+        if truncated {
+            return Err(Error::rejected(
+                "the option list is scrolled — the visible rows are not \
+                 the whole menu; answer it in the pane",
+            ));
+        }
         // A lone `→` row is not a one-option menu — a stray marker
         // row with chrome beneath it can parse as a block; a real
         // menu always lists at least one sibling option.
@@ -1119,10 +1146,10 @@ mod tests {
 
     #[test]
     fn approval_anchor_wins_over_transcript() {
-        // `Not in allowlist` inside the status region is a real
-        // pending approval — anchor evidence decides on its own.
+        // `Not in allowlist` beside a real option row is a pending
+        // approval — anchor plus menu structure decides.
         let p = analyze_cursor(
-            "$ cadence self\n  → Add a follow-up\nNot in allowlist: cadence\n  Grok 4.6\n",
+            "$ cadence self\nNot in allowlist: cadence\n  → Run (once) (y)\n    Skip & tell the agent what to do instead (esc or n)\n",
             None,
         );
         assert!(!p.idle && p.approval_menu);
@@ -1229,6 +1256,72 @@ mod tests {
             let p = analyze_cursor(&format!("{busy}\n{quoted}"), None);
             assert!(!p.approval_menu, "{quoted}: {:?}", p);
         }
+    }
+
+    #[test]
+    fn indented_anchor_without_structure_is_not_a_menu() {
+        // A transcript row that LEADS with the anchor once indented
+        // is the round-3 false positive: `trim_start` makes it look
+        // row-anchored, and the anchor alone used to flip the pane
+        // to `approval_menu` and livelock every send. With no option
+        // block and no legend beside it, the row is inert text.
+        let busy = fixture("busy.txt");
+        for line in [
+            "    Run this command?",
+            "      Not in allowlist: rg",
+            "  → waiting earlier: Run this command?", // mid-row anchor
+        ] {
+            let p = analyze_cursor(&format!("{busy}\n{line}"), None);
+            assert!(!p.approval_menu, "{line}: {:?}", p);
+        }
+    }
+
+    #[test]
+    fn parenthesized_transcript_line_is_not_an_option() {
+        // `foo(bar)` is not a hotkey — a `→` transcript row plus that
+        // line used to parse as a two-option block, letting `answer`
+        // send Enter into a real input box. `opt_row` now requires
+        // an allowlisted hotkey on non-selected rows, so no block
+        // forms and neither detect nor answer engages.
+        let screen = "echo ran ok\n  → ls -la\n foo(bar)\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        let prof = screen_profile();
+        assert!(prof.approval_answer(screen, "1").is_err());
+        // And the input-box case outright: `→` input prompt over a
+        // parenthesized transcript row.
+        let prompt = " foo(bar)\n  → \n  Grok 4.6\n";
+        assert!(!analyze_cursor(prompt, None).approval_menu);
+        assert!(prof.approval_answer(prompt, "1").is_err());
+    }
+
+    #[test]
+    fn last_row_highlight_still_detects_and_answers() {
+        // A highlighted option can be the frame's last row — nothing
+        // renders below it. The block must still qualify via the
+        // option row above it.
+        let screen = " Run this command?\n Not in allowlist: whoami\n    Run (once) (y)\n  → Skip & tell the agent what to do instead (esc or n)\n";
+        let p = analyze_cursor(screen, None);
+        assert!(p.approval_menu, "{p:?}");
+        let prof = screen_profile();
+        assert_eq!(prof.approval_answer(screen, "1").unwrap(), vec!["y"]);
+        assert_eq!(prof.approval_answer(screen, "2").unwrap(), vec!["n"]);
+    }
+
+    #[test]
+    fn scrolled_option_block_refuses_to_answer() {
+        // `↓ more below` under the block means option 1 is off-screen
+        // — answering `1` would hit the first *visible* row instead.
+        let screen = " Run this command?\n    Run (once) (y)\n    Add Shell(whoami) to allowlist? (tab)\n  → Skip & tell the agent what to do instead (esc or n)\n   ↓ more below\n";
+        let prof = screen_profile();
+        let err = prof.approval_answer(screen, "1").unwrap_err().to_string();
+        assert!(err.contains("scrolled"), "{err}");
+        // Detection still sees the menu — the refusal is only about
+        // which row a number picks.
+        assert!(analyze_cursor(screen, None).approval_menu);
+        // A marker ABOVE the block is the same truncation.
+        let screen = " Run this command?\n   ↑ more above\n  → Add Shell(whoami) to allowlist? (tab)\n    Skip & tell the agent what to do instead (esc or n)\n";
+        assert!(prof.approval_answer(screen, "1").is_err());
     }
 
     fn profile(dir: &std::path::Path, params: serde_json::Value) -> CursorProfile {

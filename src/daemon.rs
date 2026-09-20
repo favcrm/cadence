@@ -201,9 +201,11 @@ struct StallWatch {
     /// `Some` is the menu-open flag: the rising edge fires
     /// `approval_menu` once per menu, and the views read the line.
     menu_line: Option<String>,
-    /// The line the last `approval_menu` event carried — a detection
-    /// flicker that re-rises on the same line must not re-fire.
-    menu_evented: Option<String>,
+    /// The menu lines `approval_menu` has already fired for — a small
+    /// bounded history, not just the last one: menus that alternate
+    /// subjects across non-menu samples must not re-fire on every
+    /// re-detection.
+    menu_evented: std::collections::VecDeque<String>,
     /// `turn_silent_end` already fired for this message — the event
     /// is once per message, never twice.
     silent_end_sent: bool,
@@ -230,7 +232,7 @@ impl Default for StallWatch {
             idle_samples: 0,
             idle_since: None,
             menu_line: None,
-            menu_evented: None,
+            menu_evented: std::collections::VecDeque::new(),
             silent_end_sent: false,
             last_probe: None,
             episodes: 0,
@@ -1005,7 +1007,14 @@ impl Shared {
 
     // ---- dispatch ----
 
-    pub fn dispatch(self: &Arc<Self>, method: &str, params: &Value) -> Result<Value> {
+    /// `peer_pid` is the socket peer's pid from `SO_PEERCRED` — the
+    /// only caller-supplied-identity evidence the daemon can trust.
+    pub fn dispatch(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         match method {
             "health" => Ok(json!({
                 "state": "ready",
@@ -1110,7 +1119,7 @@ impl Shared {
             "agent_ready" => self.rpc_ready(params),
             "agent_capture" => self.rpc_capture(params),
             "agent_probe" => self.rpc_probe(params),
-            "agent_answer" => self.rpc_answer(params),
+            "agent_answer" => self.rpc_answer(params, peer_pid),
             "agent_set" => self.rpc_set(params),
             "agent_inbox" => self.rpc_inbox(params),
             "message_report" => self.rpc_message_report(params),
@@ -1744,35 +1753,49 @@ impl Shared {
     /// anything else, so the key can never land in a prompt or a
     /// running turn. Records `approval_answered` with who answered
     /// and the menu line the answer went to.
-    fn rpc_answer(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    fn rpc_answer(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let choice = required_str(params, "choice")?;
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let claimed_by = optional_str(params, "by");
         let note = optional_str(params, "note");
-        // A pane must never approve its own prompt — a worker that can
-        // reach the socket could otherwise self-sanction the very
-        // decision the menu exists to gate. And `by` naming a live
-        // agent is stamped as one: the audit trail must not read an
-        // agent-sourced answer as a human operator's decision.
-        if by == alias {
+        // The answerer's identity is DERIVED, never claimed: the socket
+        // peer's pid walks its /proc ancestry and a pid that descends
+        // from an agent's pane root IS that agent — a `by` field, an
+        // env alias, or a forked name cannot forge it. A pane must
+        // never approve its own prompt: a worker that can reach the
+        // socket could otherwise self-sanction the very decision the
+        // menu exists to gate.
+        let facts = self.store.pty_endpoint_facts().unwrap_or_default();
+        let caller = facts
+            .iter()
+            .find(|(_, (_, pid, _))| adapter::pty::descends_from(peer_pid, *pid))
+            .map(|(a, _)| a.clone());
+        if caller.as_deref() == Some(alias.as_str()) {
             return Err(Error::rejected(
-                "a pane cannot answer its own approval menu — `by` must \
-                 not be the agent's own alias",
+                "a pane cannot answer its own approval menu — the caller \
+                 descends from the target's own pane process",
             ));
         }
-        let by_kind = if self.store.agent(by).is_ok() {
-            "agent"
-        } else {
-            "operator"
+        let (by, by_kind) = match &caller {
+            Some(a) => (a.as_str(), "agent"),
+            None => ("operator", "operator"),
         };
         let probe = self.adapter_for(&alias)?.answer_approval(choice)?;
         let mut detail = json!({
             "by": by,
             "by_kind": by_kind,
+            "caller_pid": peer_pid,
             "choice": choice,
             "line": probe.reason.clone(),
             "probe": probe.to_json(),
         });
+        // A supplied `by` that disagrees with the derived identity is
+        // preserved as a claim, not an attribution.
+        if let Some(c) = claimed_by {
+            if c != by {
+                detail["claimed_by"] = json!(c);
+            }
+        }
         if let Some(n) = note {
             detail["note"] = json!(n);
         }
@@ -3028,38 +3051,35 @@ impl Shared {
     fn stall_check(&self, alias: &str, ctl: &Arc<AgentCtl>) {
         // The tracked head: the running turn when one is in flight,
         // else the oldest still-waiting message — a pane menu that
-        // blocks its delivery must surface before any turn starts
-        // (queued-head tracking is menu detection only; stall and
-        // silent-end bookkeeping need a started turn).
+        // blocks its delivery must surface before any turn starts.
+        // And with nothing tracked at all a pty pane STILL samples:
+        // an approval raised on an idle pane is a needs-me signal the
+        // views and the `approval_menu` event must carry — menu
+        // detection only; stall/silent-end bookkeeping and message
+        // attribution need a started turn.
         let running = match self.store.running_message(alias) {
             Ok(m) => m,
             Err(_) => return,
         };
-        let tracked = match running {
-            Some(ref m) => m.clone(),
+        let tracked: Option<Message> = match running {
+            Some(ref m) => Some(m.clone()),
             None => match self.store.queued_head(alias) {
-                Ok(Some(m)) => m,
-                Ok(None) => {
-                    let mut w = ctl.stall.lock().unwrap();
-                    w.message = None;
-                    w.stalled_at = None;
-                    w.sample_at = None;
-                    w.settled = None;
-                    w.previous = None;
-                    w.candidate = None;
-                    w.changed = 0;
-                    w.menu_line = None;
-                    w.menu_evented = None;
-                    w.idle_samples = 0;
-                    w.idle_since = None;
-                    return;
-                }
+                Ok(m) => m,
                 Err(_) => return,
             },
         };
         let Ok(agent) = self.store.agent(alias) else {
             return;
         };
+        if tracked.is_none() && agent.endpoint_kind != "pty" {
+            // Nothing to watch on a non-pty endpoint — clear any
+            // stale watch so a later message starts clean.
+            let mut w = ctl.stall.lock().unwrap();
+            if w.message.is_some() {
+                *w = StallWatch::default();
+            }
+            return;
+        }
         // Store reads stay outside the stall lock — `stall_budget`
         // takes the conn mutex and no other path holds it in reverse.
         let budget = running
@@ -3068,9 +3088,15 @@ impl Shared {
             .unwrap_or(0);
         let ad = ctl.adapter.lock().unwrap().clone();
         let mut w = ctl.stall.lock().unwrap();
-        if w.message.as_deref() != Some(tracked.id.as_str()) {
+        if w.message.as_deref() != tracked.as_ref().map(|m| m.id.as_str()) {
+            // The tracked subject changed (or drained) — the watch
+            // resets, but the fired-menu history is pane state, not
+            // message state: keeping it stops a menu that survives a
+            // message transition from re-firing its event.
+            let menu_evented = std::mem::take(&mut w.menu_evented);
             *w = StallWatch {
-                message: Some(tracked.id.clone()),
+                message: tracked.as_ref().map(|m| m.id.clone()),
+                menu_evented,
                 ..StallWatch::default()
             };
         }
@@ -3129,11 +3155,15 @@ impl Shared {
                 if probe.approval_menu {
                     w.idle_samples = 0;
                     w.idle_since = None;
-                    if w.menu_line.is_none()
-                        && w.menu_evented.as_deref() != Some(probe.reason.as_str())
-                    {
+                    if w.menu_line.is_none() && !w.menu_evented.iter().any(|l| l == &probe.reason) {
                         menu_rise = Some(probe.reason.clone());
-                        w.menu_evented = Some(probe.reason.clone());
+                        w.menu_evented.push_back(probe.reason.clone());
+                        // Bounded: the pane only ever renders a small
+                        // vocabulary of menu lines — 8 is far past
+                        // any alternating-subject cycle.
+                        while w.menu_evented.len() > 8 {
+                            w.menu_evented.pop_front();
+                        }
                     }
                     w.menu_line = Some(probe.reason.clone());
                 } else {
@@ -3252,7 +3282,7 @@ impl Shared {
         };
         drop(w);
         if let Some(line) = menu_rise {
-            self.approval_menu_fired(&agent, &tracked, &line, running.is_none());
+            self.approval_menu_fired(&agent, tracked.as_ref(), &line, running.is_none());
         }
         if let Some((age, last_activity, probe)) = end_fire {
             if let Some(m) = running.as_ref() {
@@ -3364,18 +3394,34 @@ impl Shared {
     }
 
     /// `approval_menu`: the sampled pane just showed an approval menu
-    /// — recorded once per menu (the rising edge), carrying the menu
-    /// line so the row names what's being asked. `queued` marks the
-    /// message as still-waiting rather than mid-turn: the menu is
-    /// what its delivery keeps backing off behind.
-    fn approval_menu_fired(&self, agent: &Agent, message: &Message, line: &str, queued: bool) {
-        let (job_id, task_id) = self.message_scope(message);
-        let mut payload = json!({"message": message.id, "line": line});
-        if queued {
-            payload["queued"] = json!(true);
-        }
-        if let Some(t) = task_id {
-            payload["task"] = json!(t);
+    /// — recorded once per distinct menu line, carrying the line so
+    /// the row names what's being asked. `tracked` is the message it
+    /// blocks: `queued` marks it still-waiting rather than mid-turn,
+    /// and `None` means the pane is idle — the event fires as
+    /// `idle: true` and never attributes a message that does not
+    /// exist.
+    fn approval_menu_fired(
+        &self,
+        agent: &Agent,
+        tracked: Option<&Message>,
+        line: &str,
+        queued: bool,
+    ) {
+        let mut payload = json!({"line": line});
+        let (mut job_id, mut task_id) = (None, None);
+        if let Some(m) = tracked {
+            payload["message"] = json!(m.id);
+            let (j, t) = self.message_scope(m);
+            job_id = j;
+            task_id = t;
+            if queued {
+                payload["queued"] = json!(true);
+            }
+            if let Some(t) = task_id {
+                payload["task"] = json!(t);
+            }
+        } else {
+            payload["idle"] = json!(true);
         }
         let _ = self.store.event_public_scoped(
             &agent.alias,
@@ -3830,8 +3876,11 @@ fn optional_i64(params: &Value, field: &str) -> Option<i64> {
     params.get(field).and_then(Value::as_i64)
 }
 
-/// Reject peers that are not the same Unix user.
-fn check_peer(stream: &UnixStream) -> Result<()> {
+/// Reject peers that are not the same Unix user; returns the peer's
+/// pid — how `agent answer` derives a caller identity the client
+/// cannot choose (a CLI run inside an agent's pane descends from that
+/// pane's root process).
+fn check_peer(stream: &UnixStream) -> Result<u32> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -3853,13 +3902,13 @@ fn check_peer(stream: &UnixStream) -> Result<()> {
     if cred.uid != unsafe { libc::geteuid() } {
         return Err(Error::rejected("Socket peer is not the same user"));
     }
-    Ok(())
+    Ok(cred.pid as u32)
 }
 
 fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
-    if check_peer(&stream).is_err() {
+    let Ok(peer_pid) = check_peer(&stream) else {
         return;
-    }
+    };
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(_) => return,
@@ -3875,7 +3924,7 @@ fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                     .and_then(Value::as_str)
                     .ok_or_else(|| Error::rejected("Missing 'method'"))?;
                 let params = frame.get("params").cloned().unwrap_or(json!({}));
-                shared.dispatch(method, &params)
+                shared.dispatch(method, &params, peer_pid)
             });
         let frame = match response {
             Ok(result) => proto::ok(result),

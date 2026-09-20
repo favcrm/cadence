@@ -51,7 +51,7 @@ Error kinds:
 | `agent_ready` | `alias, by?, force?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; probes the pane first and refuses a visibly busy one unless `force`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
-| `agent_answer` | `alias, choice, by?, note?` | `{state:"answered"}` — sends one menu-choice keystroke to a `pty` pane probing `approval_menu` (CLI: `cadence agent answer <alias> <choice> [--reason <text>]`); re-probes and refuses any other pane state, so the key can never land in a prompt or a running turn. `choice` is the option's index in the whole printed option block (top to bottom, independent of the highlighted row); the profile's keymap turns it into tmux keys — numbered menus take the digit, hotkeyed options their suffix, unnumbered selects arrows + Enter relative to the highlight. `by` equal to the agent's own alias is refused — a pane must never approve its own prompt — and a `by` naming a live agent stamps `by_kind:"agent"` on the event rather than reading as an operator. Records `approval_answered` with `by`/`by_kind`/`choice`/`line`/`note` and wakes the agent's delivery loop |
+| `agent_answer` | `alias, choice, by?, note?` | `{state:"answered"}` — sends one menu-choice keystroke to a `pty` pane probing `approval_menu` (CLI: `cadence agent answer <alias> <choice> [--reason <text>]`); re-probes and refuses any other pane state, so the key can never land in a prompt or a running turn. `choice` is the option's index in the whole printed option block (top to bottom, independent of the highlighted row); the profile's keymap turns it into tmux keys — numbered menus take the digit, hotkeyed options their suffix, unnumbered selects arrows + Enter relative to the highlight. The answerer is derived from the socket peer's pid → pane ancestry — a caller inside the target's own pane is refused, inside another agent's pane stamps `by_kind:"agent"`, otherwise `operator`; a supplied `by` that disagrees is kept only as `claimed_by`. Records `approval_answered` with `by`/`by_kind`/`caller_pid`/`choice`/`line`/`note` and wakes the agent's delivery loop |
 | `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`, `silent_end_secs` (pty only); `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; null clears to the provider default) or `approval_policy` (codex; `never|on-request|on-failure|untrusted`, null clears) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit PTY ack/result; `sha` names the produced commit for task-attached kickoffs |
@@ -407,11 +407,16 @@ by the visible count, and an unparseable or single-row block refuses
 rather than guessing; navigation moves `Up`/`Down` from the
 highlighted row on unnumbered selects, and a multi-digit index on a
 numbered menu arrows instead of typing — `send-keys "10"` would
-press `1` then `0` and select the wrong option. `by` equal to the
-agent's own alias refuses, and a `by` naming a live agent records
-`by_kind:"agent"` so the audit never reads an agent-sourced answer
-as a human's. `approval_answered` records `by`, `by_kind`, `choice`,
-the menu line and the probe, then wakes the agent's delivery loop —
+press `1` then `0` and select the wrong option. The answerer's
+identity is derived, never claimed: the socket peer's pid walks its
+`/proc` ancestry into the recorded pane roots, so a CLI run inside an
+agent's pane IS that agent — a caller inside the target's own pane is
+refused (a pane must never approve its own prompt) and one inside
+another agent's pane records that alias with `by_kind:"agent"`.
+Anything else is `by:"operator"`; a supplied `by` that disagrees is
+kept as `claimed_by`, not an attribution. `approval_answered` records
+`by`, `by_kind`, `caller_pid`, `choice`, the menu line and the probe,
+then wakes the agent's delivery loop —
 the menu may be exactly what a queued send waits behind. The probe,
 key selection and `send-keys` run inside the adapter's paste lock,
 serialized against the gate's own probe+paste so a menu closing
@@ -428,10 +433,21 @@ region is not the pane's literal bottom): a numbered approval menu
 can stay open *above* a still-visible busy input box, which pushes
 its option rows and selection footer well above the busy anchor.
 Menu-exclusive anchors (the `↑↓ select · ↵ confirm · esc cancel`
-legend, the permission prompt's title) decide alone on the trimmed
-row's leading glyph; option labels and lone legend fragments only
-count as a cluster beside real menu structure (a second hint, or
-numbered option rows) — transcript text quoting one stays inert. When
+legend — structural glyphs no transcript speaks) decide alone on the
+trimmed row's leading glyph. Natural-language anchors (the permission
+prompt's title, `Run this command?`, the trust-dialog wordings) only
+decide beside real menu structure — a parsed option row, a qualified
+option block or the anchored legend — because an indented transcript
+row leading with the same words is identical in shape; numbered rows
+must additionally form a real menu run (a `❯`-led row inside, or the
+legend right after) so a quoted markdown list is never a menu's
+options. Option labels and lone legend fragments count only as a
+cluster beside that structure — transcript text quoting one stays
+inert. Cursor's option rows parse their trailing `(hint)` through the
+hotkey allowlist — `foo(bar)` is transcript text, not an option — and
+a `↓ more below`/`↑ more above` marker beside the block refuses the
+answer rather than picking a row whose index does not match the
+printed list. When
 a menu is open the probe's reason is the menu line itself — the
 command being approved — and busy is anchored tighter still:
 the `Guide Devin while it works` input watermark, or the status row
@@ -950,14 +966,17 @@ fences, cancels, or replays anything it observes.
   `approval_menu` while a message runs emits `{message, line}` once —
   the rising edge, never per sample — carrying the menu line (the
   command being approved) so the row names what's asked, and only
-  once per distinct line: a detection flicker that closes and
-  re-opens the same menu does not re-fire. When no turn is running
-  the oldest `queued`/`submitting` head is tracked instead — a menu
-  that blocks its delivery emits the same event marked
-  `queued: true`. `agent_list`/`agent_show` expose it as `pane_menu`
-  while it stays open (queued-head menus included); the `status`
-  PANE column renders `approval: <line>`; the overview needs-me row
-  (`kind: approval_menu`) gives the remedy
+  once per distinct line: a bounded history of fired lines survives
+  message transitions, so a flicker that closes and re-opens a seen
+  menu — or menus alternating subjects — does not re-fire. When no
+  turn is running the oldest `queued`/`submitting` head is tracked
+  instead — a menu that blocks its delivery emits the same event
+  marked `queued: true` — and a menu on a pane with nothing tracked
+  at all emits it marked `idle: true` with no `message` (the wait
+  belongs to no turn). `agent_list`/`agent_show` expose it as
+  `pane_menu` while it stays open (queued-head and idle-pane menus
+  included); the `status` PANE column renders `approval: <line>`; the
+  overview needs-me row (`kind: approval_menu`) gives the remedy
   `cadence agent answer <alias> <choice>`.
 - **`turn_silent_end`.** A still-`running` message whose pane probes
   idle for `silent_end_secs` over at least three consecutive samples —
@@ -986,9 +1005,10 @@ fences, cancels, or replays anything it observes.
   while a turn runs — plus `pane_menu`, `ended_secs` and
   `silent_ended` when the sampled pane verdict warrants them; `job
   show`/`task show` add the same set to a task row whose kickoff is
-  running. An agent with no turn samples only while a queued head
-  exists, and then carries `pane_menu` alone — stall and silent-end
-  bookkeeping need a started turn.
+  running. An agent with no turn still samples on the same throttle —
+  a menu with nothing in flight surfaces as `pane_menu` and an
+  `idle: true` event — but carries the menu line alone: stall and
+  silent-end bookkeeping need a started turn.
 - **Restart.** Watch state is in memory only: after a daemon restart
   the silence and idle-streak clocks for a still-`running` message
   start from the restart — no stall or silent end survives across
