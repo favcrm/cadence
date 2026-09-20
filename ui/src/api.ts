@@ -131,7 +131,7 @@ export const api = {
     if (opts.status) q.set("status", opts.status);
     if (opts.type) q.set("type", opts.type);
     const s = q.toString();
-    return get<{ memories: MemoryCard[] }>(
+    return get<{ memories: MemoryCard[]; memory_errors?: string[] }>(
       `/api/memories${s ? `?${s}` : ""}`,
     );
   },

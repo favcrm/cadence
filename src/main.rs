@@ -4887,8 +4887,10 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
             return None;
         }
         // ≤8 entries AND ≤LESSON_MAX_BYTES total — same bound the
-        // dispatch lessons file carries.
+        // dispatch lessons file carries. An over-budget rule is
+        // skipped, not a stop: later smaller rules still list.
         let mut items = String::new();
+        let mut omitted = 0usize;
         for m in rules.iter().take(8) {
             let line = format!(
                 "- `{}`: {} — {}",
@@ -4897,15 +4899,22 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
                 cadence_agent::memory::apply_line(&m.body)
             );
             if items.len() + line.len() + 1 > cadence_agent::memory::LESSON_MAX_BYTES {
-                break;
+                omitted += 1;
+                continue;
             }
             if !items.is_empty() {
                 items.push('\n');
             }
             items.push_str(&line);
         }
+        omitted += rules.len().saturating_sub(8);
+        let more = if omitted > 0 {
+            format!("({omitted} accepted rule(s) omitted — `cadence memory ls` lists all)\n\n")
+        } else {
+            String::new()
+        };
         Some(format!(
-            "## Project memory — accepted rules ({proj_key})\n\n{items}\n\n\
+            "## Project memory — accepted rules ({proj_key})\n\n{items}\n\n{more}\
              `cadence memory match --issue <ID>` lists everything scoped to\n\
              a task; `cadence memory propose` records a new lesson.\n\n",
             proj_key = proj.key
