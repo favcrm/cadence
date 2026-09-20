@@ -535,8 +535,15 @@ fn report_summary(issue: &board::Issue) -> (String, String) {
     (title, summary)
 }
 
-fn marker(report_id: &str) -> String {
-    format!("<!-- cadence-relay:report={report_id} -->")
+fn project_marker(project_key: &str) -> String {
+    format!("<!-- cadence-relay:project={project_key} -->")
+}
+
+fn marker(project_key: &str, report_id: &str) -> String {
+    format!(
+        "{}\n<!-- cadence-relay:report={report_id} -->",
+        project_marker(project_key)
+    )
 }
 
 fn event_marker(event_id: &str) -> String {
@@ -550,6 +557,15 @@ fn report_id_from_body(body: &str) -> Option<String> {
     let end = rest.find(" -->")?;
     let id = &rest[..end];
     model_id(id).then(|| id.to_string())
+}
+
+fn project_key_from_body(body: &str) -> Option<&str> {
+    let prefix = "<!-- cadence-relay:project=";
+    let start = body.find(prefix)? + prefix.len();
+    let rest = &body[start..];
+    let end = rest.find(" -->")?;
+    let key = &rest[..end];
+    model::valid_key(key).then_some(key)
 }
 
 fn model_id(id: &str) -> bool {
@@ -566,15 +582,20 @@ fn managed_issue(issue: &GithubIssue) -> bool {
                 .is_some())
 }
 
-fn issue_marker_map(issues: &[GithubIssue]) -> BTreeMap<String, GithubIssue> {
+fn managed_issue_for_project(issue: &GithubIssue, project_key: &str) -> bool {
+    managed_issue(issue)
+        && issue.body.as_deref().is_some_and(|body| {
+            project_key_from_body(body) == Some(project_key) && report_id_from_body(body).is_some()
+        })
+}
+
+fn issue_marker_map(issues: &[GithubIssue], project_key: &str) -> BTreeMap<String, GithubIssue> {
     issues
         .iter()
+        .filter(|issue| managed_issue_for_project(issue, project_key))
         .filter_map(|issue| {
-            issue
-                .body
-                .as_deref()
-                .and_then(report_id_from_body)
-                .map(|id| (id, issue.clone()))
+            let body = issue.body.as_deref()?;
+            report_id_from_body(body).map(|id| (id, issue.clone()))
         })
         .collect()
 }
@@ -666,13 +687,17 @@ fn actionable_comment(body: &str) -> bool {
 fn ingest_comments<T: GithubApi>(
     api: &mut T,
     repo: &str,
+    project_key: &str,
     config: &RelayProjectConfig,
     project_state: &mut RelayProjectState,
     issues: &[GithubIssue],
 ) -> (usize, Vec<String>) {
     let mut queued = 0;
     let mut errors = Vec::new();
-    for issue in issues.iter().filter(|issue| managed_issue(issue)) {
+    for issue in issues
+        .iter()
+        .filter(|issue| managed_issue_for_project(issue, project_key))
+    {
         let report_id = issue
             .body
             .as_deref()
@@ -980,7 +1005,7 @@ fn publish_local_reports<T: GithubApi>(
             return (0, 0, vec![safe_text(&error, 600)]);
         }
     };
-    let markers = issue_marker_map(&remote);
+    let markers = issue_marker_map(&remote, project_key);
     let mut published = 0;
     let mut pending = 0;
     let mut errors = Vec::new();
@@ -1004,7 +1029,7 @@ fn publish_local_reports<T: GithubApi>(
         let (title, summary) = report_summary(issue);
         let body = format!(
             "{}\n\nSource: local report `{}`\n\n{}",
-            marker(&id),
+            marker(project_key, &id),
             id,
             summary
         );
@@ -1020,7 +1045,7 @@ fn publish_local_reports<T: GithubApi>(
                 let mut unresolved = false;
                 match list_all_issues(api, &config.repo) {
                     Ok(after) => {
-                        if let Some(remote_issue) = issue_marker_map(&after).get(&id) {
+                        if let Some(remote_issue) = issue_marker_map(&after, project_key).get(&id) {
                             mark_published(r, remote_issue, source_rev);
                             published += 1;
                         } else {
@@ -1070,7 +1095,14 @@ fn sync_project<T: GithubApi>(
     };
     let (queued_comments, comment_errors) = {
         let project_state = state.projects.entry(project_key.to_string()).or_default();
-        ingest_comments(api, &config.repo, config, project_state, &remote)
+        ingest_comments(
+            api,
+            &config.repo,
+            project_key,
+            config,
+            project_state,
+            &remote,
+        )
     };
     errors.extend(comment_errors);
     let dispatched = dispatch_pending(state_dir, pm_dir, project_key, config, state, dispatch);
@@ -1381,6 +1413,59 @@ mod tests {
         pm
     }
 
+    fn add_intake_project(
+        pm: &crate::issue::Pm,
+        temp: &TempDir,
+        project_key: &str,
+        prefix: &str,
+        issue_id: &str,
+        title: &str,
+    ) {
+        crate::issue::write::project_add(
+            pm,
+            project_key,
+            prefix,
+            &[],
+            &[],
+            &["intake".to_string(), "question".to_string()],
+            None,
+        )
+        .unwrap();
+        crate::issue::write::new_issue(
+            pm,
+            temp.path(),
+            Some(project_key),
+            title,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &["intake".to_string()],
+            Some(issue_id),
+            "",
+        )
+        .unwrap();
+        let path = temp
+            .path()
+            .join(project_key)
+            .join(issue_id)
+            .join("issue.md");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, text.replacen("---\n", "---\nkind: question\n", 1)).unwrap();
+    }
+
+    fn relay_config() -> RelayProjectConfig {
+        RelayProjectConfig {
+            enabled: true,
+            repo: "fake/repo".to_string(),
+            poll_seconds: 300,
+            dispatch: false,
+            pm_alias: None,
+            actor: None,
+        }
+    }
+
     fn sample_issue(temp: &TempDir) -> board::Issue {
         let dir = temp.path().join("issue");
         fs::create_dir_all(&dir).unwrap();
@@ -1463,6 +1548,141 @@ mod tests {
     }
 
     #[test]
+    fn shared_repo_projects_publish_and_ingest_only_owned_comments() {
+        let pm_temp = tempfile::tempdir().unwrap();
+        let pm = intake_pm(&pm_temp);
+        add_intake_project(&pm, &pm_temp, "other", "OTH", "OTH-1", "Other report");
+        let config = relay_config();
+        let mut api = MockApi::default();
+        let mut cadence_state = RelayProjectState::default();
+        let mut other_state = RelayProjectState::default();
+
+        let (published, pending, errors) =
+            publish_local_reports(&pm.dir, "cadence", &config, &mut cadence_state, &mut api);
+        assert_eq!((published, pending), (1, 0));
+        assert!(errors.is_empty());
+        let (published, pending, errors) =
+            publish_local_reports(&pm.dir, "other", &config, &mut other_state, &mut api);
+        assert_eq!((published, pending), (1, 0));
+        assert!(errors.is_empty());
+        assert_eq!(api.create_calls, 2);
+        assert_eq!(cadence_state.reports["CAD-1"].state, "published");
+        assert_eq!(other_state.reports["OTH-1"].state, "published");
+
+        let cadence_issue = api
+            .issues
+            .iter()
+            .find(|issue| {
+                issue
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| project_key_from_body(body) == Some("cadence"))
+            })
+            .unwrap()
+            .number;
+        let other_issue = api
+            .issues
+            .iter()
+            .find(|issue| {
+                issue
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| project_key_from_body(body) == Some("other"))
+            })
+            .unwrap()
+            .number;
+        api.issues.push(GithubIssue {
+            number: 99,
+            html_url: String::new(),
+            title: "legacy report-only issue".to_string(),
+            body: Some("<!-- cadence-relay:report=LEG-1 -->".to_string()),
+            updated_at: Some("2026-09-20T00:00:03Z".to_string()),
+            labels: vec![GithubLabel {
+                name: RELAY_LABEL.to_string(),
+            }],
+            pull_request: None,
+        });
+        api.comments.insert(
+            cadence_issue,
+            vec![GithubComment {
+                id: 1,
+                body: "cadence action".to_string(),
+                user: None,
+                created_at: None,
+                updated_at: None,
+            }],
+        );
+        api.comments.insert(
+            other_issue,
+            vec![GithubComment {
+                id: 2,
+                body: "other action".to_string(),
+                user: None,
+                created_at: None,
+                updated_at: None,
+            }],
+        );
+        api.comments.insert(
+            99,
+            vec![GithubComment {
+                id: 3,
+                body: "unowned action".to_string(),
+                user: None,
+                created_at: None,
+                updated_at: None,
+            }],
+        );
+
+        let (_state_temp, state_dir) = temp_state();
+        let mut state = RelayState::default();
+        state.projects.insert("cadence".to_string(), cadence_state);
+        state.projects.insert("other".to_string(), other_state);
+        let cadence = sync_project(
+            &pm.dir, &state_dir, "cadence", &config, &mut state, &mut api, false,
+        )
+        .unwrap();
+        let other = sync_project(
+            &pm.dir, &state_dir, "other", &config, &mut state, &mut api, false,
+        )
+        .unwrap();
+
+        assert_eq!(cadence["published"], 0);
+        assert_eq!(cadence["queued_comments"], 1);
+        assert_eq!(cadence["dispatched"], 0);
+        assert_eq!(other["published"], 0);
+        assert_eq!(other["queued_comments"], 1);
+        assert_eq!(other["dispatched"], 0);
+        assert_eq!(state.projects["cadence"].actions.len(), 1);
+        assert_eq!(state.projects["other"].actions.len(), 1);
+        assert_eq!(
+            state.projects["cadence"]
+                .actions
+                .values()
+                .next()
+                .unwrap()
+                .report_id,
+            "CAD-1"
+        );
+        assert_eq!(
+            state.projects["other"]
+                .actions
+                .values()
+                .next()
+                .unwrap()
+                .report_id,
+            "OTH-1"
+        );
+        assert!(!state.projects["cadence"]
+            .actions
+            .values()
+            .any(|action| action.report_id == "LEG-1"));
+        assert!(!state.projects["other"]
+            .actions
+            .values()
+            .any(|action| action.report_id == "LEG-1"));
+    }
+
+    #[test]
     fn reordered_events_and_self_echo_are_deduplicated() {
         let (_temp, state_dir) = temp_state();
         let config = RelayProjectConfig {
@@ -1478,7 +1698,7 @@ mod tests {
                 number: 7,
                 html_url: String::new(),
                 title: "report".to_string(),
-                body: Some(marker("CAD-1")),
+                body: Some(marker("cadence", "CAD-1")),
                 updated_at: Some("2026-09-20T00:00:02Z".to_string()),
                 labels: vec![GithubLabel {
                     name: RELAY_LABEL.to_string(),
@@ -1524,8 +1744,14 @@ mod tests {
         };
         let mut project_state = RelayProjectState::default();
         let remote = api.issues.clone();
-        let (queued, errors) =
-            ingest_comments(&mut api, "fake/repo", &config, &mut project_state, &remote);
+        let (queued, errors) = ingest_comments(
+            &mut api,
+            "fake/repo",
+            "cadence",
+            &config,
+            &mut project_state,
+            &remote,
+        );
         assert_eq!(queued, 1);
         assert!(errors.is_empty());
         assert_eq!(project_state.actions.len(), 1);

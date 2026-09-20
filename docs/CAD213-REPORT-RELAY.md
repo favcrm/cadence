@@ -47,6 +47,12 @@ stable shape; until then the relay can be configured and exercised with the
 existing issue writer. `fable-cc` remains an inbox provider and is not treated
 as a report listener unless an operator configures and verifies one.
 
+Every published issue carries both a report marker and an exact project marker.
+When projects share a GitHub repository, reconciliation and comment ingestion
+accept only the matching project marker; label-only, report-only, and foreign
+project issues are ignored. This fail-closed boundary keeps a comment from one
+project out of another project's durable outbox and optional PM dispatch.
+
 GitHub authentication is delegated to the installed `gh` CLI and its bounded
 API calls. Repository values accept only `owner/name`; credentials are never
 written to config or included in relay summaries. Development and tests use a
