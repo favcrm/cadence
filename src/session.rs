@@ -15,8 +15,8 @@
 //! and no running message — re-verified against a live `agent_show`
 //! immediately before each stop so a just-dispatched agent is skipped,
 //! never killed mid-turn — `agent gc --older-than 1h`, a host sweep
-//! (orphaned processes are reported, never killed, and command lines
-//! are redacted so argv secrets never reach output), and a handoff
+//! (orphaned processes are reported, never killed, and process argv
+//! never reaches output — orphans show executable + argument count),
 //! note under `<state>/sessions/<timestamp>-end.md` (real runs never
 //! overwrite; `--dry-run` writes nothing and previews the markdown).
 //! It never stops a busy agent and never stops the daemon while work
@@ -265,13 +265,14 @@ fn scrub_token_shapes(s: &str) -> String {
 }
 
 /// One display line through `scrub_auth_spans` then
-/// `scrub_token_shapes` — text (orphan cmdline heads, remedies quoting
-/// commands, running-turn heads) is secret-bearing, so every row
-/// boundary scrubs before it renders or serializes. The span pass
-/// masks `key<sep>value` expressions; the shape pass masks bare
-/// credential-shaped tokens with no keyword. Local until PR #64's
-/// `doctor::host::redact_argv` lands on main — then this delegates to
-/// the shared helper (CAD-108 follow-up).
+/// `scrub_token_shapes` — text (remedies quoting commands, running-turn
+/// heads, check details) can still carry secrets, so every row
+/// boundary scrubs before it renders or serializes. Process argv
+/// itself never reaches here — orphans display as `exe (arg count)`.
+/// The span pass masks `key<sep>value` expressions; the shape pass
+/// masks bare credential-shaped tokens with no keyword. Local until
+/// PR #64's `doctor::host::redact_argv` lands on main — then this
+/// delegates to the shared helper (CAD-108 follow-up).
 fn scrub_line(s: &str) -> String {
     scrub_token_shapes(&scrub_auth_spans(s))
 }
@@ -300,8 +301,78 @@ fn host_report(scan: &doctor::host::Scan) -> Value {
     doctor::host::run(scan)
 }
 
+/// Display detail for one check — the orphans check's own detail
+/// embeds cmdlines, and session output never prints argv (CAD-108 QA:
+/// every scrubber leaks some shape — `user:tok@host`, joined
+/// `-p<pass>`), so it degrades to a count. Checks without `pids`
+/// (fixture shorthand) keep their detail — it's the fixture's text.
+fn check_detail(c: &Value) -> String {
+    if c["name"].as_str() == Some("orphans") {
+        if let Some(pids) = c["value"]["pids"].as_array() {
+            return format!("{} orphaned pid(s)", pids.len());
+        }
+    }
+    c["detail"].as_str().unwrap_or_default().to_string()
+}
+
+/// argv0 → the executable name. argv0 can be one shell string holding
+/// the whole command — `sh -c 'npm exec --api-key=…'` — so the
+/// executable is the first word, then its basename.
+fn exe_of(argv0: &str) -> String {
+    let word = argv0.split_whitespace().next().unwrap_or_default();
+    Path::new(word)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "(unknown)".to_string())
+}
+
+/// `/proc/<pid>/cmdline` re-read at display time — the orphan line is
+/// the executable basename and the argument count, never the
+/// arguments. A pid that vanished or is unreadable still names the
+/// pid; `head` (the raw cmdline) is never a fallback.
+fn orphan_pid_item(o: &Value) -> String {
+    let pid = o["pid"].as_u64().unwrap_or_default();
+    let reasons = o["reasons"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let exe_argc = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .and_then(|raw| {
+            let parts: Vec<&[u8]> = raw.split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
+            parts.first().map(|p| {
+                format!(
+                    "{} ({} arg(s))",
+                    exe_of(&String::from_utf8_lossy(p)),
+                    parts.len()
+                )
+            })
+        })
+        .unwrap_or_else(|| "(argv unavailable)".to_string());
+    format!("orphan pid {pid} — {exe_argc} ({reasons})")
+}
+
+/// Per-pid `exe (N arg(s))` lines for an orphans check — the argv-free
+/// replacement for cmdline heads. Capped: the count detail already
+/// carries the full number.
+fn orphan_items(c: &Value) -> Vec<String> {
+    let Some(pids) = c["value"]["pids"].as_array() else {
+        return vec![];
+    };
+    let mut items: Vec<String> = pids.iter().take(8).map(orphan_pid_item).collect();
+    if pids.len() > 8 {
+        items.push(format!("… and {} more orphan pid(s)", pids.len() - 8));
+    }
+    items
+}
+
 /// A `doctor --host` report as one Row: worst level wins, each non-ok
-/// check becomes an item with its remedy.
+/// check becomes an item with its remedy. Orphan checks get count-only
+/// details plus per-pid `exe (arg count)` items — no argv.
 fn host_row(name: &'static str, report: &Value) -> Row {
     let mut row = Row::new(name);
     let level = match report["level"].as_str() {
@@ -323,23 +394,25 @@ fn host_row(name: &'static str, report: &Value) -> Row {
             continue;
         }
         let cname = c["name"].as_str().unwrap_or("?");
-        let detail = c["detail"].as_str().unwrap_or_default();
+        let detail = check_detail(c);
         let remedy = c["remedy"].as_str().unwrap_or_default();
         row.items.push(if remedy.is_empty() {
             format!("{cname}: {detail}")
         } else {
             format!("{cname}: {detail} — {remedy}")
         });
+        row.items.extend(orphan_items(c));
     }
     row.sev = level;
     if let Some(c) = bad.get(head) {
         let cname = c["name"].as_str().unwrap_or("?");
-        let detail = c["detail"].as_str().unwrap_or_default();
+        let detail = check_detail(c);
         let remedy = c["remedy"].as_str().unwrap_or_default();
         row.detail = format!("{cname}: {detail}");
         if !remedy.is_empty() {
             row.remedy = Some(remedy.to_string());
         }
+        row.items.extend(orphan_items(c));
     } else {
         row.detail = "host clean".to_string();
     }
@@ -1228,35 +1301,6 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     if sweep_row.detail == "host clean" {
         sweep_row.detail = "clean".to_string();
     }
-    // Orphan pids deserve their own lines — the checklist's "five hung
-    // test binaries" are named, not counted. Capped: the summary line
-    // above already carries the full count.
-    for c in host_scan["checks"].as_array().cloned().unwrap_or_default() {
-        if c["name"].as_str() != Some("orphans") {
-            continue;
-        }
-        let pids = c["value"]["pids"].as_array().cloned().unwrap_or_default();
-        for o in pids.iter().take(8) {
-            sweep_row.items.push(format!(
-                "orphan pid {} — {} ({})",
-                o["pid"],
-                o["head"].as_str().unwrap_or_default(),
-                o["reasons"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|r| r.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        if pids.len() > 8 {
-            sweep_row
-                .items
-                .push(format!("… and {} more orphan pid(s)", pids.len() - 8));
-        }
-    }
     rows.push(sweep_row);
 
     // ---- handoff: --dry-run writes nothing — the row names the file
@@ -1633,6 +1677,18 @@ mod tests {
     fn scrub_line_multibyte_is_safe() {
         let out = scrub_line("pröc --token=tök rest");
         assert!(out.contains("[REDACTED]") && !out.contains("tök"));
+    }
+
+    #[test]
+    fn exe_of_strips_shell_strings_to_the_executable() {
+        // argv0 is a path → basename.
+        assert_eq!(exe_of("/usr/bin/bash"), "bash");
+        // argv0 is one shell string holding the whole command — the
+        // real leak: `npm exec --figma-api-key=figd_… --stdio` as a
+        // single argv element must display as `npm`, never the args.
+        assert_eq!(exe_of("npm exec --api-key=figd_x --stdio"), "npm");
+        assert_eq!(exe_of("sh -c 'do --secret=1 thing'"), "sh");
+        assert_eq!(exe_of(""), "(unknown)");
     }
 
     #[test]

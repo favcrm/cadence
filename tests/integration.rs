@@ -17769,3 +17769,77 @@ fn session_end_host_fail_caps_at_warn() {
         "the sweep row shows warn, not fail:\n{text}"
     );
 }
+
+/// Addendum §1: session output never prints process argv — every
+/// scrubber leaks some shape, so orphans display as `exe (arg count)`.
+/// The fixture plants a credential in `head`; it must not appear.
+/// `pid = self` gives a readable cmdline; `u32::MAX` gives the
+/// unavailable path.
+#[test]
+fn session_end_orphans_report_exe_and_argc_never_argv() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, notes) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("notes"),
+    );
+    for d in [&state, &pm, &repo] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    seed_pm(&pm, &repo, &notes);
+    seed_repo(&repo);
+    let _sd = stub_daemon(&state, cadence_agent::overview::BUILD_COMMIT, vec![]);
+    let me = std::process::id();
+    let host = tmp.path().join("host-orphans.json");
+    std::fs::write(
+        &host,
+        format!(
+            r#"{{"level":"warn","checks":[{{"name":"orphans","level":"warn",
+            "detail":"2: pid {me} (1h npm exec --api-key=figd_PLANTEDLEAK --stdio)",
+            "remedy":"kill {me} 4294967295",
+            "value":{{"pids":[
+                {{"pid":{me},"head":"npm exec --api-key=figd_PLANTEDLEAK --stdio",
+                  "reasons":["cwd/exe under a deleted .cadence/wt worktree"]}},
+                {{"pid":4294967295,"head":"./hung-test-binary --secret=hunter2",
+                  "reasons":["cargo test binary older than an hour"]}}
+            ]}}}}]}}"#
+        ),
+    )
+    .unwrap();
+    let envs = [("CADENCE_SESSION_HOST_JSON", host.as_path())];
+
+    let out = run_session_env(&state, &pm, &repo, &["session", "end", "--dry-run"], &envs);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("orphans: 2 orphaned pid(s)"),
+        "count-only detail replaces the argv-bearing one:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("orphan pid {me} — integration-")),
+        "self pid shows the executable basename:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("orphan pid {me} — integration-")) && text.contains(" arg(s))"),
+        "the argument count is shown:\n{text}"
+    );
+    assert!(
+        text.contains("orphan pid 4294967295 — (argv unavailable)"),
+        "an unreadable cmdline degrades without head:\n{text}"
+    );
+    for leaked in [
+        "figd_PLANTEDLEAK",
+        "hunter2",
+        "--api-key",
+        "--secret",
+        "npm exec",
+        "hung-test-binary",
+    ] {
+        assert!(!text.contains(leaked), "argv leaked as {leaked:?}:\n{text}");
+    }
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "warn host, dry-run clean: exit 1:\n{text}"
+    );
+}

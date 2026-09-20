@@ -377,7 +377,8 @@ that has nothing queued, no running message and no busy pane —
 re-checking each one live immediately before the stop so an agent
 that claimed work mid-sweep is skipped, never killed mid-turn. It then
 runs `agent gc --older-than 1h`, reports orphan test processes and
-disk state (never kills; argv secrets are redacted), and writes the
+disk state (never kills; process argv is never printed — orphans show
+the executable name and argument count), and writes the
 handoff note to `<state>/sessions/<YYYYMMDDTHHMMSSZ>-end.md` —
 timestamped, so a same-day rerun never overwrites. `--dry-run` writes
 nothing — not even the gh cache — the row names the file it would
