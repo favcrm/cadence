@@ -1104,10 +1104,12 @@ enum BuildSlotAction {
         /// $USER, else "unknown").
         #[arg(long)]
         lane: Option<String>,
-        /// Pid whose death frees the slot (default: the caller's
-        /// parent — the wrapping shell or job runner).
+        /// Pid whose death frees the slot — REQUIRED: the hold must
+        /// bind to the process that actually lives for the work (`$$`
+        /// in a shell wrapper). `build-slot run` needs no --pid: it
+        /// binds the real command itself.
         #[arg(long)]
-        pid: Option<u32>,
+        pid: u32,
         /// Give up after <secs> waiting in the queue (0 = answer
         /// immediately, granted or not).
         #[arg(long, default_value_t = 0)]
@@ -1137,9 +1139,10 @@ enum BuildSlotAction {
         cmd: Vec<String>,
     },
     /// Return a held slot by token. Release must name the holder —
-    /// lane and pid default like `acquire` so a shell script's
-    /// acquire/release pair matches; pass --pid to release a slot
-    /// held by `run` ($CADENCE_BUILD_SLOT_PID) or another process.
+    /// the default pid is the caller's parent, so a script that
+    /// acquired with `--pid $$` releases with a bare `release` from
+    /// the same shell; pass --pid to release a slot held by `run`
+    /// ($CADENCE_BUILD_SLOT_PID) or another process.
     Release {
         /// The token `acquire` printed.
         token: String,
@@ -1148,7 +1151,8 @@ enum BuildSlotAction {
         #[arg(long)]
         lane: Option<String>,
         /// The pid the slot is bound to (default: the caller's
-        /// parent — matching `acquire`'s default).
+        /// parent — pairing with `acquire --pid $$` in the same
+        /// shell).
         #[arg(long)]
         pid: Option<u32>,
     },
@@ -2381,7 +2385,7 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
             let lane = lane
                 .clone()
                 .unwrap_or_else(cadence_agent::slots::default_lane);
-            let pid = pid.unwrap_or_else(std::os::unix::process::parent_id);
+            let pid = *pid;
             let request_id = Uuid::new_v4().simple().to_string();
             let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs)?;
             if *json_out {

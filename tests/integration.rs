@@ -20293,6 +20293,52 @@ fn slot_release_foreign_caller_is_rejected() {
     child.wait().unwrap();
 }
 
+/// BLOCKER (r3): `slot_acquired` rides the victim's event stream —
+/// readable by any local caller via `agent_events`. It must never
+/// carry the token: token+lane+pid are the entire release credential,
+/// so a peer's stream can never be mined for one.
+#[test]
+fn slot_acquired_event_cannot_release_a_peers_hold() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    d.register("victim");
+    d.register("snoop");
+    let me = std::process::id();
+    let g = slot_acquire(&d, "build", "victim", "r1");
+    let token = g["token"].as_str().unwrap().to_string();
+    // The peer reads the victim's stream — sees the acquisition…
+    let ev = d
+        .events("victim")
+        .into_iter()
+        .find(|e| e["kind"].as_str() == Some("slot_acquired"))
+        .expect("victim emitted slot_acquired");
+    assert!(
+        ev["payload"].get("token").is_none() && !ev["payload"].to_string().contains(&token),
+        "slot_acquired leaks the release credential: {}",
+        ev["payload"]
+    );
+    // …but the visible fields can't release anything: a guessed token
+    // is an unknown-token rejection and the hold survives.
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": "slot-guess", "lane": "victim", "pid": me}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("Unknown slot token"), "{err}");
+    // Even the real token under a foreign lane is refused.
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": token, "lane": "snoop", "pid": me}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("another caller"), "{err}");
+    let s = d.rpc("slot_status", json!({"lane": "victim"})).unwrap();
+    assert_eq!(s["pools"]["build"]["held"].as_array().unwrap().len(), 1);
+    // The owner releases normally.
+    slot_release(&d, &token, "victim", me);
+}
+
 /// BLOCKER: holds survive a daemon restart — persisted slots.json is
 /// revalidated at boot: live holders keep their slots (never
 /// re-granted), dead holders are dropped with a named reason.
@@ -20414,14 +20460,32 @@ fn build_slot_cli_acquire_release_status() {
         .as_str()
         .unwrap()
         .to_string(); // build pool full
+    let me = std::process::id().to_string(); // the CLI child's parent
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "acquire",
+            "build",
+            "--wait-secs",
+            "0",
+            "--pid",
+            &me,
+        ],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("No build slot free"), "{err}");
+    // --pid is required — a bare acquire refuses rather than binding
+    // a transient parent the work outlives.
     let out = cadence_at(
         home.path(),
         &d.state,
         &["build-slot", "acquire", "build", "--wait-secs", "0"],
     );
     assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("No build slot free"), "{err}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--pid"));
     // Free it through the CLI — release names the holding lane; the
     // default pid (the CLI's parent = this test) matches the hold.
     let out = cadence_at(
@@ -20446,6 +20510,8 @@ fn build_slot_cli_acquire_release_status() {
             "0",
             "--lane",
             "dev-9",
+            "--pid",
+            &me,
         ],
     );
     assert!(
@@ -20488,7 +20554,15 @@ fn build_slot_cli_acquire_release_status() {
     let out = cadence_at(
         home.path(),
         &d.state,
-        &["build-slot", "acquire", "bogus", "--wait-secs", "0"],
+        &[
+            "build-slot",
+            "acquire",
+            "bogus",
+            "--wait-secs",
+            "0",
+            "--pid",
+            &me,
+        ],
     );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("build, test or suite"));
@@ -20701,8 +20775,8 @@ fn build_slot_run_binds_the_real_process() {
 }
 
 /// The CLI's queued path: `--wait-secs > 0` polls until a release
-/// frees the pool — and the default `--pid` binds the hold to the
-/// caller's parent (this test process), matching `acquire`'s doc.
+/// frees the pool — and `--pid` binds the hold to the named holder
+/// (this test process, the CLI's parent).
 #[test]
 fn build_slot_cli_wait_then_grant() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
@@ -20711,6 +20785,7 @@ fn build_slot_cli_wait_then_grant() {
         .as_str()
         .unwrap()
         .to_string();
+    let me = std::process::id().to_string();
     let cli = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .arg("--state-dir")
         .arg(&d.state)
@@ -20722,6 +20797,8 @@ fn build_slot_cli_wait_then_grant() {
             "15",
             "--lane",
             "dev-9",
+            "--pid",
+            &me,
         ])
         .env("HOME", home.path())
         .envs(test_env().vars())
@@ -20749,8 +20826,8 @@ fn build_slot_cli_wait_then_grant() {
     );
     let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(token.starts_with("slot-"), "minted token: {token}");
-    // The default --pid bound the hold to the CLI's parent — the
-    // test process, still alive.
+    // The explicit --pid bound the hold to the named pid — the test
+    // process, still alive.
     let s = d.rpc("slot_status", json!({"lane": "dev-9"})).unwrap();
     let held = s["pools"]["build"]["held"].as_array().unwrap();
     assert_eq!(held[0]["pid"].as_u64().unwrap() as u32, std::process::id());

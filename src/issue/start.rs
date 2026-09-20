@@ -467,33 +467,47 @@ fn write_slot_env(wt_dir: &Path, pm_dir: &Path) -> Result<PathBuf> {
     // The generated env must never dirty the worktree — `issue
     // finish`'s clean-tree guard reads `git status`. `.git/info/
     // exclude` covers untracked `.env` without touching tracked files
-    // (a linked worktree resolves this to the common git dir).
+    // (a linked worktree resolves this to the COMMON git dir, so the
+    // anchored `/.env` entry applies at every worktree's root and the
+    // main checkout's — permanently; see docs/BOARD.md). The flock
+    // serializes concurrent `issue start`s: check-and-append under
+    // LOCK_EX can never double-write.
     let mut exclude = PathBuf::from(git(wt_dir, &["rev-parse", "--git-path", "info/exclude"])?);
     if exclude.is_relative() {
         exclude = wt_dir.join(exclude);
     }
-    let covered: Vec<String> = std::fs::read_to_string(&exclude)
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().to_string())
-        .collect();
-    let want = [".env", ".env.tmp"];
-    if want
-        .iter()
-        .any(|p| !covered.iter().any(|l| l == p || *l == format!("/{p}")))
+    if let Some(dir) = exclude.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(&exclude)?;
     {
-        if let Some(dir) = exclude.parent() {
-            std::fs::create_dir_all(dir)?;
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(Error::internal(format!(
+                "flock {}: {}",
+                exclude.display(),
+                std::io::Error::last_os_error()
+            )));
         }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&exclude)?;
-        for p in want {
-            if !covered.iter().any(|l| l == p || *l == format!("/{p}")) {
+        let mut text = String::new();
+        f.read_to_string(&mut text)?;
+        let covered: Vec<&str> = text.lines().map(|l| l.trim()).collect();
+        // Anchored to the worktree root — a bare `.env` would hide
+        // `.env` at ANY depth in EVERY worktree forever. An existing
+        // unanchored entry still counts as coverage (superset), so a
+        // host that ran the older writer never gains a duplicate.
+        for p in ["/.env", "/.env.tmp"] {
+            let bare = &p[1..];
+            if !covered.iter().any(|l| *l == p || *l == bare) {
                 writeln!(f, "{p}")?;
             }
         }
+        // flock releases with the fd on drop.
     }
     let jobs = crate::doctor::host::host_overrides(pm_dir)
         .and_then(|o| o.jobs_per_lane)

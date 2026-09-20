@@ -147,9 +147,13 @@ pub struct HostOverrides {
     pub priority_lanes: Option<Vec<String>>,
     pub max_hold_secs: Option<u64>,
     /// Load watchdog: warn when load1 exceeds `load_warn_ratio`×cpus
-    /// or io stall avg10 exceeds `io_stall_warn_pct`%.
+    /// or io stall avg10 exceeds `io_stall_warn_pct`/`io_stall_fail_pct`%.
+    /// Unset `load_warn_ratio` derives the warn line from the slot
+    /// plan — the farm is *meant* to run `slots × jobs` deep, so warn
+    /// above that plan, not below it.
     pub load_warn_ratio: Option<f64>,
     pub io_stall_warn_pct: Option<f64>,
+    pub io_stall_fail_pct: Option<f64>,
 }
 
 /// Every threshold in one place; `pm.yaml [host]` overrides any subset.
@@ -174,8 +178,11 @@ pub struct Thresholds {
     pub wal_max_bytes: u64,
     pub wal_checkpoint: bool,
     pub wal_dry_run: bool,
-    /// Warn when load1 exceeds this × cpu count (fail at 2×).
-    pub load_warn_ratio: f64,
+    /// Warn when load1 exceeds this × cpu count (fail at 2×). `None`
+    /// derives the line from the slot plan at check time — the farm
+    /// is meant to run `slots × jobs` deep, so warn above the plan,
+    /// not below it.
+    pub load_warn_ratio: Option<f64>,
     /// Warn/fail on `/proc/pressure/io` `some avg10` percent.
     pub io_stall_warn_pct: f64,
     pub io_stall_fail_pct: f64,
@@ -203,7 +210,7 @@ impl Default for Thresholds {
             wal_max_bytes: GIB,
             wal_checkpoint: true,
             wal_dry_run: false,
-            load_warn_ratio: 1.0,
+            load_warn_ratio: None,
             io_stall_warn_pct: 30.0,
             io_stall_fail_pct: 60.0,
         }
@@ -272,10 +279,13 @@ impl Thresholds {
                 t.wal_dry_run = v;
             }
             if let Some(v) = o.load_warn_ratio {
-                t.load_warn_ratio = v;
+                t.load_warn_ratio = Some(v);
             }
             if let Some(v) = o.io_stall_warn_pct {
                 t.io_stall_warn_pct = v;
+            }
+            if let Some(v) = o.io_stall_fail_pct {
+                t.io_stall_fail_pct = v;
             }
         }
         t
@@ -3889,15 +3899,36 @@ pub fn render_reclaim(plan: &Value) -> String {
     out
 }
 
+/// The load warn line when `[host] load_warn_ratio` is unset: the
+/// slot plan's own ceiling plus headroom — the farm is *meant* to run
+/// `(build_slots + suite_slots) × jobs_per_lane` deep, so warn above
+/// 1.25× that plan (never below plain saturation). The daemon's
+/// resolved config rides `scan.slots`; unreachable, the built-in
+/// defaults stand in.
+fn planned_load_warn_ratio(scan: &Scan, cpus: f64) -> f64 {
+    let cfg = scan.slots.as_ref().map(|s| &s["config"]);
+    let key = |k: &str, d: f64| cfg.and_then(|c| c[k].as_f64()).unwrap_or(d);
+    let planned_jobs =
+        (key("build_slots", 3.0) + key("suite_slots", 1.0)) * key("jobs_per_lane", 4.0);
+    (planned_jobs * 1.25 / cpus).max(1.0)
+}
+
 /// Host pressure: load1 vs cpu count plus io stall, with the slot
 /// queue in the detail so a hot host names its cause. Everything
 /// reads `scan.proc_root`, so tests fabricate both files.
 fn check_load(scan: &Scan) -> Check {
     let name = "load";
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1) as f64;
+    let warn_ratio = scan
+        .thresholds
+        .load_warn_ratio
+        .unwrap_or_else(|| planned_load_warn_ratio(scan, cpus));
     let threshold = json!({
         "load1": format!("warn > {}x cpus, fail > {}x",
-                         scan.thresholds.load_warn_ratio,
-                         scan.thresholds.load_warn_ratio * 2.0),
+                         warn_ratio,
+                         warn_ratio * 2.0),
         "io_stall_avg10_pct": format!("warn > {}, fail > {}",
                                      scan.thresholds.io_stall_warn_pct,
                                      scan.thresholds.io_stall_fail_pct),
@@ -3928,15 +3959,12 @@ fn check_load(scan: &Scan) -> Check {
             String::new(),
         );
     }
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1) as f64;
     let ratio = load1.map(|l| l / cpus);
-    let level = if ratio.is_some_and(|r| r > scan.thresholds.load_warn_ratio * 2.0)
+    let level = if ratio.is_some_and(|r| r > warn_ratio * 2.0)
         || io_stall.is_some_and(|s| s > scan.thresholds.io_stall_fail_pct)
     {
         Level::Fail
-    } else if ratio.is_some_and(|r| r > scan.thresholds.load_warn_ratio)
+    } else if ratio.is_some_and(|r| r > warn_ratio)
         || io_stall.is_some_and(|s| s > scan.thresholds.io_stall_warn_pct)
     {
         Level::Warn
@@ -6820,7 +6848,8 @@ mod tests {
             pm.join("pm.yaml"),
             "schema: 1\nhost:\n  build_slots: 5\n  suite_slots: 2\n  \
              jobs_per_lane: 8\n  starve_secs: 300\n  \
-             priority_lanes: [qa-1, qa-2]\n  load_warn_ratio: 1.5\n",
+             priority_lanes: [qa-1, qa-2]\n  load_warn_ratio: 1.5\n  \
+             io_stall_fail_pct: 45\n",
         )
         .unwrap();
         let o = host_overrides(&pm).unwrap();
@@ -6830,6 +6859,10 @@ mod tests {
         assert_eq!(o.starve_secs, Some(300));
         assert_eq!(o.priority_lanes.as_deref().unwrap().len(), 2);
         assert_eq!(o.load_warn_ratio, Some(1.5));
+        // …and it resolves through to the threshold.
+        let t = Thresholds::resolve(Some(o));
+        assert_eq!(t.load_warn_ratio, Some(1.5));
+        assert_eq!(t.io_stall_fail_pct, 45.0);
     }
 
     // ---------- load (CAD-113) ----------
@@ -6873,6 +6906,8 @@ mod tests {
             c.detail
         );
         assert!(c.detail.contains("longest 4m12s"), "{}", c.detail);
+        // An explicit warn ratio pins the bands regardless of cpus.
+        scan.thresholds.load_warn_ratio = Some(1.0);
         // Warn band: load1 above cpus but under 2x.
         proc_load(&scan, cpus * 1.5, Some(10.0));
         let c = check_load(&scan);
@@ -6886,6 +6921,18 @@ mod tests {
         proc_load(&scan, cpus * 2.5, Some(0.0));
         let c = check_load(&scan);
         assert_eq!(c.level, Level::Fail, "{}", c.detail);
+        // Unset, the warn line derives from the slot plan — the
+        // farm's own (3+1)×4 jobs on this box: warn only above it.
+        scan.thresholds.load_warn_ratio = None;
+        let derived = ((3.0 + 1.0) * 4.0 * 1.25 / cpus).max(1.0);
+        // The fixture's slot config (3/1/4) equals the defaults, so
+        // the derived ratio matches either way; below it → ok.
+        proc_load(&scan, cpus * derived * 0.9, Some(2.0));
+        let c = check_load(&scan);
+        assert_eq!(c.level, Level::Ok, "below plan: {}", c.detail);
+        proc_load(&scan, cpus * derived * 1.5, Some(2.0));
+        let c = check_load(&scan);
+        assert_eq!(c.level, Level::Warn, "above plan: {}", c.detail);
         // Unreachable daemon reports, never penalises.
         scan.slots = None;
         proc_load(&scan, 0.5, Some(2.0));

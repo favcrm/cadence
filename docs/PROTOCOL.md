@@ -85,7 +85,7 @@ Error kinds:
 | `agent_remove` | `alias` | deletes the agent + its history; refuses live endpoints |
 | `agent_gc` | `older_than?` | sweeps dead agents; `{removed:[alias]}` |
 | `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (queue identity only — the daemon mints the `slot-*` token on grant). A re-poll adopts a hold only on an exact `(request_id, pid, lane, kind)` match; any other caller sharing the id queues. `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot |
-| `slot_release` | `token, lane?, pid?` | `{released:true,token,kind}` — the release must name the holding `(lane, pid)`; a foreign token is a named refusal, an unknown token a named rejection |
+| `slot_release` | `token, lane?, pid?` | `{released:true,token,kind}` — the release must name the holding `(lane, pid)`; a foreign token is a named refusal, a never-held token a named rejection, and a token just reaped this call answers `{released:false, reason}` (a `trap`-style cleanup never hard-fails) |
 | `slot_status` | `lane?` | `{pools:{build,suite}:{capacity,held[]}, waiting[], config}` — also a reap pass: dead holders/waiters drop on the read. The calling lane's holds include their `token`; other lanes' holds show identity only |
 
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
@@ -1013,9 +1013,11 @@ host, so lanes queue instead of thrashing. The simplest consumer is
 `cadence build-slot run test -- cargo test --lib` — `run` acquires
 then *execs* the command, so the slot's holder is the real build
 process and its exit frees the slot. A manual wrap works too:
-`token=$(cadence build-slot acquire build --wait-secs 600); cargo build;
-cadence build-slot release $token` — the daemon owns the queue, the
-CLI only polls.
+`token=$(cadence build-slot acquire build --pid $$ --wait-secs 600);
+cargo build; cadence build-slot release $token` — `acquire` requires
+`--pid` (the hold binds the process that actually lives for the work;
+`$$` inside a shell wrapper) while `release` defaults it to the
+calling shell — the daemon owns the queue, the CLI only polls.
 
 Two pools share one queue: `build`/`test` requests draw on
 `build_slots` (default 3), `suite` requests on `suite_slots` (default
@@ -1024,9 +1026,12 @@ builds. Grant order is FIFO with two modifiers: `test`/`suite`
 requests from a configured *priority lane* (`[host] priority_lanes` —
 the reviewer lane) outrank ordinary requests, and a `(lane, kind)`
 waiting continuously longer than `starve_secs` (default 900) jumps to
-the front — seniority rides the lane+kind, so a caller that re-queues
-under a new request id keeps its accumulated wait rather than
-restarting at the back.
+the front. Seniority belongs to an *unserved* wait: a caller that
+re-queues under a new request id keeps the lane's accumulated wait,
+but every grant for that `(lane, kind)` restarts the anchor — a lane
+can never keep an old anchor alive by always having one more request
+queued — and a waiter's ordering age is capped at `starve_secs`, so
+any request is granted within the bound once it reaches the front.
 
 A slot is a daemon-minted `slot-*` token bound to (lane, pid,
 pid-starttime): `release` must name the holding lane and pid, so one
@@ -1046,21 +1051,23 @@ or reports position without ever joining the queue. All slot ages
 ride a monotonic clock: an NTP step or suspend cannot age a waiter
 or expire a hold.
 
-Holds persist to `<state>/slots.json` (atomic, mode 0600) — the
-record is `(token, request_id, kind, lane, pid, pid-starttime,
-acquired_epoch)` plus the `(lane, kind)` seniority table. On daemon
-boot each persisted hold is revalidated: a hold survives restart only
-while its recorded process is still the same live process (pid +
-starttime), and the dead are dropped with a `slot_released` event
-(`holder died` / `pid recycled`) rather than silently re-granted.
-Waiters do not persist — their callers re-poll into the restored
-seniority table, so starvation order survives a restart too. One
-deadlock guard applies: a lane may never *queue* for one pool while
-holding a slot in the other — a grant that never waits is always
-allowed, so the safe order is simply "wait only while holding
-nothing". `CADENCE_SUITE_LOCK` keeps working underneath as the
-test-process suite slot — the daemon queue is the observable layer
-above it.
+Holds persist to `<state>/slots.json` (atomic + fsynced, mode 0600)
+— the record is `(token, request_id, kind, lane, pid, pid-starttime,
+acquired_epoch)`. On daemon boot each persisted hold is revalidated:
+a hold survives restart only while its recorded process is still the
+same live process (pid + starttime), and the dead are dropped with a
+`slot_released` event (`holder died` / `pid recycled`) rather than
+silently re-granted. Waiters do not persist, and neither does
+seniority — it measures an unserved wait and no waiter survives a
+restart, so every caller re-polls into a fresh anchor. One deadlock
+guard applies: a *process* may never *queue* for one pool while
+holding a slot in the other (the guard keys on `(lane, pid)` — two
+shells sharing a lane name never block each other) — a grant that
+never waits is always allowed, so the safe order is simply "wait
+only while holding nothing". The queue is bounded twice over: 128
+waiters total, 32 per lane. `CADENCE_SUITE_LOCK` keeps working
+underneath as the test-process suite slot — the daemon queue is the
+observable layer above it.
 
 Configuration rides the `[host]` table in `pm.yaml` (all optional):
 
@@ -1072,8 +1079,12 @@ host:
   starve_secs: 900      # never-starve bound on (lane, kind) seniority
   max_hold_secs: 7200   # a forgotten hold is reaped past this
   priority_lanes: [qa-1]  # test/suite requests outrank ordinary ones
-  load_warn_ratio: 1.0  # doctor --host load warn = ratio x cpus (fail 2x)
-  io_stall_warn_pct: 30 # doctor --host io stall warn % (fail 60)
+  # load_warn_ratio — doctor --host load warn = ratio x cpus (fail
+  # 2x). Unset: derived from the slot plan — the farm is meant to run
+  # (build_slots + suite_slots) x jobs_per_lane deep, so the default
+  # warns above 1.25x that plan (floor 1.0), never below it.
+  io_stall_warn_pct: 30 # doctor --host io stall warn %
+  io_stall_fail_pct: 60 # doctor --host io stall fail %
 ```
 
 `cadence issue start`/`dispatch` write `<worktree>/.env` atomically
@@ -1084,11 +1095,14 @@ remember flags. `build-slot run` exports `CADENCE_BUILD_SLOT_TOKEN` /
 `CADENCE_BUILD_SLOT_PID` / `CADENCE_BUILD_SLOT_LANE` to the command so
 a nested script can release its own hold early. Observability:
 `slot_acquired` / `slot_waited` / `slot_released` events land on the
-requesting lane's event stream, `cadence status` carries a `slots:`
-footer line, `cadence build-slot status [--json]` shows holders and
-waiters (your own lane's holds show tokens; others' show identity
-only), and `doctor --host`'s `load` check reports load, io stall and
-the queue. Nothing here kills a process or cancels anyone's work.
+requesting lane's event stream — and no event ever carries a token:
+a token returns only in the `slot_acquire` RPC reply, because lane
+streams are readable by any local caller and token+lane+pid are the
+whole release credential. `cadence status` carries a `slots:` footer
+line, `cadence build-slot status [--json]` shows holders and waiters
+(your own lane's holds show tokens; others' show identity only), and
+`doctor --host`'s `load` check reports load, io stall and the queue.
+Nothing here kills a process or cancels anyone's work.
 
 ## Recovery
 

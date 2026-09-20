@@ -6,9 +6,13 @@
 //! (default 1) — independent, so a queued full suite never starves
 //! ordinary builds. Grant order is FIFO with two modifiers:
 //! `test`/`suite` requests from a configured priority lane outrank
-//! everything ordinary, and a `(lane, kind)` that has waited
-//! continuously longer than `starve_secs` (default 900) jumps to the
-//! front so priority can never starve a lane out.
+//! everything ordinary, and a `(lane, kind)` whose requests have
+//! waited continuously longer than `starve_secs` (default 900) jumps
+//! to the front so priority can never starve a lane out. Seniority
+//! belongs to an *unserved* wait: it survives a caller re-queueing
+//! under a new request id, but every grant for that `(lane, kind)`
+//! restarts the clock — a lane can never keep an old anchor alive
+//! just by keeping one more request queued.
 //!
 //! A slot is held by a daemon-minted token bound to (lane, pid,
 //! pid-starttime): `release` must name the holding caller, and a
@@ -139,10 +143,11 @@ struct SlotWait {
     lane: String,
     pid: u32,
     pid_start: Option<u64>,
-    /// Seniority start — when this `(lane, kind)` began waiting
-    /// CONTINUOUSLY, which may predate this request_id (a re-queued
+    /// Seniority start — when this `(lane, kind)` began its current
+    /// unserved wait, which may predate this request_id (a re-queued
     /// caller keeps the lane's place rather than restarting at the
-    /// back).
+    /// back). The anchor can never outlive a serve: `grant` clears
+    /// the record, so waiters enqueued later stamp fresh.
     queued_at: f64,
     /// Last time this request polled — a caller that stops polling is
     /// abandoned and reaped after `WAITER_TTL_SECS`, so a fast-failed
@@ -167,14 +172,6 @@ struct SlotHold {
     /// Wall-clock grant instant — persisted so a restart can restore
     /// the hold's age against the new clock epoch.
     acquired_epoch: f64,
-}
-
-/// When a `(lane, kind)` began waiting continuously, in both clocks:
-/// mono drives ranking, wall rides the persist file across restarts.
-#[derive(Clone, Copy)]
-struct Seniority {
-    mono: f64,
-    wall: f64,
 }
 
 /// One event the caller should emit — `(alias, kind, payload)`; the
@@ -231,14 +228,25 @@ fn pid_start(pid: u32) -> Option<u64> {
 /// Liveness + identity: alive, and — when a starttime was captured —
 /// still the same boot-time process. An unreadable starttime on
 /// either side weakens the check to alive-only rather than reaping a
-/// live process on a /proc hiccup.
+/// live process on a /proc hiccup — but never silently: a live pid
+/// whose starttime cannot be compared degrades the recycling check,
+/// so it is surfaced once per process.
 fn pid_matches(pid: u32, recorded: Option<u64>) -> bool {
     if !pid_alive(pid) {
         return false;
     }
     match (recorded, pid_start(pid)) {
         (Some(recorded), Some(current)) => recorded == current,
-        _ => true,
+        _ => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "slots: pid starttime unavailable — recycled-pid \
+                     detection is degraded (alive-only) until /proc reads work"
+                );
+            });
+            true
+        }
     }
 }
 
@@ -251,6 +259,21 @@ const WAITER_TTL_SECS: f64 = 30.0;
 /// entries keep real queues far below this.
 const MAX_WAITERS: usize = 128;
 
+/// One lane's share of the queue — without it a single lane could
+/// fill `MAX_WAITERS` and deny everyone else a place. A lane running
+/// more than this many distinct slot requests at once is already
+/// abusive (each should be one cargo invocation).
+const MAX_WAITERS_PER_LANE: usize = 32;
+
+/// A hold `reap_dead` just dropped — `release` answers these softly
+/// (`released:false` + the reap reason) instead of calling them
+/// unknown tokens.
+struct Reaped {
+    token: String,
+    kind: SlotKind,
+    reason: &'static str,
+}
+
 /// The slot registry. In-memory for queue state (waiters re-poll
 /// after a restart), persisted for holds: `persist_path` is written
 /// on every hold change so a daemon restart can revalidate them
@@ -260,10 +283,11 @@ pub struct Slots {
     pub config: SlotConfig,
     waiting: Vec<SlotWait>,
     held: Vec<SlotHold>,
-    /// Continuous-wait start per `(lane, kind)` — the starvation
-    /// clock that survives a caller re-queuing under a new
-    /// request_id.
-    seniority: HashMap<(String, SlotKind), Seniority>,
+    /// Unserved-wait start per `(lane, kind)` — the starvation clock
+    /// that survives a caller re-queuing under a new request_id but
+    /// NEVER a grant: `grant` removes the record, so the anchor can
+    /// only be as old as the lane's current post-serve wait.
+    seniority: HashMap<(String, SlotKind), f64>,
     persist_path: Option<PathBuf>,
 }
 
@@ -294,16 +318,24 @@ impl Slots {
 
     /// Grant-order rank: starved `(lane, kind)`s first, then priority
     /// lanes on test/suite, then plain FIFO — the key is
-    /// (rank, seniority).
+    /// (rank, seniority). A waiter's ordering age is capped at
+    /// `starve_secs`: no anchor — however old — can rank ahead of a
+    /// request that has itself crossed the never-starve bound, so a
+    /// lane flooding the queue still yields within `starve_secs`.
     fn rank(&self, w: &SlotWait, now: f64) -> (u8, f64) {
-        if now - w.queued_at >= self.config.starve_secs as f64 {
-            (0, w.queued_at)
+        let starve = self.config.starve_secs as f64;
+        // Effective seniority for ordering: older than `starve` ago
+        // collapses to the bound itself — every starved waiter ranks
+        // equal-eldest and grants go to whoever polls first.
+        let senior = w.queued_at.max(now - starve);
+        if now - w.queued_at >= starve {
+            (0, senior)
         } else if matches!(w.kind, SlotKind::Test | SlotKind::Suite)
             && self.config.priority_lanes.iter().any(|l| l == &w.lane)
         {
-            (1, w.queued_at)
+            (1, senior)
         } else {
-            (2, w.queued_at)
+            (2, senior)
         }
     }
 
@@ -325,10 +357,12 @@ impl Slots {
     }
 
     /// Drop dead/recycled/expired holders and dead or silent waiters.
-    /// Holder drops emit `slot_released` with the reap reason; a dead
-    /// waiter held nothing, so it drops silently.
-    fn reap_dead(&mut self, now: f64, events: &mut Vec<SlotEvent>) {
-        let mut dead: Vec<String> = Vec::new();
+    /// Holder drops emit `slot_released` with the reap reason (and no
+    /// token — events never carry one); a dead waiter held nothing,
+    /// so it drops silently. Returns what was reaped so `release`
+    /// can answer a just-reaped token softly.
+    fn reap_dead(&mut self, now: f64, events: &mut Vec<SlotEvent>) -> Vec<Reaped> {
+        let mut dead: Vec<Reaped> = Vec::new();
         self.held.retain(|h| {
             let gone = !pid_matches(h.pid, h.pid_start);
             let expired = now - h.acquired_at >= self.config.max_hold_secs as f64;
@@ -347,11 +381,15 @@ impl Slots {
             events.push((
                 h.lane.clone(),
                 "slot_released",
-                json!({"token": h.token, "kind": h.kind.as_str(),
+                json!({"kind": h.kind.as_str(), "pid": h.pid,
                        "held_secs": (now - h.acquired_at).max(0.0),
                        "reason": reason}),
             ));
-            dead.push(h.token.clone());
+            dead.push(Reaped {
+                token: h.token.clone(),
+                kind: h.kind,
+                reason,
+            });
             false
         });
         // Waiters drop on either abandonment signal: a dead/recycled
@@ -364,11 +402,14 @@ impl Slots {
         if !dead.is_empty() {
             self.persist();
         }
+        dead
     }
 
     /// Seniority entries live only while a waiter keeps the
-    /// `(lane, kind)` queue non-empty — a lane that was served (or
-    /// went silent and reaped) starts its starvation clock fresh.
+    /// `(lane, kind)` queue non-empty — a lane whose waiters all
+    /// died or went silent starts its starvation clock fresh.
+    /// (The OTHER half of the rule lives in `grant`: a served lane's
+    /// record is cleared even when waiters remain.)
     fn prune_seniority(&mut self) {
         self.seniority.retain(|(lane, kind), _| {
             self.waiting
@@ -377,17 +418,22 @@ impl Slots {
         });
     }
 
-    fn seniority_of(&mut self, lane: &str, kind: SlotKind, clk: SlotClock) -> f64 {
-        let (now, wall) = (clk.mono, clk.wall);
-        self.seniority
+    /// The `(lane, kind)` anchor for a new waiter — an existing
+    /// unserved record wins (the lane's wait continues), else now.
+    fn seniority_of(&mut self, lane: &str, kind: SlotKind, now: f64) -> f64 {
+        *self
+            .seniority
             .entry((lane.to_string(), kind))
-            .or_insert(Seniority { mono: now, wall })
-            .mono
+            .or_insert(now)
     }
 
     /// Atomic best-effort write of the hold registry — a reader never
     /// sees a torn file, and a write failure is logged, not fatal:
-    /// the in-memory registry stays authoritative either way.
+    /// the in-memory registry stays authoritative either way. The tmp
+    /// file is fsynced before the rename and the directory after it,
+    /// so a crash cannot lose a persisted hold silently. Seniority is
+    /// deliberately not persisted: it measures a wait, and no waiter
+    /// survives a restart — every caller re-polls into a fresh anchor.
     fn persist(&self) {
         let Some(path) = &self.persist_path else {
             return;
@@ -400,9 +446,6 @@ impl Slots {
                 "pid": h.pid, "pid_start": h.pid_start,
                 "acquired_epoch": h.acquired_epoch,
             })).collect::<Vec<_>>(),
-            "seniority": self.seniority.iter().map(|((lane, kind), s)| json!({
-                "lane": lane, "kind": kind.as_str(), "since_epoch": s.wall,
-            })).collect::<Vec<_>>(),
         });
         let tmp = path.with_extension("tmp");
         let write = std::fs::OpenOptions::new()
@@ -411,10 +454,19 @@ impl Slots {
             .truncate(true)
             .mode(0o600)
             .open(&tmp)
-            .and_then(|mut f| f.write_all(doc.to_string().as_bytes()))
+            .and_then(|mut f| {
+                f.write_all(doc.to_string().as_bytes())?;
+                f.sync_all()
+            })
             .and_then(|_| std::fs::rename(&tmp, path));
-        if let Err(e) = write {
-            eprintln!("slots: persist {} failed: {e}", path.display());
+        match write {
+            Ok(()) => {
+                // The rename is durable only once its directory is.
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+                }
+            }
+            Err(e) => eprintln!("slots: persist {} failed: {e}", path.display()),
         }
     }
 
@@ -456,7 +508,7 @@ impl Slots {
                 events.push((
                     lane.to_string(),
                     "slot_released",
-                    json!({"token": h["token"], "kind": kind.as_str(),
+                    json!({"kind": kind.as_str(), "pid": pid,
                            "held_secs": held_secs, "reason": reason}),
                 ));
                 continue;
@@ -475,24 +527,10 @@ impl Slots {
                 acquired_epoch: wall - held_secs,
             });
         }
-        for s in doc["seniority"].as_array().cloned().unwrap_or_default() {
-            let (Some(lane), Some(kind), Some(since)) = (
-                s["lane"].as_str(),
-                s["kind"].as_str().and_then(|k| SlotKind::parse(k).ok()),
-                s["since_epoch"].as_f64(),
-            ) else {
-                continue;
-            };
-            let age = (wall - since).max(0.0);
-            self.seniority.insert(
-                (lane.to_string(), kind),
-                Seniority {
-                    mono: now - age,
-                    wall: since,
-                },
-            );
-        }
-        // Rewrite canonically — dropped holds leave the file too.
+        // Seniority is never persisted: it measures an unserved wait
+        // and no waiter survives a restart — re-polling callers
+        // anchor fresh. (A stale `seniority` block in an old file is
+        // simply ignored.)
         self.persist();
         events
     }
@@ -512,6 +550,10 @@ impl Slots {
     /// The grant itself: hold registration + the `slot_acquired`
     /// event, shared by the probe and the queueing path. The token is
     /// minted here — the caller's request_id is queue identity only.
+    /// The event carries NO token: lane event streams are readable by
+    /// any local caller, and token+lane+pid are exactly the inputs a
+    /// release authenticates — publishing all three would hand every
+    /// peer the keys to a live hold.
     fn grant(
         &mut self,
         req: SlotReq<'_>,
@@ -524,10 +566,15 @@ impl Slots {
         events.push((
             req.lane.to_string(),
             "slot_acquired",
-            json!({"token": token, "kind": req.kind.as_str(),
+            json!({"kind": req.kind.as_str(),
                    "pool": req.kind.pool().as_str(), "wait_secs": wait_secs,
                    "pid": req.pid}),
         ));
+        // Serving this lane ends its unserved wait: the seniority
+        // anchor dies here so a lane that always has "one more
+        // request" queued can never ride an ancient timestamp — its
+        // next enqueue anchors at its own honest arrival.
+        self.seniority.remove(&(req.lane.to_string(), req.kind));
         self.held.push(SlotHold {
             token: token.clone(),
             request_id: req.request_id.to_string(),
@@ -543,15 +590,18 @@ impl Slots {
                "kind": req.kind.as_str(), "wait_secs": wait_secs})
     }
 
-    /// Cross-pool deadlock guard: a lane may never QUEUE for one
+    /// Cross-pool deadlock guard: a caller may never QUEUE for one
     /// pool while holding a slot in the other — otherwise A(holds
     /// build, waits suite) vs B(holds suite, waits build) is a
-    /// classic hold-and-wait deadlock. Granting without waiting is
-    /// always fine: a caller that never waits holds no wait-edge.
-    fn holds_other_pool(&self, pool: Pool, lane: &str) -> bool {
+    /// classic hold-and-wait deadlock. The guard keys on `(lane,
+    /// pid)` — the holding *process*: two unrelated shells sharing a
+    /// lane name (e.g. `$USER` when no `CADENCE_ALIAS` is set) never
+    /// block each other. Granting without waiting is always fine: a
+    /// caller that never waits holds no wait-edge.
+    fn holds_other_pool(&self, pool: Pool, lane: &str, pid: u32) -> bool {
         self.held
             .iter()
-            .any(|h| h.lane == lane && h.kind.pool() != pool)
+            .any(|h| h.lane == lane && h.pid == pid && h.kind.pool() != pool)
     }
 
     /// Non-blocking acquire: grants a minted token when the pool has
@@ -575,7 +625,8 @@ impl Slots {
         let now = clk.mono;
         if pid == 0 {
             return Err(Error::rejected(
-                "Slot acquire needs the holder's pid (`--pid`, default: caller's parent)",
+                "Slot acquire needs the holder's pid — `build-slot run` binds \
+                 the real command; a manual `acquire` passes `--pid $$`",
             ));
         }
         self.reap_dead(now, &mut events);
@@ -616,7 +667,7 @@ impl Slots {
             // A fresh probe grants exactly when an enqueue would —
             // capacity free and the request next — but never joins
             // the queue.
-            let senior = self.seniority_of(lane, kind, clk);
+            let senior = self.seniority_of(lane, kind, now);
             let w = SlotWait {
                 request_id: request_id.to_string(),
                 kind,
@@ -636,9 +687,9 @@ impl Slots {
             if next {
                 return Ok((self.grant(req, 0.0, clk, &mut events), events));
             }
-            if self.holds_other_pool(pool, lane) {
+            if self.holds_other_pool(pool, lane, pid) {
                 return Err(Error::rejected(format!(
-                    "A lane holding a {} slot cannot queue for {} — \
+                    "A caller holding a {} slot cannot queue for {} — \
                      release that hold first (hold-and-wait deadlock guard)",
                     other_pool(pool).as_str(),
                     pool.as_str(),
@@ -661,7 +712,15 @@ impl Slots {
                         "Slot queue is full ({MAX_WAITERS} waiting) — try again later"
                     )));
                 }
-                let senior = self.seniority_of(lane, kind, clk);
+                // A lane's share is bounded too — without it one lane
+                // could fill the whole queue and deny everyone else.
+                if self.waiting.iter().filter(|w| w.lane == lane).count() >= MAX_WAITERS_PER_LANE {
+                    return Err(Error::rejected(format!(
+                        "Lane '{lane}' already has {MAX_WAITERS_PER_LANE} slot \
+                         requests queued — let some grant or die first"
+                    )));
+                }
+                let senior = self.seniority_of(lane, kind, now);
                 self.waiting.push(SlotWait {
                     request_id: request_id.to_string(),
                     kind,
@@ -685,14 +744,14 @@ impl Slots {
             self.prune_seniority();
             return Ok((self.grant(req, wait_secs, clk, &mut events), events));
         }
-        // It must wait — but a lane holding the other pool may not
+        // It must wait — but a caller holding the other pool may not
         // queue at all (the deadlock guard). The forbidden waiter
         // is removed, never registered.
-        if self.holds_other_pool(pool, lane) {
+        if self.holds_other_pool(pool, lane, pid) {
             self.waiting.remove(idx);
             self.prune_seniority();
             return Err(Error::rejected(format!(
-                "A lane holding a {} slot cannot queue for {} — \
+                "A caller holding a {} slot cannot queue for {} — \
                  release that hold first (hold-and-wait deadlock guard)",
                 other_pool(pool).as_str(),
                 pool.as_str(),
@@ -720,7 +779,11 @@ impl Slots {
 
     /// Return a held slot. The release must name the holding caller —
     /// (lane, pid) — so one caller can never release another's hold.
-    /// Unknown tokens and foreign tokens are both named refusals.
+    /// A foreign token is a named refusal; an unknown token a named
+    /// rejection — EXCEPT a token this very call just reaped, which
+    /// answers softly (`released:false` + the reap reason): a cleanup
+    /// path like `trap 'release $T' EXIT` should not hard-fail on a
+    /// hold the daemon already took back.
     pub fn release(
         &mut self,
         token: &str,
@@ -729,8 +792,15 @@ impl Slots {
         now: f64,
     ) -> Result<(Value, Vec<SlotEvent>)> {
         let mut events = Vec::new();
-        self.reap_dead(now, &mut events);
+        let reaped = self.reap_dead(now, &mut events);
         let Some(h) = self.held.iter().find(|h| h.token == token) else {
+            if let Some(r) = reaped.iter().find(|r| r.token == token) {
+                return Ok((
+                    json!({"released": false, "token": token,
+                           "kind": r.kind.as_str(), "reason": r.reason}),
+                    events,
+                ));
+            }
             return Err(Error::rejected(format!(
                 "Unknown slot token '{token}' — it was never granted or already released"
             )));
@@ -747,7 +817,7 @@ impl Slots {
         events.push((
             h.lane.clone(),
             "slot_released",
-            json!({"token": h.token, "kind": h.kind.as_str(),
+            json!({"kind": h.kind.as_str(), "pid": h.pid,
                    "held_secs": (now - h.acquired_at).max(0.0),
                    "reason": "released"}),
         ));
@@ -896,6 +966,14 @@ mod tests {
         release(s, &token, lane, now)
     }
 
+    /// Release the current hold whichever lane owns it — the
+    /// contention tests hand the slot between lanes.
+    fn release_any(s: &mut Slots, now: f64) -> Value {
+        let h = &s.held[0];
+        let (token, lane) = (h.token.clone(), h.lane.clone());
+        release(s, &token, &lane, now)
+    }
+
     /// A real child pid distinct from the test process — killed on drop.
     struct Child(std::process::Child);
     impl Child {
@@ -989,7 +1067,9 @@ mod tests {
     }
 
     /// A dead holder is reaped by the next operation — and a release
-    /// racing that reap resolves to a named unknown-token error.
+    /// racing that reap answers softly: the daemon already took the
+    /// slot back, so `released:false` + the reap reason instead of a
+    /// hard error a `trap`-style cleanup would trip on.
     #[test]
     fn reap_racing_release_is_deterministic() {
         let mut s = slots(1, 1, 900, &[]);
@@ -1003,8 +1083,17 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         // The release's own reap pass wins: the token is already gone
-        // by the time the lookup runs.
-        let err = s.release(&token, "dev-1", pid, 1.0).unwrap_err();
+        // by the time the lookup runs — and the reply says so.
+        let (r, events) = s.release(&token, "dev-1", pid, 1.0).unwrap();
+        assert_eq!(r["released"], false);
+        assert_eq!(r["reason"], "holder died");
+        assert!(events.iter().any(|e| e.1 == "slot_released"
+            && e.2["reason"] == "holder died"
+            && e.2.get("token").is_none()));
+        // A token that was never granted is still a hard rejection.
+        let err = s
+            .release("slot-never-granted", "dev-1", pid, 1.0)
+            .unwrap_err();
         assert!(err.to_string().contains("Unknown slot token"), "{err}");
         // The reap emitted slot_released with the cause.
         let (status, _) = s.status("dev-1", 2.0);
@@ -1082,11 +1171,12 @@ mod tests {
         assert_eq!(q["wait_secs"], 10.0);
     }
 
-    /// Seniority is keyed on (lane, kind): a second request from the
-    /// same lane+kind inherits the accumulated wait rather than
-    /// restarting at the back — it is ALREADY starved on arrival.
+    /// Seniority measures an UNSERVED wait: a re-queued caller keeps
+    /// the lane's place, but every grant for that `(lane, kind)` ends
+    /// the anchor — a lane can never renew seniority by always having
+    /// one more request queued.
     #[test]
-    fn seniority_survives_a_requeue() {
+    fn seniority_survives_requeue_but_not_a_grant() {
         let mut s = slots(1, 1, 60, &["qa-1"]);
         acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
         // dev-2 waits on build from t=0, polling within the TTL.
@@ -1095,23 +1185,27 @@ mod tests {
             acquire(&mut s, SlotKind::Build, "dev-2", "w1", t);
         }
         // A second dev-2 build request joins at t=70 — it inherits
-        // the (dev-2, build) seniority at t=0, so it is ALREADY past
-        // the 60s starve bound and outranks a fresh priority waiter.
+        // the still-unserved (dev-2, build) anchor at t=0, so it is
+        // ALREADY past the 60s starve bound and outranks a fresh
+        // priority waiter.
         acquire(&mut s, SlotKind::Build, "dev-2", "w2", 70.0);
         acquire(&mut s, SlotKind::Test, "qa-1", "w3", 71.0);
         release_first(&mut s, "dev-1", 71.0);
         let g = acquire(&mut s, SlotKind::Build, "dev-2", "w1", 71.0);
         assert_eq!(g["granted"], true, "seniority keeps w1 first");
-        // w1 granted — w2 keeps the (dev-2, build) wait alive, so the
-        // seniority entry survives; w2 still outranks priority w3.
+        // w2's stamp was baked before w1's serve — it wins once more.
         release_first(&mut s, "dev-2", 72.0);
         let g = acquire(&mut s, SlotKind::Build, "dev-2", "w2", 72.0);
-        assert_eq!(g["granted"], true, "w2 inherits lane seniority");
-        // w3, the priority waiter, waited behind both — it grants
-        // only once the pool frees again.
+        assert_eq!(g["granted"], true, "w2's baked anchor rides once");
+        // But the serve cleared (dev-2, build): a NEW dev-2 request
+        // anchors at its own arrival — it must NOT resurrect t=0.
+        // Priority w3 (waiting since t=71) now outranks it.
         release_first(&mut s, "dev-2", 73.0);
-        let g = acquire(&mut s, SlotKind::Test, "qa-1", "w3", 73.0);
-        assert_eq!(g["granted"], true);
+        acquire(&mut s, SlotKind::Build, "dev-2", "w4", 74.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w4", 75.0);
+        assert_eq!(g["granted"], false, "post-serve request ranks honestly");
+        let g = acquire(&mut s, SlotKind::Test, "qa-1", "w3", 75.0);
+        assert_eq!(g["granted"], true, "priority outranks a fresh anchor");
     }
 
     /// max_hold_secs reaps a forgotten hold — one caller can never
@@ -1217,12 +1311,45 @@ mod tests {
         other.reap();
     }
 
-    /// The queue is bounded — the cap refuses new request ids.
+    /// The queue is bounded — the global cap refuses new request ids
+    /// (four lanes at the per-lane bound fill it to the brim).
     #[test]
     fn queue_cap_rejects_overflow() {
         let mut s = slots(1, 1, 900, &[]);
         acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
-        for i in 0..MAX_WAITERS {
+        for lane in 0..4 {
+            for i in 0..MAX_WAITERS_PER_LANE {
+                let q = acquire(
+                    &mut s,
+                    SlotKind::Build,
+                    &format!("dev-w{lane}"),
+                    &format!("w{i}"),
+                    0.0,
+                );
+                assert_eq!(q["granted"], false);
+            }
+        }
+        assert_eq!(s.waiting.len(), MAX_WAITERS);
+        let err = s
+            .acquire(
+                SlotKind::Build,
+                "dev-9",
+                me(),
+                "one-more",
+                false,
+                SlotClock::at(0.0, 0.0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("queue is full"), "{err}");
+    }
+
+    /// One lane's share of the queue is bounded too — a lane past its
+    /// own cap is refused while other lanes still queue fine.
+    #[test]
+    fn per_lane_queue_cap_bounds_one_lanes_share() {
+        let mut s = slots(1, 1, 900, &[]);
+        acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
+        for i in 0..MAX_WAITERS_PER_LANE {
             let q = acquire(&mut s, SlotKind::Build, "dev-2", &format!("w{i}"), 0.0);
             assert_eq!(q["granted"], false);
         }
@@ -1236,7 +1363,10 @@ mod tests {
                 SlotClock::at(0.0, 0.0),
             )
             .unwrap_err();
-        assert!(err.to_string().contains("queue is full"), "{err}");
+        assert!(err.to_string().contains("32 slot requests"), "{err}");
+        // The refusal is per-lane — the queue itself still has room.
+        let q = acquire(&mut s, SlotKind::Build, "dev-3", "b1", 0.0);
+        assert_eq!(q["granted"], false);
     }
 
     #[test]
@@ -1324,5 +1454,134 @@ mod tests {
         assert_eq!(g["granted"], false, "fresh waiter keeps its place");
         let g = acquire(&mut s, SlotKind::Build, "dev-2", "w1", 2.0);
         assert_eq!(g["granted"], true);
+    }
+
+    /// REGRESSION (r3 blocker): a lane keeping requests continuously
+    /// in flight must not own the pool. Seniority ends at each serve
+    /// and ordering age is capped at `starve_secs`, so a rival lane
+    /// grants within the bound no matter how often the first lane
+    /// re-queues. On the pre-r3 head the `(lane, kind)` anchor
+    /// survived every grant — every fresh A waiter stamped t=0 and B
+    /// never reached the front (this test's loop runs to its end and
+    /// `b_granted_at` stays None).
+    #[test]
+    fn continuous_requeue_cannot_monopolize_a_pool() {
+        let mut s = slots(1, 1, 900, &[]);
+        // Lane A holds the only build slot and already keeps two
+        // waiters in flight riding the t=0 anchor.
+        acquire(&mut s, SlotKind::Build, "A", "h", 0.0);
+        acquire(&mut s, SlotKind::Build, "A", "w1", 0.0);
+        acquire(&mut s, SlotKind::Build, "A", "w2", 0.0);
+        // Lane B requests once, a second later.
+        acquire(&mut s, SlotKind::Build, "B", "b1", 1.0);
+        let mut a_waiters = vec!["w1".to_string(), "w2".to_string()];
+        let mut next = 3u32;
+        let mut b_granted_at = None;
+        // Every 20s the holder releases; A's waiters poll first
+        // (adversarial), B polls once, and A tops back up to two
+        // in-flight requests — the monopolization pattern.
+        for tick in 1..=45 {
+            let t = tick as f64 * 20.0;
+            release_any(&mut s, t);
+            let mut still = Vec::new();
+            for r in &a_waiters {
+                let g = acquire(&mut s, SlotKind::Build, "A", r, t);
+                if !g["granted"].as_bool().unwrap_or(false) {
+                    still.push(r.clone());
+                }
+            }
+            a_waiters = still;
+            let g = acquire(&mut s, SlotKind::Build, "B", "b1", t);
+            if g["granted"].as_bool().unwrap_or(false) {
+                b_granted_at = Some(t);
+                break;
+            }
+            while a_waiters.len() < 2 {
+                let r = format!("w{next}");
+                next += 1;
+                acquire(&mut s, SlotKind::Build, "A", &r, t);
+                a_waiters.push(r);
+            }
+        }
+        let t = b_granted_at.expect("B never granted — A owned the pool");
+        assert!(t <= 900.0, "B granted only at t={t} — past starve_secs");
+    }
+
+    /// REGRESSION (r3 blocker): `slot_acquired` rides the lane's event
+    /// stream — readable by ANY local caller — so it must never carry
+    /// the token. token+lane+pid are the whole release credential;
+    /// publishing all three hands every peer the keys to a live hold.
+    /// On the pre-r3 head the event payload contained `token` and the
+    /// first assertion fails.
+    #[test]
+    fn slot_events_never_carry_tokens() {
+        let mut s = slots(1, 1, 900, &[]);
+        let (g, events) = s
+            .acquire(
+                SlotKind::Build,
+                "victim",
+                me(),
+                "r1",
+                false,
+                SlotClock::at(0.0, 0.0),
+            )
+            .unwrap();
+        // The RPC reply still returns the token to the acquirer.
+        let token = g["token"].as_str().unwrap().to_string();
+        assert!(token.starts_with("slot-"));
+        let ev = events
+            .iter()
+            .find(|e| e.1 == "slot_acquired")
+            .expect("acquired event");
+        assert!(
+            ev.2.get("token").is_none() && !ev.2.to_string().contains(&token),
+            "slot_acquired leaks the token: {}",
+            ev.2
+        );
+        // A peer who read the event knows lane+pid but not the token —
+        // every guess is refused, and the hold survives.
+        assert!(s.release("slot-guess", "victim", me(), 1.0).is_err());
+        assert_eq!(s.held.len(), 1);
+        // The owner releases normally; the released event doesn't
+        // print the spent token either.
+        let (r, events) = s.release(&token, "victim", me(), 1.0).unwrap();
+        assert_eq!(r["released"], true);
+        let ev = events
+            .iter()
+            .find(|e| e.1 == "slot_released")
+            .expect("released event");
+        assert!(
+            ev.2.get("token").is_none(),
+            "slot_released leaks the token: {}",
+            ev.2
+        );
+    }
+
+    /// The deadlock guard binds the holding PROCESS — a second shell
+    /// in the same lane (`$USER` fallback makes lanes collide) is an
+    /// independent actor and may queue across pools.
+    #[test]
+    fn same_lane_other_pid_may_queue_across_pools() {
+        let mut s = slots(1, 1, 900, &[]);
+        let child = Child::spawn();
+        // The child holds the suite slot; another lane fills build.
+        acquire_pid(&mut s, SlotKind::Suite, "shared", child.pid(), "s1", 0.0);
+        acquire(&mut s, SlotKind::Build, "dev-9", "b9", 0.0);
+        // Same lane, DIFFERENT process queueing for build — allowed.
+        let q = acquire_pid(&mut s, SlotKind::Build, "shared", me(), "b1", 0.0);
+        assert_eq!(q["granted"], false, "queued, not refused");
+        // The holding process itself is still guarded.
+        let err = s
+            .acquire(
+                SlotKind::Build,
+                "shared",
+                child.pid(),
+                "b2",
+                false,
+                SlotClock::at(0.0, 0.0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("deadlock guard"), "{err}");
+        child.reap();
     }
 }
