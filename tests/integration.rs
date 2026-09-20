@@ -16268,6 +16268,9 @@ fn tmux_call_count(mock: &MockDevin, state: &Path, cmd: &str) -> usize {
 
 #[test]
 fn status_rows_probe_once_and_footer() {
+    // The stall watch now samples idle panes too — park it far out so
+    // a tick cannot land inside the capture-count window below.
+    stall_sample(3600);
     let d = TestDaemon::start();
     let mock = d.mock_devin();
     let _chatty = d.mock_claude("chatty", None);
