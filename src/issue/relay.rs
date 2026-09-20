@@ -1488,7 +1488,8 @@ mod tests {
                 refs: vec![],
                 created: "2026-09-20T00:00:00Z".to_string(),
             },
-            body: "A report\n\npassword: ghp_secret\nnormal detail".to_string(),
+            body: "A report\n\npassword: TEST_ONLY_REDACTION_SENTINEL_12345\nnormal detail"
+                .to_string(),
             comments: vec![],
             artifacts: vec![],
         }
@@ -1499,7 +1500,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let issue = sample_issue(&temp);
         let (_, summary) = report_summary(&issue);
-        assert!(!summary.contains("ghp_secret"));
+        assert!(!summary.contains("TEST_ONLY_REDACTION_SENTINEL_12345"));
+        assert!(summary.contains("[REDACTED]"));
+        assert!(summary.contains("normal detail"));
         assert!(!summary.contains("Report context"));
         assert!(summary.starts_with("kind: question"));
     }
