@@ -1,0 +1,14 @@
+# CAD-173: explicit profile for the pinned wrapper in scripts/cadence-nextest.
+# This file does not activate nextest in cadence-review.toml.
+[profile.cadence]
+# Retries mask flakes and bypass the review flake ledger; keep the gate strict.
+retries = 0
+fail-fast = false
+
+# The activation follow-up consumes this report after every nextest command.
+# Review deletes the prior file before launch and rejects missing or empty
+# reports, so a stale report cannot launder a zero-test run into a pass.
+[profile.cadence.junit]
+path = "junit.xml"
+report-skipped = "all"
+flaky-fail-status = "failure"

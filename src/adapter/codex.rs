@@ -31,6 +31,165 @@ const ENV_SCRUB: &[&str] = &[
     "CLAUDE_CODE_SESSION_ID",
 ];
 
+/// The provider's model catalogue is queried only when a caller requests a
+/// model or effort. The app-server returns this metadata through
+/// `model/list`; keeping the parser local means an unknown/changed wire shape
+/// is surfaced as unknown availability instead of becoming a silent default.
+#[derive(Debug)]
+struct ModelMetadata {
+    name: String,
+    supported_efforts: Option<Vec<String>>,
+    is_default: bool,
+}
+
+fn configured_settings(agent: &Agent) -> Result<(Option<String>, Option<String>)> {
+    let params = agent.params.as_ref();
+    let model = match params.and_then(|p| p.get("model")) {
+        None => None,
+        Some(Value::String(model)) if !model.trim().is_empty() => Some(model.clone()),
+        Some(_) => return Err(Error::rejected("codex model must be a non-empty string")),
+    };
+    let effort = match params.and_then(|p| p.get("effort")) {
+        None => None,
+        Some(Value::String(effort)) => {
+            registry::codex_effort(effort)?;
+            Some(effort.clone())
+        }
+        Some(_) => {
+            return Err(Error::rejected(format!(
+                "codex effort must be a string, one of: {}",
+                registry::CODEX_EFFORTS.join(", ")
+            )))
+        }
+    };
+    Ok((model, effort))
+}
+
+fn model_metadata(result: &Value) -> Result<Vec<ModelMetadata>> {
+    let data = result
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::provider("Codex model availability unknown: model/list returned no data")
+        })?;
+    let mut models = Vec::with_capacity(data.len());
+    for item in data {
+        let name = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                item.get("model")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+            })
+            .ok_or_else(|| {
+                Error::provider(
+                    "Codex model availability unknown: model/list returned an entry without an id",
+                )
+            })?
+            .to_string();
+        let supported_efforts = item
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        item.as_str()
+                            .or_else(|| item.get("reasoningEffort").and_then(Value::as_str))
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            });
+        models.push(ModelMetadata {
+            name,
+            supported_efforts,
+            is_default: item
+                .get("isDefault")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    Ok(models)
+}
+
+/// Validate the requested `(model, effort)` pair against the provider's
+/// advertised model catalogue. A catalogue failure is intentionally a
+/// provider error labelled "availability unknown"; accepting the request
+/// would otherwise silently inherit the user's global Codex model.
+fn validate_settings(
+    transport: &Transport,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<()> {
+    if model.is_none() && effort.is_none() {
+        return Ok(());
+    }
+    let mut models = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..32 {
+        let mut request = json!({"includeHidden": true, "limit": 256});
+        if let Some(value) = &cursor {
+            request["cursor"] = json!(value);
+        }
+        let result = transport.request("model/list", request).map_err(|error| {
+            Error::provider(format!(
+                "Codex model availability unknown: model/list failed: {error}"
+            ))
+        })?;
+        models.extend(model_metadata(&result)?);
+        cursor = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    if cursor.is_some() {
+        return Err(Error::provider(
+            "Codex model availability unknown: model/list pagination exceeded its bound",
+        ));
+    }
+    let selected = match model {
+        Some(name) => models.iter().find(|entry| entry.name == name),
+        None => models.iter().find(|entry| entry.is_default),
+    };
+    let Some(selected) = selected else {
+        if model.is_none() {
+            return Err(Error::provider(
+                "Codex model availability unknown: model/list did not identify a default model",
+            ));
+        }
+        let requested = model.unwrap_or("provider default");
+        return Err(Error::provider(format!(
+            "Codex provider rejected model '{requested}': it is not present in model/list metadata"
+        )));
+    };
+    if let Some(effort) = effort {
+        let Some(supported) = selected.supported_efforts.as_ref() else {
+            return Err(Error::provider(format!(
+                "Codex effort availability unknown for model '{}': model/list omitted supportedReasoningEfforts",
+                selected.name
+            )));
+        };
+        if !supported.iter().any(|candidate| candidate == effort) {
+            return Err(Error::provider(format!(
+                "Codex provider rejected effort '{effort}' for model '{}': supported efforts are {}",
+                selected.name,
+                if supported.is_empty() {
+                    "none".to_string()
+                } else {
+                    supported.join(", ")
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Provider command; `CADENCE_CODEX_COMMAND` overrides it (test/mock use).
 fn codex_command(env: &ProviderEnv) -> Vec<String> {
     if let Some(cmd) = env.var("CADENCE_CODEX_COMMAND") {
@@ -350,11 +509,26 @@ impl ProviderAdapter for CodexAdapter {
                 }
                 None => "never",
             };
+            let (configured_model, configured_effort) = configured_settings(agent)?;
+            validate_settings(
+                &self.transport,
+                configured_model.as_deref(),
+                configured_effort.as_deref(),
+            )?;
             let mut params = json!({
                 "cwd": agent.cwd,
                 "sandbox": agent.sandbox,
                 "approvalPolicy": approval_policy,
             });
+            if let Some(model) = configured_model.as_deref() {
+                params["model"] = json!(model);
+            }
+            if let Some(effort) = configured_effort.as_deref() {
+                // Scope the reasoning setting to this managed thread. This
+                // uses the app-server config field without touching the
+                // operator's global ~/.codex configuration.
+                params["config"] = json!({"model_reasoning_effort": effort});
+            }
             if let Some(instructions) = &agent.instructions {
                 params["developerInstructions"] = json!(instructions);
             }
@@ -374,6 +548,42 @@ impl ProviderAdapter for CodexAdapter {
                 .ok_or_else(|| Error::provider("thread/start returned no thread id"))?
                 .to_string();
             *self.shared.thread_id.lock().unwrap() = Some(thread_id.clone());
+            let effective_model = result
+                .get("model")
+                .or_else(|| result.pointer("/thread/model"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let effective_effort = result
+                .get("reasoningEffort")
+                .or_else(|| result.pointer("/thread/reasoningEffort"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let (Some(requested), Some(effective)) =
+                (configured_model.as_deref(), effective_model.as_deref())
+            {
+                if requested != effective {
+                    return Err(Error::provider(format!(
+                        "Codex provider selected model '{effective}' instead of requested '{requested}'; refusing silent substitution"
+                    )));
+                }
+            } else if configured_model.is_some() {
+                return Err(Error::provider(
+                    "Codex effective model is unknown: thread response omitted model",
+                ));
+            }
+            if let (Some(requested), Some(effective)) =
+                (configured_effort.as_deref(), effective_effort.as_deref())
+            {
+                if requested != effective {
+                    return Err(Error::provider(format!(
+                        "Codex provider selected effort '{effective}' instead of requested '{requested}'; refusing silent substitution"
+                    )));
+                }
+            } else if configured_effort.is_some() {
+                return Err(Error::provider(
+                    "Codex effective effort is unknown: thread response omitted reasoningEffort",
+                ));
+            }
             // A TUI can only resume a thread whose rollout is persisted —
             // which happens after its first turn. Seed fresh WebSocket
             // threads with one minimal turn so `agent attach` works.
@@ -387,10 +597,8 @@ impl ProviderAdapter for CodexAdapter {
                     .unwrap_or(&thread_id)
                     .to_string(),
                 thread_id,
-                model: result
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                model: effective_model,
+                effort: effective_effort,
                 pid: launched.pid,
                 endpoint: launched.endpoint.clone(),
                 generation: None,

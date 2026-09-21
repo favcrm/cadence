@@ -884,6 +884,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
                     thread_id: "th-mismatch".into(),
                     session_id: "s-mismatch".into(),
                     model: None,
+                    effort: None,
                     pid: 1,
                     endpoint: None,
                     generation: None,
@@ -2091,15 +2092,44 @@ fn is_filtered_run() -> bool {
     false
 }
 
+/// Nextest launches every test in a process-per-test child and exposes
+/// `NEXTEST=1` plus `NEXTEST_EXECUTION_MODE`. A filtered child cannot
+/// safely acquire the host slot itself. The outer review process owns
+/// the flock and explicitly clears the child path instead.
+fn is_nextest_run() -> bool {
+    std::env::var("NEXTEST").ok().as_deref() == Some("1")
+        || std::env::var("NEXTEST_EXECUTION_MODE").is_ok()
+}
+
+fn nextest_outer_lock_required(
+    nextest: bool,
+    lock_path: Option<&str>,
+    review_held: bool,
+) -> Result<(), &'static str> {
+    if !nextest {
+        return Ok(());
+    }
+    if review_held && lock_path.is_none() {
+        return Ok(());
+    }
+    Err(
+        "nextest requires the external CADENCE_SUITE_LOCK; run `cadence review` or use the pinned outer wrapper",
+    )
+}
+
 fn acquire_suite_slot() -> Result<Option<std::fs::File>, String> {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
-    let Some(path) = std::env::var("CADENCE_SUITE_LOCK")
+    let path = std::env::var("CADENCE_SUITE_LOCK")
         .ok()
-        .filter(|p| !p.is_empty())
-    else {
-        return Ok(None);
-    };
+        .filter(|p| !p.is_empty());
+    let review_held = std::env::var("CADENCE_REVIEW_SUITE_LOCK_HELD")
+        .ok()
+        .as_deref()
+        == Some("1");
+    nextest_outer_lock_required(is_nextest_run(), path.as_deref(), review_held)
+        .map_err(str::to_string)?;
+    let Some(path) = path else { return Ok(None) };
     if is_filtered_run() {
         return Ok(None);
     }
@@ -2175,6 +2205,20 @@ fn acquire_suite_slot() -> Result<Option<std::fs::File>, String> {
     }
 }
 
+#[test]
+fn nextest_requires_external_suite_lock_without_nested_flock() {
+    // Ordinary cargo filtered tests retain the historical no-slot path.
+    assert!(nextest_outer_lock_required(false, None, false).is_ok());
+    // Direct nextest is refused whether the caller forgot the path or
+    // supplied one without proving that an outer review owns it.
+    assert!(nextest_outer_lock_required(true, None, false).is_err());
+    assert!(nextest_outer_lock_required(true, Some("/tmp/suite.lock"), false).is_err());
+    // Review's outer Flock is the only accepted child contract: it clears
+    // the path and sets the marker, so no nested flock can deadlock.
+    assert!(nextest_outer_lock_required(true, None, true).is_ok());
+    assert!(nextest_outer_lock_required(true, Some("/tmp/suite.lock"), true).is_err());
+}
+
 fn daemon_opts() -> daemon::ServeOptions {
     daemon::ServeOptions {
         provider_env: test_env(),
@@ -2203,6 +2247,25 @@ for line in sys.stdin:
     if method == "initialize":
         if mode == "slow-init": time.sleep(30)
         emit({"id": mid, "result": {"serverInfo": {"name": "mock", "version": "0"}}})
+    elif method == "model/list":
+        # Metadata-only response: configured Codex tests can exercise the
+        # pair validator without making a paid model turn.
+        if mode == "bad-model-list":
+            emit({"id": mid, "result": {}})
+        else:
+            emit({"id": mid, "result": {"data": [
+                {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna",
+                 "isDefault": False,
+                 "supportedReasoningEfforts": [
+                     {"reasoningEffort": "low"},
+                     {"reasoningEffort": "medium"},
+                     {"reasoningEffort": "high"},
+                     {"reasoningEffort": "xhigh"},
+                     {"reasoningEffort": "max"}]},
+                {"id": "mock-model", "model": "mock-model",
+                 "isDefault": True,
+                 "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]}
+            ], "nextCursor": None}})
     elif method in ("thread/start", "thread/resume"):
         # Record the launch payload before answering so tests can read
         # exactly what reached the wire (<pidfile>.requests).
@@ -2212,7 +2275,13 @@ for line in sys.stdin:
         if mode == "bad-thread":
             emit({"id": mid, "result": {"thread": {}}})
         else:
-            emit({"id": mid, "result": {"thread": {"id": "th-1", "sessionId": "s-1"}}})
+            launch = msg.get("params", {})
+            effort = launch.get("config", {}).get("model_reasoning_effort", "medium")
+            model = launch.get("model", "mock-model")
+            emit({"id": mid, "result": {"thread": {
+                "id": "th-1", "sessionId": "s-1", "model": model,
+                "reasoningEffort": effort},
+                "model": model, "reasoningEffort": effort}})
     elif method == "turn/start":
         if mode == "bad-turn":
             emit({"id": mid, "result": {"turn": {}}})
@@ -2459,13 +2528,32 @@ def handle(conn):
                 time.sleep(30)
             send_json(conn, {"id": mid, "result": {
                 "serverInfo": {"name": "mock-ws", "version": "0"}}})
+        elif method == "model/list":
+            send_json(conn, {"id": mid, "result": {"data": [
+                {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna",
+                 "isDefault": False,
+                 "supportedReasoningEfforts": [
+                     {"reasoningEffort": "low"},
+                     {"reasoningEffort": "medium"},
+                     {"reasoningEffort": "high"},
+                     {"reasoningEffort": "xhigh"},
+                     {"reasoningEffort": "max"}]},
+                {"id": "mock-model", "model": "mock-model",
+                 "isDefault": True,
+                 "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]}
+            ], "nextCursor": None}})
         elif method in ("thread/start", "thread/resume"):
             # Record the launch payload before answering (<pidfile>.requests).
             with open(pidfile + ".requests", "a") as rf:
                 rf.write(json.dumps({"method": method,
                                      "params": msg.get("params", {})}) + "\n")
-            send_json(conn, {"id": mid, "result": {
-                "thread": {"id": "th-1", "sessionId": "s-1"}}})
+            launch = msg.get("params", {})
+            effort = launch.get("config", {}).get("model_reasoning_effort", "medium")
+            model = launch.get("model", "mock-model")
+            send_json(conn, {"id": mid, "result": {"thread": {
+                "id": "th-1", "sessionId": "s-1", "model": model,
+                "reasoningEffort": effort},
+                "model": model, "reasoningEffort": effort}})
         elif method == "turn/start":
             text = ""
             try:
@@ -2660,6 +2748,102 @@ fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     assert_eq!(reqs[1]["method"], "thread/resume");
     assert_eq!(reqs[1]["params"]["approvalPolicy"], "never");
     assert_eq!(reqs[1]["params"]["threadId"], "th-1");
+}
+
+#[test]
+fn codex_model_effort_are_validated_reported_and_replayed_on_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "luna", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("luna", "idle", 15);
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    assert_eq!(reqs[0]["method"], "thread/start");
+    assert_eq!(reqs[0]["params"]["model"], "gpt-5.6-luna");
+    assert_eq!(reqs[0]["params"]["config"]["model_reasoning_effort"], "max");
+    let agent = d.rpc("agent_show", json!({"alias": "luna"})).unwrap()["agent"].clone();
+    assert_eq!(agent["model_configured"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["model_reported"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["model_effective"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["effort_configured"], "max", "{agent}");
+    assert_eq!(agent["effort_reported"], "max", "{agent}");
+    assert_eq!(agent["effort_effective"], "max", "{agent}");
+
+    d.rpc("agent_stop", json!({"alias": "luna"})).unwrap();
+    d.wait_agent("luna", "stopped", 15);
+    d.rpc("agent_resume", json!({"alias": "luna"})).unwrap();
+    d.wait_agent("luna", "idle", 15);
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs.len(), 2, "{reqs:?}");
+    assert_eq!(reqs[1]["method"], "thread/resume");
+    assert_eq!(reqs[1]["params"]["threadId"], "th-1");
+    assert_eq!(reqs[1]["params"]["model"], "gpt-5.6-luna");
+    assert_eq!(reqs[1]["params"]["config"]["model_reasoning_effort"], "max");
+}
+
+#[test]
+fn codex_model_effort_pair_rejection_is_visible() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "bad-luna", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"ultra\"}"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("bad-luna", "attention", 15);
+    let error = agent["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider rejected effort"), "{error}");
+    assert!(error.contains("gpt-5.6-luna"), "{error}");
+    assert!(error.contains("max"), "{error}");
+}
+
+#[test]
+fn codex_model_availability_unknown_is_visible() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("bad-model-list");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "unknown-luna", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\"}"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("unknown-luna", "attention", 15);
+    let error = agent["error"].as_str().unwrap_or_default();
+    assert!(error.contains("availability unknown"), "{error}");
+    assert!(!error.contains("provider rejected"), "{error}");
+}
+
+#[test]
+fn codex_ws_model_effort_are_replayed_and_reported() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "luna-ws", "provider": "codex",
+               "endpoint_kind": "managed-ws", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("luna-ws", "idle", 15);
+    let agent = d.rpc("agent_show", json!({"alias": "luna-ws"})).unwrap()["agent"].clone();
+    assert_eq!(agent["model_effective"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["effort_effective"], "max", "{agent}");
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs[0]["params"]["model"], "gpt-5.6-luna");
+    assert_eq!(reqs[0]["params"]["config"]["model_reasoning_effort"], "max");
 }
 
 #[test]
@@ -6304,6 +6488,140 @@ impl TestDaemon {
             thread::sleep(Duration::from_millis(50));
         }
     }
+
+    /// Poll until an event of `kind` satisfying `pred` exists
+    /// (bounded). Payload-scoped — an earlier event that merely shares
+    /// the kind is never returned (CAD-222: a late `turn_stalled` for
+    /// one message must not answer a wait meant for another's).
+    fn wait_event_where(
+        &self,
+        alias: &str,
+        kind: &str,
+        pred: impl Fn(&Value) -> bool,
+        secs: u64,
+    ) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(e) = self
+                .events(alias)
+                .into_iter()
+                .find(|e| e["kind"].as_str() == Some(kind) && pred(e))
+            {
+                return e;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent {alias} never emitted a matching {kind}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Emit a test-only timing trace for a routed PTY delivery. The daemon's
+/// durable event/message timestamps are the phase clock here: using them
+/// avoids charging the test's 50ms RPC polling to a render or retry phase.
+/// A `submitting` row is the durable attempt-start boundary and a
+/// `paste_not_rendered` row is its completion. The next `submitting` row is
+/// the observable retry wake; no separate wake event exists. This is evidence
+/// for the follow-up audit, not a change to the delivery contract.
+fn emit_park_phase_trace(d: &TestDaemon, test_name: &str, alias: &str, routed_id: &str) {
+    fn at(value: &Value) -> Option<f64> {
+        value["at"].as_f64()
+    }
+
+    fn delta(start: Option<f64>, end: Option<f64>) -> Value {
+        match (start, end) {
+            (Some(start), Some(end)) if end >= start => json!(end - start),
+            _ => Value::Null,
+        }
+    }
+
+    let events = d.events(alias);
+    let starts: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "submitting" && event["payload"]["message"].as_str() == Some(routed_id)
+        })
+        .collect();
+    let misses: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "paste_not_rendered"
+                && event["payload"]["message"].as_str() == Some(routed_id)
+        })
+        .collect();
+    let parked = events.iter().find(|event| {
+        event["kind"] == "delivery_parked"
+            && event["payload"]["message"].as_str() == Some(routed_id)
+    });
+    let show = d.rpc("agent_show", json!({"alias": alias})).unwrap();
+    let message = show["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().find(|message| message["id"] == routed_id));
+    let enqueue_at = message.and_then(|message| message["created"].as_f64());
+    let attempt_phases: Vec<Value> = misses
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let started_at = starts.get(index).and_then(|event| at(event));
+            json!({
+                "attempt": index + 1,
+                "started_at_epoch_s": started_at,
+                "completion_at_epoch_s": at(event),
+                "enqueue_to_start_s": if index == 0 {
+                    delta(enqueue_at, started_at)
+                } else {
+                    Value::Null
+                },
+                "render_attempt_s": delta(started_at, at(event)),
+                "retry": event["payload"]["retry"],
+            })
+        })
+        .collect();
+    let retry_phases: Vec<Value> = misses
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| {
+            json!({
+                "after_attempt": index + 1,
+                "retry_wake_at_epoch_s": starts.get(index + 1).and_then(|event| at(event)),
+                "retry_to_next_attempt_start_s": delta(
+                    at(pair[0]),
+                    starts.get(index + 1).and_then(|event| at(event)),
+                ),
+            })
+        })
+        .collect();
+    let parked_at = parked.and_then(at);
+    let completed_at = message.and_then(|message| message["completed"].as_f64());
+    let final_agent = show.get("agent").map(|agent| {
+        json!({
+            "state": agent["state"],
+            "dead": agent["dead"],
+            "updated_epoch_s": agent["updated"],
+        })
+    });
+    let report = json!({
+        "schema": "cad173.e4a.phase-trace.v1",
+        "test": test_name,
+        "alias": alias,
+        "message": routed_id,
+        "enqueue_at_epoch_s": enqueue_at,
+        "attempts": attempt_phases,
+        "submitting_events": starts.len(),
+        "retry_gaps": retry_phases,
+        "park_at_epoch_s": parked_at,
+        "park_after_attempt4_s": delta(misses.last().and_then(|event| at(event)), parked_at),
+        "failed_state_at_epoch_s": completed_at,
+        "park_to_failed_state_s": delta(parked_at, completed_at),
+        "enqueue_to_failed_state_s": delta(enqueue_at, completed_at),
+        "message_state": message.map(|message| message["state"].clone()),
+        "agent": final_agent,
+        "clock": "durable events.at and messages.created/completed (epoch seconds)",
+        "attempt_boundary": "submitting event is attempt start; paste_not_rendered is completion; next submitting event is the retry wake",
+    });
+    eprintln!("CAD173_E4A_PHASE {report}");
 }
 
 #[test]
@@ -7394,6 +7712,12 @@ fn pty_unrendered_worker_result_requeues_then_parks() {
     // Delivered = render-verified `running` (a task then awaits an
     // explicit report, so the agent correctly stays busy on it).
     d.wait_message("pm", "after", &["running"], 20);
+    emit_park_phase_trace(
+        &d,
+        "pty_unrendered_worker_result_requeues_then_parks",
+        "pm",
+        &routed_id,
+    );
 }
 
 #[test]
@@ -9742,6 +10066,7 @@ fn job_event_parks_on_unrendered_pty_pm() {
     d.wait_agent("pm", "idle", 15);
     let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap()["agent"].clone();
     assert_eq!(pm["dead"], false);
+    emit_park_phase_trace(&d, "job_event_parks_on_unrendered_pty_pm", "pm", parked_id);
 }
 
 #[test]
@@ -13163,7 +13488,29 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
-    thread::sleep(Duration::from_secs(7));
+    // Positive window-opened proof before any absence assertion
+    // (CAD-221, the canary pattern from #70's slot-plant test): a
+    // pending brokered request refreshes the turn's activity on every
+    // stall tick, so a wait older than the budget still reporting
+    // silence *under* the budget can only happen while the refresh
+    // path runs. A dead or skipping ticker reports wall-clock age
+    // instead and this loop fails loudly — absence is never asserted
+    // inside a window that may not have opened.
+    let wait_started = Instant::now();
+    let canary_deadline = wait_started + Duration::from_secs(15);
+    loop {
+        let a = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+        let silent = a["silent_secs"].as_u64().unwrap_or(u64::MAX);
+        if wait_started.elapsed() > Duration::from_secs(4) && silent < 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < canary_deadline,
+            "stall ticker never refreshed the brokered wait — the \
+             absence window never provably opened: {a}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     assert!(
         d.events("w1")
             .iter()
@@ -13181,14 +13528,22 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     d.wait_message("w1", "m-need", &["completed"], 15);
 
     // A genuinely silent turn stalls once — then simply ends; no
-    // recovery event is owed for a finished message.
+    // recovery event is owed for a finished message. The wait selects
+    // by payload: a `turn_stalled` for m-need landing late (between
+    // respond and completion on a slow host) must not be returned
+    // here (CAD-222).
     d.rpc(
         "agent_send",
         json!({"alias": "w1", "text": "SLEEP:12", "reply_to": "pm",
                "message": "m-sleep"}),
     )
     .unwrap();
-    let e = d.wait_event("w1", "turn_stalled", 20);
+    let e = d.wait_event_where(
+        "w1",
+        "turn_stalled",
+        |e| e["payload"]["message"].as_str() == Some("m-sleep"),
+        20,
+    );
     assert_eq!(e["payload"]["message"], "m-sleep", "{e}");
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(agent["stalled"], true, "{agent}");

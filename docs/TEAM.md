@@ -88,7 +88,14 @@ message of their turn; pty developers report with `cadence message result`.
 4. A PR entering the merge queue is frozen by message naming the exact SHA.
 5. When main moved, gate the merge result, or one combined tree for several PRs, and check that main's tree equals the gated tree after merging.
 6. A failing test is rerun isolated on the PR tree and on main before anyone blames the PR.
-7. One full integration suite per host, under `CADENCE_SUITE_LOCK`.
+7. One full integration suite per host, under `CADENCE_SUITE_LOCK`. The
+   optional CAD-173 nextest wrapper verifies the reviewed executable
+   digest, takes this lock before launching the process-per-test harness,
+   and forces zero retries. A review child receives an explicit outer-held
+   marker and never nests `flock`. The activation candidate records JUnit
+   testcase names, outcomes, counts and durations; a missing or empty report
+   is blocking evidence, and the full and isolated commands must use the same
+   exact-filter backend. Human approval still gates this config change.
 8. Never paste other processes' command lines or tool output verbatim into PRs, issues or notes; scan for secrets before any outward write.
 9. A pty pane that probes idle while its message is still running has stopped; a numbered menu is an approval prompt, not work.
 10. Git commands that may open an editor run with `GIT_EDITOR=true`.
