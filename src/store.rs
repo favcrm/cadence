@@ -1350,14 +1350,17 @@ impl Store {
         }
         identifier(id, "Message id")?;
         self.agent_in(tx, alias)?;
-        if let Some(target) = reply_to {
-            self.agent_in(tx, target)?;
+        let reply_recipient = if let Some(target) = reply_to {
+            let recipient = self.agent_in(tx, target)?;
             if target == alias {
                 return Err(Error::rejected(
                     "An agent cannot automatically reply to itself",
                 ));
             }
-        }
+            Some(recipient)
+        } else {
+            None
+        };
         if let Some(task) = task_id {
             self.task_in(tx, task)?;
         }
@@ -1383,7 +1386,14 @@ impl Store {
             tx,
             alias,
             "queued",
-            json!({"message": id, "source": source, "reply_to": reply_to}),
+            json!({
+                "message": id,
+                "source": source,
+                "reply_to": reply_to,
+                "recipient_identity": reply_recipient
+                    .as_ref()
+                    .map(Self::agent_identity),
+            }),
             None,
             task_id,
         )?;
@@ -1406,6 +1416,218 @@ impl Store {
         }
     }
 
+    /// The durable binding captured when a message names a recipient. The
+    /// row timestamp separates a removed/re-registered alias; the provider,
+    /// endpoint and launch fields bind the trust boundary; endpoint identity
+    /// fields are checked when they were known at enqueue time.
+    fn agent_identity(agent: &Agent) -> Value {
+        json!({
+            "created": agent.created,
+            // Keep the exact SQLite REAL bits alongside the human-readable
+            // timestamp. JSON number round-tripping can move an epoch f64
+            // by one ULP; the bits are the durable identity comparison.
+            "created_bits": agent.created.to_bits(),
+            "provider": agent.provider,
+            "endpoint_kind": agent.endpoint_kind,
+            "role": agent.role,
+            "cwd": agent.cwd,
+            "sandbox": agent.sandbox,
+            "params": agent.params,
+            "generation": agent.generation,
+            "thread_id": agent.thread_id,
+            "session_id": agent.session_id,
+            "model": agent.model,
+        })
+    }
+
+    /// Compare an enqueue-time binding with the current row. A missing
+    /// enqueue-time binding is never safe. Runtime generation/session values
+    /// that were unknown at enqueue remain unbound; once recorded, they must
+    /// match exactly across a restart.
+    fn identity_matches(expected: &Value, actual: &Agent) -> bool {
+        let Some(expected) = expected.as_object() else {
+            return false;
+        };
+        let actual = Self::agent_identity(actual);
+        let stable = [
+            "created_bits",
+            "provider",
+            "endpoint_kind",
+            "role",
+            "cwd",
+            "sandbox",
+            "params",
+        ];
+        if stable
+            .iter()
+            .any(|key| expected.get(*key) != actual.get(*key))
+        {
+            return false;
+        }
+        ["generation", "thread_id", "session_id", "model"]
+            .iter()
+            .all(|key| match expected.get(*key) {
+                Some(value) if !value.is_null() => Some(value) == actual.get(*key),
+                _ => true,
+            })
+    }
+
+    /// Read the recipient binding from the source message's durable queued
+    /// event. The event log is the existing cursor/idempotency primitive, so
+    /// no schema column or migration is needed for this handoff proof.
+    fn queued_recipient_identity(
+        &self,
+        tx: &Connection,
+        alias: &str,
+        message_id: &str,
+        source: &str,
+    ) -> Result<Option<Value>> {
+        let mut stmt = tx.prepare(
+            "SELECT payload FROM events
+             WHERE alias=? AND kind='queued' ORDER BY seq",
+        )?;
+        let mut rows = stmt.query([alias])?;
+        while let Some(row) = rows.next()? {
+            let payload: String = row.get(0)?;
+            let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            if payload.get("message").and_then(Value::as_str) == Some(message_id)
+                && payload.get("source").and_then(Value::as_str) == Some(source)
+            {
+                return Ok(payload.get("recipient_identity").cloned());
+            }
+        }
+        Ok(None)
+    }
+
+    fn recipient_binding(
+        &self,
+        tx: &Connection,
+        source_alias: &str,
+        source_message: &str,
+        source: &str,
+        recipient: &str,
+    ) -> Result<(Option<Value>, Option<Agent>, Option<&'static str>)> {
+        let expected = self.queued_recipient_identity(tx, source_alias, source_message, source)?;
+        let current = self.agent_opt_in(tx, recipient)?;
+        let reason = match current.as_ref() {
+            None => Some("recipient_missing"),
+            Some(_) if expected.is_none() => Some("recipient_identity_unavailable"),
+            Some(agent) if !Self::identity_matches(expected.as_ref().unwrap(), agent) => {
+                Some("recipient_identity_changed")
+            }
+            Some(_) => None,
+        };
+        Ok((expected, current, reason))
+    }
+
+    fn handoff_unresolved_exists(&self, tx: &Connection, delivery: &str) -> Result<bool> {
+        let mut stmt = tx.prepare(
+            "SELECT payload FROM events
+             WHERE alias=? AND kind='handoff_unresolved' ORDER BY seq",
+        )?;
+        let mut rows = stmt.query([Self::DAEMON_STREAM])?;
+        while let Some(row) = rows.next()? {
+            let payload: String = row.get(0)?;
+            let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            if payload.get("delivery").and_then(Value::as_str) == Some(delivery) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Record one durable route failure. Missing/replaced recipients are
+    /// intentionally not retried into a later alias registration: the
+    /// unresolved event keeps the result visible to the monitor/operator.
+    #[allow(clippy::too_many_arguments)]
+    fn handoff_unresolved(
+        &self,
+        tx: &Connection,
+        task_id: Option<&str>,
+        recipient: &str,
+        delivery: &str,
+        source: &str,
+        source_message: &str,
+        reason: &str,
+        expected: Option<&Value>,
+        current: Option<&Agent>,
+    ) -> Result<()> {
+        if self.handoff_unresolved_exists(tx, delivery)? {
+            return Ok(());
+        }
+
+        let job_id = if let Some(task_id) = task_id {
+            match tx.query_row("SELECT job_id FROM tasks WHERE id=?", [task_id], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(job_id) => Some(job_id),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        Self::event_scoped(
+            tx,
+            Self::DAEMON_STREAM,
+            "handoff_unresolved",
+            json!({
+                "recipient": recipient,
+                "delivery": delivery,
+                "source": source,
+                "source_message": source_message,
+                "task": task_id,
+                "reason": reason,
+                "expected_identity": expected.cloned().unwrap_or(Value::Null),
+                "current_identity": current.map(Self::agent_identity).unwrap_or(Value::Null),
+            }),
+            job_id.as_deref(),
+            task_id,
+        )
+    }
+
+    fn fail_unresolved_routed(
+        &self,
+        tx: &Connection,
+        message: &Message,
+        recipient: &Agent,
+        expected: Option<&Value>,
+        reason: &str,
+    ) -> Result<()> {
+        let result = json!({
+            "status": "failed",
+            "via": "handoff_unresolved",
+            "message": message.id,
+            "source": message.source,
+            "reason": reason,
+        });
+        tx.execute(
+            "UPDATE messages SET state='failed',result=?,error=?,completed=?
+             WHERE id=? AND state='queued'",
+            params![
+                result.to_string(),
+                format!("routed delivery withheld: {reason}"),
+                now(),
+                message.id
+            ],
+        )?;
+        self.handoff_unresolved(
+            tx,
+            message.task_id.as_deref(),
+            &message.alias,
+            &message.id,
+            &message.source,
+            &message.id,
+            reason,
+            expected,
+            Some(recipient),
+        )
+    }
+
     /// Atomically take the oldest queued message for `alias` and mark it
     /// `submitting`. The actor is the only caller; one actor per alias keeps
     /// turns serialized.
@@ -1416,28 +1638,50 @@ impl Store {
         if !agent.enabled {
             return Ok(Take::Stop);
         }
-        let next = tx
-            .query_row(
-                "SELECT * FROM messages WHERE alias=? AND state='queued'
-                 ORDER BY seq LIMIT 1",
-                [alias],
-                row_message,
-            )
-            .ok();
-        let Some(message) = next else {
-            return Ok(Take::Empty);
-        };
-        tx.execute(
-            "UPDATE messages SET state='submitting',started=? WHERE id=?",
-            params![now(), message.id],
-        )?;
-        tx.execute(
-            "UPDATE agents SET state='busy',updated=? WHERE alias=?",
-            params![now(), alias],
-        )?;
-        Self::event(&tx, alias, "submitting", json!({"message": message.id}))?;
-        tx.commit()?;
-        Ok(Take::Message(Box::new(message)))
+        loop {
+            let next = tx
+                .query_row(
+                    "SELECT * FROM messages WHERE alias=? AND state='queued'
+                     ORDER BY seq LIMIT 1",
+                    [alias],
+                    row_message,
+                )
+                .ok();
+            let Some(message) = next else {
+                // A prior routed row in this same transaction may have
+                // been failed as unresolved before the queue became empty.
+                // Commit that durable evidence even though no message is
+                // returned to the actor.
+                tx.commit()?;
+                return Ok(Take::Empty);
+            };
+            if message.is_routed() {
+                let expected =
+                    self.queued_recipient_identity(&tx, alias, &message.id, &message.source)?;
+                let reason = match expected.as_ref() {
+                    None => Some("recipient_identity_unavailable"),
+                    Some(expected) if !Self::identity_matches(expected, &agent) => {
+                        Some("recipient_identity_changed")
+                    }
+                    Some(_) => None,
+                };
+                if let Some(reason) = reason {
+                    self.fail_unresolved_routed(&tx, &message, &agent, expected.as_ref(), reason)?;
+                    continue;
+                }
+            }
+            tx.execute(
+                "UPDATE messages SET state='submitting',started=? WHERE id=?",
+                params![now(), message.id],
+            )?;
+            tx.execute(
+                "UPDATE agents SET state='busy',updated=? WHERE alias=?",
+                params![now(), alias],
+            )?;
+            Self::event(&tx, alias, "submitting", json!({"message": message.id}))?;
+            tx.commit()?;
+            return Ok(Take::Message(Box::new(message)));
+        }
     }
 
     /// Record that the provider acknowledged a turn start.
@@ -1617,6 +1861,32 @@ impl Store {
         )
         .simple()
         .to_string();
+        if self.message_in(tx, &delivery)?.is_some()
+            || self.handoff_unresolved_exists(tx, &delivery)?
+        {
+            return Ok(());
+        }
+        let (expected, current, reason) =
+            self.recipient_binding(tx, &message.alias, &message.id, &message.source, target)?;
+        if let Some(reason) = reason {
+            self.handoff_unresolved(
+                tx,
+                message.task_id.as_deref(),
+                target,
+                &delivery,
+                "worker_result",
+                &message.id,
+                reason,
+                expected.as_ref(),
+                current.as_ref(),
+            )?;
+            return Ok(());
+        }
+        let Some(recipient) = current.as_ref() else {
+            return Err(Error::internal(
+                "safe result recipient binding lost its current row",
+            ));
+        };
         let mut routed = result.clone();
         let pointer = self.bound_routed_result(tx, target, &mut routed, &message.alias)?;
         let payload = json!({
@@ -1649,7 +1919,11 @@ impl Store {
             tx,
             target,
             "queued",
-            json!({"message": delivery, "source": "worker_result"}),
+            json!({
+                "message": delivery,
+                "source": "worker_result",
+                "recipient_identity": Self::agent_identity(recipient),
+            }),
         )?;
         Ok(())
     }
@@ -1677,6 +1951,32 @@ impl Store {
         )
         .simple()
         .to_string();
+        if self.message_in(tx, &delivery)?.is_some()
+            || self.handoff_unresolved_exists(tx, &delivery)?
+        {
+            return Ok(());
+        }
+        let (expected, current, reason) =
+            self.recipient_binding(tx, &message.alias, &message.id, &message.source, target)?;
+        if let Some(reason) = reason {
+            self.handoff_unresolved(
+                tx,
+                message.task_id.as_deref(),
+                target,
+                &delivery,
+                "worker_notice",
+                &message.id,
+                reason,
+                expected.as_ref(),
+                current.as_ref(),
+            )?;
+            return Ok(());
+        }
+        let Some(recipient) = current.as_ref() else {
+            return Err(Error::internal(
+                "safe notice recipient binding lost its current row",
+            ));
+        };
         let mut routed = result.clone();
         let pointer = self.bound_routed_result(tx, target, &mut routed, &message.alias)?;
         let payload = json!({
@@ -1716,7 +2016,11 @@ impl Store {
             tx,
             target,
             "queued",
-            json!({"message": delivery, "source": "worker_notice"}),
+            json!({
+                "message": delivery,
+                "source": "worker_notice",
+                "recipient_identity": Self::agent_identity(recipient),
+            }),
         )?;
         Ok(())
     }
@@ -3715,8 +4019,9 @@ impl Store {
     /// Routed job notification to the PM — `source='job_event'` so it
     /// gets the same fire-and-forget delivery as `worker_result`:
     /// render-miss retries, park-instead-of-fence, never a turn of the
-    /// PM's own. Deterministic id dedupes a retried write. A removed
-    /// PM simply gets no copy — the event row already records it.
+    /// PM's own. Deterministic id dedupes a retried write. A removed or
+    /// replaced PM gets no copy; a task-scoped unresolved event records the
+    /// route failure for monitor/operator follow-up.
     /// `new_state` is the task state the notification announces — the
     /// caller's UPDATE already landed, so the in-memory `task.state`
     /// is stale by the time this runs. `dedupe` names the triggering
@@ -3731,9 +4036,6 @@ impl Store {
         dedupe: &str,
         note: &str,
     ) -> Result<()> {
-        if self.agent_opt_in(tx, &job.pm_alias)?.is_none() {
-            return Ok(());
-        }
         let delivery = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
             format!(
@@ -3744,9 +4046,26 @@ impl Store {
         )
         .simple()
         .to_string();
-        if self.message_in(tx, &delivery)?.is_some() {
+        if self.message_in(tx, &delivery)?.is_some()
+            || self.handoff_unresolved_exists(tx, &delivery)?
+        {
             return Ok(());
         }
+        let recipient = self.agent_opt_in(tx, &job.pm_alias)?;
+        let Some(recipient) = recipient else {
+            self.handoff_unresolved(
+                tx,
+                Some(&task.id),
+                &job.pm_alias,
+                &delivery,
+                "job_event",
+                &delivery,
+                "recipient_missing",
+                None,
+                None,
+            )?;
+            return Ok(());
+        };
         let payload = json!({"job": job.id, "task": task.id,
                              "revision": task.revision, "state": new_state});
         let body = format!("Cadence job {}: {note} {payload}", job.id);
@@ -3759,7 +4078,11 @@ impl Store {
             tx,
             &job.pm_alias,
             "queued",
-            json!({"message": delivery, "source": "job_event"}),
+            json!({
+                "message": delivery,
+                "source": "job_event",
+                "recipient_identity": Self::agent_identity(&recipient),
+            }),
             Some(&job.id),
             Some(&task.id),
         )?;
@@ -4126,6 +4449,217 @@ mod tests {
             .simple()
             .to_string();
         assert_eq!(pm_msgs[0].id, expected);
+    }
+
+    #[test]
+    fn finish_route_identity_survives_timestamp_json_ulp() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        for alias in ["pm", "w1"] {
+            reg(&s, alias, &cwd);
+        }
+        s.enqueue("w1", "do it", Some("pm"), "m1", "user").unwrap();
+
+        // A JSON number at epoch scale can round the same SQLite REAL to
+        // the adjacent f64 when it is serialized and parsed again. Recreate
+        // that harmless presentation drift in the queued binding; the exact
+        // created_bits proof must still admit the original recipient.
+        let (seq, payload): (i64, String) = {
+            let conn = s.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT seq,payload FROM events
+                 WHERE alias='w1' AND kind='queued' ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let mut payload: Value = serde_json::from_str(&payload).unwrap();
+        let created = payload["recipient_identity"]["created"].as_f64().unwrap();
+        payload["recipient_identity"]["created"] =
+            json!(f64::from_bits(created.to_bits().wrapping_add(1)));
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE events SET payload=? WHERE seq=?",
+                rusqlite::params![payload.to_string(), seq],
+            )
+            .unwrap();
+        }
+
+        let m = match s.take_queued("w1").unwrap() {
+            Take::Message(m) => m,
+            _ => panic!("expected worker message"),
+        };
+        s.mark_running("m1", "turn-1").unwrap();
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "text": "done"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.messages("pm").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn finish_survives_removed_recipient_across_restart_and_dedupes_failure() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        let m = run_kickoff(&s, &kickoff);
+
+        s.set_state_detached("pm", "stopped", None).unwrap();
+        s.remove_agent("pm").unwrap();
+        let result = json!({"status": "completed", "text": "done", "sha": SHA40_A});
+        s.finish(&m, "completed", &result, None).unwrap();
+        // A repeated completion is an idempotent replay: it must not add a
+        // second unresolved route event or roll back the terminal write.
+        s.finish(&m, "completed", &result, None).unwrap();
+
+        assert_eq!(s.message(&kickoff).unwrap().unwrap().state, "completed");
+        assert_eq!(s.task("t1").unwrap().state, "review");
+        let unresolved: Vec<_> = s
+            .job_events("j1", 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "handoff_unresolved")
+            .collect();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].payload["reason"], "recipient_missing");
+        assert_eq!(unresolved[0].task_id.as_deref(), Some("t1"));
+
+        drop(s);
+        let s2 = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        reg(&s2, "pm", &cwd);
+        // Re-registering an alias never replays a sensitive old result.
+        assert!(s2.messages("pm").unwrap().is_empty());
+        let after_restart: Vec<_> = s2
+            .job_events("j1", 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "handoff_unresolved")
+            .collect();
+        assert_eq!(after_restart.len(), 1);
+    }
+
+    #[test]
+    fn finish_refuses_re_registered_alias_with_changed_identity() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        let m = run_kickoff(&s, &kickoff);
+
+        s.set_state_detached("pm", "stopped", None).unwrap();
+        s.remove_agent("pm").unwrap();
+        reg(&s, "pm", &cwd);
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "text": "done", "sha": SHA40_A}),
+            None,
+        )
+        .unwrap();
+
+        assert!(s.messages("pm").unwrap().is_empty());
+        let event = s
+            .job_events("j1", 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "handoff_unresolved")
+            .expect("alias reuse must leave an unresolved route record");
+        assert_eq!(event.payload["reason"], "recipient_identity_changed");
+        assert_ne!(
+            event.payload["expected_identity"]["created"],
+            event.payload["current_identity"]["created"]
+        );
+        assert_eq!(s.task("t1").unwrap().state, "review");
+    }
+
+    #[test]
+    fn queued_routed_result_refuses_endpoint_generation_change() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "pm", &cwd);
+        reg(&s, "w1", &cwd);
+        s.set_identity(
+            "pm",
+            &crate::adapter::Identity {
+                thread_id: "thread-1".into(),
+                session_id: "session-1".into(),
+                model: Some("model-1".into()),
+                pid: 1,
+                endpoint: Some("fake://one".into()),
+                generation: Some("generation-1".into()),
+                attach: None,
+            },
+        )
+        .unwrap();
+        s.enqueue("w1", "do it", Some("pm"), "m1", "user").unwrap();
+        let m = match s.take_queued("w1").unwrap() {
+            Take::Message(m) => m,
+            _ => panic!("expected worker message"),
+        };
+        s.mark_running("m1", "turn-1").unwrap();
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "text": "done"}),
+            None,
+        )
+        .unwrap();
+        let delivery = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"cadence-result:m1")
+            .simple()
+            .to_string();
+        assert_eq!(s.message(&delivery).unwrap().unwrap().state, "queued");
+
+        s.set_identity(
+            "pm",
+            &crate::adapter::Identity {
+                thread_id: "thread-2".into(),
+                session_id: "session-2".into(),
+                model: Some("model-1".into()),
+                pid: 2,
+                endpoint: Some("fake://two".into()),
+                generation: Some("generation-2".into()),
+                attach: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(s.take_queued("pm").unwrap(), Take::Empty));
+        let failed = s.message(&delivery).unwrap().unwrap();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.result.unwrap()["via"], "handoff_unresolved");
+        assert!(s.events("daemon", 0, 100).unwrap().iter().any(|event| {
+            event.kind == "handoff_unresolved"
+                && event.payload["reason"] == "recipient_identity_changed"
+        }));
+    }
+
+    #[test]
+    fn missing_job_event_recipient_is_durable_and_not_replayed() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let _kickoff = seeded_task(&s, &cwd);
+        s.set_state_detached("pm", "stopped", None).unwrap();
+        s.remove_agent("pm").unwrap();
+
+        s.job_notice("t1", "running", "stall:1", "worker is quiet")
+            .unwrap();
+        let event = s
+            .job_events("j1", 0, 100)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "handoff_unresolved")
+            .expect("missing PM notification must be durable");
+        assert_eq!(event.payload["source"], "job_event");
+        assert_eq!(event.payload["reason"], "recipient_missing");
+        assert_eq!(event.task_id.as_deref(), Some("t1"));
+
+        reg(&s, "pm", &cwd);
+        s.job_notice("t1", "running", "stall:1", "worker is quiet")
+            .unwrap();
+        assert!(s.messages("pm").unwrap().is_empty());
     }
 
     /// The conditional transition used by approval relaxation cannot
