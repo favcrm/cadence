@@ -7,7 +7,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use cadence_agent::adapter::ProviderEnv;
 use cadence_agent::client;
@@ -19817,13 +19817,22 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
     let mut d = TestDaemon::start();
     d.register("pm");
     let cwd = d.dir.path().to_str().unwrap().to_string();
+    let quota_at = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
     for (alias, params) in [
         ("w1", json!({"upstream": "pm"})),
         (
             "w2",
-            json!({"upstream": "pm", "quota": {"state": "available", "remaining": 4}}),
+            json!({"upstream": "pm", "quota": {"source": "provider", "agent": "w2",
+                   "observed_at": quota_at, "state": "available", "remaining": 4}}),
         ),
-        ("w3", json!({"upstream": "pm"})),
+        (
+            "w3",
+            json!({"upstream": "pm", "quota": {"source": "provider", "agent": "w3",
+                   "observed_at": quota_at - 301.0, "state": "available", "remaining": 4}}),
+        ),
     ] {
         d.rpc(
             "agent_register",

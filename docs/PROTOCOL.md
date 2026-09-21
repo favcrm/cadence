@@ -983,7 +983,9 @@ is true, the periodic observer applies this same guard to the monitor's
 fixed coverage set for draft/revising tasks. A refusal becomes one durable
 `dispatch_blocked` alert per task, updated on later monitor intervals rather
 than retried in a tight loop. The automatic path also refuses when quota
-telemetry is absent or exhausted. Neither path interrupts, resumes, accepts
+telemetry is absent, stale, unbound, or exhausted. The allowance check uses a
+fresh provider-tagged sample bound to the assignee; it is admission evidence,
+not a standing permission grant. Neither path interrupts, resumes, accepts
 approvals, or changes worker state, and the observer never selects work
 outside the explicit coverage set. Fairness, reviewer capacity, lease
 recovery, and the independent-review handoff remain outside this slice.

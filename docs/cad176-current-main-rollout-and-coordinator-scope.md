@@ -76,7 +76,9 @@ Guard failures are recorded as one deduplicated durable `dispatch_blocked`
 alert per task, with the latest reason and an operator action. The retry unit
 is one monitor interval; there is no tight retry loop or queued-message spam.
 Quota telemetry that is absent remains `unknown` and is surfaced in the block
-reason. Successful task completion continues through the existing result,
+reason. Automatic admission also requires a current provider-tagged allowance
+sample bound to the assignee; a static or unbound `available` value expires
+and cannot serve as a standing grant. Successful task completion continues through the existing result,
 independent-review, author-revision, and Ops routing path.
 
 Passive inboxes are a separate transport boundary. An actor queue can wake its

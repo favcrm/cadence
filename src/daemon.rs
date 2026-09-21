@@ -79,6 +79,9 @@ const WAL_TICK: Duration = Duration::from_secs(60);
 /// carry their own interval; this tick only bounds how soon a due check
 /// starts after its deadline.
 const MONITOR_TICK: Duration = Duration::from_secs(1);
+/// Provider allowance evidence is admission evidence, not a standing grant.
+/// Without a fresh provider-tagged sample the automatic path fails closed.
+const QUOTA_EVIDENCE_MAX_AGE_SECS: f64 = 300.0;
 /// The daemon's own event stream — `wal_checkpointed` lands here.
 /// Readable via `cadence events daemon`; not a sendable alias.
 const DAEMON_ALIAS: &str = Store::DAEMON_STREAM;
@@ -2551,6 +2554,19 @@ impl Shared {
         let Some(quota) = quota else {
             return Some("quota unknown: no account allowance telemetry".to_string());
         };
+        if quota.get("source").and_then(Value::as_str) != Some("provider") {
+            return Some("quota unknown: provider evidence source is not declared".to_string());
+        }
+        if quota.get("agent").and_then(Value::as_str) != Some(agent.alias.as_str()) {
+            return Some("quota unknown: allowance is not bound to this agent".to_string());
+        }
+        let Some(observed_at) = quota.get("observed_at").and_then(Value::as_f64) else {
+            return Some("quota unknown: provider evidence has no timestamp".to_string());
+        };
+        let age = epoch_secs() - observed_at;
+        if !age.is_finite() || age < -30.0 || age > QUOTA_EVIDENCE_MAX_AGE_SECS {
+            return Some("quota unknown: provider allowance evidence is stale".to_string());
+        }
         let Some(state) = quota.get("state").and_then(Value::as_str) else {
             return Some("quota unknown: allowance telemetry has no state".to_string());
         };
@@ -2562,6 +2578,9 @@ impl Shared {
         }
         if quota.get("unlimited").and_then(Value::as_bool) == Some(true) {
             return None;
+        }
+        if quota.get("used_percent").and_then(Value::as_f64) == Some(100.0) {
+            return Some("quota exhausted".to_string());
         }
         match quota.get("remaining").and_then(Value::as_i64) {
             Some(remaining) if remaining > 0 => None,
