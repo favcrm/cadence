@@ -18,6 +18,7 @@ pub mod notes;
 pub mod parse;
 pub mod project;
 pub mod relay;
+pub mod report;
 pub mod retro;
 pub mod start;
 pub mod sync;

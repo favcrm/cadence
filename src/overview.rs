@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::adapter::registry;
 use crate::client;
-use crate::issue::{self, board, project};
+use crate::issue::{self, board, project, report};
 use crate::proc::run_bounded;
 
 /// Git identity baked in by build.rs — `unknown` when git or a repo
@@ -124,6 +124,18 @@ pub fn cmd_agent_unfence(alias: &str) -> String {
 
 pub fn cmd_agent_show(alias: &str) -> String {
     format!("cadence agent show {alias}")
+}
+
+/// The menu-answer command for a pty pane probing `approval_menu` —
+/// `<choice>` is the option's printed index on the open menu.
+pub fn cmd_agent_answer(alias: &str) -> String {
+    format!("cadence agent answer {alias} <choice>")
+}
+
+/// The ready-gated continue for a silently ended turn: the pane
+/// provably probes idle, so `--ready` claims and pastes in one step.
+pub fn cmd_send_ready(alias: &str) -> String {
+    format!("cadence send {alias} --ready --text \"continue …\"")
 }
 
 pub fn cmd_inbox(alias: &str) -> String {
@@ -956,6 +968,30 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
                 &cmd_agent_show(alias),
             ));
         }
+        // A sampled approval menu ranks with brokered approvals — the
+        // pane is waiting on a human either way.
+        if let Some(line) = show["agent"]["pane_menu"].as_str() {
+            needs.push(item(
+                20,
+                "approval_menu",
+                &format!("agent {alias} approval menu: {line}"),
+                age,
+                "",
+                None,
+                &cmd_agent_answer(alias),
+            ));
+        }
+        if show["agent"]["silent_ended"].as_bool().unwrap_or(false) {
+            needs.push(item(
+                40,
+                "silent_end",
+                &format!("agent {alias} turn ended at an idle pane — never reported"),
+                show["agent"]["ended_secs"].as_f64().unwrap_or(age as f64) as i64,
+                "",
+                None,
+                &cmd_send_ready(alias),
+            ));
+        }
         if a["provider"].as_str() == Some(registry::INBOX) && queued > 0 {
             needs.push(item(
                 100,
@@ -1061,6 +1097,7 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
         for v in &views {
             status_of.insert(v.issue.front.id.clone(), v.status.clone());
         }
+        let mut intake: Vec<Item> = Vec::new();
         for v in &views {
             let id = v.issue.front.id.as_str();
             let project = v.issue.project.as_str();
@@ -1105,7 +1142,52 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
                     &cmd_issue_set_ready(id),
                 ));
             }
+            // `cadence report` intake: a backlog-tagged row surfaces
+            // until triage moves it off backlog — the effective status
+            // (notes-derived counts too) is what clears it.
+            if v.status == "backlog" && v.issue.front.tags.iter().any(|t| t == "intake") {
+                let kind_tag = v
+                    .issue
+                    .front
+                    .kind
+                    .as_deref()
+                    .or_else(|| {
+                        v.issue
+                            .front
+                            .tags
+                            .iter()
+                            .find(|t| *t != "intake")
+                            .map(String::as_str)
+                    })
+                    .unwrap_or("intake");
+                intake.push(item(
+                    85,
+                    "intake",
+                    &format!("{id} {kind_tag} report — {}", v.issue.front.title),
+                    age,
+                    project,
+                    None,
+                    &format!("cadence report show {id}"),
+                ));
+            }
         }
+        // Cap the intake block — hundreds of untriaged reports must not
+        // bury real work. Oldest first, then one summary row.
+        intake.sort_by_key(|i| std::cmp::Reverse(i.age));
+        if intake.len() > report::NEEDS_ME_CAP {
+            let extra = intake.len() - report::NEEDS_ME_CAP;
+            intake.truncate(report::NEEDS_ME_CAP);
+            intake.push(item(
+                85,
+                "intake",
+                &format!("… {extra} more intake reports"),
+                0,
+                "",
+                None,
+                "cadence report ls",
+            ));
+        }
+        needs.extend(intake);
         for p in project::list(&pm.dir).unwrap_or_default() {
             let mut open_by_status = serde_json::Map::new();
             let mut oldest_review: Option<i64> = None;

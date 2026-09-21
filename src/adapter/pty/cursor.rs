@@ -44,6 +44,11 @@ const MINT_DEADLINE: Duration = Duration::from_secs(20);
 /// text. (Busy is anchored tighter still: the input line's interrupt
 /// hint or the status row directly above it — see `analyze_cursor`.)
 const STATUS_LINES: usize = 16;
+/// The wider window a menu may occupy: the permission select (~8
+/// rows) plus the input box, status chips and model/cwd bar that can
+/// stay visible below it — its own chrome can sit above the busy
+/// anchor. Menu evidence only matches inside it.
+const MENU_LINES: usize = 24;
 
 /// Cursor TUI screen signatures — THE one place they live. A provider
 /// TUI update means editing this table, never the gate logic. Every
@@ -224,31 +229,232 @@ fn spinner_row(row: &str) -> bool {
 /// neutral. The region is anchored at the last NON-BLANK row —
 /// `capture-pane` pads to pane height, so a young session on a tall
 /// pane has blank rows below the real content.
+/// A menu option row: the `→`-led selected row (never a placeholder —
+/// the input box's `→` watermarks are not options, and a bare `→` is
+/// transcript text) or a row carrying a `(hint)` hotkey suffix like
+/// `Add Shell(whoami) to allowlist? (tab)`.
+fn opt_row(l: &str) -> bool {
+    let t = l.trim_start();
+    if let Some(rest) = t.strip_prefix('→') {
+        let rest = rest.trim();
+        !rest.is_empty() && !cursor_screen::PLACEHOLDERS.contains(&rest)
+    } else {
+        // A bare option row must carry a real menu key in its trailing
+        // `(hint)` — transcript text like `foo(bar)` would otherwise
+        // satisfy the shape and fake an option block under a `→` row.
+        hotkey(l).is_some()
+    }
+}
+
+/// A footer/legend row matching hint `h` — anchored on the trimmed
+/// row's leading glyph, a legend word, or an option row carrying the
+/// hint text, so a transcript quoting the same words mid-line does
+/// not count.
+fn hint_row(l: &str, h: &str) -> bool {
+    if !l.contains(h) {
+        return false;
+    }
+    let t = l.trim_start();
+    t.starts_with(h)
+        || t.starts_with('↑')
+        || t.starts_with('↓')
+        || t.starts_with('↵')
+        || t.starts_with("Esc")
+        || opt_row(l)
+}
+
+/// An option row that is not the highlighted one: never `→`-led (a
+/// menu highlights exactly one row — a second `→` line is a transcript
+/// echo, not a sibling) and always carrying its `(key)` hint, so a
+/// bare transcript row cannot qualify.
+fn keyed_row(l: &str) -> bool {
+    !l.trim_start().starts_with('→') && hotkey(l).is_some()
+}
+
+/// Any menu-chrome row — a keyed sibling option or an anchored hint.
+/// A `→`-led row is deliberately not chrome: transcript echoes lead
+/// with `→` too, and only real structure may support a menu.
+fn chrome_row(l: &str) -> bool {
+    keyed_row(l) || cursor_screen::HINT.iter().any(|h| hint_row(l, h))
+}
+
+/// The input row's index under the prompt rule — a `→`-led row that is
+/// never the frame's last row (the model/cwd bar renders below it) and
+/// always inside the status region. The row directly below is never
+/// menu chrome: the input sits on the model/cwd bar, while a menu's
+/// highlighted option sits on keyed sibling rows. Menu parsing must
+/// never treat the input as an option row: a keyed row beside it
+/// cannot make it a highlight.
+fn prompt_row(lines: &[&str]) -> Option<usize> {
+    // Search `→` rows bottom-up, not just the last one — when the
+    // lowest `→` is a menu highlight (chrome below it) the input row
+    // is still the next `→` up that carries the input frame. A `→`
+    // row that fails the frame test is a menu row or a transcript
+    // echo, never the input.
+    lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, l)| {
+            l.trim_start().starts_with(cursor_screen::PROMPT)
+                && *i + 1 < lines.len()
+                && lines.len() - i <= STATUS_LINES
+                && !chrome_row(lines[i + 1])
+        })
+        .map(|(i, _)| i)
+}
+
+/// The open option block as `(selected row, block start, block end)`.
+/// The selected row is the last `→`-led row with menu chrome directly
+/// below it — or the frame's last row with a keyed option directly
+/// above it (a highlighted final option has nothing below it) — while
+/// the input box's `→` is followed by the model/cwd bar and is never
+/// eligible (`prompt` names its row). The block then extends over
+/// contiguous keyed rows up AND down: options printed above the
+/// highlighted row are part of the menu, so a choice counts the whole
+/// list in printed order, never just the suffix from `→`.
+fn menu_block(lines: &[&str], prompt: Option<usize>) -> Option<(usize, usize, usize)> {
+    let sel = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, l)| {
+            Some(*i) != prompt
+                && opt_row(l)
+                && l.trim_start().starts_with('→')
+                && (lines[i + 1..]
+                    .iter()
+                    .find(|n| !n.trim().is_empty())
+                    .is_some_and(|n| chrome_row(n))
+                    // The keyed-above path (a highlight on the frame's
+                    // last row) needs the `→` row's own `(key)` — an
+                    // unidentified input row has a keyed transcript row
+                    // above it too, but a draft never carries a hotkey.
+                    || (*i > 0 && keyed_row(lines[i - 1]) && hotkey(l).is_some()))
+        })
+        .map(|(i, _)| i)?;
+    let mut start = sel;
+    while start > 0 && keyed_row(lines[start - 1]) {
+        start -= 1;
+    }
+    let mut end = sel;
+    while end + 1 < lines.len() && keyed_row(lines[end + 1]) {
+        end += 1;
+    }
+    // A live menu renders in place of the input row — a menu-looking
+    // block sitting ABOVE a still-live `→` input line is a transcript
+    // quoting the pane verbatim, and `answer` would key the choice
+    // into the draft. The frame position is the corroboration the
+    // text alone cannot supply.
+    if prompt.is_some_and(|p| end < p) {
+        return None;
+    }
+    Some((sel, start, end))
+}
+
+/// The option's `(hint)` hotkey as a tmux key name, from a fixed
+/// allowlist — the named keys Cursor prints plus the observed single
+/// characters `y`/`n`, and only when the `(key)` ends the row AND is
+/// whitespace-separated from the label: `take(n)` is a function call,
+/// `Ok(v)`/`f(1)`/`(C-c)` are transcript text wearing the shape — not
+/// a menu key: the answer falls back to arrows + Enter instead.
+fn hotkey(row: &str) -> Option<String> {
+    let inner = row.trim_end().strip_suffix(')')?;
+    let (label, hint) = inner.rsplit_once('(')?;
+    if !label.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let hint = hint.trim();
+    // `(esc or n)` lists alternatives — take the last.
+    let hint = hint.rsplit(" or ").next().unwrap_or(hint);
+    match hint {
+        "tab" => Some("Tab".to_string()),
+        "shift+tab" => Some("BTab".to_string()),
+        "enter" => Some("Enter".to_string()),
+        "esc" => Some("Escape".to_string()),
+        "space" => Some("Space".to_string()),
+        "y" | "n" => Some(hint.to_string()),
+        _ => None,
+    }
+}
+
+/// The line naming what the menu asks: the furthest row of the menu
+/// block above the option list — ` $ whoami in .` names the command
+/// being approved.
+fn menu_subject(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.trim_end().lines().collect();
+    let menu_top = lines.len().saturating_sub(MENU_LINES);
+    let (_, start, _) = menu_block(&lines[menu_top..], prompt_row(&lines[menu_top..]))?;
+    let start = start + menu_top;
+    // Walk up over non-blank rows and single blank gaps; a double
+    // blank or a border row ends the menu's block.
+    let mut subject: Option<String> = None;
+    let mut blanks = 0;
+    for l in lines[..start].iter().rev() {
+        let t = l.trim();
+        if t.is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                break;
+            }
+            continue;
+        }
+        if t.chars().filter(|c| matches!(c, '─' | '═')).count() >= 8 {
+            break;
+        }
+        subject = Some(t.split_whitespace().collect::<Vec<_>>().join(" "));
+        blanks = 0;
+    }
+    subject.map(|s| s.chars().take(100).collect())
+}
+
 pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
     let content = screen.trim_end();
-    let tail: String = content
+    // Menu evidence lives in the wider menu window — the permission
+    // select plus still-visible status chrome can push its rows above
+    // the busy anchor. Natural-language anchors are ordinary sentence
+    // text, so even matched on the trimmed row's leading text they
+    // decide only beside real menu structure: a parsed option row or
+    // the anchored legend — an indented transcript line quoting
+    // `Run this command?` stays inert. `Waiting for approval` sits
+    // mid-row on the `$ cmd …` status line, same rule. A hint cluster
+    // without an anchor still needs the `→` option block.
+    let menu_lines: Vec<&str> = content
         .lines()
         .rev()
-        .take(STATUS_LINES)
+        .take(MENU_LINES)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let approval_menu = cursor_screen::ANCHOR.iter().any(|m| tail.contains(m))
-        || cursor_screen::HINT
+        .collect();
+    let anchor = menu_lines.iter().any(|l| {
+        let t = l.trim_start();
+        cursor_screen::ANCHOR
             .iter()
-            .filter(|m| tail.contains(*m))
-            .count()
-            >= 2;
+            .filter(|a| **a != "Waiting for approval")
+            .any(|a| t.starts_with(a))
+    });
+    let waiting = menu_lines
+        .iter()
+        .any(|l| l.trim_start().starts_with('$') && l.contains("Waiting for approval"));
+    let hints = cursor_screen::HINT
+        .iter()
+        .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
+        .count();
+    // The input row is never menu evidence — a keyed sibling beside it
+    // cannot make it the highlighted option.
+    let block = menu_block(&menu_lines, prompt_row(&menu_lines));
+    // Structure beside an anchor means a qualified option block or two
+    // distinct hint rows — one hint alone is transcript-speakable, and
+    // a lone `→` row is the input box or a transcript echo, never menu
+    // evidence by itself.
+    let structure = block.is_some() || hints >= 2;
+    let approval_menu = ((anchor || waiting) && structure) || (block.is_some() && hints >= 2);
     let lines: Vec<&str> = content.lines().collect();
     // Prompt search is anchored to the bottom `STATUS_LINES` rows —
     // the input row lives there on every real frame — and can never
     // be the last row: the model/cwd bar always renders below it.
-    let prompt_idx = lines
-        .iter()
-        .rposition(|l| l.trim_start().starts_with(cursor_screen::PROMPT))
-        .filter(|i| *i + 1 < lines.len() && lines.len() - i <= STATUS_LINES);
+    let prompt_idx = prompt_row(&lines);
     let prompt_visible = prompt_idx.is_some();
     let input_line = prompt_idx.map(|i| lines[i]).unwrap_or("");
     // The interrupt hint shares the input row while a turn runs —
@@ -281,21 +487,30 @@ pub fn analyze_cursor(screen: &str, _cursor: Option<(u32, u32)>) -> Probe {
     let input_nonempty =
         !draft.is_empty() && !cursor_screen::PLACEHOLDERS.contains(&draft.as_str());
     let (idle, reason) = if approval_menu {
-        (false, "approval menu is open")
+        (
+            false,
+            menu_subject(content).unwrap_or_else(|| "approval menu is open".to_string()),
+        )
     } else if interrupt_hint {
-        (false, "tui is busy (interrupt hint on the input line)")
+        (
+            false,
+            "tui is busy (interrupt hint on the input line)".to_string(),
+        )
     } else if status_busy {
-        (false, "tui is busy (status row above the input line)")
+        (
+            false,
+            "tui is busy (status row above the input line)".to_string(),
+        )
     } else if !prompt_visible {
-        (false, "no prompt line visible")
+        (false, "no prompt line visible".to_string())
     } else if input_nonempty {
-        (false, "unsubmitted text in the input line")
+        (false, "unsubmitted text in the input line".to_string())
     } else {
-        (true, "idle")
+        (true, "idle".to_string())
     };
     Probe {
         idle,
-        reason: reason.to_string(),
+        reason,
         input_nonempty,
         prompt_visible,
         busy_marker,
@@ -722,6 +937,85 @@ impl TuiProfile for CursorProfile {
          permission prompts in the terminal itself"
     }
 
+    /// The permission select's options carry their own hotkeys —
+    /// `(y)`, `(tab)`, `(shift+tab)`, `(esc or n)`. A choice is the
+    /// option's 1-based index; its trailing key hint is sent
+    /// verbatim, or arrows + Enter when no hint prints.
+    fn approval_answer(&self, screen: &str, choice: &str) -> Result<Vec<String>> {
+        let n: u32 = choice.parse().map_err(|_| {
+            Error::rejected(format!(
+                "'{choice}' is not a menu index — Cursor menus take the \
+                 option's position in printed order"
+            ))
+        })?;
+        if n == 0 {
+            return Err(Error::rejected("menu indices start at 1"));
+        }
+        let lines: Vec<&str> = screen.trim_end().lines().collect();
+        let menu_top = lines.len().saturating_sub(MENU_LINES);
+        // The option block is the whole contiguous list in printed
+        // order — the `→` row may sit below earlier options, so a
+        // choice indexes the block, never the suffix from `→`. When
+        // the block cannot be found the answer refuses rather than
+        // walking blind.
+        let (sel, start, end) = menu_block(&lines[menu_top..], prompt_row(&lines[menu_top..]))
+            .ok_or_else(|| {
+                Error::rejected(
+                    "cannot locate the option rows on this menu — answer \
+                     it in the pane",
+                )
+            })?;
+        let options = &lines[menu_top + start..=menu_top + end];
+        // A `↓ more below`/`↑ more above` marker beside the block
+        // means the visible list is a window onto a longer one —
+        // `answer 1` would hit the first *visible* option, not the
+        // first printed one. Refuse rather than pick the wrong row.
+        let scroll_marker = |l: &str| {
+            let t = l.trim_start();
+            t.contains("more below") || t.contains("more above")
+        };
+        let truncated = (start > 0 && scroll_marker(lines[menu_top + start - 1]))
+            || lines
+                .get(menu_top + end + 1)
+                .is_some_and(|l| scroll_marker(l));
+        if truncated {
+            return Err(Error::rejected(
+                "the option list is scrolled — the visible rows are not \
+                 the whole menu; answer it in the pane",
+            ));
+        }
+        // A lone `→` row is not a one-option menu — a stray marker
+        // row with chrome beneath it can parse as a block; a real
+        // menu always lists at least one sibling option.
+        if options.len() < 2 {
+            return Err(Error::rejected(
+                "cannot locate the option rows on this menu — answer \
+                 it in the pane",
+            ));
+        }
+        if n as usize > options.len() {
+            return Err(Error::rejected(format!(
+                "no option {n} on this menu — it lists {}",
+                options.len()
+            )));
+        }
+        if let Some(key) = hotkey(options[(n - 1) as usize]) {
+            return Ok(vec![key]);
+        }
+        // No hotkey on the chosen row — navigate from the highlighted
+        // option, which is not necessarily the first.
+        let want = (n - 1) as usize;
+        let cur = sel - start;
+        let (dir, steps) = if want >= cur {
+            ("Down", want - cur)
+        } else {
+            ("Up", cur - want)
+        };
+        let mut keys = vec![dir.to_string(); steps];
+        keys.push("Enter".to_string());
+        Ok(keys)
+    }
+
     fn forbidden_prefixes(&self) -> &'static [char] {
         FORBIDDEN_PREFIXES
     }
@@ -788,7 +1082,9 @@ mod tests {
         // must outrank prompt parsing or it reads as a draft.
         let p = analyze_cursor(&fixture("approval.txt"), None);
         assert!(!p.idle && p.approval_menu);
-        assert_eq!(p.reason, "approval menu is open");
+        // The reason names what the menu asks — the menu block's
+        // furthest row above the option list.
+        assert_eq!(p.reason, "$ whoami in .");
     }
 
     #[test]
@@ -884,7 +1180,9 @@ mod tests {
             None,
         );
         assert!(!p.idle && p.approval_menu);
-        assert_eq!(p.reason, "approval menu is open");
+        // The typed `/skills` line sits directly above the option
+        // block — it's the menu's subject.
+        assert_eq!(p.reason, "/skills");
     }
 
     #[test]
@@ -906,13 +1204,290 @@ mod tests {
 
     #[test]
     fn approval_anchor_wins_over_transcript() {
-        // `Not in allowlist` inside the status region is a real
-        // pending approval — anchor evidence decides on its own.
+        // `Not in allowlist` beside a real option row is a pending
+        // approval — anchor plus menu structure decides.
         let p = analyze_cursor(
-            "$ cadence self\n  → Add a follow-up\nNot in allowlist: cadence\n  Grok 4.6\n",
+            "$ cadence self\nNot in allowlist: cadence\n  → Run (once) (y)\n    Skip & tell the agent what to do instead (esc or n)\n",
             None,
         );
         assert!(!p.idle && p.approval_menu);
+    }
+
+    /// A profile for `approval_answer` tests — the method only reads
+    /// the screen, so the launch fields are dummies.
+    fn screen_profile() -> CursorProfile {
+        CursorProfile {
+            chats_dir: PathBuf::from("/tmp"),
+            command: "cursor-agent".to_string(),
+            model: None,
+            permission_mode: None,
+        }
+    }
+
+    /// The permission select's option block (from `approval.txt`) —
+    /// every option carries its hotkey.
+    fn permission_menu() -> &'static str {
+        " $  whoami in .\n Run this command?\n Not in allowlist: whoami\n  → Run (once) (y)\n    Add Shell(whoami) to allowlist? (tab)\n    Run Everything (shift+tab)\n    Skip & tell the agent what to do instead (esc or n)\n"
+    }
+
+    #[test]
+    fn answer_sends_the_chosen_options_hotkey() {
+        let prof = screen_profile();
+        assert_eq!(
+            prof.approval_answer(permission_menu(), "1").unwrap(),
+            vec!["y"]
+        );
+        assert_eq!(
+            prof.approval_answer(permission_menu(), "3").unwrap(),
+            vec!["BTab"]
+        );
+        // `(esc or n)` takes the last alternative.
+        assert_eq!(
+            prof.approval_answer(permission_menu(), "4").unwrap(),
+            vec!["n"]
+        );
+    }
+
+    #[test]
+    fn answer_counts_options_above_the_highlight() {
+        // The `→` highlight sits on the SECOND printed option — option
+        // 1 is the row above it, so its hotkey (`y`), never the
+        // highlighted row's (`tab`).
+        let screen = " Run this command?\n Not in allowlist: whoami\n    Run (once) (y)\n  → Add Shell(whoami) to allowlist? (tab)\n    Run Everything (shift+tab)\n";
+        let prof = screen_profile();
+        assert_eq!(prof.approval_answer(screen, "1").unwrap(), vec!["y"]);
+        assert_eq!(prof.approval_answer(screen, "2").unwrap(), vec!["Tab"]);
+        assert_eq!(prof.approval_answer(screen, "3").unwrap(), vec!["BTab"]);
+    }
+
+    #[test]
+    fn answer_index_is_bounded_by_the_visible_block() {
+        let prof = screen_profile();
+        for choice in ["5", "4000000000", "0"] {
+            assert!(
+                prof.approval_answer(permission_menu(), choice).is_err(),
+                "{choice} must refuse"
+            );
+        }
+        // Chrome with no `→` option block refuses outright — never a
+        // blind arrow walk.
+        let anchor_only = " Run this command?\n Not in allowlist: whoami\n";
+        assert!(prof.approval_answer(anchor_only, "1").is_err());
+        assert!(prof.approval_answer(anchor_only, "4000000000").is_err());
+    }
+
+    #[test]
+    fn hotkey_hint_outside_the_allowlist_falls_back() {
+        // `(C-c)` is not a menu key — the allowlist sends arrows
+        // instead of passing the token to tmux.
+        let screen = " Run this command?\n  → Run (once) (C-c)\n    Cancel (esc or n)\n";
+        let prof = screen_profile();
+        assert_eq!(prof.approval_answer(screen, "1").unwrap(), vec!["Enter"]);
+        assert_eq!(prof.approval_answer(screen, "2").unwrap(), vec!["n"]);
+    }
+
+    #[test]
+    fn quoted_anchor_text_is_not_a_menu() {
+        // The anchor strings quoted mid-line in a transcript stay
+        // text — detection matches on the trimmed row's leading text
+        // (or requires the option block for `Waiting for approval`).
+        let busy = fixture("busy.txt");
+        for quoted in [
+            "earlier the agent asked \"Run this command?\" — transcript",
+            "the log shows \"Not in allowlist\" in passing",
+            "it printed \"$ x Waiting for approval...\" mid-line once",
+        ] {
+            let p = analyze_cursor(&format!("{busy}\n{quoted}"), None);
+            assert!(!p.approval_menu, "{quoted}: {:?}", p);
+        }
+    }
+
+    #[test]
+    fn quoted_hint_text_is_not_a_menu() {
+        // Footer fragments mid-line are not menu rows — a menu needs
+        // the anchored legend or the `→` option block beside them.
+        let busy = fixture("busy.txt");
+        for quoted in [
+            "docs say \"Esc to close\" dismisses pickers",
+            "scroll down for more below the fold",
+        ] {
+            let p = analyze_cursor(&format!("{busy}\n{quoted}"), None);
+            assert!(!p.approval_menu, "{quoted}: {:?}", p);
+        }
+    }
+
+    #[test]
+    fn indented_anchor_without_structure_is_not_a_menu() {
+        // A transcript row that LEADS with the anchor once indented
+        // is the round-3 false positive: `trim_start` makes it look
+        // row-anchored, and the anchor alone used to flip the pane
+        // to `approval_menu` and livelock every send. With no option
+        // block and no legend beside it, the row is inert text.
+        let busy = fixture("busy.txt");
+        for line in [
+            "    Run this command?",
+            "      Not in allowlist: rg",
+            "  → waiting earlier: Run this command?", // mid-row anchor
+        ] {
+            let p = analyze_cursor(&format!("{busy}\n{line}"), None);
+            assert!(!p.approval_menu, "{line}: {:?}", p);
+        }
+    }
+
+    #[test]
+    fn parenthesized_transcript_line_is_not_an_option() {
+        // `foo(bar)` is not a hotkey — a `→` transcript row plus that
+        // line used to parse as a two-option block, letting `answer`
+        // send Enter into a real input box. `opt_row` now requires
+        // an allowlisted hotkey on non-selected rows, so no block
+        // forms and neither detect nor answer engages.
+        let screen = "echo ran ok\n  → ls -la\n foo(bar)\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        let prof = screen_profile();
+        assert!(prof.approval_answer(screen, "1").is_err());
+        // And the input-box case outright: `→` input prompt over a
+        // parenthesized transcript row.
+        let prompt = " foo(bar)\n  → \n  Grok 4.6\n";
+        assert!(!analyze_cursor(prompt, None).approval_menu);
+        assert!(prof.approval_answer(prompt, "1").is_err());
+    }
+
+    #[test]
+    fn last_row_highlight_still_detects_and_answers() {
+        // A highlighted option can be the frame's last row — nothing
+        // renders below it. The block must still qualify via the
+        // option row above it.
+        let screen = " Run this command?\n Not in allowlist: whoami\n    Run (once) (y)\n  → Skip & tell the agent what to do instead (esc or n)\n";
+        let p = analyze_cursor(screen, None);
+        assert!(p.approval_menu, "{p:?}");
+        let prof = screen_profile();
+        assert_eq!(prof.approval_answer(screen, "1").unwrap(), vec!["y"]);
+        assert_eq!(prof.approval_answer(screen, "2").unwrap(), vec!["n"]);
+    }
+
+    #[test]
+    fn scrolled_option_block_refuses_to_answer() {
+        // `↓ more below` under the block means option 1 is off-screen
+        // — answering `1` would hit the first *visible* row instead.
+        let screen = " Run this command?\n    Run (once) (y)\n    Add Shell(whoami) to allowlist? (tab)\n  → Skip & tell the agent what to do instead (esc or n)\n   ↓ more below\n";
+        let prof = screen_profile();
+        let err = prof.approval_answer(screen, "1").unwrap_err().to_string();
+        assert!(err.contains("scrolled"), "{err}");
+        // Detection still sees the menu — the refusal is only about
+        // which row a number picks.
+        assert!(analyze_cursor(screen, None).approval_menu);
+        // A marker ABOVE the block is the same truncation.
+        let screen = " Run this command?\n   ↑ more above\n  → Add Shell(whoami) to allowlist? (tab)\n    Skip & tell the agent what to do instead (esc or n)\n";
+        assert!(prof.approval_answer(screen, "1").is_err());
+    }
+
+    #[test]
+    fn transcript_echoes_without_keys_are_not_a_menu() {
+        // Two adjacent `→` transcript echoes carry no `(key)` hint —
+        // every real option row advertises one, so a block of echoes
+        // must not qualify even with an anchor on screen.
+        let screen =
+            " Run this command?\n  → earlier submitted prompt\n  → another submitted prompt\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        let prof = screen_profile();
+        assert!(prof.approval_answer(screen, "1").is_err());
+    }
+
+    #[test]
+    fn rust_style_parens_are_not_option_keys() {
+        // Round-4 review: `hotkey` used to accept ANY single ascii
+        // alphanumeric inside a trailing paren — `Ok(v)`, `Some(x)`,
+        // `f(1)`, `Err(e)` all parsed as keyed option rows, so Rust
+        // output under an anchor could fake a menu block. The key must
+        // end the row AND come from the named/observed allowlist.
+        let prof = screen_profile();
+        for row in [" foo(b)", " Ok(v)", " Some(x)", " f(1)", " Err(e)"] {
+            let screen = format!(" Run this command?\n{row}\n  → ls -la\n");
+            assert!(!analyze_cursor(&screen, None).approval_menu, "{row}");
+            assert!(prof.approval_answer(&screen, "1").is_err(), "{row}");
+        }
+        // The real keys still resolve: `(y)`, `(tab)`, `(esc or n)`.
+        assert_eq!(
+            prof.approval_answer(permission_menu(), "1").unwrap(),
+            vec!["y"]
+        );
+    }
+
+    #[test]
+    fn input_row_is_never_a_menu_highlight() {
+        // A keyed transcript row directly above the live input line
+        // used to make the input itself the block's selected option —
+        // `answer` then sent Enter into a staged draft. The prompt row
+        // is excluded from menu parsing outright.
+        let screen = " Run this command?\n    Add Shell(whoami) to allowlist? (tab)\n  → my staged draft\n  Grok 4.6 · ~/repo\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        // The draft still reads as a draft — menu refusal must not
+        // blind the draft signal.
+        assert!(
+            p.input_nonempty && p.reason == "unsubmitted text in the input line",
+            "{p:?}"
+        );
+        let prof = screen_profile();
+        assert!(prof.approval_answer(screen, "1").is_err());
+    }
+
+    #[test]
+    fn function_call_parens_are_not_key_hints() {
+        // Round-5 review: the allowlist alone left `let v = take(n)`
+        // keyed — `(n)` at end-of-row satisfied it. The hint paren
+        // must be a separate trailing token, whitespace-separated from
+        // the label — function-call parens never qualify.
+        for row in [
+            "    let v = take(n)",
+            "    return f(y)",
+            "    exit(status)",
+            "    Option::Some(esc)",
+        ] {
+            let screen = format!(" Run this command?\n{row}\n{row}\n  → Run (once) (y)\n");
+            assert!(
+                !analyze_cursor(&screen, None).approval_menu,
+                "{row} must not be a keyed row"
+            );
+        }
+        // Real whitespace-separated hints still parse.
+        for row in [
+            "    Run (once) (y)",
+            "    Skip (esc or n)",
+            "    Add to allowlist? (tab)",
+        ] {
+            let screen = format!(" Run this command?\n  → Run (once) (y)\n{row}\n");
+            let p = analyze_cursor(&screen, None);
+            assert!(p.approval_menu, "{row}");
+        }
+    }
+
+    #[test]
+    fn unidentified_input_row_cannot_become_sel() {
+        // Round-5 should-fix: when the input `→` row fails its frame
+        // test — the model bar is cut off the capture — `prompt_row`
+        // is None and the row used to become the block's selected
+        // option, letting `answer` send a bare Enter into a staged
+        // draft. The keyed-above path now needs the `→` row's own
+        // `(key)`, which a draft never carries.
+        let screen =
+            " Run this command?\n    Add Shell(whoami) to allowlist? (tab)\n  → deploy to prod\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        let prof = screen_profile();
+        assert!(prof.approval_answer(screen, "1").is_err());
+        // The same draft mid-frame (model bar visible) stays a draft.
+        let screen = " Run this command?\n    Add Shell(whoami) to allowlist? (tab)\n  → deploy to prod\n  Grok 4.6 · ~/repo\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu && p.input_nonempty, "{p:?}");
+        // And a draft ENDING in a key-looking suffix is still a draft
+        // — the `(y)` is typed text, never the row's own hotkey.
+        let screen = " Run this command?\n    Add Shell(whoami) to allowlist? (tab)\n  → deploy to prod (y)\n  Grok 4.6 · ~/repo\n";
+        let p = analyze_cursor(screen, None);
+        assert!(!p.approval_menu && p.input_nonempty, "{p:?}");
+        assert!(prof.approval_answer(screen, "y").is_err());
     }
 
     fn profile(dir: &std::path::Path, params: serde_json::Value) -> CursorProfile {

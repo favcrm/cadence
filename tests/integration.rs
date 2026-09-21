@@ -25,12 +25,17 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start() -> Self {
+        Self::start_opts(daemon_opts())
+    }
+
+    /// `start` with explicit daemon options — slot tests shrink the
+    /// pools this way.
+    fn start_opts(opts: daemon::ServeOptions) -> Self {
         suite_slot();
         let dir = TempDir::new().unwrap();
         let state = dir.path().to_path_buf();
         std::fs::create_dir_all(&state).unwrap();
         let owned = state.clone();
-        let opts = daemon_opts();
         let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
         let daemon = Self {
             dir,
@@ -43,10 +48,15 @@ impl TestDaemon {
 
     /// Start a daemon over a pre-seeded state directory.
     fn start_on(state: PathBuf) -> Self {
+        Self::start_on_opts(state, daemon_opts())
+    }
+
+    /// `start_on` with explicit daemon options — slot tests shrink the
+    /// pools or inject the clock this way.
+    fn start_on_opts(state: PathBuf, opts: daemon::ServeOptions) -> Self {
         suite_slot();
         let dir = TempDir::new().unwrap(); // keeps lifetime uniform
         let owned = state.clone();
-        let opts = daemon_opts();
         let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
         let daemon = Self {
             dir,
@@ -2214,6 +2224,10 @@ fn daemon_opts() -> daemon::ServeOptions {
     daemon::ServeOptions {
         provider_env: test_env(),
         stall_sample_secs: TEST_STALL_SAMPLE.with(std::sync::Arc::clone),
+        // Explicit defaults keep test daemons hermetic — a real pm.yaml
+        // [host] table on the dev host must never leak into a test.
+        slots: Some(cadence_agent::slots::SlotConfig::default()),
+        slot_clock: None,
     }
 }
 
@@ -3625,6 +3639,11 @@ hold_fmt = os.environ.get("MOCK_TMUX_HOLD_FMT", "")
 if hold and cmd == os.environ.get("MOCK_TMUX_HOLD_CMD", "display-message") \
         and (not hold_fmt or hold_fmt in rest):
     time.sleep(hold)
+# MOCK_TMUX_FAIL=<cmd> makes that subcommand die — deterministic
+# failure injection, e.g. a transient capture-pane outage while a
+# gate probe runs.
+if cmd and cmd == os.environ.get("MOCK_TMUX_FAIL", ""):
+    die("mock injected failure")
 if cmd == "new-session":
     name = rest[rest.index("-s") + 1]
     cwd = rest[rest.index("-c") + 1] if "-c" in rest else os.getcwd()
@@ -3702,6 +3721,11 @@ if cmd == "capture-pane":
     # make the pane look busy, approval-blocked, etc.
     try: out += open(sess_path(name, "tui-state")).read()
     except FileNotFoundError: pass
+    # Real tmux only prints the pane with `-p` — without it the capture
+    # lands in the paste buffer and stdout stays empty. Emulate that so
+    # a dropped `-p` fails loudly here the way it does on a real pane.
+    if "-p" not in rest:
+        sys.exit(0)
     sys.stdout.write(out); sys.exit(0)
 if cmd == "load-buffer":
     open(os.path.join(state, "buffer"), "w").write(open(rest[-1]).read())
@@ -3716,9 +3740,11 @@ if cmd == "paste-buffer":
     sys.exit(0)
 if cmd == "send-keys":
     name = rest[rest.index("-t") + 1]
-    key = rest[-1]
-    aappend(sess_path(name, "input"),
-            "<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
+    for key in rest[rest.index("-t") + 2:]:
+        if key == "--":  # ends tmux option parsing — not a key
+            continue
+        aappend(sess_path(name, "input"),
+                "<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
     sys.exit(0)
 if cmd == "set-option":
     # Record option writes so tests can assert pane defaults.
@@ -6420,6 +6446,65 @@ fn send_verb_matches_message_send() {
     assert_eq!(v["message"], "m-verb", "{v}");
     // Fake endpoints complete turns in-line — the message lands.
     d.wait_message("w1", "m-verb", &["completed"], 15);
+}
+
+/// The uncapped send path must read complete file and stdin bodies before
+/// enqueueing them. Exercise both CLI input forms against a real temporary
+/// daemon so a successful exit also proves the full body was persisted.
+#[test]
+fn send_file_and_stdin_persist_full_bodies() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+
+    let file_body = "file body\nwith a second line\n";
+    let file = d.dir.path().join("send-body.txt");
+    std::fs::write(&file, file_body).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "send",
+            "w1",
+            "--file",
+            file.to_str().unwrap(),
+            "--message",
+            "m-file-body",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let message = d.wait_message("w1", "m-file-body", &["completed"], 15);
+    assert_eq!(message["body"], file_body);
+
+    let stdin_body = "stdin body\nwith a second line\n";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["send", "w1", "--message", "m-stdin-body"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin_body.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let message = d.wait_message("w1", "m-stdin-body", &["completed"], 15);
+    assert_eq!(message["body"], stdin_body);
 }
 
 // ==== inbox endpoint kind ====
@@ -13598,10 +13683,11 @@ fn stall_secs_zero_disables_and_live_set_rearms() {
     assert_eq!(e["payload"]["message"], "m-zero", "{e}");
 }
 
-/// The ticker only samples panes while a turn runs: captures stop when
-/// nothing is in flight.
+/// The ticker samples every live pty pane — idle included, so an
+/// approval menu raised with no message in flight still surfaces —
+/// and stops only when the agent does.
 #[test]
-fn pty_stall_sampling_stops_when_nothing_runs() {
+fn pty_stall_sampling_runs_while_the_pane_lives() {
     let d = TestDaemon::start();
     let mock = d.mock_stub();
     stall_sample(1);
@@ -13614,14 +13700,8 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
             .unwrap_or_default()
             .len()
     };
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "do work", "message": "ms6"}),
-    )
-    .unwrap();
-    d.wait_message("w1", "ms6", &["running"], 15);
-    // While the turn runs, captures grow — poll, don't assume a tick
-    // landed inside a fixed sleep.
+    // Nothing has ever been sent — an idle-but-live pane still
+    // samples: the approval-menu watch needs the frames.
     let baseline = captures();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut grew = false;
@@ -13632,7 +13712,7 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
         }
         thread::sleep(Duration::from_millis(200));
     }
-    assert!(grew, "no samples while a turn runs: {baseline}");
+    assert!(grew, "idle pane was never sampled: {baseline}");
 
     // Stopping the pane mid-sampling returns promptly — the ticker
     // never holds the adapter across a capture.
@@ -13652,9 +13732,690 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
     assert_eq!(
         captures(),
         idle_count,
-        "capture-pane ran while nothing was running"
+        "capture-pane ran after the agent stopped"
     );
     stall_sample(0);
+}
+
+// ---- CAD-102: approval menus are a probe state, not busy churn ----
+
+/// The real Devin permission menu — option rows and the selection
+/// footer ABOVE a still-visible busy input box (the CAD-102 incident
+/// layout): everything the analyzer must see sits ~11 rows above the
+/// frame end.
+const DEVIN_MENU: &str = "\
+❭ run the shell command: printenv FOO
+ ⏺ Running command
+ └ $ printenv FOO
+
+❭ 1 Yes  (Approve once)
+· 2 Yes, allow `printenv` commands
+· 3 Yes, always allow `printenv` commands in `tmp`
+· 4 Yes, always allow `printenv` commands in all projects
+· 5 Yes, switch to bypass mode
+· 6 Edit command
+· 7 Describe change to command
+· 8 No
+↑↓ select · ↵ confirm · esc cancel
+⠸ Thinking · 5s (esc twice to interrupt)
+❭ Guide Devin while it works
+";
+
+/// A numbered menu over the busy box is `approval_menu`, never busy:
+/// the gate refuses pastes under it (the claim survives untouched),
+/// `agent answer` sends the option's one keystroke and records
+/// `approval_answered`, and the sampled rise lands an `approval_menu`
+/// event with the menu line.
+#[test]
+fn pty_approval_menu_blocks_pastes_and_answers() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "do work", "message": "m1"}),
+    )
+    .unwrap();
+    let token1 = pty_token(&d, "dv", "m1");
+
+    // The menu appears mid-turn.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let rise = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(rise["payload"]["message"], "m1", "{rise}");
+    assert_eq!(rise["payload"]["line"], "$ printenv FOO", "{rise}");
+
+    // The probe reads the menu line, not busy churn.
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["approval_menu"], true, "{probe}");
+    assert_eq!(probe["reason"], "$ printenv FOO", "{probe}");
+    // The views carry the menu line while the turn runs.
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(show["pane_menu"], "$ printenv FOO", "{show}");
+
+    // A paste under the menu is refused: m2 queues behind a gate_wait
+    // naming the menu, and no claim is eaten by the refusal.
+    d.rpc("agent_ready", json!({"alias": "dv", "force": true}))
+        .unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "wait for idle", "message": "m2"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("dv", "gate_wait", 15);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("approval menu"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("dv", "m2"), "queued");
+
+    // `agent answer` validates the choice against the visible menu —
+    // 9 is not on it — then sends the one digit key.
+    assert!(d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "9"}))
+        .is_err());
+    let answered = d
+        .rpc(
+            "agent_answer",
+            json!({"alias": "dv", "choice": "8", "by": "test-op"}),
+        )
+        .unwrap();
+    assert_eq!(answered["state"], "answered", "{answered}");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap();
+    assert!(
+        input.ends_with("<KEY:8>"),
+        "the digit key, never a paste: {input}"
+    );
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["choice"], "8", "{ev}");
+    assert_eq!(ev["payload"]["line"], "$ printenv FOO", "{ev}");
+    // Identity is derived from the peer pid — the test process sits
+    // outside every pane, so `by` is `operator` when it holds a
+    // foreign terminal (a suite on a pty) and `unknown` when fully
+    // detached; the supplied name survives only as a claim.
+    let want = if (0..=2).any(|fd| {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
+    }) {
+        "operator"
+    } else {
+        "unknown"
+    };
+    assert_eq!(ev["payload"]["by"], want, "{ev}");
+    assert_eq!(ev["payload"]["claimed_by"], "test-op", "{ev}");
+    assert_eq!(ev["payload"]["probe"]["approval_menu"], true, "{ev}");
+
+    // With the menu cleared (operator closed it), the surviving claim
+    // delivers m2 — no second `agent ready` needed: the refusal ate
+    // nothing. And an answer on a non-menu pane refuses.
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    assert!(d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "8"}))
+        .is_err());
+    d.wait_message("dv", "m2", &["running"], 20);
+    let token2 = pty_token(&d, "dv", "m2");
+    for (id, token) in [("m1", &token1), ("m2", &token2)] {
+        d.rpc(
+            "message_report",
+            json!({"message": id, "token": token, "kind": "result",
+                   "text": "done"}),
+        )
+        .unwrap();
+        d.wait_message("dv", id, &["completed"], 10);
+    }
+    stall_sample(0);
+}
+
+/// A turn that ends at the idle prompt without reporting is detected
+/// by the sampled probe: `turn_silent_end` fires once per message
+/// carrying the age and the admitting probe, the views flag it
+/// (`silent_ended`, `ended_secs`, `ended?:` in status, an overview
+/// needs-me row), and a `--ready` send is the one-command recovery.
+/// The message itself is never auto-resolved.
+#[test]
+fn pty_silent_end_fires_once_and_recovers() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    stall_sample(1);
+    d.register_stub(
+        "w1",
+        json!({"auto_ready": "verified", "silent_end_secs": 4}),
+    );
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "do work", "message": "ms9"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "w1", "ms9");
+
+    // The stub pane returns to `» stub ready` after the submission —
+    // the message still runs but the probe reads idle.
+    let e = d.wait_event("w1", "turn_silent_end", 40);
+    assert_eq!(e["payload"]["message"], "ms9", "{e}");
+    assert!(e["payload"]["age_secs"].as_u64().unwrap_or(0) >= 4, "{e}");
+    assert_eq!(e["payload"]["probe"]["idle"], true, "{e}");
+    assert!(
+        e["payload"]["last_activity"].as_f64().unwrap_or(0.0) > 0.0,
+        "{e}"
+    );
+
+    // Once per message: the pane stays idle but no second event fires.
+    thread::sleep(Duration::from_secs(6));
+    assert_eq!(wait_event_count(&d, "w1", "turn_silent_end", 1, 2).len(), 1);
+
+    // The views flag it: show/list carry silent_ended + ended_secs,
+    // status renders `ended?:`, and the overview needs-me row names
+    // the ready-gated recovery command.
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(show["silent_ended"], true, "{show}");
+    assert!(show["ended_secs"].as_u64().unwrap_or(0) >= 4, "{show}");
+    let row = d.rpc("agent_list", json!({})).unwrap()["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"].as_str() == Some("w1"))
+        .cloned()
+        .unwrap();
+    assert_eq!(row["silent_ended"], true, "{row}");
+    let table = status_table(&d.state, &[]);
+    assert!(table.contains("ended?:"), "{table}");
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    let ended = needs
+        .iter()
+        .find(|n| n["kind"] == "silent_end")
+        .expect("silent_end row");
+    assert_eq!(
+        ended["command"],
+        "cadence send w1 --ready --text \"continue …\""
+    );
+    assert!(ended["title"].as_str().unwrap().contains("w1"));
+
+    // The message is flagged, never auto-resolved — and the remedy is
+    // the documented ready-gated follow-up verbatim: the idle pane
+    // passes the claim probe and the new turn proceeds normally.
+    assert_eq!(d.message_state("w1", "ms9"), "running");
+    let (ok, sent) = cadence_cli(
+        &d.state,
+        &["send", "w1", "--ready", "--text", "continue"],
+        &[],
+    );
+    assert!(ok, "{sent}");
+    let ms10 = sent["message"].as_str().unwrap().to_string();
+    let token2 = pty_token(&d, "w1", &ms10);
+    for (id, t) in [("ms9", &token), (ms10.as_str(), &token2)] {
+        d.rpc(
+            "message_report",
+            json!({"message": id, "token": t, "kind": "result",
+                   "text": "done"}),
+        )
+        .unwrap();
+        d.wait_message("w1", id, &["completed"], 10);
+    }
+    stall_sample(0);
+}
+
+/// A menu that opens BEFORE any turn starts — the pane sits blocked
+/// with a message still queued — must surface identically to a
+/// mid-turn one: `approval_menu` fires against the queued head
+/// (marked `queued`), the views carry `pane_menu`, the needs-me row
+/// names the answer command, and `agent answer` unblocks delivery.
+#[test]
+fn pty_queued_menu_surfaces_and_answers() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    // The menu opens first; the send behind it can only queue.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "blocked send", "message": "mq"}),
+    )
+    .unwrap();
+    // `queued` or `submitting` — the delivery loop may have already
+    // claimed the head and be gate-waiting on the menu; it cannot be
+    // running while the pane shows a menu.
+    let st = d.message_state("dv", "mq");
+    assert!(st == "queued" || st == "submitting", "{st}");
+
+    // The queued head is tracked for menu detection: the event names
+    // the waiting message and marks it queued, the views carry the
+    // menu line with no running turn at all.
+    let rise = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(rise["payload"]["message"], "mq", "{rise}");
+    assert_eq!(rise["payload"]["queued"], true, "{rise}");
+    assert_eq!(rise["payload"]["line"], "$ printenv FOO", "{rise}");
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(show["pane_menu"], "$ printenv FOO", "{show}");
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    assert!(
+        needs.iter().any(|n| n["kind"] == "approval_menu"
+            && n["command"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("cadence agent answer dv ")),
+        "{needs:?}"
+    );
+
+    // A garbage index is rejected at the RPC — the count never
+    // reaches a key vector — and the daemon answers normally after.
+    let err = d
+        .rpc(
+            "agent_answer",
+            json!({"alias": "dv", "choice": "4000000000"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("no option 4000000000"), "{err}");
+    // And a menu whose option block cannot be parsed refuses rather
+    // than walking blind — the legend anchor alone, no option rows.
+    atomic_write(
+        d.pane_file(&mock, "dv", "tui-state"),
+        "↑↓ select · ↵ confirm · esc cancel\n⠸ Thinking · 5s (esc twice to interrupt)\n",
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["approval_menu"], true, "{probe}");
+    assert!(d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "1"}))
+        .is_err());
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    // Answering the menu unblocks the queued send — the pane claims
+    // cleanly once the operator's menu is gone. A real TUI consumes
+    // the answer key; the mock leaves it staged, so clear the input
+    // file the way an answered menu would.
+    d.rpc("agent_answer", json!({"alias": "dv", "choice": "8"}))
+        .unwrap();
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    atomic_write(d.pane_file(&mock, "dv", "input"), "");
+    d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
+    d.wait_message("dv", "mq", &["running"], 20);
+    let token = pty_token(&d, "dv", "mq");
+    d.rpc(
+        "message_report",
+        json!({"message": "mq", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "mq", &["completed"], 10);
+    stall_sample(0);
+}
+
+/// A menu raised on a pane with NO message at all still surfaces —
+/// the stall watch samples idle panes, the event fires `idle: true`
+/// and attributes no message, and the needs-me row names the remedy.
+#[test]
+fn pty_idle_pane_menu_surfaces() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    // Nothing was ever sent — the menu arrives on a quiet pane.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let rise = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(rise["payload"]["idle"], true, "{rise}");
+    assert_eq!(rise["payload"]["line"], "$ printenv FOO", "{rise}");
+    assert!(rise["payload"]["message"].is_null(), "{rise}");
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(show["pane_menu"], "$ printenv FOO", "{show}");
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    assert!(
+        needs.iter().any(|n| n["kind"] == "approval_menu"
+            && n["command"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("cadence agent answer dv ")),
+        "{needs:?}"
+    );
+
+    // The operator can answer it straight away.
+    d.rpc("agent_answer", json!({"alias": "dv", "choice": "8"}))
+        .unwrap();
+    stall_sample(0);
+}
+
+/// A menu that closes and later reopens is a NEW approval — the same
+/// subject must fire `approval_menu` again. The event history is
+/// scoped to the open menu: it clears when the menu closes, so the
+/// second occurrence is never deduped away.
+#[test]
+fn pty_menu_event_refires_after_close() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let first = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(first["payload"]["line"], "$ printenv FOO", "{first}");
+
+    // Menu closes — the idle screen returns. The sampler must observe
+    // at least one non-menu frame before the reopen.
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+        if show["pane_menu"].is_null() {
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(20), "{show}");
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    // The same menu reopens — same subject — and fires again.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let events = wait_event_count(&d, "dv", "approval_menu", 2, 20);
+    assert_eq!(events[1]["payload"]["line"], "$ printenv FOO", "{events:?}");
+    stall_sample(0);
+}
+
+/// The answerer's identity is derived from the socket peer's pid
+/// walking its /proc ancestry into a pane — never from a `by` the
+/// client chose. A caller inside the target's own pane is refused
+/// outright; inside another agent's pane it stamps that agent.
+#[test]
+fn pty_answer_derives_caller_from_peer_pid() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.register_devin_opts("peer", json!({}));
+    d.wait_agent("dv", "idle", 20);
+    d.wait_agent("peer", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    // Point a pane pid at this test process and every RPC it makes
+    // descends from that pane — the unforgeable "caller is inside
+    // the agent" signal.
+    let me = std::process::id() as i64;
+    let set_pid = |alias: &str, pid: i64| {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE agents SET pid=?1 WHERE alias=?2",
+            rusqlite::params![pid, alias],
+        )
+        .unwrap();
+    };
+
+    // Self-approval refuses before any key is sent — even with `by`
+    // claiming to be an operator.
+    set_pid("dv", me);
+    let err = d
+        .rpc(
+            "agent_answer",
+            json!({"alias": "dv", "choice": "8", "by": "operator"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("its own pane"), "{err}");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+
+    // A caller inside ANOTHER agent's pane stamps that agent; a `by`
+    // claiming otherwise is kept only as a claim.
+    set_pid("dv", 999_999_999);
+    set_pid("peer", me);
+    d.rpc(
+        "agent_answer",
+        json!({"alias": "dv", "choice": "8", "by": "dv"}),
+    )
+    .unwrap();
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["by"], "peer", "{ev}");
+    assert_eq!(ev["payload"]["by_kind"], "agent", "{ev}");
+    assert_eq!(ev["payload"]["claimed_by"], "dv", "{ev}");
+    assert_eq!(ev["payload"]["caller_pid"], me, "{ev}");
+
+    // Outside every pane the caller is an operator only when it holds
+    // a foreign terminal — this test process inherits one when the
+    // suite runs on a pty, none under piped CI — and `unknown`
+    // otherwise. A `by` naming the target is a claim, not an
+    // attribution either way.
+    set_pid("peer", 999_999_999);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    d.rpc(
+        "agent_answer",
+        json!({"alias": "dv", "choice": "1", "by": "dv"}),
+    )
+    .unwrap();
+    let on_tty = (0..=2).any(|fd| {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
+    });
+    let want = if on_tty { "operator" } else { "unknown" };
+    let evs = wait_event_count(&d, "dv", "approval_answered", 2, 10);
+    assert_eq!(evs[1]["payload"]["by"], want, "{evs:?}");
+    assert_eq!(evs[1]["payload"]["by_kind"], want, "{evs:?}");
+    assert_eq!(evs[1]["payload"]["claimed_by"], "dv", "{evs:?}");
+}
+
+/// `setsid` detaches the caller from the pane's /proc ancestry — the
+/// self-approval guard must still see through it. The pane's own
+/// `CADENCE_ALIAS` env survives the detach, so `setsid env
+/// CADENCE_ALIAS=<self> cadence agent answer <self>` is refused rather
+/// than stamped `operator`. A detached caller carrying another pane's
+/// alias attributes to that pane — an agent, never an operator.
+#[test]
+fn pty_answer_setsid_cannot_launder_self_approval() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.register_devin_opts("peer", json!({}));
+    d.wait_agent("dv", "idle", 20);
+    d.wait_agent("peer", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    // The detached call names its own pane in env — refused, no key
+    // reaches the input, no event is stamped.
+    let out = std::process::Command::new("setsid")
+        .arg("env")
+        .arg("CADENCE_ALIAS=dv")
+        .arg(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "answer", "dv", "8"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "self-answer must refuse: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+    let events = d.rpc("agent_events", json!({"alias": "dv"})).unwrap();
+    assert!(
+        !events.to_string().contains("approval_answered"),
+        "self-answer must not stamp an event: {events}"
+    );
+
+    // Detached and carrying ANOTHER pane's env — stamps that pane as
+    // the agent, not `operator`.
+    let out = std::process::Command::new("setsid")
+        .arg("env")
+        .arg("CADENCE_ALIAS=peer")
+        .arg(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "answer", "dv", "8"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["by"], "peer", "{ev}");
+    assert_eq!(ev["payload"]["by_kind"], "agent", "{ev}");
+}
+
+/// A *full* detach — `env -u CADENCE_ALIAS setsid sh -c 'cadence agent
+/// answer <self> </dev/null >/dev/null 2>&1'` — clears ancestry, env
+/// and tty at once. The caller matches nothing, so the honest stamp is
+/// `unknown`, never `operator`: `operator` needs positive terminal
+/// evidence the detached process cannot carry.
+#[test]
+fn pty_answer_full_detach_stamps_unknown() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    let out = std::process::Command::new("setsid")
+        .arg("env")
+        .arg("-u")
+        .arg("CADENCE_ALIAS")
+        .arg(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "answer", "dv", "8"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "unmatched-but-unproven caller answers as unknown: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["by"], "unknown", "{ev}");
+    assert_eq!(ev["payload"]["by_kind"], "unknown", "{ev}");
+}
+
+/// A transcript that quotes a real menu verbatim — anchor, `❯`-led
+/// numbered run and all — cannot flip the pane: a live menu replaces
+/// the input box's interior, so the boxed `❯` prompt still rendered
+/// below the quote proves the menu-looking rows are text. The probe
+/// stays inert and `agent answer` refuses rather than keying a digit
+/// into the live input line.
+#[test]
+fn pty_claude_quoted_menu_above_input_box_is_inert() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
+    d.wait_agent("cl", "idle", 20);
+    atomic_write(
+        d.claude_pane_file(&mock, "cl", "tui-state"),
+        "● I reproduced it. The pane printed:\n\n    Do you want to proceed?\n    ❯ 1. Yes\n      2. No, and tell Claude what to do differently\n\n  So it is waiting on you.\n────────────────────\n❯ \n",
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "cl"})).unwrap();
+    assert_eq!(probe["approval_menu"], false, "{probe}");
+    assert_eq!(probe["idle"], true, "{probe}");
+    let err = d
+        .rpc("agent_answer", json!({"alias": "cl", "choice": "2"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("no approval menu"), "{err}");
+    let input =
+        std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+}
+
+/// Same class on the Devin profile (CAD-102 r6): a verbatim quoted
+/// menu above the live idle input box probes inert — the legend is
+/// transcript text, and the editable `❭` row vetoes the region —
+/// and `agent answer` refuses rather than keying the digit into the
+/// input line.
+#[test]
+fn pty_devin_quoted_menu_above_input_box_is_inert() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    atomic_write(
+        d.pane_file(&mock, "dv", "tui-state"),
+        "● The pane showed:\n\n  Allow this tool call?\n  ❭ 1 Yes  (Approve once)\n  · 2 Yes, allow `env` commands\n  · 8 No\n  ↑↓ select · ↵ confirm · esc cancel\n\n  So it is waiting.\n\n────────────────────\n❭ Ask Devin to build features, fix bugs, or work on your code\n────────────────────\nSWE-2 Max   Context: 43k / 262k\n",
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["approval_menu"], false, "{probe}");
+    assert_eq!(probe["idle"], true, "{probe}");
+    let err = d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "2"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("no approval menu"), "{err}");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+}
+
+/// A transient `capture-pane` failure inside the gate probe refuses
+/// the send like a busy pane — `gate_wait`, message still queued —
+/// never an actor-fatal provider error. The daemon survives and the
+/// send delivers once the outage clears.
+#[test]
+fn pty_gate_probe_failure_is_a_gate_refusal() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    // `MOCK_TMUX_FAIL` is process-global — a parallel test's mock
+    // calls could trip on it inside this window. The outage is
+    // seconds-long and the failure mode (a gate retry) is benign, so
+    // the knob stays env-global rather than growing a per-pane
+    // failure file.
+    std::env::set_var("MOCK_TMUX_FAIL", "capture-pane");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "during outage", "message": "mf"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("dv", "gate_wait", 15);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("pane probe failed"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("dv", "mf"), "queued");
+    std::env::remove_var("MOCK_TMUX_FAIL");
+
+    d.wait_message("dv", "mf", &["running"], 20);
+    let token = pty_token(&d, "dv", "mf");
+    d.rpc(
+        "message_report",
+        json!({"message": "mf", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "mf", &["completed"], 10);
+}
+
+/// `agent answer` is a menu channel only: a pane with no menu refuses
+/// (idle, busy or fenced alike), and a non-pty endpoint has no such
+/// channel at all.
+#[test]
+fn pty_answer_refuses_without_a_menu() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register_stub("w1", json!({}));
+    d.register("fx");
+    d.wait_agent("w1", "idle", 20);
+    d.wait_agent("fx", "idle", 10);
+    let err = d
+        .rpc("agent_answer", json!({"alias": "w1", "choice": "1"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("no approval menu"), "{err}");
+    let err = d
+        .rpc("agent_answer", json!({"alias": "fx", "choice": "1"}))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no approval-menu channel"),
+        "{err}"
+    );
 }
 
 // ---- CAD-55: `cadence dispatch` + `cadence issue finish` against a live daemon ----
@@ -16161,6 +16922,9 @@ fn tmux_call_count(mock: &MockDevin, state: &Path, cmd: &str) -> usize {
 
 #[test]
 fn status_rows_probe_once_and_footer() {
+    // The stall watch now samples idle panes too — park it far out so
+    // a tick cannot land inside the capture-count window below.
+    stall_sample(3600);
     let d = TestDaemon::start();
     let mock = d.mock_devin();
     let _chatty = d.mock_claude("chatty", None);
@@ -16233,6 +16997,19 @@ fn status_rows_probe_once_and_footer() {
         &pm_dir,
         &["issue", "set", "CAD-3", "owner=w1"],
     );
+    // The stall watch samples each new pty pane once at registration —
+    // the interval only gates REPEATS, so `stall_sample(3600)` cannot
+    // hold that first capture back. Under suite load the watch's first
+    // tick can land this late; wait it out so the window below counts
+    // only the status probes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while tmux_call_count(&mock, &d.state, "capture-pane") < 2 {
+        assert!(
+            deadline.elapsed() < Duration::from_secs(20),
+            "first stall samples for dv1/dv2 never landed"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
     let captures_before = tmux_call_count(&mock, &d.state, "capture-pane");
     let view = status_json(&d.state, &[], &[("CADENCE_PM_DIR", &pm_dir)]);
     let agents = view["agents"].as_array().unwrap();
@@ -17505,7 +18282,7 @@ fn overview_drift_reports_commits_after_build() {
     assert_eq!(row["command"], "cadence daemon restart --when-idle --ui");
 }
 
-/// `doctor --host --json` on the real host: one object, six named
+/// `doctor --host --json` on the real host: one object, the named
 /// checks, each ok|warn|fail, exit code the worst level. What the host
 /// measures is its own business — this only proves the surface runs
 /// and reports honestly, never which level comes back.
@@ -17547,7 +18324,8 @@ fn doctor_host_json_reports_all_checks() {
             "sessions",
             "orphans",
             "temp-dirs",
-            "worktrees"
+            "worktrees",
+            "load"
         ]
     );
     for c in report["checks"].as_array().unwrap() {
@@ -19537,6 +20315,698 @@ fn issue_ls_survives_a_closed_downstream_pipe() {
         "the open-pipe failure still prints its error"
     );
 }
+
+// ---------- CAD-136: report intake ----------
+
+/// pm + two repos (the `cadence` project and a `product` project) +
+/// home + state under one temp dir; `cli_at` runs the real binary with
+/// cwd control — report routing is decided by kind and cwd, so the
+/// fixture keeps both an inside-a-project cwd and a foreign one.
+struct ReportFx {
+    _tmp: TempDir,
+    pm_dir: PathBuf,
+    notes_dir: PathBuf,
+    cadence_repo: PathBuf,
+    product_repo: PathBuf,
+    foreign_cwd: PathBuf,
+    home: PathBuf,
+    state: PathBuf,
+    bin_dir: PathBuf,
+}
+
+impl ReportFx {
+    fn new() -> Self {
+        let tmp = TempDir::new().unwrap();
+        let (pm_dir, notes_dir, cadence_repo, product_repo, foreign_cwd, home, state) = (
+            tmp.path().join("pm"),
+            tmp.path().join("notes"),
+            tmp.path().join("cadence-repo"),
+            tmp.path().join("product-repo"),
+            tmp.path().join("nowhere"),
+            tmp.path().join("home"),
+            tmp.path().join("state"),
+        );
+        for dir in [&pm_dir, &notes_dir, &home, &state, &foreign_cwd] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        git_repo(&cadence_repo);
+        git_repo(&product_repo);
+        let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let s = Self {
+            _tmp: tmp,
+            pm_dir,
+            notes_dir,
+            cadence_repo,
+            product_repo,
+            foreign_cwd,
+            home,
+            state,
+            bin_dir,
+        };
+        assert!(s.cli(&["issue", "init"]).0);
+        // init defaults notes_dir to the shared /var/www/agent-notes —
+        // a stray real note tagged `Issue: C-1` would flip a derived
+        // status and flake these tests, so point it at the temp dir.
+        let pm_yaml = s.pm_dir.join("pm.yaml");
+        let text = std::fs::read_to_string(&pm_yaml).unwrap();
+        let text = text
+            .lines()
+            .map(|l| {
+                if l.starts_with("notes_dir:") {
+                    format!("notes_dir: {}", s.notes_dir.display())
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&pm_yaml, format!("{text}\n")).unwrap();
+        for (key, prefix, repo) in [
+            ("cadence", "C", s.cadence_repo.clone()),
+            ("product", "P", s.product_repo.clone()),
+        ] {
+            let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+            let (ok, out) = s.cli(&[
+                "issue", "project", "add", key, "--prefix", prefix, "--repo", &repo_s,
+            ]);
+            assert!(ok, "project add {key}: {out}");
+        }
+        s
+    }
+
+    fn cli(&self, args: &[&str]) -> (bool, Value) {
+        self.cli_at(&self.product_repo, args)
+    }
+
+    fn cli_at(&self, cwd: &Path, args: &[&str]) -> (bool, Value) {
+        self.cli_at_env(cwd, args, &[]).2
+    }
+
+    /// `(success, stderr, parsed stdout-or-stderr-json)` — stderr kept
+    /// separate so refusal tests can assert on the message text.
+    fn cli_at_env(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> (bool, String, (bool, Value)) {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+        cmd.arg("--state-dir")
+            .arg(&self.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &self.pm_dir)
+            .env("HOME", &self.home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .current_dir(cwd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let text = if out.stdout.is_empty() {
+            stderr.clone()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            stderr,
+            (
+                out.status.success(),
+                serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+            ),
+        )
+    }
+
+    fn issue_body(&self, project: &str, id: &str) -> String {
+        std::fs::read_to_string(self.pm_dir.join(project).join(id).join("issue.md")).unwrap()
+    }
+
+    fn tracker_log(&self, n: usize) -> String {
+        git_at(
+            &self.pm_dir,
+            &["log", &format!("-{n}"), "--format=%s%n%(trailers)"],
+        )
+    }
+}
+
+/// The routing contract: `question`, `feedback` and `bug` file into
+/// `cadence` from any cwd; `idea` files into the cwd's project (or
+/// --project) and refuses when neither resolves. Priorities default
+/// P3 except `bug` (P2); every issue carries `intake` + kind tags.
+#[test]
+fn report_routes_by_kind_and_defaults() {
+    let s = ReportFx::new();
+
+    // bug/question/feedback from the product repo all land in cadence.
+    for (kind, want_id) in [("bug", "C-1"), ("question", "C-2"), ("feedback", "C-3")] {
+        let (ok, out) = s.cli_at(&s.product_repo, &["report", "--kind", kind, "-m", "x"]);
+        assert!(ok && out["id"] == want_id, "{kind}: {out}");
+        assert_eq!(out["project"], "cadence");
+    }
+    // bug defaults P2, the rest P3; --priority overrides.
+    let (_, out) = s.cli(&["report", "show", "C-1"]);
+    assert_eq!(out["priority"], "P2");
+    let (_, out) = s.cli(&["report", "show", "C-2"]);
+    assert_eq!(out["priority"], "P3");
+    let (ok, out) = s.cli_at(
+        &s.product_repo,
+        &["report", "--kind", "bug", "--priority", "P0", "-m", "sev"],
+    );
+    assert!(ok && out["priority"] == "P0", "{out}");
+
+    // idea from the product repo lands in product.
+    let (ok, out) = s.cli_at(
+        &s.product_repo,
+        &["report", "--kind", "idea", "-m", "a product idea"],
+    );
+    assert!(
+        ok && out["id"] == "P-1" && out["project"] == "product",
+        "{out}"
+    );
+
+    // idea from a foreign cwd refuses, naming --project.
+    let (_, stderr, _) = s.cli_at_env(
+        &s.foreign_cwd,
+        &["report", "--kind", "idea", "-m", "stray idea"],
+        &[],
+    );
+    assert!(stderr.contains("--project"), "{stderr}");
+
+    // --project wins even for kinds that would otherwise route by cwd.
+    let (ok, out) = s.cli_at(
+        &s.product_repo,
+        &[
+            "report",
+            "--kind",
+            "idea",
+            "--project",
+            "cadence",
+            "-m",
+            "a cadence idea",
+        ],
+    );
+    assert!(ok && out["project"] == "cadence", "{out}");
+
+    // Tags: intake + kind on every issue; the commit carries the
+    // Actor trailer.
+    let body = s.issue_body("cadence", "C-1");
+    assert!(
+        body.contains("- bug") && body.contains("- intake"),
+        "{body}"
+    );
+    let log = s.tracker_log(6);
+    assert!(log.contains("Actor:"), "{log}");
+
+    // The default kind is feedback — `cadence report -m` files into
+    // cadence's project.
+    let (ok, out) = s.cli_at(&s.product_repo, &["report", "-m", "no kind"]);
+    assert!(
+        ok && out["kind"] == "feedback" && out["project"] == "cadence",
+        "{out}"
+    );
+}
+
+/// `--issue` attaches the report as a comment on the named issue and
+/// creates nothing new; the comment carries the kind and context.
+#[test]
+fn report_issue_attaches_comment() {
+    let s = ReportFx::new();
+    let (ok, out) = s.cli(&["issue", "new", "Target", "--project", "product"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+
+    let (ok, out) = s.cli(&[
+        "report",
+        "--issue",
+        &id,
+        "--kind",
+        "question",
+        "-m",
+        "what does the flag do?",
+    ]);
+    assert!(ok && out["id"] == id && out["kind"] == "question", "{out}");
+    let comments = s.pm_dir.join("product").join(&id).join("comments");
+    let comment = std::fs::read_dir(&comments)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let text = std::fs::read_to_string(comment).unwrap();
+    assert!(text.contains("what does the flag do?"), "{text}");
+    assert!(text.contains("## Report context"), "{text}");
+}
+
+/// A credential-shaped string in the report body is stored redacted —
+/// body, title and context all pass through the shared scrubber.
+#[test]
+fn report_redacts_credential_shapes() {
+    let s = ReportFx::new();
+    let secret = "ghp_".to_string() + &"a".repeat(36);
+    let (ok, out) = s.cli(&[
+        "report",
+        "--kind",
+        "bug",
+        "-m",
+        &format!("leaked {secret} in CI log"),
+    ]);
+    assert!(ok, "{out}");
+    let body = s.issue_body("cadence", out["id"].as_str().unwrap());
+    assert!(!body.contains(&secret), "{body}");
+    assert!(body.contains("[REDACTED]"), "{body}");
+}
+
+/// The Overview needs-me row appears while the issue sits in backlog
+/// and clears when it leaves — and `report ls` filters by kind and
+/// project.
+#[test]
+fn report_needs_me_row_and_ls_filters() {
+    let s = ReportFx::new();
+    let (ok, _) = s.cli_at(
+        &s.product_repo,
+        &["report", "--kind", "idea", "-m", "an idea"],
+    );
+    assert!(ok);
+    let (ok, _) = s.cli_at(&s.product_repo, &["report", "--kind", "bug", "-m", "a bug"]);
+    assert!(ok);
+
+    let view = overview_at(&s.home, &s.state, Some(&s.pm_dir), &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    let intake: Vec<&Value> = needs.iter().filter(|n| n["kind"] == "intake").collect();
+    assert_eq!(intake.len(), 2, "{needs:?}");
+    let commands: Vec<&str> = intake
+        .iter()
+        .filter_map(|n| n["command"].as_str())
+        .collect();
+    assert!(
+        commands.contains(&"cadence report show P-1"),
+        "{commands:?}"
+    );
+    assert!(
+        commands.contains(&"cadence report show C-1"),
+        "{commands:?}"
+    );
+
+    // `ls` filters: by kind and by project.
+    let (_, out) = s.cli(&["report", "ls", "--kind", "idea"]);
+    assert_eq!(out["count"], 1);
+    assert_eq!(out["reports"][0]["id"], "P-1");
+    let (_, out) = s.cli(&["report", "ls", "--project", "cadence"]);
+    assert_eq!(out["count"], 1);
+    assert_eq!(out["reports"][0]["id"], "C-1");
+
+    // Moving the issue off backlog clears the row.
+    let (ok, _) = s.cli(&["issue", "set", "P-1", "status=ready"]);
+    assert!(ok);
+    let view = overview_at(&s.home, &s.state, Some(&s.pm_dir), &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    assert_eq!(
+        needs.iter().filter(|n| n["kind"] == "intake").count(),
+        1,
+        "{needs:?}"
+    );
+}
+
+/// A report notifies the project's PM inbox — `team.yaml`
+/// `roles.pm.alias` names it (ADR 0001); absent any resolvable PM the
+/// report still files, with `notified` recording the miss.
+#[test]
+fn report_notifies_pm_inbox() {
+    let s = ReportFx::new();
+    let d = TestDaemon::start_on(s.state.clone());
+    d.register_inbox("pm");
+    // The daemon's own state dir is s.state — report and daemon agree.
+
+    // No team.yaml yet — no resolvable PM, still files fine.
+    let (ok, out) = s.cli(&["report", "--kind", "bug", "-m", "first"]);
+    assert!(ok && out["notified"].is_null(), "{out}");
+
+    // team.yaml declares the PM inbox — the report sends one line.
+    std::fs::write(
+        s.pm_dir.join("cadence").join("team.yaml"),
+        "roles:\n  pm:\n    kind: inbox\n    alias: pm\n",
+    )
+    .unwrap();
+    let (ok, out) = s.cli(&["report", "--kind", "bug", "-m", "second"]);
+    assert!(
+        ok && out["notified"]["sent"] == true && out["notified"]["to"] == "pm",
+        "{out}"
+    );
+    let show = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    assert_eq!(show["queued"].as_i64().unwrap(), 1);
+    let drained = d.rpc("agent_inbox", json!({"alias": "pm"})).unwrap();
+    let msgs = drained["messages"].as_array().unwrap();
+    assert!(
+        msgs[0]["body"].as_str().unwrap().contains("C-2"),
+        "{msgs:?}"
+    );
+}
+
+/// `cli_at_env` without the JSON parse — for clap-level refusals
+/// (`--issue --project`) that exit 2 with plain-text usage.
+fn cli_raw_at(s: &ReportFx, cwd: &Path, args: &[&str]) -> (bool, String) {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
+        .arg(&s.state)
+        .args(args)
+        .env("CADENCE_PM_DIR", &s.pm_dir)
+        .env("HOME", &s.home)
+        .env_remove("CADENCE_ALIAS")
+        .current_dir(cwd);
+    let out = cmd.output().unwrap();
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// Round 2: a multi-line body keeps its line structure — blank lines
+/// and indentation survive the prose scrubber — and the title is the
+/// first line only, never the collapsed body.
+#[test]
+fn report_preserves_multiline_body() {
+    let s = ReportFx::new();
+    let body = "Steps to reproduce:\n\n    1. run `cadence status`\n\t2. see error\n";
+    let (ok, out) = s.cli_at(&s.product_repo, &["report", "--kind", "bug", "-m", body]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let stored = s.issue_body("cadence", &id);
+    assert!(stored.contains("    1. run `cadence status`"), "{stored}");
+    assert!(stored.contains("\t2. see error"), "{stored}");
+    let (_, out) = s.cli(&["report", "show", &id]);
+    assert_eq!(out["title"], "Steps to reproduce:", "{out}");
+}
+
+/// Round 2: the prose leak rows — each secret asserted absent from
+/// the stored issue file.
+#[test]
+fn report_redacts_prose_secret_forms() {
+    let s = ReportFx::new();
+    let rows: [(&str, &str); 9] = [
+        (
+            "Auth header\nAuthorization: Basic dXNlcjpwYXNzd29yZA==",
+            "dXNlcjpwYXNzd29yZA==",
+        ),
+        ("quoted flag\n--password \"correct horse battery\"", "horse"),
+        ("user pair\n-u \"admin:hunter 2\"", "admin:hunter"),
+        ("prose\nnote: the db password is hunter2 ok", "hunter2"),
+        (
+            "url\ncall https://api/x?api_key=abcd1234&page=2 done",
+            "abcd1234",
+        ),
+        (
+            "pem\n-----BEGIN RSA PRIVATE KEY-----\nMIIabc123\n-----END RSA PRIVATE KEY-----\ntail",
+            "MIIabc123",
+        ),
+        (
+            "password:\n  synthetic_boundary_value",
+            "synthetic_boundary_value",
+        ),
+        ("Example\n--password=\"first second third\"", "second"),
+        (
+            "Example\n--password \"first\n synthetic_quote_tail\" ordinary tail",
+            "synthetic_quote_tail",
+        ),
+    ];
+    for (i, (body, gone)) in rows.iter().enumerate() {
+        let (ok, out) = s.cli_at(&s.product_repo, &["report", "--kind", "bug", "-m", body]);
+        assert!(ok, "row {i}: {out}");
+        let stored = s.issue_body("cadence", &format!("C-{}", i + 1));
+        assert!(!stored.contains(gone), "row {i}: {stored}");
+        assert!(stored.contains("[REDACTED]"), "row {i}: {stored}");
+    }
+    // A PEM marker may itself be the title, so exercise the `--file` path
+    // because clap treats a leading `-----` inline value as an option.
+    let pem_file = s._tmp.path().join("pem-title.txt");
+    std::fs::write(
+        &pem_file,
+        "-----BEGIN RSA PRIVATE KEY-----\nsynthetic_pem_payload\n-----END RSA PRIVATE KEY-----",
+    )
+    .unwrap();
+    let (ok, out) = s.cli_at(
+        &s.product_repo,
+        &[
+            "report",
+            "--kind",
+            "bug",
+            "--file",
+            pem_file.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "{out}");
+    let stored = s.issue_body("cadence", "C-10");
+    assert!(!stored.contains("synthetic_pem_payload"), "{stored}");
+    assert!(stored.contains("[REDACTED]"), "{stored}");
+    // The URL keeps its non-secret query params and path.
+    let stored = s.issue_body("cadence", "C-5");
+    assert!(
+        stored.contains("https://api/x?api_key=[REDACTED]&page=2"),
+        "{stored}"
+    );
+}
+
+/// Boundary redaction also applies to comments on existing issues, not just
+/// newly filed intake rows.
+#[test]
+fn report_comment_redacts_boundary_secret_forms() {
+    let s = ReportFx::new();
+    let (ok, out) = s.cli(&["issue", "new", "Target", "--project", "product"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let body = r#"password:
+  synthetic_comment_boundary
+
+Example
+--password="first synthetic_comment_glued"
+
+-----BEGIN RSA PRIVATE KEY-----
+synthetic_comment_pem
+-----END RSA PRIVATE KEY-----
+
+Example
+--password "first
+ synthetic_comment_quote" ordinary tail"#;
+    let (ok, out) = s.cli(&["report", "--issue", &id, "--kind", "bug", "-m", body]);
+    assert!(ok, "{out}");
+    let comments = s.pm_dir.join("product").join(&id).join("comments");
+    let comment = std::fs::read_dir(&comments)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let stored = std::fs::read_to_string(comment).unwrap();
+    for gone in [
+        "synthetic_comment_boundary",
+        "synthetic_comment_glued",
+        "synthetic_comment_pem",
+        "synthetic_comment_quote",
+    ] {
+        assert!(!stored.contains(gone), "{gone}: {stored}");
+    }
+    assert!(stored.contains("[REDACTED]"), "{stored}");
+}
+
+/// Round 2: control characters reach neither the stored issue nor
+/// the PM's inbox line.
+#[test]
+fn report_strips_control_chars() {
+    let s = ReportFx::new();
+    let d = TestDaemon::start_on(s.state.clone());
+    d.register_inbox("pm");
+    std::fs::write(
+        s.pm_dir.join("cadence").join("team.yaml"),
+        "roles:\n  pm:\n    kind: inbox\n    alias: pm\n",
+    )
+    .unwrap();
+    // --file: argv cannot carry `\x00` at all — the OS rejects it
+    // before cadence reads it.
+    let body_file = s._tmp.path().join("body.txt");
+    std::fs::write(
+        &body_file,
+        "crash\x1b[2J here\n\x1b]0;pwned\x07second\x00l\n",
+    )
+    .unwrap();
+    let (ok, out) = s.cli(&[
+        "report",
+        "--kind",
+        "bug",
+        "--file",
+        body_file.to_str().unwrap(),
+    ]);
+    assert!(ok, "{out}");
+    let stored = s.issue_body("cadence", out["id"].as_str().unwrap());
+    assert!(
+        !stored.contains('\x1b') && !stored.contains('\x07') && !stored.contains('\x00'),
+        "{stored}"
+    );
+    let msgs = d.rpc("agent_inbox", json!({"alias": "pm"})).unwrap();
+    let line = msgs["messages"][0]["body"].as_str().unwrap().to_string();
+    assert!(!line.chars().any(|c| c.is_control()), "{line:?}");
+}
+
+/// Round 2: a body over the 32 KB cap is refused with the cap named;
+/// a first line over 200 chars becomes a capped title, not a 300-char
+/// board row.
+#[test]
+fn report_caps_body_and_title() {
+    let s = ReportFx::new();
+    let big = "x".repeat(33 * 1024);
+    let (_, stderr, (ok, _)) = s.cli_at_env(&s.product_repo, &["report", "-m", &big], &[]);
+    assert!(!ok && stderr.contains("32 KB"), "{stderr}");
+
+    let long_title = "a".repeat(300);
+    let (ok, out) = s.cli(&["report", "-m", &format!("{long_title}\nrest")]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let (_, out) = s.cli(&["report", "show", &id]);
+    assert_eq!(out["title"].as_str().unwrap().chars().count(), 200);
+}
+
+/// Round 2: `intake` + kind are system vocabulary — a project with a
+/// declared `tags:` allowlist still takes reports.
+#[test]
+fn report_ignores_project_tag_allowlist() {
+    let s = ReportFx::new();
+    let repo = s
+        .product_repo
+        .canonicalize()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (ok, out) = s.cli(&[
+        "issue", "project", "add", "strict", "--prefix", "S", "--repo", &repo, "--tag", "triage",
+    ]);
+    assert!(ok, "{out}");
+    let (ok, out) = s.cli(&[
+        "report",
+        "--kind",
+        "idea",
+        "--project",
+        "strict",
+        "-m",
+        "an idea",
+    ]);
+    assert!(ok && out["project"] == "strict", "{out}");
+    let stored = s.issue_body("strict", "S-1");
+    assert!(
+        stored.contains("- intake") && stored.contains("- idea"),
+        "{stored}"
+    );
+}
+
+/// Round 2: the kind is its own frontmatter field — an extra tag
+/// sorting ahead of it cannot mislabel `ls`/`show`.
+#[test]
+fn report_kind_survives_extra_tags() {
+    let s = ReportFx::new();
+    let (ok, out) = s.cli_at(&s.product_repo, &["report", "--kind", "bug", "-m", "x"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let (ok, out) = s.cli(&["issue", "tag", &id, "add", "aaa-first"]);
+    assert!(ok, "{out}");
+    let (_, out) = s.cli(&["report", "ls", "--kind", "bug"]);
+    assert_eq!(out["count"], 1, "{out}");
+    assert_eq!(out["reports"][0]["kind"], "bug");
+    let (_, out) = s.cli(&["report", "show", &id]);
+    assert_eq!(out["kind"], "bug", "{out}");
+    let stored = s.issue_body("cadence", &id);
+    assert!(stored.contains("kind: bug"), "{stored}");
+}
+
+/// Round 2: `report ls` reads the derived status — a verdict note
+/// derives `done` while frontmatter still says `backlog`, and `ls`
+/// agrees with the overview.
+#[test]
+fn report_ls_uses_derived_status() {
+    let s = ReportFx::new();
+    let (ok, out) = s.cli_at(&s.product_repo, &["report", "--kind", "bug", "-m", "x"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    std::fs::write(
+        s.notes_dir.join("20260101-000000-t-verdict.md"),
+        format!("# Close-out\n> Issue: `{id}`\n\n## Verdict\npass\n"),
+    )
+    .unwrap();
+    let (_, out) = s.cli(&["report", "ls"]);
+    assert_eq!(out["count"], 0, "{out}");
+    // The file still says backlog — `ls` followed the derived status.
+    let stored = s.issue_body("cadence", &id);
+    assert!(stored.contains("status: backlog"), "{stored}");
+}
+
+/// Round 2: `needs_me` caps intake rows at NEEDS_ME_CAP plus one
+/// summary row — a flood cannot bury real work.
+#[test]
+fn report_needs_me_caps_intake_rows() {
+    let s = ReportFx::new();
+    for i in 0..12 {
+        let (ok, out) = s.cli_at(
+            &s.product_repo,
+            &["report", "--kind", "bug", "-m", &format!("bug {i}")],
+        );
+        assert!(ok, "{out}");
+    }
+    let view = overview_at(&s.home, &s.state, Some(&s.pm_dir), &[]);
+    let intake: Vec<&Value> = view["needs_me"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "intake")
+        .collect();
+    assert_eq!(intake.len(), 11, "{intake:?}");
+    assert!(
+        intake.iter().any(|n| n["title"]
+            .as_str()
+            .unwrap()
+            .contains("2 more intake reports")),
+        "{intake:?}"
+    );
+}
+
+/// Round 2 nits: `--issue` rejects the flags it would ignore;
+/// `report show` refuses non-intake issues.
+#[test]
+fn report_issue_conflicts_and_show_scope() {
+    let s = ReportFx::new();
+    let (ok, out) = s.cli(&["issue", "new", "Target", "--project", "product"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+
+    let (ok, text) = cli_raw_at(
+        &s,
+        &s.product_repo,
+        &["report", "--issue", &id, "--project", "cadence", "-m", "x"],
+    );
+    assert!(!ok && text.contains("--project"), "{text}");
+    let (ok, text) = cli_raw_at(
+        &s,
+        &s.product_repo,
+        &["report", "--issue", &id, "--priority", "P0", "-m", "x"],
+    );
+    assert!(!ok && text.contains("--priority"), "{text}");
+
+    let (ok, _, (_, out)) = s.cli_at_env(&s.product_repo, &["report", "show", &id], &[]);
+    assert!(!ok, "{out}");
+}
+
 // ==================== persistent monitors (CAD-176) ====================
 
 #[test]
@@ -20934,4 +22404,1199 @@ fn audit_post_hoc_verdict_does_not_clear_flag() {
             .any(|f| f == "no-passing-verdict"),
         "post-hoc pass must not clear the flag: {m}"
     );
+}
+
+// ---------- CAD-113: build slots ----------
+
+/// A daemon with a shrunken slot config — hermetic (ServeOptions wins
+/// over pm.yaml, so no host config can leak in).
+fn slot_opts(build: usize, suite: usize, starve: u64, priority: &[&str]) -> daemon::ServeOptions {
+    slot_opts_clock(build, suite, starve, priority, None)
+}
+
+/// `slot_opts` with an injected slot clock: a shared counter the test
+/// advances instead of sleeping — starvation tests stay deterministic
+/// under host load.
+fn slot_opts_clock(
+    build: usize,
+    suite: usize,
+    starve: u64,
+    priority: &[&str],
+    clock: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) -> daemon::ServeOptions {
+    daemon::ServeOptions {
+        slots: Some(cadence_agent::slots::SlotConfig {
+            build_slots: build,
+            suite_slots: suite,
+            starve_secs: starve,
+            priority_lanes: priority.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }),
+        slot_clock: clock.map(|c| {
+            std::sync::Arc::new(move || c.load(std::sync::atomic::Ordering::Relaxed) as f64)
+                as std::sync::Arc<dyn Fn() -> f64 + Send + Sync>
+        }),
+        ..daemon_opts()
+    }
+}
+
+/// Plant `alias` as a live pty pane rooted at `pid` — the endpoint
+/// facts the slot caller-identity derivation reads (CAD-113). The row
+/// stays otherwise inert: registered as an actorless `inbox` pair and
+/// marked `enabled=0`, so neither a register-time `set_identity` nor a
+/// restart's relaunch sweep can overwrite or detach the planted facts.
+/// `slot_*` RPCs derive caller identity from `SO_PEERCRED` + /proc
+/// ancestry, so a test lane is only reachable from processes whose
+/// ancestry includes this pid.
+fn plant_pane(d: &TestDaemon, alias: &str, pid: u32) {
+    // Register as an `inbox` mailbox: the pair owns no actor, so no
+    // async `set_identity` can land after this plant and overwrite
+    // the pid (`agent_register` on an existing alias errors —
+    // idempotent on a daemon restarted over a kept state dir). And
+    // `enabled=0` keeps a restarted daemon's relaunch sweep from
+    // spawning a pty actor for the row — its open cannot verify a
+    // planted pane and the exit-detach clears the pid the pane map
+    // resolves callers by (the CAD-113 CI flake).
+    let _ = d.rpc(
+        "agent_register",
+        json!({"alias": alias, "provider": "inbox",
+               "endpoint_kind": "inbox",
+               "cwd": d.dir.path().to_str().unwrap()}),
+    );
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET endpoint_kind='pty', pid=?1, enabled=0, \
+            generation='planted', session_id='planted' WHERE alias=?2",
+        rusqlite::params![pid as i64, alias],
+    )
+    .unwrap();
+}
+
+/// The lane every in-process `d.rpc` slot call derives: the test
+/// process's own pid planted as this alias's pane.
+const SELF_LANE: &str = "pane-self";
+
+/// Plant the test process itself as `SELF_LANE`'s pane — after this,
+/// `d.rpc` slot calls and `Command`-spawned cadence CLIs all run as
+/// that lane (their ancestry always includes the test pid).
+fn plant_self(d: &TestDaemon) {
+    plant_pane(d, SELF_LANE, std::process::id());
+}
+
+/// A long-lived `bash` whose pid is planted as a lane's pane:
+/// commands written to its stdin run as its children, so their
+/// socket-peer identity derives that lane — the only way to get a
+/// second connection identity in-process tests can't reach.
+struct LaneShell {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+    dir: TempDir,
+    seq: u64,
+}
+
+impl LaneShell {
+    fn spawn(home: &Path) -> LaneShell {
+        let mut child = std::process::Command::new("bash")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .env("HOME", home)
+            .envs(test_env().vars())
+            .spawn()
+            .unwrap();
+        LaneShell {
+            stdin: child.stdin.take().unwrap(),
+            stdout: BufReader::new(child.stdout.take().unwrap()),
+            child,
+            dir: TempDir::new().unwrap(),
+            seq: 0,
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Run a bash fragment under this lane; answer (exit code, output).
+    fn run(&mut self, cmd: &str) -> (i64, String) {
+        let tag = format!("__lane_rc_{}__", self.seq);
+        self.seq += 1;
+        // The bare `echo` first guarantees the marker opens a fresh
+        // line even when the command's output ends mid-line.
+        writeln!(self.stdin, "{{ {cmd} ; }} 2>&1; rc=$?; echo; echo {tag}$rc").unwrap();
+        self.stdin.flush().unwrap();
+        let mut out = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.stdout.read_line(&mut line).unwrap() > 0,
+                "lane shell exited while running: {cmd}"
+            );
+            if let Some(rc) = line.strip_prefix(&tag) {
+                return (rc.trim().parse().unwrap(), out);
+            }
+            out.push_str(&line);
+        }
+    }
+
+    /// `cadence <args>` run under this lane's identity.
+    fn cadence(&mut self, state: &Path, args: &str) -> (i64, String) {
+        self.run(&format!(
+            "{} --state-dir {} {args}",
+            env!("CARGO_BIN_EXE_cadence"),
+            state.display()
+        ))
+    }
+
+    /// One raw JSONL RPC under this lane's identity — the answer is
+    /// the wire frame (`{"ok":…, "result"|"error":…}`).
+    fn rpc(&mut self, state: &Path, method: &str, params: Value) -> Value {
+        let req = self.dir.path().join(format!("req-{}.json", self.seq));
+        std::fs::write(
+            &req,
+            cadence_agent::proto::request(method, params).to_string(),
+        )
+        .unwrap();
+        let (rc, out) = self.run(&format!(
+            "python3 -c 'import socket,sys;\
+             s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);\
+             s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");\
+             print(s.makefile().readline())' {} {}",
+            client::socket_path(state).display(),
+            req.display()
+        ));
+        assert_eq!(rc, 0, "lane rpc failed: {out}");
+        serde_json::from_str(out.trim()).unwrap()
+    }
+}
+
+impl Drop for LaneShell {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `slot_acquire` with the test process's pid — alive for the whole
+/// test, so the pid check never reaps a live waiter here. The lane
+/// param is ignored by the daemon (identity is the connection's);
+/// callers pass SELF_LANE for honesty.
+fn slot_acquire(d: &TestDaemon, kind: &str, lane: &str, req: &str) -> Value {
+    slot_acquire_pid(d, kind, lane, std::process::id(), req)
+}
+
+/// `slot_acquire` claiming an explicit pid — must be the test process
+/// or one of its /proc ancestors, or the daemon refuses.
+fn slot_acquire_pid(d: &TestDaemon, kind: &str, lane: &str, pid: u32, req: &str) -> Value {
+    d.rpc(
+        "slot_acquire",
+        json!({"kind": kind, "lane": lane, "pid": pid,
+               "request_id": req}),
+    )
+    .unwrap()
+}
+
+/// `slot_release` naming the holding (lane, pid) — the identity the
+/// grant was bound to.
+fn slot_release(d: &TestDaemon, token: &str, lane: &str, pid: u32) -> Value {
+    d.rpc(
+        "slot_release",
+        json!({"token": token, "lane": lane, "pid": pid}),
+    )
+    .unwrap()
+}
+
+/// N+1 acquires: the last queues until a release, FIFO order is kept,
+/// and slot events land on the caller's stream. Every call here runs
+/// as `SELF_LANE` — identity is connection-derived (CAD-113).
+#[test]
+fn slot_acquire_queues_until_release() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let g1 = slot_acquire(&d, "build", SELF_LANE, "r1");
+    assert_eq!(g1["granted"], true);
+    let t1 = g1["token"].as_str().unwrap().to_string();
+    assert!(t1.starts_with("slot-"), "the daemon mints the token: {t1}");
+    // The next acquire queues — answered, never hung.
+    let q = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(q["granted"], false);
+    assert_eq!(q["position"], 1);
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert_eq!(s["pools"]["build"]["held"].as_array().unwrap().len(), 1);
+    // The owner sees its own token — the hold's pid is on its chain.
+    assert_eq!(
+        s["pools"]["build"]["held"][0]["token"], t1,
+        "the holding process's own chain sees its token"
+    );
+    let waiting = s["waiting"].as_array().unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0]["lane"], SELF_LANE);
+    // A re-poll keeps the original place — same request id, same
+    // position, no second slot_waited.
+    let q = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(q["position"], 1);
+    // Release frees the pool; the waiter's next poll grants.
+    slot_release(&d, &t1, SELF_LANE, std::process::id());
+    let g2 = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(g2["granted"], true);
+    let t2 = g2["token"].as_str().unwrap().to_string();
+    assert_ne!(t2, t1, "each grant mints a fresh token");
+    // And a re-poll of a granted id returns the same token (the CLI's
+    // poll loop depends on this idempotency).
+    let again = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(again["token"], t2);
+    let kinds = |a: &str| {
+        d.events(a)
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let own = kinds(SELF_LANE);
+    assert!(own.contains(&"slot_acquired".to_string()));
+    assert!(own.contains(&"slot_released".to_string()));
+    assert_eq!(
+        own.iter().filter(|k| *k == "slot_waited").count(),
+        1,
+        "one slot_waited for the whole wait: {own:?}"
+    );
+}
+
+/// A holder whose pid dies frees its slot on the next acquire —
+/// nothing kills the work, the slot just stops being owed by a corpse.
+/// The hold binds to a lane shell's pid: killing the shell kills the
+/// hold's owner.
+#[test]
+fn slot_dead_holder_is_reaped() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let mut holder = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", holder.pid());
+    // The holder's child claims its own pane — `$$` in the shell is
+    // the planted pane pid itself.
+    let g = holder.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": holder.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(g["ok"], true, "{g}");
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    holder.child.kill().unwrap();
+    holder.child.wait().unwrap(); // reap the zombie so kill(pid,0) answers ESRCH
+    let g2 = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(g2["granted"], true, "dead holder's slot must free");
+    // The reap names the cause on the dead lane's stream.
+    let evs = d.events("dev-1");
+    assert!(
+        evs.iter()
+            .any(|e| e["kind"].as_str() == Some("slot_released")
+                && e["payload"]["reason"].as_str() == Some("holder died")),
+        "{evs:?}"
+    );
+    // Releasing the dead token is a named refusal, not a silent pass
+    // — and nobody can claim the dead pid anyway.
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": token, "pid": std::process::id()}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("Unknown slot token"), "{err}");
+}
+
+/// BLOCKER: two callers sharing a request_id — the second queues, it
+/// never adopts the first's hold; a same-identity re-poll does. The
+/// "different pid" is the test's own parent — a second pid on the
+/// connection's ancestry that may legitimately be claimed (CAD-113).
+#[test]
+fn slot_duplicate_request_id_different_pid_queues() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let parent = std::os::unix::process::parent_id();
+    let g1 = slot_acquire_pid(&d, "build", SELF_LANE, parent, "r1");
+    assert_eq!(g1["granted"], true);
+    // Same request_id claiming a different pid — a different caller:
+    // queued, never granted the first's hold.
+    let q = slot_acquire(&d, "build", SELF_LANE, "r1");
+    assert_eq!(q["granted"], false, "must not adopt another caller's hold");
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert_eq!(s["waiting"].as_array().unwrap().len(), 1);
+    // The true holder re-polls and still gets its own token.
+    let again = slot_acquire_pid(&d, "build", SELF_LANE, parent, "r1");
+    assert_eq!(again["token"], g1["token"]);
+}
+
+/// BLOCKER: release binds to the holding (lane, pid) — both derived
+/// from the connection now. A foreign lane's release is a named
+/// refusal; a claimed pid off the caller's own ancestry is refused
+/// before the token is even looked at. The hold survives both.
+#[test]
+fn slot_release_foreign_caller_is_rejected() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let mut foreign = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-2", foreign.pid());
+    let g = slot_acquire(&d, "build", SELF_LANE, "r1");
+    let token = g["token"].as_str().unwrap().to_string();
+    // The foreign lane knows the token but its derived lane doesn't
+    // match the hold — refused. (The `pid` claim is honest here.)
+    let f = foreign.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": token, "pid": foreign.pid()}),
+    );
+    assert_eq!(f["ok"], false, "{f}");
+    assert!(
+        f["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("another caller"),
+        "{f}"
+    );
+    // A claimed pid off the caller's own chain — a sibling lane's pid
+    // is a live pid the shell does not descend from — is refused
+    // outright, before the token is even looked at.
+    let sibling = LaneShell::spawn(home.path());
+    let f = foreign.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": token, "pid": sibling.pid()}),
+    );
+    assert_eq!(f["ok"], false, "{f}");
+    assert!(
+        f["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot claim"),
+        "{f}"
+    );
+    // The hold still stands — the pool stays full.
+    let q = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(q["granted"], false, "failed release must not free the slot");
+    // And the true holder releases normally.
+    slot_release(&d, &token, SELF_LANE, std::process::id());
+}
+
+/// ACCEPTANCE: `slot_status` reveals a token only to the connection
+/// whose derived identity owns the hold — two real lanes. The owner
+/// sees its token; a foreign lane passing the owner's `lane` sees the
+/// hold but never the token (CAD-113 identity fork, option A).
+#[test]
+fn slot_status_reveals_tokens_only_to_the_owner() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut owner = LaneShell::spawn(home.path());
+    plant_pane(&d, "owner", owner.pid());
+    plant_self(&d); // the foreign observer
+    let g = owner.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": owner.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(g["result"]["granted"], true, "{g}");
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    // The owner's own status reveals its token — via the real CLI
+    // too: the cadence child derives this lane from its ancestry.
+    let s = owner.rpc(&d.state, "slot_status", json!({}));
+    let held = s["result"]["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held[0]["token"], token, "owner sees its own token");
+    let (rc, out) = owner.cadence(&d.state, "build-slot status --json");
+    assert_eq!(rc, 0, "{out}");
+    let cli: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        cli["pools"]["build"]["held"][0]["token"], token,
+        "owner CLI sees its own token"
+    );
+    // The foreign lane's status sees the hold but not the token —
+    // even naming the owner's lane in the request.
+    let s = d.rpc("slot_status", json!({"lane": "owner"})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1);
+    assert!(
+        held[0].get("token").is_none(),
+        "foreign caller must not see the token: {held:?}"
+    );
+    assert_eq!(held[0]["lane"], "owner");
+}
+
+/// ACCEPTANCE: a `slot_acquire` whose claimed `pid` is not the socket
+/// peer or one of its /proc ancestors is refused — the daemon never
+/// rebinds it (CAD-113 identity fork, option A).
+#[test]
+fn slot_acquire_refuses_a_pid_off_the_caller_chain() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut lane = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", lane.pid());
+    // A sibling lane's pid is live but off this caller's ancestry.
+    let other = LaneShell::spawn(home.path());
+    let r = lane.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": other.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot claim"),
+        "{r}"
+    );
+    // Nothing queued or held under either identity.
+    plant_self(&d);
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert!(s["waiting"].as_array().unwrap().is_empty());
+    assert!(s["pools"]["build"]["held"].as_array().unwrap().is_empty());
+    // An honest claim — the caller's own pid — grants normally.
+    let g = lane.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": lane.pid(), "request_id": "r2"}),
+    );
+    assert_eq!(g["result"]["granted"], true, "{g}");
+}
+
+/// ACCEPTANCE: a caller detached from every registered pane derives
+/// no identity at all — all three slot RPCs refuse it, and nothing is
+/// stamped `operator` (the PR-#71 fail-open pattern, closed here).
+#[test]
+fn slot_rpc_refuses_an_underivable_caller() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    // `stray` descends from the test process but nothing in its
+    // ancestry is a registered pty pane — no pane is planted for it.
+    let mut stray = LaneShell::spawn(home.path());
+    // `observer` is a real lane so we can inspect the pools afterward.
+    let mut observer = LaneShell::spawn(home.path());
+    plant_pane(&d, "observer", observer.pid());
+    for (method, params) in [
+        (
+            "slot_acquire",
+            json!({"kind": "build", "pid": stray.pid(), "request_id": "r1"}),
+        ),
+        (
+            "slot_release",
+            json!({"token": "slot-x", "pid": stray.pid()}),
+        ),
+        ("slot_status", json!({})),
+    ] {
+        let r = stray.rpc(&d.state, method, params);
+        assert_eq!(r["ok"], false, "{method}: {r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("caller identity underivable"),
+            "{method} must refuse identity-less callers: {r}"
+        );
+    }
+    // Nothing was recorded — and especially not as `operator`.
+    let s = observer.rpc(&d.state, "slot_status", json!({}));
+    assert_eq!(s["ok"], true, "{s}");
+    assert!(s["result"]["waiting"].as_array().unwrap().is_empty());
+    assert!(s["result"]["pools"]["build"]["held"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(
+        !s["result"].to_string().contains("operator"),
+        "no operator identity may appear: {}",
+        s["result"]
+    );
+}
+
+/// BLOCKER (r3): `slot_acquired` rides the victim's event stream —
+/// readable by any local caller via `agent_events`. It must never
+/// carry the token: token+lane+pid are the entire release credential,
+/// so a peer's stream can never be mined for one. (r5: the victim is
+/// a real second connection identity — a lane shell.)
+#[test]
+fn slot_acquired_event_cannot_release_a_peers_hold() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut victim = LaneShell::spawn(home.path());
+    plant_pane(&d, "victim", victim.pid());
+    plant_self(&d); // the snoop: every d.rpc runs as SELF_LANE
+    let g = victim.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": victim.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(g["ok"], true, "{g}");
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    // The peer reads the victim's stream — sees the acquisition…
+    let ev = d
+        .events("victim")
+        .into_iter()
+        .find(|e| e["kind"].as_str() == Some("slot_acquired"))
+        .expect("victim emitted slot_acquired");
+    assert!(
+        ev["payload"].get("token").is_none() && !ev["payload"].to_string().contains(&token),
+        "slot_acquired leaks the release credential: {}",
+        ev["payload"]
+    );
+    // …but the visible fields can't release anything: a guessed token
+    // is an unknown-token rejection and the hold survives.
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": "slot-guess", "pid": std::process::id()}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("Unknown slot token"), "{err}");
+    // Even the real token under a foreign identity is refused — the
+    // derived lane (pane-self) is not the hold's lane, whatever the
+    // request's `lane` field claims.
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": token, "lane": "victim", "pid": std::process::id()}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("another caller"), "{err}");
+    // And status passing the victim's lane still shows no token.
+    let s = d.rpc("slot_status", json!({"lane": "victim"})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1);
+    assert!(held[0].get("token").is_none(), "foreign token hidden");
+    // The owner releases normally under its own connection identity.
+    let r = victim.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": token, "pid": victim.pid()}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+}
+
+/// BLOCKER: holds survive a daemon restart — persisted slots.json is
+/// revalidated at boot: live holders keep their slots (never
+/// re-granted), dead holders are dropped with a named reason.
+#[test]
+fn slot_restart_revalidates_holders() {
+    let state = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let d = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    // Two holds: one bound to a lane shell that dies before the
+    // restart, one bound to the test process which outlives it.
+    let mut doomed = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", doomed.pid());
+    let g = doomed.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": doomed.pid(), "request_id": "r0"}),
+    );
+    assert_eq!(g["ok"], true, "{g}");
+    plant_self(&d);
+    let live = slot_acquire(&d, "build", SELF_LANE, "r1");
+    assert_eq!(live["granted"], true);
+    let live_tok = live["token"].as_str().unwrap().to_string();
+    let live_pid = std::process::id();
+    doomed.child.kill().unwrap();
+    doomed.child.wait().unwrap();
+    drop(d); // shutdown → serve returns → state dir kept
+    let d2 = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    // The agent rows persisted but a clean shutdown clears endpoint
+    // fields — re-stamp the live pane's facts before deriving.
+    plant_pane(&d2, SELF_LANE, live_pid);
+    // The live hold survived with its token intact; the dead one's
+    // slot was reaped — one held, one free.
+    let s = d2.rpc("slot_status", json!({})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "one live holder survives: {held:?}");
+    assert_eq!(held[0]["token"], live_tok);
+    assert_eq!(held[0]["pid"], live_pid);
+    // The boot reap named the dead holder's cause on its lane.
+    let evs = d2.events("dev-1");
+    assert!(
+        evs.iter()
+            .any(|e| e["kind"].as_str() == Some("slot_released")
+                && e["payload"]["reason"].as_str() == Some("holder died")),
+        "{evs:?}"
+    );
+    // And an acquire never re-grants the survivor's slot — one free
+    // slot grants once, then the pool is full again.
+    let g = slot_acquire(&d2, "build", SELF_LANE, "r9");
+    assert_eq!(g["granted"], true);
+    let q = slot_acquire(&d2, "build", SELF_LANE, "r10");
+    assert_eq!(q["granted"], false, "restarted holds keep the pool bounded");
+    // The survivor still releases by its minted token.
+    slot_release(&d2, &live_tok, SELF_LANE, live_pid);
+}
+
+/// Regression for CI 35542407390: a planted pane row must survive a
+/// daemon restart's relaunch sweep untouched. The sweep relaunches
+/// every enabled actor-owning row; an actor whose open can't verify
+/// the planted pane exit-detaches it — clearing the pid/generation
+/// the caller-identity pane map resolves by — or a real open's
+/// `set_identity` overwrites it. Either way the next slot call fails
+/// closed ("descends from no registered pane"). plant_pane's rows are
+/// actorless (`inbox` pair) and `enabled=0`, so the sweep never
+/// touches them: the planted facts persist through the whole window.
+#[test]
+fn slot_planted_pane_row_survives_restart() {
+    let state = TempDir::new().unwrap();
+    let live_pid = std::process::id();
+    let d = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    plant_pane(&d, SELF_LANE, live_pid);
+    let g = slot_acquire(&d, "build", SELF_LANE, "r1");
+    assert_eq!(g["granted"], true, "{g}");
+    // Canary in the pre-fix shape — an enabled (fake, pty) row the boot
+    // relaunch sweep must launch. Its actor's adapter build fails
+    // deterministically and the exit-detach emits `attention`. The alias
+    // sorts after every other agent, so once its outcome lands the sweep
+    // has spawned an actor for every earlier row.
+    let conn = rusqlite::Connection::open(state.path().join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,
+            state,enabled,pid,generation,session_id,created,updated)
+         VALUES('zz-canary','fake','pty','worker',?1,'read-only',
+            'stopped',1,0,'planted','planted',0,0)",
+        [state.path().to_str().unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+    drop(d);
+    let d2 = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    plant_pane(&d2, SELF_LANE, live_pid);
+    // Positive window-closed signal (CAD-221): never assert absence
+    // inside a window that may not have opened. The canary's `attention`
+    // proves the sweep ran and an actor outcome landed on the very path
+    // that would destroy a vulnerable planted row — the lane assertion
+    // below is made only after that window provably closed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if d2
+            .events("zz-canary")
+            .iter()
+            .any(|e| e["kind"].as_str() == Some("attention"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "canary never detached — the relaunch sweep did not run: {:?}",
+            d2.events("zz-canary")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let conn = rusqlite::Connection::open(state.path().join("cadence.sqlite3")).unwrap();
+    let p: i64 = conn
+        .query_row("SELECT pid FROM agents WHERE alias=?", [SELF_LANE], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(p as u32, live_pid, "no actor clobbered the plant");
+    assert!(
+        !d2.events(SELF_LANE)
+            .iter()
+            .any(|e| e["kind"].as_str() == Some("attention")),
+        "no actor should ever have launched: {:?}",
+        d2.events(SELF_LANE)
+    );
+    let g = slot_acquire(&d2, "build", SELF_LANE, "r9");
+    assert_eq!(g["granted"], true, "{g}");
+}
+
+/// `starve_secs` promotes a long waiter ahead of a priority lane:
+/// priority wins inside the window, the starved waiter wins after it.
+/// The slot clock is injected — the test advances it instead of
+/// sleeping, so timing stays exact under host load. The waiter lanes
+/// are real connection identities — one lane shell each (CAD-113).
+#[test]
+fn slot_starve_promotes_long_waiter() {
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let d = TestDaemon::start_opts(slot_opts_clock(1, 1, 3, &["qa-1"], Some(clock.clone())));
+    let home = TempDir::new().unwrap();
+    plant_self(&d);
+    let mut dev = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-2", dev.pid());
+    let mut qa = LaneShell::spawn(home.path());
+    plant_pane(&d, "qa-1", qa.pid());
+    let h1 = slot_acquire(&d, "build", SELF_LANE, "h1")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Ordinary waiter first, priority waiter second.
+    let w = dev.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": dev.pid(), "request_id": "w1"}),
+    );
+    assert_eq!(w["result"]["granted"], false, "{w}");
+    let w = qa.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "test", "pid": qa.pid(), "request_id": "w2"}),
+    );
+    assert_eq!(w["result"]["granted"], false, "{w}");
+    slot_release(&d, &h1, SELF_LANE, std::process::id());
+    // Inside the starve window the reviewer lane's test wins.
+    let g = qa.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "test", "pid": qa.pid(), "request_id": "w2"}),
+    );
+    assert_eq!(
+        g["result"]["granted"], true,
+        "priority lane should outrank: {g}"
+    );
+    let w2 = g["result"]["token"].as_str().unwrap().to_string();
+    // Once w1 has waited past starve_secs it outranks even a new
+    // priority request — the never-starve bound.
+    clock.store(4, std::sync::atomic::Ordering::Relaxed);
+    let w = qa.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "test", "pid": qa.pid(), "request_id": "w3"}),
+    );
+    assert_eq!(w["result"]["granted"], false, "{w}");
+    let r = qa.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": w2, "pid": qa.pid()}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let g = dev.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": dev.pid(), "request_id": "w1"}),
+    );
+    assert_eq!(
+        g["result"]["granted"], true,
+        "starved waiter must outrank priority: {g}"
+    );
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    let w3 = s["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["request_id"] == "w3")
+        .expect("w3 still queued");
+    assert_eq!(w3["priority"], true);
+}
+
+/// suite draws on its own pool — a full suite queue never jams the
+/// build lanes, and `test` shares the build pool. The two pool users
+/// claim different pids on this connection's own ancestry (CAD-113):
+/// the cross-pool deadlock guard keys on `(lane, pid)`, so the same
+/// process must never hold one pool while queueing the other.
+#[test]
+fn slot_pools_are_independent() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let me = std::process::id();
+    let parent = std::os::unix::process::parent_id();
+    assert_eq!(
+        slot_acquire_pid(&d, "suite", SELF_LANE, me, "s1")["granted"],
+        true
+    );
+    assert_eq!(
+        slot_acquire_pid(&d, "suite", SELF_LANE, me, "s2")["granted"],
+        false,
+        "second suite must queue"
+    );
+    // The suite pool being full does not touch build.
+    assert_eq!(
+        slot_acquire_pid(&d, "build", SELF_LANE, parent, "b1")["granted"],
+        true
+    );
+    // test shares the build pool — now full too.
+    assert_eq!(
+        slot_acquire_pid(&d, "test", SELF_LANE, parent, "t1")["granted"],
+        false
+    );
+}
+
+/// The CLI: `--wait-secs 0` fails fast with a named error, a free slot
+/// grants a bare token, release returns it, and `status` shows the
+/// pool both ways.
+#[test]
+fn build_slot_cli_acquire_release_status() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let t1 = slot_acquire(&d, "build", SELF_LANE, "r1")["token"]
+        .as_str()
+        .unwrap()
+        .to_string(); // build pool full
+    let me = std::process::id().to_string(); // the CLI child's parent
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "acquire",
+            "build",
+            "--wait-secs",
+            "0",
+            "--pid",
+            &me,
+        ],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("No build slot free"), "{err}");
+    // --pid is required — a bare acquire refuses rather than binding
+    // a transient parent the work outlives.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "acquire", "build", "--wait-secs", "0"],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--pid"));
+    // Free it through the CLI — release names the holding lane; the
+    // default pid (the CLI's parent = this test) matches the hold.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "release", &t1, "--lane", "dev-1"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("released slot-"));
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "acquire",
+            "build",
+            "--wait-secs",
+            "0",
+            "--lane",
+            "dev-9",
+            "--pid",
+            &me,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        token.starts_with("slot-"),
+        "bare minted token on stdout: {token:?}"
+    );
+    // The token round-trips: release by exactly what acquire printed,
+    // same lane, same default pid.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "release", &token, "--lane", "dev-9"],
+    );
+    assert!(out.status.success());
+    // `--lane` is advisory only (CAD-113): the daemon derives the
+    // caller's lane from the connection, so a release naming another
+    // lane still acts on — and only on — the caller's own hold.
+    let g = slot_acquire(&d, "build", SELF_LANE, "r9");
+    let t9 = g["token"].as_str().unwrap().to_string();
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "release", &t9, "--lane", "dev-2"],
+    );
+    assert!(
+        out.status.success(),
+        "own hold releases whatever --lane claims: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // status --json shows the empty pool; bad kind is a named error.
+    let out = cadence_at(home.path(), &d.state, &["build-slot", "status", "--json"]);
+    let s: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(s["pools"]["build"]["held"].as_array().unwrap().is_empty());
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "acquire",
+            "bogus",
+            "--wait-secs",
+            "0",
+            "--pid",
+            &me,
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("build, test or suite"));
+}
+
+/// `cadence status` carries the slot line — table and --json agree.
+#[test]
+fn status_footer_shows_slots() {
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    plant_self(&d);
+    slot_acquire(&d, "build", SELF_LANE, "r1");
+    slot_acquire(&d, "build", SELF_LANE, "r2");
+    slot_acquire(&d, "build", SELF_LANE, "r3"); // the waiter
+    let home = TempDir::new().unwrap();
+    let out = cadence_at(home.path(), &d.state, &["status"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("slots: 2/2 build, 0/1 suite; waiting: 1"),
+        "{text}"
+    );
+    let out = cadence_at(home.path(), &d.state, &["status", "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["footer"]["slots"]["pools"]["build"]["held"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(v["footer"]["slots"]["waiting"].as_array().unwrap().len(), 1);
+}
+
+/// `issue start` writes the worktree slot env: `CARGO_BUILD_JOBS` from
+/// `[host] jobs_per_lane` plus the helper path — idempotent, and a
+/// foreign line in an existing `.env` survives.
+#[test]
+fn issue_start_writes_slot_env() {
+    let d = TestDaemon::start();
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]).0);
+    assert!(cli(&["issue", "new", "One", "--project", "demo"]).0);
+    // The [host] override lands before the start reads it.
+    let pm_yaml = pm_dir.join("pm.yaml");
+    let mut yaml = std::fs::read_to_string(&pm_yaml).unwrap();
+    yaml.push_str("host:\n  jobs_per_lane: 7\n");
+    std::fs::write(&pm_yaml, yaml).unwrap();
+    let (ok, out) = cli(&["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let env_file = PathBuf::from(out["slot_env"]["path"].as_str().unwrap());
+    assert_eq!(
+        env_file,
+        Path::new(out["worktree"].as_str().unwrap()).join(".env")
+    );
+    let text = std::fs::read_to_string(&env_file).unwrap();
+    assert!(text.contains("CARGO_BUILD_JOBS=7"), "{text}");
+    assert!(text.contains("CADENCE_BUILD_SLOT="), "{text}");
+    assert!(text.contains("cadence"), "{text}");
+    // Created 0600 — the file may hold build secrets someday.
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // A second start is idempotent and keeps foreign lines — and an
+    // existing file's mode survives the atomic rewrite.
+    std::fs::write(&env_file, format!("OTHER=1\n{text}")).unwrap();
+    std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let (ok, _) = cli(&["issue", "start", "D-1"]);
+    assert!(ok);
+    let text = std::fs::read_to_string(&env_file).unwrap();
+    assert_eq!(text.matches("CARGO_BUILD_JOBS=").count(), 1, "{text}");
+    assert!(text.contains("OTHER=1"), "{text}");
+    assert_eq!(
+        std::fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o640,
+        "existing mode preserved"
+    );
+    drop(d);
+}
+
+/// `build-slot run` binds the hold to the REAL command process: the
+/// CLI acquires with its own pid then execs, so the slot's holder IS
+/// the running command — its exit frees the slot.
+#[test]
+fn build_slot_run_binds_the_real_process() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "build-slot",
+            "run",
+            "build",
+            "--wait-secs",
+            "5",
+            "--",
+            "sleep",
+            "30",
+        ])
+        .env("HOME", home.path())
+        .envs(test_env().vars())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // After exec the spawned pid IS `sleep 30` — the hold must bind
+    // to exactly that process, not a wrapper that already exited.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = d.rpc("slot_status", json!({"lane": "unknown"})).unwrap();
+        let held = s["pools"]["build"]["held"].as_array().unwrap();
+        if held
+            .iter()
+            .any(|h| h["pid"].as_u64() == Some(child.id() as u64))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "run never held the slot: {s}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The command's exit frees its slot on the next read.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let s = d.rpc("slot_status", json!({"lane": "unknown"})).unwrap();
+    assert!(
+        s["pools"]["build"]["held"].as_array().unwrap().is_empty(),
+        "the command's exit frees its slot: {s}"
+    );
+    // A short command exits cleanly through run.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "run",
+            "build",
+            "--wait-secs",
+            "5",
+            "--",
+            "true",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The CLI's queued path: `--wait-secs > 0` polls until a release
+/// frees the pool — and `--pid` binds the hold to the named holder
+/// (this test process, the CLI's parent).
+#[test]
+fn build_slot_cli_wait_then_grant() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let t1 = slot_acquire(&d, "build", SELF_LANE, "r1")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let me = std::process::id().to_string();
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "build-slot",
+            "acquire",
+            "build",
+            "--wait-secs",
+            "15",
+            "--lane",
+            "dev-9",
+            "--pid",
+            &me,
+        ])
+        .env("HOME", home.path())
+        .envs(test_env().vars())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Let it queue — the waiter shows in status, then a release
+    // frees the pool and the next poll grants.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = d.rpc("slot_status", json!({"lane": "dev-9"})).unwrap();
+        if !s["waiting"].as_array().unwrap().is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "CLI never queued: {s}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    slot_release(&d, &t1, SELF_LANE, std::process::id());
+    let out = cli.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(token.starts_with("slot-"), "minted token: {token}");
+    // The explicit --pid bound the hold to the named pid — the test
+    // process, still alive. The CLI's `--lane dev-9` was advisory:
+    // the derived lane is this pane's alias.
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held[0]["pid"].as_u64().unwrap() as u32, std::process::id());
+    assert_eq!(held[0]["lane"], SELF_LANE);
+    slot_release(&d, &token, SELF_LANE, std::process::id());
 }

@@ -2,7 +2,9 @@
 //!
 //! The socket lives in a 0700 state directory and accepts only same-UID
 //! peers (`SO_PEERCRED`). That establishes same-user access — it is not a
-//! hostile same-user isolation boundary.
+//! hostile same-user isolation boundary. Slot RPCs additionally bind
+//! caller identity to the connection (CAD-113): the peer pid's /proc
+//! ancestry must reach a registered pane, or the call is refused.
 //!
 //! Each registered agent gets one actor thread that owns its provider
 //! adapter and serializes turns. The daemon relaunches enabled actors on
@@ -24,11 +26,12 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::adapter::{
-    self, registry, AdapterHooks, ProviderAdapter, ProviderEnv, ProviderRequest, TurnResult,
+    self, registry, AdapterHooks, Probe, ProviderAdapter, ProviderEnv, ProviderRequest, TurnResult,
 };
 use crate::client;
 use crate::error::{Error, Result};
 use crate::proto;
+use crate::slots::{SlotConfig, SlotKind, Slots};
 use crate::store::{self, Agent, Message, Store, Take};
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
@@ -84,8 +87,15 @@ const MONITOR_TICK: Duration = Duration::from_secs(1);
 const DAEMON_ALIAS: &str = Store::DAEMON_STREAM;
 /// `stall_secs` when neither the job nor the agent sets one.
 const DEFAULT_STALL_SECS: u64 = 1800;
-/// PTY screens are sampled at most this often while a turn runs — the
-/// bound is one capture per running pty agent per minute.
+/// `silent_end_secs` when the agent doesn't set one: ten minutes of
+/// probe-verified idle pane on a running message before
+/// `turn_silent_end` fires — long enough that a between-tools quiet
+/// spell never trips it.
+const DEFAULT_SILENT_END_SECS: u64 = 600;
+/// PTY screens are sampled at most this often while the pane is live —
+/// a running turn for activity/silent-end bookkeeping, an idle pane for
+/// menu/draft surfacing. The bound is one capture per pty agent per
+/// minute.
 const SCREEN_SAMPLE: Duration = Duration::from_secs(60);
 
 /// Screen sampling interval: this daemon's `ServeOptions` value when
@@ -111,6 +121,17 @@ fn epoch_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// Monotonic seconds since an arbitrary process-local epoch — the
+/// slot clock. NTP steps and wall-clock jumps cannot age a waiter or
+/// expire a hold; the wall epoch rides alongside only for restart
+/// persistence.
+fn mono_secs() -> f64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now)
+        .elapsed()
         .as_secs_f64()
 }
 
@@ -182,7 +203,31 @@ struct StallWatch {
     changed: u8,
     /// A capture in flight on its own thread — at most one per agent,
     /// so a wedged pane leaks one thread and never stalls the ticker.
-    sample_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// The sample carries the probe verdict beside the hash: a menu
+    /// frame is a human wait (never activity), an idle frame builds
+    /// the silent-end streak.
+    sample_rx: Option<std::sync::mpsc::Receiver<(String, Probe)>>,
+    /// Consecutive landed samples whose probe read the pane idle — a
+    /// silent end is proven by a streak, never one capture.
+    idle_samples: u8,
+    /// When the current idle streak began — `silent_end_secs`
+    /// measures from here.
+    idle_since: Option<Instant>,
+    /// The menu line while the sampled probe shows an approval menu —
+    /// `Some` is the menu-open flag: the rising edge fires
+    /// `approval_menu` once per menu, and the views read the line.
+    menu_line: Option<String>,
+    /// The menu lines `approval_menu` has already fired for — a small
+    /// bounded history, not just the last one: menus that alternate
+    /// subjects across non-menu samples must not re-fire on every
+    /// re-detection.
+    menu_evented: std::collections::VecDeque<String>,
+    /// `turn_silent_end` already fired for this message — the event
+    /// is once per message, never twice.
+    silent_end_sent: bool,
+    /// The last landed probe verdict — rides `turn_silent_end`'s
+    /// payload as evidence.
+    last_probe: Option<Probe>,
     /// Stall episodes seen for `message`; each mints a distinct notice
     /// dedupe so a resume + re-stall notifies again.
     episodes: u64,
@@ -200,7 +245,42 @@ impl Default for StallWatch {
             candidate: None,
             changed: 0,
             sample_rx: None,
+            idle_samples: 0,
+            idle_since: None,
+            menu_line: None,
+            menu_evented: std::collections::VecDeque::new(),
+            silent_end_sent: false,
+            last_probe: None,
             episodes: 0,
+        }
+    }
+}
+
+/// What `stall_view` hands a view: the silence age, the open stall
+/// episode, and the sampled pane verdict (menu line, idle-streak age,
+/// once-fired silent-end flag).
+struct StallView {
+    silent_secs: u64,
+    stalled: bool,
+    menu: Option<String>,
+    ended_secs: Option<u64>,
+    silent_ended: bool,
+}
+
+impl StallView {
+    /// Write the view fields onto an agent/task JSON row — the same
+    /// keys `agent_list`/`agent_show`/`job show` consumers read.
+    fn apply(&self, j: &mut Value) {
+        j["silent_secs"] = json!(self.silent_secs);
+        j["stalled"] = json!(self.stalled);
+        if let Some(line) = &self.menu {
+            j["pane_menu"] = json!(line);
+        }
+        if let Some(secs) = self.ended_secs {
+            j["ended_secs"] = json!(secs);
+        }
+        if self.silent_ended {
+            j["silent_ended"] = json!(true);
         }
     }
 }
@@ -271,6 +351,13 @@ pub struct Shared {
     /// shutdown marker, so the next daemon can prove a marker belongs
     /// to the immediately preceding run (CAD-89).
     instance: String,
+    /// CAD-113 build-slot registry — holds persist to slots.json and
+    /// are revalidated at boot; the queue itself is in-memory (its
+    /// callers re-poll anyway).
+    slots: Mutex<Slots>,
+    /// The slot clock — `mono_secs` in production, injectable so the
+    /// integration suite advances starvation/age without sleeping.
+    slot_clock: Arc<dyn Fn() -> f64 + Send + Sync>,
 }
 
 impl Shared {
@@ -285,7 +372,17 @@ impl Shared {
         let store = Store::open_adopting(&state_dir.join("cadence.sqlite3"), marker)?;
         let provider_log_dir = state_dir.join("agents");
         std::fs::create_dir_all(&provider_log_dir)?;
-        Ok(Arc::new(Self {
+        // CAD-113: slot holds persist under the state dir; restore
+        // revalidates them against live processes BEFORE the socket
+        // opens, so a restart never forgets or double-grants a hold.
+        let slot_clock = opts
+            .slot_clock
+            .clone()
+            .unwrap_or_else(|| Arc::new(mono_secs));
+        let mut slots = Slots::new(resolve_slot_config(opts));
+        slots.persist_to(state_dir.join("slots.json"));
+        let boot_events = slots.restore(crate::slots::SlotClock::at(slot_clock(), epoch_secs()));
+        let shared = Arc::new(Self {
             store,
             changed: Notify::new(),
             pending: Mutex::new(HashMap::new()),
@@ -299,7 +396,13 @@ impl Shared {
             started_at: epoch_secs(),
             stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
             instance,
-        }))
+            slots: Mutex::new(slots),
+            slot_clock,
+        });
+        // Holds dropped by boot-time revalidation get their release
+        // events now that the store-backed emitter exists.
+        shared.emit_slot_events(boot_events);
+        Ok(shared)
     }
 
     fn wake(&self) {
@@ -943,7 +1046,14 @@ impl Shared {
 
     // ---- dispatch ----
 
-    pub fn dispatch(self: &Arc<Self>, method: &str, params: &Value) -> Result<Value> {
+    /// The socket peer's `SO_PEERCRED` pid binds slot and approval-answer
+    /// caller identity; clients cannot supply this identity.
+    pub fn dispatch(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         match method {
             "health" => Ok(json!({
                 "state": "ready",
@@ -984,9 +1094,8 @@ impl Shared {
                     if let Some(inbox) = self.store.inbox_status(&agent.alias)? {
                         j["inbox"] = inbox;
                     }
-                    if let Some((silent_secs, stalled)) = self.stall_view(&agent.alias) {
-                        j["silent_secs"] = json!(silent_secs);
-                        j["stalled"] = json!(stalled);
+                    if let Some(view) = self.stall_view(&agent.alias) {
+                        view.apply(&mut j);
                     }
                     agents.push(j);
                 }
@@ -1002,9 +1111,8 @@ impl Shared {
                 let (dead, resumable) = self.agent_liveness(&agent);
                 agent_json["dead"] = json!(dead);
                 agent_json["resumable"] = json!(resumable);
-                if let Some((silent_secs, stalled)) = self.stall_view(&alias) {
-                    agent_json["silent_secs"] = json!(silent_secs);
-                    agent_json["stalled"] = json!(stalled);
+                if let Some(view) = self.stall_view(&alias) {
+                    view.apply(&mut agent_json);
                 }
                 // The briefing lives under the state dir — actors read
                 // it there, never inside their cwd repository.
@@ -1054,6 +1162,7 @@ impl Shared {
             "agent_ready" => self.rpc_ready(params),
             "agent_capture" => self.rpc_capture(params),
             "agent_probe" => self.rpc_probe(params),
+            "agent_answer" => self.rpc_answer(params, peer_pid),
             "agent_set" => self.rpc_set(params),
             "agent_inbox" => self.rpc_inbox(params),
             "message_report" => self.rpc_message_report(params),
@@ -1158,8 +1267,144 @@ impl Shared {
                 let state = if started { "starting" } else { "attention" };
                 Ok(json!({"alias": alias, "state": state}))
             }
+            "slot_acquire" => self.rpc_slot_acquire(params, peer_pid),
+            "slot_release" => self.rpc_slot_release(params, peer_pid),
+            "slot_status" => self.rpc_slot_status(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
+    }
+
+    /// Slot lifecycle events ride the durable event stream addressed
+    /// to the requesting lane — an agent sees why its build waited in
+    /// its own `agent events` view.
+    fn emit_slot_events(&self, events: Vec<crate::slots::SlotEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        for (lane, kind, payload) in events {
+            let _ = self.store.event_public(&lane, kind, payload);
+        }
+        self.wake();
+    }
+
+    /// The slot caller's connection-bound identity (CAD-113): `lane`
+    /// is the alias of the registered pane the socket peer descends
+    /// from — the NEAREST pane on the chain wins, so the caller's own
+    /// pane beats any outer one and resolution never depends on map
+    /// order — and the returned `Vec` is every pid the caller may bind
+    /// a hold to: the peer itself plus its /proc ancestors (`acquire
+    /// --pid $$` claims the invoking shell). Fail-closed: an
+    /// unreadable ancestry or no pane match refuses the call — there
+    /// is no `operator` fallback; a caller detached from every pane
+    /// holds no lane at all.
+    fn slot_caller(&self, peer_pid: u32) -> Result<(String, Vec<u32>)> {
+        let chain = adapter::pty::caller_chain(peer_pid).ok_or_else(|| {
+            Error::rejected(format!(
+                "Slot caller pid {peer_pid}: /proc ancestry unreadable — \
+                 caller identity underivable"
+            ))
+        })?;
+        let panes: HashMap<u32, String> = self
+            .store
+            .pty_endpoint_facts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
+            .collect();
+        let lane = chain
+            .iter()
+            .find_map(|p| panes.get(p))
+            .cloned()
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "Slot caller pid {peer_pid} descends from no registered \
+                     pane — caller identity underivable"
+                ))
+            })?;
+        Ok((lane, chain))
+    }
+
+    /// The pid a slot request may bind: the socket peer itself or one
+    /// of its /proc ancestors — anything else is a foreign pid and the
+    /// request is refused, not rebound. `pid` absent means the peer.
+    fn claimed_slot_pid(params: &Value, chain: &[u32], peer_pid: u32) -> Result<u32> {
+        let pid = optional_u64(params, "pid")
+            .map(|p| p as u32)
+            .unwrap_or(peer_pid);
+        if pid == 0 || !chain.contains(&pid) {
+            return Err(Error::rejected(format!(
+                "Slot caller pid {peer_pid} cannot claim pid {pid} — it is \
+                 not the connection peer or one of its ancestors"
+            )));
+        }
+        Ok(pid)
+    }
+
+    /// Non-blocking slot acquire (CAD-113) — the caller polls with a
+    /// stable `request_id`; each answer is granted-or-queue-position.
+    /// `lane`/`pid` are never taken from the request: identity is the
+    /// connection's, and a `pid` claim off the peer's own ancestry is
+    /// refused.
+    fn rpc_slot_acquire(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let (lane, chain) = self.slot_caller(peer_pid)?;
+        let kind = SlotKind::parse(required_str(params, "kind")?)?;
+        let request_id = required_str(params, "request_id")?;
+        if request_id.len() > 128 {
+            return Err(Error::rejected("Slot request_id must be <= 128 bytes"));
+        }
+        let pid = Self::claimed_slot_pid(params, &chain, peer_pid)?;
+        // `probe` is the read-only fast-fail: it answers granted or
+        // position without leaving a waiter in the queue.
+        let probe = params["probe"].as_bool().unwrap_or(false);
+        let (result, events) = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .acquire(
+                kind,
+                &lane,
+                pid,
+                request_id,
+                probe,
+                crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs()),
+            )?;
+        self.emit_slot_events(events);
+        Ok(result)
+    }
+
+    /// `slot_release` — the release must name the holding (lane,
+    /// pid): a token alone is not authority to free another
+    /// caller's slot. Both come from the connection: the lane is the
+    /// peer's derived pane and the pid must be on the peer's own
+    /// ancestry, so a caller can only ever name its own lineage.
+    fn rpc_slot_release(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let (lane, chain) = self.slot_caller(peer_pid)?;
+        let token = required_str(params, "token")?;
+        let pid = Self::claimed_slot_pid(params, &chain, peer_pid)?;
+        let (result, events) = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(token, &lane, pid, (self.slot_clock)())?;
+        self.emit_slot_events(events);
+        Ok(result)
+    }
+
+    /// `slot_status` — the pools and queue are public, but a hold's
+    /// token shows only to its owner: the caller whose derived lane
+    /// matches the hold and whose own ancestry includes the hold's
+    /// pid. A `lane` param is ignored — identity is the connection's.
+    fn rpc_slot_status(&self, _params: &Value, peer_pid: u32) -> Result<Value> {
+        let (lane, chain) = self.slot_caller(peer_pid)?;
+        let (status, events) = self.slots.lock().unwrap_or_else(|e| e.into_inner()).status(
+            crate::slots::SlotCaller {
+                lane: &lane,
+                pids: &chain,
+            },
+            (self.slot_clock)(),
+        );
+        self.emit_slot_events(events);
+        Ok(status)
     }
 
     fn rpc_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -1682,6 +1927,106 @@ impl Shared {
         Ok(out)
     }
 
+    /// The caller's derived identity for pane-attention verbs
+    /// (`answer`), from three signals a client cannot choose:
+    /// `/proc` ancestry from the `SO_PEERCRED` pid (a pid that descends
+    /// from an agent's pane root IS that agent), the pane's own
+    /// `CADENCE_ALIAS` env the peer still carries (a `setsid` detach
+    /// keeps it), and a shared controlling pty via fd targets (detach
+    /// keeps stdio). A pane must never act on its own pane state: a
+    /// worker that can reach the socket could otherwise self-sanction
+    /// the very decision the menu exists to gate.
+    ///
+    /// Deterministic: the target's pane is checked first — self-refusal
+    /// never loses to map order — then the others sorted by alias.
+    /// Fails closed: the fleet map itself must load (a store error is
+    /// a refusal, never an empty map that skips the self-check), and a
+    /// caller whose ancestry cannot be fully walked is never stamped
+    /// `operator` — while the target's pane is alive the ambiguity is
+    /// a refusal, after it is gone the stamp is `unknown`. `operator`
+    /// requires positive terminal evidence — the peer holding a pty
+    /// that is no pane's; a fully detached caller (no ancestry hit, no
+    /// env alias, no tty) matches nothing and is honestly `unknown`.
+    /// Returns `(by, by_kind)`; callers record `claimed_by` separately
+    /// when the supplied `by` disagrees.
+    fn derived_caller(
+        &self,
+        alias: &str,
+        peer_pid: u32,
+        verb: &str,
+    ) -> Result<(String, &'static str)> {
+        let facts = self.store.pty_endpoint_facts()?;
+        let chain = proc_ancestors(peer_pid);
+        let env_alias = caller_env_alias(peer_pid);
+        let member = |pane_pid: u32| -> bool {
+            chain.as_deref().is_some_and(|c| c.contains(&pane_pid))
+                || holds_pane_tty(peer_pid, pane_pid)
+        };
+        if let Some((_, pane_pid, _)) = facts.get(alias) {
+            if member(*pane_pid) || env_alias.as_deref() == Some(alias) {
+                return Err(Error::rejected(format!(
+                    "a pane cannot {verb} its own pane — the caller is tied \
+                     to the target's pane process",
+                )));
+            }
+        }
+        let mut others: Vec<(&String, &(String, u32, String))> =
+            facts.iter().filter(|(a, _)| a.as_str() != alias).collect();
+        others.sort_by_key(|(a, _)| *a);
+        for (a, (_, pane_pid, _)) in others {
+            if member(*pane_pid) || env_alias.as_deref() == Some(a.as_str()) {
+                return Ok((a.clone(), "agent"));
+            }
+        }
+        // `/proc/<pid>` is a directory — `read_link` on it is always
+        // EINVAL, so liveness is a `metadata` existence check.
+        let target_alive = facts
+            .get(alias)
+            .is_some_and(|(_, pid, _)| std::fs::metadata(format!("/proc/{pid}")).is_ok());
+        unmatched_caller(chain.is_some(), target_alive, peer_on_tty(peer_pid), verb)
+    }
+
+    /// `agent answer`: one menu-choice keystroke to a pane currently
+    /// probing `approval_menu` — the adapter re-probes and refuses
+    /// anything else, so the key can never land in a prompt or a
+    /// running turn. Records `approval_answered` with who answered
+    /// and the menu line the answer went to.
+    fn rpc_answer(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let choice = required_str(params, "choice")?;
+        let claimed_by = optional_str(params, "by");
+        let note = optional_str(params, "note");
+        // The answerer's identity is DERIVED, never claimed — see
+        // `derived_caller` for the signals and the fail-closed rule.
+        let (by, by_kind) = self.derived_caller(&alias, peer_pid, "answer")?;
+        let probe = self.adapter_for(&alias)?.answer_approval(choice)?;
+        let mut detail = json!({
+            "by": by,
+            "by_kind": by_kind,
+            "caller_pid": peer_pid,
+            "choice": choice,
+            "line": probe.reason.clone(),
+            "probe": probe.to_json(),
+        });
+        // A supplied `by` that disagrees with the derived identity is
+        // preserved as a claim, not an attribution.
+        if let Some(c) = claimed_by {
+            if c != by {
+                detail["claimed_by"] = json!(c);
+            }
+        }
+        if let Some(n) = note {
+            detail["note"] = json!(n);
+        }
+        let _ = self.store.event_public(&alias, "approval_answered", detail);
+        self.wake();
+        // An answered menu may be exactly what a queued head waits
+        // behind — wake the delivery loop rather than leaving it to
+        // sit out the gate backoff.
+        self.notify_agent(&alias);
+        Ok(json!({"alias": alias, "state": "answered", "choice": choice}))
+    }
+
     /// Merge key=value pairs into an agent's stored params — how an
     /// existing agent opts into `auto_ready=verified` post-launch.
     fn rpc_set(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -2138,9 +2483,8 @@ impl Shared {
                     j["kickoff"] = json!({"id": m.id, "state": m.state, "turn_id": m.turn_id});
                     if m.state == "running" {
                         if let Some(assignee) = &task.assignee {
-                            if let Some((silent_secs, stalled)) = self.stall_view(assignee) {
-                                j["silent_secs"] = json!(silent_secs);
-                                j["stalled"] = json!(stalled);
+                            if let Some(view) = self.stall_view(assignee) {
+                                view.apply(&mut j);
                             }
                         }
                     }
@@ -3058,62 +3402,92 @@ impl Shared {
     /// transition, if any. A turn that ends while stalled just ends —
     /// no recovery event is owed for a message that stopped running.
     fn stall_check(&self, alias: &str, ctl: &Arc<AgentCtl>) {
+        // The tracked head: the running turn when one is in flight,
+        // else the oldest still-waiting message — a pane menu that
+        // blocks its delivery must surface before any turn starts.
+        // And with nothing tracked at all a pty pane STILL samples:
+        // an approval raised on an idle pane is a needs-me signal the
+        // views and the `approval_menu` event must carry — menu
+        // detection only; stall/silent-end bookkeeping and message
+        // attribution need a started turn.
         let running = match self.store.running_message(alias) {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                let mut w = ctl.stall.lock().unwrap();
-                w.message = None;
-                w.stalled_at = None;
-                w.sample_at = None;
-                w.settled = None;
-                w.previous = None;
-                w.candidate = None;
-                w.changed = 0;
-                return;
-            }
+            Ok(m) => m,
             Err(_) => return,
+        };
+        let tracked: Option<Message> = match running {
+            Some(ref m) => Some(m.clone()),
+            None => match self.store.queued_head(alias) {
+                Ok(m) => m,
+                Err(_) => return,
+            },
         };
         let Ok(agent) = self.store.agent(alias) else {
             return;
         };
+        if tracked.is_none() && agent.endpoint_kind != "pty" {
+            // Nothing to watch on a non-pty endpoint — clear any
+            // stale watch so a later message starts clean.
+            let mut w = ctl.stall.lock().unwrap();
+            if w.message.is_some() {
+                *w = StallWatch::default();
+            }
+            return;
+        }
         // Store reads stay outside the stall lock — `stall_budget`
         // takes the conn mutex and no other path holds it in reverse.
-        let budget = self.stall_budget(&agent, &running);
+        let budget = running
+            .as_ref()
+            .map(|m| self.stall_budget(&agent, m))
+            .unwrap_or(0);
         let ad = ctl.adapter.lock().unwrap().clone();
         let mut w = ctl.stall.lock().unwrap();
-        if w.message.as_deref() != Some(running.id.as_str()) {
+        if w.message.as_deref() != tracked.as_ref().map(|m| m.id.as_str()) {
+            // The tracked subject changed (or drained) — the watch
+            // resets, but the fired-menu history is pane state, not
+            // message state: keeping it stops a menu that survives a
+            // message transition from re-firing its event.
+            let menu_evented = std::mem::take(&mut w.menu_evented);
             *w = StallWatch {
-                message: Some(running.id.clone()),
+                message: tracked.as_ref().map(|m| m.id.clone()),
+                menu_evented,
                 ..StallWatch::default()
             };
         }
         // An open brokered request means the provider is silent by
         // design — a human is thinking. That wait is activity.
-        if self
-            .pending
-            .lock()
-            .unwrap()
-            .values()
-            .any(|req| req.alias == alias)
-        {
+        let pending_req = running.is_some()
+            && self
+                .pending
+                .lock()
+                .unwrap()
+                .values()
+                .any(|req| req.alias == alias);
+        if pending_req {
             w.activity = Instant::now();
         }
         // The adapter's own clock when it keeps one — managed
         // transcripts stamp every provider notification.
-        if let Some(at) = ad.as_ref().and_then(|a| a.activity_at()) {
-            if at > w.activity {
-                w.activity = at;
+        if running.is_some() {
+            if let Some(at) = ad.as_ref().and_then(|a| a.activity_at()) {
+                if at > w.activity {
+                    w.activity = at;
+                }
             }
         }
         // PTY screens have no transport clock: captures run on their
         // own threads, one in flight per agent at most, so a slow or
         // wedged pane can never block the ticker (or any view that
-        // touches this lock). A finished sample lands here.
+        // touches this lock). A finished sample lands here carrying
+        // the probe verdict beside the hash — a menu frame is a human
+        // wait (never activity), an idle frame builds the silent-end
+        // streak.
+        let mut menu_rise: Option<String> = None;
+        let mut end_fire: Option<(u64, f64, Probe)> = None;
         if agent.endpoint_kind == "pty" {
             let mut landed = None;
             match w.sample_rx.as_ref().map(|rx| rx.try_recv()) {
-                Some(Ok(hash)) => {
-                    landed = Some(hash);
+                Some(Ok(sample)) => {
+                    landed = Some(sample);
                     w.sample_rx = None;
                 }
                 // The sender is gone (capture failed) — release the
@@ -3124,8 +3498,53 @@ impl Shared {
                 }
                 _ => {}
             }
-            if let Some(hash) = landed {
-                if w.settled.as_deref() == Some(hash.as_str()) {
+            if let Some((hash, probe)) = landed {
+                // The verdict first: an open menu clears the idle
+                // streak and fires `approval_menu` on the rising edge
+                // only — and only once per distinct menu line, so a
+                // detection flicker cannot re-fire the same wait; an
+                // idle frame extends the streak; anything else (busy,
+                // draft) resets both clocks.
+                if probe.approval_menu {
+                    w.idle_samples = 0;
+                    w.idle_since = None;
+                    if w.menu_line.is_none() && !w.menu_evented.iter().any(|l| l == &probe.reason) {
+                        menu_rise = Some(probe.reason.clone());
+                        w.menu_evented.push_back(probe.reason.clone());
+                        // Bounded: the pane only ever renders a small
+                        // vocabulary of menu lines — 8 is far past
+                        // any alternating-subject cycle.
+                        while w.menu_evented.len() > 8 {
+                            w.menu_evented.pop_front();
+                        }
+                    }
+                    w.menu_line = Some(probe.reason.clone());
+                } else {
+                    // The menu closed — a re-request of the same
+                    // subject is a NEW wait and must re-fire, so the
+                    // fired-subject history resets with the menu. A
+                    // one-sample flicker between menu frames re-fires
+                    // a duplicate — noise is recoverable, a silently
+                    // missed approval is not.
+                    if w.menu_line.is_some() {
+                        w.menu_evented.clear();
+                    }
+                    w.menu_line = None;
+                    if probe.idle {
+                        w.idle_samples = w.idle_samples.saturating_add(1);
+                        if w.idle_since.is_none() {
+                            w.idle_since = Some(Instant::now());
+                        }
+                    } else {
+                        w.idle_samples = 0;
+                        w.idle_since = None;
+                    }
+                }
+                if running.is_none() {
+                    // Queued-head tracking is menu detection only —
+                    // the screen-hash churn below measures a turn's
+                    // activity and means nothing before it starts.
+                } else if w.settled.as_deref() == Some(hash.as_str()) {
                     // Still the settled screen — a candidate reverted
                     // without ever confirming; drop it.
                     w.candidate = None;
@@ -3138,8 +3557,10 @@ impl Shared {
                         // Second consecutive sighting, or a novel hash
                         // after the screen stayed changed for two
                         // samples — the change is real. A first-ever
-                        // settle only forms the baseline.
-                        if w.settled.is_some() {
+                        // settle only forms the baseline. A menu frame
+                        // never counts as turn activity: the wait is a
+                        // human's, and the silence clock must see it.
+                        if w.settled.is_some() && !probe.approval_menu {
                             w.activity = Instant::now();
                         }
                         w.previous = w.settled.take();
@@ -3152,6 +3573,7 @@ impl Shared {
                         w.candidate = Some(hash);
                     }
                 }
+                w.last_probe = Some(probe);
                 w.sample_at = Some(Instant::now());
             }
             if w.sample_rx.is_none()
@@ -3161,30 +3583,82 @@ impl Shared {
                 if let Some(ad) = ad {
                     let (tx, rx) = std::sync::mpsc::channel();
                     thread::spawn(move || {
-                        if let Ok(screen) = ad.capture() {
-                            let _ = tx.send(adapter::pty::activity_hash(&screen));
+                        if let Ok(sample) = ad.sample_screen() {
+                            let _ = tx.send(sample);
                         }
                     });
                     w.sample_rx = Some(rx);
                 }
             }
+            // The silent end: the durable message still runs but the
+            // pane probes idle — verified for `silent_end_secs` over
+            // at least three consecutive samples, never one capture,
+            // never while a menu or a brokered request explains the
+            // wait. The event fires once per message and flags it —
+            // the message itself is never auto-resolved.
+            let end_budget = if running.is_some() {
+                self.silent_end_budget(&agent)
+            } else {
+                0
+            };
+            if !w.silent_end_sent
+                && end_budget > 0
+                && !pending_req
+                && w.menu_line.is_none()
+                && w.idle_samples >= 3
+                && w.idle_since
+                    .is_some_and(|t| t.elapsed() >= Duration::from_secs(end_budget))
+            {
+                w.silent_end_sent = true;
+                if let Some(p) = w.last_probe.clone() {
+                    let age = w.idle_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                    let last_activity = epoch_secs() - w.activity.elapsed().as_secs_f64();
+                    end_fire = Some((age, last_activity, p));
+                }
+            }
         }
         let silent = w.activity.elapsed();
-        if let Some(stalled_at) = w.stalled_at {
+        // Everything the lock decided, applied after it's dropped —
+        // event writes take the store mutex and never run under `w`.
+        enum After {
+            Resume(Instant, u64),
+            Stall(u64, Duration),
+            Emit,
+        }
+        let after = if running.is_none() {
+            After::Emit
+        } else if let Some(stalled_at) = w.stalled_at {
             if w.activity > stalled_at {
                 let episode = w.episodes;
                 w.stalled_at = None;
-                drop(w);
-                self.stall_resumed(&agent, &running, stalled_at.elapsed(), episode);
+                After::Resume(stalled_at, episode)
+            } else {
+                After::Emit
             }
-            return;
-        }
-        if budget > 0 && silent >= Duration::from_secs(budget) {
+        } else if budget > 0 && silent >= Duration::from_secs(budget) {
             w.episodes += 1;
             w.stalled_at = Some(w.activity);
-            let episode = w.episodes;
-            drop(w);
-            self.stall_fired(&agent, &running, silent, episode);
+            After::Stall(w.episodes, silent)
+        } else {
+            After::Emit
+        };
+        drop(w);
+        if let Some(line) = menu_rise {
+            self.approval_menu_fired(&agent, tracked.as_ref(), &line, running.is_none());
+        }
+        if let Some((age, last_activity, probe)) = end_fire {
+            if let Some(m) = running.as_ref() {
+                self.silent_end_fired(&agent, m, age, last_activity, &probe);
+            }
+        }
+        match after {
+            After::Resume(at, episode) => {
+                self.stall_resumed(&agent, running.as_ref().unwrap(), at.elapsed(), episode)
+            }
+            After::Stall(episode, silent) => {
+                self.stall_fired(&agent, running.as_ref().unwrap(), silent, episode)
+            }
+            After::Emit => {}
         }
     }
 
@@ -3211,6 +3685,22 @@ impl Shared {
                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             })
             .unwrap_or(DEFAULT_STALL_SECS)
+    }
+
+    /// The idle-pane budget for `turn_silent_end`: the agent's
+    /// `silent_end_secs` param, else the default. `0` disables — a
+    /// still-running message on an idle pane is then only ever a
+    /// stall observation, never a silent-end verdict.
+    fn silent_end_budget(&self, agent: &Agent) -> u64 {
+        agent
+            .params
+            .as_ref()
+            .and_then(|p| p.get("silent_end_secs"))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(DEFAULT_SILENT_END_SECS)
     }
 
     /// `(job_id, task_id)` scope for a message's stall events — the
@@ -3263,6 +3753,78 @@ impl Shared {
         );
         self.wake();
         self.stall_notice(agent, message, episode, false, silent_secs);
+    }
+
+    /// `approval_menu`: the sampled pane just showed an approval menu
+    /// — recorded once per distinct menu line, carrying the line so
+    /// the row names what's being asked. `tracked` is the message it
+    /// blocks: `queued` marks it still-waiting rather than mid-turn,
+    /// and `None` means the pane is idle — the event fires as
+    /// `idle: true` and never attributes a message that does not
+    /// exist.
+    fn approval_menu_fired(
+        &self,
+        agent: &Agent,
+        tracked: Option<&Message>,
+        line: &str,
+        queued: bool,
+    ) {
+        let mut payload = json!({"line": line});
+        let (mut job_id, mut task_id) = (None, None);
+        if let Some(m) = tracked {
+            payload["message"] = json!(m.id);
+            let (j, t) = self.message_scope(m);
+            job_id = j;
+            task_id = t;
+            if queued {
+                payload["queued"] = json!(true);
+            }
+            if let Some(t) = task_id {
+                payload["task"] = json!(t);
+            }
+        } else {
+            payload["idle"] = json!(true);
+        }
+        let _ = self.store.event_public_scoped(
+            &agent.alias,
+            "approval_menu",
+            payload,
+            job_id.as_deref(),
+            task_id,
+        );
+        self.wake();
+    }
+
+    /// `turn_silent_end`: the durable message still runs but the pane
+    /// has probed idle for `silent_end_secs` — the provider ended
+    /// without reporting. Records the age and the admitting probe as
+    /// evidence; the message is flagged, never auto-resolved.
+    fn silent_end_fired(
+        &self,
+        agent: &Agent,
+        message: &Message,
+        age_secs: u64,
+        last_activity: f64,
+        probe: &Probe,
+    ) {
+        let (job_id, task_id) = self.message_scope(message);
+        let mut payload = json!({
+            "message": message.id,
+            "age_secs": age_secs,
+            "last_activity": last_activity,
+            "probe": probe.to_json(),
+        });
+        if let Some(t) = task_id {
+            payload["task"] = json!(t);
+        }
+        let _ = self.store.event_public_scoped(
+            &agent.alias,
+            "turn_silent_end",
+            payload,
+            job_id.as_deref(),
+            task_id,
+        );
+        self.wake();
     }
 
     /// The one notice an episode sends: a `job_event` to the PM for a
@@ -3347,15 +3909,35 @@ impl Shared {
         }
     }
 
-    /// The view-side snapshot for `agent show`/`agent list`/`job show`:
-    /// `(silent_secs, stalled)` while a message is running — `None`
-    /// when the agent has no in-flight turn.
-    fn stall_view(&self, alias: &str) -> Option<(u64, bool)> {
-        let running = self.store.running_message(alias).ok()??;
+    /// The live stall-watch facts a view renders while a message runs:
+    /// silence age, the open `turn_stalled` episode, and the sampled
+    /// pane verdict — the menu line while one's open, the idle
+    /// streak's age, and the once-fired silent-end flag. With no
+    /// in-flight turn the view only carries a menu line the queued
+    /// head is blocked behind; `None` when nothing is tracked at all.
+    fn stall_view(&self, alias: &str) -> Option<StallView> {
+        let running = self.store.running_message(alias).ok()?;
         let ctl = self.lifecycle.lock().unwrap().agents.get(alias)?.clone();
         let w = ctl.stall.lock().unwrap();
+        let Some(running) = running else {
+            // A queued head behind an open menu: only the menu line
+            // is meaningful — nothing has started or ended.
+            return w.menu_line.clone().map(|line| StallView {
+                silent_secs: 0,
+                stalled: false,
+                menu: Some(line),
+                ended_secs: None,
+                silent_ended: false,
+            });
+        };
         if w.message.as_deref() == Some(running.id.as_str()) {
-            return Some((w.activity.elapsed().as_secs(), w.stalled_at.is_some()));
+            return Some(StallView {
+                silent_secs: w.activity.elapsed().as_secs(),
+                stalled: w.stalled_at.is_some(),
+                menu: w.menu_line.clone(),
+                ended_secs: w.idle_since.map(|t| t.elapsed().as_secs()),
+                silent_ended: w.silent_end_sent,
+            });
         }
         // The watch hasn't ticked over this message yet — report
         // silence from its recorded start.
@@ -3363,7 +3945,13 @@ impl Shared {
             .started
             .map(|s| (epoch_secs() - s).max(0.0) as u64)
             .unwrap_or(0);
-        Some((silent, false))
+        Some(StallView {
+            silent_secs: silent,
+            stalled: false,
+            menu: None,
+            ended_secs: None,
+            silent_ended: false,
+        })
     }
 
     fn notify_agent(&self, alias: &str) {
@@ -3650,8 +4238,9 @@ fn optional_i64(params: &Value, field: &str) -> Option<i64> {
     params.get(field).and_then(Value::as_i64)
 }
 
-/// Reject peers that are not the same Unix user.
-fn check_peer(stream: &UnixStream) -> Result<()> {
+/// Reject peers that are not the same Unix user; return the peer PID
+/// used to derive slot and approval-answer caller identity.
+fn check_peer(stream: &UnixStream) -> Result<u32> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -3673,13 +4262,101 @@ fn check_peer(stream: &UnixStream) -> Result<()> {
     if cred.uid != unsafe { libc::geteuid() } {
         return Err(Error::rejected("Socket peer is not the same user"));
     }
-    Ok(())
+    Ok(cred.pid as u32)
+}
+
+/// The peer's ancestor chain (peer first, up to pid 1) — `None` when
+/// any `/proc` read fails mid-walk: an incomplete chain proves neither
+/// membership nor its absence, so callers must treat it as unverifiable
+/// rather than outside.
+fn proc_ancestors(mut pid: u32) -> Option<Vec<u32>> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while pid > 1 && seen.insert(pid) {
+        chain.push(pid);
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        pid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse().ok())?;
+    }
+    Some(chain)
+}
+
+/// The `CADENCE_ALIAS` the socket peer carries — pane env survives
+/// `setsid`, so a detached pane process still names its agent. An
+/// alias this daemon never registered means nothing (a stale or
+/// foreign daemon's env) — only registered panes match.
+fn caller_env_alias(peer_pid: u32) -> Option<String> {
+    let env = std::fs::read(format!("/proc/{peer_pid}/environ")).ok()?;
+    env.split(|b| *b == 0)
+        .filter_map(|kv| std::str::from_utf8(kv).ok())
+        .find_map(|kv| kv.strip_prefix("CADENCE_ALIAS="))
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+}
+
+/// Does `peer_pid` hold the pane's pty? A detached pane process loses
+/// its ancestry and controlling terminal but keeps stdio — the fd
+/// targets still name the pane's pts device. Redirected stdio is the
+/// documented residual (a maximal-effort detach), accepted because the
+/// same actor could `tmux send-keys` its own pane directly.
+fn holds_pane_tty(peer_pid: u32, pane_pid: u32) -> bool {
+    let pane_tty = (0..=2)
+        .filter_map(|fd| std::fs::read_link(format!("/proc/{pane_pid}/fd/{fd}")).ok())
+        .find(|p| p.to_string_lossy().starts_with("/dev/pts/"));
+    let Some(tty) = pane_tty else {
+        return false;
+    };
+    (0..=2)
+        .any(|fd| std::fs::read_link(format!("/proc/{peer_pid}/fd/{fd}")).is_ok_and(|p| p == tty))
+}
+
+/// Does the peer hold a pty at all? Called only after every pane
+/// membership check fails, so any pts fd is foreign by definition —
+/// positive evidence of an interactive terminal, which is what
+/// `operator` means. A detached caller (`setsid … </dev/null >&2`)
+/// holds none.
+fn peer_on_tty(peer_pid: u32) -> bool {
+    (0..=2).any(|fd| {
+        std::fs::read_link(format!("/proc/{peer_pid}/fd/{fd}"))
+            .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
+    })
+}
+
+/// The caller matched no pane — place it honestly. A broken `/proc`
+/// walk (`walked == false`) proves neither membership nor its
+/// absence: a refusal while the target pane is alive, `unknown` once
+/// it is gone. A clean walk with no match is `operator` only with
+/// positive terminal evidence (`foreign_tty`); a detached caller is
+/// `unknown`, never `operator`.
+fn unmatched_caller(
+    walked: bool,
+    target_alive: bool,
+    foreign_tty: bool,
+    verb: &str,
+) -> Result<(String, &'static str)> {
+    if !walked {
+        if target_alive {
+            return Err(Error::rejected(format!(
+                "cannot derive the caller for `{verb}` — /proc could \
+                 not be walked while the target pane is alive; run it \
+                 from a shell attached to a pane or outside all panes",
+            )));
+        }
+        return Ok(("unknown".to_string(), "unknown"));
+    }
+    if foreign_tty {
+        Ok(("operator".to_string(), "operator"))
+    } else {
+        Ok(("unknown".to_string(), "unknown"))
+    }
 }
 
 fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
-    if check_peer(&stream).is_err() {
+    let Ok(peer_pid) = check_peer(&stream) else {
         return;
-    }
+    };
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(_) => return,
@@ -3695,7 +4372,7 @@ fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                     .and_then(Value::as_str)
                     .ok_or_else(|| Error::rejected("Missing 'method'"))?;
                 let params = frame.get("params").cloned().unwrap_or(json!({}));
-                shared.dispatch(method, &params)
+                shared.dispatch(method, &params, peer_pid)
             });
         let frame = match response {
             Ok(result) => proto::ok(result),
@@ -3735,6 +4412,46 @@ pub struct ServeOptions {
     /// back to `CADENCE_STALL_SAMPLE_SECS`, then one minute. Shared so
     /// an in-process test can shrink it after start.
     pub stall_sample_secs: Arc<AtomicU64>,
+    /// CAD-113 slot configuration: `Some` is verbatim (tests);
+    /// `None` resolves `[host]` in pm.yaml, falling back to defaults.
+    pub slots: Option<SlotConfig>,
+    /// The slot clock — `None` is `mono_secs`; tests inject a
+    /// counter they advance on demand instead of sleeping.
+    pub slot_clock: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
+}
+
+/// Slot configuration precedence: explicit `ServeOptions.slots`, then
+/// `[host]` in the repo's pm.yaml, then the built-in defaults.
+fn resolve_slot_config(opts: &ServeOptions) -> SlotConfig {
+    if let Some(c) = &opts.slots {
+        return c.clone();
+    }
+    let mut c = SlotConfig::default();
+    let overrides = crate::issue::default_dir()
+        .ok()
+        .as_deref()
+        .and_then(crate::doctor::host::host_overrides);
+    if let Some(o) = overrides {
+        if let Some(v) = o.build_slots {
+            c.build_slots = v as usize;
+        }
+        if let Some(v) = o.suite_slots {
+            c.suite_slots = v as usize;
+        }
+        if let Some(v) = o.jobs_per_lane {
+            c.jobs_per_lane = v as usize;
+        }
+        if let Some(v) = o.starve_secs {
+            c.starve_secs = v;
+        }
+        if let Some(v) = o.priority_lanes {
+            c.priority_lanes = v;
+        }
+        if let Some(v) = o.max_hold_secs {
+            c.max_hold_secs = v;
+        }
+    }
+    c
 }
 
 // ---- Hot restart (CAD-89): clean-stop marker + instance files ----
@@ -4563,5 +5280,62 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert_eq!(events.last().unwrap().payload["i"], 4);
         assert_eq!(events.first().unwrap().payload["i"], 2);
+    }
+
+    /// CAD-102 r5: a caller whose `/proc` ancestry cannot be walked —
+    /// here a peer pid that no longer exists — must be REFUSED while
+    /// the target pane is alive. The r4 guard checked liveness with
+    /// `read_link("/proc/<pid>")`, which always fails EINVAL on a
+    /// directory, so the refusal never fired and the answer proceeded
+    /// stamped `unknown`.
+    #[test]
+    fn broken_walk_with_live_target_pane_is_refused() {
+        let (dir, shared) = shared();
+        register(&shared, dir.path(), "tgt");
+        // Give the agent a pty endpoint with a LIVE pane pid — this
+        // test process — so `pty_endpoint_facts` finds the target.
+        let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE agents SET endpoint_kind='pty', generation=1, pid=?1 \
+             WHERE alias='tgt'",
+            rusqlite::params![std::process::id() as i64],
+        )
+        .unwrap();
+        drop(conn);
+        // A dead peer pid: the first /proc read fails → chain is None.
+        let dead = u32::MAX - 42;
+        assert!(std::fs::metadata(format!("/proc/{dead}")).is_err());
+        let err = shared.derived_caller("tgt", dead, "answer").unwrap_err();
+        assert!(err.to_string().contains("could not be walked"), "{err}");
+    }
+
+    /// The unmatched-caller tail: a broken walk refuses only while the
+    /// target lives; a clean walk stamps `operator` solely on positive
+    /// terminal evidence — a detached caller is `unknown`, never
+    /// `operator`.
+    #[test]
+    fn unmatched_caller_is_fail_closed() {
+        // Broken walk: refused while the target pane lives.
+        assert!(unmatched_caller(false, true, false, "answer").is_err());
+        assert!(unmatched_caller(false, true, true, "answer").is_err());
+        // …and `unknown` once it is gone.
+        assert_eq!(
+            unmatched_caller(false, false, false, "answer").unwrap(),
+            ("unknown".to_string(), "unknown")
+        );
+        // Clean walk + foreign pty → operator.
+        assert_eq!(
+            unmatched_caller(true, true, true, "answer").unwrap(),
+            ("operator".to_string(), "operator")
+        );
+        // Clean walk + no terminal (a full setsid detach) → unknown.
+        assert_eq!(
+            unmatched_caller(true, true, false, "answer").unwrap(),
+            ("unknown".to_string(), "unknown")
+        );
+        assert_eq!(
+            unmatched_caller(true, false, false, "answer").unwrap(),
+            ("unknown".to_string(), "unknown")
+        );
     }
 }

@@ -51,7 +51,8 @@ Error kinds:
 | `agent_ready` | `alias, by?, force?` | `{state:"ready-claimed"}` — single-use readiness claim for `pty`; probes the pane first and refuses a visibly busy one unless `force`; `by` records the claimer |
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
-| `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`; `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; Codex model/effort are checked against `model/list`; null clears to the provider default) or `approval_policy` (codex; `never|on-request|on-failure|untrusted`, null clears) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
+| `agent_answer` | `alias, choice, by?, note?` | `{state:"answered"}` — sends one menu-choice keystroke to a `pty` pane probing `approval_menu` (CLI: `cadence agent answer <alias> <choice> [--reason <text>]`); re-probes and refuses any other detected pane state. Detection uses terminal text: CAD-220 tracks the residual ambiguity of a quoted menu directly adjoining the busy frame, so this is not an authoritative provider approval signal. `choice` is the option's index in the whole printed option block (top to bottom, independent of the highlighted row); the profile's keymap turns it into tmux keys — numbered menus take the digit, hotkeyed options their suffix, unnumbered selects arrows + Enter relative to the highlight. The answerer is derived from the socket peer's pid — `/proc` ancestry into the pane roots plus the pane `CADENCE_ALIAS` env and the pane's pty fds (a `setsid` detach keeps both) — a caller inside or tied to the target's own pane is refused, inside another agent's pane stamps `by_kind:"agent"`, an ancestry walk that cannot complete refuses while the target pane is alive (never a derivation-failure `operator`), and a caller that matches no pane is `operator` only when it holds a terminal no pane owns — a fully detached caller is honestly `unknown`; a supplied `by` that disagrees is kept only as `claimed_by`. Records `approval_answered` with `by`/`by_kind`/`caller_pid`/`choice`/`line`/`note` and wakes the agent's delivery loop |
+| `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`, `silent_end_secs` (pty only); `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; Codex model/effort are checked against `model/list`; null clears to the provider default) or `approval_policy` (codex; `never|on-request|on-failure|untrusted`, null clears) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit PTY ack/result; `sha` names the produced commit for task-attached kickoffs |
 | `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?, sha?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice. A `sha` on `completed` binds like a worker `--sha` |
@@ -84,6 +85,9 @@ Error kinds:
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 | `agent_remove` | `alias` | deletes the agent + its history; refuses live endpoints |
 | `agent_gc` | `older_than?` | sweeps dead agents; `{removed:[alias]}` |
+| `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (queue identity only — the daemon mints the `slot-*` token on grant). Caller identity is connection-derived (below): `lane` is advisory, `pid` must be the socket peer or its ancestor. A re-poll adopts a hold only on an exact `(request_id, pid, lane, kind)` match; any other caller sharing the id queues. `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot |
+| `slot_release` | `token, lane?, pid?` | `{released:true,token,kind}` — the release must name the holding `(lane, pid)`, both derived from the connection (`lane` advisory, `pid` must be the peer or its ancestor); a foreign token is a named refusal, a never-held token a named rejection, and a token just reaped this call answers `{released:false, reason}` to its own lane (a `trap`-style cleanup never hard-fails) — foreign lanes get the same never-held rejection, so a token's existence is never probed across lanes |
+| `slot_status` | `lane?` | `{pools:{build,suite}:{capacity,held[]}, waiting[], config}` — also a reap pass: dead holders/waiters drop on the read. A hold's `token` shows only to the connection whose derived lane owns the hold and whose ancestry includes the hold's pid; everyone else sees identity only |
 
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
@@ -390,23 +394,91 @@ worker's `cadence self`/`message result` then runs without an
 approval menu.
 
 **Submission gates.** `run_turn` requires all of: pane alive,
-`pane_dead=0`, `pane_in_mode=0`, native ownership still held, and a
-fresh unconsumed claim — either an operator claim from `agent ready`
-(60s TTL) or, under `auto_ready=verified`, a daemon-minted claim. Claims
-are single-use (consumed atomically by exactly one send), FIFO, and
-capped; every consumption emits a `claim_used` event recording the
-message id and the claimer (`agent ready <alias>` records
-`CADENCE_ALIAS` when set, else `"operator"`; daemon-minted claims
-record `"daemon"` on the `ready_claimed` event itself).
+`pane_dead=0`, `pane_in_mode=0`, native ownership still held, a screen
+probe showing no approval menu, and a fresh unconsumed claim — either
+an operator claim from `agent ready` (60s TTL) or, under
+`auto_ready=verified`, a daemon-minted claim. The probe runs *before*
+any claim is consumed, so an open menu refuses every paste — claimed
+or self-claimed — and the refusal eats nothing: the claim survives to
+deliver once the menu closes. Claims are single-use (consumed
+atomically by exactly one send), FIFO, and capped; every consumption
+emits a `claim_used` event recording the message id and the claimer
+(`agent ready <alias>` records `CADENCE_ALIAS` when set, else
+`"operator"`; daemon-minted claims record `"daemon"` on the
+`ready_claimed` event itself). A probe failure inside the gate is
+itself a gate refusal — `capture-pane` flaking mid-check retries
+like a busy pane rather than failing the message. The remedy for a
+menu is `cadence agent answer <alias> <choice>` (`agent_answer`
+RPC): the adapter re-probes, requires `approval_menu`, validates
+`choice` against the option rows on screen, and sends the profile's
+keymap — never a paste. `choice` indexes the whole printed option
+block top-to-bottom (the highlighted row may not be first), bounded
+by the visible count, and an unparseable or single-row block refuses
+rather than guessing; navigation moves `Up`/`Down` from the
+highlighted row on unnumbered selects, and a multi-digit index on a
+numbered menu arrows instead of typing — `send-keys "10"` would
+press `1` then `0` and select the wrong option. The answerer's
+identity is derived, never claimed: the socket peer's pid walks its
+`/proc` ancestry into the recorded pane roots, so a CLI run inside an
+agent's pane IS that agent — a caller inside the target's own pane is
+refused (a pane must never approve its own prompt) and one inside
+another agent's pane records that alias with `by_kind:"agent"`. The
+target's pane is checked first, then others in sorted order — a
+self-refusal never loses to map iteration order. Pane membership is
+three signals, not one: ancestry, the `CADENCE_ALIAS` env the peer
+still carries (a `setsid` detach keeps it), and a shared controlling
+pty via fd targets (detach keeps stdio) — so `setsid cadence agent
+answer <self>` cannot launder a self-approval into `operator`. A
+caller whose ancestry cannot be fully walked is never stamped
+`operator`: while the target's pane is alive the ambiguity is a
+refusal, after it is gone the stamp is `by:"unknown"` with
+`caller_pid` still recorded. (The documented residual is a maximal
+detach — `setsid` plus a scrubbed env plus redirected stdio; the same
+actor could `tmux send-keys` its own pane, so the guard targets
+accidents and the common detach, not a determined in-pane actor.)
+Anything else is `by:"operator"`; a supplied `by` that disagrees is
+kept as `claimed_by`, not an attribution. `approval_answered` records
+`by`, `by_kind`, `caller_pid`, `choice`, the menu line and the probe,
+then wakes the agent's delivery loop —
+the menu may be exactly what a queued send waits behind. The probe,
+key selection and `send-keys` run inside the adapter's paste lock,
+serialized against the gate's own probe+paste so a menu closing
+mid-answer can never strand a key in the input line.
 
 With `auto_ready=verified` the daemon mints a claim only after a pane
 probe verifies idle: the screen must show the `❭` prompt with an empty
 input line, and none of the observed busy signatures or an approval
 menu — an approval screen's `❭` option marker can mimic a prompt, so
-menu detection wins over prompt shape. Menu markers are matched only
-in the status region (the ~14 lines ending at the last non-blank row —
-`capture-pane` pads short content with blank rows, so the region is
-not the pane's literal bottom), and busy is anchored tighter still:
+menu detection wins over prompt shape. Menu evidence is matched in a
+wider window than busy (the ~24 lines ending at the last non-blank
+row — `capture-pane` pads short content with blank rows, so the
+region is not the pane's literal bottom): a numbered approval menu
+can stay open *above* a still-visible busy input box, which pushes
+its option rows and selection footer well above the busy anchor.
+Menu-exclusive anchors (the `↑↓ select · ↵ confirm · esc cancel`
+legend — structural glyphs no transcript speaks) decide alone on the
+trimmed row's leading glyph. Natural-language anchors (the permission
+prompt's title, `Run this command?`, the trust-dialog wordings) only
+decide beside real menu structure — a parsed option row, a qualified
+option block or the anchored legend — because an indented transcript
+row leading with the same words is identical in shape; numbered rows
+must additionally form a real menu run (an *indented* `❯`-led row
+inside — a column-0 `❯` is the input box or a transcript echo — or
+the legend right after) so a quoted markdown list is never a menu's
+options. A highlighted `❯`/`→` row only counts as menu structure when
+it sits inside a real option block — at least one sibling option —
+so transcript echoes of submitted prompts are never mistaken for a
+menu's highlight. Option labels and lone legend fragments count only
+as a cluster beside that structure — transcript text quoting one
+stays inert. Cursor's option rows parse their trailing `(hint)`
+through the hotkey allowlist — `foo(bar)` is transcript text, not an
+option — and sibling rows beside a `→` highlight must carry a key,
+since a menu highlights exactly one row. A `↓ more below`/`↑ more
+above` marker beside the block refuses the
+answer rather than picking a row whose index does not match the
+printed list. When
+a menu is open the probe's reason is the menu line itself — the
+command being approved — and busy is anchored tighter still:
 the `Guide Devin while it works` input watermark, or the status row
 directly above the input box — the spinner label (`Thinking`,
 `Typing`, `Running tools`) or an `esc to interrupt`/`Cancel agent`
@@ -855,6 +927,7 @@ gate_wait, submitted, session_minted, session_resume_failed,
 session_persist_failed,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
 params_updated, reconciled, relaunch_skipped, attention,
+approval_menu, approval_answered, turn_silent_end,
 turn_stalled, turn_resumed, monitor_registered, monitor_alert,
 monitor_alert_ack, monitor_degraded, monitor_dispatch,
 monitor_dispatch_blocked, monitor_dispatch_resolved, monitor_off,
@@ -913,20 +986,68 @@ fences, cancels, or replays anything it observes.
   to the same recipient, then re-arms — a later silence raises a new
   `turn_stalled` episode with its own notice. A turn that ends while
   stalled just ends; no recovery event is owed.
+- **Probe verdicts ride the samples (pty).** Every landed screen sample
+  carries the analyzer's verdict beside the hash, so the watch sees
+  pane states a bare hash cannot name. A menu frame is never activity —
+  the wait is a human's, not the provider's: it neither confirms a
+  screen change nor feeds the idle streak. An idle frame extends the
+  silent-end streak; anything else resets it.
+- **`approval_menu`.** The first sampled frame probing
+  `approval_menu` while a message runs emits `{message, line}` once —
+  the rising edge, never per sample — carrying the menu line (the
+  command being approved) so the row names what's asked, and only
+  once per open menu: a bounded history of fired lines survives
+  message transitions so alternating subjects do not re-fire, but the
+  history clears when the menu closes — the same subject re-requested
+  is a new wait and fires again. When no turn is running the oldest
+  `queued`/`submitting` head is tracked instead — a menu that blocks
+  its delivery emits the same event marked `queued: true` — and a
+  menu on a pane with nothing tracked at all emits it marked
+  `idle: true` with no `message` (the wait belongs to no turn).
+  `agent_list`/`agent_show` expose it as `pane_menu` while it stays
+  open (queued-head and idle-pane menus included); the `status` PANE
+  column renders `approval: <line>`; the overview needs-me row
+  (`kind: approval_menu`) gives the remedy `cadence agent answer
+  <alias> <choice>`. A needs-me row is a suggestion to *look*, never
+  proof a real menu exists — menu detection reads text shapes a
+  transcript can quote, so the remedy command is only safe because
+  `agent answer` re-probes the live screen and refuses anything that
+  is not a corroborated menu.
+- **`turn_silent_end`.** A still-`running` message whose pane probes
+  idle for `silent_end_secs` over at least three consecutive samples —
+  never one capture, never while a menu or a brokered request explains
+  the wait — emits `{message, age_secs, last_activity, probe}` once
+  per message: the provider ended without reporting. The flag is
+  evidence, not resolution — the message stays `running` until an
+  explicit report or reconcile. `agent_list`/`agent_show` expose
+  `silent_ended` + `ended_secs` (the idle streak's age), `status`
+  renders `ended?: <age>` beside an idle pane on a running message,
+  and the overview needs-me row (`kind: silent_end`) gives the remedy
+  `cadence send <alias> --ready --text "continue …"` — a ready-gated
+  follow-up that claims the provably-idle pane and pastes in one step.
 - **Budget resolution.** `jobs.stall_secs` (set at `job new
   --stall-secs`) wins for task-attached deliveries; otherwise the
   agent's `params.stall_secs` (launch param or live `agent set alias
   stall_secs=<n>`); otherwise the daemon default of 1800s. `0`
   disables firing — silence is still measured. Values accept an
   unsigned integer or digit string; negatives are rejected at
-  `job_new` and both `agent` param validators.
+  `job_new` and both `agent` param validators. `silent_end_secs`
+  resolves the same way minus the job layer — the agent's launch or
+  live-set param, else the 600s default; `0` disables silent-end
+  detection (idle-pane silence is then only ever a stall
+  observation).
 - **Views.** `agent_list`/`agent_show` add `silent_secs` and `stalled`
-  while a turn runs; `job show`/`task show` add the same pair to a
-  task row whose kickoff is running. Idle agents sample nothing and
-  carry neither field.
+  while a turn runs — plus `pane_menu`, `ended_secs` and
+  `silent_ended` when the sampled pane verdict warrants them; `job
+  show`/`task show` add the same set to a task row whose kickoff is
+  running. An agent with no turn still samples on the same throttle —
+  a menu with nothing in flight surfaces as `pane_menu` and an
+  `idle: true` event — but carries the menu line alone: stall and
+  silent-end bookkeeping need a started turn.
 - **Restart.** Watch state is in memory only: after a daemon restart
-  the silence clock for a still-`running` message starts from the
-  restart — no stall survives across it, and no episode replays.
+  the silence and idle-streak clocks for a still-`running` message
+  start from the restart — no stall or silent end survives across
+  it, and no episode replays.
 
 ## Jobs and tasks
 
@@ -1021,6 +1142,132 @@ methods keep the per-type responses above. Pending entries are
 in-memory: an actor exit or daemon restart reads as `closed` to any
 waiter. Today the only producer is the `mcp-permission` server backing
 brokered claude approvals (see the managed claude section).
+
+## Build slots (CAD-113)
+
+One bounded, fair, observable scheduler for cargo build/test work on a
+host, so lanes queue instead of thrashing. The simplest consumer is
+`cadence build-slot run test -- cargo test --lib` — `run` acquires
+then *execs* the command, so the slot's holder is the real build
+process and its exit frees the slot. A manual wrap works too:
+`token=$(cadence build-slot acquire build --pid $$ --wait-secs 600);
+cargo build; cadence build-slot release $token` — `acquire` requires
+`--pid` (the hold binds the process that actually lives for the work;
+`$$` inside a shell wrapper) while `release` defaults it to the
+calling shell — the daemon owns the queue, the CLI only polls.
+
+Caller identity is bound to the connection, never to the request. On
+every `slot_*` RPC the daemon takes the peer's pid from `SO_PEERCRED`
+and walks `/proc` ancestry up to init; the caller's lane is the alias
+of the *nearest* registered pty pane on that chain (its own pane beats
+any outer one, so resolution never depends on map order). A request's
+`lane` field is advisory — it is never consulted for authority — and a
+`pid` field must name the socket peer itself or one of its ancestors
+(`acquire --pid $$` legitimately claims the invoking shell); anything
+else refuses rather than rebinds. The walk is fail-closed: an
+unreadable `/proc`, an incomplete chain, or no pane match refuses the
+call outright. There is no `operator` fallback — a caller detached
+from every registered pane holds no lane at all, so `setsid` or a
+detached helper cannot borrow an identity it was never given.
+`slot_status` applies the same rule to visibility: a hold's `token`
+appears only to the connection whose derived lane matches the hold
+*and* whose ancestry includes the hold's pid.
+
+Two pools share one queue: `build`/`test` requests draw on
+`build_slots` (default 3), `suite` requests on `suite_slots` (default
+1) — independent, so a queued full suite never starves ordinary
+builds. Grant order is FIFO with two modifiers: `test`/`suite`
+requests from a configured *priority lane* (`[host] priority_lanes` —
+the reviewer lane) outrank ordinary requests, and a `(lane, kind)`
+waiting continuously longer than `starve_secs` (default 900) jumps to
+the front. Seniority belongs to an *unserved* wait and is carried by
+exactly one waiter — the lane's eldest for that kind: a caller that
+re-queues under a new request id keeps the lane's accumulated wait
+for up to one waiter TTL after its last poll, but later arrivals of
+a burst stamp their own arrival and queue behind it, so one lane can
+never multiply an old anchor into N front-running requests. Every
+grant for that `(lane, kind)` restarts the anchor — a lane can never
+keep an old anchor alive by always having one more request queued —
+and an inherited stamp is clamped to `starve_secs` at enqueue time,
+so rank 0 stays true FIFO: a two-hour waiter still beats a
+901-second one, and any request is granted within the bound once it
+reaches the front.
+
+A slot is a daemon-minted `slot-*` token bound to (lane, pid,
+pid-starttime): `release` must name the holding lane and pid — and
+because both come from the connection's own identity (above), one
+caller can never free another's hold. A re-poll whose `request_id`
+matches a hold adopts it only on an exact `(request_id, pid, lane,
+kind)` match — a second process sharing a natural request id queues
+like everyone else. A holder whose process dies or whose pid is
+recycled is reaped on the next acquire/status — a killed agent frees
+its slot, nothing is ever killed for one — and a hold past
+`max_hold_secs` (default 7200) is reaped as `hold expired` so a
+forgotten hold cannot wedge a pool. Waiting is client-side:
+`slot_acquire` answers instantly with granted-or-position, and a
+polling caller keeps its place by refreshing `last_poll`; a request
+that goes silent past the waiter TTL (30s) or whose pid dies drops
+out of the queue. `probe:true` is the non-mutating read — it grants
+or reports position without ever joining the queue. All slot ages
+ride a monotonic clock: an NTP step or suspend cannot age a waiter
+or expire a hold.
+
+Holds persist to `<state>/slots.json` (atomic + fsynced, mode 0600)
+— the record is `(token, request_id, kind, lane, pid, pid-starttime,
+acquired_epoch)`. On daemon boot each persisted hold is revalidated:
+a hold survives restart only while its recorded process is still the
+same live process (pid + starttime), and the dead are dropped with a
+`slot_released` event (`holder died` / `pid recycled`) rather than
+silently re-granted. Waiters do not persist, and neither does
+seniority — it measures an unserved wait and no waiter survives a
+restart, so every caller re-polls into a fresh anchor. One deadlock
+guard applies: a *process* may never *queue* for one pool while
+holding a slot in the other (the guard keys on `(lane, pid)` — two
+shells sharing a lane name never block each other) — a grant that
+never waits is always allowed, so the safe order is simply "wait
+only while holding nothing". The queue is bounded twice over: 128
+waiters total, 32 per lane. `CADENCE_SUITE_LOCK` keeps working
+underneath as the test-process suite slot — the daemon queue is the
+observable layer above it.
+
+Configuration rides the `[host]` table in `pm.yaml` (all optional):
+
+```yaml
+host:
+  build_slots: 3        # concurrent build+test grants
+  suite_slots: 1        # concurrent full-suite grants
+  jobs_per_lane: 4      # CARGO_BUILD_JOBS `issue start`/`dispatch` injects
+  starve_secs: 900      # never-starve bound on (lane, kind) seniority
+  max_hold_secs: 7200   # a forgotten hold is reaped past this
+  priority_lanes: [qa-1]  # test/suite requests outrank ordinary ones
+  # load_warn_ratio — doctor --host load warn = ratio x cpus (fail
+  # 2x). Unset: derived from the slot plan — the farm is meant to run
+  # (build_slots + suite_slots) x jobs_per_lane deep, so the default
+  # warns above 1.25x that plan (floor 1.0), never below it.
+  io_stall_warn_pct: 30 # doctor --host io stall warn %
+  io_stall_fail_pct: 60 # doctor --host io stall fail %
+```
+
+`cadence issue start`/`dispatch` write `<worktree>/.env` atomically
+(mode 0600, existing modes and foreign lines preserved, symlinks
+refused) with `CARGO_BUILD_JOBS=<jobs_per_lane>` and
+`CADENCE_BUILD_SLOT=<cadence binary>` so a worker never has to
+remember flags. `build-slot run` exports `CADENCE_BUILD_SLOT_TOKEN` /
+`CADENCE_BUILD_SLOT_PID` / `CADENCE_BUILD_SLOT_LANE` to the command so
+a nested script can release its own hold early. Observability:
+`slot_acquired` / `slot_waited` / `slot_released` events land on the
+requesting lane's event stream — and no event ever carries a token:
+a token returns only in the `slot_acquire` RPC reply and in the
+holding connection's own `slot_status`, because lane streams are
+readable by any local caller and token+lane+pid are the whole release
+credential. `cadence status` carries a `slots:` footer line,
+`cadence build-slot status [--json]` shows holders and waiters (your
+own connection's holds show tokens; others' show identity only), and
+`doctor --host`'s `load` check reports load, io stall and the queue.
+A caller with no derivable pane identity — the operator's own shell
+included — sees the slot calls refused; the footers then simply omit
+the slot line rather than fail.
+Nothing here kills a process or cancels anyone's work.
 
 ## Recovery
 
