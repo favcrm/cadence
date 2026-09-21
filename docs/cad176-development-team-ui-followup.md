@@ -20,6 +20,11 @@ of the following on a temporary state directory and after a board reload:
 - mixed monitor health keeps the aggregate `stale`/`degraded` result
   regardless of row order, and malformed monitor RPC rows fail closed as
   `unavailable` rather than being skipped;
+- the daemon lifecycle accepts only `active`, `degraded`, or `off`; every
+  `monitor_alerts` response validates its monitor, cursor, alert array, alert
+  scope, fields, and `open`/`acknowledged` state. RPC failure, a missing or
+  malformed response, or an unsupported state is `unavailable`; `alerts: []`
+  remains a valid empty history;
 - a concrete alert with project, task, event sequence, fingerprint, age,
   evidence, next action, next owner, and authority;
 - the rendered monitor row shows heartbeat, last check, completed scan, and

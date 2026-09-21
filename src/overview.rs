@@ -385,7 +385,12 @@ fn validate_monitor_rows(rows: &[Value]) -> Result<(), String> {
         string_field("id")?;
         string_field("project")?;
         string_field("owner")?;
-        string_field("monitoring")?;
+        let state = string_field("monitoring")?;
+        if !matches!(state, "active" | "degraded" | "off") {
+            return Err(format!(
+                "monitor_list row {index} has unsupported monitoring state"
+            ));
+        }
         if object
             .get("interval_secs")
             .and_then(Value::as_i64)
@@ -414,6 +419,102 @@ fn validate_monitor_rows(rows: &[Value]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Validate the complete `monitor_alerts` response before exposing any
+/// durable evidence to the Overview. An empty alert array is valid; a
+/// missing or partially malformed response is unavailable rather than a
+/// misleading healthy monitor view.
+fn validate_monitor_alert_response<'a>(
+    monitor_id: &str,
+    response: &'a Value,
+) -> Result<&'a [Value], String> {
+    let object = response
+        .as_object()
+        .ok_or_else(|| "monitor_alerts response is not an object".to_string())?;
+    let response_monitor = object
+        .get("monitor")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if response_monitor != Some(monitor_id) {
+        return Err("monitor_alerts response has the wrong monitor".to_string());
+    }
+    if object
+        .get("cursor")
+        .and_then(Value::as_i64)
+        .is_none_or(|value| value < 0)
+    {
+        return Err("monitor_alerts response has malformed cursor".to_string());
+    }
+    let rows = object
+        .get("alerts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "monitor_alerts response missing alerts".to_string())?;
+    for (index, row) in rows.iter().enumerate() {
+        let alert = row
+            .as_object()
+            .ok_or_else(|| format!("monitor_alerts row {index} is not an object"))?;
+        let string_field = |field: &str| {
+            alert
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("monitor_alerts row {index} missing {field}"))
+        };
+        if alert
+            .get("seq")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value < 1)
+        {
+            return Err(format!("monitor_alerts row {index} missing seq"));
+        }
+        let row_monitor = string_field("monitor")?;
+        if row_monitor != monitor_id {
+            return Err(format!(
+                "monitor_alerts row {index} belongs to a different monitor"
+            ));
+        }
+        string_field("task")?;
+        if alert
+            .get("event_seq")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value < 1)
+        {
+            return Err(format!("monitor_alerts row {index} missing event_seq"));
+        }
+        string_field("fingerprint")?;
+        string_field("kind")?;
+        if !alert.contains_key("payload") {
+            return Err(format!("monitor_alerts row {index} missing payload"));
+        }
+        if !matches!(
+            alert.get("state").and_then(Value::as_str),
+            Some("open") | Some("acknowledged")
+        ) {
+            return Err(format!("monitor_alerts row {index} has unsupported state"));
+        }
+        if alert
+            .get("attempts")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value < 0)
+        {
+            return Err(format!("monitor_alerts row {index} missing attempts"));
+        }
+        if !matches!(
+            alert.get("last_error"),
+            Some(value) if value.is_null() || value.as_str().is_some()
+        ) {
+            return Err(format!(
+                "monitor_alerts row {index} has malformed last_error"
+            ));
+        }
+        for field in ["created", "updated"] {
+            if alert.get(field).and_then(Value::as_f64).is_none() {
+                return Err(format!("monitor_alerts row {index} missing {field}"));
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn monitoring_unavailable(error: impl Into<String>) -> Value {
@@ -450,7 +551,6 @@ pub fn monitoring(state_dir: &Path) -> Value {
     }
     let monitors = rows.to_vec();
     let mut alerts_by_monitor = HashMap::new();
-    let mut alert_errors = HashMap::new();
     for monitor in &monitors {
         let id = monitor["id"].as_str().unwrap_or_default();
         match client::rpc(
@@ -458,22 +558,20 @@ pub fn monitoring(state_dir: &Path) -> Value {
             "monitor_alerts",
             json!({"monitor": id, "open": false, "limit": 100}),
         ) {
-            Ok(value) => {
-                if let Some(rows) = value["alerts"].as_array() {
+            Ok(value) => match validate_monitor_alert_response(id, &value) {
+                Ok(rows) => {
                     alerts_by_monitor.insert(id.to_string(), rows.to_vec());
-                } else {
-                    alert_errors.insert(
-                        id.to_string(),
-                        "monitor_alerts response missing alerts".to_string(),
-                    );
                 }
-            }
+                Err(error) => {
+                    return monitoring_unavailable(format!("monitor_alerts '{id}': {error}"));
+                }
+            },
             Err(error) => {
-                alert_errors.insert(id.to_string(), error.to_string());
+                return monitoring_unavailable(format!("monitor_alerts '{id}': {error}"));
             }
         }
     }
-    monitoring_view(monitors, alerts_by_monitor, alert_errors, now)
+    monitoring_view(monitors, alerts_by_monitor, HashMap::new(), now)
 }
 
 /// A needs-me row before the urgency sort.
@@ -1405,6 +1503,7 @@ mod tests {
 
     #[test]
     fn malformed_monitor_rows_fail_closed_before_projection() {
+        assert!(validate_monitor_rows(&[]).is_ok());
         let error = validate_monitor_rows(&[json!({"project": "cadence"})]).unwrap_err();
         assert!(error.contains("row 0") && error.contains("id"), "{error}");
         let unavailable = monitoring_unavailable(error);
@@ -1419,6 +1518,83 @@ mod tests {
             error.contains("row 0") && error.contains("project"),
             "{error}"
         );
+        let error = validate_monitor_rows(&[json!({
+            "id": "watch",
+            "project": "cadence",
+            "owner": "watchdog",
+            "monitoring": "bogus",
+            "interval_secs": 60,
+            "coverage": [],
+            "delivery": {"configured": false, "state": "unconfigured"},
+            "open_alerts": 0,
+            "total_alerts": 0,
+        })])
+        .unwrap_err();
+        assert!(error.contains("unsupported monitoring state"), "{error}");
+        let unavailable = monitoring_unavailable(error);
+        assert_eq!(unavailable["available"], false);
+        assert_eq!(unavailable["state"], "unavailable");
+    }
+
+    #[test]
+    fn monitor_alert_response_validation_accepts_empty_and_rejects_partial() {
+        let empty = json!({"monitor": "watch", "alerts": [], "cursor": 0});
+        assert!(validate_monitor_alert_response("watch", &empty)
+            .unwrap()
+            .is_empty());
+
+        let missing_alerts = json!({"monitor": "watch", "cursor": 0});
+        let error = validate_monitor_alert_response("watch", &missing_alerts).unwrap_err();
+        assert!(error.contains("missing alerts"), "{error}");
+        let unavailable = monitoring_unavailable(format!("monitor_alerts 'watch': {error}"));
+        assert_eq!(unavailable["available"], false);
+
+        let valid_alert = json!({
+            "seq": 1,
+            "monitor": "watch",
+            "task": "task-1",
+            "event_seq": 2,
+            "fingerprint": "event:2",
+            "kind": "turn_stalled",
+            "payload": {"message": "synthetic"},
+            "state": "open",
+            "attempts": 0,
+            "last_error": Value::Null,
+            "created": 10.0,
+            "updated": 10.0,
+        });
+        let response = json!({"monitor": "watch", "alerts": [valid_alert], "cursor": 1});
+        assert_eq!(
+            validate_monitor_alert_response("watch", &response)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let malformed_alert = json!({
+            "seq": 1,
+            "monitor": "watch",
+            "task": "task-1",
+            "event_seq": 2,
+            "fingerprint": "event:2",
+            "kind": "turn_stalled",
+            "state": "open",
+            "attempts": 0,
+            "last_error": Value::Null,
+            "created": 10.0,
+            "updated": 10.0,
+        });
+        let response = json!({
+            "monitor": "watch",
+            "alerts": [malformed_alert],
+            "cursor": 1,
+        });
+        let error = validate_monitor_alert_response("watch", &response).unwrap_err();
+        assert!(error.contains("missing payload"), "{error}");
+
+        let wrong_monitor = json!({"monitor": "other", "alerts": [], "cursor": 0});
+        let error = validate_monitor_alert_response("watch", &wrong_monitor).unwrap_err();
+        assert!(error.contains("wrong monitor"), "{error}");
     }
 
     fn git(repo: &Path, args: &[&str]) {
