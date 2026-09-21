@@ -6,8 +6,13 @@ daemon, migrate a live store, restart a board, or configure outbound delivery.
 
 ## Current tree and isolated evidence
 
-- Source: `f1dd5a300bae3897d34a70f550feead5d12a6b35` (PR98 UI plus PR99
-  durable handoff fix).
+- Baseline source used for the recorded v6-to-v8 rehearsal:
+  `f1dd5a300bae3897d34a70f550feead5d12a6b35` (PR98 UI plus PR99 durable
+  handoff fix).
+- Review candidate: this worktree rebased onto current `origin/main`
+  `9d2414f`, carrying the separate coordinator v8-to-v9 migration. The
+  final full candidate head is supplied with the review handoff after the
+  documentation commit.
 - Isolated binary: `target/debug/cadence`, built with
   `CARGO_BUILD_JOBS=4 cargo build --locked` from that exact tree.
 - Binary identity: `cadence 0.1.0+f1dd5a300bae3897d34a70f550feead5d12a6b35`.
