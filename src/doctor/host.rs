@@ -12,15 +12,16 @@
 //!
 //! Every check reports `ok | warn | fail` with the measured value, the
 //! threshold it was compared against, and a `remedy` — the exact
-//! command an operator would run. Nothing here writes, signals or
-//! deletes: filesystem reads, `/proc` walks and a handful of read-only
-//! `git` probes are the whole surface. The exit code is the worst
-//! level: 0 all ok, 1 any warn, 2 any fail.
+//! command an operator would run, except `task-targets`, whose remedy
+//! is a read-only inventory note and never a deletion. Nothing here
+//! writes, signals or deletes: filesystem reads, `/proc` walks and a
+//! handful of read-only `git` probes are the whole surface. The exit
+//! code is the worst level: 0 all ok, 1 any warn, 2 any fail.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -41,6 +42,25 @@ const PAGES_PER_PIPE: u64 = 16;
 /// `.tmp*`, mktemp's `tmp.*` and cadence's own `cadence-*`
 /// (`cadence-issue-at-*` exports, leaked state dirs).
 const TEMP_PREFIXES: &[&str] = &["cadence-", ".tmp", "tmp."];
+/// How many temp-dir entries the legacy task-target scan will look at
+/// before it stops and reports the inventory as truncated.
+const TASK_TARGET_TEMP_BUDGET: usize = 8_192;
+/// Rows kept after that scan. The host's leaked `cad*-target*` set is
+/// small; the cap is what keeps a polluted temp dir from blowing the
+/// report up.
+const TASK_TARGET_ROW_CAP: usize = 64;
+/// Shared `stat` budget for every task-target walk in one report, and
+/// the most entries one directory may contribute. A real cargo tree
+/// trips the per-dir cap (the byte count is then a lower bound and the
+/// row warns); a fixture with a handful of files does not.
+const TASK_TARGET_STAT_BUDGET: usize = 8_192;
+const TASK_TARGET_DIR_STAT_CAP: usize = 1_024;
+/// `/proc` pids inspected while attributing cwd/exe to those rows.
+const TASK_TARGET_PROC_BUDGET: usize = 8_192;
+/// Issue files read while looking for recorded `cargo_target` paths.
+const TASK_TARGET_ISSUE_BUDGET: usize = 4_096;
+/// Pids quoted on one row. The count is the full number observed.
+const TASK_TARGET_PIDS: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Level {
@@ -297,6 +317,11 @@ impl Thresholds {
 pub struct Scan {
     pub proc_root: PathBuf,
     pub temp_dir: PathBuf,
+    /// `CARGO_TARGET_DIR` as this process received it — absolute, or
+    /// relative to `cwd`. `None` when unset. The check reads this
+    /// field and never the environment, so a test does not inherit
+    /// the runner's target dir.
+    pub cargo_target_dir: Option<PathBuf>,
     pub home: PathBuf,
     pub state_dir: PathBuf,
     pub cwd: PathBuf,
@@ -337,6 +362,9 @@ impl Scan {
         Scan {
             proc_root: PathBuf::from("/proc"),
             temp_dir: std::env::temp_dir(),
+            cargo_target_dir: std::env::var_os("CARGO_TARGET_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             devin_data: data_home.join("devin"),
             claude_projects: home.join(".claude/projects"),
@@ -377,8 +405,8 @@ pub(crate) fn host_thresholds(pm_dir: Option<&Path>) -> Thresholds {
     Thresholds::resolve(pm_dir.and_then(host_overrides))
 }
 
-/// All nine checks against `scan`; the report is one JSON object whose
-/// `level` is the worst check level.
+/// Every host check against `scan`; the report is one JSON object
+/// whose `level` is the worst check level.
 pub fn run(scan: &Scan) -> Value {
     let checks = [
         check_disk(scan),
@@ -389,6 +417,7 @@ pub fn run(scan: &Scan) -> Value {
         check_sessions(scan),
         check_orphans(scan),
         check_temp_dirs(scan),
+        check_task_targets(scan),
         check_worktrees(scan),
         check_load(scan),
     ];
@@ -498,22 +527,46 @@ const DIR_WALK_BUDGET: usize = 200_000;
 /// each inode once per call (cargo's hardlinked uplifts can't double
 /// up) and stays on the starting path's device, `du -x`-style, so a
 /// row's bytes are what `rm -rf` frees *on that filesystem*. Skips
-/// anything that vanishes or denies mid-walk — a watchdog walk races
-/// with the processes it watches. Returns `(bytes, truncated)`; a
-/// truncated walk is a lower bound, not the real size.
+/// anything that vanishes mid-walk — a watchdog walk races with the
+/// processes it watches. A directory that exists but cannot be listed
+/// marks the walk truncated: the byte count is a lower bound, not a
+/// complete measurement. Returns `(bytes, truncated)`.
 fn dir_size(path: &Path) -> (u64, bool) {
+    let (bytes, truncated, _) = dir_size_limited(path, DIR_WALK_BUDGET);
+    (bytes, truncated)
+}
+
+/// `dir_size` with a caller-chosen entry budget. The third value is
+/// how many entries were stat'd. `ent.metadata()` does not follow
+/// symlinks; the root `metadata` call does, so callers must not pass
+/// a symlink they have refused to follow.
+fn dir_size_limited(path: &Path, budget: usize) -> (u64, bool, usize) {
     let mut total = 0u64;
     let mut visited = 0_usize;
     let mut inodes = std::collections::HashSet::new();
     let root_dev = std::fs::metadata(path).ok().map(|m| m.dev());
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // Absence is an empty measurement. Permission and I/O
+            // failures are a lower bound: `truncated == false` would
+            // otherwise look like a finished walk of nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if dir.as_path() == path {
+                    return (0, false, 0);
+                }
+                continue;
+            }
+            Err(_) => return (total, true, visited),
         };
-        for ent in entries.flatten() {
-            if visited >= DIR_WALK_BUDGET {
-                return (total, true);
+        for ent in entries {
+            let ent = match ent {
+                Ok(ent) => ent,
+                Err(_) => return (total, true, visited),
+            };
+            if visited >= budget {
+                return (total, true, visited);
             }
             visited += 1;
             let Ok(meta) = ent.metadata() else {
@@ -528,7 +581,7 @@ fn dir_size(path: &Path) -> (u64, bool) {
             }
         }
     }
-    (total, false)
+    (total, false, visited)
 }
 
 /// POSIX single-quoting for a path emitted inside a shell command —
@@ -3435,6 +3488,807 @@ fn check_temp_dirs(scan: &Scan) -> Check {
     check(name, level, value, threshold, detail, remedy)
 }
 
+// ---------- legacy task cargo targets ----------
+//
+// `temp-dirs` only matches `cadence-` / `.tmp` / `tmp.`. Per-task
+// cargo output such as `/tmp/cad156-fix-target` is invisible there,
+// and a name that looks similar is not proof the directory is ours
+// or that it is idle. This check inventories that namespace and
+// stops. It does not join `--reclaim-plan` and it never emits a
+// deletion command: live, locked, foreign, symlink, name-only and
+// merely unproven rows are all excluded, and "no cwd/exe pointed
+// here" is reported as unproven rather than safe.
+
+/// `cad156-fix-target`, `cad173-nextest-target-one`,
+/// `cad176-pr100-target`. The `cad` + digits + `-` head is the
+/// legacy task prefix; `target` anywhere in the tail is what keeps
+/// `cad156-fix` and `cadence-*` out. Byte-wise so a non-UTF8 temp
+/// name cannot be lossily rewritten into a match.
+fn legacy_task_target_name(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = name.as_bytes();
+    let Some(rest) = bytes.strip_prefix(b"cad") else {
+        return false;
+    };
+    let Some(dash) = rest.iter().position(|b| *b == b'-') else {
+        return false;
+    };
+    let num = &rest[..dash];
+    let tail = &rest[dash + 1..];
+    !num.is_empty()
+        && num.iter().all(|b| b.is_ascii_digit())
+        && tail.windows(6).any(|w| w == b"target")
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn normalize_abs(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches('/');
+    let path = if trimmed.is_empty() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(trimmed)
+    };
+    Some(lexical_normalize(&path))
+}
+
+fn under_cadence_tree(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == ".cadence")
+}
+
+fn configured_cargo_target(scan: &Scan) -> Option<PathBuf> {
+    let raw = scan.cargo_target_dir.as_ref()?;
+    let joined = if raw.is_absolute() {
+        raw.clone()
+    } else {
+        scan.cwd.join(raw)
+    };
+    normalize_abs(&joined)
+}
+
+/// Keep the stronger gap. `unreadable` must not collapse back to
+/// `incomplete` when a later entry fails a milder check.
+fn note_record(status: &mut &'static str, next: &'static str) {
+    fn rank(s: &str) -> u8 {
+        match s {
+            "unreadable" => 3,
+            "incomplete" => 2,
+            _ => 0,
+        }
+    }
+    if rank(next) > rank(status) {
+        *status = next;
+    }
+}
+
+/// Issue ids whose worktree ref records this cargo target. Symlinked
+/// issue files and project dirs are skipped rather than followed; a
+/// skip or a read error makes the search status incomplete so a
+/// missing record is not treated as proof of non-ownership.
+fn recorded_cargo_targets(pm: Option<&Path>) -> (BTreeMap<PathBuf, Vec<String>>, &'static str) {
+    let mut map: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    let Some(pm) = pm else {
+        return (map, "no-tracker");
+    };
+    let Ok(meta) = std::fs::symlink_metadata(pm) else {
+        return (map, "unreadable");
+    };
+    if !meta.is_dir() {
+        return (map, "unreadable");
+    }
+    let Ok(projects) = std::fs::read_dir(pm) else {
+        return (map, "unreadable");
+    };
+    let mut status = "complete";
+    let mut seen = 0_usize;
+    for project in projects {
+        let project = match project {
+            Ok(project) => project,
+            Err(_) => {
+                note_record(&mut status, "incomplete");
+                continue;
+            }
+        };
+        let Ok(kind) = project.file_type() else {
+            note_record(&mut status, "incomplete");
+            continue;
+        };
+        if !kind.is_dir() {
+            continue;
+        }
+        let Ok(issues) = std::fs::read_dir(project.path()) else {
+            note_record(&mut status, "unreadable");
+            continue;
+        };
+        for issue in issues {
+            if seen >= TASK_TARGET_ISSUE_BUDGET {
+                return (map, "truncated");
+            }
+            let issue = match issue {
+                Ok(issue) => issue,
+                Err(_) => {
+                    note_record(&mut status, "incomplete");
+                    continue;
+                }
+            };
+            let Ok(kind) = issue.file_type() else {
+                note_record(&mut status, "incomplete");
+                continue;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let file = issue.path().join("issue.md");
+            let meta = match std::fs::symlink_metadata(&file) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    note_record(&mut status, "incomplete");
+                    continue;
+                }
+            };
+            if meta.file_type().is_symlink() {
+                note_record(&mut status, "incomplete");
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            seen += 1;
+            if meta.len() > 1_048_576 {
+                note_record(&mut status, "incomplete");
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                note_record(&mut status, "incomplete");
+                continue;
+            };
+            let Ok((front, _)) = crate::issue::parse::parse_issue(&text) else {
+                note_record(&mut status, "incomplete");
+                continue;
+            };
+            for r in &front.refs {
+                if r.kind != "worktree" {
+                    continue;
+                }
+                let Some(raw) = r.cargo_target.as_deref() else {
+                    continue;
+                };
+                let Some(path) = normalize_abs(Path::new(raw)) else {
+                    note_record(&mut status, "incomplete");
+                    continue;
+                };
+                let ids = map.entry(path).or_default();
+                if !ids.iter().any(|id| id == &front.id) {
+                    ids.push(front.id.clone());
+                    ids.sort();
+                }
+            }
+        }
+    }
+    (map, status)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LockBit {
+    Absent,
+    Free,
+    Held,
+    Unknown,
+}
+
+/// What `lstat` can say about `path` without crossing a symlink.
+/// `symlink_metadata` on the full path still walks ancestor links, so
+/// `/tmp/link/target` looks like a real directory when `link` is a
+/// symlink. Each component is `lstat`'d on its own and the walk stops
+/// at the first link.
+enum LexicalKind {
+    Absent,
+    /// `at` is the symlink component. `final_component` is false when
+    /// an ancestor, not the path itself, is the link.
+    Symlink {
+        at: PathBuf,
+        final_component: bool,
+    },
+    Ready(std::fs::Metadata),
+    Error,
+}
+
+fn lexical_kind(path: &Path) -> LexicalKind {
+    if !path.is_absolute() {
+        return LexicalKind::Error;
+    }
+    let mut cur = PathBuf::new();
+    let comps: Vec<_> = path.components().collect();
+    let last = comps.len().saturating_sub(1);
+    for (i, c) in comps.into_iter().enumerate() {
+        match c {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                cur.push(c);
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return LexicalKind::Error;
+            }
+            std::path::Component::Normal(name) => {
+                cur.push(name);
+                match std::fs::symlink_metadata(&cur) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return LexicalKind::Symlink {
+                            at: cur,
+                            final_component: i == last,
+                        };
+                    }
+                    Ok(meta) if i == last => return LexicalKind::Ready(meta),
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => return LexicalKind::Error,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return LexicalKind::Absent;
+                    }
+                    Err(_) => return LexicalKind::Error,
+                }
+            }
+        }
+    }
+    LexicalKind::Error
+}
+
+/// Non-blocking exclusive probe of one cargo lock file.
+///
+/// A FIFO named `.cargo-lock` blocks `open` forever. A final-component
+/// symlink is not the only trap: `lstat` of the basename still follows
+/// ancestor links, and a replacement between the check and `open` can
+/// swap in a FIFO or a symlink. Non-regular files are rejected first.
+/// The open itself is one `O_NOFOLLOW | O_NONBLOCK` call, and the fd is
+/// kept only when `fstat` still says it is a regular file.
+fn probe_lock_file(path: &Path) -> LockBit {
+    match lexical_kind(path) {
+        LexicalKind::Absent => return LockBit::Absent,
+        LexicalKind::Ready(meta) if meta.is_file() => {}
+        LexicalKind::Ready(_) | LexicalKind::Symlink { .. } | LexicalKind::Error => {
+            return LockBit::Unknown;
+        }
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LockBit::Absent,
+        Err(_) => return LockBit::Unknown,
+    };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        _ => return LockBit::Unknown,
+    }
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return LockBit::Free;
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        LockBit::Held
+    } else {
+        LockBit::Unknown
+    }
+}
+
+fn fold_lock(status: &'static str, bit: LockBit) -> &'static str {
+    match (status, bit) {
+        (_, LockBit::Held) | ("held", _) => "held",
+        ("unknown", _) | (_, LockBit::Unknown) => "unknown",
+        (_, LockBit::Free) => "free",
+        (status, LockBit::Absent) => status,
+    }
+}
+
+/// Cargo's build locks at the target root and under `debug/` /
+/// `release/` only. A symlinked profile directory is not entered,
+/// and neither is a directory reached through an ancestor symlink.
+fn cargo_lock_status(dir: &Path) -> &'static str {
+    match lexical_kind(dir) {
+        LexicalKind::Ready(meta) if meta.is_dir() => {}
+        _ => return "unknown",
+    }
+    let mut status = "absent";
+    for name in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
+        status = fold_lock(status, probe_lock_file(&dir.join(name)));
+        if status == "held" {
+            return status;
+        }
+    }
+    for sub in ["debug", "release"] {
+        let subdir = dir.join(sub);
+        match std::fs::symlink_metadata(&subdir) {
+            Ok(m) if m.file_type().is_symlink() => {
+                status = fold_lock(status, LockBit::Unknown);
+            }
+            Ok(m) if m.is_dir() => {
+                for name in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
+                    status = fold_lock(status, probe_lock_file(&subdir.join(name)));
+                    if status == "held" {
+                        return status;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    status
+}
+
+struct ProcSeen {
+    pids: Vec<u32>,
+    extra: usize,
+}
+
+/// One pass over `proc_root`. Cwd and exe are `read_link` results —
+/// the link text, not a followed target. `partial` means a pid denied
+/// both links or a directory entry could not be read, so a row with
+/// no hit is not proof that nothing references it.
+fn task_target_proc_hits(proc_root: &Path, roots: &[PathBuf]) -> (Vec<ProcSeen>, &'static str) {
+    let mut hits = roots
+        .iter()
+        .map(|_| ProcSeen {
+            pids: Vec::new(),
+            extra: 0,
+        })
+        .collect::<Vec<_>>();
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return (hits, "unreadable");
+    };
+    let mut seen = 0_usize;
+    let mut partial = false;
+    for ent in entries {
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(_) => {
+                partial = true;
+                continue;
+            }
+        };
+        if seen >= TASK_TARGET_PROC_BUDGET {
+            return (hits, "truncated");
+        }
+        let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        seen += 1;
+        let cwd = std::fs::read_link(ent.path().join("cwd"));
+        let exe = std::fs::read_link(ent.path().join("exe"));
+        if cwd
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+            && exe
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            partial = true;
+            continue;
+        }
+        for (i, root) in roots.iter().enumerate() {
+            let matched = [cwd.as_ref(), exe.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|link| {
+                    let text = link.to_string_lossy();
+                    let stripped = text.strip_suffix(" (deleted)").unwrap_or(text.as_ref());
+                    let path = lexical_normalize(Path::new(stripped));
+                    path == *root || path.starts_with(root)
+                });
+            if !matched {
+                continue;
+            }
+            let hit = &mut hits[i];
+            if hit.pids.len() < TASK_TARGET_PIDS {
+                if !hit.pids.contains(&pid) {
+                    hit.pids.push(pid);
+                }
+            } else {
+                hit.extra += 1;
+            }
+        }
+    }
+    for hit in &mut hits {
+        hit.pids.sort_unstable();
+    }
+    let status = if partial { "partial" } else { "complete" };
+    (hits, status)
+}
+
+struct TaskCandidate {
+    path: PathBuf,
+    name_match: bool,
+}
+
+fn check_task_targets(scan: &Scan) -> Check {
+    let name = "task-targets";
+    let t = &scan.thresholds;
+    let threshold = json!(format!(
+        "warn: ≥{} pressure dirs, ≥{}, a truncated or incomplete temp/tracker/proc scan, or any active/locked/unknown row — inventory only, never a deletion list",
+        t.temp_warn_count,
+        human(t.temp_warn_bytes)
+    ));
+    let (recorded, record_search) = recorded_cargo_targets(scan.pm_dir.as_deref());
+    let configured = configured_cargo_target(scan);
+
+    let mut candidates: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    let mut temp_scan = "complete";
+    match std::fs::read_dir(&scan.temp_dir) {
+        Ok(entries) => {
+            let mut n = 0_usize;
+            for ent in entries {
+                if n >= TASK_TARGET_TEMP_BUDGET {
+                    temp_scan = "truncated";
+                    break;
+                }
+                let ent = match ent {
+                    Ok(ent) => ent,
+                    Err(_) => {
+                        if temp_scan == "complete" {
+                            temp_scan = "incomplete";
+                        }
+                        continue;
+                    }
+                };
+                n += 1;
+                if !legacy_task_target_name(&ent.file_name()) {
+                    continue;
+                }
+                // `file_type` does not follow links. A symlink is
+                // inventoried and not walked; a regular file is not a
+                // cargo target directory.
+                let Ok(kind) = ent.file_type() else {
+                    temp_scan = "incomplete";
+                    continue;
+                };
+                if !kind.is_dir() && !kind.is_symlink() {
+                    continue;
+                }
+                let path = lexical_normalize(&ent.path());
+                candidates.insert(path, true);
+            }
+        }
+        Err(_) => temp_scan = "unreadable",
+    }
+    for path in recorded.keys() {
+        candidates.entry(path.clone()).or_insert(false);
+    }
+    if let Some(path) = &configured {
+        candidates.entry(path.clone()).or_insert(false);
+    }
+
+    let mut scan_truncated = temp_scan == "truncated" || record_search == "truncated";
+    let mut selected: Vec<TaskCandidate> = candidates
+        .into_iter()
+        .map(|(path, name_match)| TaskCandidate { path, name_match })
+        .collect();
+    if selected.len() > TASK_TARGET_ROW_CAP {
+        selected.truncate(TASK_TARGET_ROW_CAP);
+        scan_truncated = true;
+    }
+
+    let roots: Vec<PathBuf> = selected.iter().map(|c| c.path.clone()).collect();
+    let (hits, proc_scan) = task_target_proc_hits(&scan.proc_root, &roots);
+
+    let pressure_slots = selected
+        .iter()
+        .filter(|c| !under_cadence_tree(&c.path))
+        .count()
+        .max(1);
+    // Every legacy directory gets the same slice of the stat budget.
+    // Walking recorded `.cadence` targets first would consume it and
+    // leave the `/tmp/cad*-target*` rows unsized.
+    let per_dir_budget =
+        (TASK_TARGET_STAT_BUDGET / pressure_slots).clamp(1, TASK_TARGET_DIR_STAT_CAP);
+    let mut rows: Vec<Value> = Vec::new();
+    let mut pressure_count = 0_u64;
+    let mut pressure_bytes = 0_u64;
+    let record_gap = !matches!(record_search, "complete" | "no-tracker");
+    // An unknown proc/tracker/temp scan must not leave the check `ok`.
+    // `run` takes the worst level and `exit_code` treats `ok` as a
+    // healthy host.
+    let proc_gap = proc_scan != "complete";
+    let mut attention = temp_scan != "complete" || scan_truncated || record_gap || proc_gap;
+    for (cand, hit) in selected.iter().zip(hits.iter()) {
+        let path = &cand.path;
+        let issues = recorded.get(path).cloned().unwrap_or_default();
+        let is_configured = configured.as_ref().is_some_and(|p| p == path);
+        let name_match = cand.name_match || path.file_name().is_some_and(legacy_task_target_name);
+        let ownership = if !issues.is_empty() {
+            "recorded"
+        } else if is_configured {
+            "configured"
+        } else {
+            "name-only"
+        };
+        let proven = ownership != "name-only";
+        let pressure = !under_cadence_tree(path);
+        let quoted = shell_quote(&path.display().to_string());
+
+        // Component-wise lstat. `symlink_metadata(path)` would follow
+        // an ancestor and report the final directory as real.
+        let looked = lexical_kind(path);
+        let ancestor_symlink = matches!(
+            looked,
+            LexicalKind::Symlink {
+                final_component: false,
+                ..
+            }
+        );
+        let link_at = match &looked {
+            LexicalKind::Symlink { at, .. } => Some(at.clone()),
+            _ => None,
+        };
+        let symlink = link_at.is_some();
+        let meta = match &looked {
+            LexicalKind::Ready(m) => Some(m.clone()),
+            LexicalKind::Symlink { at, .. } => std::fs::symlink_metadata(at).ok(),
+            _ => None,
+        };
+        let exists = matches!(looked, LexicalKind::Ready(_) | LexicalKind::Symlink { .. });
+        let uid = meta.as_ref().map(|m| m.uid());
+        let uid_matches = uid.is_some_and(|u| u == scan.uid);
+        let age_secs = meta.as_ref().and_then(|m| {
+            m.modified().ok().map(|modified| {
+                scan.now
+                    .duration_since(modified)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            })
+        });
+        let link_target = link_at
+            .as_deref()
+            .and_then(|at| std::fs::read_link(at).ok())
+            .map(|t| t.display().to_string());
+        let foreign_symlink = if let Some(at) = &link_at {
+            match &link_target {
+                Some(target) => {
+                    let target = PathBuf::from(target);
+                    let base = at.parent().unwrap_or(Path::new("/"));
+                    let resolved = if target.is_absolute() {
+                        lexical_normalize(&target)
+                    } else {
+                        lexical_normalize(&base.join(target))
+                    };
+                    let tmp = lexical_normalize(&scan.temp_dir);
+                    !resolved.starts_with(&tmp)
+                }
+                None => true,
+            }
+        } else {
+            false
+        };
+
+        let (bytes, bytes_truncated, bytes_skipped, cargo_lock) = if symlink {
+            (None, false, Some("symlink"), "unknown")
+        } else if matches!(looked, LexicalKind::Error) {
+            (None, false, Some("unreadable"), "unknown")
+        } else if !exists {
+            (None, false, Some("absent"), "absent")
+        } else if !uid_matches {
+            (None, false, Some("foreign-uid"), "unknown")
+        } else if meta.as_ref().is_some_and(|m| !m.is_dir()) {
+            (None, false, Some("not-a-directory"), "unknown")
+        } else if !pressure {
+            // The worktree check already measures these trees.
+            (
+                None,
+                false,
+                Some("tracked-elsewhere"),
+                cargo_lock_status(path),
+            )
+        } else {
+            let (b, truncated, _) = dir_size_limited(path, per_dir_budget);
+            if truncated {
+                scan_truncated = true;
+            }
+            (Some(b), truncated, None, cargo_lock_status(path))
+        };
+
+        let observed = !hit.pids.is_empty();
+        // Hits we did see stay observed. A row with no hit is
+        // `none-observed` only when the proc scan finished. Partial,
+        // truncated, and unreadable scans are unknown negatives.
+        let cwd_exe = if observed {
+            "observed"
+        } else if proc_scan != "complete" {
+            "unreadable"
+        } else {
+            "none-observed"
+        };
+        let activity = if observed || cargo_lock == "held" {
+            "active"
+        } else if symlink
+            || !exists
+            || !uid_matches
+            || cwd_exe == "unreadable"
+            || cargo_lock == "unknown"
+        {
+            "unknown"
+        } else {
+            "unproven"
+        };
+        let exclude = if symlink {
+            "symlink"
+        } else if exists && !uid_matches {
+            "foreign-uid"
+        } else if activity == "active" {
+            "active"
+        } else if activity == "unknown" {
+            "unknown"
+        } else if ownership == "name-only" {
+            "name-only"
+        } else {
+            "unproven"
+        };
+
+        if pressure && exists {
+            pressure_count += 1;
+            pressure_bytes = pressure_bytes.saturating_add(bytes.unwrap_or(0));
+            if bytes_truncated
+                || activity == "active"
+                || activity == "unknown"
+                || cargo_lock == "held"
+                || cargo_lock == "unknown"
+            {
+                attention = true;
+            }
+        }
+
+        rows.push(json!({
+            "path": path,
+            "quoted": quoted,
+            "name": path.file_name().map(|n| n.to_string_lossy().into_owned()),
+            "name_match": name_match,
+            "ownership": ownership,
+            "proven": proven,
+            "configured": is_configured,
+            "issues": issues,
+            "owner_uid": uid,
+            "uid_matches": exists && uid_matches,
+            "age_secs": age_secs,
+            "bytes": bytes,
+            "bytes_truncated": bytes_truncated,
+            "bytes_skipped": bytes_skipped,
+            "exists": exists,
+            "symlink": symlink,
+            "ancestor_symlink": ancestor_symlink,
+            // True only if a symlink component was crossed. Nothing in
+            // this check crosses one, including an ancestor of the
+            // final path, so this stays false.
+            "followed": false,
+            "foreign_symlink": foreign_symlink,
+            "cargo_lock": cargo_lock,
+            "activity": activity,
+            "cwd_exe": cwd_exe,
+            "pids": hit.pids,
+            "pids_omitted": hit.extra,
+            "pressure": pressure,
+            "reclaim_candidate": false,
+            "safe_to_delete": false,
+            "action": "none",
+            "exclude": exclude,
+        }));
+    }
+
+    if scan_truncated {
+        attention = true;
+    }
+    let level = if attention
+        || pressure_count >= t.temp_warn_count
+        || pressure_bytes >= t.temp_warn_bytes
+    {
+        Level::Warn
+    } else {
+        Level::Ok
+    };
+
+    let shown_rows: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["pressure"] == json!(true))
+        .chain(rows.iter().filter(|r| r["pressure"] != json!(true)))
+        .collect();
+    let detail = if rows.is_empty() {
+        if temp_scan == "unreadable" {
+            format!(
+                "temp dir {} unreadable — task targets not inventoried",
+                scan.temp_dir.display()
+            )
+        } else if record_gap || temp_scan != "complete" || proc_scan != "complete" {
+            format!(
+                "none listed — temp {temp_scan}, tracker {record_search}, proc {proc_scan}; not a conclusive absence"
+            )
+        } else {
+            "none".to_string()
+        }
+    } else {
+        let name_only = rows
+            .iter()
+            .filter(|r| r["ownership"] == "name-only")
+            .count();
+        let proven_n = rows.iter().filter(|r| r["proven"] == json!(true)).count();
+        let active = rows.iter().filter(|r| r["activity"] == "active").count();
+        let unproven = rows.iter().filter(|r| r["activity"] == "unproven").count();
+        let locked = rows.iter().filter(|r| r["cargo_lock"] == "held").count();
+        let size = if rows.iter().any(|r| r["bytes_truncated"] == json!(true)) || scan_truncated {
+            format!("at least {}", human(pressure_bytes))
+        } else {
+            human(pressure_bytes)
+        };
+        let shown = shown_rows
+            .iter()
+            .take(5)
+            .map(|r| r["quoted"].as_str().unwrap_or("?"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let more = if rows.len() > 5 {
+            format!(" (+{} more)", rows.len() - 5)
+        } else {
+            String::new()
+        };
+        let idle_note = if unproven > 0 || proc_scan != "complete" {
+            " — none-observed is not proof the directory is idle"
+        } else {
+            ""
+        };
+        format!(
+            "{n} task targets, {size} pressure ({name_only} name-only, {proven_n} proven; {active} active, {locked} cargo-locked, {unproven} cwd/exe none-observed{idle_note}; proc {proc_scan}){more}: {shown}",
+            n = rows.len(),
+        )
+    };
+    let remedy = if rows.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "read-only inventory — nothing is deleted. A matching name is not Cadence ownership. No cwd/exe reference is not proof the directory is idle. Recheck ownership, process cwd/exe, and cargo locks immediately before any authorised reclaim. {}",
+            shown_rows
+                .iter()
+                .take(5)
+                .map(|r| format!(
+                    "{} ({}, {}, lock {})",
+                    r["quoted"].as_str().unwrap_or("?"),
+                    r["ownership"].as_str().unwrap_or("?"),
+                    r["activity"].as_str().unwrap_or("?"),
+                    r["cargo_lock"].as_str().unwrap_or("?")
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    let value = json!({
+        "count": rows.len(),
+        "bytes": pressure_bytes,
+        "pressure_count": pressure_count,
+        "scan_truncated": scan_truncated,
+        "temp_scan": temp_scan,
+        "record_search": record_search,
+        "proc_scan": proc_scan,
+        "safe_to_delete": false,
+        "record_conclusive": record_search == "complete",
+        "note": "A matching name is not Cadence ownership. No observed cwd/exe reference is not proof the directory is idle. Recheck ownership, process cwd/exe, and cargo locks immediately before any authorised reclaim.",
+        "rows": rows,
+    });
+    check(name, level, value, threshold, detail, remedy)
+}
+
 // ---------- stale worktrees ----------
 
 /// `git worktree list --porcelain` → worktree path to branch name.
@@ -4041,6 +4895,7 @@ mod tests {
         let scan = Scan {
             proc_root: root.path().join("proc"),
             temp_dir: root.path().join("tmp"),
+            cargo_target_dir: None,
             home: root.path().join("home"),
             state_dir: root.path().join("state"),
             cwd: root.path().join("repo"),
@@ -4353,6 +5208,29 @@ mod tests {
     fn real_bytes(path: &Path, bytes: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, vec![7u8; bytes]).unwrap();
+    }
+
+    /// Puts `mode` back before the owning `TempDir` is removed. Declare
+    /// it after the `TempDir` so this drops first.
+    struct RestoreMode {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    fn deny_directory(path: &Path) -> RestoreMode {
+        let restore = RestoreMode {
+            path: path.to_path_buf(),
+            mode: 0o755,
+        };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        restore
     }
 
     fn set_mtime_old(path: &Path, secs_ago: i64) {
@@ -5360,6 +6238,686 @@ mod tests {
         assert!(c.remedy.contains("cadence-issue-at-1-2"));
     }
 
+    // ---------- legacy task cargo targets ----------
+
+    fn task_row<'a>(value: &'a Value, name: &str) -> &'a Value {
+        value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("no task-target row {name} in {value}"))
+    }
+
+    #[test]
+    fn legacy_task_target_name_matches_only_the_missed_shape() {
+        for name in [
+            "cad156-fix-target",
+            "cad173-nextest-target-one",
+            "cad176-pr100-target",
+            "cad9-target",
+        ] {
+            assert!(
+                legacy_task_target_name(std::ffi::OsStr::new(name)),
+                "{name}"
+            );
+        }
+        for name in [
+            "cadence-issue-at-1-2",
+            "cadence-smoke",
+            ".tmpAbc",
+            "tmp.XYZ",
+            "unrelated",
+            "my-target",
+            "cad-target",
+            "cad156-fix",
+            "CAD156-fix-target",
+            "notcad156-fix-target",
+            "target",
+        ] {
+            assert!(
+                !legacy_task_target_name(std::ffi::OsStr::new(name)),
+                "{name} must stay outside the inventory"
+            );
+        }
+    }
+
+    #[test]
+    fn task_targets_list_missed_names_and_skip_unrelated() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let tmp = scan.temp_dir.clone();
+        for name in [
+            "cad156-fix-target",
+            "cad173-nextest-target-one",
+            "cad176-pr100-target",
+        ] {
+            let dir = tmp.join(name);
+            std::fs::create_dir_all(dir.join("debug")).unwrap();
+            real_bytes(&dir.join("debug/lib.rlib"), 4096);
+            set_mtime_old(&dir, 90_000);
+        }
+        // Same age as a leak the temp-dirs check would delete — these
+        // names must not join that `rm -rf` list.
+        for name in [
+            "cad156-fix-target",
+            "cad173-nextest-target-one",
+            "cad176-pr100-target",
+        ] {
+            set_mtime_old(&tmp.join(name), 90_000);
+        }
+        for name in [
+            "unrelated",
+            "cadence-issue-at-1-2",
+            "cadence-smoke",
+            "my-target",
+            "cad-target",
+            "cad156-fix",
+            "target",
+        ] {
+            std::fs::create_dir_all(tmp.join(name)).unwrap();
+            set_mtime_old(&tmp.join(name), 90_000);
+        }
+        std::fs::write(tmp.join("cad156-fix-target-file"), b"not a dir").unwrap();
+
+        let temps = check_temp_dirs(&scan);
+        assert_eq!(temps.value["count"].as_u64(), Some(2));
+        let listed: Vec<&str> = temps.value["dirs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["path"].as_str())
+            .collect();
+        assert!(listed
+            .iter()
+            .all(|p| !p.contains("cad156") && !p.contains("cad173") && !p.contains("cad176")));
+
+        let c = check_task_targets(&scan);
+        assert_eq!(c.level, Level::Ok, "{}", c.detail);
+        assert_eq!(c.value["count"], 3);
+        assert_eq!(c.value["safe_to_delete"], false);
+        assert_eq!(c.value["record_search"], "complete");
+        assert!(!c.remedy.contains("rm"));
+        assert!(c.remedy.contains("read-only"));
+        assert!(c.detail.contains("not proof"));
+        let names: Vec<&str> = c.value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "cad156-fix-target",
+                "cad173-nextest-target-one",
+                "cad176-pr100-target",
+            ]
+        );
+        for name in &names {
+            let row = task_row(&c.value, name);
+            assert_eq!(row["ownership"], "name-only");
+            assert_eq!(row["proven"], false);
+            assert_eq!(row["activity"], "unproven");
+            assert_eq!(row["cwd_exe"], "none-observed");
+            assert_eq!(row["cargo_lock"], "absent");
+            assert_eq!(row["safe_to_delete"], false);
+            assert_eq!(row["reclaim_candidate"], false);
+            assert_eq!(row["action"], "none");
+            assert_eq!(row["followed"], false);
+            assert_eq!(row["exclude"], "name-only");
+            assert!(row["age_secs"].as_u64().unwrap() >= 80_000);
+            assert!(row["bytes"].as_u64().unwrap() > 0);
+            assert_eq!(row["bytes_truncated"], false);
+        }
+    }
+
+    #[test]
+    fn task_targets_do_not_follow_foreign_symlinks() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let tmp = scan.temp_dir.clone();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        real_bytes(&outside.join("payload"), 50_000);
+        std::os::unix::fs::symlink(&outside, tmp.join("cad999-foreign-target")).unwrap();
+        // A relative link that escapes the temp dir is foreign too.
+        std::os::unix::fs::symlink("../outside", tmp.join("cad998-rel-target")).unwrap();
+        // A link that stays inside the temp dir is still not walked.
+        let inside = tmp.join("cad997-inside-target");
+        std::fs::create_dir_all(&inside).unwrap();
+        real_bytes(&inside.join("payload"), 50_000);
+        std::os::unix::fs::symlink(&inside, tmp.join("cad997-link-target")).unwrap();
+
+        let c = check_task_targets(&scan);
+        assert_eq!(c.level, Level::Warn, "{}", c.detail);
+        for name in [
+            "cad999-foreign-target",
+            "cad998-rel-target",
+            "cad997-link-target",
+        ] {
+            let row = task_row(&c.value, name);
+            assert_eq!(row["symlink"], true);
+            assert_eq!(row["ancestor_symlink"], false);
+            assert_eq!(row["followed"], false);
+            assert_eq!(row["bytes"], Value::Null);
+            assert_eq!(row["bytes_skipped"], "symlink");
+            assert_eq!(row["cargo_lock"], "unknown");
+            assert_eq!(row["safe_to_delete"], false);
+            assert_eq!(row["action"], "none");
+            assert_eq!(row["exclude"], "symlink");
+            let blob = serde_json::to_string(row).unwrap();
+            assert!(!blob.contains("payload"), "{blob}");
+        }
+        assert_eq!(
+            task_row(&c.value, "cad999-foreign-target")["foreign_symlink"],
+            true
+        );
+        assert_eq!(
+            task_row(&c.value, "cad998-rel-target")["foreign_symlink"],
+            true
+        );
+        assert_eq!(
+            task_row(&c.value, "cad997-link-target")["foreign_symlink"],
+            false
+        );
+        // The real directory the inside link points at is its own row
+        // and is measured; the link row must not have added those bytes.
+        let inside_row = task_row(&c.value, "cad997-inside-target");
+        assert!(inside_row["bytes"].as_u64().unwrap() > 0);
+        assert_eq!(
+            task_row(&c.value, "cad997-link-target")["bytes"],
+            Value::Null
+        );
+    }
+
+    fn mkfifo(path: &Path) {
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o644) },
+            0,
+            "mkfifo {}",
+            path.display()
+        );
+    }
+
+    /// The probe must return. A regression that blocks in `open` fails
+    /// this instead of hanging the suite.
+    fn probe_lock_bounded(path: &Path) -> LockBit {
+        let path = path.to_path_buf();
+        let shown = path.display().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_lock_file(&path));
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("probe_lock_file blocked on {shown}"))
+    }
+
+    fn check_targets_bounded(scan: Scan) -> Check {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(check_task_targets(&scan));
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("task-target inventory blocked")
+    }
+
+    #[test]
+    fn task_targets_lock_probe_rejects_fifo_and_symlink_without_blocking() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let fifo_dir = scan.temp_dir.join("cad410-fifo-target");
+        std::fs::create_dir_all(fifo_dir.join("debug")).unwrap();
+        mkfifo(&fifo_dir.join(".cargo-lock"));
+        mkfifo(&fifo_dir.join("debug/.cargo-lock"));
+
+        let link_dir = scan.temp_dir.join("cad411-locklink-target");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let fifo = root.path().join("elsewhere-fifo");
+        mkfifo(&fifo);
+        std::os::unix::fs::symlink(&fifo, link_dir.join(".cargo-lock")).unwrap();
+
+        let free_dir = scan.temp_dir.join("cad412-freelock-target");
+        std::fs::create_dir_all(&free_dir).unwrap();
+        std::fs::write(free_dir.join(".cargo-lock"), b"lock").unwrap();
+
+        assert_eq!(
+            probe_lock_bounded(&fifo_dir.join(".cargo-lock")),
+            LockBit::Unknown
+        );
+        assert_eq!(
+            probe_lock_bounded(&fifo_dir.join("debug/.cargo-lock")),
+            LockBit::Unknown
+        );
+        assert_eq!(
+            probe_lock_bounded(&link_dir.join(".cargo-lock")),
+            LockBit::Unknown
+        );
+        assert_eq!(
+            probe_lock_bounded(&free_dir.join(".cargo-lock")),
+            LockBit::Free
+        );
+
+        let c = check_targets_bounded(scan);
+        for name in ["cad410-fifo-target", "cad411-locklink-target"] {
+            let row = task_row(&c.value, name);
+            assert_eq!(row["cargo_lock"], "unknown", "{name}");
+            assert_eq!(row["followed"], false, "{name}");
+            assert_eq!(row["safe_to_delete"], false, "{name}");
+            assert_eq!(row["action"], "none", "{name}");
+        }
+        assert_eq!(
+            task_row(&c.value, "cad412-freelock-target")["cargo_lock"],
+            "free"
+        );
+        assert!(!c.remedy.contains("rm"));
+    }
+
+    #[test]
+    fn task_targets_do_not_follow_ancestor_symlinks() {
+        let root = TempDir::new().unwrap();
+        let mut scan = fake_scan(&root);
+        let real = root.path().join("real-cache");
+        let hidden = real.join("cad400-ancestor-target");
+        std::fs::create_dir_all(&hidden).unwrap();
+        real_bytes(&hidden.join("payload.bin"), 50_000);
+        mkfifo(&hidden.join(".cargo-lock"));
+        let via = scan.temp_dir.join("via-link");
+        std::os::unix::fs::symlink(&real, &via).unwrap();
+        let through = via.join("cad400-ancestor-target");
+        // Final-component lstat would follow `via-link` and then block
+        // on the FIFO. The probe must stop at the ancestor link.
+        assert_eq!(
+            probe_lock_bounded(&through.join(".cargo-lock")),
+            LockBit::Unknown
+        );
+        assert!(matches!(
+            lexical_kind(&through),
+            LexicalKind::Symlink {
+                final_component: false,
+                ..
+            }
+        ));
+        scan.cargo_target_dir = Some(through);
+        let c = check_targets_bounded(scan);
+        let row = task_row(&c.value, "cad400-ancestor-target");
+        assert_eq!(row["ancestor_symlink"], true);
+        assert_eq!(row["symlink"], true);
+        assert_eq!(row["followed"], false);
+        assert_eq!(row["bytes"], Value::Null);
+        assert_eq!(row["bytes_skipped"], "symlink");
+        assert_eq!(row["cargo_lock"], "unknown");
+        assert_eq!(row["foreign_symlink"], true);
+        assert_eq!(row["safe_to_delete"], false);
+        assert_eq!(row["reclaim_candidate"], false);
+        assert_eq!(row["action"], "none");
+        let blob = serde_json::to_string(&c.to_json()).unwrap();
+        assert!(!blob.contains("payload.bin"), "{blob}");
+        assert!(!blob.contains("rm "), "{blob}");
+    }
+
+    #[test]
+    fn task_targets_skip_foreign_uid_walks() {
+        let root = TempDir::new().unwrap();
+        let mut scan = fake_scan(&root);
+        scan.uid = scan.uid.wrapping_add(1);
+        let dir = scan.temp_dir.join("cad156-fix-target");
+        std::fs::create_dir_all(dir.join("debug")).unwrap();
+        real_bytes(&dir.join("debug/lib.rlib"), 20_000);
+        // A symlink planted inside must not be followed just because
+        // the name matched: the whole tree is someone else's.
+        std::os::unix::fs::symlink("/etc", dir.join("debug/escape")).unwrap();
+
+        let c = check_task_targets(&scan);
+        let row = task_row(&c.value, "cad156-fix-target");
+        assert_eq!(row["uid_matches"], false);
+        assert_eq!(row["bytes"], Value::Null);
+        assert_eq!(row["bytes_skipped"], "foreign-uid");
+        assert_eq!(row["cargo_lock"], "unknown");
+        assert_eq!(row["activity"], "unknown");
+        assert_eq!(row["exclude"], "foreign-uid");
+        assert_eq!(row["safe_to_delete"], false);
+        assert_eq!(row["followed"], false);
+        assert_eq!(c.level, Level::Warn);
+        let blob = serde_json::to_string(&c.to_json()).unwrap();
+        assert!(!blob.contains("escape"), "{blob}");
+    }
+
+    #[test]
+    fn task_targets_live_lock_and_cwd_are_active_not_safe() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let live = scan.temp_dir.join("cad176-pr100-target");
+        let idle = scan.temp_dir.join("cad156-fix-target");
+        let decoy = scan.temp_dir.join("cad156-fix-target-extra");
+        for dir in [&live, &idle, &decoy] {
+            std::fs::create_dir_all(dir.join("debug")).unwrap();
+        }
+        let lock_path = live.join("debug/.cargo-lock");
+        std::fs::write(&lock_path, b"lock").unwrap();
+        let _held = crate::worktree::TestFileLock::acquire(&lock_path);
+        add_pid(
+            &scan.proc_root,
+            176,
+            Some(&live.join("debug")),
+            None,
+            Some("cargo test --lib host_inventory_marker"),
+            30,
+            &[],
+        );
+        // Component-wise: this cwd is the sibling, not the live dir.
+        add_pid(
+            &scan.proc_root,
+            177,
+            Some(&decoy),
+            Some(&live.join("debug/cadence")),
+            None,
+            30,
+            &[],
+        );
+
+        let c = check_task_targets(&scan);
+        assert_eq!(c.level, Level::Warn, "{}", c.detail);
+        let live_row = task_row(&c.value, "cad176-pr100-target");
+        assert_eq!(live_row["cargo_lock"], "held");
+        assert_eq!(live_row["activity"], "active");
+        assert_eq!(live_row["cwd_exe"], "observed");
+        assert_eq!(live_row["exclude"], "active");
+        assert_eq!(live_row["safe_to_delete"], false);
+        assert_eq!(live_row["reclaim_candidate"], false);
+        assert_eq!(live_row["action"], "none");
+        let pids: Vec<u64> = live_row["pids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_u64().unwrap())
+            .collect();
+        assert_eq!(pids, vec![176, 177]);
+        let idle_row = task_row(&c.value, "cad156-fix-target");
+        assert_eq!(idle_row["activity"], "unproven");
+        assert_eq!(idle_row["cwd_exe"], "none-observed");
+        assert_eq!(idle_row["cargo_lock"], "absent");
+        assert_eq!(idle_row["safe_to_delete"], false);
+        assert!(idle_row["pids"].as_array().unwrap().is_empty());
+        let decoy_row = task_row(&c.value, "cad156-fix-target-extra");
+        let decoy_pids: Vec<u64> = decoy_row["pids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_u64().unwrap())
+            .collect();
+        assert_eq!(decoy_pids, vec![177]);
+        assert!(!decoy_row["pids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_u64() == Some(176)));
+        let blob = serde_json::to_string(&c.to_json()).unwrap();
+        // The synthetic cmdline is a neutral marker. This inventory
+        // must not echo process arguments.
+        assert!(!blob.contains("host_inventory_marker"), "{blob}");
+        assert!(!blob.contains("rm -rf"), "{blob}");
+        assert!(c.detail.contains("not proof"));
+    }
+
+    #[test]
+    fn task_targets_recorded_and_configured_are_proven() {
+        let root = TempDir::new().unwrap();
+        let mut scan = fake_scan(&root);
+        let recorded = scan.temp_dir.join("recorded-custom-out");
+        let named = scan.temp_dir.join("cad200-only-target");
+        let both = scan.temp_dir.join("cad201-recorded-target");
+        let configured = scan.cwd.join(".cadence/target/shared");
+        for dir in [&recorded, &named, &both, &configured] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        real_bytes(&named.join("lib.rlib"), 128);
+        scan.cargo_target_dir = Some(PathBuf::from(".cadence/target/shared"));
+        let pm = scan.pm_dir.clone().unwrap();
+        write_issue(
+            &pm,
+            "cadence",
+            "CAD-201",
+            "doing",
+            &format!(
+                "refs:\n  - kind: worktree\n    path: {}\n    cargo_target: {}\n  - kind: worktree\n    path: {}\n    cargo_target: {}\n",
+                scan.cwd.join(".cadence/wt/cad-201").display(),
+                both.display(),
+                scan.cwd.join(".cadence/wt/custom").display(),
+                recorded.display(),
+            ),
+        );
+
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["record_search"], "complete");
+        assert_eq!(c.value["record_conclusive"], true);
+        let named_row = task_row(&c.value, "cad200-only-target");
+        assert_eq!(named_row["ownership"], "name-only");
+        assert_eq!(named_row["proven"], false);
+        assert_eq!(named_row["safe_to_delete"], false);
+        let both_row = task_row(&c.value, "cad201-recorded-target");
+        assert_eq!(both_row["ownership"], "recorded");
+        assert_eq!(both_row["proven"], true);
+        assert_eq!(both_row["name_match"], true);
+        assert_eq!(both_row["issues"][0], "CAD-201");
+        assert_eq!(both_row["safe_to_delete"], false);
+        assert_eq!(both_row["reclaim_candidate"], false);
+        let recorded_row = task_row(&c.value, "recorded-custom-out");
+        assert_eq!(recorded_row["ownership"], "recorded");
+        assert_eq!(recorded_row["proven"], true);
+        assert_eq!(recorded_row["name_match"], false);
+        assert_eq!(recorded_row["pressure"], true);
+        let configured_row = task_row(&c.value, "shared");
+        assert_eq!(configured_row["ownership"], "configured");
+        assert_eq!(configured_row["proven"], true);
+        assert_eq!(configured_row["configured"], true);
+        assert_eq!(configured_row["pressure"], false);
+        assert_eq!(configured_row["bytes_skipped"], "tracked-elsewhere");
+        assert_eq!(configured_row["safe_to_delete"], false);
+        // Unrelated names stay out even when a tracker is present.
+        assert!(c.value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["name"] != "unrelated"));
+        let blob = serde_json::to_string(&c.to_json()).unwrap();
+        assert!(!blob.contains("rm "), "{blob}");
+    }
+
+    #[test]
+    fn task_targets_unreadable_tracker_does_not_prove_name_only() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let pm = scan.pm_dir.clone().unwrap();
+        std::fs::remove_dir_all(&pm).unwrap();
+        std::fs::write(&pm, b"not a directory").unwrap();
+        std::fs::create_dir_all(scan.temp_dir.join("cad156-fix-target")).unwrap();
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["record_search"], "unreadable");
+        assert_eq!(c.value["record_conclusive"], false);
+        let row = task_row(&c.value, "cad156-fix-target");
+        assert_eq!(row["ownership"], "name-only");
+        assert_eq!(row["proven"], false);
+        assert_eq!(row["safe_to_delete"], false);
+    }
+
+    #[test]
+    fn dir_size_limited_unreadable_directory_is_truncated() {
+        let root = TempDir::new().unwrap();
+        let missing = root.path().join("missing-cad233");
+        let (bytes, truncated, visited) = dir_size_limited(&missing, 32);
+        assert_eq!(bytes, 0);
+        assert!(!truncated);
+        assert_eq!(visited, 0);
+
+        let dir = root.path().join("sized");
+        std::fs::create_dir_all(dir.join("open")).unwrap();
+        real_bytes(&dir.join("open/seen.bin"), 4096);
+        let (open_bytes, open_truncated, _) = dir_size_limited(&dir, 32);
+        assert!(!open_truncated);
+        assert!(open_bytes >= 4096);
+
+        let secret = dir.join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        real_bytes(&secret.join("hidden.bin"), 80_000);
+        let _restore = deny_directory(&secret);
+        let (bytes, truncated, _) = dir_size_limited(&dir, 32);
+        assert!(truncated);
+        assert!(bytes < 80_000, "hidden bytes were counted: {bytes}");
+        assert!(bytes >= open_bytes);
+    }
+
+    #[test]
+    fn task_targets_unreadable_child_is_not_a_finished_measurement() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let dir = scan.temp_dir.join("cad420-partial-target");
+        std::fs::create_dir_all(dir.join("secret")).unwrap();
+        real_bytes(&dir.join("seen.bin"), 2048);
+        real_bytes(&dir.join("secret/hidden.bin"), 80_000);
+        let _restore = deny_directory(&dir.join("secret"));
+        let c = check_task_targets(&scan);
+        let row = task_row(&c.value, "cad420-partial-target");
+        assert_eq!(row["bytes_truncated"], true);
+        assert_eq!(row["safe_to_delete"], false);
+        assert_eq!(row["reclaim_candidate"], false);
+        assert_eq!(row["action"], "none");
+        assert_eq!(c.value["scan_truncated"], true);
+        assert_eq!(c.value["safe_to_delete"], false);
+        assert_eq!(c.level, Level::Warn);
+        assert!(row["bytes"].as_u64().unwrap() < 80_000);
+        let blob = serde_json::to_string(&c.to_json()).unwrap();
+        assert!(!blob.contains("rm "), "{blob}");
+    }
+
+    #[test]
+    fn task_targets_denied_issue_record_is_not_conclusive() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let pm = scan.pm_dir.clone().unwrap();
+        let hidden = pm.join("cadence").join("CAD-420");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(
+            hidden.join("issue.md"),
+            format!(
+                "---\nid: CAD-420\ntitle: t\nstatus: doing\npriority: P2\nrefs:\n  - kind: worktree\n    path: {}\n    cargo_target: {}\ncreated: 2026-09-19T00:00:00Z\n---\n\nbody\n",
+                scan.cwd.display(),
+                scan.temp_dir.join("cad420-recorded-target").display(),
+            ),
+        )
+        .unwrap();
+        write_issue(&pm, "cadence", "CAD-421", "doing", "");
+        let _restore = deny_directory(&hidden);
+        std::fs::create_dir_all(scan.temp_dir.join("cad420-recorded-target")).unwrap();
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["record_search"], "incomplete");
+        assert_eq!(c.value["record_conclusive"], false);
+        let row = task_row(&c.value, "cad420-recorded-target");
+        assert_eq!(row["ownership"], "name-only");
+        assert_eq!(row["proven"], false);
+        assert_eq!(row["safe_to_delete"], false);
+        assert_eq!(row["reclaim_candidate"], false);
+        assert_eq!(c.level, Level::Warn);
+        assert_ne!(c.detail, "none");
+    }
+
+    #[test]
+    fn task_targets_unreadable_tracker_with_no_rows_is_not_none() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let pm = scan.pm_dir.clone().unwrap();
+        std::fs::remove_dir_all(&pm).unwrap();
+        std::fs::write(&pm, b"not a directory").unwrap();
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["record_search"], "unreadable");
+        assert_eq!(c.value["record_conclusive"], false);
+        assert_eq!(c.value["count"], 0);
+        assert_eq!(c.value["safe_to_delete"], false);
+        assert_ne!(c.detail, "none");
+        assert!(c.detail.contains("unreadable"), "{}", c.detail);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.remedy.is_empty());
+    }
+
+    #[test]
+    fn task_targets_denied_proc_dir_is_not_a_complete_idle_scan() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let pid = scan.proc_root.join("4242");
+        std::fs::create_dir_all(&pid).unwrap();
+        let _restore = deny_directory(&pid);
+        std::fs::create_dir_all(scan.temp_dir.join("cad421-proc-target")).unwrap();
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["proc_scan"], "partial");
+        let row = task_row(&c.value, "cad421-proc-target");
+        assert_eq!(row["cwd_exe"], "unreadable");
+        assert_eq!(row["activity"], "unknown");
+        assert_eq!(row["exclude"], "unknown");
+        assert_eq!(row["safe_to_delete"], false);
+        assert_eq!(row["reclaim_candidate"], false);
+        assert_eq!(row["action"], "none");
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.contains("not proof"), "{}", c.detail);
+        assert!(c.detail.contains("partial"), "{}", c.detail);
+        let body = c.to_json();
+        assert_eq!(body["level"], "warn");
+        assert_eq!(exit_code(&json!({"level": body["level"]})), 1);
+    }
+
+    #[test]
+    fn task_targets_unreadable_proc_with_no_rows_is_not_a_healthy_gate() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let _restore = deny_directory(&scan.proc_root);
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["proc_scan"], "unreadable");
+        assert_eq!(c.value["count"], 0);
+        assert_eq!(c.value["safe_to_delete"], false);
+        assert_eq!(c.level, Level::Warn);
+        assert_ne!(c.detail, "none");
+        assert!(c.detail.contains("unreadable"), "{}", c.detail);
+        let body = c.to_json();
+        assert_eq!(exit_code(&json!({"level": body["level"]})), 1);
+        assert!(c.remedy.is_empty());
+    }
+
+    #[test]
+    fn task_targets_unreadable_temp_dir_is_not_an_empty_inventory() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        std::fs::create_dir_all(scan.temp_dir.join("cad422-hidden-target")).unwrap();
+        let _restore = deny_directory(&scan.temp_dir);
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["temp_scan"], "unreadable");
+        assert_eq!(c.value["count"], 0);
+        assert_eq!(c.value["safe_to_delete"], false);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.contains("unreadable"), "{}", c.detail);
+        assert_ne!(c.detail, "none");
+        assert!(c.remedy.is_empty());
+    }
+
+    #[test]
+    fn task_targets_truncate_a_long_name_scan() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        for i in 0..=TASK_TARGET_ROW_CAP {
+            std::fs::create_dir_all(scan.temp_dir.join(format!("cad{i:04}-row-target"))).unwrap();
+        }
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["count"], TASK_TARGET_ROW_CAP);
+        assert_eq!(c.value["scan_truncated"], true);
+        assert_eq!(c.level, Level::Warn);
+        assert!(task_row(&c.value, "cad0000-row-target")["safe_to_delete"] == false);
+        assert!(c.value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["name"] != format!("cad{TASK_TARGET_ROW_CAP:04}-row-target")));
+        assert!(!c.remedy.contains("rm"));
+    }
+
     // ---------- stale worktrees ----------
 
     #[test]
@@ -5920,6 +7478,7 @@ mod tests {
                 "sessions",
                 "orphans",
                 "temp-dirs",
+                "task-targets",
                 "worktrees",
                 "load"
             ]
@@ -5930,6 +7489,17 @@ mod tests {
             }
         }
         assert_eq!(exit_code(&report), 0, "{}", render(&report));
+        let task = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "task-targets")
+            .unwrap();
+        assert_eq!(task["level"], "ok");
+        assert_eq!(task["detail"], "none");
+        assert_eq!(task["value"]["count"], 0);
+        assert_eq!(task["value"]["safe_to_delete"], false);
+        assert_eq!(task["remedy"], "");
     }
 
     #[test]
