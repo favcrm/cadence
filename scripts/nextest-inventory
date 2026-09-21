@@ -18,7 +18,7 @@ command -v jq >/dev/null 2>&1 || die "jq is required to parse nextest list JSON"
 
 # libtest prints one `name: test` line per case. Keep only those lines so
 # cargo warnings and the final summary cannot masquerade as test names.
-cargo --manifest-path "$ROOT/Cargo.toml" test --test "$TARGET" -- --list >"$TMP/cargo.list" ||
+cargo test --manifest-path "$ROOT/Cargo.toml" --test "$TARGET" -- --list >"$TMP/cargo.list" ||
     die "cargo test --test $TARGET -- --list failed"
 awk '
     /^[[:space:]]*[^[:space:]].*: test[[:space:]]*$/ {
