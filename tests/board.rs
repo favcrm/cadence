@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cadence_agent::issue::board;
+use cadence_agent::store::Store;
 use cadence_agent::ui;
 use cadence_agent::{client, daemon};
 use serde_json::{json, Value};
@@ -2101,6 +2102,143 @@ fn ui_job_state_drives_status_and_binding() {
     );
     assert_eq!(code, 409, "derived status write must conflict: {body}");
     assert!(body.contains("derived"), "409 names the cause: {body}");
+}
+
+#[test]
+fn ui_overview_surfaces_durable_monitor_alert_and_acknowledges_it() {
+    let pm = TempDir::new().unwrap();
+    let d = UiDaemon::start();
+    seed(pm.path(), &d.state());
+    let cwd = pm.path().to_str().unwrap();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": cwd}),
+    );
+    d.rpc(
+        "agent_register",
+        json!({"alias": "wk", "provider": "fake",
+               "endpoint_kind": "fake", "cwd": cwd,
+               "params": "{\"upstream\":\"pm\"}"}),
+    );
+    let spec = pm.path().join("monitor-ui.md");
+    std::fs::write(&spec, "# monitor ui\n").unwrap();
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "ui-monitor-job", "spec": spec,
+               "spec_sha256": "synthetic", "repo": "cadence", "issue": "CAD-3"}),
+    );
+    d.rpc(
+        "task_new",
+        json!({"job": "ui-monitor-job", "task": "ui-monitor-task",
+               "assignee": "wk", "acceptance": "observe the monitor"}),
+    );
+    d.rpc(
+        "monitor_register",
+        json!({"monitor": "ui-monitor", "project": "cadence",
+               "owner": "watchdog", "tasks": ["ui-monitor-task"],
+               "interval_secs": 1}),
+    );
+    let active_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let monitor = d.rpc("monitor_show", json!({"monitor": "ui-monitor"}))["monitor"].clone();
+        if monitor["monitoring"] == "active" {
+            assert!(monitor["last_success_at"].is_number(), "{monitor}");
+            break;
+        }
+        assert!(
+            Instant::now() < active_deadline,
+            "monitor never became active: {monitor}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let store = Store::open(&d.state.join("cadence.sqlite3")).unwrap();
+    store
+        .event_public_scoped(
+            "wk",
+            "turn_stalled",
+            json!({"message": "synthetic-stall", "episode": 1}),
+            Some("ui-monitor-job"),
+            Some("ui-monitor-task"),
+        )
+        .unwrap();
+    let alert = loop {
+        let page = d.rpc("monitor_alerts", json!({"monitor": "ui-monitor"}));
+        if let Some(alert) = page["alerts"].as_array().and_then(|a| a.first()) {
+            break alert.clone();
+        }
+        assert!(
+            Instant::now() < active_deadline + Duration::from_secs(5),
+            "alert not observed: {page}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+    let (code, body) = http(port, "GET", "/api/overview", &host);
+    assert_eq!(code, 200, "{body}");
+    let overview: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(overview["monitoring"]["state"], "active", "{overview}");
+    assert!(
+        overview["monitoring"]["last_success_at"].is_number(),
+        "{overview}"
+    );
+    let monitor = &overview["monitoring"]["monitors"][0];
+    assert!(monitor["heartbeat_at"].is_number(), "{overview}");
+    assert!(monitor["last_check_at"].is_number(), "{overview}");
+    assert_eq!(
+        monitor["coverage"],
+        json!(["ui-monitor-task"]),
+        "{overview}"
+    );
+    assert_eq!(overview["monitoring"]["open_alerts"], 1, "{overview}");
+    assert_eq!(overview["monitoring"]["alerts"][0]["project"], "cadence");
+    assert_eq!(
+        overview["monitoring"]["alerts"][0]["next_owner"],
+        "watchdog"
+    );
+    assert_eq!(
+        overview["monitoring"]["alerts"][0]["evidence"]["event_seq"],
+        alert["event_seq"]
+    );
+
+    let seq = alert["seq"].as_i64().unwrap();
+    let (code, _, body) = write_json(
+        port,
+        "POST",
+        &format!("/api/monitors/ui-monitor/alerts/{seq}/ack"),
+        &host,
+        "{}",
+    );
+    assert_eq!(code, 200, "{body}");
+    let ack: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(ack["alert"]["state"], "acknowledged", "{ack}");
+
+    let (code, body) = http(port, "GET", "/api/overview", &host);
+    assert_eq!(code, 200, "{body}");
+    let overview: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(overview["monitoring"]["open_alerts"], 0, "{overview}");
+    assert_eq!(
+        overview["monitoring"]["alerts"][0]["state"], "acknowledged",
+        "{overview}"
+    );
+
+    // The durable acknowledgement remains behind the board's existing
+    // read-only guard; a shared browse-only board cannot claim it handled
+    // an operator alert.
+    let read_only_port = start_ui_opts(pm.path().to_path_buf(), d.state(), |opts| {
+        opts.read_only = true;
+    });
+    let read_only_host = format!("127.0.0.1:{read_only_port}");
+    let (code, _, body) = write_json(
+        read_only_port,
+        "POST",
+        &format!("/api/monitors/ui-monitor/alerts/{seq}/ack"),
+        &read_only_host,
+        "{}",
+    );
+    assert_eq!(code, 403, "read-only board must refuse monitor ack: {body}");
 }
 
 #[test]
