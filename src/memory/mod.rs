@@ -1,20 +1,20 @@
 //! Project memory — reviewed, scoped facts shared across agents.
 //!
 //! One fact per file at `<pm>/<project>/memory/<slug>.md`: YAML
-//! frontmatter (id/type/status/scope/source/confidence/created/
-//! verified_at/supersedes/author) plus a body holding the fact (≤5
-//! lines), a `**Why:**` line and a `**How to apply:**` line.
+//! frontmatter plus a body holding the fact (≤5 lines), a `**Why:**`
+//! line and a `**How to apply:**` line.
 //!
-//! Workers `propose`; only a group root, an inbox PM or a plain
-//! operator terminal may `accept`/`reject`/`supersede` — the guard is
-//! enforced here in the guarded write path, not in the CLI. Every
-//! write is exactly one tracker commit with `Actor:` and `Memory:`
-//! trailers (never `Issue:` — memory writes are not issue writes).
+//! Authority-bearing writes go through daemon RPC. The daemon resolves the
+//! Unix peer to one live, owned native PTY endpoint and supplies the
+//! authenticated proposer/reviewer proof. Two distinct worker endpoint
+//! incarnations review the same semantic digest; an authenticated PM
+//! endpoint finalizes. Legacy records remain readable but are blocked from
+//! retrieval until a corrected native proposal is reviewed.
 //!
-//! Only `accepted` memories match a dispatch: `scope.project` or any
-//! of components/path-globs/tags/providers intersecting the dispatch
-//! context. `cadence dispatch` renders the top matches into a lessons
-//! file and names it in the kickoff; the briefing lists accepted
+//! Only accepted memories with a valid quorum match a dispatch:
+//! `scope.project` or any of components/path-globs/tags/providers intersecting
+//! the dispatch context. `cadence dispatch` renders the top matches into a
+//! lessons file and names it in the kickoff; the briefing lists eligible
 //! project-wide `rule`s.
 
 pub mod cli;
@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
-use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::{board, git, history, parse, project, time, write, Pm};
 use crate::proc;
@@ -33,6 +33,74 @@ use crate::proc;
 pub const TYPES: &[&str] = &["rule", "gotcha", "decision", "recipe"];
 pub const STATUSES: &[&str] = &["proposed", "accepted", "rejected", "superseded"];
 pub const CONFIDENCES: &[&str] = &["low", "medium", "high"];
+
+/// The small, daemon-issued identity proof that memory records retain.
+///
+/// `alias` is useful to a human reading a record, but it is not the
+/// identity key.  The persisted registration discriminator stays stable
+/// across a resume, while endpoint generation and process start are retained
+/// as live provenance; a later registration of the alias cannot inherit its
+/// reviews.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdentityProof {
+    pub alias: String,
+    /// Registration discriminator from the daemon's persisted Agent row.
+    /// It survives endpoint resumes but changes when an alias is removed
+    /// and registered again.
+    pub registration: u64,
+    pub generation: String,
+    pub process_start: u64,
+    pub role: String,
+}
+
+impl IdentityProof {
+    pub fn stable_id(&self) -> String {
+        format!("{}#{}", self.alias, self.registration)
+    }
+}
+
+/// An immutable review receipt.  Receipts are retained in the memory file;
+/// lifecycle status and timestamps do not enter the semantic revision digest.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewReceipt {
+    pub reviewer: String,
+    pub identity: String,
+    pub generation: String,
+    pub process_start: u64,
+    pub role: String,
+    pub operation: String,
+    pub cycle: u64,
+    pub digest: String,
+    pub verdict: String,
+    pub evidence: String,
+    pub recorded_at: String,
+}
+
+/// Durable PM finalization receipt.  A review quorum is only eligible for
+/// retrieval after the PM records this receipt; worker receipts alone are
+/// never an acceptance or revalidation decision.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FinalizationReceipt {
+    pub operation: String,
+    pub cycle: u64,
+    pub digest: String,
+    pub finalizer: IdentityProof,
+    pub finalized_at: String,
+}
+
+/// Identity resolved by the daemon from a Unix socket peer.  It is kept in
+/// this module so every write path consumes the same proof shape and no CLI
+/// or HTTP request can construct one from claimed fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeIdentity {
+    pub proof: IdentityProof,
+}
+
+impl NativeIdentity {
+    pub fn stable_id(&self) -> String {
+        self.proof.stable_id()
+    }
+}
 
 /// Dispatch injection caps — the lessons file stays a quick scan.
 pub const LESSON_MAX_ENTRIES: usize = 12;
@@ -83,6 +151,36 @@ pub struct Front {
     /// CADENCE_ALIAS of the proposer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    /// Daemon-authenticated proposer proof.  Legacy `author` strings are
+    /// intentionally not upgraded into this field when they are loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_proof: Option<IdentityProof>,
+    /// Authenticated contributors included in the semantic revision.  The
+    /// current CLI does not add contributors, but retaining the field makes
+    /// imported records explicit rather than silently trusted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributors: Vec<IdentityProof>,
+    /// Current review cycle.  A new semantic revision starts a new cycle;
+    /// verify/revalidation cycles are distinct from initial acceptance.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub review_cycle: u64,
+    /// The worker-review operation currently collecting receipts.  It is
+    /// cleared only by an authenticated PM finalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_operation: Option<String>,
+    /// Immutable review history.  Empty on legacy records, which therefore
+    /// remain visible but can never satisfy the quorum.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<ReviewReceipt>,
+    /// Immutable PM finalization history.  This is separate from the active
+    /// cycle so retrieval survives status transitions and a later verify can
+    /// start a genuinely new cycle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finalizations: Vec<FinalizationReceipt>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A loaded memory file.
@@ -356,32 +454,220 @@ pub fn find(pm: &Pm, flag: Option<&str>, slug: &str) -> Result<(project::Project
     }
 }
 
-/// Curator gate for accept/reject/supersede: outside a cadence pane
-/// any operator may curate; inside one, only a group root (no
-/// `upstream`) may. A worker pane fails closed — the daemon answering
-/// is what proves PM status, so an unreachable daemon also refuses.
-fn require_curator(state_dir: &Path) -> Result<()> {
-    let Ok(alias) = std::env::var("CADENCE_ALIAS") else {
-        return Ok(());
+/// Stable semantic revision digest. This deliberately excludes lifecycle
+/// status, review timestamps and receipt history: changing any claim or its
+/// applicability invalidates the old quorum, while a timestamp-only update
+/// does not create a new claim.
+pub fn semantic_digest(mem: &Memory) -> String {
+    #[derive(Serialize)]
+    struct Revision<'a> {
+        project: &'a str,
+        id: &'a str,
+        kind: &'a str,
+        body: &'a str,
+        author: &'a Option<String>,
+        author_proof: &'a Option<IdentityProof>,
+        contributors: &'a [IdentityProof],
+        source: &'a Option<String>,
+        confidence: &'a str,
+        scope: &'a Scope,
+        supersedes: &'a Option<String>,
+    }
+    let revision = Revision {
+        project: &mem.project,
+        id: &mem.front.id,
+        kind: &mem.front.kind,
+        body: &mem.body,
+        author: &mem.front.author,
+        author_proof: &mem.front.author_proof,
+        contributors: &mem.front.contributors,
+        source: &mem.front.source,
+        confidence: &mem.front.confidence,
+        scope: &mem.front.scope,
+        supersedes: &mem.front.supersedes,
     };
-    if alias.is_empty() {
-        return Ok(());
+    let bytes = serde_json::to_vec(&revision).expect("memory semantic revision is serializable");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Return the exact current review cycle for an operation. A cycle is only
+/// live while its operation is recorded in `active_operation`; finalization
+/// clears that marker so an old quorum cannot be submitted twice.
+fn operation_cycle(front: &Front, operation: &str) -> Option<u64> {
+    if front.active_operation.as_deref() != Some(operation) {
+        return None;
     }
-    let show = client::rpc(state_dir, "agent_show", json!({"alias": alias})).map_err(|_| {
-        Error::rejected(format!(
-            "'{alias}' is in a cadence pane but the daemon is unreachable — \
-             cannot verify PM status for memory curation"
-        ))
-    })?;
-    let agent = &show["agent"];
-    if agent["params"]["upstream"].is_null() {
-        Ok(())
-    } else {
-        Err(Error::rejected(format!(
-            "'{alias}' is a cadence worker — accept/reject/supersede is the PM's \
-             job; `cadence memory propose` records the lesson instead"
-        )))
+    match operation {
+        "accept" if front.status == "proposed" && front.review_cycle > 0 => {
+            Some(front.review_cycle)
+        }
+        "verify" if front.status == "accepted" && front.review_cycle > 1 => {
+            Some(front.review_cycle)
+        }
+        _ => None,
     }
+}
+
+fn finalization_for<'a>(
+    front: &'a Front,
+    operation: &str,
+    cycle: Option<u64>,
+    digest: &str,
+) -> Option<&'a FinalizationReceipt> {
+    front.finalizations.iter().find(|receipt| {
+        receipt.operation == operation
+            && cycle.is_none_or(|expected| receipt.cycle == expected)
+            && receipt.digest == digest
+            && receipt.finalizer.role == "pm"
+            && !receipt.finalizer.alias.is_empty()
+            && !receipt.finalizer.generation.is_empty()
+            && !receipt.finalized_at.is_empty()
+    })
+}
+
+fn next_verify_cycle(front: &Front) -> u64 {
+    let last = front
+        .finalizations
+        .iter()
+        .filter(|receipt| receipt.operation == "verify")
+        .map(|receipt| receipt.cycle)
+        .max()
+        .unwrap_or(1);
+    last.max(front.review_cycle).saturating_add(1).max(2)
+}
+
+/// Whether a memory has the authenticated quorum needed for operation, and
+/// a precise reason when it does not. This is used both by finalization and
+/// by all retrieval paths; status alone is never enough.
+pub fn quorum_status(mem: &Memory, operation: &str) -> (bool, String) {
+    let Some(author) = mem.front.author_proof.as_ref() else {
+        return (
+            false,
+            "review blocked: proposer has no authenticated native identity".to_string(),
+        );
+    };
+    let Some(cycle) = operation_cycle(&mem.front, operation) else {
+        return (
+            false,
+            format!("review blocked: no active {operation} review cycle"),
+        );
+    };
+    let digest = semantic_digest(mem);
+    let author_id = author.stable_id();
+    let contributor_ids: std::collections::HashSet<String> = mem
+        .front
+        .contributors
+        .iter()
+        .map(IdentityProof::stable_id)
+        .collect();
+    let contributor_aliases: std::collections::HashSet<String> = mem
+        .front
+        .contributors
+        .iter()
+        .map(|c| c.alias.clone())
+        .collect();
+    let mut identities = std::collections::HashSet::new();
+    let mut aliases = std::collections::HashSet::new();
+    let mut passes = 0usize;
+    let mut disagreement = false;
+    for receipt in &mem.front.reviews {
+        if receipt.operation != operation || receipt.cycle != cycle {
+            continue;
+        }
+        let identity_prefix = format!("{}#", receipt.reviewer);
+        if receipt.digest != digest
+            || receipt.evidence.trim().is_empty()
+            || receipt.role != "worker"
+            || receipt.reviewer.is_empty()
+            || !receipt.identity.starts_with(&identity_prefix)
+            || receipt.generation.is_empty()
+            || receipt.process_start == 0
+        {
+            continue;
+        }
+        if receipt.verdict == "revise" {
+            disagreement = true;
+            continue;
+        }
+        if receipt.verdict != "pass"
+            || receipt.identity == author_id
+            || contributor_ids.contains(&receipt.identity)
+            || contributor_aliases.contains(&receipt.reviewer)
+        {
+            continue;
+        }
+        if !identities.insert(receipt.identity.clone()) || !aliases.insert(receipt.reviewer.clone())
+        {
+            continue;
+        }
+        passes += 1;
+    }
+    if disagreement {
+        return (
+            false,
+            format!(
+                "review blocked: an authenticated reviewer requested revision in {operation} cycle {cycle}"
+            ),
+        );
+    }
+    if passes < 2 {
+        return (
+            false,
+            format!(
+                "review blocked: {passes}/2 distinct authenticated reviewers passed {operation} cycle {cycle}"
+            ),
+        );
+    }
+    (
+        true,
+        format!("{passes}/2 authenticated reviewers passed {operation} cycle {cycle}"),
+    )
+}
+
+/// Retrieval eligibility is stricter than a lifecycle status. Accepted
+/// records must retain their PM acceptance finalization; once a fresh verify
+/// cycle is opened, worker receipts do not make the lesson eligible until a
+/// PM records a matching finalization for that cycle.
+pub fn retrieval_status(mem: &Memory) -> (bool, String) {
+    if mem.front.status != "accepted" {
+        return (
+            false,
+            format!("review blocked: memory status is {}", mem.front.status),
+        );
+    }
+    if mem.front.author_proof.is_none() {
+        return (
+            false,
+            "review blocked: accepted record has no authenticated proposer".to_string(),
+        );
+    }
+    let digest = semantic_digest(mem);
+    if finalization_for(&mem.front, "accept", None, &digest).is_none() {
+        return (
+            false,
+            "review blocked: accepted record has no matching PM acceptance finalization"
+                .to_string(),
+        );
+    }
+    if let Some(operation) = mem.front.active_operation.as_deref() {
+        return (
+            false,
+            format!(
+                "review blocked: {operation} cycle {} awaits PM finalization",
+                mem.front.review_cycle
+            ),
+        );
+    }
+    if let Some(receipt) = finalization_for(&mem.front, "verify", None, &digest) {
+        return (
+            true,
+            format!(
+                "accepted with PM verify finalization cycle {}",
+                receipt.cycle
+            ),
+        );
+    }
+    (true, "accepted with PM acceptance finalization".to_string())
 }
 
 /// One tracker commit for a memory write: subject plus `Memory:` and
@@ -470,62 +756,70 @@ fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `memory propose` — workers and operators alike. `--from` accepts a
-/// full memory file (frontmatter kept verbatim; status is still reset
-/// to `proposed`) or a bare body; `-m` is a bare body inline.
+/// Build and persist a proposal from content supplied by the authenticated
+/// daemon caller. The caller supplies raw file content rather than a path so
+/// the daemon, not a client-controlled path, owns the write decision.
 #[allow(clippy::too_many_arguments)]
-pub fn propose(
+pub fn propose_native(
     pm: &Pm,
     key: &str,
     kind: &str,
     scope: &Scope,
     source: Option<&str>,
     confidence: Option<&str>,
-    from: Option<&Path>,
+    from_text: Option<&str>,
     text: Option<&str>,
     slug: Option<&str>,
-    actor: &str,
+    actor: &NativeIdentity,
 ) -> Result<Value> {
+    if actor.proof.alias.is_empty() || actor.proof.generation.is_empty() {
+        return Err(Error::rejected("native proposer identity is incomplete"));
+    }
+    if actor.proof.role != "pm" && actor.proof.role != "worker" {
+        return Err(Error::rejected("native proposer role is unsupported"));
+    }
     let projects = project::list(&pm.dir)?;
     let proj = projects
         .iter()
         .find(|p| p.key == key)
         .ok_or_else(|| project::unknown_project(key, &pm.dir))?;
-    let (mut front, body) = match (from, text) {
-        (Some(file), None) => {
-            let raw = std::fs::read_to_string(file)
-                .map_err(|_| Error::rejected(format!("Cannot read {}", file.display())))?;
-            match parse_memory(&raw) {
-                Ok((f, b)) => (Some(f), b),
-                Err(_) => (None, raw),
-            }
-        }
+    let (mut front, body) = match (from_text, text) {
+        (Some(raw), None) => match parse_memory(raw) {
+            Ok((f, b)) => (Some(f), b),
+            Err(_) => (None, raw.to_string()),
+        },
         (None, Some(t)) => (None, t.to_string()),
         (None, None) => {
             return Err(Error::rejected(
-                "propose needs content — `-m \"<body>\"` or `--from <file>`",
+                "propose needs content — text or authenticated file content",
             ))
         }
-        (Some(_), Some(_)) => return Err(Error::rejected("propose takes --from or -m, not both")),
+        (Some(_), Some(_)) => return Err(Error::rejected("propose takes one content source")),
     };
     let slug = match slug {
         Some(s) => check_slug(s)?,
         None => {
             let base = fact_line(&body);
-            // slugify can leave dash runs — collapse them before the
-            // grammar check rather than erroring on a derived slug.
-            let s: String = crate::issue::start::slugify(&base)
+            let derived: String = crate::issue::start::slugify(&base)
                 .split('-')
                 .filter(|p| !p.is_empty())
                 .collect::<Vec<_>>()
                 .join("-");
-            check_slug(if s.is_empty() || s == "work" {
+            check_slug(if derived.is_empty() || derived == "work" {
                 "lesson"
             } else {
-                &s
+                &derived
             })?
         }
     };
+    if front
+        .as_ref()
+        .is_some_and(|candidate| !candidate.contributors.is_empty())
+    {
+        return Err(Error::rejected(
+            "authenticated multi-contributor proposals are unsupported; submit one native author proposal and review it independently",
+        ));
+    }
     let now = time::iso(time::now_epoch());
     let mut front = front.take().unwrap_or_else(|| Front {
         id: slug.clone(),
@@ -538,16 +832,24 @@ pub fn propose(
         verified_at: None,
         supersedes: None,
         author: None,
+        author_proof: None,
+        contributors: Vec::new(),
+        review_cycle: 0,
+        active_operation: None,
+        reviews: Vec::new(),
+        finalizations: Vec::new(),
     });
     front.id = slug.clone();
     front.status = "proposed".to_string();
-    front.author = Some(write::actor_who(actor, None));
+    front.verified_at = None;
+    front.author = Some(actor.proof.alias.clone());
+    front.author_proof = Some(actor.proof.clone());
+    front.contributors.clear();
+    front.review_cycle = 0;
+    front.active_operation = None;
+    front.reviews.clear();
+    front.finalizations.clear();
     let path = memory_dir(pm, key).join(format!("{slug}.md"));
-    if path.exists() {
-        return Err(Error::rejected(format!(
-            "Memory '{slug}' already exists — `memory show {slug}` reads it"
-        )));
-    }
     let mem = Memory {
         project: key.to_string(),
         front,
@@ -556,144 +858,328 @@ pub fn propose(
     };
     check_front(&mem, &proj.components)?;
     let _lock = pm.lock()?;
-    std::fs::create_dir_all(memory_dir(pm, key))?;
-    save_mem(&mem)?;
-    let committed = commit_mem(pm, &slug, &format!("{key}/memory/{slug}: proposed"), actor)?;
-    Ok(json!({"project": key, "slug": slug, "status": "proposed",
-              "path": mem.path, "committed": committed}))
-}
-
-/// Shared accept/reject: curator-gated status transition.
-fn review(
-    pm: &Pm,
-    flag: Option<&str>,
-    slug: &str,
-    status: &str,
-    edit: Option<&str>,
-    actor: &str,
-    state_dir: &Path,
-) -> Result<Value> {
-    require_curator(state_dir)?;
-    let (proj, mut mem) = find(pm, flag, slug)?;
-    if let Some(body) = edit {
-        mem.body = body.to_string();
-    }
-    mem.front.status = status.to_string();
-    if status == "accepted" {
-        mem.front.verified_at = Some(time::iso(time::now_epoch()));
-    }
-    check_front(&mem, &proj.components)?;
-    let _lock = pm.lock()?;
-    save_mem(&mem)?;
-    let committed = commit_mem(
-        pm,
-        slug,
-        &format!("{}/memory/{slug}: {status}", proj.key),
-        actor,
-    )?;
-    Ok(json!({"project": proj.key, "slug": slug, "status": status,
-              "committed": committed}))
-}
-
-/// `memory accept <slug>` — PM/operator only; stamps verified_at.
-pub fn accept(
-    pm: &Pm,
-    flag: Option<&str>,
-    slug: &str,
-    edit: Option<&str>,
-    actor: &str,
-    state_dir: &Path,
-) -> Result<Value> {
-    review(pm, flag, slug, "accepted", edit, actor, state_dir)
-}
-
-/// `memory reject <slug>`.
-pub fn reject(
-    pm: &Pm,
-    flag: Option<&str>,
-    slug: &str,
-    actor: &str,
-    state_dir: &Path,
-) -> Result<Value> {
-    review(pm, flag, slug, "rejected", None, actor, state_dir)
-}
-
-/// `memory supersede <old> <new>` — one commit: old → `superseded`,
-/// new gains `supersedes: <old>`; a proposed `new` is accepted by the
-/// same act of curation.
-pub fn supersede(
-    pm: &Pm,
-    flag: Option<&str>,
-    old: &str,
-    new: &str,
-    actor: &str,
-    state_dir: &Path,
-) -> Result<Value> {
-    require_curator(state_dir)?;
-    let (proj, mut old_mem) = find(pm, flag, old)?;
-    let (_, mut new_mem) = find(pm, flag.or(Some(&proj.key)), new)?;
-    if old == new {
-        return Err(Error::rejected("a memory cannot supersede itself"));
-    }
-    old_mem.front.status = "superseded".to_string();
-    new_mem.front.supersedes = Some(old.to_string());
-    if new_mem.front.status == "proposed" {
-        new_mem.front.status = "accepted".to_string();
-        new_mem.front.verified_at = Some(time::iso(time::now_epoch()));
-    }
-    check_front(&old_mem, &proj.components)?;
-    check_front(&new_mem, &proj.components)?;
-    let _lock = pm.lock()?;
-    save_mem(&old_mem)?;
-    save_mem(&new_mem)?;
-    let committed = commit_mem(
-        pm,
-        new,
-        &format!("{}/memory/{new}: supersedes {old}", proj.key),
-        actor,
-    )?;
-    Ok(json!({"project": proj.key, "old": old, "new": new,
-              "old_status": "superseded", "new_status": new_mem.front.status,
-              "committed": committed}))
-}
-
-/// `memory verify <slug>` — re-stamp verified_at. Curator-gated like
-/// accept/reject: verified_at is documented as the PM's re-check of a
-/// fact, and it feeds ranking and staleness — a worker verify would
-/// falsify the attestation and silently un-stale the memory. Workers
-/// propose a correction instead.
-/// A same-second re-verify changes nothing and commits nothing.
-pub fn verify(
-    pm: &Pm,
-    flag: Option<&str>,
-    slug: &str,
-    actor: &str,
-    state_dir: &Path,
-) -> Result<Value> {
-    require_curator(state_dir)?;
-    let (proj, mut mem) = find(pm, flag, slug)?;
-    if mem.front.status != "accepted" {
+    if mem.path.exists() {
         return Err(Error::rejected(format!(
-            "'{slug}' is {} — only accepted memories are verified",
-            mem.front.status
+            "Memory '{slug}' already exists — use a new authenticated proposal"
         )));
     }
-    let now = time::iso(time::now_epoch());
-    if mem.front.verified_at.as_deref() == Some(now.as_str()) {
-        return Ok(json!({"project": proj.key, "slug": slug,
-                  "verified_at": mem.front.verified_at, "committed": false}));
+    std::fs::create_dir_all(memory_dir(pm, key))?;
+    save_mem(&mem)?;
+    let committed = commit_mem(
+        pm,
+        &slug,
+        &format!("{key}/memory/{slug}: proposed"),
+        &actor.proof.alias,
+    )?;
+    Ok(json!({
+        "project": key,
+        "slug": slug,
+        "status": "proposed",
+        "digest": semantic_digest(&mem),
+        "quorum": {"eligible": false, "reason": "review required"},
+        "path": mem.path,
+        "committed": committed
+    }))
+}
+
+/// Submit one native review receipt. All reads that decide the revision are
+/// repeated under the existing PM lock, so a concurrent edit cannot leave a
+/// receipt attached to a different claim.
+pub fn submit_review(
+    pm: &Pm,
+    flag: Option<&str>,
+    slug: &str,
+    operation: &str,
+    verdict: &str,
+    evidence: &str,
+    expected_digest: &str,
+    actor: &NativeIdentity,
+) -> Result<Value> {
+    if !matches!(operation, "accept" | "verify") {
+        return Err(Error::rejected(
+            "memory review operation must be accept or verify",
+        ));
     }
-    mem.front.verified_at = Some(now);
+    if !matches!(verdict, "pass" | "revise") {
+        return Err(Error::rejected(
+            "memory review verdict must be pass or revise",
+        ));
+    }
+    if actor.proof.role != "worker" {
+        return Err(Error::rejected(
+            "only an authenticated worker endpoint may submit a memory review",
+        ));
+    }
+    let evidence = evidence.trim();
+    if evidence.is_empty() {
+        return Err(Error::rejected("memory review evidence must be nonempty"));
+    }
+    if evidence.len() > 16_384 {
+        return Err(Error::rejected("memory review evidence is too long"));
+    }
+    if expected_digest.len() != 64 || !expected_digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::rejected(
+            "memory review requires a SHA-256 content digest",
+        ));
+    }
+    let (proj, _) = find(pm, flag, slug)?;
     let _lock = pm.lock()?;
+    let (_, mut mem) = find(pm, Some(&proj.key), slug)?;
+    let digest = semantic_digest(&mem);
+    if digest != expected_digest {
+        return Err(Error::rejected(format!(
+            "memory revision changed — expected {expected_digest}, current {digest}"
+        )));
+    }
+    let Some(author) = mem.front.author_proof.as_ref() else {
+        return Err(Error::rejected(
+            "legacy memory has no authenticated proposer; create a corrected native proposal",
+        ));
+    };
+    if actor.stable_id() == author.stable_id() || actor.proof.alias == author.alias {
+        return Err(Error::rejected(
+            "memory author cannot review its own proposal",
+        ));
+    }
+    let cycle = match operation {
+        "accept" => {
+            if mem.front.status != "proposed" {
+                return Err(Error::rejected("accept reviews require a proposed memory"));
+            }
+            match mem.front.active_operation.as_deref() {
+                None => {
+                    mem.front.active_operation = Some("accept".to_string());
+                    mem.front.review_cycle = 1;
+                }
+                Some("accept") => {}
+                Some(other) => {
+                    return Err(Error::rejected(format!(
+                        "memory has an active {other} review cycle"
+                    )))
+                }
+            }
+            mem.front.review_cycle
+        }
+        "verify" => {
+            if mem.front.status != "accepted" {
+                return Err(Error::rejected("verify reviews require an accepted memory"));
+            }
+            match mem.front.active_operation.as_deref() {
+                None => {
+                    mem.front.active_operation = Some("verify".to_string());
+                    let next_cycle = next_verify_cycle(&mem.front);
+                    mem.front.review_cycle = next_cycle;
+                }
+                Some("verify") => {}
+                Some(other) => {
+                    return Err(Error::rejected(format!(
+                        "memory has an active {other} review cycle"
+                    )))
+                }
+            }
+            mem.front.review_cycle
+        }
+        _ => unreachable!(),
+    };
+    if mem.front.reviews.iter().any(|r| {
+        r.operation == operation
+            && r.cycle == cycle
+            && (r.identity == actor.stable_id() || r.reviewer == actor.proof.alias)
+    }) {
+        return Err(Error::rejected(
+            "this native agent already reviewed the current memory cycle",
+        ));
+    }
+    mem.front.reviews.push(ReviewReceipt {
+        reviewer: actor.proof.alias.clone(),
+        identity: actor.stable_id(),
+        generation: actor.proof.generation.clone(),
+        process_start: actor.proof.process_start,
+        role: actor.proof.role.clone(),
+        operation: operation.to_string(),
+        cycle,
+        digest,
+        verdict: verdict.to_string(),
+        evidence: evidence.to_string(),
+        recorded_at: time::iso(time::now_epoch()),
+    });
+    check_front(&mem, &proj.components)?;
     save_mem(&mem)?;
     let committed = commit_mem(
         pm,
         slug,
-        &format!("{}/memory/{slug}: verified", proj.key),
-        actor,
+        &format!("{}/memory/{slug}: review {operation} {verdict}", proj.key),
+        &actor.proof.alias,
     )?;
-    Ok(json!({"project": proj.key, "slug": slug,
-              "verified_at": mem.front.verified_at, "committed": committed}))
+    let (eligible, reason) = quorum_status(&mem, operation);
+    Ok(json!({
+        "project": proj.key,
+        "slug": slug,
+        "status": mem.front.status,
+        "operation": operation,
+        "cycle": cycle,
+        "verdict": verdict,
+        "digest": semantic_digest(&mem),
+        "quorum": {"eligible": eligible, "reason": reason},
+        "committed": committed
+    }))
+}
+
+/// PM-only finalization after two distinct worker receipts. A PM does not
+/// become a third reviewer merely by accepting the result.
+pub fn finalize_native(
+    pm: &Pm,
+    flag: Option<&str>,
+    slug: &str,
+    operation: &str,
+    expected_digest: &str,
+    actor: &NativeIdentity,
+) -> Result<Value> {
+    if actor.proof.role != "pm" {
+        return Err(Error::rejected(
+            "memory finalization is restricted to an authenticated PM endpoint",
+        ));
+    }
+    if !matches!(operation, "accept" | "verify") {
+        return Err(Error::rejected(
+            "memory finalization operation is unsupported",
+        ));
+    }
+    let (proj, _) = find(pm, flag, slug)?;
+    let _lock = pm.lock()?;
+    let (_, mut mem) = find(pm, Some(&proj.key), slug)?;
+    let digest = semantic_digest(&mem);
+    if digest != expected_digest {
+        return Err(Error::rejected(format!(
+            "memory revision changed — expected {expected_digest}, current {digest}"
+        )));
+    }
+    let Some(cycle) = operation_cycle(&mem.front, operation) else {
+        if mem
+            .front
+            .finalizations
+            .iter()
+            .any(|receipt| receipt.operation == operation)
+        {
+            return Err(Error::rejected(format!(
+                "memory {operation} review cycle was already finalized; submit a fresh review cycle"
+            )));
+        }
+        return Err(Error::rejected(format!(
+            "memory has no active {operation} review cycle"
+        )));
+    };
+    if mem
+        .front
+        .finalizations
+        .iter()
+        .any(|receipt| receipt.operation == operation && receipt.cycle == cycle)
+    {
+        return Err(Error::rejected(format!(
+            "memory {operation} review cycle {cycle} was already finalized"
+        )));
+    }
+    let (eligible, reason) = quorum_status(&mem, operation);
+    if !eligible {
+        return Err(Error::rejected(reason));
+    }
+    match operation {
+        "accept" => {
+            if mem.front.status != "proposed" {
+                return Err(Error::rejected("only proposed memories can be accepted"));
+            }
+            mem.front.status = "accepted".to_string();
+        }
+        "verify" => {
+            if mem.front.status != "accepted" {
+                return Err(Error::rejected("only accepted memories can be verified"));
+            }
+        }
+        _ => unreachable!(),
+    }
+    let finalized_at = time::iso(time::now_epoch());
+    mem.front.verified_at = Some(finalized_at.clone());
+    mem.front.finalizations.push(FinalizationReceipt {
+        operation: operation.to_string(),
+        cycle,
+        digest: digest.clone(),
+        finalizer: actor.proof.clone(),
+        finalized_at,
+    });
+    mem.front.active_operation = None;
+    check_front(&mem, &proj.components)?;
+    save_mem(&mem)?;
+    let committed = commit_mem(
+        pm,
+        slug,
+        &format!("{}/memory/{slug}: {operation} finalized", proj.key),
+        &actor.proof.alias,
+    )?;
+    Ok(json!({
+        "project": proj.key,
+        "slug": slug,
+        "status": mem.front.status,
+        "operation": operation,
+        "cycle": cycle,
+        "digest": semantic_digest(&mem),
+        "quorum": {"eligible": true, "reason": reason},
+        "finalized": true,
+        "committed": committed
+    }))
+}
+
+/// PM-only rejection. Rejection is a lifecycle decision, not a positive
+/// review, and never upgrades legacy records or clears their history.
+pub fn reject_native(
+    pm: &Pm,
+    flag: Option<&str>,
+    slug: &str,
+    actor: &NativeIdentity,
+) -> Result<Value> {
+    if actor.proof.role != "pm" {
+        return Err(Error::rejected(
+            "memory rejection is restricted to an authenticated PM endpoint",
+        ));
+    }
+    let (proj, _) = find(pm, flag, slug)?;
+    let _lock = pm.lock()?;
+    let (_, mut mem) = find(pm, Some(&proj.key), slug)?;
+    if mem.front.status == "superseded" {
+        return Err(Error::rejected("a superseded memory cannot be rejected"));
+    }
+    mem.front.status = "rejected".to_string();
+    mem.front.verified_at = None;
+    mem.front.active_operation = None;
+    check_front(&mem, &proj.components)?;
+    save_mem(&mem)?;
+    let committed = commit_mem(
+        pm,
+        slug,
+        &format!("{}/memory/{slug}: rejected", proj.key),
+        &actor.proof.alias,
+    )?;
+    Ok(json!({
+        "project": proj.key,
+        "slug": slug,
+        "status": "rejected",
+        "digest": semantic_digest(&mem),
+        "committed": committed
+    }))
+}
+
+/// Pairwise supersede needs a crash-atomic transaction/recovery primitive
+/// that this file writer does not have. Refuse it until CAD-193 supplies
+/// that primitive rather than performing two sequential writes.
+pub fn supersede_native(
+    _pm: &Pm,
+    _flag: Option<&str>,
+    _old: &str,
+    _new: &str,
+    _actor: &NativeIdentity,
+) -> Result<Value> {
+    Err(Error::rejected(
+        "memory supersede is unsupported until crash-atomic pair recovery is available",
+    ))
 }
 
 // ── Matching ─────────────────────────────────────────────────────
@@ -777,7 +1263,9 @@ fn confidence_rank(confidence: &str) -> u8 {
 pub fn match_memories(memories: &[Memory], ctx: &MatchCtx) -> Vec<Memory> {
     let mut hits: Vec<Memory> = memories
         .iter()
-        .filter(|m| m.front.status == "accepted" && applies(&m.front.scope, ctx))
+        .filter(|m| {
+            m.front.status == "accepted" && retrieval_status(m).0 && applies(&m.front.scope, ctx)
+        })
         .cloned()
         .collect();
     hits.sort_by(|a, b| {
@@ -939,7 +1427,12 @@ pub fn project_rules(pm: &Pm, key: &str) -> (Vec<Memory>, Vec<String>) {
     let (mems, errors) = load_project_report(&pm.dir, key);
     let mut rules: Vec<Memory> = mems
         .into_iter()
-        .filter(|m| m.front.status == "accepted" && m.front.scope.project && m.front.kind == "rule")
+        .filter(|m| {
+            m.front.status == "accepted"
+                && retrieval_status(m).0
+                && m.front.scope.project
+                && m.front.kind == "rule"
+        })
         .collect();
     rules.sort_by(|a, b| a.front.id.cmp(&b.front.id));
     (rules, errors)
@@ -1156,6 +1649,10 @@ pub fn lint_dir(
 
 /// Card/list payload for `ls` and the UI.
 pub fn card_json(m: &Memory) -> Value {
+    let digest = semantic_digest(m);
+    let (eligible, reason) = retrieval_status(m);
+    let (accept_eligible, accept_reason) = quorum_status(m, "accept");
+    let (verify_eligible, verify_reason) = quorum_status(m, "verify");
     json!({
         "project": m.project,
         "slug": m.front.id,
@@ -1174,6 +1671,24 @@ pub fn card_json(m: &Memory) -> Value {
         "created": m.front.created,
         "verified_at": m.front.verified_at,
         "supersedes": m.front.supersedes,
+        "revision_digest": digest,
+        "review_cycle": m.front.review_cycle,
+        "active_operation": m.front.active_operation,
+        "review_count": m.front.reviews.len(),
+        "finalization_count": m.front.finalizations.len(),
+        "finalized_operations": m.front.finalizations.iter().map(|r| json!({
+            "operation": r.operation.clone(),
+            "cycle": r.cycle,
+            "digest": r.digest.clone(),
+            "finalized_at": r.finalized_at.clone(),
+            "finalizer": r.finalizer.alias.clone(),
+        })).collect::<Vec<_>>(),
+        "quorum": {
+            "eligible": eligible,
+            "reason": reason,
+            "accept": {"eligible": accept_eligible, "reason": accept_reason},
+            "verify": {"eligible": verify_eligible, "reason": verify_reason},
+        },
         "fact": fact_line(&m.body),
         "path": m.path,
     })
@@ -1183,4 +1698,331 @@ pub fn detail_json(m: &Memory) -> Value {
     let mut v = card_json(m);
     v["body"] = json!(m.body);
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proof(alias: &str, registration: u64) -> IdentityProof {
+        IdentityProof {
+            alias: alias.to_string(),
+            registration,
+            generation: format!("gen-{registration}"),
+            process_start: registration + 100,
+            role: if alias == "pm" {
+                "pm".to_string()
+            } else {
+                "worker".to_string()
+            },
+        }
+    }
+
+    fn memory(status: &str, cycle: u64, author: Option<IdentityProof>) -> Memory {
+        Memory {
+            project: "demo".to_string(),
+            front: Front {
+                id: "lesson".to_string(),
+                kind: "rule".to_string(),
+                status: status.to_string(),
+                scope: Scope {
+                    project: true,
+                    ..Scope::default()
+                },
+                source: Some("CAD-191".to_string()),
+                confidence: "medium".to_string(),
+                created: "2026-01-01T00:00:00Z".to_string(),
+                verified_at: None,
+                supersedes: None,
+                author: author.as_ref().map(|p| p.alias.clone()),
+                author_proof: author,
+                contributors: Vec::new(),
+                review_cycle: cycle,
+                active_operation: None,
+                reviews: Vec::new(),
+                finalizations: Vec::new(),
+            },
+            body: "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n".to_string(),
+            path: PathBuf::from("/tmp/lesson.md"),
+        }
+    }
+
+    fn receipt(actor: &IdentityProof, operation: &str, cycle: u64, digest: &str) -> ReviewReceipt {
+        ReviewReceipt {
+            reviewer: actor.alias.clone(),
+            identity: actor.stable_id(),
+            generation: actor.generation.clone(),
+            process_start: actor.process_start,
+            role: actor.role.clone(),
+            operation: operation.to_string(),
+            cycle,
+            digest: digest.to_string(),
+            verdict: "pass".to_string(),
+            evidence: "independent evidence".to_string(),
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn finalization(
+        actor: &IdentityProof,
+        operation: &str,
+        cycle: u64,
+        digest: &str,
+    ) -> FinalizationReceipt {
+        FinalizationReceipt {
+            operation: operation.to_string(),
+            cycle,
+            digest: digest.to_string(),
+            finalizer: actor.clone(),
+            finalized_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn mutation_fixture() -> (tempfile::TempDir, Pm) {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = Pm::init(dir.path()).unwrap();
+        let project_dir = dir.path().join("demo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.yaml"),
+            "key: demo\nprefix: D\ncomponents: []\n",
+        )
+        .unwrap();
+        pm.commit("project fixture\n\nActor: test\n").unwrap();
+        (dir, pm)
+    }
+
+    fn native(alias: &str, registration: u64) -> NativeIdentity {
+        NativeIdentity {
+            proof: proof(alias, registration),
+        }
+    }
+
+    #[test]
+    fn native_review_finalize_consumes_cycle_and_requires_new_verify_cycle() {
+        let (_dir, pm) = mutation_fixture();
+        let pm_actor = native("pm", 1);
+        let worker_a = native("worker-a", 2);
+        let worker_b = native("worker-b", 3);
+        let body = "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
+        propose_native(
+            &pm,
+            "demo",
+            "rule",
+            &Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-191"),
+            Some("high"),
+            None,
+            Some(body),
+            Some("lesson"),
+            &pm_actor,
+        )
+        .unwrap();
+        let (_, mem) = find(&pm, Some("demo"), "lesson").unwrap();
+        let digest = semantic_digest(&mem);
+        submit_review(
+            &pm,
+            Some("demo"),
+            "lesson",
+            "accept",
+            "pass",
+            "worker-a acceptance evidence",
+            &digest,
+            &worker_a,
+        )
+        .unwrap();
+        submit_review(
+            &pm,
+            Some("demo"),
+            "lesson",
+            "accept",
+            "pass",
+            "worker-b acceptance evidence",
+            &digest,
+            &worker_b,
+        )
+        .unwrap();
+        finalize_native(&pm, Some("demo"), "lesson", "accept", &digest, &pm_actor).unwrap();
+        let (_, accepted) = find(&pm, Some("demo"), "lesson").unwrap();
+        assert!(retrieval_status(&accepted).0);
+
+        let bytes_after_accept = std::fs::read(&accepted.path).unwrap();
+        let repeated =
+            finalize_native(&pm, Some("demo"), "lesson", "accept", &digest, &pm_actor).unwrap_err();
+        assert!(repeated.to_string().contains("already finalized"));
+        assert_eq!(bytes_after_accept, std::fs::read(&accepted.path).unwrap());
+
+        for (worker, evidence) in [
+            (&worker_a, "worker-a verify evidence"),
+            (&worker_b, "worker-b verify evidence"),
+        ] {
+            submit_review(
+                &pm,
+                Some("demo"),
+                "lesson",
+                "verify",
+                "pass",
+                evidence,
+                &digest,
+                worker,
+            )
+            .unwrap();
+        }
+        let (_, before_verify_finalize) = find(&pm, Some("demo"), "lesson").unwrap();
+        assert_eq!(before_verify_finalize.front.review_cycle, 2);
+        assert!(!retrieval_status(&before_verify_finalize).0);
+        finalize_native(&pm, Some("demo"), "lesson", "verify", &digest, &pm_actor).unwrap();
+        let (_, verified) = find(&pm, Some("demo"), "lesson").unwrap();
+        assert!(retrieval_status(&verified).0);
+
+        let bytes_after_verify = std::fs::read(&verified.path).unwrap();
+        let repeated =
+            finalize_native(&pm, Some("demo"), "lesson", "verify", &digest, &pm_actor).unwrap_err();
+        assert!(repeated.to_string().contains("already finalized"));
+        assert_eq!(bytes_after_verify, std::fs::read(&verified.path).unwrap());
+
+        // The same two authenticated workers may review again, but only in
+        // cycle three.  Cycle-two receipts cannot make this cycle eligible.
+        for (worker, evidence) in [
+            (&worker_a, "worker-a cycle-three evidence"),
+            (&worker_b, "worker-b cycle-three evidence"),
+        ] {
+            submit_review(
+                &pm,
+                Some("demo"),
+                "lesson",
+                "verify",
+                "pass",
+                evidence,
+                &digest,
+                worker,
+            )
+            .unwrap();
+        }
+        let (_, cycle_three) = find(&pm, Some("demo"), "lesson").unwrap();
+        assert_eq!(cycle_three.front.review_cycle, 3);
+        assert!(!retrieval_status(&cycle_three).0);
+        finalize_native(&pm, Some("demo"), "lesson", "verify", &digest, &pm_actor).unwrap();
+        let (_, final_memory) = find(&pm, Some("demo"), "lesson").unwrap();
+        assert_eq!(final_memory.front.finalizations.len(), 3);
+        assert!(retrieval_status(&final_memory).0);
+    }
+
+    #[test]
+    fn accepted_retrieval_requires_two_distinct_worker_aliases() {
+        let mut mem = memory("accepted", 1, Some(proof("author", 1)));
+        let digest = semantic_digest(&mem);
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-a", 2), "accept", 1, &digest));
+        assert!(!retrieval_status(&mem).0);
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-b", 3), "accept", 1, &digest));
+        assert!(!retrieval_status(&mem).0);
+        mem.front
+            .finalizations
+            .push(finalization(&proof("pm", 4), "accept", 1, &digest));
+        assert!(retrieval_status(&mem).0);
+        assert_eq!(
+            match_memories(
+                &[mem],
+                &MatchCtx {
+                    ..Default::default()
+                }
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn alias_reuse_cannot_supply_the_second_vote() {
+        let mut mem = memory("accepted", 1, Some(proof("author", 1)));
+        let digest = semantic_digest(&mem);
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-a", 2), "accept", 1, &digest));
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-a", 9), "accept", 1, &digest));
+        assert!(!retrieval_status(&mem).0);
+    }
+
+    #[test]
+    fn changed_claim_invalidates_old_receipts() {
+        let mut mem = memory("accepted", 1, Some(proof("author", 1)));
+        let digest = semantic_digest(&mem);
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-a", 2), "accept", 1, &digest));
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-b", 3), "accept", 1, &digest));
+        mem.front
+            .finalizations
+            .push(finalization(&proof("pm", 4), "accept", 1, &digest));
+        mem.body = "changed\n\n**Why:** new\n\n**How to apply:** new\n".to_string();
+        assert!(!retrieval_status(&mem).0);
+    }
+
+    #[test]
+    fn accepted_legacy_record_is_visible_but_blocked() {
+        let mem = memory("accepted", 1, None);
+        let (eligible, reason) = retrieval_status(&mem);
+        assert!(!eligible);
+        assert!(reason.contains("authenticated proposer"));
+    }
+
+    #[test]
+    fn verify_requires_a_fresh_cycle() {
+        let mut mem = memory("accepted", 1, Some(proof("author", 1)));
+        let digest = semantic_digest(&mem);
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-a", 2), "accept", 1, &digest));
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-b", 3), "accept", 1, &digest));
+        mem.front
+            .finalizations
+            .push(finalization(&proof("pm", 4), "accept", 1, &digest));
+        assert!(retrieval_status(&mem).0);
+        mem.front.active_operation = Some("verify".to_string());
+        mem.front.review_cycle = 2;
+        assert!(!retrieval_status(&mem).0);
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-a", 2), "verify", 2, &digest));
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-b", 3), "verify", 2, &digest));
+        assert!(!retrieval_status(&mem).0);
+        mem.front
+            .finalizations
+            .push(finalization(&proof("pm", 4), "verify", 2, &digest));
+        mem.front.active_operation = None;
+        assert!(retrieval_status(&mem).0);
+
+        // A finalized verify cycle is consumed.  The next cycle starts at
+        // three and cannot reuse the two workers' cycle-two receipts.
+        mem.front.active_operation = Some("verify".to_string());
+        mem.front.review_cycle = 3;
+        assert!(!retrieval_status(&mem).0);
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-a", 2), "verify", 3, &digest));
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-b", 3), "verify", 3, &digest));
+        assert!(!retrieval_status(&mem).0);
+        mem.front
+            .finalizations
+            .push(finalization(&proof("pm", 4), "verify", 3, &digest));
+        mem.front.active_operation = None;
+        assert!(retrieval_status(&mem).0);
+    }
 }

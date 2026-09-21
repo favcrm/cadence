@@ -1267,7 +1267,6 @@ fn write_route(
             send(request, resp);
             return;
         }
-        let actor = request_actor(&request, opts);
         let pm = match Pm::at(pm_dir) {
             Ok(pm) => pm,
             Err(e) => {
@@ -1294,16 +1293,29 @@ fn write_route(
             }
         };
         let out = if verb == Some("accept") {
-            crate::memory::accept(
-                &pm,
-                Some(key),
-                slug,
-                req["body"].as_str(),
-                &actor,
-                state_dir,
-            )
+            let (_, memory) = match crate::memory::find(&pm, Some(key), slug) {
+                Ok(found) => found,
+                Err(e) => {
+                    send(request, err_response(404, &e.to_string()));
+                    return;
+                }
+            };
+            let mut params = json!({
+                "project": key,
+                "slug": slug,
+                "operation": "accept",
+                "digest": crate::memory::semantic_digest(&memory),
+            });
+            if let Some(body) = req["body"].as_str() {
+                params["body"] = json!(body);
+            }
+            client::rpc(state_dir, "memory_finalize", params)
         } else {
-            crate::memory::reject(&pm, Some(key), slug, &actor, state_dir)
+            client::rpc(
+                state_dir,
+                "memory_finalize",
+                json!({"project": key, "slug": slug, "operation": "reject"}),
+            )
         };
         match out {
             Ok(v) => {

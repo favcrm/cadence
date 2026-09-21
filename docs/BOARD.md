@@ -444,7 +444,8 @@ list in the output and a `Forced: true` trailer on the commit.
 
 One reviewed fact per file at `<pm>/<project>/memory/<slug>.md`:
 YAML frontmatter (`id`, `type`, `status`, `confidence`, `scope`,
-`author`, `source`, `created`, `verified_at`, optional `supersedes`)
+`author`, authenticated `author_proof`, `source`, `created`,
+`verified_at`, review cycle/receipts and optional `supersedes`)
 plus a body contract — a fact, then `**Why:**` and `**How to apply:**`
 sections. Types are `rule | gotcha | decision | recipe`; statuses are
 `proposed | accepted | rejected | superseded`.
@@ -459,9 +460,12 @@ Retrying a wedged adapter needs daemon restart first.
 **How to apply:** `cadence daemon stop` before the retry.
 EOF
 )"
-cadence memory accept pipe-drain [--project demo]   # curator only
-cadence memory reject <slug>    cadence memory supersede <old> <new>
-cadence memory verify <slug>    # re-stamp verified_at — curator only
+cadence memory review <slug> --operation accept --verdict pass \
+    --digest <sha256> --evidence 'source and applicability checks'
+cadence memory accept pipe-drain [--project demo]   # PM finalization only
+cadence memory reject <slug>                       # PM only
+cadence memory supersede <old> <new>               # currently refused
+cadence memory verify <slug>                       # fresh review cycle + PM
 cadence memory ls [--project k] [--status s] [--type t] [--component c]
                   [--path f] [--stale [--days 30]] [--json]
 cadence memory show <slug> [--json]
@@ -469,13 +473,26 @@ cadence memory match --issue <ID> [--provider p] [--json]
 cadence memory lint [--project k]
 ```
 
-Proposals may come from anyone (the author's `CADENCE_ALIAS` is
-stamped); accept/reject/supersede/verify are curator actions — a
-cadence worker pane is refused unless the daemon proves it is the PM
-or the group root; a missing daemon fails closed. `verify` is gated
-because `verified_at` is the curator's re-check attestation and feeds
-ranking + staleness. Every write is one tracker commit carrying
-`Memory: <slug>` and `Actor:` trailers — never `Issue:`. `issue lint`
+Every authority-bearing proposal/review/finalization is a daemon RPC.
+The daemon derives one live native PTY endpoint from the Unix socket
+peer, current adapter ownership, endpoint generation, registration
+incarnation and process start identity. Request aliases, `CADENCE_ALIAS`,
+operator UI labels and external/headless identities cannot create proof.
+Two distinct non-author worker aliases must pass the same semantic
+SHA-256 revision (claim/body, trusted author/contributors, type, source,
+confidence, scope and supersede target); an authenticated PM endpoint
+then finalizes. Body edits, stale digests, duplicate aliases, missing
+evidence, disagreement and reused endpoint identities fail closed.
+Legacy accepted records remain visible with a review-blocked reason and
+are excluded from matching until a corrected native proposal is reviewed.
+`verify` opens a fresh receipt cycle; a timestamp alone cannot revalidate.
+Worker receipts do not make a record retrievable: acceptance and each
+verify cycle need a durable PM finalization receipt bound to the same
+semantic digest. A finalized cycle is consumed; a later verify starts the
+next cycle and cannot reuse its receipts.
+Supersede is refused until crash-atomic pair recovery exists. Every write
+is one tracker commit carrying `Memory: <slug>` and `Actor:` trailers —
+never `Issue:`. `issue lint`
 validates memory files with everything else (the pre-commit hook
 covers them); `memory lint` runs the same checks alone. Lint bounds a
 fact block to 5 lines and 512 bytes and a path glob to 200 chars and

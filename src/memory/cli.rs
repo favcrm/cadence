@@ -1,22 +1,20 @@
-//! `cadence memory` — the only writer for project memory. Proposals
-//! may come from anyone; accept/reject/supersede are curator actions
-//! (a cadence worker pane is refused inside the write path itself).
-//! Every write ends in one git commit inside the PM dir; reads need
-//! no daemon.
+//! `cadence memory` reads the tracker directly, but all authority-bearing
+//! writes are daemon RPCs. The daemon derives the native endpoint identity;
+//! request aliases and operator fallbacks are never accepted.
 
 use std::path::PathBuf;
 
 use clap::Subcommand;
 use serde_json::json;
 
-use crate::error::Result;
+use crate::client;
+use crate::error::{Error, Result};
 use crate::issue::{board, write, Pm};
 use crate::memory::{self, MatchCtx, Scope};
 
 #[derive(Subcommand)]
 pub enum MemoryAction {
-    /// Propose a memory: one fact file under `<pm>/<project>/memory/`,
-    /// status `proposed`, author = CADENCE_ALIAS.
+    /// Propose a memory through the authenticated native daemon endpoint.
     Propose {
         /// Project key (required).
         #[arg(long)]
@@ -57,26 +55,42 @@ pub enum MemoryAction {
         #[arg(long)]
         id: Option<String>,
     },
-    /// Accept a proposed memory — PM/group-root/operator only.
+    /// Finalize a proposed memory after two native worker reviews.
     Accept {
         /// Memory slug.
         slug: String,
         /// Project key — needed only when the slug is ambiguous.
         #[arg(long)]
         project: Option<String>,
-        /// Replace the body while accepting.
+        /// Body edits are refused because they invalidate the review digest.
         #[arg(short = 'm')]
         text: Option<String>,
     },
-    /// Reject a proposed memory — PM/group-root/operator only.
+    /// Reject a memory through an authenticated PM endpoint.
     Reject {
         /// Memory slug.
         slug: String,
         #[arg(long)]
         project: Option<String>,
     },
-    /// Mark <old> superseded by <new> — one commit; a proposed <new>
-    /// is accepted by the same act.
+    /// Submit one native worker review. The daemon derives the reviewer
+    /// from the Unix socket peer; the digest must be supplied explicitly.
+    Review {
+        slug: String,
+        #[arg(long)]
+        project: Option<String>,
+        /// accept or verify.
+        #[arg(long)]
+        operation: String,
+        /// pass or revise.
+        #[arg(long)]
+        verdict: String,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long)]
+        digest: String,
+    },
+    /// Supersede is refused until crash-atomic pair recovery is available.
     Supersede {
         /// Slug being replaced.
         old: String,
@@ -85,7 +99,7 @@ pub enum MemoryAction {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Re-stamp `verified_at` on an accepted memory.
+    /// Finalize a fresh native verify cycle on an accepted memory.
     Verify {
         /// Memory slug.
         slug: String,
@@ -185,7 +199,6 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             text,
             id,
         } => {
-            let pm = open_pm()?;
             let scope = Scope {
                 components: components.clone(),
                 paths: paths.clone(),
@@ -193,17 +206,27 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 tags: tags.clone(),
                 project: *project_wide,
             };
-            let out = memory::propose(
-                &pm,
-                project,
-                kind,
-                &scope,
-                source.as_deref(),
-                confidence.as_deref(),
-                from.as_deref(),
-                text.as_deref(),
-                id.as_deref(),
-                "",
+            if from.is_some() && text.is_some() {
+                return Err(Error::rejected("propose takes --from or -m, not both"));
+            }
+            let from_text = from
+                .as_ref()
+                .map(|path| std::fs::read_to_string(path))
+                .transpose()
+                .map_err(|e| Error::rejected(format!("cannot read proposal source: {e}")))?;
+            let out = client::rpc(
+                state_dir,
+                "memory_propose",
+                json!({
+                    "project": project,
+                    "kind": kind,
+                    "scope": scope,
+                    "source": source,
+                    "confidence": confidence,
+                    "from": from_text,
+                    "text": text,
+                    "id": id,
+                }),
             )?;
             crate::issue::cli::print_json(&out);
             Ok(0)
@@ -214,32 +237,83 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             text,
         } => {
             let pm = open_pm()?;
-            let out = memory::accept(
-                &pm,
-                project.as_deref(),
-                slug,
-                text.as_deref(),
-                "",
-                state_dir,
-            )?;
+            let (_, mem) = memory::find(&pm, project.as_deref(), slug)?;
+            let mut params = json!({
+                "project": project,
+                "slug": slug,
+                "operation": "accept",
+                "digest": memory::semantic_digest(&mem),
+            });
+            if let Some(body) = text {
+                params["body"] = json!(body);
+            }
+            let out = client::rpc(state_dir, "memory_finalize", params)?;
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
         MemoryAction::Reject { slug, project } => {
-            let pm = open_pm()?;
-            let out = memory::reject(&pm, project.as_deref(), slug, "", state_dir)?;
+            let out = client::rpc(
+                state_dir,
+                "memory_finalize",
+                json!({
+                    "project": project,
+                    "slug": slug,
+                    "operation": "reject",
+                }),
+            )?;
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
         MemoryAction::Supersede { old, new, project } => {
-            let pm = open_pm()?;
-            let out = memory::supersede(&pm, project.as_deref(), old, new, "", state_dir)?;
+            let out = client::rpc(
+                state_dir,
+                "memory_finalize",
+                json!({
+                    "project": project,
+                    "old": old,
+                    "new": new,
+                    "operation": "supersede",
+                }),
+            )?;
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
         MemoryAction::Verify { slug, project } => {
             let pm = open_pm()?;
-            let out = memory::verify(&pm, project.as_deref(), slug, "", state_dir)?;
+            let (_, mem) = memory::find(&pm, project.as_deref(), slug)?;
+            let out = client::rpc(
+                state_dir,
+                "memory_finalize",
+                json!({
+                    "project": project,
+                    "slug": slug,
+                    "operation": "verify",
+                    "digest": memory::semantic_digest(&mem),
+                }),
+            )?;
+            crate::issue::cli::print_json(&out);
+            Ok(0)
+        }
+        MemoryAction::Review {
+            slug,
+            project,
+            operation,
+            verdict,
+            evidence,
+            digest,
+        } => {
+            let out = client::rpc(
+                state_dir,
+                "memory_review",
+                json!({
+                    "project": project,
+                    "slug": slug,
+                    "operation": operation,
+                    "verdict": verdict,
+                    "evidence": evidence,
+                    "digest": digest,
+                }),
+            )?;
             crate::issue::cli::print_json(&out);
             Ok(0)
         }

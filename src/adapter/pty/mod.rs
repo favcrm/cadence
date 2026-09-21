@@ -1090,6 +1090,42 @@ impl ProviderAdapter for PtyAdapter {
         Ok(self.profile.analyze(&self.capture_visible()?, cursor))
     }
 
+    fn verify_owned_endpoint(
+        &self,
+        expected_pid: u32,
+        expected_generation: &str,
+        expected_native: Option<&str>,
+    ) -> Result<()> {
+        let (session, native, generation) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.session.clone(),
+                state.native_session.clone(),
+                state.generation.clone(),
+            )
+        };
+        if generation != expected_generation {
+            return Err(Error::rejected(
+                "native endpoint generation changed while resolving memory identity",
+            ));
+        }
+        if expected_native.is_some_and(|want| want != native) {
+            return Err(Error::rejected(
+                "native endpoint session changed while resolving memory identity",
+            ));
+        }
+        if !self.has_session(&session) {
+            return Err(Error::rejected("native endpoint session is no longer live"));
+        }
+        let pane_pid = self.pane_pid(&session)?;
+        if pane_pid != expected_pid {
+            return Err(Error::rejected(
+                "native endpoint pane pid changed while resolving memory identity",
+            ));
+        }
+        self.profile.verify_ownership(&native, pane_pid)
+    }
+
     /// `agent answer`: the only input a menu accepts is its own choice
     /// key — never a paste. The fresh probe must still see the menu;
     /// anything else refuses so the keystroke cannot land in a prompt,
