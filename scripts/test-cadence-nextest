@@ -54,6 +54,12 @@ if CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$TMP/suite.lock" \
 fi
 contains "retries are pinned" "$TMP/err"
 
+if CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$TMP/suite.lock" \
+    "$RUNNER" --no-tests pass >"$TMP/out" 2>"$TMP/err"; then
+    die "zero-test policy override was accepted"
+fi
+contains "do not override '--no-tests pass'" "$TMP/err"
+
 CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$TMP/suite.lock" \
     "$RUNNER" --help >"$TMP/direct-help.out"
 contains "Usage: cargo nextest run" "$TMP/direct-help.out"

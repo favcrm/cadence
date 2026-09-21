@@ -1,0 +1,93 @@
+#!/bin/sh
+# CAD-173 activation follow-up: install the reviewed nextest artifact only
+# into a task-local directory. This never writes PATH, rustup, Cargo home,
+# the repository, or a production state directory.
+set -eu
+
+VERSION=0.9.145
+TARGET=x86_64-unknown-linux-gnu
+ARCHIVE="cargo-nextest-$VERSION-$TARGET.tar.gz"
+URL="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$VERSION/$ARCHIVE"
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+MANIFEST="$ROOT/.config/cargo-nextest.sha256"
+INSTALL_DIR=${CADENCE_NEXTTEST_INSTALL_DIR:-/tmp/cadence-nextest-$VERSION}
+TASK_TMP=${TMPDIR:-/tmp}
+
+die() {
+    echo "install-cadence-nextest: $*" >&2
+    exit 1
+}
+
+case "$INSTALL_DIR" in
+    /*) ;;
+    *) die "CADENCE_NEXTTEST_INSTALL_DIR must be an absolute task-local path" ;;
+esac
+case "$TASK_TMP" in
+    /*) ;;
+    *) die "TMPDIR must be an absolute path" ;;
+esac
+case "$INSTALL_DIR" in
+    "$TASK_TMP"|"$TASK_TMP"/*) ;;
+    *) die "refusing install outside task-local TMPDIR ($TASK_TMP)" ;;
+esac
+case "$INSTALL_DIR" in
+    "$ROOT"|"$ROOT"/*) die "refusing to install inside the repository" ;;
+esac
+
+command -v awk >/dev/null 2>&1 || die "awk is required"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
+command -v tar >/dev/null 2>&1 || die "tar is required"
+command -v curl >/dev/null 2>&1 || die "curl is required to fetch a missing archive"
+[ -f "$MANIFEST" ] || die "missing trusted artifact manifest: $MANIFEST"
+
+archive_sha256=$(awk -v name="$ARCHIVE" \
+    '$1 !~ /^#/ && $2 == name { print $1; exit }' "$MANIFEST")
+binary_sha256=$(awk -v name=cargo-nextest \
+    '$1 !~ /^#/ && $2 == name { print $1; exit }' "$MANIFEST")
+[ -n "$archive_sha256" ] || die "no trusted checksum for archive $ARCHIVE"
+[ -n "$binary_sha256" ] || die "no trusted checksum for extracted cargo-nextest"
+
+mkdir -p "$INSTALL_DIR"
+archive_path="$INSTALL_DIR/$ARCHIVE"
+if [ ! -f "$archive_path" ]; then
+    download=$(mktemp "$INSTALL_DIR/.nextest-download.XXXXXX")
+    trap 'rm -f "$download"' EXIT HUP INT TERM
+    curl --fail --location --proto '=https' --tlsv1.2 --output "$download" "$URL" \
+        || die "download failed: $URL"
+    mv "$download" "$archive_path"
+    trap - EXIT HUP INT TERM
+fi
+
+printf '%s  %s\n' "$archive_sha256" "$archive_path" | sha256sum -c - >/dev/null \
+    || die "archive checksum mismatch: $archive_path"
+
+binary_path="$INSTALL_DIR/cargo-nextest"
+if [ -f "$binary_path" ]; then
+    existing_sha256=$(sha256sum "$binary_path" | awk '{print $1}')
+    [ "$existing_sha256" = "$binary_sha256" ] ||
+        die "existing binary checksum mismatch: refusing to overwrite $binary_path"
+    chmod 755 "$binary_path"
+    printf '%s\n' "trusted cargo-nextest $VERSION already installed at $binary_path"
+    exit 0
+fi
+
+extract_dir=$(mktemp -d "$INSTALL_DIR/.nextest-extract.XXXXXX")
+trap 'rm -rf "$extract_dir"' EXIT HUP INT TERM
+entries=$(tar -tzf "$archive_path")
+[ "$entries" = "cargo-nextest" ] ||
+    die "unexpected archive entries; refusing extraction"
+tar -xzf "$archive_path" -C "$extract_dir" || die "archive extraction failed"
+[ -f "$extract_dir/cargo-nextest" ] || die "archive did not contain cargo-nextest"
+actual_sha256=$(sha256sum "$extract_dir/cargo-nextest" | awk '{print $1}')
+[ "$actual_sha256" = "$binary_sha256" ] ||
+    die "extracted binary checksum mismatch: expected $binary_sha256, got $actual_sha256"
+chmod 755 "$extract_dir/cargo-nextest"
+mv "$extract_dir/cargo-nextest" "$binary_path"
+trap - EXIT HUP INT TERM
+
+version=$("$binary_path" --version 2>&1) || die "installed binary could not report its version"
+case "$version" in
+    "cargo-nextest $VERSION"*) ;;
+    *) die "installed binary reported unexpected version: $version" ;;
+esac
+printf '%s\n' "installed trusted cargo-nextest $VERSION at $binary_path"
