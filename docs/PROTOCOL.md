@@ -39,7 +39,7 @@ Error kinds:
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded), writes the clean-stop marker, then exits |
 | `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?` | `{alias,state:"starting"|"idle",provider}` |
 | `agent_list` | — | `{agents:[Agent+tasks+capabilities]}` — `tasks` names the alias's non-terminal task assignments; `capabilities` is the registry descriptor |
-| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown}` — `unknown` counts unreconciled unknowns fencing the agent; `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_source` (`configured` or `provider default`) and `effort` — also on every `agent_list` row |
+| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown, inbox?}` — `unknown` counts unreconciled unknowns fencing the agent; passive `inbox` evidence includes queued count, oldest age, last receipt/progress, and `semantic_completion:"external_consumer_required"`; it is never a drain or completion claim. `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_source` (`configured` or `provider default`) and `effort` — also on every `agent_list` row |
 | `agent_send` | `alias, text, message?, reply_to?, source?, task?` | `{message,state,duplicate}` — `task` attaches the delivery to a task for indexing |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after?, wait(<=30), tail?` | `{events:[Event], cursor, has_older}` — `tail:true` returns the newest page (50) in ascending order instead of paging forward from `after` |
@@ -69,14 +69,14 @@ Error kinds:
 | `task_fail` | `task, reason, by?` | `{task}` — mark unrecoverable |
 | `task_reopen` | `task, pane?` | `{task}` — `blocked|verified|failed → draft`, `revision` resets |
 | `task_cancel` | `task, by?` | `{task}` — cancels the task; a `queued`/`submitting` kickoff cancels in the same tx, a `running` one completes on its own |
-| `monitor_register` | `monitor, project, tasks[], interval_secs?, owner?, dispatch_enabled?` | `{monitor, duplicate}` — registers an explicit task coverage set; the first check is `degraded`, then `active`; delivery stays separately `unconfigured` |
+| `monitor_register` | `monitor, project, tasks[], interval_secs?, owner?, dispatch_enabled?, auto_dispatch_enabled?` | `{monitor, duplicate}` — registers an explicit task coverage set; the first check is `degraded`, then `active`; automatic dispatch requires both explicit bits and preserves all dispatch guards; delivery stays separately `unconfigured` |
 | `monitor_list` | — | `{monitors:[Monitor]}` — durable observer registrations and explicit coverage |
 | `monitor_show` | `monitor` | `{monitor:Monitor}` — heartbeat, last successful check, durable event cursor, coverage and alert counts |
 | `monitor_heartbeat` | `monitor` | `{monitor:Monitor}` — records the caller's monitor heartbeat; it is not a worker-health claim |
 | `monitor_alerts` | `monitor, after?, open?, limit?` | `{monitor, alerts:[MonitorAlert], cursor}` — reads local durable alerts |
 | `monitor_alert_ack` | `monitor, alert, by?` | `{alert:MonitorAlert}` — acknowledges one local alert; history remains durable |
 | `monitor_stop` | `monitor` | `{monitor:Monitor}` — turns one registration off without deleting coverage or alert history |
-| `monitor_dispatch` | `monitor, task` | `{monitor, task, message, duplicate, queued_behind_dead}` — explicit operator handoff through the existing guarded job-dispatch transaction; never called by the observer |
+| `monitor_dispatch` | `monitor, task` | `{monitor, task, message, duplicate, queued_behind_dead}` — explicit operator handoff through the existing guarded job-dispatch transaction; automatic reconciliation calls the same internal guard only for a registration with `auto_dispatch_enabled` |
 | `job_cancel` | `job, by?` | `{job}` — cancels the job + every non-terminal task |
 | `job_close` | `job, by?` | `{job}` — legal only when every task is `done` |
 | `agent_unfence` | `alias, status?, note?, by?, resume?` | reconciles every `unknown` on the agent (default `interrupted`); `{alias, reconciled:[id], resumed, pane?, state, error?}` — `resume:true` also starts the actor and waits (bounded ~30s) for its open; `pane` is pty-only: `adopted`/`respawned`/`none` |
@@ -849,7 +849,8 @@ session_persist_failed,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
 params_updated, reconciled, relaunch_skipped, attention,
 turn_stalled, turn_resumed, monitor_registered, monitor_alert,
-monitor_alert_ack, monitor_degraded, monitor_dispatch, monitor_off,
+monitor_alert_ack, monitor_degraded, monitor_dispatch,
+monitor_dispatch_blocked, monitor_off,
 stop_requested`. `wait>0` long-polls
 up to 30s.
 
@@ -951,8 +952,10 @@ Full semantics live in `docs/JOBS.md`. The wire contract in brief:
 listed task ids. A project name never expands coverage implicitly: every
 task must belong to a job whose explicit `repo` equals `project`, and a
 registration with the same id is idempotent only when all settings and
-coverage match. Monitor rows, coverage, alert state and the event cursor
-are stored in SQLite and survive a daemon restart.
+coverage match. Monitor rows, coverage, alert state, the event cursor, and
+the separate `auto_dispatch_enabled` opt-in are stored in SQLite and survive
+a daemon restart. The older `dispatch_enabled` bit still permits an
+explicit `monitor_dispatch` call; it is not treated as background consent.
 
 The monitor watch runs local SQLite checks on a bounded cadence. A
 successful pass records `heartbeat_at`, `last_check_at`,
@@ -975,10 +978,15 @@ acceptance text, matching open project, explicit assignee, live idle
 actor, no pending approval or queued work, and (where the endpoint has a
 ready gate) an explicit verified readiness claim. It then delegates to
 the existing `task_dispatch` transaction, including its group,
-revision, lease and idempotency checks. The periodic observer never
-dispatches, interrupts, resumes, accepts approvals, or changes worker
-state. `monitor_dispatch` does not select backlog work autonomously; quotas,
-fairness, reviewer capacity, and lease recovery remain outside this slice.
+revision, lease and idempotency checks. When the separate automatic opt-in
+is true, the periodic observer applies this same guard to the monitor's
+fixed coverage set for draft/revising tasks. A refusal becomes one durable
+`dispatch_blocked` alert per task, updated on later monitor intervals rather
+than retried in a tight loop. The automatic path also refuses when quota
+telemetry is absent or exhausted. Neither path interrupts, resumes, accepts
+approvals, or changes worker state, and the observer never selects work
+outside the explicit coverage set. Fairness, reviewer capacity, lease
+recovery, and the independent-review handoff remain outside this slice.
 
 ## Approvals
 

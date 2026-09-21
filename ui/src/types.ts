@@ -209,6 +209,7 @@ export interface MonitorRow {
   coverage: string[];
   delivery: { configured: boolean; state: string; push?: boolean; detail?: string };
   dispatch_enabled: boolean;
+  auto_dispatch_enabled: boolean;
   open_alerts: number;
   total_alerts: number;
   error?: string | null;
@@ -248,6 +249,22 @@ export interface AgentTask {
   message?: { id: string; task?: string; turn_id?: string; created?: string } | null;
 }
 
+/** Durable evidence for a passive mailbox. A read receipt is transport
+ * progress only; it is never a semantic completion claim. */
+export interface InboxStatus {
+  kind: "passive" | string;
+  state: "backlog" | "idle" | string;
+  queued: number;
+  states?: Record<string, number>;
+  oldest_created_at?: number | null;
+  oldest_age_secs?: number | null;
+  last_received_at?: number | null;
+  last_progress_at?: number | null;
+  semantic_completion?: string;
+  receipt_only?: boolean;
+  next_action?: string;
+}
+
 export interface Agent {
   alias: string;
   provider: string;
@@ -274,6 +291,7 @@ export interface Agent {
   resume_hint?: string;
   dead?: boolean;
   inbox?: boolean;
+  inbox_status?: InboxStatus | null;
   last_activity?: string | null;
   /** Seconds since the running turn's last observed activity. */
   silent_secs?: number;
@@ -323,6 +341,7 @@ export interface AgentDetail {
   };
   queued: number;
   unknown: number;
+  inbox?: InboxStatus | null;
   running: { id: string; task?: string; turn_id?: string; created?: string }[];
   events: {
     seq: number;

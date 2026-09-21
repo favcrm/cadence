@@ -238,6 +238,38 @@ function AgentDrawer({
                 </section>
               )}
 
+              {detail.inbox?.kind === "passive" && (
+                <section>
+                  <div className="flex items-baseline gap-2 mb-2">
+                    <h3 className="text-cardtitle font-semibold text-ink-100">
+                      Mailbox
+                    </h3>
+                    <span className="kicker">transport evidence</span>
+                  </div>
+                  <div className="grid grid-cols-[6rem_1fr] gap-y-1 text-label">
+                    <span className="slabel">state</span>
+                    <span className="num text-ink-300">{detail.inbox.state}</span>
+                    <span className="slabel">queued</span>
+                    <span className="num text-ink-300">{detail.inbox.queued}</span>
+                    <span className="slabel">oldest</span>
+                    <span className="num text-ink-300">
+                      {detail.inbox.oldest_age_secs != null
+                        ? fmtSilence(detail.inbox.oldest_age_secs)
+                        : "—"}
+                    </span>
+                    <span className="slabel">completion</span>
+                    <span className="num text-ink-400">
+                      {detail.inbox.semantic_completion ?? "external consumer required"}
+                    </span>
+                  </div>
+                  {detail.inbox.next_action && (
+                    <p className="mt-2 text-label text-warn">
+                      {detail.inbox.next_action}
+                    </p>
+                  )}
+                </section>
+              )}
+
               {(detail.running.length > 0 || detail.queued > 0) && (
                 <section>
                   <div className="flex items-baseline gap-2 mb-2">
@@ -449,6 +481,20 @@ export default function Agents({
                   {a.queued}
                   {a.unknown > 0 ? ` +${a.unknown} unk` : ""}
                 </span>
+                {a.inbox && (
+                  <>
+                    <span className="slabel">oldest</span>
+                    <span
+                      className="num text-ink-300"
+                      title={a.inbox_status?.next_action ?? "passive mailbox evidence"}
+                    >
+                      {a.inbox_status?.oldest_age_secs != null
+                        ? fmtSilence(a.inbox_status.oldest_age_secs)
+                        : "—"}
+                      {a.inbox_status?.receipt_only ? " · receipt only" : ""}
+                    </span>
+                  </>
+                )}
                 <span className="slabel">activity</span>
                 <span className="num text-ink-300">
                   {a.last_activity ? fmtTime(a.last_activity) : "—"}
@@ -561,6 +607,15 @@ export default function Agents({
                       {a.queued}
                       {a.unknown > 0 ? ` +${a.unknown} unk` : ""}
                     </span>
+                    {a.inbox && a.inbox_status?.oldest_age_secs != null && (
+                      <div
+                        className="num text-micro text-ink-500 mt-0.5"
+                        title={a.inbox_status.next_action ?? "passive mailbox evidence"}
+                      >
+                        oldest {fmtSilence(a.inbox_status.oldest_age_secs)}
+                        {a.inbox_status.receipt_only ? " · receipt only" : ""}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-2.5 align-top">
                     <span className="num text-ink-400">

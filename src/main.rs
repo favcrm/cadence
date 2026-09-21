@@ -958,7 +958,8 @@ enum JobAction {
 enum MonitorAction {
     /// Register an explicit project/task coverage set. Delivery remains
     /// local and unconfigured; --dispatch only enables the guarded manual
-    /// handoff into existing job dispatch.
+    /// handoff into existing job dispatch. Automatic reconciliation requires
+    /// the separate --auto-dispatch opt-in as well.
     Register {
         monitor: String,
         #[arg(long)]
@@ -971,6 +972,11 @@ enum MonitorAction {
         owner: Option<String>,
         #[arg(long)]
         dispatch: bool,
+        /// Opt into the background coordinator after every existing manual
+        /// dispatch guard passes. This never bypasses approval, readiness,
+        /// identity, queue, or quota checks.
+        #[arg(long)]
+        auto_dispatch: bool,
     },
     /// List persistent monitor registrations and their separate delivery state.
     List,
@@ -3732,6 +3738,7 @@ fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i32> {
             interval_secs,
             owner,
             dispatch,
+            auto_dispatch,
         } => {
             print_json(&rpc(
                 "monitor_register",
@@ -3739,7 +3746,8 @@ fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i32> {
                        "tasks": tasks, "interval_secs": interval_secs,
                        "owner": owner.as_deref().or(pane.as_deref())
                            .unwrap_or("operator"),
-                       "dispatch_enabled": dispatch}),
+                       "dispatch_enabled": dispatch,
+                       "auto_dispatch_enabled": auto_dispatch}),
             )?);
         }
         MonitorAction::List => print_json(&rpc("monitor_list", json!({}))?),

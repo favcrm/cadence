@@ -107,6 +107,9 @@ function MonitoringView({
                 </span>
                 <span className="num text-ink-300">{monitor.id}</span>
                 <span className="text-ink-500">owner {monitor.owner}</span>
+                <span className="text-ink-600">
+                  dispatch {monitor.auto_dispatch_enabled ? "automatic opt-in" : monitor.dispatch_enabled ? "manual" : "off"}
+                </span>
                 <span className="text-ink-500">
                   scan {when(monitor.last_success_at)} · last check {when(monitor.last_check_at)}
                 </span>

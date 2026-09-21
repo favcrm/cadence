@@ -6481,6 +6481,13 @@ fn inbox_registers_as_durable_mailbox() {
     assert_eq!(agent["dead"], false, "{agent}");
     assert_eq!(agent["state"], "idle");
     assert_eq!(show["queued"], 0);
+    assert_eq!(show["inbox"]["kind"], "passive", "{show}");
+    assert_eq!(show["inbox"]["state"], "idle", "{show}");
+    assert_eq!(show["inbox"]["receipt_only"], true, "{show}");
+    assert_eq!(
+        show["inbox"]["semantic_completion"], "external_consumer_required",
+        "{show}"
+    );
     // Registration wrote no briefing files in its cwd.
     assert!(!d.dir.path().join(".cadence").exists());
 
@@ -6519,6 +6526,14 @@ fn inbox_drains_messages_once() {
         d.rpc("agent_show", json!({"alias": "obs"})).unwrap()["queued"],
         2
     );
+    let backlog = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    assert_eq!(backlog["inbox"]["state"], "backlog", "{backlog}");
+    assert_eq!(backlog["inbox"]["queued"], 2, "{backlog}");
+    assert!(backlog["inbox"]["oldest_age_secs"].as_f64().unwrap_or(-1.0) >= 0.0);
+    assert!(backlog["inbox"]["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("consumer"));
     let page = d.rpc("agent_inbox", json!({"alias": "obs"})).unwrap();
     let msgs = page["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 2, "{page}");
@@ -19383,7 +19398,7 @@ fn issue_ls_survives_a_closed_downstream_pipe() {
 // ==================== persistent monitors (CAD-176) ====================
 
 #[test]
-fn monitor_migration_from_v6_bridges_provider_effort_before_v8() {
+fn monitor_migration_from_v6_bridges_provider_effort_before_v8_and_v9() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("cadence.sqlite3");
     let store = Store::open(&path).unwrap();
@@ -19413,12 +19428,22 @@ fn monitor_migration_from_v6_bridges_provider_effort_before_v8() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(columns.iter().any(|column| column == "effort"));
+    let monitor_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(monitors)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(monitor_columns
+        .iter()
+        .any(|column| column == "auto_dispatch_enabled"));
 }
 
 #[test]
-fn monitor_migration_after_provider_effort_v7_is_v8() {
+fn monitor_migration_after_provider_effort_v7_is_v8_and_v9() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("cadence.sqlite3");
     let store = Store::open(&path).unwrap();
@@ -19447,8 +19472,55 @@ fn monitor_migration_after_provider_effort_v7_is_v8() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(columns.iter().any(|column| column == "effort"));
+    let monitor_columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(monitors)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(monitor_columns
+        .iter()
+        .any(|column| column == "auto_dispatch_enabled"));
+}
+
+#[test]
+fn monitor_migration_from_v8_defaults_auto_dispatch_off() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cadence.sqlite3");
+    let store = Store::open(&path).unwrap();
+    drop(store);
+    // Model a v8 store with an existing manual registration. The new
+    // background bit must be added as an explicit opt-in and default off;
+    // upgrading an old manual monitor must not start a scheduler.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO monitors(
+             id,project,owner,interval_secs,state,next_check_at,event_cursor,
+             delivery_configured,delivery_state,dispatch_enabled,error,created,updated)
+         VALUES('legacy','repo','operator',60,'active',NULL,0,0,'unconfigured',1,NULL,0,0)",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "ALTER TABLE monitors DROP COLUMN auto_dispatch_enabled;
+         UPDATE schema_version SET version=8;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.monitor("legacy").unwrap().auto_dispatch_enabled,
+        false
+    );
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 9);
 }
 
 #[test]
@@ -19684,6 +19756,20 @@ fn monitor_dispatch_requires_explicit_safe_eligibility() {
     )
     .unwrap();
     wait_monitor_state(&d, "dm", "active", 5);
+    // The legacy manual permission remains inert under the background
+    // watcher. Automatic reconciliation requires its separate opt-in bit.
+    thread::sleep(Duration::from_millis(1200));
+    assert_eq!(d.task_state("djob-ready"), "draft");
+    let before_manual = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(
+        before_manual["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["source"] == "job_dispatch")
+            .count(),
+        0
+    );
 
     let result = d
         .rpc(
@@ -19724,6 +19810,193 @@ fn monitor_dispatch_requires_explicit_safe_eligibility() {
         "{messages}"
     );
     assert_ne!(kickoff, existing_kickoff);
+}
+
+#[test]
+fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
+    let mut d = TestDaemon::start();
+    d.register("pm");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    for (alias, params) in [
+        ("w1", json!({"upstream": "pm"})),
+        (
+            "w2",
+            json!({"upstream": "pm", "quota": {"state": "available", "remaining": 4}}),
+        ),
+        ("w3", json!({"upstream": "pm"})),
+    ] {
+        d.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake",
+                   "cwd": cwd, "params": params.to_string()}),
+        )
+        .unwrap();
+    }
+    for alias in ["pm", "w1", "w2", "w3"] {
+        d.wait_agent(alias, "idle", 10);
+    }
+    // Leave one durable kickoff queued for a stopped worker. The automatic
+    // retry must reuse it, proving the existing duplicate-only branch is the
+    // idempotency boundary rather than minting another revision.
+    let (spec, sha) = d.spec_file("automatic-monitor.md", "coordinator test");
+    let project = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "ajob", "spec": spec,
+               "spec_sha256": sha, "repo": project}),
+    )
+    .unwrap();
+    for (task, assignee) in [
+        ("ajob-fresh", "w2"),
+        ("ajob-duplicate", "w1"),
+        ("ajob-blocked", "w3"),
+    ] {
+        d.rpc(
+            "task_new",
+            json!({"job": "ajob", "task": task, "assignee": assignee,
+                   "acceptance": "run the focused coordinator checks"}),
+        )
+        .unwrap();
+    }
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 10);
+    let existing = d
+        .rpc(
+            "task_dispatch",
+            json!({"task": "ajob-duplicate", "by": "operator"}),
+        )
+        .unwrap();
+    let existing_kickoff = existing["message"].as_str().unwrap().to_string();
+    assert_eq!(existing["duplicate"], false);
+
+    let invalid = d.rpc(
+        "monitor_register",
+        json!({"monitor": "auto-invalid", "project": project,
+               "owner": "operator", "tasks": ["ajob-fresh"],
+               "interval_secs": 1, "auto_dispatch_enabled": true}),
+    );
+    assert!(invalid
+        .unwrap_err()
+        .to_string()
+        .contains("separate manual dispatch permission"));
+
+    let registered = d
+        .rpc(
+            "monitor_register",
+            json!({"monitor": "auto", "project": project,
+                   "owner": "operator", "tasks": ["ajob-blocked", "ajob-duplicate", "ajob-fresh"],
+                   "interval_secs": 1, "dispatch_enabled": true,
+                   "auto_dispatch_enabled": true}),
+        )
+        .unwrap();
+    assert_eq!(registered["monitor"]["dispatch_enabled"], true);
+    assert_eq!(registered["monitor"]["auto_dispatch_enabled"], true);
+    wait_monitor_state(&d, "auto", "active", 5);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let show = d.rpc("agent_show", json!({"alias": "w2"})).unwrap();
+        let dispatched = show["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["source"] == "job_dispatch")
+            .count();
+        if dispatched == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "automatic task was not dispatched: {show}; monitor={}; events={}",
+            d.rpc("monitor_show", json!({"monitor": "auto"})).unwrap(),
+            d.rpc("agent_events", json!({"alias": "w2"})).unwrap()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let w2 = d.rpc("agent_show", json!({"alias": "w2"})).unwrap();
+    assert_eq!(
+        w2["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["source"] == "job_dispatch")
+            .count(),
+        1,
+        "fresh automatic dispatch must mint one kickoff"
+    );
+
+    let blocked_deadline = Instant::now() + Duration::from_secs(5);
+    let blocked = loop {
+        let page = d.rpc("monitor_alerts", json!({"monitor": "auto"})).unwrap();
+        if let Some(alert) = page["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|alert| alert["kind"] == "dispatch_blocked")
+        {
+            break alert.clone();
+        }
+        assert!(
+            Instant::now() < blocked_deadline,
+            "missing automatic block alert: {page}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(blocked["task"], "ajob-blocked");
+    assert!(blocked["last_error"]
+        .as_str()
+        .unwrap()
+        .contains("quota unknown"));
+    assert_eq!(blocked["payload"]["next_action"].is_string(), true);
+    let blocked_seq = blocked["seq"].as_i64().unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    let repeated = d.rpc("monitor_alerts", json!({"monitor": "auto"})).unwrap();
+    let alerts = repeated["alerts"].as_array().unwrap();
+    assert_eq!(
+        alerts
+            .iter()
+            .filter(|alert| alert["kind"] == "dispatch_blocked")
+            .count(),
+        1
+    );
+    assert_eq!(alerts[0]["seq"], blocked_seq);
+    assert!(alerts[0]["attempts"].as_i64().unwrap() >= 2);
+
+    // The pre-existing kickoff is reused after a monitor tick and restart;
+    // no second job_dispatch message appears for the stopped worker.
+    let duplicate = d
+        .rpc(
+            "monitor_dispatch",
+            json!({"monitor": "auto", "task": "ajob-duplicate"}),
+        )
+        .unwrap();
+    assert_eq!(duplicate["duplicate"], true);
+    assert_eq!(duplicate["message"], existing_kickoff);
+    let state = d.state.clone();
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let d2 = TestDaemon::start_on(state);
+    wait_monitor_state(&d2, "auto", "active", 5);
+    thread::sleep(Duration::from_millis(1200));
+    let w1 = d2.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(
+        w1["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["source"] == "job_dispatch")
+            .count(),
+        1
+    );
+    let restored = d2
+        .rpc("monitor_alerts", json!({"monitor": "auto"}))
+        .unwrap();
+    assert!(restored["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|alert| { alert["seq"] == blocked_seq && alert["kind"] == "dispatch_blocked" }));
+    let _ = d2.rpc("monitor_stop", json!({"monitor": "auto"}));
 }
 // ---------- CAD-153: cadence audit -------------------------------------
 

@@ -202,6 +202,11 @@ fn monitor_alert_action(kind: &str, monitor_owner: &str) -> (&'static str, Strin
             monitor_owner.to_string(),
             "monitor owner may reconcile the worker",
         ),
+        "dispatch_blocked" => (
+            "Resolve the guarded dispatch prerequisite, then retry the task",
+            monitor_owner.to_string(),
+            "operator decision required; coordinator cannot bypass the guard",
+        ),
         _ => (
             "Inspect the monitor evidence and choose the next owner",
             monitor_owner.to_string(),

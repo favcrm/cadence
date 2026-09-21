@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -178,7 +178,11 @@ pub struct Monitor {
     pub event_cursor: i64,
     pub delivery_configured: bool,
     pub delivery_state: String,
+    /// The legacy dispatch bit only permits an explicit `monitor dispatch`
+    /// call.  Background coordination needs a separate durable opt-in so a
+    /// pre-existing manual registration cannot silently start dispatching.
     pub dispatch_enabled: bool,
+    pub auto_dispatch_enabled: bool,
     pub error: Option<String>,
     pub created: f64,
     pub updated: f64,
@@ -361,6 +365,7 @@ fn row_monitor(row: &rusqlite::Row) -> rusqlite::Result<Monitor> {
         delivery_configured: row.get::<_, i64>("delivery_configured")? != 0,
         delivery_state: row.get("delivery_state")?,
         dispatch_enabled: row.get::<_, i64>("dispatch_enabled")? != 0,
+        auto_dispatch_enabled: row.get::<_, i64>("auto_dispatch_enabled")? != 0,
         error: row.get("error")?,
         created: row.get("created")?,
         updated: row.get("updated")?,
@@ -555,6 +560,7 @@ impl Monitor {
                 "state": self.delivery_state,
             },
             "dispatch_enabled": self.dispatch_enabled,
+            "auto_dispatch_enabled": self.auto_dispatch_enabled,
             "open_alerts": open_alerts,
             "total_alerts": total_alerts,
             "error": self.error,
@@ -844,6 +850,29 @@ impl Store {
                     ON monitor_alerts(monitor_id, seq);
                  UPDATE schema_version SET version=8;",
             )?;
+            tx.commit()?;
+        }
+        if version < 9 {
+            // v9: background dispatch is a separate, durable consent from
+            // the v8 manual `dispatch_enabled` bit.  Keep the old bit's
+            // meaning stable so an existing registration cannot begin
+            // dispatching merely because the daemon was upgraded.
+            let monitor_columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(monitors)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !monitor_columns
+                .iter()
+                .any(|column| column == "auto_dispatch_enabled")
+            {
+                tx.execute_batch(
+                    "ALTER TABLE monitors
+                     ADD COLUMN auto_dispatch_enabled INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
+            tx.execute("UPDATE schema_version SET version=9", [])?;
             tx.commit()?;
         }
         let store = Self {
@@ -2634,6 +2663,60 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Durable mailbox evidence for a passive inbox.  Reading this view does
+    /// not claim, drain, or complete any message: `inbox_read` remains an
+    /// explicit consumer receipt and therefore cannot be mistaken for a
+    /// semantic PM decision.
+    pub fn inbox_status(&self, alias: &str) -> Result<Option<Value>> {
+        let conn = self.conn.lock().unwrap();
+        let agent = self.agent_in(&conn, alias)?;
+        if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            return Ok(None);
+        }
+        let mut states = serde_json::Map::new();
+        let mut stmt = conn.prepare(
+            "SELECT state,COUNT(*) FROM messages WHERE alias=? GROUP BY state ORDER BY state",
+        )?;
+        let rows = stmt.query_map([alias], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (state, count) = row?;
+            states.insert(state, json!(count));
+        }
+        let queued = states.get("queued").and_then(Value::as_i64).unwrap_or(0);
+        let (oldest_created, last_received_at, last_progress_at): (
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        ) = conn.query_row(
+            "SELECT MIN(CASE WHEN state='queued' THEN created END),
+                    MAX(created),
+                    MAX(CASE WHEN completed IS NOT NULL THEN completed
+                             WHEN started IS NOT NULL THEN started END)
+             FROM messages WHERE alias=?",
+            [alias],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(Some(json!({
+            "kind": "passive",
+            "state": if queued > 0 { "backlog" } else { "idle" },
+            "queued": queued,
+            "states": states,
+            "oldest_created_at": oldest_created,
+            "oldest_age_secs": oldest_created.map(|created| (now() - created).max(0.0)),
+            "last_received_at": last_received_at,
+            "last_progress_at": last_progress_at,
+            "semantic_completion": "external_consumer_required",
+            "receipt_only": true,
+            "next_action": if queued > 0 {
+                "A persistent mailbox consumer must read and act on these messages"
+            } else {
+                "Await the next durable message"
+            },
+        })))
+    }
+
     pub fn message(&self, id: &str) -> Result<Option<Message>> {
         let conn = self.conn.lock().unwrap();
         self.message_in(&conn, id)
@@ -2758,6 +2841,7 @@ impl Store {
 
     /// Register a monitor with a fixed task set. The project key must match
     /// each covered job's explicit repo binding; scope is never inferred.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_monitor(
         &self,
         id: &str,
@@ -2766,6 +2850,7 @@ impl Store {
         interval_secs: u64,
         task_ids: &[String],
         dispatch_enabled: bool,
+        auto_dispatch_enabled: bool,
     ) -> Result<(Monitor, bool)> {
         identifier(id, "Monitor id")?;
         identifier(owner, "Monitor owner")?;
@@ -2777,6 +2862,11 @@ impl Store {
         if !(1..=86_400).contains(&interval_secs) {
             return Err(Error::rejected(
                 "Monitor interval must be between 1 and 86400 seconds",
+            ));
+        }
+        if auto_dispatch_enabled && !dispatch_enabled {
+            return Err(Error::rejected(
+                "Automatic monitor dispatch requires the separate manual dispatch permission",
             ));
         }
         if task_ids.is_empty() || task_ids.len() > 256 {
@@ -2809,6 +2899,7 @@ impl Store {
                 && existing.owner == owner
                 && existing.interval_secs == interval_secs as i64
                 && existing.dispatch_enabled == dispatch_enabled
+                && existing.auto_dispatch_enabled == auto_dispatch_enabled
                 && existing_coverage == unique;
             if !same {
                 return Err(Error::rejected(format!(
@@ -2824,8 +2915,9 @@ impl Store {
         tx.execute(
             "INSERT INTO monitors(
                 id,project,owner,interval_secs,state,next_check_at,event_cursor,
-                delivery_configured,delivery_state,dispatch_enabled,created,updated)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                delivery_configured,delivery_state,dispatch_enabled,
+                auto_dispatch_enabled,created,updated)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 id,
                 project,
@@ -2837,6 +2929,7 @@ impl Store {
                 0i64,
                 "unconfigured",
                 dispatch_enabled as i64,
+                auto_dispatch_enabled as i64,
                 t,
                 t
             ],
@@ -2853,7 +2946,8 @@ impl Store {
             "monitor_registered",
             json!({"monitor": id, "project": project,
                    "owner": owner, "coverage": unique,
-                   "dispatch_enabled": dispatch_enabled}),
+                   "dispatch_enabled": dispatch_enabled,
+                   "auto_dispatch_enabled": auto_dispatch_enabled}),
         )?;
         tx.commit()?;
         let monitor = self.monitor_in(&conn, id)?;
@@ -2875,6 +2969,15 @@ impl Store {
                 |_| Ok(()),
             )
             .is_ok())
+    }
+
+    /// The fixed coverage set for a monitor.  Callers use this list for
+    /// reconciliation; membership is always the stored task set and is
+    /// never inferred from a project or job name.
+    pub fn monitor_tasks(&self, id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        self.monitor_in(&conn, id)?;
+        self.monitor_coverage_in(&conn, id)
     }
 
     /// Return an existing live kickoff without minting a new revision. This
@@ -3060,6 +3163,112 @@ impl Store {
         }
         tx.commit()?;
         self.monitor_in(&conn, id)
+    }
+
+    /// Record a guarded automatic-dispatch refusal without treating the
+    /// refusal as a monitor-health failure.  One alert per `(monitor,task)`
+    /// is retained and updated across reconciliation ticks; this prevents a
+    /// busy/approval/quota guard from creating an alert storm while keeping
+    /// the latest actionable reason durable across restart.
+    pub fn record_monitor_dispatch_blocked(
+        &self,
+        id: &str,
+        task_id: &str,
+        at: f64,
+        reason: &str,
+    ) -> Result<MonitorAlert> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let monitor = self.monitor_in(&tx, id)?;
+        let owner = monitor.owner.clone();
+        if !self
+            .monitor_coverage_in(&tx, id)?
+            .iter()
+            .any(|covered| covered == task_id)
+        {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is outside monitor '{id}' coverage"
+            )));
+        }
+        let fingerprint = format!("dispatch-blocked:{task_id}");
+        let previous: Option<(i64, i64, String, Option<String>)> = tx
+            .query_row(
+                "SELECT seq,event_seq,state,last_error FROM monitor_alerts
+                 WHERE monitor_id=? AND fingerprint=?",
+                params![id, fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let action =
+            "Inspect the guard reason, resolve the explicit task/worker prerequisite, then retry";
+        let seq = if let Some((seq, event_seq, state, previous_reason)) = previous {
+            let next_state =
+                if state == "acknowledged" && previous_reason.as_deref() != Some(reason) {
+                    "open"
+                } else {
+                    state.as_str()
+                };
+            let payload = json!({
+                "monitor": id,
+                "task_id": task_id,
+                "event_seq": event_seq,
+                "reason": reason,
+                "next_action": action,
+                "owner": owner.clone(),
+                "authority": "operator",
+                "automatic": true,
+                "observed_at": at,
+            });
+            tx.execute(
+                "UPDATE monitor_alerts SET payload=?,state=?,attempts=attempts+1,
+                    last_error=?,updated=? WHERE seq=?",
+                params![payload.to_string(), next_state, reason, at, seq],
+            )?;
+            seq
+        } else {
+            Self::event_scoped(
+                &tx,
+                Self::DAEMON_STREAM,
+                "monitor_dispatch_blocked",
+                json!({"monitor": id, "task": task_id,
+                       "reason": reason, "next_action": action,
+                       "owner": owner.clone(), "automatic": true}),
+                None,
+                Some(task_id),
+            )?;
+            let event_seq = tx.last_insert_rowid();
+            let payload = json!({
+                "monitor": id,
+                "task_id": task_id,
+                "event_seq": event_seq,
+                "reason": reason,
+                "next_action": action,
+                "owner": owner,
+                "authority": "operator",
+                "automatic": true,
+                "observed_at": at,
+            });
+            tx.execute(
+                "INSERT INTO monitor_alerts(
+                    monitor_id,task_id,event_seq,fingerprint,kind,payload,
+                    state,attempts,last_error,created,updated)
+                 VALUES(?,?,?,?,?,?,'open',1,?,?,?)",
+                params![
+                    id,
+                    task_id,
+                    event_seq,
+                    fingerprint,
+                    "dispatch_blocked",
+                    payload.to_string(),
+                    reason,
+                    at,
+                    at
+                ],
+            )?;
+            tx.last_insert_rowid()
+        };
+        tx.commit()?;
+        self.monitor_alert_in(&conn, seq)
     }
 
     pub fn stop_monitor(&self, id: &str) -> Result<Monitor> {
@@ -4749,7 +4958,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         Store::open(&db).unwrap();
     }
 
