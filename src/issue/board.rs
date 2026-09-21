@@ -677,6 +677,16 @@ fn link_ref(views_by_id: &HashMap<String, &View>, id: &str) -> Value {
 /// `history` is `git log` for issue.md — cheap at this scale.
 pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &View>) -> Value {
     let f = &view.issue.front;
+    let acceptance: Vec<Value> = parse::acceptance_items(&view.issue.body)
+        .into_iter()
+        .map(|item| {
+            json!({
+                "text": item.text,
+                "checked": item.checked,
+                "done": item.checked,
+            })
+        })
+        .collect();
     let link_list = |ids: &[String]| {
         ids.iter()
             .map(|id| link_ref(views_by_id, id))
@@ -737,6 +747,7 @@ pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &Vi
             .collect::<Vec<_>>(),
         "comments": comments,
         "notes_chain": chain,
+        "acceptance": acceptance,
         "history": history,
         "activity": activity,
         "commits": commits,

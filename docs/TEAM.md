@@ -13,12 +13,52 @@ standing instruction set.
 | PM | `fable-cc` | Claude Code session, inbox endpoint | Roadmap to issues, priority, dispatch, capacity, escalations, these docs | Implement, review or merge |
 | Researcher | `rsch-1` | managed Claude, Opus, effort high | Answers with sources: prior art, library and API facts, feasibility, cost | Write product code, decide |
 | Architect | `arch-1` | managed Claude, Opus, effort high | Options and trade-offs, ADRs, specs with runnable acceptance checks, ticket breakdown | Merge, implement beyond a spike |
-| Developer | `dev-<n>` (and existing Devin aliases) | Devin pty in bypass mode; Claude, Cursor or Codex as alternates | One issue per worktree: code, tests, docs, PR, qa note, review rounds | Touch another lane, merge, review |
+| Developer | `dev-<n>` (and existing Devin aliases) | Devin pty in bypass mode; Claude, Cursor or Codex as alternates | One cohesive delivery per worktree: code, tests, docs, PR, qa note, review rounds | Touch another lane, merge, review |
 | QA reviewer and memory curator | `qa-1` | managed Claude, Opus, effort high | Independent review, verdict pinned to a SHA, risk class, round-N kickoffs, residue issues, security flags; accepts or rejects memory lessons | Merge, push to an author's branch |
 | DevOps | `ops-1` | managed Claude, Opus, effort medium | Merge queue, combined gates, auto merges, post-merge ops, daemon restarts, host care | Merge class `human` without approval |
 
 Names for new agents follow `<role>-<n>`. Existing Devin workers keep
 their aliases until they are retired.
+
+## Delivery scope and working set
+
+Track a user outcome, independent defect, or material dependency as an issue.
+Keep implementation steps, related tests/docs, review corrections and routine
+operational receipts in that issue's checklist or comments. Search existing
+work before creating another ticket; preserve evidence when consolidating a
+duplicate, and do not label unimplemented work done.
+
+A PR is one self-contained, reviewable delivery slice. It can address multiple
+related issues; a large outcome can need multiple PRs. Include related tests
+and documentation in the same change. Split when independent rollback,
+security or migration boundaries, dependencies, or reviewer comprehension
+require it. Neither a checklist item nor an agent handoff requires its own PR;
+unrelated work should not be bundled merely to reduce PR count.
+
+Before dispatch, record observable acceptance, scope, dependencies, one writer
+per area, the reviewer/result route and proportionate validation in the
+existing issue/spec. Do not add a separate planning ceremony to a routine fix.
+Use architecture review early where the decision is consequential.
+
+Start with at most three active delivery outcomes, normally two development
+streams and one review stream, and about five ready outcomes. Parent rollups
+and roadmap ideas are not active developer work. Adjust this working target
+using measured review/CI capacity within the host ceiling below; clear review
+bottlenecks before starting more work. Reconcile stale doing/review labels
+against actual owners, PRs and remaining acceptance, rather than inferring
+completion from a single merged PR.
+
+Use supported focused checks during iteration and required full gates on the
+review candidate. All configured resource-admission and exact-revision review
+rules still apply. Deterministic tooling watches long-running CI; agents act on
+completion, failure or a meaningful blocker instead of repeated unchanged
+status turns. Reuse eligible unchanged evidence, never a stale-head verdict.
+
+After delivery, perform guarded cleanup and record one compact reflection at
+the existing outcome. Curate reusable lessons in batches. Measure completed
+outcomes, lead time, review age, rework, escaped defects and CI minutes per
+accepted outcome; ticket and PR counts alone are not productivity measures.
+These are team operating rules; they do not imply automated WIP enforcement.
 
 ## Lifecycle of a piece of work
 
@@ -54,7 +94,7 @@ goal (operator) ──► research question ──► rsch-1: research note (sou
 |---|---|---|---|
 | PM | Researcher | A question with the decision it feeds | `cadence send rsch-1 --reply-to fable-cc --text "…"` |
 | PM | Architect | A goal plus research notes | `cadence send arch-1 --reply-to fable-cc --text "…"` |
-| PM | Developer | Kickoff for one issue | `cadence dispatch <ID> --to <dev> --note <kickoff> --reply-to qa-1` |
+| PM | Developer | Kickoff for one delivery outcome, with related issue links | `cadence dispatch <ID> --to <dev> --note <kickoff> --reply-to qa-1` |
 | Developer | QA | Completion (automatic) and the qa note | `cadence message result …`; `mail-post.sh qa-1 qa …` |
 | QA | Developer | Round-N kickoff | `cadence send <dev> --reply-to qa-1 --text "read <note> — …"` |
 | QA | DevOps | Pass | `cadence send ops-1 --reply-to fable-cc --text "merge-ready #<pr> head <sha> risk <class> verdict <note>"` |
@@ -105,7 +145,9 @@ message of their turn; pty developers report with `cadence message result`.
 
 ## Capacity
 
-- At most five developer lanes plus one review suite at a time on this host.
+- Host ceiling: at most five developer lanes plus one review suite. The smaller
+  delivery working set above is the default; unused capacity is not a reason
+  to exceed review capacity.
 - Disk under 20 GiB free: DevOps deletes `target/` in worktrees of merged issues first.
 - Idle agents with nothing queued are stopped (resumable); reserves are resumed on demand.
 

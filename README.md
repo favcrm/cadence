@@ -164,6 +164,16 @@ cadence doctor --host           # read-only host watchdog: disk free, provider
                                 #  (--json for machines; pm.yaml [host] tunes)
 ```
 
+issue acceptance <ID> --from <FILE> replaces the unique level-two Acceptance
+checklist in that issue, or inserts it when the section is absent. The input
+file must contain at least one nonempty - [ ] or - [x] item; replacement keeps
+the checklist order and checked state while preserving the rest of the body.
+Duplicate Acceptance headings, malformed or empty input, missing issues and
+missing files are refused before any tracker write. This command only authors
+and reads criteria. Dispatch enforcement for empty acceptance remains the
+later CAD-159 increment; this slice does not change existing issues or
+running jobs.
+
 The **board** tracks issues as folders of Markdown files under `~/pm`
 (`CADENCE_PM_DIR` overrides) — a private git repo outside every project
 repo. There is exactly one writer implementation (`src/issue/write.rs`);
@@ -187,6 +197,7 @@ cadence issue doctor               # tracker health: hooks, lint, remote, push l
 cadence issue new "title"          # project resolves from the cwd repo
 cadence issue ls --ready           # leaves with no unfinished blockers
 cadence issue show CAD-16
+cadence issue acceptance CAD-16 --from acceptance.md
 cadence issue lint                 # dangling/cyclic links, depth, sizes —
                                    # the safety net; writes validate first
 cadence issue sync                 # multi-host: fetch, rebase, lint, push —

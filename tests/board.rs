@@ -429,6 +429,184 @@ fn issue_cli_end_to_end() {
 }
 
 #[test]
+fn issue_acceptance_round_trip_and_refusals() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let source_dir = TempDir::new().unwrap();
+    let source = source_dir.path().join("acceptance.md");
+    std::fs::write(
+        &source,
+        "- [X] first user outcome\r\n\r\n- [ ] second user outcome\r\n",
+    )
+    .unwrap();
+
+    let before = commits(pm.path());
+    let (ok, out) = cli(
+        pm.path(),
+        state.path(),
+        &[
+            "issue",
+            "acceptance",
+            "CAD-3",
+            "--from",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(commits(pm.path()), before + 1);
+    assert_eq!(out["acceptance"][0]["text"], "first user outcome");
+    assert_eq!(out["acceptance"][0]["checked"], true);
+    assert_eq!(out["acceptance"][1]["done"], false);
+    assert!(head_message(pm.path()).contains("CAD-3: acceptance replaced"));
+
+    let (ok, shown) = cli(
+        pm.path(),
+        state.path(),
+        &["issue", "show", "CAD-3", "--json"],
+    );
+    assert!(ok, "{shown}");
+    assert_eq!(
+        shown["acceptance"],
+        json!([
+            {
+                "text": "first user outcome",
+                "checked": true,
+                "done": true
+            },
+            {
+                "text": "second user outcome",
+                "checked": false,
+                "done": false
+            }
+        ])
+    );
+
+    // Readback stays scoped to the unique section while legacy checks remain
+    // the global compatibility count.
+    let issue_md = pm.path().join("cadence/CAD-3/issue.md");
+    let original = std::fs::read_to_string(&issue_md).unwrap();
+    let marker = "\n---\n\n";
+    let body_start = original.find(marker).unwrap() + marker.len();
+    let body = concat!(
+        "Before acceptance\n",
+        "- [ ] unrelated checkbox\n",
+        "## Acceptance\n",
+        "- [x] scoped outcome\n",
+        "\x60\x60\x60markdown\n",
+        "- [x] fenced example\n",
+        "\x60\x60\x60\n",
+        "## Notes\n",
+        "Unrelated notes stay intact.\n",
+        "- [ ] unrelated after\n",
+    );
+    std::fs::write(&issue_md, format!("{}{}", &original[..body_start], body)).unwrap();
+    let (ok, shown) = cli(
+        pm.path(),
+        state.path(),
+        &["issue", "show", "CAD-3", "--json"],
+    );
+    assert!(ok, "{shown}");
+    assert_eq!(
+        shown["acceptance"],
+        json!([{
+            "text": "scoped outcome",
+            "checked": true,
+            "done": true
+        }])
+    );
+    assert_eq!(shown["checks"], json!({"done": 2, "total": 4}));
+
+    // Duplicate sections refuse before save or commit.
+    let duplicate = concat!(
+        "## Acceptance\n",
+        "- [ ] first\n",
+        "## Acceptance\n",
+        "- [ ] duplicate\n",
+    );
+    std::fs::write(
+        &issue_md,
+        format!("{}{}", &original[..body_start], duplicate),
+    )
+    .unwrap();
+    let duplicate_bytes = std::fs::read(&issue_md).unwrap();
+    let before = commits(pm.path());
+    let (ok, err) = cli(
+        pm.path(),
+        state.path(),
+        &[
+            "issue",
+            "acceptance",
+            "CAD-3",
+            "--from",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("duplicate"),
+        "{err}"
+    );
+    assert_eq!(commits(pm.path()), before);
+    assert_eq!(std::fs::read(&issue_md).unwrap(), duplicate_bytes);
+
+    // Empty and malformed sources are rejected without touching the issue.
+    let before = commits(pm.path());
+    for invalid in ["", "- [] missing state\n", "not a checklist\n"] {
+        std::fs::write(&source, invalid).unwrap();
+        let (ok, err) = cli(
+            pm.path(),
+            state.path(),
+            &[
+                "issue",
+                "acceptance",
+                "CAD-3",
+                "--from",
+                source.to_str().unwrap(),
+            ],
+        );
+        assert!(!ok, "{invalid:?}: {err}");
+    }
+    assert_eq!(commits(pm.path()), before);
+    assert_eq!(std::fs::read(&issue_md).unwrap(), duplicate_bytes);
+
+    // Missing issue and missing input both fail closed without creating
+    // folders or commits.
+    std::fs::write(&source, "- [ ] valid input for missing issue\n").unwrap();
+    let missing = source_dir.path().join("missing.md");
+    let (ok, err) = cli(
+        pm.path(),
+        state.path(),
+        &[
+            "issue",
+            "acceptance",
+            "CAD-99",
+            "--from",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("Unknown"),
+        "{err}"
+    );
+    let (ok, err) = cli(
+        pm.path(),
+        state.path(),
+        &[
+            "issue",
+            "acceptance",
+            "CAD-99",
+            "--from",
+            missing.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("Cannot read"),
+        "{err}"
+    );
+    assert!(!pm.path().join("cadence/CAD-99").exists());
+}
+
+#[test]
 fn symlinks_are_never_followed() {
     let pm = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
