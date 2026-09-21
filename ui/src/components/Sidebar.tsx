@@ -74,7 +74,7 @@ export default function Sidebar({ tab, onTab, project, onProject, projects, tota
           className="navlink"
           aria-current={tab === "board" ? "page" : undefined}
         >
-          {boardIcon}Board
+          {boardIcon}Projects
         </button>
         <button
           onClick={() => onTab("plan")}

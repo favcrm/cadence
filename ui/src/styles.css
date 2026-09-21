@@ -193,3 +193,74 @@ pre {
   background: #222428;
   border-radius: 6px;
 }
+
+/* Project workspace reader and document layout stay shrinkable on phones. */
+.plan-grid > * {
+  min-width: 0;
+}
+.plan-grid pre,
+.plan-grid table {
+  max-width: 100%;
+}
+.issue-reader {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+.issue-reader h1,
+.issue-reader h2,
+.issue-reader h3,
+.issue-reader h4 {
+  color: #f6f7f8;
+  font-weight: 600;
+  line-height: 1.25;
+  margin: 1.15rem 0 .5rem;
+}
+.issue-reader h1 { font-size: 1.1rem; }
+.issue-reader h2 { font-size: 1rem; }
+.issue-reader h3,
+.issue-reader h4 { font-size: .9rem; }
+.issue-reader > :first-child { margin-top: 0; }
+.issue-reader p,
+.issue-reader ul,
+.issue-reader ol,
+.issue-reader blockquote,
+.issue-reader pre,
+.issue-reader table {
+  margin-block: .6rem;
+}
+.issue-reader ul,
+.issue-reader ol {
+  padding-inline-start: 1.25rem;
+}
+.issue-reader ul { list-style: disc; }
+.issue-reader ol { list-style: decimal; }
+.issue-reader li + li { margin-top: .25rem; }
+.issue-reader blockquote {
+  border-inline-start: 2px solid #2e3136;
+  color: #9ba1a9;
+  padding-inline-start: .8rem;
+}
+.issue-reader code {
+  overflow-wrap: anywhere;
+  color: #e7e9ec;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: .85em;
+}
+.issue-reader pre {
+  max-inline-size: 100%;
+  overflow: auto;
+  padding: .75rem;
+  border: 1px solid #222428;
+  background: #0b0b0c;
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
+}
+.issue-reader img {
+  max-inline-size: 100%;
+  block-size: auto;
+}
+.issue-reader a,
+.issue-reader button {
+  overflow-wrap: anywhere;
+}

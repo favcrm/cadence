@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, type WriteResp } from "../api";
 import { epicProgress, matches, type BoardFilters } from "../filters";
+import { agentIsUnassigned, agentMatchesProject, issueProjectMap } from "../scope";
 import type { AgentsPayload, Health, IssueCard, Project } from "../types";
 import Card, { noDragReason } from "./Card";
 import FilterBar from "./FilterBar";
@@ -27,6 +28,105 @@ const AGENT_DOT: Record<string, string> = {
   stopped: "bg-ink-600",
   attention: "bg-fail",
 };
+
+const STATUS_CHIP: Record<string, string> = {
+  backlog: "bg-ink-800 text-ink-400",
+  ready: "bg-ink-800 text-ink-300",
+  doing: "bg-info/10 text-info",
+  review: "bg-warn/10 text-warn",
+  done: "bg-ok/10 text-ok",
+  dropped: "bg-ink-800 text-ink-500",
+};
+
+const STATUS_ORDER = new Map(COLS.map(([key], index) => [key, index]));
+
+function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: string; onOpen: (id: string) => void }) {
+  const [sort, setSort] = useState<{ key: "id" | "title" | "status" | "priority" | "owner"; direction: "asc" | "desc" }>({ key: "status", direction: "asc" });
+  const sortRows = (key: typeof sort.key) => setSort((current) => ({
+    key,
+    direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
+  }));
+  const rows = issues.slice().sort((a, b) => {
+    const av = sort.key === "status" ? STATUS_ORDER.get(a.status) ?? 99 : sort.key === "priority" ? a.priority : (a[sort.key] ?? "");
+    const bv = sort.key === "status" ? STATUS_ORDER.get(b.status) ?? 99 : sort.key === "priority" ? b.priority : (b[sort.key] ?? "");
+    const result = typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv), undefined, { numeric: true });
+    return (sort.direction === "asc" ? result : -result) || a.id.localeCompare(b.id, undefined, { numeric: true });
+  });
+  const header = (key: typeof sort.key, label: string) => (
+    <button className="inline-flex items-center gap-1 hover:text-ink-200" onClick={() => sortRows(key)}>
+      {label}<span className="text-ink-600">{sort.key === key ? (sort.direction === "asc" ? "↑" : "↓") : "↕"}</span>
+    </button>
+  );
+  return (
+    <section className="card overflow-hidden reveal" aria-label="Project issue list">
+      <div className="sm:hidden divide-y divide-ink-700/70">
+        {rows.map((issue) => (
+          <button key={issue.id} className="w-full text-left px-3.5 py-3.5 hover:bg-ink-850" onClick={() => onOpen(issue.id)}>
+            <div className="flex items-center gap-2">
+              <span className="lnk num text-label">{issue.id}</span>
+              <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{issue.status}</span>
+              <span className="num text-micro text-ink-500 ml-auto">{issue.priority}</span>
+            </div>
+            <div className="text-ink-200 mt-1.5 leading-[1.4]">{issue.title}</div>
+            <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-micro text-ink-500">
+              <span>{issue.owner ?? "unassigned"}</span>
+              <span>{issue.component ?? "no component"}</span>
+              <span>{issue.checks.done}/{issue.checks.total} checks</span>
+              {project === "all" && <span>{issue.project}</span>}
+            </div>
+          </button>
+        ))}
+        {rows.length === 0 && <div className="px-4 py-10 text-center text-ink-500">No issues match this view.</div>}
+      </div>
+      <div className="hidden sm:block overflow-x-auto">
+        <table className="w-full min-w-[46rem] text-label">
+          <thead>
+            <tr className="border-b border-ink-700 text-left">
+              <th className="slabel font-normal px-4 py-2.5">{header("id", "issue")}</th>
+              {project === "all" && <th className="slabel font-normal px-3 py-2.5">project</th>}
+              <th className="slabel font-normal px-3 py-2.5">{header("status", "status")}</th>
+              <th className="slabel font-normal px-3 py-2.5">{header("priority", "priority")}</th>
+              <th className="slabel font-normal px-3 py-2.5">{header("owner", "owner")}</th>
+              <th className="slabel font-normal px-3 py-2.5">component / tags</th>
+              <th className="slabel font-normal px-3 py-2.5 text-right">checks</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-ink-700/70">
+            {rows.map((issue) => (
+              <tr key={issue.id} className="hover:bg-ink-850 transition-colors">
+                <td className="px-4 py-3 min-w-0 max-w-[28rem]">
+                  <button className="text-left min-w-0" onClick={() => onOpen(issue.id)}>
+                    <span className="lnk num">{issue.id}</span>
+                    <span className="block text-ink-200 truncate mt-0.5" title={issue.title}>{issue.title}</span>
+                  </button>
+                </td>
+                {project === "all" && <td className="px-3 py-3 align-top num text-ink-400">{issue.project}</td>}
+                <td className="px-3 py-3 align-top">
+                  <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{issue.status}</span>
+                </td>
+                <td className="px-3 py-3 align-top num text-ink-300">{issue.priority}</td>
+                <td className="px-3 py-3 align-top num text-ink-400">{issue.owner ?? "unassigned"}</td>
+                <td className="px-3 py-3 align-top min-w-[11rem]">
+                  <span className="text-ink-400">{issue.component ?? "—"}</span>
+                  {(issue.tags ?? []).length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-1">
+                      {issue.tags!.map((tag) => <span key={tag} className="chip bg-ink-800 text-ink-500">#{tag}</span>)}
+                    </div>
+                  )}
+                </td>
+                <td className="px-3 py-3 align-top text-right num text-ink-400">
+                  {issue.checks.done}/{issue.checks.total}
+                  {issue.blocked && <span className="block text-fail text-micro">blocked</span>}
+                </td>
+              </tr>
+            ))}
+            {rows.length === 0 && <tr><td colSpan={project === "all" ? 7 : 6} className="px-4 py-10 text-center text-ink-500">No issues match this view.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
 
 interface Props {
   issues: IssueCard[];
@@ -168,6 +268,19 @@ export default function Board({
   onAgents,
 }: Props) {
   const [over, setOver] = useState<string | null>(null);
+  const [view, setView] = useState<"kanban" | "list">(() => {
+    const fromUrl = new URLSearchParams(location.search).get("view");
+    if (fromUrl === "list" || fromUrl === "kanban") return fromUrl;
+    return localStorage.getItem("cadence-project-view") === "list" ? "list" : "kanban";
+  });
+  useEffect(() => {
+    localStorage.setItem("cadence-project-view", view);
+    const query = new URLSearchParams(location.search);
+    if (view === "list") query.set("view", "list");
+    else query.delete("view");
+    const next = query.toString();
+    history.replaceState(null, "", location.pathname + (next ? `?${next}` : ""));
+  }, [view]);
   // `scope` is what the project and the search box leave; the filter
   // bar counts over it and its chips narrow it to `visible`.
   const scope = issues.filter(
@@ -186,24 +299,41 @@ export default function Board({
       ? "All projects"
       : projects.find((p) => p.key === project)?.key ?? project;
 
+  const issueProjects = issueProjectMap(issues);
+  const scopedAgents = (agents?.agents ?? []).filter((agent) =>
+    agentMatchesProject(agent, project, issueProjects),
+  );
+  const globalAgents = (agents?.agents ?? []).filter((agent) =>
+    agentIsUnassigned(agent, issueProjects),
+  );
+
   // issue id → agent aliases currently running a turn that names it
   const busy = new Map<string, string[]>();
-  for (const a of agents?.agents ?? []) {
+  for (const a of scopedAgents) {
     for (const id of a.on) {
       busy.set(id, [...(busy.get(id) ?? []), a.alias]);
     }
   }
   const titleOf = new Map(issues.map((i) => [i.id, i.title]));
 
-  const totals = agents?.totals;
-  const fencedAgents = (agents?.agents ?? []).filter((a) => a.fenced);
-  const activeAgents = (agents?.agents ?? []).filter(
+  const totals = scopedAgents.reduce(
+    (sum, agent) => ({
+      running: sum.running + agent.running,
+      queued: sum.queued + agent.queued,
+      fenced: sum.fenced + (agent.fenced ? 1 : 0),
+      parked: sum.parked + agent.parked,
+      inboxes: sum.inboxes + (agent.inbox ? 1 : 0),
+    }),
+    { running: 0, queued: 0, fenced: 0, parked: 0, inboxes: 0 },
+  );
+  const fencedAgents = scopedAgents.filter((a) => a.fenced);
+  const activeAgents = scopedAgents.filter(
     (a) => a.running > 0 || a.fenced,
   );
-  const idleCount = (agents?.agents ?? []).filter(
+  const idleCount = scopedAgents.filter(
     (a) => a.state === "idle" && !a.fenced,
   ).length;
-  const stoppedCount = (agents?.agents ?? []).filter(
+  const stoppedCount = scopedAgents.filter(
     (a) => a.state === "stopped" && !a.fenced,
   ).length;
 
@@ -343,15 +473,25 @@ export default function Board({
           {title}
         </h1>
         <span className="kicker">
-          {visible.length} issues · {visible.filter((t) => t.blocked).length}{" "}
-          blocked ·{" "}
-          {visible.filter((t) => t.status_source !== "file").length} derived
+          {visible.length} issues · {visible.filter((t) => ["doing", "review"].includes(t.status)).length} active · {visible.filter((t) => t.blocked).length} blocked
         </span>
+        <div className="ml-auto flex items-center gap-1 rounded border border-ink-700 p-0.5" role="group" aria-label="Project view">
+          {(["kanban", "list"] as const).map((mode) => (
+            <button
+              key={mode}
+              aria-pressed={view === mode}
+              onClick={() => setView(mode)}
+              className={`chip !py-[.25rem] capitalize ${view === mode ? "bg-accent/10 text-accent" : "text-ink-500 hover:text-ink-200"}`}
+            >
+              {mode === "kanban" ? "board" : "list"}
+            </button>
+          ))}
+        </div>
         <input
           value={query}
           onChange={(e) => onQuery(e.target.value)}
-          className="field ml-auto w-full sm:w-64"
-          placeholder="Filter issues by id, title, owner or tag"
+          className="field w-full sm:w-64"
+          placeholder="Search issues, owners or tags"
         />
       </div>
 
@@ -446,7 +586,7 @@ export default function Board({
             {idleCount > 0 && (
               <span
                 className="chip bg-ink-800 !py-[.15rem] text-ink-400"
-                title={(agents?.agents ?? [])
+                title={scopedAgents
                   .filter((a) => a.state === "idle" && !a.fenced)
                   .map((a) => a.alias)
                   .join(", ")}
@@ -458,13 +598,21 @@ export default function Board({
             {stoppedCount > 0 && (
               <span
                 className="chip bg-ink-800 !py-[.15rem] text-ink-400"
-                title={(agents?.agents ?? [])
+                title={scopedAgents
                   .filter((a) => a.state === "stopped" && !a.fenced)
                   .map((a) => a.alias)
                   .join(", ")}
               >
                 <i className="w-1.5 h-1.5 rounded-full bg-ink-600" />
                 <span className="num text-ink-200">{stoppedCount}</span>stopped
+              </span>
+            )}
+            {project !== "all" && globalAgents.length > 0 && (
+              <span
+                className="chip bg-ink-800 !py-[.15rem] text-ink-500"
+                title="agents without an exact issue binding remain global"
+              >
+                {globalAgents.length} global/unassigned
               </span>
             )}
           </div>
@@ -478,7 +626,9 @@ export default function Board({
         onChange={onFilters}
       />
 
-      {!filters.groupByEpic ? (
+      {view === "list" ? (
+        <IssueList issues={visible} project={project} onOpen={onOpen} />
+      ) : !filters.groupByEpic ? (
         columns(visible, "", true)
       ) : (
         <div className="space-y-5">

@@ -9,7 +9,7 @@ import Plan from "./components/Plan";
 import Sidebar from "./components/Sidebar";
 import Toast, { type ToastMsg } from "./components/Toast";
 import { Logo } from "./components/Logo";
-import { NO_FILTERS, readFilters, writeFilters, type BoardFilters } from "./filters";
+import { readFilters, writeFilters, type BoardFilters } from "./filters";
 import type {
   AgentsPayload,
   Health,
@@ -21,12 +21,13 @@ import type {
 } from "./types";
 
 export default function App() {
+  const initialUrl = new URLSearchParams(location.search);
   const [tab, setTab] = useState<
     "overview" | "board" | "plan" | "agents" | "memory"
   >("overview");
-  const [project, setProject] = useState("all");
+  const [project, setProject] = useState(() => initialUrl.get("project") ?? "all");
   const [query, setQuery] = useState("");
-  const [filters, setFilters] = useState<BoardFilters>(NO_FILTERS);
+  const [filters, setFilters] = useState<BoardFilters>(() => readFilters(initialUrl));
   const [issues, setIssues] = useState<IssueCard[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<AgentsPayload | null>(null);
@@ -36,7 +37,7 @@ export default function App() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
-  const [openId, setOpenId] = useState<string | null>(null);
+  const [openId, setOpenId] = useState<string | null>(() => initialUrl.get("issue"));
   const [openDetail, setOpenDetail] = useState<IssueDetail | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastMsg | null>(null);
@@ -61,7 +62,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const q = new URLSearchParams();
+    const q = new URLSearchParams(location.search);
+    q.delete("project");
+    q.delete("issue");
     if (project !== "all") q.set("project", project);
     if (openId) q.set("issue", openId);
     writeFilters(q, filters);
@@ -284,7 +287,7 @@ export default function App() {
           <div className="num text-label text-ink-500">
             <span className="hidden sm:inline text-ink-300">cadence</span>
             <span className="hidden sm:inline"> / </span>
-            <span className="text-ink-100">{tab}</span>
+            <span className="text-ink-100">{tab === "board" ? "projects" : tab}</span>
           </div>
 
           <div className="ml-auto flex items-center gap-2">
@@ -347,7 +350,7 @@ export default function App() {
                         : "bg-ink-800 text-ink-300"
                     }`}
                   >
-                    {t}
+                    {t === "board" ? "projects" : t}
                   </button>
                 ),
               )}
@@ -404,7 +407,12 @@ export default function App() {
         )}
 
         {tab === "overview" && (
-          <OverviewView data={overview} readOnly={readOnly} onAck={ackMonitor} />
+          <OverviewView
+            data={overview}
+            project={project}
+            readOnly={readOnly}
+            onAck={ackMonitor}
+          />
         )}
         {tab === "board" && (
           <Board
@@ -429,6 +437,8 @@ export default function App() {
         {tab === "agents" && (
           <Agents
             payload={agents}
+            issues={issues}
+            project={project}
             onOpenIssue={openIssue}
             loading={agentsLoading}
             error={agentsError}

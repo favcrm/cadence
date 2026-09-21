@@ -49,11 +49,11 @@ export default function FilterBar({ scope, issues, filters, onChange }: Props) {
       <button
         aria-expanded={open}
         onClick={() => setOpen(!open)}
-        className="sm:hidden chip !py-[.15rem] bg-ink-800 text-ink-400 hover:text-ink-200 transition-colors"
+        className="chip !py-[.15rem] bg-ink-800 text-ink-400 hover:text-ink-200 transition-colors"
       >
-        filters{active > 0 ? ` · ${active}` : ""}
+        {open ? "hide filters" : "filters"}{active > 0 ? ` · ${active}` : ""}
       </button>
-      <div className={open ? "contents" : "hidden sm:contents"}>
+      <div className={open ? "contents" : "hidden"}>
       {facets.map(([facet, label, options]) => {
         // A value picked through the URL stays removable even when no
         // card in scope carries it any more.
