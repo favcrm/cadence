@@ -74,6 +74,12 @@ cadence doctor --host         # host watchdog: disk free, provider WALs, pipe
                               #  owner, reclaim confidence — warns only when
                               #  the session-registry store is unreadable),
                               #  orphaned processes, leaked temp dirs,
+                              #  legacy task cargo targets (`cad<digits>-*target*`
+                              #  plus recorded `cargo_target` / `CARGO_TARGET_DIR`
+                              #  — age, bytes, ownership, cwd/exe, cargo lock;
+                              #  a name match is not ownership, no cwd reference
+                              #  is not proof the dir is idle, and the remedy is
+                              #  not a deletion command),
                               #  stale worktrees (shared cargo cache counted
                               #  once) — read-only, exit 0/1/2
 cadence doctor --host --reclaim-plan
