@@ -223,6 +223,39 @@ pub(crate) fn save_front(dir: &Path, front: &Front, body: &str) -> Result<()> {
     atomic_write(&dir.join("issue.md"), &parse::render(front, body)?)
 }
 
+/// issue acceptance <ID> --from <file> — replace the issue's unique
+/// level-two Acceptance section, or append one when it is absent.
+/// Validation happens before the PM lock and the body is saved atomically
+/// under that lock, so malformed input and duplicate sections leave the
+/// tracker unchanged.
+pub fn set_acceptance(pm: &Pm, id: &str, source: &Path, actor: &str) -> Result<Value> {
+    let input = std::fs::read_to_string(source).map_err(|e| {
+        Error::rejected(format!(
+            "Cannot read acceptance input {}: {e}",
+            source.display()
+        ))
+    })?;
+    let items = parse::parse_acceptance_input(&input)?;
+    let (_project, dir) = issue_dir(pm, id)?;
+    let _lock = pm.lock()?;
+    let (front, body) = load_front(&dir)?;
+    let body = parse::replace_acceptance(&body, &items)?;
+    save_front(&dir, &front, &body)?;
+    commit(pm, &format!("{id}: acceptance replaced"), &[id], actor)?;
+    Ok(json!({
+        "id": id,
+        "acceptance": items
+            .iter()
+            .map(|item| json!({
+                "text": item.text,
+                "checked": item.checked,
+                "done": item.checked,
+            }))
+            .collect::<Vec<_>>(),
+        "committed": true,
+    }))
+}
+
 /// `project add` — create `<pm>/<key>/project.yaml`.
 #[allow(clippy::too_many_arguments)]
 pub fn project_add(

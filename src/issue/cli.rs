@@ -231,6 +231,15 @@ pub enum IssueAction {
         #[arg(long)]
         json: bool,
     },
+    /// Replace the level-two Acceptance checklist from a file. The file
+    /// must contain at least one explicit checked or unchecked item.
+    Acceptance {
+        /// Issue id (CAD-16).
+        id: String,
+        /// Checklist file; every nonblank line must be a checkbox item.
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
+    },
     /// Set writable fields: `status priority owner component title
     /// tags`. Several ids make a bulk edit: one commit, and nothing is
     /// written unless every id and pair is valid.
@@ -696,6 +705,11 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             } else {
                 print_show(view, &by_id);
             }
+            Ok(0)
+        }
+        IssueAction::Acceptance { id, from } => {
+            let pm = open_pm()?;
+            print_json(&write::set_acceptance(&pm, id, from, "")?);
             Ok(0)
         }
         IssueAction::Set { args } => {
