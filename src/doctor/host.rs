@@ -132,6 +132,28 @@ pub struct HostOverrides {
     /// `wal_dry_run: true` records `wal_checkpoint_pending` events for
     /// what the watcher *would* checkpoint instead of touching the db.
     pub wal_dry_run: Option<bool>,
+    /// CAD-113 build slots — read by the daemon's slot service, not by
+    /// `Thresholds`. `build_slots` bounds concurrent build+test grants
+    /// (default 3), `suite_slots` the full-suite pool (default 1),
+    /// `jobs_per_lane` is the `CARGO_BUILD_JOBS` dispatch injects
+    /// (default 4), `starve_secs` is the never-starve bound (default
+    /// 900), `priority_lanes` are aliases whose test/suite requests
+    /// outrank ordinary ones (the reviewer lane), `max_hold_secs`
+    /// reaps a forgotten hold (default 7200).
+    pub build_slots: Option<u64>,
+    pub suite_slots: Option<u64>,
+    pub jobs_per_lane: Option<u64>,
+    pub starve_secs: Option<u64>,
+    pub priority_lanes: Option<Vec<String>>,
+    pub max_hold_secs: Option<u64>,
+    /// Load watchdog: warn when load1 exceeds `load_warn_ratio`×cpus
+    /// or io stall avg10 exceeds `io_stall_warn_pct`/`io_stall_fail_pct`%.
+    /// Unset `load_warn_ratio` derives the warn line from the slot
+    /// plan — the farm is *meant* to run `slots × jobs` deep, so warn
+    /// above that plan, not below it.
+    pub load_warn_ratio: Option<f64>,
+    pub io_stall_warn_pct: Option<f64>,
+    pub io_stall_fail_pct: Option<f64>,
 }
 
 /// Every threshold in one place; `pm.yaml [host]` overrides any subset.
@@ -156,6 +178,14 @@ pub struct Thresholds {
     pub wal_max_bytes: u64,
     pub wal_checkpoint: bool,
     pub wal_dry_run: bool,
+    /// Warn when load1 exceeds this × cpu count (fail at 2×). `None`
+    /// derives the line from the slot plan at check time — the farm
+    /// is meant to run `slots × jobs` deep, so warn above the plan,
+    /// not below it.
+    pub load_warn_ratio: Option<f64>,
+    /// Warn/fail on `/proc/pressure/io` `some avg10` percent.
+    pub io_stall_warn_pct: f64,
+    pub io_stall_fail_pct: f64,
 }
 
 impl Default for Thresholds {
@@ -180,6 +210,9 @@ impl Default for Thresholds {
             wal_max_bytes: GIB,
             wal_checkpoint: true,
             wal_dry_run: false,
+            load_warn_ratio: None,
+            io_stall_warn_pct: 30.0,
+            io_stall_fail_pct: 60.0,
         }
     }
 }
@@ -245,6 +278,15 @@ impl Thresholds {
             if let Some(v) = o.wal_dry_run {
                 t.wal_dry_run = v;
             }
+            if let Some(v) = o.load_warn_ratio {
+                t.load_warn_ratio = Some(v);
+            }
+            if let Some(v) = o.io_stall_warn_pct {
+                t.io_stall_warn_pct = v;
+            }
+            if let Some(v) = o.io_stall_fail_pct {
+                t.io_stall_fail_pct = v;
+            }
         }
         t
     }
@@ -266,6 +308,10 @@ pub struct Scan {
     pub now: SystemTime,
     pub thresholds: Thresholds,
     pub linux: bool,
+    /// The daemon's `slot_status` payload when it answers — `cli()`
+    /// fills it best-effort so the load check can report the queue;
+    /// `None` means daemon unreachable (reported, not penalised).
+    pub slots: Option<Value>,
     /// Injectable statvfs — tests substitute fabricated free-space
     /// answers so no check ever depends on the host's real disks.
     pub(crate) fs_probe: Option<fn(&Path) -> Option<FsFree>>,
@@ -302,6 +348,13 @@ impl Scan {
             now: SystemTime::now(),
             thresholds,
             linux: cfg!(target_os = "linux"),
+            slots: crate::client::rpc_timeout(
+                state_dir,
+                "slot_status",
+                serde_json::json!({"lane": crate::slots::default_lane()}),
+                std::time::Duration::from_secs(2),
+            )
+            .ok(),
             fs_probe: None,
             census: std::cell::OnceCell::new(),
         }
@@ -310,7 +363,9 @@ impl Scan {
 
 /// The optional `[host]` table in `pm.yaml` — read as plain YAML so a
 /// missing or older `pm.yaml` is simply "no overrides", never an error.
-fn host_overrides(pm_dir: &Path) -> Option<HostOverrides> {
+/// `pub(crate)` — the daemon's slot service and `issue start` reuse it
+/// for the CAD-113 `[host]` keys (`build_slots` &c.).
+pub(crate) fn host_overrides(pm_dir: &Path) -> Option<HostOverrides> {
     let text = std::fs::read_to_string(pm_dir.join("pm.yaml")).ok()?;
     let yaml: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
     serde_yaml::from_value(yaml.get("host")?.clone()).ok()
@@ -335,6 +390,7 @@ pub fn run(scan: &Scan) -> Value {
         check_orphans(scan),
         check_temp_dirs(scan),
         check_worktrees(scan),
+        check_load(scan),
     ];
     let level = checks.iter().map(|c| c.level).max().unwrap_or(Level::Ok);
     json!({
@@ -3843,6 +3899,135 @@ pub fn render_reclaim(plan: &Value) -> String {
     out
 }
 
+/// The load warn line when `[host] load_warn_ratio` is unset: the
+/// slot plan's own ceiling plus headroom — the farm is *meant* to run
+/// `(build_slots + suite_slots) × jobs_per_lane` deep, so warn above
+/// 1.25× that plan (never below plain saturation). The daemon's
+/// resolved config rides `scan.slots`; unreachable, the built-in
+/// defaults stand in.
+fn planned_load_warn_ratio(scan: &Scan, cpus: f64) -> f64 {
+    let cfg = scan.slots.as_ref().map(|s| &s["config"]);
+    let key = |k: &str, d: f64| cfg.and_then(|c| c[k].as_f64()).unwrap_or(d);
+    let planned_jobs =
+        (key("build_slots", 3.0) + key("suite_slots", 1.0)) * key("jobs_per_lane", 4.0);
+    (planned_jobs * 1.25 / cpus).max(1.0)
+}
+
+/// Host pressure: load1 vs cpu count plus io stall, with the slot
+/// queue in the detail so a hot host names its cause. Everything
+/// reads `scan.proc_root`, so tests fabricate both files.
+fn check_load(scan: &Scan) -> Check {
+    let name = "load";
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1) as f64;
+    let warn_ratio = scan
+        .thresholds
+        .load_warn_ratio
+        .unwrap_or_else(|| planned_load_warn_ratio(scan, cpus));
+    let threshold = json!({
+        "load1": format!("warn > {}x cpus, fail > {}x",
+                         warn_ratio,
+                         warn_ratio * 2.0),
+        "io_stall_avg10_pct": format!("warn > {}, fail > {}",
+                                     scan.thresholds.io_stall_warn_pct,
+                                     scan.thresholds.io_stall_fail_pct),
+    });
+    let load1 = std::fs::read_to_string(scan.proc_root.join("loadavg"))
+        .ok()
+        .and_then(|t| t.split_whitespace().next()?.parse::<f64>().ok());
+    let io_stall = std::fs::read_to_string(scan.proc_root.join("pressure/io"))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find(|l| l.starts_with("some"))?
+                .split_whitespace()
+                .find_map(|f| f.strip_prefix("avg10="))?
+                .parse::<f64>()
+                .ok()
+        });
+    if load1.is_none() && io_stall.is_none() {
+        return check(
+            name,
+            Level::Ok,
+            json!({"skipped": true}),
+            threshold,
+            format!(
+                "no loadavg or pressure/io under {}",
+                scan.proc_root.display()
+            ),
+            String::new(),
+        );
+    }
+    let ratio = load1.map(|l| l / cpus);
+    let level = if ratio.is_some_and(|r| r > warn_ratio * 2.0)
+        || io_stall.is_some_and(|s| s > scan.thresholds.io_stall_fail_pct)
+    {
+        Level::Fail
+    } else if ratio.is_some_and(|r| r > warn_ratio)
+        || io_stall.is_some_and(|s| s > scan.thresholds.io_stall_warn_pct)
+    {
+        Level::Warn
+    } else {
+        Level::Ok
+    };
+    let slots_text = match &scan.slots {
+        Some(s) => {
+            let held = |pool: &str| s["pools"][pool]["held"].as_array().map_or(0, Vec::len);
+            let cap = |pool: &str| s["pools"][pool]["capacity"].as_u64().unwrap_or(0);
+            let waiting = s["waiting"].as_array().map_or(0, Vec::len);
+            let longest = s["waiting"]
+                .as_array()
+                .map(|w| {
+                    w.iter()
+                        .map(|x| x["wait_secs"].as_f64().unwrap_or(0.0))
+                        .fold(0.0, f64::max)
+                })
+                .unwrap_or(0.0);
+            format!(
+                "slots {}/{} build {}/{} suite ({} waiting, longest {})",
+                held("build"),
+                cap("build"),
+                held("suite"),
+                cap("suite"),
+                waiting,
+                crate::slots::fmt_wait(longest)
+            )
+        }
+        None => "slots: daemon unreachable".to_string(),
+    };
+    check(
+        name,
+        level,
+        json!({
+            "load1": load1, "cpus": cpus, "load_ratio": ratio,
+            "io_stall_avg10": io_stall,
+            "slots": scan.slots.as_ref().map(|s| s["waiting"]
+                .as_array().map_or(0, Vec::len)),
+        }),
+        threshold,
+        format!(
+            "load1 {} ({}x of {} cpus), io stall {}, {}",
+            load1
+                .map(|l| format!("{l:.1}"))
+                .unwrap_or_else(|| "-".into()),
+            ratio
+                .map(|r| format!("{r:.1}"))
+                .unwrap_or_else(|| "-".into()),
+            cpus as u64,
+            io_stall
+                .map(|s| format!("{s:.0}% avg10"))
+                .unwrap_or_else(|| "-".into()),
+            slots_text
+        ),
+        if level == Level::Ok {
+            String::new()
+        } else {
+            "cadence build-slot status  # who holds the build slots".to_string()
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3867,6 +4052,7 @@ mod tests {
             now: SystemTime::now(),
             thresholds: Thresholds::default(),
             linux: true,
+            slots: None,
             fs_probe: Some(|path| {
                 Some(FsFree {
                     path: path.to_path_buf(),
@@ -5734,7 +5920,8 @@ mod tests {
                 "sessions",
                 "orphans",
                 "temp-dirs",
-                "worktrees"
+                "worktrees",
+                "load"
             ]
         );
         for c in report["checks"].as_array().unwrap() {
@@ -6650,5 +6837,113 @@ mod tests {
             text.contains("separately authorised phase"),
             "caveat missing from render:\n{text}"
         );
+    }
+
+    #[test]
+    fn pm_yaml_host_slot_keys_parse() {
+        let root = TempDir::new().unwrap();
+        let pm = root.path().join("pm");
+        std::fs::create_dir_all(&pm).unwrap();
+        std::fs::write(
+            pm.join("pm.yaml"),
+            "schema: 1\nhost:\n  build_slots: 5\n  suite_slots: 2\n  \
+             jobs_per_lane: 8\n  starve_secs: 300\n  \
+             priority_lanes: [qa-1, qa-2]\n  load_warn_ratio: 1.5\n  \
+             io_stall_fail_pct: 45\n",
+        )
+        .unwrap();
+        let o = host_overrides(&pm).unwrap();
+        assert_eq!(o.build_slots, Some(5));
+        assert_eq!(o.suite_slots, Some(2));
+        assert_eq!(o.jobs_per_lane, Some(8));
+        assert_eq!(o.starve_secs, Some(300));
+        assert_eq!(o.priority_lanes.as_deref().unwrap().len(), 2);
+        assert_eq!(o.load_warn_ratio, Some(1.5));
+        // …and it resolves through to the threshold.
+        let t = Thresholds::resolve(Some(o));
+        assert_eq!(t.load_warn_ratio, Some(1.5));
+        assert_eq!(t.io_stall_fail_pct, 45.0);
+    }
+
+    // ---------- load (CAD-113) ----------
+
+    /// Fabricate `loadavg` + `pressure/io` under the scan's proc root.
+    fn proc_load(scan: &Scan, load1: f64, io_avg10: Option<f64>) {
+        std::fs::create_dir_all(scan.proc_root.join("pressure")).unwrap();
+        std::fs::write(
+            scan.proc_root.join("loadavg"),
+            format!("{load1} 1.00 1.00 1/100 999\n"),
+        )
+        .unwrap();
+        let io = match io_avg10 {
+            Some(v) => format!("some avg10={v} avg60=0.00 avg300=0.00 total=1\n"),
+            None => String::new(),
+        };
+        std::fs::write(scan.proc_root.join("pressure/io"), io).unwrap();
+    }
+
+    #[test]
+    fn load_check_levels_and_slot_detail() {
+        let root = TempDir::new().unwrap();
+        let mut scan = fake_scan(&root);
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1) as f64;
+        // Calm host: level ok, detail still names the slot queue.
+        scan.slots = Some(json!({
+            "pools": {
+                "build": {"capacity": 3, "held": [{"a": 1}, {"a": 2}]},
+                "suite": {"capacity": 1, "held": []},
+            },
+            "waiting": [{"wait_secs": 252.0}],
+        }));
+        proc_load(&scan, 0.5, Some(2.0));
+        let c = check_load(&scan);
+        assert_eq!(c.level, Level::Ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("slots 2/3 build 0/1 suite"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("longest 4m12s"), "{}", c.detail);
+        // An explicit warn ratio pins the bands regardless of cpus.
+        scan.thresholds.load_warn_ratio = Some(1.0);
+        // Warn band: load1 above cpus but under 2x.
+        proc_load(&scan, cpus * 1.5, Some(10.0));
+        let c = check_load(&scan);
+        assert_eq!(c.level, Level::Warn, "{}", c.detail);
+        assert!(c.remedy.contains("build-slot status"));
+        // Fail band: io stall alone can carry it.
+        proc_load(&scan, 0.5, Some(70.0));
+        let c = check_load(&scan);
+        assert_eq!(c.level, Level::Fail, "{}", c.detail);
+        // Load alone over 2x also fails.
+        proc_load(&scan, cpus * 2.5, Some(0.0));
+        let c = check_load(&scan);
+        assert_eq!(c.level, Level::Fail, "{}", c.detail);
+        // Unset, the warn line derives from the slot plan — the
+        // farm's own (3+1)×4 jobs on this box: warn only above it.
+        scan.thresholds.load_warn_ratio = None;
+        let derived = ((3.0 + 1.0) * 4.0 * 1.25 / cpus).max(1.0);
+        // The fixture's slot config (3/1/4) equals the defaults, so
+        // the derived ratio matches either way; below it → ok.
+        proc_load(&scan, cpus * derived * 0.9, Some(2.0));
+        let c = check_load(&scan);
+        assert_eq!(c.level, Level::Ok, "below plan: {}", c.detail);
+        proc_load(&scan, cpus * derived * 1.5, Some(2.0));
+        let c = check_load(&scan);
+        assert_eq!(c.level, Level::Warn, "above plan: {}", c.detail);
+        // Unreachable daemon reports, never penalises.
+        scan.slots = None;
+        proc_load(&scan, 0.5, Some(2.0));
+        let c = check_load(&scan);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.detail.contains("daemon unreachable"), "{}", c.detail);
+        // Neither file exists → skipped ok.
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let c = check_load(&scan);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.value["skipped"].as_bool().unwrap_or(false));
     }
 }

@@ -692,6 +692,14 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         watch: Option<u64>,
     },
+    /// Bounded, fair cargo build/test scheduling (CAD-113): the daemon
+    /// grants a bounded number of concurrent build and suite slots —
+    /// wrap `cargo build|test|clippy` so the host stays responsive
+    /// under a fleet of agents.
+    BuildSlot {
+        #[command(subcommand)]
+        action: BuildSlotAction,
+    },
     /// Review a PR end-to-end: detached checkout under
     /// `.cadence/wt/review-<pr>` (the merge result when the base moved),
     /// config-driven gates from `cadence-review.toml`, new-test stress,
@@ -1129,6 +1137,87 @@ enum DaemonAction {
         /// running for this state dir.
         #[arg(long)]
         ui: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BuildSlotAction {
+    /// Take a build/test/suite slot: granted immediately when a slot
+    /// is free, else this polls the daemon with a stable request id
+    /// until granted or --wait-secs elapses. Prints the slot token.
+    Acquire {
+        /// build, test or suite. `test` and `suite` can be claimed by
+        /// the configured priority lanes ahead of ordinary requests;
+        /// `suite` draws on its own pool so a full suite never jams
+        /// the build lanes.
+        kind: String,
+        /// The lane this slot is for (default: $CADENCE_ALIAS, else
+        /// $USER, else "unknown").
+        #[arg(long)]
+        lane: Option<String>,
+        /// Pid whose death frees the slot — REQUIRED: the hold must
+        /// bind to the process that actually lives for the work (`$$`
+        /// in a shell wrapper). `build-slot run` needs no --pid: it
+        /// binds the real command itself.
+        #[arg(long)]
+        pid: u32,
+        /// Give up after <secs> waiting in the queue (0 = answer
+        /// immediately, granted or not).
+        #[arg(long, default_value_t = 0)]
+        wait_secs: u64,
+        /// Print the grant as JSON ({token, kind, wait_secs}) instead
+        /// of the bare token.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Hold a slot for exactly one command's lifetime: acquires, then
+    /// EXECS the command — the slot's holder is the real cargo/test
+    /// process itself, and its exit frees the slot. Wrap gates like
+    /// `cadence build-slot run test -- cargo test --lib`.
+    Run {
+        /// build, test or suite.
+        kind: String,
+        /// The lane this slot is for (default: $CADENCE_ALIAS, else
+        /// $USER, else "unknown").
+        #[arg(long)]
+        lane: Option<String>,
+        /// Give up after <secs> waiting in the queue (0 = fail fast
+        /// when nothing is free).
+        #[arg(long, default_value_t = 600)]
+        wait_secs: u64,
+        /// The command to run while holding the slot.
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Return a held slot by token. Release must name the holder —
+    /// the default pid is the caller's parent, so a script that
+    /// acquired with `--pid $$` releases with a bare `release` from
+    /// the same shell; pass --pid to release a slot held by `run`
+    /// ($CADENCE_BUILD_SLOT_PID) or another process.
+    Release {
+        /// The token `acquire` printed.
+        token: String,
+        /// The lane the slot is held for (default: $CADENCE_ALIAS,
+        /// else $USER, else "unknown").
+        #[arg(long)]
+        lane: Option<String>,
+        /// The pid the slot is bound to (default: the caller's
+        /// parent — pairing with `acquire --pid $$` in the same
+        /// shell).
+        #[arg(long)]
+        pid: Option<u32>,
+    },
+    /// Who holds and who waits: per-pool capacity, holders, and the
+    /// live queue. Your own lane's holds show their tokens; other
+    /// lanes' holds show identity only.
+    Status {
+        /// The lane to view as (default: $CADENCE_ALIAS, else $USER,
+        /// else "unknown").
+        #[arg(long)]
+        lane: Option<String>,
+        /// Emit the daemon's slot_status payload as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2088,11 +2177,21 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
         let count = states.get(state).and_then(Value::as_i64).unwrap_or(0) + 1;
         states.insert(state.to_string(), json!(count));
     }
+    // CAD-113: slot occupancy rides the footer — best-effort and
+    // time-boxed: a wedged daemon must not hang the screen.
+    let slots = client::rpc_timeout(
+        state_dir,
+        "slot_status",
+        json!({"lane": cadence_agent::slots::default_lane()}),
+        Duration::from_secs(2),
+    )
+    .ok();
     Ok(json!({
         "agents": rows,
         "footer": {
             "states": states,
             "unread_inboxes": unread_inboxes,
+            "slots": slots,
         },
         "tracker": tracker,
     }))
@@ -2202,6 +2301,30 @@ fn print_status_table(view: &Value) {
     if !unread.is_empty() {
         println!("unread: {}", unread.join(", "));
     }
+    // Slot occupancy — the one-line build-queue summary.
+    let slots = &view["footer"]["slots"];
+    if slots.is_object() {
+        let held = |pool: &str| slots["pools"][pool]["held"].as_array().map_or(0, Vec::len);
+        let cap = |pool: &str| slots["pools"][pool]["capacity"].as_u64().unwrap_or(0);
+        let waiting = slots["waiting"].as_array().map_or(0, Vec::len);
+        let longest = slots["waiting"]
+            .as_array()
+            .map(|w| {
+                w.iter()
+                    .map(|x| x["wait_secs"].as_f64().unwrap_or(0.0))
+                    .fold(0.0, f64::max)
+            })
+            .unwrap_or(0.0);
+        println!(
+            "slots: {}/{} build, {}/{} suite; waiting: {}, longest {}",
+            held("build"),
+            cap("build"),
+            held("suite"),
+            cap("suite"),
+            waiting,
+            cadence_agent::slots::fmt_wait(longest)
+        );
+    }
     if !view["tracker"].as_bool().unwrap_or(false) {
         println!("tracker: unreachable (no pm dir) — issue column empty");
     }
@@ -2230,6 +2353,190 @@ fn run_status(
             // JSON output must stay a clean stream of documents.
             print!("\x1b[2J\x1b[H");
             let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    }
+}
+
+/// Aligned rendering of `slot_status` — the TTY default.
+fn print_slot_status(s: &Value) {
+    println!("{:<6} {:<8} HOLDERS", "POOL", "HELD");
+    for pool in ["build", "suite"] {
+        let p = &s["pools"][pool];
+        let cap = p["capacity"].as_u64().unwrap_or(0);
+        let held: Vec<String> = p["held"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|h| {
+                format!(
+                    "{} {} {}",
+                    h["lane"].as_str().unwrap_or("?"),
+                    h["kind"].as_str().unwrap_or("?"),
+                    cadence_agent::slots::fmt_wait(h["age_secs"].as_f64().unwrap_or(0.0))
+                )
+            })
+            .collect();
+        println!("{pool:<6} {}/{cap:<6} {}", held.len(), held.join(", "));
+    }
+    let waiting = s["waiting"].as_array().cloned().unwrap_or_default();
+    if waiting.is_empty() {
+        println!("queue: empty");
+        return;
+    }
+    println!(
+        "{:<4} {:<14} {:<6} {:<8} FLAGS",
+        "#", "LANE", "KIND", "WAITED"
+    );
+    for (i, w) in waiting.iter().enumerate() {
+        let flags = if w["starved"].as_bool().unwrap_or(false) {
+            "starved"
+        } else if w["priority"].as_bool().unwrap_or(false) {
+            "priority"
+        } else {
+            ""
+        };
+        println!(
+            "{:<4} {:<14} {:<6} {:<8} {}",
+            i + 1,
+            w["lane"].as_str().unwrap_or("?"),
+            w["kind"].as_str().unwrap_or("?"),
+            cadence_agent::slots::fmt_wait(w["wait_secs"].as_f64().unwrap_or(0.0)),
+            flags
+        );
+    }
+}
+
+/// The shared acquire poll: `request_id` keeps a queued caller's
+/// place across polls; `--wait-secs 0` is the read-only probe so a
+/// fast-fail never leaves a waiter behind. Returns the grant payload.
+fn slot_acquire_loop(
+    state_dir: &Path,
+    kind: &str,
+    lane: &str,
+    pid: u32,
+    request_id: &str,
+    wait_secs: u64,
+) -> Result<Value> {
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
+    let probe = wait_secs == 0;
+    let mut announced = false;
+    loop {
+        let r = client::rpc(
+            state_dir,
+            "slot_acquire",
+            json!({"kind": kind, "lane": lane, "pid": pid,
+                   "request_id": request_id, "probe": probe}),
+        )?;
+        if r["granted"].as_bool().unwrap_or(false) {
+            return Ok(r);
+        }
+        let position = r["position"].as_u64().unwrap_or(0);
+        if wait_secs == 0 {
+            return Err(Error::rejected(format!(
+                "No {kind} slot free — position {position} in the queue. \
+                 `cadence build-slot status` shows holders and waiters"
+            )));
+        }
+        if !announced {
+            eprintln!("waiting for a {kind} slot (position {position})…");
+            announced = true;
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::rejected(format!(
+                "Timed out after {wait_secs}s waiting for a {kind} slot \
+                 (still position {position})"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// `cadence build-slot` — acquire polls with a stable request id so a
+/// queued caller keeps its place; the daemon mints the token, and
+/// release must name the holding (lane, pid).
+fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
+    match action {
+        BuildSlotAction::Acquire {
+            kind,
+            lane,
+            pid,
+            wait_secs,
+            json: json_out,
+        } => {
+            // Validate the kind before minting a request id.
+            let parsed = cadence_agent::slots::SlotKind::parse(kind)?;
+            let lane = lane
+                .clone()
+                .unwrap_or_else(cadence_agent::slots::default_lane);
+            let pid = *pid;
+            let request_id = Uuid::new_v4().simple().to_string();
+            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs)?;
+            if *json_out {
+                print_json(&json!({"token": r["token"],
+                    "kind": parsed.as_str(),
+                    "wait_secs": r["wait_secs"].as_f64().unwrap_or(0.0)}));
+            } else {
+                println!("{}", r["token"].as_str().unwrap_or_default());
+            }
+            Ok(0)
+        }
+        BuildSlotAction::Run {
+            kind,
+            lane,
+            wait_secs,
+            cmd,
+        } => {
+            let lane = lane
+                .clone()
+                .unwrap_or_else(cadence_agent::slots::default_lane);
+            // This process IS the holder — after exec the real
+            // command owns the pid the slot is bound to, so the hold
+            // lives exactly as long as the work and dies with it.
+            let pid = std::process::id();
+            let request_id = Uuid::new_v4().simple().to_string();
+            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs)?;
+            let token = r["token"].as_str().unwrap_or_default().to_string();
+            eprintln!(
+                "slot {token} acquired ({kind}, pid {pid}) — running {}",
+                cmd[0]
+            );
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&cmd[0])
+                .args(&cmd[1..])
+                .env("CADENCE_BUILD_SLOT_TOKEN", &token)
+                .env("CADENCE_BUILD_SLOT_PID", pid.to_string())
+                .env("CADENCE_BUILD_SLOT_LANE", &lane)
+                .exec();
+            Err(Error::internal(format!("exec {}: {err}", cmd[0])))
+        }
+        BuildSlotAction::Release { token, lane, pid } => {
+            let lane = lane
+                .clone()
+                .unwrap_or_else(cadence_agent::slots::default_lane);
+            let pid = pid.unwrap_or_else(std::os::unix::process::parent_id);
+            let r = client::rpc(
+                state_dir,
+                "slot_release",
+                json!({"token": token, "lane": lane, "pid": pid}),
+            )?;
+            println!("released {}", r["token"].as_str().unwrap_or(token));
+            Ok(0)
+        }
+        BuildSlotAction::Status {
+            lane,
+            json: json_out,
+        } => {
+            let lane = lane
+                .clone()
+                .unwrap_or_else(cadence_agent::slots::default_lane);
+            let s = client::rpc(state_dir, "slot_status", json!({"lane": lane}))?;
+            if *json_out {
+                print_json(&s);
+            } else {
+                print_slot_status(&s);
+            }
+            Ok(0)
         }
     }
 }
@@ -3768,6 +4075,7 @@ fn run() -> Result<i32> {
         Commands::Status { group, json, watch } => {
             run_status(&state_dir, group.as_deref(), json, watch)
         }
+        Commands::BuildSlot { action } => run_build_slot(&state_dir, &action),
         Commands::Review {
             pr,
             repo,
