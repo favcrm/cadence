@@ -611,6 +611,10 @@ impl TestRunSummary {
             "reason": self.reason,
         })
     }
+
+    fn executed_count(&self) -> u64 {
+        self.passed + self.failed
+    }
 }
 
 /// Parse the Jenkins XML emitted by cargo-nextest's configured JUnit
@@ -704,6 +708,8 @@ fn parse_junit(text: &str) -> TestRunSummary {
     }
     failed_tests.sort();
     failed_tests.dedup();
+    let reason =
+        (passed + failed == 0).then(|| "JUnit report contained no executed testcases".to_string());
     TestRunSummary {
         valid: true,
         test_count: tests.len() as u64,
@@ -712,7 +718,7 @@ fn parse_junit(text: &str) -> TestRunSummary {
         skipped,
         tests,
         failed_tests,
-        reason: None,
+        reason,
     }
 }
 
@@ -733,6 +739,7 @@ fn next_xml_tag(text: &str, from: usize) -> Option<(usize, &str)> {
 
 fn xml_tag_name(tag: &str) -> &str {
     tag.trim_start_matches('/')
+        .trim_end_matches('/')
         .split_whitespace()
         .next()
         .unwrap_or("")
@@ -862,7 +869,7 @@ fn run_step_with_result(
     };
     let result = result_path.map(parse_junit_file);
     if let Some(summary) = &result {
-        if !summary.valid && outcome == "ok" {
+        if (!summary.valid || summary.executed_count() == 0) && outcome == "ok" {
             outcome = "fail";
             tail = summary
                 .reason
@@ -1222,7 +1229,11 @@ fn structured_failed_tests(step: &Step) -> Vec<String> {
 fn classify_isolated(step: &Step) -> &'static str {
     match step.outcome {
         "ok" => match &step.result {
-            Some(result) if !result.valid || result.test_count == 0 => "unknown",
+            Some(result)
+                if !result.valid || result.test_count == 0 || result.executed_count() == 0 =>
+            {
+                "unknown"
+            }
             Some(result) if result.failed > 0 => "fail",
             Some(_) => "pass",
             None => match test_totals(&step.output) {
@@ -1231,11 +1242,9 @@ fn classify_isolated(step: &Step) -> &'static str {
             },
         },
         "fail" => {
-            if step
-                .result
-                .as_ref()
-                .is_some_and(|result| !result.valid || result.test_count == 0)
-            {
+            if step.result.as_ref().is_some_and(|result| {
+                !result.valid || result.test_count == 0 || result.executed_count() == 0
+            }) {
                 "unknown"
             } else {
                 "fail"
@@ -2702,6 +2711,47 @@ gate_secs = 42
         let malformed = parse_junit("<testsuites><testsuite><testcase name=\"x\">");
         assert!(!malformed.valid);
         assert!(malformed.reason.unwrap().contains("closing all tags"));
+    }
+
+    #[test]
+    fn junit_ignored_only_is_unknown_not_failure() {
+        let ignored = parse_junit(
+            r#"<testsuites tests="1" skipped="1" failures="0">
+  <testsuite name="ignored" tests="1" skipped="1" failures="0">
+    <testcase name="ignored_case"><skipped/></testcase>
+  </testsuite>
+</testsuites>"#,
+        );
+        assert!(ignored.valid);
+        assert_eq!(ignored.test_count, 1);
+        assert_eq!(ignored.executed_count(), 0);
+        assert_eq!(
+            ignored.reason.as_deref(),
+            Some("JUnit report contained no executed testcases")
+        );
+
+        let step = |outcome: &'static str, result: TestRunSummary| Step {
+            name: "ignored_case".into(),
+            cmd: "scripts/cadence-nextest --test integration -- ignored_case --exact".into(),
+            duration_ms: 0,
+            outcome,
+            exit: Some(4),
+            tail: Vec::new(),
+            output: String::new(),
+            result: Some(result),
+        };
+        assert_eq!(classify_isolated(&step("fail", ignored.clone())), "unknown");
+        assert_eq!(classify_isolated(&step("ok", ignored)), "unknown");
+
+        let executed = parse_junit(
+            r#"<testsuites tests="1" skipped="0" failures="0">
+  <testsuite name="executed" tests="1" skipped="0" failures="0">
+    <testcase name="executed_case"/>
+  </testsuite>
+</testsuites>"#,
+        );
+        assert_eq!(executed.executed_count(), 1);
+        assert_eq!(classify_isolated(&step("ok", executed)), "pass");
     }
 
     #[test]
