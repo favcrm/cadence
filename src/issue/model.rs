@@ -70,6 +70,12 @@ pub struct Front {
     /// Free-form slicing labels — stored sorted and de-duplicated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Intake kind for `cadence report` issues
+    /// (`question|feedback|idea|bug`) — its own field, not a positional
+    /// tag, so an extra tag can never mislabel it. Absent on ordinary
+    /// issues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -93,6 +99,7 @@ impl Front {
             owner: None,
             component: None,
             tags: vec![],
+            kind: None,
             parent: None,
             blocked_by: vec![],
             relates: vec![],
@@ -191,6 +198,13 @@ pub fn valid_tag(tag: &str) -> bool {
         && tag
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// System vocabulary exempt from a project's declared `tags:`
+/// allowlist — `cadence report`'s `intake` + kind tags file into any
+/// project without seeding its vocabulary first.
+pub fn system_tag(tag: &str) -> bool {
+    matches!(tag, "intake" | "question" | "feedback" | "idea" | "bug")
 }
 
 /// The stored shape of a tag list: every tag well-formed, sorted,
