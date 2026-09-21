@@ -69,7 +69,10 @@ cadence doctor --host         # host watchdog: disk free, provider WALs, pipe
                               #  Committed_AS vs CommitLimit with overcommit
                               #  mode — strict-mode overshoot fails; heuristic
                               #  overshoot is informational), a process-group
-                              #  census (counts, RSS, oldest idle),
+                              #  census (counts, RSS, oldest idle), an
+                              #  owned-session-tree census (per-tree PSS+swap,
+                              #  owner, reclaim confidence — warns only when
+                              #  the session-registry store is unreadable),
                               #  orphaned processes, leaked temp dirs,
                               #  stale worktrees (shared cargo cache counted
                               #  once) — read-only, exit 0/1/2
