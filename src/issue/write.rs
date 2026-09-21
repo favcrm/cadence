@@ -191,10 +191,13 @@ fn check_component(project: &project::Project, component: &str) -> Result<()> {
 
 /// The same rule for tags: well-formed, sorted, de-duplicated, capped —
 /// and, when the project declares a `tags:` list, drawn from it.
-fn check_tags(project: &project::Project, tags: &[String]) -> Result<Vec<String>> {
+pub(crate) fn check_tags(project: &project::Project, tags: &[String]) -> Result<Vec<String>> {
     let tags = model::normalize_tags(tags)?;
     if !project.tags.is_empty() {
-        if let Some(unknown) = tags.iter().find(|t| !project.tags.contains(t)) {
+        if let Some(unknown) = tags
+            .iter()
+            .find(|t| !project.tags.contains(t) && !model::system_tag(t))
+        {
             return Err(Error::rejected(format!(
                 "Unknown tag '{unknown}' — {} declares: {}",
                 project.key,
@@ -301,7 +304,7 @@ pub fn project_add(
 }
 
 /// Allocate the next id under the write lock: `<PREFIX>-<max+1>`.
-fn next_id(dir: &Path, prefix: &str) -> Result<u64> {
+pub(crate) fn next_id(dir: &Path, prefix: &str) -> Result<u64> {
     let mut max = 0u64;
     for entry in std::fs::read_dir(dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -394,7 +397,7 @@ pub fn new_issue(
 
 /// Reject shapes lint would flag, at write time: self-links, missing
 /// targets, parent cycles and depth > 2, blocked_by cycles.
-fn check_structure(issues: &[board::Issue], id: &str) -> Result<()> {
+pub(crate) fn check_structure(issues: &[board::Issue], id: &str) -> Result<()> {
     let by_id: HashMap<&str, &board::Issue> =
         issues.iter().map(|i| (i.front.id.as_str(), i)).collect();
     let this = by_id
