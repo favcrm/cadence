@@ -17,8 +17,13 @@ of the following on a temporary state directory and after a board reload:
   heartbeat and next scheduled check;
 - an overdue active monitor marked `stale`, so a stopped coordinator cannot
   look healthy forever from its last heartbeat;
+- mixed monitor health keeps the aggregate `stale`/`degraded` result
+  regardless of row order, and malformed monitor RPC rows fail closed as
+  `unavailable` rather than being skipped;
 - a concrete alert with project, task, event sequence, fingerprint, age,
   evidence, next action, next owner, and authority;
+- the rendered monitor row shows heartbeat, last check, completed scan, and
+  explicit task coverage, while the alert shows its project;
 - receipt-only events remaining absent from the alert inbox (the existing
   monitor store tests cover this contract);
 - one alert remaining one alert across repeated reads and acknowledgement

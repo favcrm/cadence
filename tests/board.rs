@@ -2184,7 +2184,16 @@ fn ui_overview_surfaces_durable_monitor_alert_and_acknowledges_it() {
         overview["monitoring"]["last_success_at"].is_number(),
         "{overview}"
     );
+    let monitor = &overview["monitoring"]["monitors"][0];
+    assert!(monitor["heartbeat_at"].is_number(), "{overview}");
+    assert!(monitor["last_check_at"].is_number(), "{overview}");
+    assert_eq!(
+        monitor["coverage"],
+        json!(["ui-monitor-task"]),
+        "{overview}"
+    );
     assert_eq!(overview["monitoring"]["open_alerts"], 1, "{overview}");
+    assert_eq!(overview["monitoring"]["alerts"][0]["project"], "cadence");
     assert_eq!(
         overview["monitoring"]["alerts"][0]["next_owner"],
         "watchdog"

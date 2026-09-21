@@ -108,7 +108,10 @@ function MonitoringView({
                 <span className="num text-ink-300">{monitor.id}</span>
                 <span className="text-ink-500">owner {monitor.owner}</span>
                 <span className="text-ink-500">
-                  scan {when(monitor.last_success_at)}
+                  scan {when(monitor.last_success_at)} · last check {when(monitor.last_check_at)}
+                </span>
+                <span className="text-ink-600">
+                  heartbeat {when(monitor.heartbeat_at)} · coverage {monitor.coverage.join(", ") || "none"}
                 </span>
                 {monitor.error && <span className="text-fail">{monitor.error}</span>}
               </div>
@@ -163,7 +166,9 @@ function MonitorAlertView({
         </span>
         <span className="chip !py-[.15rem] bg-ink-800 text-ink-300">{alert.kind}</span>
         <span className="num text-micro text-ink-500">{age(alert.age_secs)}</span>
-        <span className="num text-micro text-ink-500">{alert.monitor} · {alert.task ?? "task unknown"}</span>
+        <span className="num text-micro text-ink-500">
+          {alert.project} · {alert.monitor} · {alert.task ?? "task unknown"}
+        </span>
         {open && (
           <button
             className="chip ml-auto bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50"

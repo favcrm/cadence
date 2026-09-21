@@ -200,12 +200,13 @@ export interface MonitorRow {
   project: string;
   owner: string;
   interval_secs: number;
-  monitoring: "active" | "degraded" | "off" | string;
+  monitoring: "active" | "degraded" | "stale" | "off" | string;
   heartbeat_at?: number | null;
   last_check_at?: number | null;
   last_success_at?: number | null;
   next_check_at?: number | null;
   event_cursor: number;
+  coverage: string[];
   delivery: { configured: boolean; state: string; push?: boolean; detail?: string };
   dispatch_enabled: boolean;
   open_alerts: number;
@@ -217,7 +218,7 @@ export interface MonitorRow {
 
 export interface Monitoring {
   available: boolean;
-  state: "active" | "degraded" | "stopped" | "unavailable" | string;
+  state: "active" | "degraded" | "stale" | "stopped" | "unavailable" | string;
   last_success_at?: number | null;
   last_check_at?: number | null;
   next_check_at?: number | null;

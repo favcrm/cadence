@@ -229,7 +229,9 @@ fn monitoring_view(
     alert_errors: HashMap<String, String>,
     now: i64,
 ) -> Value {
-    let mut state = "stopped";
+    let mut has_degraded = false;
+    let mut has_stale = false;
+    let mut has_active = false;
     let mut last_success_at: Option<f64> = None;
     let mut last_check_at: Option<f64> = None;
     let mut next_check_at: Option<f64> = None;
@@ -242,8 +244,9 @@ fn monitoring_view(
         let id = monitor["id"].as_str().unwrap_or_default().to_string();
         let raw_state = monitor["monitoring"].as_str().unwrap_or("off");
         match raw_state {
-            "degraded" => state = "degraded",
-            "active" if state != "degraded" => state = "active",
+            "degraded" => has_degraded = true,
+            "stale" => has_stale = true,
+            "active" => has_active = true,
             _ => {}
         }
         for (field, target) in [
@@ -273,9 +276,7 @@ fn monitoring_view(
         if overdue {
             monitor["stale"] = json!(true);
             monitor["monitoring"] = json!("stale");
-            if state != "degraded" {
-                state = "stale";
-            }
+            has_stale = true;
             let stale_error = if monitor["last_success_at"].is_null() {
                 "active monitor has no successful scan evidence"
             } else {
@@ -339,9 +340,17 @@ fn monitoring_view(
         monitor_rows.push(monitor);
     }
 
-    if monitor_rows.is_empty() {
-        state = "stopped";
-    }
+    let state = if monitor_rows.is_empty() {
+        "stopped"
+    } else if has_degraded {
+        "degraded"
+    } else if has_stale {
+        "stale"
+    } else if has_active {
+        "active"
+    } else {
+        "stopped"
+    };
     all_alerts.sort_by_key(|a| a["seq"].as_i64().unwrap_or(0));
     let latest = |value: Option<f64>| value.map(|v| v as i64);
     json!({
@@ -358,6 +367,70 @@ fn monitoring_view(
     })
 }
 
+/// Validate the stable fields emitted by `monitor_list` before projecting any
+/// rows. A partially readable response is not a valid empty registration:
+/// failing closed keeps the Overview from claiming a healthy subset.
+fn validate_monitor_rows(rows: &[Value]) -> Result<(), String> {
+    for (index, row) in rows.iter().enumerate() {
+        let object = row
+            .as_object()
+            .ok_or_else(|| format!("monitor_list row {index} is not an object"))?;
+        let string_field = |field: &str| {
+            object
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("monitor_list row {index} missing {field}"))
+        };
+        string_field("id")?;
+        string_field("project")?;
+        string_field("owner")?;
+        string_field("monitoring")?;
+        if object
+            .get("interval_secs")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value < 1)
+        {
+            return Err(format!("monitor_list row {index} missing interval_secs"));
+        }
+        if object.get("coverage").and_then(Value::as_array).is_none() {
+            return Err(format!("monitor_list row {index} missing coverage"));
+        }
+        let Some(delivery) = object.get("delivery").and_then(Value::as_object) else {
+            return Err(format!("monitor_list row {index} missing delivery"));
+        };
+        if delivery
+            .get("configured")
+            .and_then(Value::as_bool)
+            .is_none()
+            || delivery.get("state").and_then(Value::as_str).is_none()
+        {
+            return Err(format!("monitor_list row {index} has malformed delivery"));
+        }
+        for field in ["open_alerts", "total_alerts"] {
+            if object.get(field).and_then(Value::as_i64).is_none() {
+                return Err(format!("monitor_list row {index} missing {field}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn monitoring_unavailable(error: impl Into<String>) -> Value {
+    json!({
+        "available": false,
+        "state": "unavailable",
+        "last_success_at": Value::Null,
+        "last_check_at": Value::Null,
+        "next_check_at": Value::Null,
+        "open_alerts": 0,
+        "errors": [{"error": error.into()}],
+        "delivery": local_monitor_delivery(),
+        "monitors": [],
+        "alerts": [],
+    })
+}
+
 /// Read monitor health and durable alerts through the daemon socket.  The
 /// board is allowed to show an explicit unavailable state when the daemon is
 /// older than the monitor RPC; it must not open the live SQLite store itself.
@@ -366,41 +439,20 @@ pub fn monitoring(state_dir: &Path) -> Value {
     let list = match client::rpc(state_dir, "monitor_list", json!({})) {
         Ok(value) => value,
         Err(error) => {
-            return json!({
-                "available": false,
-                "state": "unavailable",
-                "last_success_at": Value::Null,
-                "last_check_at": Value::Null,
-                "next_check_at": Value::Null,
-                "open_alerts": 0,
-                "errors": [{"error": error.to_string()}],
-                "delivery": local_monitor_delivery(),
-                "monitors": [],
-                "alerts": [],
-            });
+            return monitoring_unavailable(error.to_string());
         }
     };
     let Some(rows) = list["monitors"].as_array() else {
-        return json!({
-            "available": false,
-            "state": "unavailable",
-            "last_success_at": Value::Null,
-            "last_check_at": Value::Null,
-            "next_check_at": Value::Null,
-            "open_alerts": 0,
-            "errors": [{"error": "monitor_list response missing monitors"}],
-            "delivery": local_monitor_delivery(),
-            "monitors": [],
-            "alerts": [],
-        });
+        return monitoring_unavailable("monitor_list response missing monitors");
     };
+    if let Err(error) = validate_monitor_rows(rows) {
+        return monitoring_unavailable(error);
+    }
     let monitors = rows.to_vec();
     let mut alerts_by_monitor = HashMap::new();
     let mut alert_errors = HashMap::new();
     for monitor in &monitors {
-        let Some(id) = monitor["id"].as_str() else {
-            continue;
-        };
+        let id = monitor["id"].as_str().unwrap_or_default();
         match client::rpc(
             state_dir,
             "monitor_alerts",
@@ -1315,6 +1367,57 @@ mod tests {
         assert_eq!(
             view["errors"][0]["error"],
             "scheduled monitor reconciliation is overdue"
+        );
+    }
+
+    #[test]
+    fn monitoring_projection_keeps_stale_aggregate_when_active_row_follows() {
+        let overdue = json!({
+            "id": "overdue",
+            "project": "cadence",
+            "owner": "watchdog",
+            "monitoring": "active",
+            "last_success_at": 90.0,
+            "last_check_at": 90.0,
+            "next_check_at": 100.0,
+            "error": Value::Null,
+        });
+        let current = json!({
+            "id": "current",
+            "project": "cadence",
+            "owner": "watchdog",
+            "monitoring": "active",
+            "last_success_at": 110.0,
+            "last_check_at": 110.0,
+            "next_check_at": 200.0,
+            "error": Value::Null,
+        });
+        let forward = monitoring_view(
+            vec![overdue.clone(), current.clone()],
+            HashMap::new(),
+            HashMap::new(),
+            101,
+        );
+        let reverse = monitoring_view(vec![current, overdue], HashMap::new(), HashMap::new(), 101);
+        assert_eq!(forward["state"], "stale", "{forward}");
+        assert_eq!(reverse["state"], "stale", "{reverse}");
+    }
+
+    #[test]
+    fn malformed_monitor_rows_fail_closed_before_projection() {
+        let error = validate_monitor_rows(&[json!({"project": "cadence"})]).unwrap_err();
+        assert!(error.contains("row 0") && error.contains("id"), "{error}");
+        let unavailable = monitoring_unavailable(error);
+        assert_eq!(unavailable["available"], false);
+        assert_eq!(unavailable["state"], "unavailable");
+        assert!(unavailable["errors"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("row 0"));
+        let error = validate_monitor_rows(&[json!({"id": "watch"})]).unwrap_err();
+        assert!(
+            error.contains("row 0") && error.contains("project"),
+            "{error}"
         );
     }
 
