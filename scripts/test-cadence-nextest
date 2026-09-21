@@ -125,4 +125,48 @@ attempts=$(wc -l <"$TMP/retry.count" | tr -d ' ')
     die "NEXTEST_RETRIES override was not neutralized (attempts=$attempts)"
 }
 
+# The outer flock must be held before the nextest child starts. A temporary
+# two-second test gives a separate non-blocking probe time to observe that
+# startup ownership, without touching the repository suite lock.
+mkdir -p "$TMP/startup-workspace/src"
+cat >"$TMP/startup-workspace/Cargo.toml" <<'EOF'
+[package]
+name = "cadence-nextest-startup-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+cat >"$TMP/startup-workspace/src/lib.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn holds_startup_probe_window() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+EOF
+startup_lock="$TMP/startup.lock"
+CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$startup_lock" \
+    CARGO_BUILD_JOBS=4 "$RUNNER" \
+    --manifest-path "$TMP/startup-workspace/Cargo.toml" \
+    >"$TMP/startup.out" 2>"$TMP/startup.err" &
+runner_pid=$!
+observed=0
+attempt=0
+while [ "$attempt" -lt 8 ]; do
+    if [ -e "$startup_lock" ] && ! flock -n "$startup_lock" -c true; then
+        observed=1
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+if ! wait "$runner_pid"; then
+    cat "$TMP/startup.out" "$TMP/startup.err" >&2
+    die "startup lock fixture failed"
+fi
+[ "$observed" = 1 ] || die "outer flock was not held during child startup"
+
 printf '%s\n' 'nextest contract checks passed'

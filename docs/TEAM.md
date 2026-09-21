@@ -90,8 +90,8 @@ message of their turn; pty developers report with `cadence message result`.
 6. A failing test is rerun isolated on the PR tree and on main before anyone blames the PR.
 7. One full integration suite per host, under `CADENCE_SUITE_LOCK`. The
    optional CAD-173 nextest wrapper verifies the reviewed executable
-   digest, takes this lock outside the process-per-test harness, and
-   forces zero retries. A review child receives an explicit outer-held
+   digest, takes this lock before launching the process-per-test harness,
+   and forces zero retries. A review child receives an explicit outer-held
    marker and never nests `flock`. The checked-in review gate remains
    cargo until human approval records the pinned runner and its
    structured-result/activation changes.

@@ -272,7 +272,8 @@ gate. `scripts/cadence-nextest` verifies the pinned `cargo-nextest
 0.9.145` binary against `.config/cargo-nextest.sha256`, clears the
 `NEXTEST_RETRIES`/`NEXTEST_PROFILE` environment overrides, passes CLI
 `--retries 0`, uses `.config/nextest.toml` with `retries = 0`, and takes
-the same `CADENCE_SUITE_LOCK` in an outer `flock` for direct runs.
+the same `CADENCE_SUITE_LOCK` in an outer `flock` before launching direct
+runs.
 When `cadence review` owns the slot, `src/review.rs` clears the child's
 lock path and sets an explicit held marker; the wrapper then runs without
 a nested flock. `scripts/nextest-inventory` compares non-empty cargo and

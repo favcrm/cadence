@@ -19,7 +19,7 @@ This plan adds a reviewable, opt-in nextest runner for cadence's integration sui
 - **REQ-001**: Provide one checked-in runner that verifies `cargo-nextest` is exactly version `0.9.145` and matches the checked-in trusted executable SHA-256 before executing a test command.
 - **REQ-002**: Force the nextest profile to `retries = 0` and reject caller arguments that attempt to raise or replace retries.
 - **REQ-007**: Clear `NEXTEST_RETRIES`/`NEXTEST_PROFILE` and pass CLI `--retries 0` on every run path so a caller environment cannot override the reviewed profile.
-- **REQ-003**: Hold `CADENCE_SUITE_LOCK` with an outer `flock` for direct nextest invocation; when `cadence review` already holds that lock, run the child without nested flock and with an explicit held marker.
+- **REQ-003**: Acquire `CADENCE_SUITE_LOCK` with an outer `flock` before launching direct nextest; when `cadence review` already holds that lock, run the child without nested flock and with an explicit held marker.
 - **REQ-004**: Make the integration harness refuse direct nextest execution when the outer lock contract is absent, while preserving ordinary cargo filtered tests and the review child's explicit empty-path contract.
 - **REQ-005**: Provide a non-empty, deterministic inventory check proving cargo and nextest expose the same complete integration test set; preserve unit, binary, board, and integration coverage in the review gates.
 - **REQ-006**: Record cold versus warm runner timings as evidence when the operator/Ops lane is admitted; historical CAD-173 measurements must remain labelled historical rather than current proof.
@@ -66,7 +66,7 @@ This plan adds a reviewable, opt-in nextest runner for cadence's integration sui
 ## Acceptance
 
 - **AC-001**: A direct runner call executes only when the installed executable matches the checked-in SHA-256 and reports `cargo-nextest 0.9.145`, the checked-in cadence profile is selected, caller retry/profile/config overrides are rejected, and `NEXTEST_RETRIES` cannot raise retries above zero.
-- **AC-002**: A direct runner owns `CADENCE_SUITE_LOCK` in one outer `flock`; a review-owned child runs with an empty child path and explicit held marker, while `--no-suite-lock` does not emit that marker and cannot activate an unowned nextest suite.
+- **AC-002**: A direct runner owns `CADENCE_SUITE_LOCK` in one outer `flock` before child startup; a review-owned child runs with an empty child path and explicit held marker, while `--no-suite-lock` does not emit that marker and cannot activate an unowned nextest suite.
 - **AC-003**: The integration harness rejects nextest without the external lock contract, retains ordinary cargo filtered behavior, and the inventory command reports success only when both non-empty manifests are exactly equal.
 - **AC-004**: The current review gate remains cargo-configured, no nextest binary is installed, no production or CI gate is activated, and all timing claims identify whether they are historical, fixture, or Ops-admitted current-head evidence.
 - **AC-005**: Focused syntax, wrapper-contract, formatting, and Rust guard checks pass on the exact branch head; any unavailable pinned binary or host suite slot is reported as a dependency rather than inferred healthy.
@@ -95,13 +95,14 @@ This plan adds a reviewable, opt-in nextest runner for cadence's integration sui
 - **FILE-005**: `src/review.rs` — review-owned lock marker and report evidence.
 - **FILE-006**: `docs/SESSION.md` and `docs/TEAM.md` — activation boundary and timing protocol.
 - **FILE-007**: `design-plans/feature-pinned-nextest-runner-1.md` — executable plan and acceptance mapping.
-- **FILE-008**: `scripts/test-cadence-nextest` — local fake-runner contract and inventory fixtures.
+- **FILE-008**: `scripts/test-cadence-nextest` — trusted-runner lock, retry, checksum, and temporary-workspace fixtures.
 
 ## 6. Testing
 
 - **TEST-001**: `scripts/test-cadence-nextest` plus shell syntax checks prove the checked-in executable digest is required; a missing, wrong, or version-only binary refuses.
 - **TEST-002**: The same local fixture proves retries cannot be supplied by caller, `NEXTEST_RETRIES` is neutralized with CLI `--retries 0`, and direct invocation requires `CADENCE_SUITE_LOCK`.
 - **TEST-003**: The same local fixture proves `CADENCE_REVIEW_SUITE_LOCK_HELD=1` with an empty child lock path runs without a second flock.
+- **TEST-008**: The same local fixture runs a temporary two-second test and observes a non-blocking probe denied by the outer lock while the child is starting/running.
 - **TEST-004**: Focused Rust test proves nextest detection rejects filtered execution without the review-held marker and ordinary cargo filtering remains allowed.
 - **TEST-005**: Inventory command proves both manifests are non-empty and equal before reporting success; missing nextest reports an honest dependency failure.
 - **TEST-006**: Current-head `cargo test --test integration -- --list`, `cargo test --lib --bins --test board --no-run`, and equivalent inventory/build checks preserve unit/bin/board/integration coverage without a full-suite run in this lane.
