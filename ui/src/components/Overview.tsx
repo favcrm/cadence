@@ -161,11 +161,12 @@ function MonitorAlertView({
   onAck: (monitor: string, seq: number) => void;
 }) {
   const open = alert.state === "open";
+  const stateLabel = alert.state === "resolved" ? "resolved" : open ? "open" : "acknowledged";
   return (
     <div className="rounded border border-ink-700/70 bg-ink-875 px-3 py-2.5 space-y-1.5">
       <div className="flex flex-wrap items-center gap-2">
         <span className={`chip !py-[.15rem] ${open ? "bg-warn/10 text-warn" : "bg-ink-800 text-ink-500"}`}>
-          {open ? "open" : "acknowledged"}
+          {stateLabel}
         </span>
         <span className="chip !py-[.15rem] bg-ink-800 text-ink-300">{alert.kind}</span>
         <span className="num text-micro text-ink-500">{age(alert.age_secs)}</span>

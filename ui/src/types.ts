@@ -177,7 +177,7 @@ export interface MonitorAlert {
   fingerprint: string;
   kind: string;
   payload: unknown;
-  state: "open" | "acknowledged" | string;
+  state: "open" | "acknowledged" | "resolved" | string;
   attempts: number;
   last_error?: string | null;
   created: number;
@@ -209,6 +209,7 @@ export interface MonitorRow {
   coverage: string[];
   delivery: { configured: boolean; state: string; push?: boolean; detail?: string };
   dispatch_enabled: boolean;
+  auto_dispatch_enabled: boolean;
   open_alerts: number;
   total_alerts: number;
   error?: string | null;
