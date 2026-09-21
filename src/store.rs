@@ -5776,7 +5776,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 9);
+            assert_eq!(v, 10);
         }
         // Half-applied: v4 objects present but version rolled back —
         // reopening must converge, not fail on duplicates.
@@ -5811,7 +5811,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 9);
+            assert_eq!(v, 10);
         }
     }
 
