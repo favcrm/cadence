@@ -3922,7 +3922,7 @@ fn check_task_targets(scan: &Scan) -> Check {
     let name = "task-targets";
     let t = &scan.thresholds;
     let threshold = json!(format!(
-        "warn: ≥{} pressure dirs, ≥{}, a truncated scan, or any active/locked/unknown row — inventory only, never a deletion list",
+        "warn: ≥{} pressure dirs, ≥{}, a truncated or incomplete temp/tracker/proc scan, or any active/locked/unknown row — inventory only, never a deletion list",
         t.temp_warn_count,
         human(t.temp_warn_bytes)
     ));
@@ -4002,7 +4002,11 @@ fn check_task_targets(scan: &Scan) -> Check {
     let mut pressure_count = 0_u64;
     let mut pressure_bytes = 0_u64;
     let record_gap = !matches!(record_search, "complete" | "no-tracker");
-    let mut attention = temp_scan != "complete" || scan_truncated || record_gap;
+    // An unknown proc/tracker/temp scan must not leave the check `ok`.
+    // `run` takes the worst level and `exit_code` treats `ok` as a
+    // healthy host.
+    let proc_gap = proc_scan != "complete";
+    let mut attention = temp_scan != "complete" || scan_truncated || record_gap || proc_gap;
     for (cand, hit) in selected.iter().zip(hits.iter()) {
         let path = &cand.path;
         let issues = recorded.get(path).cloned().unwrap_or_default();
@@ -4100,13 +4104,12 @@ fn check_task_targets(scan: &Scan) -> Check {
         };
 
         let observed = !hit.pids.is_empty();
-        // A partial `/proc` read means some pids could not be
-        // classified. Hits we did see stay observed. A row with no
-        // hit is `none-observed`, not proof it is idle — `proc_scan`
-        // on the check says whether that negative was complete.
+        // Hits we did see stay observed. A row with no hit is
+        // `none-observed` only when the proc scan finished. Partial,
+        // truncated, and unreadable scans are unknown negatives.
         let cwd_exe = if observed {
             "observed"
-        } else if proc_scan == "unreadable" || proc_scan == "truncated" {
+        } else if proc_scan != "complete" {
             "unreadable"
         } else {
             "none-observed"
@@ -6599,7 +6602,7 @@ mod tests {
             176,
             Some(&live.join("debug")),
             None,
-            Some("cargo test --token sk-TESTTOKEN"),
+            Some("cargo test --lib host_inventory_marker"),
             30,
             &[],
         );
@@ -6651,7 +6654,9 @@ mod tests {
             .iter()
             .any(|p| p.as_u64() == Some(176)));
         let blob = serde_json::to_string(&c.to_json()).unwrap();
-        assert!(!blob.contains("sk-TESTTOKEN"), "{blob}");
+        // The synthetic cmdline is a neutral marker. This inventory
+        // must not echo process arguments.
+        assert!(!blob.contains("host_inventory_marker"), "{blob}");
         assert!(!blob.contains("rm -rf"), "{blob}");
         assert!(c.detail.contains("not proof"));
     }
@@ -6846,13 +6851,35 @@ mod tests {
         let c = check_task_targets(&scan);
         assert_eq!(c.value["proc_scan"], "partial");
         let row = task_row(&c.value, "cad421-proc-target");
-        assert_eq!(row["cwd_exe"], "none-observed");
-        assert_eq!(row["activity"], "unproven");
+        assert_eq!(row["cwd_exe"], "unreadable");
+        assert_eq!(row["activity"], "unknown");
+        assert_eq!(row["exclude"], "unknown");
         assert_eq!(row["safe_to_delete"], false);
         assert_eq!(row["reclaim_candidate"], false);
         assert_eq!(row["action"], "none");
+        assert_eq!(c.level, Level::Warn);
         assert!(c.detail.contains("not proof"), "{}", c.detail);
         assert!(c.detail.contains("partial"), "{}", c.detail);
+        let body = c.to_json();
+        assert_eq!(body["level"], "warn");
+        assert_eq!(exit_code(&json!({"level": body["level"]})), 1);
+    }
+
+    #[test]
+    fn task_targets_unreadable_proc_with_no_rows_is_not_a_healthy_gate() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let _restore = deny_directory(&scan.proc_root);
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["proc_scan"], "unreadable");
+        assert_eq!(c.value["count"], 0);
+        assert_eq!(c.value["safe_to_delete"], false);
+        assert_eq!(c.level, Level::Warn);
+        assert_ne!(c.detail, "none");
+        assert!(c.detail.contains("unreadable"), "{}", c.detail);
+        let body = c.to_json();
+        assert_eq!(exit_code(&json!({"level": body["level"]})), 1);
+        assert!(c.remedy.is_empty());
     }
 
     #[test]
