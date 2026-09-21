@@ -1963,14 +1963,16 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
     // Before/after table: state then, state now, and for pty agents
     // whether the pane pid survived and whether an in-flight turn was
     // re-adopted (`kept`) or fenced (`fenced`) by the hot restart. A
-    // changed pane pid, a fenced turn, or an agent that came back in
-    // `attention` makes the command exit non-zero.
+    // changed pane pid, a fenced turn, a new attention state, or an
+    // unsettled previously live agent makes the command exit non-zero.
+    // Existing fences stay visible without being blamed on this restart.
     let before_by_alias: std::collections::HashMap<&str, &Value> = before
         .iter()
         .filter_map(|a| a["alias"].as_str().map(|al| (al, a)))
         .collect();
     let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
     let mut bad = false;
+    let mut existing_fences = Vec::new();
     for a in &after {
         let alias = a["alias"].as_str().unwrap_or_default().to_string();
         let b = before_by_alias.get(alias.as_str());
@@ -2032,6 +2034,13 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
             }
         }
         if after_state == "attention" {
+            if before_state == "attention" {
+                existing_fences.push(alias.clone());
+            } else {
+                bad = true;
+            }
+        }
+        if live_before.contains(&alias) && matches!(after_state.as_str(), "starting" | "offline") {
             bad = true;
         }
         rows.push((alias, before_state, after_state, pane, turn));
@@ -2052,11 +2061,15 @@ fn daemon_restart(state_dir: &Path, when_idle: bool, timeout: u64, ui: bool) -> 
             w = w
         );
     }
+    if !existing_fences.is_empty() {
+        existing_fences.sort();
+        println!("Existing fences retained: {}", existing_fences.join(", "));
+    }
     if bad {
         Err(Error::rejected(
             "restart completed but not cleanly — see the table above \
-             (pane pid changed, a turn was fenced, or the agent came \
-             back fenced)",
+             (pane pid changed, a turn was fenced, an agent became \
+             fenced, or a previously live agent did not settle)",
         ))
     } else {
         Ok(0)
