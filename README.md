@@ -37,7 +37,10 @@ cadence devin -r cookie-cesium  # resume an existing Devin session, like `devin 
 cadence codex                   # Codex managed-ws endpoint, then `codex resume --remote`
                                 # (--detach opts out; non-TTY or inside tmux prints
                                 #  the attach command instead of exec'ing it;
-                                #  --worktree <name> isolates it like join's)
+                                #  --worktree <name> isolates it like join's;
+                                #  --model <id> --effort <level> persist and
+                                #  are validated against Codex model/list on
+                                #  every fresh launch/resume)
 cadence claude                  # headless managed Claude (stream-json) — each
                                 #  message is one turn; the result IS the report
                                 #  (--model/--effort/--permission-mode/--allow/

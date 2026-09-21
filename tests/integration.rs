@@ -874,6 +874,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
                     thread_id: "th-mismatch".into(),
                     session_id: "s-mismatch".into(),
                     model: None,
+                    effort: None,
                     pid: 1,
                     endpoint: None,
                     generation: None,
@@ -2232,6 +2233,25 @@ for line in sys.stdin:
     if method == "initialize":
         if mode == "slow-init": time.sleep(30)
         emit({"id": mid, "result": {"serverInfo": {"name": "mock", "version": "0"}}})
+    elif method == "model/list":
+        # Metadata-only response: configured Codex tests can exercise the
+        # pair validator without making a paid model turn.
+        if mode == "bad-model-list":
+            emit({"id": mid, "result": {}})
+        else:
+            emit({"id": mid, "result": {"data": [
+                {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna",
+                 "isDefault": False,
+                 "supportedReasoningEfforts": [
+                     {"reasoningEffort": "low"},
+                     {"reasoningEffort": "medium"},
+                     {"reasoningEffort": "high"},
+                     {"reasoningEffort": "xhigh"},
+                     {"reasoningEffort": "max"}]},
+                {"id": "mock-model", "model": "mock-model",
+                 "isDefault": True,
+                 "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]}
+            ], "nextCursor": None}})
     elif method in ("thread/start", "thread/resume"):
         # Record the launch payload before answering so tests can read
         # exactly what reached the wire (<pidfile>.requests).
@@ -2241,7 +2261,13 @@ for line in sys.stdin:
         if mode == "bad-thread":
             emit({"id": mid, "result": {"thread": {}}})
         else:
-            emit({"id": mid, "result": {"thread": {"id": "th-1", "sessionId": "s-1"}}})
+            launch = msg.get("params", {})
+            effort = launch.get("config", {}).get("model_reasoning_effort", "medium")
+            model = launch.get("model", "mock-model")
+            emit({"id": mid, "result": {"thread": {
+                "id": "th-1", "sessionId": "s-1", "model": model,
+                "reasoningEffort": effort},
+                "model": model, "reasoningEffort": effort}})
     elif method == "turn/start":
         if mode == "bad-turn":
             emit({"id": mid, "result": {"turn": {}}})
@@ -2488,13 +2514,32 @@ def handle(conn):
                 time.sleep(30)
             send_json(conn, {"id": mid, "result": {
                 "serverInfo": {"name": "mock-ws", "version": "0"}}})
+        elif method == "model/list":
+            send_json(conn, {"id": mid, "result": {"data": [
+                {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna",
+                 "isDefault": False,
+                 "supportedReasoningEfforts": [
+                     {"reasoningEffort": "low"},
+                     {"reasoningEffort": "medium"},
+                     {"reasoningEffort": "high"},
+                     {"reasoningEffort": "xhigh"},
+                     {"reasoningEffort": "max"}]},
+                {"id": "mock-model", "model": "mock-model",
+                 "isDefault": True,
+                 "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]}
+            ], "nextCursor": None}})
         elif method in ("thread/start", "thread/resume"):
             # Record the launch payload before answering (<pidfile>.requests).
             with open(pidfile + ".requests", "a") as rf:
                 rf.write(json.dumps({"method": method,
                                      "params": msg.get("params", {})}) + "\n")
-            send_json(conn, {"id": mid, "result": {
-                "thread": {"id": "th-1", "sessionId": "s-1"}}})
+            launch = msg.get("params", {})
+            effort = launch.get("config", {}).get("model_reasoning_effort", "medium")
+            model = launch.get("model", "mock-model")
+            send_json(conn, {"id": mid, "result": {"thread": {
+                "id": "th-1", "sessionId": "s-1", "model": model,
+                "reasoningEffort": effort},
+                "model": model, "reasoningEffort": effort}})
         elif method == "turn/start":
             text = ""
             try:
@@ -2689,6 +2734,102 @@ fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     assert_eq!(reqs[1]["method"], "thread/resume");
     assert_eq!(reqs[1]["params"]["approvalPolicy"], "never");
     assert_eq!(reqs[1]["params"]["threadId"], "th-1");
+}
+
+#[test]
+fn codex_model_effort_are_validated_reported_and_replayed_on_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "luna", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("luna", "idle", 15);
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    assert_eq!(reqs[0]["method"], "thread/start");
+    assert_eq!(reqs[0]["params"]["model"], "gpt-5.6-luna");
+    assert_eq!(reqs[0]["params"]["config"]["model_reasoning_effort"], "max");
+    let agent = d.rpc("agent_show", json!({"alias": "luna"})).unwrap()["agent"].clone();
+    assert_eq!(agent["model_configured"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["model_reported"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["model_effective"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["effort_configured"], "max", "{agent}");
+    assert_eq!(agent["effort_reported"], "max", "{agent}");
+    assert_eq!(agent["effort_effective"], "max", "{agent}");
+
+    d.rpc("agent_stop", json!({"alias": "luna"})).unwrap();
+    d.wait_agent("luna", "stopped", 15);
+    d.rpc("agent_resume", json!({"alias": "luna"})).unwrap();
+    d.wait_agent("luna", "idle", 15);
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs.len(), 2, "{reqs:?}");
+    assert_eq!(reqs[1]["method"], "thread/resume");
+    assert_eq!(reqs[1]["params"]["threadId"], "th-1");
+    assert_eq!(reqs[1]["params"]["model"], "gpt-5.6-luna");
+    assert_eq!(reqs[1]["params"]["config"]["model_reasoning_effort"], "max");
+}
+
+#[test]
+fn codex_model_effort_pair_rejection_is_visible() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "bad-luna", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"ultra\"}"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("bad-luna", "attention", 15);
+    let error = agent["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider rejected effort"), "{error}");
+    assert!(error.contains("gpt-5.6-luna"), "{error}");
+    assert!(error.contains("max"), "{error}");
+}
+
+#[test]
+fn codex_model_availability_unknown_is_visible() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("bad-model-list");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "unknown-luna", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\"}"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("unknown-luna", "attention", 15);
+    let error = agent["error"].as_str().unwrap_or_default();
+    assert!(error.contains("availability unknown"), "{error}");
+    assert!(!error.contains("provider rejected"), "{error}");
+}
+
+#[test]
+fn codex_ws_model_effort_are_replayed_and_reported() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "luna-ws", "provider": "codex",
+               "endpoint_kind": "managed-ws", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("luna-ws", "idle", 15);
+    let agent = d.rpc("agent_show", json!({"alias": "luna-ws"})).unwrap()["agent"].clone();
+    assert_eq!(agent["model_effective"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["effort_effective"], "max", "{agent}");
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs[0]["params"]["model"], "gpt-5.6-luna");
+    assert_eq!(reqs[0]["params"]["config"]["model_reasoning_effort"], "max");
 }
 
 #[test]
