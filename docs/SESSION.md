@@ -425,8 +425,19 @@ In this order:
    finish --merged --remote` finishes every merged+idle worktree in
    the project — one row each: `finished | would-finish |
    skipped(reason) | refused(reason)` (`would-finish` is the dry-run
-   preview of a clean finish); the verb exits 1 when anything
-   refused and never forces. Without `--project` the sweep covers
+   preview of a clean finish). A recorded worktree directory that is
+   already missing, or a branch checked out at a different live path,
+   is `skipped` on both the dry run and a real sweep — never
+   `would-finish`, and the sweep does not close the ref or delete the
+   branch. The reason is `reconcile: missing-worktree, branch-present`,
+   `reconcile: missing-worktree, branch-missing`, or
+   `reconcile: path-branch-mismatch`. Every candidate row also carries
+   `path_state` (`present`|`missing`), `branch_state`
+   (`present`|`missing`|`elsewhere`), and `live_path`. Finish that
+   lane only with an explicit `cadence issue finish <ID>` after the
+   path and branch are reconciled. A present path keeps the existing
+   guard: in-use or dirty rows stay `refused`. The verb exits 1 when
+   anything refused and never forces. Without `--project` the sweep covers
    every project on the board. Marking an issue `status=done` while
    its worktree ref is still open prints a `worktree open: run
    cadence issue finish <ID>` reminder, so the sweep is the usual
