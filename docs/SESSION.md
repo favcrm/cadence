@@ -281,8 +281,12 @@ When `cadence review` owns the slot, `src/review.rs` clears the child's
 lock path and sets an explicit held marker; the wrapper then runs without
 a nested flock. `scripts/nextest-inventory` compares non-empty cargo and
 nextest test-name manifests from the repository root before any runner
-switch, even when the command is invoked from another directory. The checked-in
-review configuration remains on cargo until the human-class installation,
+switch, even when the command is invoked from another directory. The
+activation follow-up configures both the full and isolated review commands
+to use the same wrapper and reads its profile-resolved JUnit report. The
+review deletes the old report before each command; missing, malformed, or
+zero-test evidence is unknown/blocking rather than a pass. The config change
+remains human-class and must not be merged or activated until the installation,
 structured-result, and gate-activation approvals for CAD-173 are recorded.
 
 For an admitted current-head measurement, record two separate runs for
