@@ -108,8 +108,10 @@ Acceptance for this slice is focused and reviewable:
   restart, and the normal completion path reaches the existing independent
   review route;
 - the auto opt-in and block alert survive store reopen;
-- passive inbox rows remain queued with age/backlog evidence and are never
-  treated as semantic task completion by the coordinator.
+- passive inbox RPC rows remain queued with age/backlog evidence and are never
+  treated as semantic task completion by the coordinator; the dependent
+  CAD226 browser projection can render this contract without changing the
+  coordinator boundary.
 
 The existing monitor deployment, current-main build, or this follow-up alone
 does not establish full autonomous operation. The end-to-end acceptance

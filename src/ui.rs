@@ -622,16 +622,14 @@ fn agents_payload(state_dir: &Path) -> Value {
         let actor = registry::has_actor(provider, kind);
         if !actor {
             inboxes += 1;
-            let inbox = agent["inbox"].clone();
-            let queued = inbox["queued"].as_i64().unwrap_or(0);
             out.push(json!({
                 "alias": alias, "provider": agent["provider"],
                 "endpoint_kind": agent["endpoint_kind"],
                 "state": "inbox", "group": agent["params"]["upstream"].as_str().unwrap_or(alias),
                 "group_root": agent["params"]["upstream"].is_null(),
-                "running": 0, "queued": queued, "unknown": 0, "parked": 0,
+                "running": 0, "queued": 0, "unknown": 0, "parked": 0,
                 "fenced": false, "on": [], "tasks": [], "message": Value::Null,
-                "dead": agent["dead"], "inbox": true, "inbox_status": inbox,
+                "dead": agent["dead"], "inbox": true,
             }));
             continue;
         }
@@ -791,7 +789,6 @@ fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result<Value, Str
         "agent": agent,
         "queued": show["queued"],
         "unknown": show["unknown"],
-        "inbox": show["inbox"],
         "running": running,
         "events": events,
         "fenced": fenced,
