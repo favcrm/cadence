@@ -108,7 +108,7 @@ fn line_ranges(text: &str) -> Vec<LineRange> {
 /// Return the heading level and title for a Markdown ATX heading.
 /// Closing `#` characters are ignored, matching normal Markdown syntax.
 fn heading(line: &str) -> Option<(usize, &str)> {
-    let line = line.trim_start();
+    let line = markdown_line(line)?;
     let level = line.bytes().take_while(|b| *b == b'#').count();
     if level == 0 {
         return None;
@@ -122,13 +122,31 @@ fn heading(line: &str) -> Option<(usize, &str)> {
     {
         return None;
     }
-    let title = rest.trim().trim_end_matches('#').trim();
+    let trimmed = rest.trim();
+    let without_closing = trimmed.trim_end_matches('#');
+    let title = if without_closing.len() < trimmed.len()
+        && without_closing
+            .chars()
+            .last()
+            .is_some_and(char::is_whitespace)
+    {
+        without_closing.trim_end()
+    } else {
+        trimmed
+    };
     Some((level, title))
+}
+
+/// Markdown ATX headings and fenced blocks may be indented by at most three
+/// spaces. Four-space examples are indented code and must not become syntax.
+fn markdown_line(line: &str) -> Option<&str> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    (indent <= 3).then(|| &line[indent..])
 }
 
 /// Return a fence marker for a line that starts a fenced code block.
 fn fence(line: &str) -> Option<(u8, usize)> {
-    let line = line.trim_start();
+    let line = markdown_line(line)?;
     let marker = line.as_bytes().first().copied()?;
     if marker != b'`' && marker != b'~' {
         return None;
@@ -141,11 +159,14 @@ fn fence(line: &str) -> Option<(u8, usize)> {
 /// can carry an optional language or other info string, so that rule belongs
 /// here rather than in `fence`.
 fn is_closing_fence(line: &str, marker: u8, count: usize) -> bool {
-    let line = line.trim_start();
+    let Some(line) = markdown_line(line) else {
+        return false;
+    };
+    let marker_count = line.bytes().take_while(|byte| *byte == marker).count();
     line.as_bytes().first().copied() == Some(marker)
-        && line.bytes().take_while(|byte| *byte == marker).count() >= count
+        && marker_count >= count
         && line
-            .get(count..)
+            .get(marker_count..)
             .is_some_and(|trailing| trailing.chars().all(char::is_whitespace))
 }
 
@@ -195,14 +216,18 @@ fn acceptance_sections(body: &str) -> Vec<AcceptanceSection> {
 
 /// Parse one Markdown checklist line. Empty checklist stubs are excluded.
 fn checkbox_item(line: &str) -> Option<AcceptanceItem> {
-    let line = line.trim_start();
+    let line = markdown_line(line)?;
     let rest = line.strip_prefix("- [")?;
     let marked = match rest.as_bytes().first() {
         Some(b'x') | Some(b'X') if rest.as_bytes().get(1) == Some(&b']') => true,
         Some(b' ') if rest.as_bytes().get(1) == Some(&b']') => false,
         _ => return None,
     };
-    let text = rest[2..].trim();
+    let suffix = &rest[2..];
+    if !suffix.is_empty() && !suffix.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let text = suffix.trim();
     (!text.is_empty()).then(|| AcceptanceItem {
         text: text.to_string(),
         checked: marked,
@@ -466,6 +491,28 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_ignores_indented_code_and_requires_heading_closing_space() {
+        let body = concat!(
+            "    ## Acceptance\n",
+            "    - [x] indented example\n",
+            "## Acceptance#\n",
+            "- [x] hash is part of this title\n",
+            "## Acceptance###\n",
+            "- [x] hashes are part of this title\n",
+            "## Acceptance ###\n",
+            "- [ ] real outcome\n",
+            "## Notes\n",
+        );
+        assert_eq!(
+            acceptance_items(body),
+            vec![AcceptanceItem {
+                text: "real outcome".into(),
+                checked: false,
+            }]
+        );
+    }
+
+    #[test]
     fn acceptance_requires_whitespace_after_fence_closer() {
         let body = concat!(
             "## Acceptance\n",
@@ -473,7 +520,7 @@ mod tests {
             "- [x] fenced example\n",
             "``` with trailing text\n",
             "- [x] still fenced\n",
-            "```\n",
+            "````\n",
             "- [ ] visible outcome\n",
             "## Notes\n",
         );
@@ -498,14 +545,30 @@ mod tests {
             }]
         )
         .is_err());
-        for input in ["", "\n  \n", "- [] missing state\n", "plain text\n"] {
+        for input in [
+            "",
+            "\n  \n",
+            "- [] missing state\n",
+            "- [ ]missing separator\n",
+            "plain text\n",
+        ] {
             assert!(parse_acceptance_input(input).is_err(), "{input:?}");
         }
     }
 
     #[test]
     fn acceptance_replacement_preserves_body_and_inserts_when_absent() {
-        let body = "Intro\r\n\r\n## Acceptance\r\n- [ ] old\r\n\r\n## Notes\r\nKeep this\r\n";
+        let body = concat!(
+            "Intro\r\n\r\n",
+            "    ## Acceptance\r\n",
+            "    - [x] indented code example\r\n",
+            "    ```markdown\r\n",
+            "    - [x] indented fenced example\r\n",
+            "    ```\r\n",
+            "## Acceptance\r\n",
+            "- [ ] old\r\n\r\n",
+            "## Notes\r\nKeep this\r\n",
+        );
         let changed = replace_acceptance(
             body,
             &[
@@ -521,6 +584,10 @@ mod tests {
         )
         .unwrap();
         assert!(changed.contains("Intro\r\n\r\n"));
+        assert!(changed.contains("    ## Acceptance\r\n    - [x] indented code example\r\n"));
+        assert!(
+            changed.contains("    ```markdown\r\n    - [x] indented fenced example\r\n    ```\r\n")
+        );
         assert!(changed.contains("- [x] new one\r\n- [ ] new two\r\n"));
         assert!(changed.contains("## Notes\r\nKeep this\r\n"));
         let inserted = replace_acceptance(

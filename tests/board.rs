@@ -571,6 +571,7 @@ fn issue_acceptance_round_trip_and_refusals() {
 
     // Missing issue and missing input both fail closed without creating
     // folders or commits.
+    std::fs::write(&source, "- [ ] valid input for missing issue\n").unwrap();
     let missing = source_dir.path().join("missing.md");
     let (ok, err) = cli(
         pm.path(),

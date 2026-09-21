@@ -262,7 +262,7 @@ One folder per issue: `<project>/<ID>/issue.md` + `comments/` + `artifacts/`.\n\
 Paths never encode title, status or parent. Issues are never deleted — set\n\
 `status: dropped`.\n\n\
 ## Rules for agents and humans\n\n\
-- The only writer is `cadence issue` (`new set link unlink ref comment attach`).\n\
+- The only writer is `cadence issue` (`new set link unlink ref comment attach acceptance`).\n\
   Hand-edits are legal but must be followed by `cadence issue lint`.\n\
 - Statuses: `backlog ready doing review done dropped`.\n\
 - Links live on one side only (`blocked_by parent relates duplicate_of`);\n\
