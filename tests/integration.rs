@@ -21124,10 +21124,7 @@ fn monitor_migration_from_v8_defaults_auto_dispatch_off() {
     drop(conn);
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(
-        store.monitor("legacy").unwrap().auto_dispatch_enabled,
-        false
-    );
+    assert!(!store.monitor("legacy").unwrap().auto_dispatch_enabled);
     let conn = rusqlite::Connection::open(&path).unwrap();
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
@@ -21568,7 +21565,7 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
         .as_str()
         .unwrap()
         .contains("quota unknown"));
-    assert_eq!(blocked["payload"]["next_action"].is_string(), true);
+    assert!(blocked["payload"]["next_action"].is_string());
     let blocked_seq = blocked["seq"].as_i64().unwrap();
     thread::sleep(Duration::from_millis(1500));
     let repeated = d.rpc("monitor_alerts", json!({"monitor": "auto"})).unwrap();
