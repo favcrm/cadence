@@ -17173,6 +17173,7 @@ fn doctor_host_json_reports_all_checks() {
             "pipes",
             "memory",
             "processes",
+            "sessions",
             "orphans",
             "temp-dirs",
             "worktrees"
