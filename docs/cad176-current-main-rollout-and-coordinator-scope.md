@@ -35,6 +35,16 @@ This worktree adds a separate v8-to-v9 migration for the coordinator's
 isolated rehearsal and reviewed build; the baseline evidence does not prove
 that v9 candidate or authorize a live schema change.
 
+The candidate runtime code at `e48b8cc80dd0a08d55f1d80312ed0652c3a09e22`
+was then built with the same `CARGO_BUILD_JOBS=4 cargo build --locked` rule
+and exercised against a fresh copy of the same backup at
+`/tmp/cad176-5aa9c6f-rehearsal/cadence.sqlite3`. Before startup it had schema
+6, 21 agents, 2079 messages, and an `ok` integrity check. The isolated daemon
+started, `monitor list` returned an empty registration set, and it stopped
+cleanly. Afterwards the copy had schema 9, the three monitor tables,
+`auto_dispatch_enabled` with default `0`, the same agent/message counts, and
+an `ok` integrity check. The live state directory was never opened.
+
 ## Operator-only live sequence
 
 1. Preserve both deleted-inode daemon and board executables, then take a fresh
