@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{
-    board, doctor, finish, history, hooks, lint, model, project, start, sync, write, Pm,
+    board, doctor, finish, history, hooks, lint, model, project, retro, start, sync, write, Pm,
 };
 
 #[derive(Subcommand)]
@@ -123,6 +123,18 @@ pub enum IssueAction {
     /// For every frontmatter field currently set, the history entry
     /// that last changed it (`value`, `sha`, `at`, `by`).
     Blame { id: String },
+    /// Read-only retrospective for one issue: review rounds and
+    /// verdicts, blocking findings, flake mentions, timings and merge
+    /// evidence — assembled from the tracker, tagged notes, project
+    /// repos and the daemon store (read-only). Prints a preview;
+    /// nothing is attached, promoted or published. `--json` emits the
+    /// `cadence.retro/1` document.
+    Retro {
+        /// Issue id (CAD-16).
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the exact trailer line for this issue (`Issue: <ID>`) —
     /// agents and hooks append it to code commits without guessing
     /// the format. Refuses an id that does not exist.
@@ -556,6 +568,16 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             let pm = open_pm()?;
             let issue = board::find_issue(&pm.dir, id)?;
             println!("Issue: {}", issue.front.id);
+            Ok(0)
+        }
+        IssueAction::Retro { id, json } => {
+            let pm = open_pm()?;
+            let v = retro::run(&pm.dir, &pm.config.notes_dir(), state_dir, id)?;
+            if *json {
+                print_json(&v);
+            } else {
+                print!("{}", retro::render(&v));
+            }
             Ok(0)
         }
         IssueAction::Start {

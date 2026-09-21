@@ -52,43 +52,81 @@ pub fn header_issue(text: &str) -> Option<String> {
     None
 }
 
-/// For a `-verdict.md` note: the first content line after a
-/// `## Verdict`-style heading decides pass vs not.
-fn verdict_passes(text: &str) -> bool {
+/// For a `-verdict.md` note: `Some(true)` pass, `Some(false)` not-pass,
+/// `None` when no verdict marker exists at all — distinct from a real
+/// not-pass, so callers never misclassify an unparseable note.
+/// Recognised markers: a `## Verdict` heading (answer on the next
+/// content line), a `> Verdict:` / `# Verdict:` line (answer inline —
+/// qa-1's convention puts it in the note title).
+pub(crate) fn verdict_outcome(text: &str) -> Option<bool> {
     let lines: Vec<&str> = text.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
-        let is_verdict_heading = t.starts_with('#')
-            && t.trim_start_matches('#')
-                .trim_start()
-                .eq_ignore_ascii_case("verdict")
-            || t.trim_start_matches('>')
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("verdict:");
-        if !is_verdict_heading {
+        let body = t
+            .trim_start_matches('>')
+            .trim_start_matches('#')
+            .trim_start()
+            .to_ascii_lowercase();
+        if let Some(rest) = body.strip_prefix("verdict:") {
+            // `Verdict: X — pass` answers inline; a bare `Verdict: X`
+            // title carries no verdict word — keep scanning for a
+            // `## Verdict` section instead of misreading the title.
+            if word_pass(rest) {
+                return Some(true);
+            }
+            let mentions_pass = rest
+                .split(|c: char| !c.is_ascii_alphabetic())
+                .any(|w| w.eq_ignore_ascii_case("pass"));
+            if word_fail(rest) || mentions_pass {
+                return Some(false);
+            }
             continue;
         }
-        // `> Verdict: pass` carries the answer on the same line.
-        if let Some(rest) = t.to_ascii_lowercase().split("verdict:").nth(1) {
-            return word_pass(rest);
-        }
-        for next in &lines[i + 1..] {
-            let n = next.trim();
-            if !n.is_empty() {
-                return word_pass(&n.to_ascii_lowercase());
+        if t.starts_with('#') && body == "verdict" {
+            for next in &lines[i + 1..] {
+                let n = next.trim();
+                if !n.is_empty() {
+                    return Some(word_pass(&n.to_ascii_lowercase()));
+                }
             }
         }
     }
-    false
+    None
+}
+
+/// Boolean form of [`verdict_outcome`]: absent or unparseable verdict
+/// counts as not-pass, matching the original caller semantics.
+pub(crate) fn verdict_passes(text: &str) -> bool {
+    verdict_outcome(text) == Some(true)
 }
 
 fn word_pass(line: &str) -> bool {
-    line.split(|c: char| !c.is_ascii_alphabetic())
-        .any(|w| w.eq_ignore_ascii_case("pass"))
+    let words: Vec<String> = line
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .map(|w| w.to_ascii_lowercase())
+        .collect();
+    // "not pass"/"non-pass"/"not-pass" is a fail, not a pass.
+    words.iter().enumerate().any(|(i, w)| {
+        w == "pass"
+            && !matches!(
+                words.get(i.wrapping_sub(1)).map(|p| p.as_str()),
+                Some("not") | Some("non")
+            )
+    })
 }
 
-fn note_kind(name: &str) -> String {
+/// Explicit not-pass words — used only for inline `Verdict:` answers,
+/// where absence of "pass" alone can't tell "blocked" from a bare title.
+fn word_fail(line: &str) -> bool {
+    line.split(|c: char| !c.is_ascii_alphabetic()).any(|w| {
+        matches!(
+            w.to_ascii_lowercase().as_str(),
+            "fail" | "failed" | "blocked" | "dropped" | "reject" | "rejected"
+        )
+    })
+}
+
+pub(crate) fn note_kind(name: &str) -> String {
     name.strip_suffix(".md")
         .and_then(|n| n.rsplit('-').next())
         .map(|s| match s {
@@ -181,5 +219,28 @@ mod tests {
         assert!(!verdict_passes(dropped));
         let inline = "# v\n> Verdict: pass\n";
         assert!(verdict_passes(inline));
+    }
+
+    #[test]
+    fn verdict_outcome_tri_state() {
+        // Title-carried verdict — qa-1's convention.
+        assert_eq!(
+            verdict_outcome("# Verdict: PR #86 — CAD-198 census — pass\n\nBody.\n"),
+            Some(true)
+        );
+        assert_eq!(
+            verdict_outcome("# Verdict: CAD-1 — blocked\n\nBody.\n"),
+            Some(false)
+        );
+        // A bare `Verdict:` title is not an answer — scan on.
+        assert_eq!(
+            verdict_outcome("# Verdict: x\n\n## Verdict\n**Pass.**\n"),
+            Some(true)
+        );
+        // Negated pass is a fail, not a pass.
+        assert_eq!(verdict_outcome("> Verdict: not pass\n"), Some(false));
+        assert_eq!(verdict_outcome("> Verdict: not-pass\n"), Some(false));
+        // No verdict marker at all → None, distinct from not-pass.
+        assert_eq!(verdict_outcome("# Note\n\nno verdict here\n"), None);
     }
 }
