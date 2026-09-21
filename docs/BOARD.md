@@ -478,7 +478,7 @@ The daemon derives one live native PTY endpoint from the Unix socket
 peer, current adapter ownership, endpoint generation, registration
 incarnation and process start identity. Request aliases, `CADENCE_ALIAS`,
 operator UI labels and external/headless identities cannot create proof.
-Two distinct non-author worker aliases must pass the same semantic
+Two distinct non-author PM/worker aliases must pass the same semantic
 SHA-256 revision (claim/body, trusted author/contributors, type, source,
 confidence, scope and supersede target); an authenticated PM endpoint
 then finalizes. Body edits, stale digests, duplicate aliases, missing

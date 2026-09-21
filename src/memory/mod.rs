@@ -6,8 +6,8 @@
 //!
 //! Authority-bearing writes go through daemon RPC. The daemon resolves the
 //! Unix peer to one live, owned native PTY endpoint and supplies the
-//! authenticated proposer/reviewer proof. Two distinct worker endpoint
-//! incarnations review the same semantic digest; an authenticated PM
+//! authenticated proposer/reviewer proof. Two distinct non-author PM/worker
+//! endpoint identities review the same semantic digest; an authenticated PM
 //! endpoint finalizes. Legacy records remain readable but are blocked from
 //! retrieval until a corrected native proposal is reviewed.
 //!
@@ -577,7 +577,7 @@ pub fn quorum_status(mem: &Memory, operation: &str) -> (bool, String) {
         let identity_prefix = format!("{}#", receipt.reviewer);
         if receipt.digest != digest
             || receipt.evidence.trim().is_empty()
-            || receipt.role != "worker"
+            || !matches!(receipt.role.as_str(), "pm" | "worker")
             || receipt.reviewer.is_empty()
             || !receipt.identity.starts_with(&identity_prefix)
             || receipt.generation.is_empty()
@@ -913,9 +913,9 @@ pub fn submit_review(
             "memory review verdict must be pass or revise",
         ));
     }
-    if actor.proof.role != "worker" {
+    if !matches!(actor.proof.role.as_str(), "pm" | "worker") {
         return Err(Error::rejected(
-            "only an authenticated worker endpoint may submit a memory review",
+            "only an authenticated PM or worker endpoint may submit a memory review",
         ));
     }
     let evidence = evidence.trim();
@@ -1718,7 +1718,7 @@ mod tests {
             registration,
             generation: format!("gen-{registration}"),
             process_start: registration + 100,
-            role: if alias == "pm" {
+            role: if alias == "pm" || alias.starts_with("pm-") {
                 "pm".to_string()
             } else {
                 "worker".to_string()
@@ -1966,6 +1966,22 @@ mod tests {
             .reviews
             .push(receipt(&proof("worker-a", 9), "accept", 1, &digest));
         assert!(!retrieval_status(&mem).0);
+    }
+
+    #[test]
+    fn authenticated_pm_can_be_a_non_author_reviewer() {
+        let mut mem = memory("accepted", 1, Some(proof("author", 1)));
+        let digest = semantic_digest(&mem);
+        mem.front
+            .reviews
+            .push(receipt(&proof("pm-reviewer", 4), "accept", 1, &digest));
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-a", 2), "accept", 1, &digest));
+        mem.front
+            .finalizations
+            .push(finalization(&proof("pm", 5), "accept", 1, &digest));
+        assert!(retrieval_status(&mem).0);
     }
 
     #[test]
