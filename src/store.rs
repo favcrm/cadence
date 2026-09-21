@@ -62,6 +62,9 @@ pub struct Agent {
     pub thread_id: Option<String>,
     pub session_id: Option<String>,
     pub model: Option<String>,
+    /// Provider-confirmed reasoning effort from the most recent open.
+    /// Requested/configured effort remains in `params`.
+    pub effort: Option<String>,
     pub pid: Option<i64>,
     pub endpoint: Option<String>,
     /// Endpoint-specific registration options (`{"session": …}` for pty).
@@ -410,6 +413,7 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         thread_id: row.get("thread_id")?,
         session_id: row.get("session_id")?,
         model: row.get("model")?,
+        effort: row.get("effort")?,
         pid: row.get("pid")?,
         endpoint: row.get("endpoint")?,
         params: row
@@ -440,6 +444,7 @@ impl Agent {
             // model beside the configured launch params, with an
             // unconfigured model named as the provider's default.
             "model_reported": self.model,
+            "model_effective": self.model,
             "model_configured": self.param_str("model"),
             "model_source": if self.param_str("model").is_some() {
                 "configured"
@@ -447,6 +452,16 @@ impl Agent {
                 "provider default"
             },
             "effort": self.param_str("effort"),
+            "effort_configured": self.param_str("effort"),
+            "effort_reported": self.effort,
+            "effort_effective": self.effort,
+            "effort_source": if self.effort.is_some() {
+                "provider reported"
+            } else if self.param_str("effort").is_some() {
+                "unknown"
+            } else {
+                "provider default"
+            },
             "enabled": self.enabled, "error": self.error,
             "endpoint": self.endpoint, "params": self.params,
             "generation": self.generation,
@@ -615,7 +630,7 @@ impl Store {
                     endpoint_kind TEXT NOT NULL, role TEXT NOT NULL,
                     cwd TEXT NOT NULL, sandbox TEXT NOT NULL,
                     instructions TEXT, thread_id TEXT, session_id TEXT,
-                    model TEXT, pid INTEGER,
+                    model TEXT, effort TEXT, pid INTEGER,
                     state TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
                     error TEXT, created REAL NOT NULL, updated REAL NOT NULL);
                  CREATE TABLE IF NOT EXISTS messages(
@@ -2329,12 +2344,13 @@ impl Store {
         params.extend(kept_ids.iter().map(|k| k.to_string().into()));
         tx.execute(&sql, rusqlite::params_from_iter(params))?;
         tx.execute(
-            "UPDATE agents SET thread_id=?,session_id=?,model=?,pid=?,
+            "UPDATE agents SET thread_id=?,session_id=?,model=?,effort=?,pid=?,
                 endpoint=?,generation=?,state='idle',updated=? WHERE alias=?",
             params![
                 id.thread_id,
                 id.session_id,
                 id.model,
+                id.effort,
                 id.pid as i64,
                 id.endpoint,
                 id.generation,
@@ -2347,7 +2363,8 @@ impl Store {
             alias,
             "ready",
             json!({"thread_id": id.thread_id, "session_id": id.session_id,
-                   "model": id.model, "pid": id.pid, "endpoint": id.endpoint,
+                   "model": id.model, "effort": id.effort, "pid": id.pid,
+                   "endpoint": id.endpoint,
                    "generation": id.generation}),
         )?;
         for e in adopted.unwrap_or_default() {
@@ -4588,6 +4605,7 @@ mod tests {
                 thread_id: "thread-1".into(),
                 session_id: "session-1".into(),
                 model: Some("model-1".into()),
+                effort: None,
                 pid: 1,
                 endpoint: Some("fake://one".into()),
                 generation: Some("generation-1".into()),
@@ -4619,6 +4637,7 @@ mod tests {
                 thread_id: "thread-2".into(),
                 session_id: "session-2".into(),
                 model: Some("model-1".into()),
+                effort: None,
                 pid: 2,
                 endpoint: Some("fake://two".into()),
                 generation: Some("generation-2".into()),
@@ -4720,6 +4739,7 @@ mod tests {
                     thread_id: "th".into(),
                     session_id: "s".into(),
                     model: None,
+                    effort: None,
                     pid: 1,
                     endpoint: Some("ws://x".into()),
                     generation: None,

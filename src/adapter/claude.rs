@@ -473,6 +473,7 @@ impl ProviderAdapter for ClaudeAdapter {
             thread_id: session_id.clone(),
             session_id,
             model: agent.model.clone(),
+            effort: None,
             pid,
             endpoint: None,
             generation: Some(generation),
