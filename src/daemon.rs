@@ -1122,6 +1122,9 @@ impl Shared {
                     let (dead, resumable) = self.agent_liveness(&agent);
                     j["dead"] = json!(dead);
                     j["resumable"] = json!(resumable);
+                    if let Some(inbox) = self.store.inbox_status(&agent.alias)? {
+                        j["inbox"] = inbox;
+                    }
                     if let Some(view) = self.stall_view(&agent.alias) {
                         view.apply(&mut j);
                     }
@@ -1159,6 +1162,7 @@ impl Shared {
                     // for a mailbox, what the actor will still take for
                     // a live endpoint.
                     "queued": self.store.queued_count(&alias)?,
+                    "inbox": self.store.inbox_status(&alias)?,
                     // Unreconciled `unknown` count — nonzero means the
                     // agent is fenced and `message reconcile` /
                     // `agent unfence` is the only exit.
@@ -2816,6 +2820,10 @@ impl Shared {
             .get("dispatch_enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let auto_dispatch_enabled = params
+            .get("auto_dispatch_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (monitor, duplicate) = self.store.register_monitor(
             required_str(params, "monitor")?,
             required_str(params, "project")?,
@@ -2823,6 +2831,7 @@ impl Shared {
             interval,
             &tasks,
             dispatch_enabled,
+            auto_dispatch_enabled,
         )?;
         let (monitor, coverage, open, total) = self.store.monitor_view(&monitor.id)?;
         self.wake();
@@ -2892,8 +2901,10 @@ impl Shared {
         Ok(json!({"monitor": monitor.to_json(&coverage, open, total)}))
     }
 
-    /// One explicit, guarded handoff into the existing job-dispatch
-    /// transaction. The observer never calls this path on its own.
+    /// One guarded handoff into the existing job-dispatch transaction. The
+    /// public RPC remains an explicit operator action; the monitor watcher
+    /// may call the same helper only for a separately persisted automatic
+    /// opt-in.
     fn rpc_monitor_dispatch(self: &Arc<Self>, params: &Value) -> Result<Value> {
         if optional_str(params, "pane").is_some() {
             return Err(Error::rejected(
@@ -2902,6 +2913,54 @@ impl Shared {
         }
         let monitor_id = required_str(params, "monitor")?;
         let task_id = required_str(params, "task")?;
+        self.monitor_dispatch_task(monitor_id, task_id, false)
+    }
+
+    fn monitor_dispatch_task(
+        self: &Arc<Self>,
+        monitor_id: &str,
+        task_id: &str,
+        automatic: bool,
+    ) -> Result<Value> {
+        if automatic {
+            // Hold the pending-request mutex across the store transaction.
+            // The snapshot contains every alias, while the transaction
+            // re-reads the task's current assignee before applying it, so an
+            // approval arriving concurrently cannot be missed or bypassed.
+            let pending = self.pending.lock().unwrap();
+            let pending_aliases: HashSet<String> = pending
+                .values()
+                .map(|request| request.alias.clone())
+                .collect();
+            let (task, message, duplicate, behind_dead) =
+                self.store.dispatch_automatic_monitor_task(
+                    monitor_id,
+                    task_id,
+                    &pending_aliases,
+                    &format!("monitor:{monitor_id}"),
+                )?;
+            drop(pending);
+            let assignee = task.assignee.clone().ok_or_else(|| {
+                Error::internal("automatic dispatch returned a task without an assignee")
+            })?;
+            let _ = self.store.event_public(
+                store::Store::DAEMON_STREAM,
+                "monitor_dispatch",
+                json!({"monitor": monitor_id, "task": task_id,
+                       "message": message, "duplicate": duplicate,
+                       "queued_behind_dead": behind_dead,
+                       "automatic": true}),
+            );
+            self.notify_agent(&assignee);
+            self.wake();
+            return Ok(json!({
+                "monitor": monitor_id,
+                "task": task.to_json(),
+                "message": message,
+                "duplicate": duplicate,
+                "queued_behind_dead": behind_dead,
+            }));
+        }
         let monitor = self.store.monitor(monitor_id)?;
         if monitor.state != "active" {
             return Err(Error::rejected(format!(
@@ -2934,13 +2993,26 @@ impl Shared {
             if let Some((task, message, duplicate, behind_dead)) =
                 self.store.duplicate_task_dispatch(task_id)?
             {
-                let _ = self.store.event_public(
-                    store::Store::DAEMON_STREAM,
+                self.store.resolve_monitor_dispatch_blocked(
+                    monitor_id,
+                    task_id,
+                    epoch_secs(),
                     "monitor_dispatch",
-                    json!({"monitor": monitor_id, "task": task_id,
-                           "message": message, "duplicate": duplicate,
-                           "queued_behind_dead": behind_dead}),
-                );
+                )?;
+                // The durable job-dispatch row is already the idempotency
+                // evidence for an automatic retry. Manual RPC callers keep
+                // their historical event for every explicit invocation;
+                // the watcher must not emit one event per interval.
+                if !automatic {
+                    let _ = self.store.event_public(
+                        store::Store::DAEMON_STREAM,
+                        "monitor_dispatch",
+                        json!({"monitor": monitor_id, "task": task_id,
+                               "message": message, "duplicate": duplicate,
+                               "queued_behind_dead": behind_dead,
+                               "automatic": false}),
+                    );
+                }
                 self.wake();
                 return Ok(json!({
                     "monitor": monitor_id,
@@ -3026,12 +3098,19 @@ impl Shared {
         let (task, message, duplicate, behind_dead) =
             self.store
                 .dispatch_task(task_id, None, None, &format!("monitor:{monitor_id}"))?;
+        self.store.resolve_monitor_dispatch_blocked(
+            monitor_id,
+            task_id,
+            epoch_secs(),
+            "monitor_dispatch",
+        )?;
         let _ = self.store.event_public(
             store::Store::DAEMON_STREAM,
             "monitor_dispatch",
             json!({"monitor": monitor_id, "task": task_id,
                    "message": message, "duplicate": duplicate,
-                   "queued_behind_dead": behind_dead}),
+                   "queued_behind_dead": behind_dead,
+                   "automatic": automatic}),
         );
         self.notify_agent(assignee);
         self.wake();
@@ -3197,6 +3276,9 @@ impl Shared {
     /// Reconcile daemon-owned monitor registrations without waking a
     /// provider. Each check advances its durable cursor together with any
     /// deduplicated local alerts; failures remain visible as `degraded`.
+    /// Opted-in registrations then run the same guarded dispatch helper as
+    /// the explicit RPC. A guard refusal becomes one durable task alert and
+    /// is retried only on the next monitor interval.
     fn run_monitor_watch(self: &Arc<Self>) {
         while !self.closing.load(Ordering::SeqCst) {
             let at = epoch_secs();
@@ -3207,6 +3289,8 @@ impl Shared {
                         let _ = self
                             .store
                             .fail_monitor_check(&monitor.id, at, &error.to_string());
+                    } else if monitor.auto_dispatch_enabled {
+                        self.reconcile_monitor_dispatch(&monitor.id, at);
                     }
                     self.wake();
                 }
@@ -3214,6 +3298,60 @@ impl Shared {
             let deadline = Instant::now() + MONITOR_TICK;
             while !self.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    fn reconcile_monitor_dispatch(self: &Arc<Self>, monitor_id: &str, at: f64) {
+        let task_ids = match self.store.monitor_tasks(monitor_id) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                let _ = self.store.fail_monitor_check(
+                    monitor_id,
+                    at,
+                    &format!("automatic coverage reconciliation failed: {error}"),
+                );
+                return;
+            }
+        };
+        for task_id in task_ids {
+            let task = match self.store.task_opt(&task_id) {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    let _ = self.store.record_monitor_dispatch_blocked(
+                        monitor_id,
+                        &task_id,
+                        at,
+                        "covered task no longer exists",
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    let _ = self.store.record_monitor_dispatch_blocked(
+                        monitor_id,
+                        &task_id,
+                        at,
+                        &format!("covered task lookup failed: {error}"),
+                    );
+                    continue;
+                }
+            };
+            if !matches!(
+                task.state.as_str(),
+                "draft" | "revising" | "dispatched" | "running"
+            ) {
+                // Review, verified, blocked, cancelled, and done work has no
+                // eligible automatic action. Its durable task state remains
+                // the source of truth; do not manufacture an alert.
+                continue;
+            }
+            if let Err(error) = self.monitor_dispatch_task(monitor_id, &task_id, true) {
+                let _ = self.store.record_monitor_dispatch_blocked(
+                    monitor_id,
+                    &task_id,
+                    at,
+                    &error.to_string(),
+                );
             }
         }
     }

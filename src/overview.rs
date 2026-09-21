@@ -214,6 +214,11 @@ fn monitor_alert_action(kind: &str, monitor_owner: &str) -> (&'static str, Strin
             monitor_owner.to_string(),
             "monitor owner may reconcile the worker",
         ),
+        "dispatch_blocked" => (
+            "Resolve the guarded dispatch prerequisite, then retry the task",
+            monitor_owner.to_string(),
+            "operator decision required; coordinator cannot bypass the guard",
+        ),
         _ => (
             "Inspect the monitor evidence and choose the next owner",
             monitor_owner.to_string(),
@@ -501,7 +506,7 @@ fn validate_monitor_alert_response<'a>(
         }
         if !matches!(
             alert.get("state").and_then(Value::as_str),
-            Some("open") | Some("acknowledged")
+            Some("open") | Some("acknowledged") | Some("resolved")
         ) {
             return Err(format!("monitor_alerts row {index} has unsupported state"));
         }

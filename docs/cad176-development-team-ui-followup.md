@@ -22,7 +22,7 @@ of the following on a temporary state directory and after a board reload:
   `unavailable` rather than being skipped;
 - the daemon lifecycle accepts only `active`, `degraded`, or `off`; every
   `monitor_alerts` response validates its monitor, cursor, alert array, alert
-  scope, fields, and `open`/`acknowledged` state. RPC failure, a missing or
+  scope, fields, and `open`/`acknowledged`/`resolved` state. RPC failure, a missing or
   malformed response, or an unsupported state is `unavailable`; `alerts: []`
   remains a valid empty history;
 - a concrete alert with project, task, event sequence, fingerprint, age,
