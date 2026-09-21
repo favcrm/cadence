@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -3636,6 +3636,7 @@ fn recorded_cargo_targets(pm: Option<&Path>) -> (BTreeMap<PathBuf, Vec<String>>,
     (map, status)
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum LockBit {
     Absent,
     Free,
@@ -3643,24 +3644,92 @@ enum LockBit {
     Unknown,
 }
 
-/// Non-blocking exclusive probe. Opening a symlink is following it,
-/// so a symlink lock file stays `Unknown` and is not opened.
-fn probe_lock_file(path: &Path) -> LockBit {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LockBit::Absent,
-        Err(_) => return LockBit::Unknown,
-    };
-    if meta.file_type().is_symlink() {
-        return LockBit::Unknown;
+/// What `lstat` can say about `path` without crossing a symlink.
+/// `symlink_metadata` on the full path still walks ancestor links, so
+/// `/tmp/link/target` looks like a real directory when `link` is a
+/// symlink. Each component is `lstat`'d on its own and the walk stops
+/// at the first link.
+enum LexicalKind {
+    Absent,
+    /// `at` is the symlink component. `final_component` is false when
+    /// an ancestor, not the path itself, is the link.
+    Symlink {
+        at: PathBuf,
+        final_component: bool,
+    },
+    Ready(std::fs::Metadata),
+    Error,
+}
+
+fn lexical_kind(path: &Path) -> LexicalKind {
+    if !path.is_absolute() {
+        return LexicalKind::Error;
     }
-    let f = match std::fs::File::open(path) {
+    let mut cur = PathBuf::new();
+    let comps: Vec<_> = path.components().collect();
+    let last = comps.len().saturating_sub(1);
+    for (i, c) in comps.into_iter().enumerate() {
+        match c {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                cur.push(c);
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return LexicalKind::Error;
+            }
+            std::path::Component::Normal(name) => {
+                cur.push(name);
+                match std::fs::symlink_metadata(&cur) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return LexicalKind::Symlink {
+                            at: cur,
+                            final_component: i == last,
+                        };
+                    }
+                    Ok(meta) if i == last => return LexicalKind::Ready(meta),
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => return LexicalKind::Error,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return LexicalKind::Absent;
+                    }
+                    Err(_) => return LexicalKind::Error,
+                }
+            }
+        }
+    }
+    LexicalKind::Error
+}
+
+/// Non-blocking exclusive probe of one cargo lock file.
+///
+/// A FIFO named `.cargo-lock` blocks `open` forever. A final-component
+/// symlink is not the only trap: `lstat` of the basename still follows
+/// ancestor links, and a replacement between the check and `open` can
+/// swap in a FIFO or a symlink. Non-regular files are rejected first.
+/// The open itself is one `O_NOFOLLOW | O_NONBLOCK` call, and the fd is
+/// kept only when `fstat` still says it is a regular file.
+fn probe_lock_file(path: &Path) -> LockBit {
+    match lexical_kind(path) {
+        LexicalKind::Absent => return LockBit::Absent,
+        LexicalKind::Ready(meta) if meta.is_file() => {}
+        LexicalKind::Ready(_) | LexicalKind::Symlink { .. } | LexicalKind::Error => {
+            return LockBit::Unknown;
+        }
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LockBit::Absent,
         Err(_) => return LockBit::Unknown,
     };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        _ => return LockBit::Unknown,
+    }
     use std::os::unix::io::AsRawFd;
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         return LockBit::Free;
     }
@@ -3682,8 +3751,13 @@ fn fold_lock(status: &'static str, bit: LockBit) -> &'static str {
 }
 
 /// Cargo's build locks at the target root and under `debug/` /
-/// `release/` only. A symlinked profile directory is not entered.
+/// `release/` only. A symlinked profile directory is not entered,
+/// and neither is a directory reached through an ancestor symlink.
 fn cargo_lock_status(dir: &Path) -> &'static str {
+    match lexical_kind(dir) {
+        LexicalKind::Ready(meta) if meta.is_dir() => {}
+        _ => return "unknown",
+    }
     let mut status = "absent";
     for name in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
         status = fold_lock(status, probe_lock_file(&dir.join(name)));
@@ -3876,9 +3950,27 @@ fn check_task_targets(scan: &Scan) -> Check {
         let pressure = !under_cadence_tree(path);
         let quoted = shell_quote(&path.display().to_string());
 
-        let meta = std::fs::symlink_metadata(path).ok();
-        let exists = meta.is_some();
-        let symlink = meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
+        // Component-wise lstat. `symlink_metadata(path)` would follow
+        // an ancestor and report the final directory as real.
+        let looked = lexical_kind(path);
+        let ancestor_symlink = matches!(
+            looked,
+            LexicalKind::Symlink {
+                final_component: false,
+                ..
+            }
+        );
+        let link_at = match &looked {
+            LexicalKind::Symlink { at, .. } => Some(at.clone()),
+            _ => None,
+        };
+        let symlink = link_at.is_some();
+        let meta = match &looked {
+            LexicalKind::Ready(m) => Some(m.clone()),
+            LexicalKind::Symlink { at, .. } => std::fs::symlink_metadata(at).ok(),
+            _ => None,
+        };
+        let exists = matches!(looked, LexicalKind::Ready(_) | LexicalKind::Symlink { .. });
         let uid = meta.as_ref().map(|m| m.uid());
         let uid_matches = uid.is_some_and(|u| u == scan.uid);
         let age_secs = meta.as_ref().and_then(|m| {
@@ -3889,18 +3981,15 @@ fn check_task_targets(scan: &Scan) -> Check {
                     .unwrap_or(0)
             })
         });
-        let link_target = if symlink {
-            std::fs::read_link(path)
-                .ok()
-                .map(|t| t.display().to_string())
-        } else {
-            None
-        };
-        let foreign_symlink = if symlink {
+        let link_target = link_at
+            .as_deref()
+            .and_then(|at| std::fs::read_link(at).ok())
+            .map(|t| t.display().to_string());
+        let foreign_symlink = if let Some(at) = &link_at {
             match &link_target {
                 Some(target) => {
                     let target = PathBuf::from(target);
-                    let base = path.parent().unwrap_or(Path::new("/"));
+                    let base = at.parent().unwrap_or(Path::new("/"));
                     let resolved = if target.is_absolute() {
                         lexical_normalize(&target)
                     } else {
@@ -3915,10 +4004,12 @@ fn check_task_targets(scan: &Scan) -> Check {
             false
         };
 
-        let (bytes, bytes_truncated, bytes_skipped, cargo_lock) = if !exists {
-            (None, false, Some("absent"), "absent")
-        } else if symlink {
+        let (bytes, bytes_truncated, bytes_skipped, cargo_lock) = if symlink {
             (None, false, Some("symlink"), "unknown")
+        } else if matches!(looked, LexicalKind::Error) {
+            (None, false, Some("unreadable"), "unknown")
+        } else if !exists {
+            (None, false, Some("absent"), "absent")
         } else if !uid_matches {
             (None, false, Some("foreign-uid"), "unknown")
         } else if meta.as_ref().is_some_and(|m| !m.is_dir()) {
@@ -4007,6 +4098,10 @@ fn check_task_targets(scan: &Scan) -> Check {
             "bytes_skipped": bytes_skipped,
             "exists": exists,
             "symlink": symlink,
+            "ancestor_symlink": ancestor_symlink,
+            // True only if a symlink component was crossed. Nothing in
+            // this check crosses one, including an ancestor of the
+            // final path, so this stays false.
             "followed": false,
             "foreign_symlink": foreign_symlink,
             "cargo_lock": cargo_lock,
@@ -6204,6 +6299,7 @@ mod tests {
         ] {
             let row = task_row(&c.value, name);
             assert_eq!(row["symlink"], true);
+            assert_eq!(row["ancestor_symlink"], false);
             assert_eq!(row["followed"], false);
             assert_eq!(row["bytes"], Value::Null);
             assert_eq!(row["bytes_skipped"], "symlink");
@@ -6234,6 +6330,132 @@ mod tests {
             task_row(&c.value, "cad997-link-target")["bytes"],
             Value::Null
         );
+    }
+
+    fn mkfifo(path: &Path) {
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o644) },
+            0,
+            "mkfifo {}",
+            path.display()
+        );
+    }
+
+    /// The probe must return. A regression that blocks in `open` fails
+    /// this instead of hanging the suite.
+    fn probe_lock_bounded(path: &Path) -> LockBit {
+        let path = path.to_path_buf();
+        let shown = path.display().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_lock_file(&path));
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("probe_lock_file blocked on {shown}"))
+    }
+
+    fn check_targets_bounded(scan: Scan) -> Check {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(check_task_targets(&scan));
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("task-target inventory blocked")
+    }
+
+    #[test]
+    fn task_targets_lock_probe_rejects_fifo_and_symlink_without_blocking() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let fifo_dir = scan.temp_dir.join("cad410-fifo-target");
+        std::fs::create_dir_all(fifo_dir.join("debug")).unwrap();
+        mkfifo(&fifo_dir.join(".cargo-lock"));
+        mkfifo(&fifo_dir.join("debug/.cargo-lock"));
+
+        let link_dir = scan.temp_dir.join("cad411-locklink-target");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let fifo = root.path().join("elsewhere-fifo");
+        mkfifo(&fifo);
+        std::os::unix::fs::symlink(&fifo, link_dir.join(".cargo-lock")).unwrap();
+
+        let free_dir = scan.temp_dir.join("cad412-freelock-target");
+        std::fs::create_dir_all(&free_dir).unwrap();
+        std::fs::write(free_dir.join(".cargo-lock"), b"lock").unwrap();
+
+        assert_eq!(
+            probe_lock_bounded(&fifo_dir.join(".cargo-lock")),
+            LockBit::Unknown
+        );
+        assert_eq!(
+            probe_lock_bounded(&fifo_dir.join("debug/.cargo-lock")),
+            LockBit::Unknown
+        );
+        assert_eq!(
+            probe_lock_bounded(&link_dir.join(".cargo-lock")),
+            LockBit::Unknown
+        );
+        assert_eq!(
+            probe_lock_bounded(&free_dir.join(".cargo-lock")),
+            LockBit::Free
+        );
+
+        let c = check_targets_bounded(scan);
+        for name in ["cad410-fifo-target", "cad411-locklink-target"] {
+            let row = task_row(&c.value, name);
+            assert_eq!(row["cargo_lock"], "unknown", "{name}");
+            assert_eq!(row["followed"], false, "{name}");
+            assert_eq!(row["safe_to_delete"], false, "{name}");
+            assert_eq!(row["action"], "none", "{name}");
+        }
+        assert_eq!(
+            task_row(&c.value, "cad412-freelock-target")["cargo_lock"],
+            "free"
+        );
+        assert!(!c.remedy.contains("rm"));
+    }
+
+    #[test]
+    fn task_targets_do_not_follow_ancestor_symlinks() {
+        let root = TempDir::new().unwrap();
+        let mut scan = fake_scan(&root);
+        let real = root.path().join("real-cache");
+        let hidden = real.join("cad400-ancestor-target");
+        std::fs::create_dir_all(&hidden).unwrap();
+        real_bytes(&hidden.join("payload.bin"), 50_000);
+        mkfifo(&hidden.join(".cargo-lock"));
+        let via = scan.temp_dir.join("via-link");
+        std::os::unix::fs::symlink(&real, &via).unwrap();
+        let through = via.join("cad400-ancestor-target");
+        // Final-component lstat would follow `via-link` and then block
+        // on the FIFO. The probe must stop at the ancestor link.
+        assert_eq!(
+            probe_lock_bounded(&through.join(".cargo-lock")),
+            LockBit::Unknown
+        );
+        assert!(matches!(
+            lexical_kind(&through),
+            LexicalKind::Symlink {
+                final_component: false,
+                ..
+            }
+        ));
+        scan.cargo_target_dir = Some(through);
+        let c = check_targets_bounded(scan);
+        let row = task_row(&c.value, "cad400-ancestor-target");
+        assert_eq!(row["ancestor_symlink"], true);
+        assert_eq!(row["symlink"], true);
+        assert_eq!(row["followed"], false);
+        assert_eq!(row["bytes"], Value::Null);
+        assert_eq!(row["bytes_skipped"], "symlink");
+        assert_eq!(row["cargo_lock"], "unknown");
+        assert_eq!(row["foreign_symlink"], true);
+        assert_eq!(row["safe_to_delete"], false);
+        assert_eq!(row["reclaim_candidate"], false);
+        assert_eq!(row["action"], "none");
+        let blob = serde_json::to_string(&c.to_json()).unwrap();
+        assert!(!blob.contains("payload.bin"), "{blob}");
+        assert!(!blob.contains("rm "), "{blob}");
     }
 
     #[test]
