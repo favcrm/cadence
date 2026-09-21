@@ -12,7 +12,11 @@
 //! trailer on the finish commit. Refs are kept as history, marked
 //! `closed: true`; the issue's status is untouched — status follows
 //! the job or the PM. `issue finish --merged` sweeps every open
-//! worktree ref whose branch is merged and whose guard passes.
+//! worktree ref whose branch is merged and whose guard passes. A
+//! recorded directory that is already missing, or a branch checked
+//! out at a different live path, is skipped for reconciliation
+//! instead of finished — the sweep does not close those refs or
+//! delete those branches.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -1415,14 +1419,131 @@ pub(crate) fn run(
     Ok(out)
 }
 
+/// Where a sweep candidate's recorded worktree and branch actually
+/// are. Read-only: a missing directory or a branch checked out at
+/// another path is a reconciliation, never a finish.
+struct PathPreview {
+    /// `present` when the recorded directory exists, else `missing`.
+    path_state: &'static str,
+    /// `present`, `missing`, or `elsewhere` (the branch ref exists
+    /// and `git worktree list` has it at a different path).
+    branch_state: &'static str,
+    /// Path `git worktree list` reports for this branch, if any.
+    live_path: Option<PathBuf>,
+    /// Stable skip reason when the sweep must not finish this row.
+    reconcile: Option<&'static str>,
+}
+
+/// Collapse `.` and `..` without requiring the path to exist, so a
+/// missing recorded directory still compares with the path git prints.
+fn lexical_path(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    if let (Ok(a), Ok(b)) = (a.canonicalize(), b.canonicalize()) {
+        return a == b;
+    }
+    lexical_path(a) == lexical_path(b)
+}
+
+/// The worktree path that currently has `branch` checked out, from
+/// `git worktree list --porcelain`. `None` when the branch is not
+/// registered to any worktree (including when the list cannot be read).
+fn branch_checkout_path(root: &Path, branch: &str) -> Option<PathBuf> {
+    if branch.is_empty() {
+        return None;
+    }
+    let text = git(root, &["worktree", "list", "--porcelain"]).ok()?;
+    let want = format!("branch refs/heads/{branch}");
+    let mut current: Option<PathBuf> = None;
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(path));
+        } else if line == want {
+            return current;
+        }
+    }
+    None
+}
+
+fn path_preview(t: &Target) -> PathPreview {
+    let recorded = t.wt_dir.as_deref();
+    let path_present = recorded.is_some_and(|d| d.is_dir());
+    let live = branch_checkout_path(&t.root, &t.branch);
+    let branch_missing = t.branch.is_empty() || branch_tip(&t.root, &t.branch).is_none();
+    let elsewhere = !branch_missing
+        && match (recorded, live.as_deref()) {
+            (Some(recorded), Some(live)) => !same_path(recorded, live),
+            _ => false,
+        };
+    let branch_state = if branch_missing {
+        "missing"
+    } else if elsewhere {
+        "elsewhere"
+    } else {
+        "present"
+    };
+    // A live checkout at another path wins over "the recorded
+    // directory is gone": that lane is the retained worktree the
+    // missing ref must not be finished out from under.
+    let reconcile = if elsewhere {
+        Some("reconcile: path-branch-mismatch")
+    } else if !path_present && branch_missing {
+        Some("reconcile: missing-worktree, branch-missing")
+    } else if !path_present {
+        Some("reconcile: missing-worktree, branch-present")
+    } else {
+        None
+    };
+    PathPreview {
+        path_state: if path_present { "present" } else { "missing" },
+        branch_state,
+        live_path: live,
+        reconcile,
+    }
+}
+
+fn annotate_preview(row: &mut Value, preview: &PathPreview) {
+    row["path_state"] = json!(preview.path_state);
+    row["branch_state"] = json!(preview.branch_state);
+    row["live_path"] = preview
+        .live_path
+        .as_ref()
+        .map(|p| json!(p.display().to_string()))
+        .unwrap_or(Value::Null);
+}
+
 /// `issue finish --merged [--project P] [--remote] [--dry-run]` —
 /// sweep every open worktree ref in scope whose branch is merged into
 /// the repo's default branch and whose per-worktree guard passes.
 /// One row per worktree: `finished` (or `would-finish` under
 /// `--dry-run`), `skipped(<reason>)` when it is not a merged
-/// candidate, `refused(<reason>)` when a guard blocks. The sweep never
-/// forces. `refused` counts the refused rows — the CLI maps nonzero
-/// to exit 1.
+/// candidate, `refused(<reason>)` when a guard blocks. A missing
+/// recorded directory, or a branch checked out at a different live
+/// path, is `skipped` with a reconcile reason on both the dry run
+/// and a real sweep — those refs stay open and those branches stay.
+/// Every candidate row also carries `path_state` (`present`|
+/// `missing`), `branch_state` (`present`|`missing`|`elsewhere`), and
+/// `live_path`. The sweep never forces. `refused` counts the refused
+/// rows — the CLI maps nonzero to exit 1.
 pub fn sweep(
     pm: &Pm,
     project: Option<&str>,
@@ -1450,6 +1571,9 @@ pub fn sweep(
             "merged_by": Value::Null,
             "outcome": Value::Null,
             "reason": Value::Null,
+            "path_state": Value::Null,
+            "branch_state": Value::Null,
+            "live_path": Value::Null,
         });
         let id = issue.front.id.clone();
         // Only open WORKTREE refs are sweep candidates — a lone open
@@ -1466,11 +1590,27 @@ pub fn sweep(
             }
         };
         row["branch"] = json!(t.branch);
+        // Missing path / branch-at-another-path is not a finish
+        // candidate. Classify before the guard so a gone directory
+        // cannot read as `would-finish`, and skip `run` so a real
+        // sweep cannot close the ref or delete the branch. Explicit
+        // `issue finish <ID>` is unchanged.
+        let preview = path_preview(&t);
+        annotate_preview(&mut row, &preview);
         // Candidates are merged branches — unmerged work is skipped,
         // never refused (the point of the verb). The sweep's own
         // evidence never fetches: a real row's `run` fetches for its
         // own gate at finish time.
         let ev = evidence(&t, false);
+        if let Some(reason) = preview.reconcile {
+            if let Branch::Merged { how, .. } = &ev.state {
+                row["merged_by"] = json!(how);
+            }
+            row["outcome"] = json!("skipped");
+            row["reason"] = json!(reason);
+            rows.push(row);
+            continue;
+        }
         match &ev.state {
             Branch::Gone => {
                 row["outcome"] = json!("skipped");
