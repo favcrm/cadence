@@ -909,6 +909,57 @@ fn runner_result_path(cwd: &Path, runner: &RunnerConfig) -> Option<PathBuf> {
     (runner.result_format == ResultFormat::Junit).then(|| cwd.join(&runner.result_path))
 }
 
+/// Render the full-suite object with the stable CAD-173 consumer fields at
+/// its top level. Keep the nested step/result shape as well: review reports
+/// already written by this branch use it, while the acceptance contract
+/// intentionally addresses the concise `.full_suite.tests[]` path.
+fn full_suite_report(step: Option<&Step>, command: &str, retries: u64) -> Value {
+    let mut report = match step {
+        Some(step) => step.to_json(),
+        None => json!({
+            "outcome": "skipped",
+            "reason": "--no-full",
+            "cmd": command,
+        }),
+    };
+    // Keep the acceptance path in seconds while retaining duration_ms for
+    // existing report consumers and markdown rendering. A skipped suite has
+    // no measurement, so its schema value is explicit null rather than an
+    // invented duration.
+    report["duration_s"] = step
+        .map(|step| json!(step.duration_ms as f64 / 1000.0))
+        .unwrap_or(Value::Null);
+    report["retries"] = json!(retries);
+    let structured = step
+        .and_then(|step| step.result.as_ref())
+        .map(TestRunSummary::to_json);
+    report["tests"] = structured
+        .as_ref()
+        .map(|result| result["tests"].clone())
+        .unwrap_or_else(|| json!([]));
+    if let Some(structured) = structured {
+        for key in [
+            "valid",
+            "test_count",
+            "passed",
+            "failed",
+            "skipped",
+            "failed_tests",
+            "reason",
+        ] {
+            report[key] = structured[key].clone();
+        }
+    }
+    report
+}
+
+/// Publish both names for the equal-conditions rows. `failures` is retained
+/// for existing report consumers; `isolated` is the CAD-173 contract path.
+fn set_failure_reports(report: &mut Value, comparisons: &[Value]) {
+    report["failures"] = json!(comparisons);
+    report["isolated"] = json!(comparisons);
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers — unit-tested without IO
 // ---------------------------------------------------------------------------
@@ -1290,6 +1341,35 @@ fn find_test_file(dir: &Path, name: &str, globs: &[String], git_secs: u64) -> Op
 /// executed for `reason`.
 fn unknown_side(reason: &str) -> Value {
     json!({"outcome": "unknown", "reason": reason})
+}
+
+/// Preserve a failed full-suite observation when the backend did not emit a
+/// testcase name. The row carries a null `test` field: a synthetic name would
+/// turn missing evidence into a false attribution. `result` is the gated
+/// isolated classification and remains `unknown`, so the verdict stays
+/// blocking until a named testcase can be compared.
+fn unknown_full_suite_row(step: &Step) -> Value {
+    let reason = step
+        .result
+        .as_ref()
+        .and_then(|result| result.reason.as_deref())
+        .unwrap_or("full suite failed without a named testcase");
+    let gated_reason = format!("full suite testcase evidence unavailable: {reason}");
+    let base_reason = "full suite emitted no testcase name for base comparison";
+    let gated = unknown_side(&gated_reason);
+    let base = unknown_side(base_reason);
+    json!({
+        "source": "full_suite",
+        "test": null,
+        "in_run": step.outcome,
+        "result": "unknown",
+        "gated": gated.clone(),
+        "base": base.clone(),
+        "isolated_gated": gated,
+        "isolated_base": base,
+        "verdict": "inconclusive",
+        "reason": reason,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,11 +1812,7 @@ pub fn run(opts: &Options) -> Result<i32> {
     report["gates"] = json!(gate_steps.iter().map(Step::to_json).collect::<Vec<_>>());
     report["stress"] = json!(stress_results);
     report["suite_lock"] = suite_lock;
-    report["full_suite"] = match &suite_step {
-        Some(s) => s.to_json(),
-        None => json!({"outcome": "skipped", "reason": "--no-full",
-            "cmd": cfg.full_suite}),
-    };
+    report["full_suite"] = full_suite_report(suite_step.as_ref(), &cfg.full_suite, 0);
 
     // Equal-conditions compare: every failing test name, rerun alone
     // on the gated tree and alone on the base head.
@@ -1790,6 +1866,9 @@ pub fn run(opts: &Options) -> Result<i32> {
             if !valid_test_name(name) {
                 comparisons.push(json!({
                     "test": name, "in_run": "fail",
+                    "result": "unknown",
+                    "gated": unknown_side("test name failed validation"),
+                    "base": unknown_side("test name failed validation"),
                     "isolated_gated": unknown_side("test name failed validation"),
                     "isolated_base": unknown_side("test name failed validation"),
                     "verdict": "inconclusive",
@@ -1804,6 +1883,9 @@ pub fn run(opts: &Options) -> Result<i32> {
             let Some(file) = file.filter(|f| safe_rel_path(f)) else {
                 comparisons.push(json!({
                     "test": name, "in_run": "fail",
+                    "result": "unknown",
+                    "gated": unknown_side("test file not found under test_globs"),
+                    "base": unknown_side("test file not found under test_globs"),
                     "isolated_gated": unknown_side("test file not found under test_globs"),
                     "isolated_base": unknown_side("test file not found under test_globs"),
                     "verdict": "inconclusive",
@@ -1891,6 +1973,9 @@ pub fn run(opts: &Options) -> Result<i32> {
             let mut row = json!({
                 "test": name, "cmd": cmd,
                 "in_run": "fail",
+                "result": gated,
+                "gated": gated_side.clone(),
+                "base": base_side.clone(),
                 "isolated_gated": gated_side,
                 "isolated_base": base_side,
                 "verdict": verdict,
@@ -1902,7 +1987,24 @@ pub fn run(opts: &Options) -> Result<i32> {
         }
         drop(base_tree);
     }
-    report["failures"] = json!(comparisons);
+    // A failed full suite without a named testcase is still evidence that
+    // blocks the review. Keep one explicit unknown row so the report cannot
+    // look like a successful empty comparison set; never invent a testcase
+    // name to satisfy the shape.
+    let suite_without_named_failures = suite_step.as_ref().is_some_and(|step| {
+        matches!(step.outcome, "fail" | "timeout")
+            && if step.result.is_some() {
+                structured_failed_tests(step).is_empty()
+            } else {
+                extract_failed_tests(&step.output).is_empty()
+            }
+    });
+    if suite_without_named_failures {
+        if let Some(step) = suite_step.as_ref() {
+            comparisons.push(unknown_full_suite_row(step));
+        }
+    }
+    set_failure_reports(&mut report, &comparisons);
     report["base_prepare"] = json!(base_prepare_steps
         .iter()
         .map(Step::to_json)
@@ -2103,6 +2205,18 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
     );
     let comparisons = report["failures"].as_array().cloned().unwrap_or_default();
     for f in &comparisons {
+        if f["source"] == "full_suite" && f["result"] == "unknown" {
+            push_reason(
+                &mut level,
+                &mut reasons,
+                2,
+                format!(
+                    "full suite produced no executable testcase evidence — {}",
+                    f["reason"].as_str().unwrap_or("reason unavailable")
+                ),
+            );
+            continue;
+        }
         let name = f["test"].as_str().unwrap_or("?");
         match f["verdict"].as_str() {
             Some("regression") => push_reason(
@@ -2752,6 +2866,98 @@ gate_secs = 42
         );
         assert_eq!(executed.executed_count(), 1);
         assert_eq!(classify_isolated(&step("ok", executed)), "pass");
+    }
+
+    #[test]
+    fn report_exposes_cad173_schema_and_preserves_legacy_paths() {
+        let summary = parse_junit(
+            r#"<testsuites tests="1" skipped="0" failures="0">
+  <testsuite name="contract" tests="1" skipped="0" failures="0">
+    <testcase name="executed_case" time="0.125"/>
+  </testsuite>
+</testsuites>"#,
+        );
+        let step = Step {
+            name: "full-suite".into(),
+            cmd: "scripts/cadence-nextest --all-targets".into(),
+            duration_ms: 125,
+            outcome: "ok",
+            exit: Some(0),
+            tail: Vec::new(),
+            output: String::new(),
+            result: Some(summary),
+        };
+        let full = full_suite_report(Some(&step), "scripts/cadence-nextest", 0);
+
+        // Canonical CAD-173 consumers read the concise top-level fields.
+        assert_eq!(full["retries"], 0);
+        assert_eq!(full["duration_s"], 0.125);
+        assert_eq!(full["tests"].as_array().unwrap().len(), 1);
+        assert_eq!(full["tests"][0]["name"], "executed_case");
+        // Existing consumers retain the nested step/result representation.
+        assert_eq!(full["result"]["tests"].as_array().unwrap().len(), 1);
+
+        let gated = json!({"outcome": "pass"});
+        let base = json!({"outcome": "pass"});
+        let row = json!({
+            "test": "executed_case",
+            "result": "pass",
+            "gated": gated.clone(),
+            "base": base.clone(),
+            "isolated_gated": gated,
+            "isolated_base": base,
+            "verdict": "flake-under-load",
+        });
+        let mut report = json!({});
+        set_failure_reports(&mut report, &[row]);
+        assert_eq!(report["isolated"][0]["gated"]["outcome"], "pass");
+        assert_eq!(report["isolated"][0]["result"], "pass");
+        assert_eq!(report["failures"][0]["isolated_base"]["outcome"], "pass");
+    }
+
+    #[test]
+    fn no_execution_full_suite_evidence_is_unknown_and_blocks() {
+        let all_skipped = parse_junit(
+            r#"<testsuites tests="1" skipped="1" failures="0">
+  <testsuite name="ignored" tests="1" skipped="1" failures="0">
+    <testcase name="ignored_case"><skipped/></testcase>
+  </testsuite>
+</testsuites>"#,
+        );
+        assert!(all_skipped.valid);
+        assert_eq!(all_skipped.executed_count(), 0);
+
+        let missing_dir = tempfile::tempdir().unwrap();
+        let missing = parse_junit_file(&missing_dir.path().join("junit.xml"));
+        let malformed = parse_junit("<testsuites><testsuite><testcase name=\"x\">");
+        let cases = [missing, malformed, all_skipped];
+        for summary in cases {
+            let step = Step {
+                name: "full-suite".into(),
+                cmd: "scripts/cadence-nextest --all-targets".into(),
+                duration_ms: 250,
+                outcome: "fail",
+                exit: Some(0),
+                tail: Vec::new(),
+                output: String::new(),
+                result: Some(summary),
+            };
+            let row = unknown_full_suite_row(&step);
+            assert_eq!(row["source"], "full_suite");
+            assert_eq!(row["result"], "unknown");
+            assert_eq!(row["verdict"], "inconclusive");
+            assert!(row["test"].is_null(), "must not invent a testcase name");
+            assert_eq!(row["gated"]["outcome"], "unknown");
+            assert_eq!(row["base"]["outcome"], "unknown");
+
+            let mut report = json!({
+                "merge": {}, "prepare": [], "gates": [], "stress": [],
+                "open_pr_conflicts": [], "full_suite": {"outcome": "fail"}
+            });
+            set_failure_reports(&mut report, &[row]);
+            assert_eq!(report["isolated"].as_array().unwrap().len(), 1);
+            assert_eq!(suggest(&report, false).0, "blocked");
+        }
     }
 
     #[test]
