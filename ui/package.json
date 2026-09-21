@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test:url-state": "tsc --target ES2022 --module commonjs --moduleResolution node --lib ES2023,DOM --skipLibCheck --outDir /tmp/cadence-ui-url-state-test src/urlState.ts src/urlState.test.ts src/filters.ts src/types.ts && node /tmp/cadence-ui-url-state-test/urlState.test.js",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"
   },

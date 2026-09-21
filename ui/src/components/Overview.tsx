@@ -2,6 +2,7 @@ import type { MonitorAlert, Monitoring, Overview } from "../types";
 
 const KIND_CHIP: Record<string, string> = {
   merge: "bg-ok/15 text-ok",
+  intake: "bg-info/10 text-info",
   approval: "bg-warn/10 text-warn",
   fenced: "bg-fail/10 text-fail",
   stalled: "bg-warn/10 text-warn",
@@ -17,6 +18,7 @@ const KIND_CHIP: Record<string, string> = {
 
 const KIND_LABEL: Record<string, string> = {
   merge: "merge",
+  intake: "intake",
   approval: "approval",
   fenced: "fenced",
   stalled: "stalled",
@@ -54,13 +56,17 @@ const MONITOR_STATE_CHIP: Record<string, string> = {
 
 const NEED_GROUPS = [
   { key: "decision", label: "Needs your decision", kinds: new Set(["approval"]) },
-  { key: "team", label: "Team handling", kinds: new Set(["merge", "fenced", "stalled", "review_no_pr", "blocked_ready", "pr_no_verdict", "ci_red", "silent_end"]) },
+  { key: "team", label: "Team handling", kinds: new Set(["merge", "intake", "fenced", "stalled", "review_no_pr", "blocked_ready", "pr_no_verdict", "ci_red", "silent_end"]) },
   { key: "dependency", label: "Waiting on dependency", kinds: new Set(["drift"]) },
   { key: "info", label: "Information", kinds: new Set(["inbox_unread", "tracker_behind"]) },
 ] as const;
 
 function needGroup(kind: string): (typeof NEED_GROUPS)[number] {
-  return NEED_GROUPS.find((group) => group.kinds.has(kind)) ?? NEED_GROUPS[3];
+  return NEED_GROUPS.find((group) => group.kinds.has(kind)) ?? NEED_GROUPS[1];
+}
+
+function needLabel(kind: string): string {
+  return KIND_LABEL[kind] ?? "unknown / unclassified";
 }
 
 function projectMatches(value: string | null | undefined, project: string): boolean {
@@ -91,7 +97,7 @@ function NeedRows({ rows }: { rows: Overview["needs_me"] }) {
                 className="card px-3.5 py-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5"
               >
                 <span className={`chip ${KIND_CHIP[n.kind] ?? "bg-ink-800 text-ink-400"}`}>
-                  {KIND_LABEL[n.kind] ?? n.kind}
+                  {needLabel(n.kind)}
                 </span>
                 <span className="num text-label text-ink-500 w-9 shrink-0">
                   {age(n.age)}
@@ -113,7 +119,7 @@ function NeedRows({ rows }: { rows: Overview["needs_me"] }) {
                     details
                   </summary>
                   <div className="mt-1.5 rounded border border-ink-700 bg-ink-900 px-2.5 py-2 text-micro text-ink-400">
-                    <div className="text-ink-300">Observed {age(n.age)} ago · source {n.project || "global host"}</div>
+                    <div className="text-ink-300">kind {n.kind} · observed {age(n.age)} ago · source {n.project || "global host"}</div>
                     <code className="num block mt-1 whitespace-pre-wrap break-words">{n.command}</code>
                   </div>
                 </details>

@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { api, type WriteResp } from "../api";
 import { epicProgress, matches, type BoardFilters } from "../filters";
 import { agentIsUnassigned, agentMatchesProject, issueProjectMap } from "../scope";
 import type { AgentsPayload, Health, IssueCard, Project } from "../types";
+import type { ProjectView } from "../urlState";
 import Card, { noDragReason } from "./Card";
 import FilterBar from "./FilterBar";
 
@@ -134,6 +135,8 @@ interface Props {
   agents: AgentsPayload | null;
   health: Health | null;
   project: string;
+  view: ProjectView;
+  onView: (view: ProjectView) => void;
   query: string;
   readOnly: boolean;
   actor: string;
@@ -255,6 +258,8 @@ export default function Board({
   agents,
   health,
   project,
+  view,
+  onView,
   query,
   readOnly,
   actor,
@@ -268,19 +273,6 @@ export default function Board({
   onAgents,
 }: Props) {
   const [over, setOver] = useState<string | null>(null);
-  const [view, setView] = useState<"kanban" | "list">(() => {
-    const fromUrl = new URLSearchParams(location.search).get("view");
-    if (fromUrl === "list" || fromUrl === "kanban") return fromUrl;
-    return localStorage.getItem("cadence-project-view") === "list" ? "list" : "kanban";
-  });
-  useEffect(() => {
-    localStorage.setItem("cadence-project-view", view);
-    const query = new URLSearchParams(location.search);
-    if (view === "list") query.set("view", "list");
-    else query.delete("view");
-    const next = query.toString();
-    history.replaceState(null, "", location.pathname + (next ? `?${next}` : ""));
-  }, [view]);
   // `scope` is what the project and the search box leave; the filter
   // bar counts over it and its chips narrow it to `visible`.
   const scope = issues.filter(
@@ -480,7 +472,7 @@ export default function Board({
             <button
               key={mode}
               aria-pressed={view === mode}
-              onClick={() => setView(mode)}
+              onClick={() => onView(mode)}
               className={`chip !py-[.25rem] capitalize ${view === mode ? "bg-accent/10 text-accent" : "text-ink-500 hover:text-ink-200"}`}
             >
               {mode === "kanban" ? "board" : "list"}

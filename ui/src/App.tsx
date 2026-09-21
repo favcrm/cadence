@@ -9,7 +9,15 @@ import Plan from "./components/Plan";
 import Sidebar from "./components/Sidebar";
 import Toast, { type ToastMsg } from "./components/Toast";
 import { Logo } from "./components/Logo";
-import { readFilters, writeFilters, type BoardFilters } from "./filters";
+import type { BoardFilters } from "./filters";
+import {
+  browserStoredProjectView,
+  persistBrowserProjectView,
+  readAppUrlState,
+  serializeAppUrlState,
+  type AppTab,
+  type ProjectView,
+} from "./urlState";
 import type {
   AgentsPayload,
   Health,
@@ -21,13 +29,16 @@ import type {
 } from "./types";
 
 export default function App() {
-  const initialUrl = new URLSearchParams(location.search);
-  const [tab, setTab] = useState<
-    "overview" | "board" | "plan" | "agents" | "memory"
-  >("overview");
-  const [project, setProject] = useState(() => initialUrl.get("project") ?? "all");
+  const initialState = useRef<ReturnType<typeof readAppUrlState> | null>(null);
+  if (!initialState.current) {
+    initialState.current = readAppUrlState(location.search, browserStoredProjectView());
+  }
+  const initial = initialState.current;
+  const [tab, setTab] = useState<AppTab>(initial.tab);
+  const [view, setView] = useState<ProjectView>(initial.view);
+  const [project, setProject] = useState(initial.project);
   const [query, setQuery] = useState("");
-  const [filters, setFilters] = useState<BoardFilters>(() => readFilters(initialUrl));
+  const [filters, setFilters] = useState<BoardFilters>(initial.filters);
   const [issues, setIssues] = useState<IssueCard[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<AgentsPayload | null>(null);
@@ -37,7 +48,7 @@ export default function App() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
-  const [openId, setOpenId] = useState<string | null>(() => initialUrl.get("issue"));
+  const [openId, setOpenId] = useState<string | null>(initial.openId);
   const [openDetail, setOpenDetail] = useState<IssueDetail | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastMsg | null>(null);
@@ -47,14 +58,16 @@ export default function App() {
   const readOnly = meta?.read_only ?? false;
   const actor = meta?.actor ?? "operator (ui)";
 
-  // Selection lives in the URL (`?project=cadence&issue=CAD-16`) so a
-  // refresh or a pasted link restores the same view.
+  // App selection lives in the URL (`?tab=board&view=list&project=cadence`
+  // `issue=CAD-16`) so a refresh or pasted link restores the same view.
   useEffect(() => {
     const read = () => {
-      const q = new URLSearchParams(location.search);
-      setProject(q.get("project") ?? "all");
-      setOpenId(q.get("issue"));
-      setFilters(readFilters(q));
+      const next = readAppUrlState(location.search, browserStoredProjectView());
+      setTab(next.tab);
+      setView(next.view);
+      setProject(next.project);
+      setOpenId(next.openId);
+      setFilters(next.filters);
     };
     read();
     addEventListener("popstate", read);
@@ -62,15 +75,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const q = new URLSearchParams(location.search);
-    q.delete("project");
-    q.delete("issue");
-    if (project !== "all") q.set("project", project);
-    if (openId) q.set("issue", openId);
-    writeFilters(q, filters);
-    const s = q.toString();
+    const s = serializeAppUrlState(location.search, {
+      tab,
+      view,
+      project,
+      openId,
+      filters,
+    });
     history.replaceState(null, "", location.pathname + (s ? `?${s}` : ""));
-  }, [project, openId, filters]);
+  }, [tab, view, project, openId, filters]);
+
+  useEffect(() => {
+    persistBrowserProjectView(view);
+  }, [view]);
 
   // The tab readable inside refresh's stable callback — the overview
   // payload costs a daemon probe + gh cache read, so it only fetches
@@ -421,6 +438,8 @@ export default function App() {
             agents={agents}
             health={health}
             project={project}
+            view={view}
+            onView={setView}
             query={query}
             readOnly={readOnly}
             actor={actor}
