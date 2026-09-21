@@ -1101,6 +1101,56 @@ fn write_route(
     opts: &ServeOpts,
     send: &dyn Fn(Request, HttpResp),
 ) {
+    // Monitor acknowledgement: this is a daemon-owned durable write, kept
+    // beside (and behind the same browser write guards as) tracker writes.
+    // The UI never mutates the monitor SQLite store directly, which keeps a
+    // board built from a newer binary compatible with an older live daemon.
+    if let Some(tail) = path.strip_prefix("/api/monitors/") {
+        let mut segs = tail.split('/');
+        let monitor = segs.next().unwrap_or_default();
+        let alerts = segs.next().unwrap_or_default();
+        let seq = segs.next().unwrap_or_default();
+        let ack = segs.next().unwrap_or_default();
+        let shape_ok = *method == Method::Post
+            && !monitor.is_empty()
+            && alerts == "alerts"
+            && seq.parse::<i64>().is_ok_and(|n| n > 0)
+            && ack == "ack"
+            && segs.next().is_none();
+        if !shape_ok {
+            send(request, err_response(404, "no such monitor write route"));
+            return;
+        }
+        if opts.read_only {
+            send(
+                request,
+                guard_fail("read_only", "board is read-only — writes are disabled"),
+            );
+            return;
+        }
+        if let Err(resp) = write_guard(&request, "application/json", opts) {
+            send(request, resp);
+            return;
+        }
+        // `MonitorAlert` uses the protocol identifier grammar for its audit
+        // actor.  The browser actor includes a display suffix, so retain a
+        // conservative operator identity here rather than passing an invalid
+        // or user-controlled value to the daemon.
+        let seq = seq.parse::<i64>().unwrap_or_default();
+        match client::rpc(
+            state_dir,
+            "monitor_alert_ack",
+            json!({"monitor": monitor, "alert": seq, "by": "operator"}),
+        ) {
+            Ok(value) => send(
+                request,
+                json_response(json!({"ok": true, "alert": value["alert"]})),
+            ),
+            Err(error) => send(request, err_response(400, &error.to_string())),
+        }
+        return;
+    }
+
     // Memory curation: POST /api/memories/<project>/<slug>/accept|reject
     // — same guarded write path as the CLI; the commit actor is the
     // request-attributed one (`request_actor`), as on /api/issues.
@@ -1542,9 +1592,9 @@ fn agents_fp(state_dir: &Path, list: &Value) -> u64 {
     value_fp(&json!(parts))
 }
 
-/// Poll the three board inputs once a second and push
-/// `issues|agents|jobs` event names into `tx` on change. The baseline
-/// is taken before the loop so a fresh client only sees deltas.
+/// Poll the board inputs once a second and push
+/// `issues|agents|jobs|monitoring` event names into `tx` on change. The
+/// baseline is taken before the loop so a fresh client only sees deltas.
 /// `__tick` is the per-second liveness probe: the reader drops it, and
 /// a failed send means the client hung up — stop polling the daemon.
 fn watch_changes(
@@ -1553,6 +1603,7 @@ fn watch_changes(
     mut tracker: Option<std::time::SystemTime>,
     mut jobs: u64,
     mut agents: u64,
+    mut monitoring: u64,
     tx: std::sync::mpsc::Sender<&'static str>,
 ) {
     loop {
@@ -1585,6 +1636,15 @@ fn watch_changes(
                 }
             }
         }
+        if let Ok(list) = client::rpc(&state_dir, "monitor_list", json!({})) {
+            let fp = value_fp(&list);
+            if fp != monitoring {
+                monitoring = fp;
+                if tx.send("monitoring").is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1607,6 +1667,9 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     let agents0 = client::rpc(state_dir, "agent_list", json!({}))
         .map(|l| agents_fp(state_dir, &l))
         .unwrap_or(0);
+    let monitoring0 = client::rpc(state_dir, "monitor_list", json!({}))
+        .map(|l| value_fp(&l))
+        .unwrap_or(0);
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
                 Cache-Control: no-store\r\nConnection: close\r\n\r\n";
     if w.write_all(head.as_bytes())
@@ -1618,7 +1681,7 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
     std::thread::spawn({
         let (state_dir, pm_dir) = (state_dir.to_path_buf(), pm_dir.to_path_buf());
-        move || watch_changes(state_dir, pm_dir, tracker0, jobs0, agents0, tx)
+        move || watch_changes(state_dir, pm_dir, tracker0, jobs0, agents0, monitoring0, tx)
     });
     let frame = |w: &mut dyn Write, bytes: &[u8]| -> bool {
         w.write_all(bytes).and_then(|_| w.flush()).is_ok()

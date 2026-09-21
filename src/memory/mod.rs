@@ -231,23 +231,15 @@ fn load_file(path: &Path, key: &str) -> Result<Option<Memory>> {
     }))
 }
 
-/// Every memory in one project, sorted by slug.
+/// Every memory in one project, sorted by slug. Strict: the first
+/// load error fails the whole call — see `load_project_report` for
+/// the keep-going variant.
 pub fn load_project(pm_dir: &Path, key: &str) -> Result<Vec<Memory>> {
-    let dir = pm_dir.join(key).join("memory");
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".md") || name.starts_with('.') {
-                continue;
-            }
-            if let Some(m) = load_file(&entry.path(), key)? {
-                out.push(m);
-            }
-        }
+    let (out, errors) = load_project_report(pm_dir, key);
+    match errors.into_iter().next() {
+        Some(e) => Err(Error::rejected(format!("memory: {e}"))),
+        None => Ok(out),
     }
-    out.sort_by(|a, b| a.front.id.cmp(&b.front.id));
-    Ok(out)
 }
 
 /// Every memory across every project.
@@ -261,21 +253,44 @@ pub fn load_all(pm_dir: &Path) -> Result<Vec<Memory>> {
 
 /// `load_project` that keeps going past a broken file — returns the
 /// good memories plus one `<project>/<file>: <error>` string per
-/// failure, so callers can surface instead of swallowing them.
+/// failure, so callers can surface instead of swallowing them. An
+/// absent memory dir is a valid empty store; a directory that cannot
+/// be enumerated (permissions, a file in its place, …) is an error.
 pub fn load_project_report(pm_dir: &Path, key: &str) -> (Vec<Memory>, Vec<String>) {
     let dir = pm_dir.join(key).join("memory");
     let (mut out, mut errors) = (Vec::new(), Vec::new());
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".md") || name.starts_with('.') {
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (out, errors),
+        Err(e) => {
+            errors.push(format!("{key}/memory: cannot list directory: {e}"));
+            return (out, errors);
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                errors.push(format!("{key}/memory: directory entry unreadable: {e}"));
                 continue;
             }
-            match load_file(&entry.path(), key) {
-                Ok(Some(m)) => out.push(m),
-                Ok(None) => {}
-                Err(e) => errors.push(format!("{key}/{name}: {e}")),
-            }
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".md") || name.starts_with('.') {
+            continue;
+        }
+        match load_file(&entry.path(), key) {
+            // Hand-edited scope globs skip write-time validation —
+            // quarantine over-complex patterns here, before matching
+            // could ever see them.
+            Ok(Some(m)) => match m.front.scope.paths.iter().find(|p| glob_over_budget(p)) {
+                Some(pat) => errors.push(format!(
+                    "{key}/{name}: path scope '{pat}' is too complex — quarantined at load"
+                )),
+                None => out.push(m),
+            },
+            Ok(None) => {}
+            Err(e) => errors.push(format!("{key}/{name}: {e}")),
         }
     }
     out.sort_by(|a, b| a.front.id.cmp(&b.front.id));
@@ -390,6 +405,15 @@ fn save_mem(mem: &Memory) -> Result<()> {
     Ok(())
 }
 
+/// `**` recursion in glob_match is exponential on adversarial
+/// patterns (`**a**a**a**`) — the bound a path scope may carry,
+/// enforced at write time (`check_front`) and re-applied at load
+/// (`load_project_report`) so a hand-edited file never reaches
+/// matching with an unbounded pattern.
+fn glob_over_budget(pat: &str) -> bool {
+    pat.len() > 200 || pat.matches("**").count() > 2
+}
+
 /// Frontmatter + body validation used by every write and by lint.
 /// `components` is the project's declared list (empty = anything goes).
 fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
@@ -431,10 +455,8 @@ fn check_front(mem: &Memory, components: &[String]) -> Result<()> {
             )));
         }
     }
-    // `**` recursion in glob_match is exponential on adversarial
-    // patterns (`**a**a**a**`) — bound the shape a scope may carry.
     for pat in &f.scope.paths {
-        if pat.len() > 200 || pat.matches("**").count() > 2 {
+        if glob_over_budget(pat) {
             return Err(Error::rejected(format!(
                 "path scope '{pat}' is too complex — ≤200 chars, ≤2 `**` segments"
             )));
@@ -861,17 +883,17 @@ pub fn issue_ctx(pm: &Pm, issue: &board::Issue, provider: Option<&str>) -> Resul
     })
 }
 
-/// The dispatch/match surface: accepted memories applying to an issue.
+/// The dispatch/match surface: accepted memories applying to an
+/// issue. Report-mode load — valid records still match when sibling
+/// files are broken; the caller surfaces `errors`.
 pub fn match_for_issue(
     pm: &Pm,
     issue: &board::Issue,
     provider: Option<&str>,
-) -> Result<Vec<Memory>> {
+) -> Result<(Vec<Memory>, Vec<String>)> {
     let ctx = issue_ctx(pm, issue, provider)?;
-    Ok(match_memories(
-        &load_project(&pm.dir, &issue.project)?,
-        &ctx,
-    ))
+    let (pool, errors) = load_project_report(&pm.dir, &issue.project);
+    Ok((match_memories(&pool, &ctx), errors))
 }
 
 // ── Lessons rendering (dispatch) ─────────────────────────────────
@@ -1041,12 +1063,28 @@ pub fn lint_dir(
     err: &mut dyn FnMut(String),
     warn: &mut dyn FnMut(String),
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // An absent dir lints clean — nothing to check.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            err(format!("{}/memory: cannot list directory: {e}", proj.key));
+            return;
+        }
     };
     let mut slugs = Vec::new();
     let mut mems = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                err(format!(
+                    "{}/memory: directory entry unreadable: {e}",
+                    proj.key
+                ));
+                continue;
+            }
+        };
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.ends_with(".md") || name.starts_with('.') {
             continue;

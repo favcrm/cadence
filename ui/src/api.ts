@@ -125,13 +125,35 @@ export const api = {
   agents: () => get<AgentsPayload>("/api/agents"),
   agent: (alias: string) =>
     get<AgentDetail>(`/api/agents/${encodeURIComponent(alias)}`),
+  monitorAck: (monitor: string, alert: number) =>
+    fetch(
+      `/api/monitors/${encodeURIComponent(monitor)}/alerts/${alert}/ack`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Cadence-Board": "1",
+        },
+        body: "{}",
+      },
+    ).then(async (resp) => {
+      const parsed = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        throw new ApiError(
+          parsed?.error ?? `${resp.status} ${resp.statusText}`,
+          resp.status,
+          parsed ?? undefined,
+        );
+      }
+      return parsed as { ok: boolean; alert: unknown };
+    }),
   memories: (opts: { project?: string; status?: string; type?: string } = {}) => {
     const q = new URLSearchParams();
     if (opts.project) q.set("project", opts.project);
     if (opts.status) q.set("status", opts.status);
     if (opts.type) q.set("type", opts.type);
     const s = q.toString();
-    return get<{ memories: MemoryCard[] }>(
+    return get<{ memories: MemoryCard[]; memory_errors?: string[] }>(
       `/api/memories${s ? `?${s}` : ""}`,
     );
   },

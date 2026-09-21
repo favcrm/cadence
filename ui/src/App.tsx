@@ -107,7 +107,7 @@ export default function App() {
 
   useEffect(refresh, [refresh]);
 
-  // Live updates: /api/stream pushes `issues|agents|jobs` event names —
+  // Live updates: /api/stream pushes `issues|agents|jobs|monitoring` event names —
   // each one just triggers the normal refresh. EventSource reconnects
   // on its own; the 30 s poll below stays as the fallback while the
   // stream is down.
@@ -116,6 +116,7 @@ export default function App() {
     es.addEventListener("issues", refresh);
     es.addEventListener("agents", refresh);
     es.addEventListener("jobs", refresh);
+    es.addEventListener("monitoring", refresh);
     return () => es.close();
   }, [refresh]);
 
@@ -141,6 +142,28 @@ export default function App() {
     clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), 4200);
   }, []);
+
+  const ackMonitor = useCallback(
+    (monitor: string, seq: number) => {
+      if (readOnly) {
+        say("err", "board is read-only — monitor acknowledgements are disabled");
+        return;
+      }
+      api
+        .monitorAck(monitor, seq)
+        .then(() => {
+          say("ok", `${monitor} alert ${seq} acknowledged`);
+          return api.overview().then(setOverview);
+        })
+        .catch((e) =>
+          say(
+            "err",
+            `monitor alert acknowledgement failed: ${String(e.message ?? e)}`,
+          ),
+        );
+    },
+    [readOnly, say],
+  );
 
   /// A write response is authoritative: merge the fresh card into the
   /// board and the fresh detail into the drawer — no second fetch.
@@ -365,7 +388,9 @@ export default function App() {
           </div>
         )}
 
-        {tab === "overview" && <OverviewView data={overview} />}
+        {tab === "overview" && (
+          <OverviewView data={overview} readOnly={readOnly} onAck={ackMonitor} />
+        )}
         {tab === "board" && (
           <Board
             issues={issues}

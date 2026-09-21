@@ -1,0 +1,5 @@
+# Trusted extracted executable for cargo-nextest 0.9.145.
+# Source archive: cargo-nextest-0.9.145-x86_64-unknown-linux-gnu.tar.gz
+# Archive SHA-256: 32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867
+c4d4f4ad7eb50677b568aae324251e8bd6978e9fc6fe97aa1347a2afdd95e59c  cargo-nextest
+32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867  cargo-nextest-0.9.145-x86_64-unknown-linux-gnu.tar.gz

@@ -133,6 +133,10 @@ pub enum MemoryAction {
         /// Issue id — supplies component, tags and commit paths.
         #[arg(long)]
         issue: Option<String>,
+        /// Project key for explicit-axis matching; defaults to the cwd's
+        /// registered project when `--issue` is absent.
+        #[arg(long)]
+        project: Option<String>,
         /// Provider for scope matching (the dispatch target's).
         #[arg(long)]
         provider: Option<String>,
@@ -354,6 +358,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
         }
         MemoryAction::Match {
             issue,
+            project,
             provider,
             component,
             path,
@@ -361,7 +366,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             json: as_json,
         } => {
             let pm = open_pm()?;
-            let (mems, ctx, load_errors) = if let Some(id) = issue {
+            let (mems, ctx, load_errors, project_key) = if let Some(id) = issue {
                 let (proj, dir) = write::issue_dir(&pm, id)?;
                 let (front, body) = write::load_front(&dir)?;
                 let issue_obj = board::Issue {
@@ -377,16 +382,23 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 ctx.paths.extend(path.clone());
                 ctx.tags.extend(tag.clone());
                 let (pool, errors) = memory::load_project_report(&pm.dir, &issue_obj.project);
-                (memory::match_memories(&pool, &ctx), ctx, errors)
+                (
+                    memory::match_memories(&pool, &ctx),
+                    ctx,
+                    errors,
+                    issue_obj.project,
+                )
             } else {
+                let cwd = std::env::current_dir()?;
+                let proj = crate::issue::project::resolve(&pm.dir, project.as_deref(), &cwd)?;
                 let ctx = MatchCtx {
                     components: component.clone(),
                     paths: path.clone(),
                     providers: provider.clone().into_iter().collect(),
                     tags: tag.clone(),
                 };
-                let (pool, errors) = memory::load_all_report(&pm.dir);
-                (memory::match_memories(&pool, &ctx), ctx, errors)
+                let (pool, errors) = memory::load_project_report(&pm.dir, &proj.key);
+                (memory::match_memories(&pool, &ctx), ctx, errors, proj.key)
             };
             if let Some(line) = memory::load_errors_line(&load_errors) {
                 eprintln!("{line}");
@@ -402,6 +414,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                         "fact": memory::fact_line(&m.body),
                     })).collect::<Vec<_>>(),
                     "context": {
+                        "project": project_key,
                         "components": ctx.components,
                         "paths": ctx.paths,
                         "providers": ctx.providers,
