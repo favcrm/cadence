@@ -322,7 +322,7 @@ pub(crate) fn host_thresholds(pm_dir: Option<&Path>) -> Thresholds {
     Thresholds::resolve(pm_dir.and_then(host_overrides))
 }
 
-/// All eight checks against `scan`; the report is one JSON object whose
+/// All nine checks against `scan`; the report is one JSON object whose
 /// `level` is the worst check level.
 pub fn run(scan: &Scan) -> Value {
     let checks = [
@@ -331,6 +331,7 @@ pub fn run(scan: &Scan) -> Value {
         check_pipes(scan),
         check_memory(scan),
         check_processes(scan),
+        check_sessions(scan),
         check_orphans(scan),
         check_temp_dirs(scan),
         check_worktrees(scan),
@@ -1034,14 +1035,23 @@ fn read_meminfo(proc_root: &Path) -> Option<MemInfo> {
     (m.total > 0).then_some(m)
 }
 
-/// `/proc/<pid>/stat`: (comm, utime+stime jiffies, starttime jiffies,
-/// rss bytes). `comm` is the kernel name — the census groups on it;
-/// fields after the last `)` are positional and safe.
-fn proc_stat(pid_dir: &Path) -> Option<(String, u64, u64, u64)> {
+/// The fields `stat` yields for free: comm, parentage, CPU, the
+/// start-time half of pid+start identity (field 22) and RSS.
+struct ProcStat {
+    comm: String,
+    ppid: u32,
+    cpu_jiffies: u64,
+    start_jiffies: u64,
+    rss_bytes: u64,
+}
+
+fn proc_stat(pid_dir: &Path) -> Option<ProcStat> {
     let text = std::fs::read_to_string(pid_dir.join("stat")).ok()?;
     let (head, rest) = text.rsplit_once(')')?;
     let comm = head.split_once('(')?.1.trim().to_string();
     let f: Vec<&str> = rest.split_whitespace().collect();
+    // rest[0] is field 3 (state); ppid is field 4 → rest[1].
+    let ppid: u32 = f.get(1)?.parse().ok()?;
     let utime: u64 = f.get(11)?.parse().ok()?;
     let stime: u64 = f.get(12)?.parse().ok()?;
     let start_jiffies: u64 = f.get(19)?.parse().ok()?;
@@ -1052,7 +1062,13 @@ fn proc_stat(pid_dir: &Path) -> Option<(String, u64, u64, u64)> {
     } else {
         0
     };
-    Some((comm, utime.saturating_add(stime), start_jiffies, rss))
+    Some(ProcStat {
+        comm,
+        ppid,
+        cpu_jiffies: utime.saturating_add(stime),
+        start_jiffies,
+        rss_bytes: rss,
+    })
 }
 
 /// Coalesce comm variants into the family an operator thinks in —
@@ -1071,6 +1087,7 @@ fn comm_family(comm: &str) -> String {
         "claude",
         "devin",
         "codex",
+        "cursor",
         "cadence",
         "python",
         "tmux",
@@ -1142,7 +1159,7 @@ fn proc_census(scan: &Scan) -> Census {
             census.vanished += 1;
             continue;
         };
-        let Some((comm, cpu_jiffies, start_jiffies, rss)) = proc_stat(&ent.path()) else {
+        let Some(stat) = proc_stat(&ent.path()) else {
             // A pid that vanished mid-scan is normal; an unreadable
             // stat is hidepid or a race — counted either way.
             if ent.path().exists() {
@@ -1152,15 +1169,15 @@ fn proc_census(scan: &Scan) -> Census {
             }
             continue;
         };
-        let age = uptime.map(|u| (u as u64).saturating_sub(start_jiffies / hz));
-        let cpu_secs = cpu_jiffies / hz;
+        let age = uptime.map(|u| (u as u64).saturating_sub(stat.start_jiffies / hz));
+        let cpu_secs = stat.cpu_jiffies / hz;
         // "Idle": alive over an hour at under ~1% duty — the leaked
         // browser sessions of CAD-154 burned nothing for days.
         let idle =
             age.is_some_and(|a| a >= 3_600) && cpu_secs.saturating_mul(100) <= age.unwrap_or(0);
-        let group = census.groups.entry(comm_family(&comm)).or_default();
+        let group = census.groups.entry(comm_family(&stat.comm)).or_default();
         group.count += 1;
-        group.rss_bytes += rss;
+        group.rss_bytes += stat.rss_bytes;
         group.uids.insert(meta.uid());
         census.procs += 1;
         if let Some(age_secs) = age {
@@ -2076,6 +2093,1195 @@ fn check_orphans(scan: &Scan) -> Check {
     check(name, level, value, threshold, detail, remedy)
 }
 
+// ---------- owned session trees (CAD-198; CAD-188 phase 1) ----------
+//
+// Read-only census answering "which agent session trees are on this
+// host, who owns each, and what would the unowned in-scope ones free".
+// Ownership is a three-way join — registry row (UNSCOPED), the recorded
+// endpoint pid, the live process tree — and every disagreement mode is
+// named rather than guessed. Nothing here acts: no kills, stops,
+// deletes, checkpoints or writes of any kind.
+//
+// Rules carried from the ops audit
+// (/var/www/agent-notes/20260920-160600-ops-cad188-session-gc-audit.md):
+//   * The registry read is unscoped BY CONSTRUCTION — the store opens
+//     read-only and every agents row is read. `cadence agent list`
+//     silently group-scopes under CADENCE_ALIAS; a scoped absence must
+//     never prove "unowned" (12 of 20 agents were invisible that way).
+//     `registry_scope` is printed so the consumer can see which view
+//     produced the classification.
+//   * Tree totals are PSS (smaps_rollup) and VmSwap (status) summed
+//     once per member pid — never RSS sums and never sums of
+//     per-family totals: MCP wrappers are children of the sessions
+//     that spawned them, so their cost is already inside the tree.
+//   * argv and env are never opened (CAD-141); identity is comm, the
+//     (pid, start_jiffies) pair and the cwd/exe links only — and
+//     start_jiffies is enforced, not just printed: a recorded
+//     endpoint pid that resolves to a process newer than the row's
+//     last write is reuse, and no claim may ride on it.
+//   * A tree is a reclaim candidate only when ownership is proven
+//     absent (ProcessOnly on a fully-read registry) AND the root runs
+//     as the daemon's euid AND its cwd lands inside this pm's
+//     registered projects — in the same mount namespace, on a live
+//     (not deleted) cwd, under scope roots that are themselves
+//     provable directories. Foreign users, foreign projects,
+//     disputed ownership and unreadable evidence are all listed but
+//     protected.
+
+/// comm families that can root an agent session tree — the providers
+/// cadence spawns (managed stdio) or a pane can run (pty). Membership
+/// is by kernel comm alone; argv is never opened. A provider added
+/// without a row here is silently missed by the census — fail-open on
+/// *listing* only (the session is invisible, never misclaimed as a
+/// candidate or an owner).
+const SESSION_FAMILIES: &[&str] = &["claude", "codex", "cursor", "devin"];
+
+/// `VmSwap`/`Pss` reads are per-pid; an `smaps_rollup` absent or denied
+/// for part of a tree marks the totals partial, never wrong.
+struct TreeMetrics {
+    pss_bytes: u64,
+    swap_bytes: u64,
+    pss_missing: u32,
+    swap_missing: u32,
+    /// The member list outgrew `MAX_METRIC_PIDS` — totals are a lower
+    /// bound over the first N members only.
+    truncated: bool,
+}
+
+/// Per-member `smaps_rollup`/`status` reads are capped — a session
+/// that forked a build must not make `doctor` map-walk the whole
+/// build on every `session start`/`session end`. Over the cap the
+/// tree's totals are a flagged lower bound, never an estimate.
+const MAX_METRIC_PIDS: usize = 512;
+
+/// How a live session tree and the registry agree — the CAD-188
+/// closed set minus `RecordOnly` (a registry row with no live tree is
+/// not a tree; those rows are listed under `records_only`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Agreement {
+    /// Registry row + live tree, joined on the recorded endpoint pid.
+    Agreed,
+    /// Live tree, no registry row — proven against an unscoped read
+    /// of a store that opened (or is provably absent: no rows exist).
+    ProcessOnly,
+    /// The registry generation contradicts the generation a live
+    /// running turn token embeds — fence, never a candidate.
+    GenerationMismatch,
+    /// The join could not be proven — store unreadable, endpoint pid
+    /// claimed twice, /proc raced. Fail-closed: never a candidate.
+    Unknown,
+}
+
+impl Agreement {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Agreed => "agreed",
+            Self::ProcessOnly => "process-only",
+            Self::GenerationMismatch => "generation-mismatch",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Where the tree's root cwd sits relative to this pm's projects —
+/// scope is proven by path, never by alias-name pattern.
+#[derive(Clone, PartialEq, Eq)]
+enum Scope {
+    /// Inside a registered project repo (its key) or the pm dir.
+    Project(String),
+    /// Resolved but matching nothing registered — a foreign project
+    /// or unrelated session; protected, never a candidate.
+    Foreign,
+    /// cwd unreadable, deleted, or in a different mount namespace —
+    /// scope cannot be proven.
+    Unproven,
+}
+
+impl Scope {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Project(k) => k,
+            Self::Foreign => "foreign",
+            Self::Unproven => "unproven",
+        }
+    }
+}
+
+/// One live session tree — the census row.
+struct SessionTree {
+    root_pid: u32,
+    /// starttime jiffies — pid+start is the identity; pid alone is
+    /// not (PID reuse is CAD-188 §10).
+    root_start_jiffies: u64,
+    /// The root's real uid (`status` Uid:) — a session owned by
+    /// another user is never a candidate, whatever its cwd says.
+    /// `None` = unreadable → uid unproven → still not a candidate.
+    root_uid: Option<u32>,
+    /// The root's `ns/mnt` differs from ours — its cwd resolves in
+    /// another namespace, so path-based scope cannot be proven.
+    root_ns_foreign: bool,
+    root_family: String,
+    root_cwd: Option<PathBuf>,
+    root_cwd_deleted: bool,
+    root_cpu_secs: u64,
+    age_secs: Option<u64>,
+    /// Every member's (pid, start_jiffies) — attribution and a later
+    /// phase's recheck material; each pid appears in one tree only.
+    members: Vec<(u32, u64)>,
+    metrics: TreeMetrics,
+    owner: Option<usize>,
+    agreement: Agreement,
+    agreement_why: String,
+    scope: Scope,
+}
+
+/// One `agents` row plus the message facts the census can prove.
+struct RegAgent {
+    alias: String,
+    provider: String,
+    endpoint_kind: String,
+    generation: Option<String>,
+    /// agents.pid — the pane pid for pty endpoints, the provider
+    /// process for managed ones; a stale value is a fact, not an
+    /// error.
+    endpoint_pid: Option<u32>,
+    /// agents.cwd — where the row's endpoint lives. Used to fence
+    /// "unowned" when the recorded pid has gone stale: a tree rooted
+    /// under a stale row's cwd is plausibly that row's session.
+    cwd: Option<String>,
+    state: String,
+    reason: Option<String>,
+    queued: u64,
+    running: u64,
+    /// Generation embedded in a live running turn token
+    /// (`<kind>-<generation>-<uuid>`) — the only live-endpoint
+    /// generation readable without the daemon.
+    running_generation: Option<String>,
+    /// Newest completed/started message time, else the row's updated.
+    last_progress: Option<f64>,
+    /// agents.updated — the row's last write. An endpoint pid is
+    /// recorded together with a write, so the process the pid names
+    /// can never be NEWER than this: a later start means reuse.
+    updated: Option<f64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegStore {
+    /// No `cadence.sqlite3` — provably zero rows, so "no registry row"
+    /// is a proven fact, not a gap.
+    Absent,
+    Open,
+    /// Present but not openable read-only — ownership is UNPROVEN for
+    /// every tree; nothing may classify ProcessOnly.
+    Unreadable,
+}
+
+impl RegStore {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Open => "open",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
+struct RegEvidence {
+    store: RegStore,
+    agents: Vec<RegAgent>,
+}
+
+/// agents + pending/progress facts from `cadence.sqlite3`, opened
+/// SQLITE_OPEN_READ_ONLY — a census must not migrate or create the
+/// file on a host that never ran the daemon. Caveat: the store is
+/// WAL, so a read-only connection still touches `-shm`; a store that
+/// exists but can't be prepared comes back `Unreadable` and every
+/// tree classifies `unknown` — fail-closed, and silent in the sense
+/// that no tree row will say why beyond the store marker.
+fn registry_evidence(scan: &Scan) -> RegEvidence {
+    let path = scan.state_dir.join("cadence.sqlite3");
+    if !path.exists() {
+        return RegEvidence {
+            store: RegStore::Absent,
+            agents: Vec::new(),
+        };
+    }
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return RegEvidence {
+            store: RegStore::Unreadable,
+            agents: Vec::new(),
+        };
+    };
+    let mut ev = RegEvidence {
+        store: RegStore::Open,
+        agents: Vec::new(),
+    };
+    let Ok(mut st) = conn.prepare(
+        "SELECT alias, provider, endpoint_kind, generation, pid, state, \
+         error, cwd, updated FROM agents ORDER BY alias",
+    ) else {
+        // A store whose agents table is unreadable/unmigrated is as
+        // good as closed for ownership purposes — fail closed.
+        ev.store = RegStore::Unreadable;
+        return ev;
+    };
+    let mut index = std::collections::HashMap::new();
+    let Ok(rows) = st.query_map([], |r| {
+        Ok(RegAgent {
+            alias: r.get(0)?,
+            provider: r.get(1)?,
+            endpoint_kind: r.get(2)?,
+            generation: r.get(3)?,
+            endpoint_pid: r
+                .get::<_, Option<i64>>(4)?
+                .and_then(|p| u32::try_from(p).ok()),
+            state: r.get(5)?,
+            reason: r.get(6)?,
+            cwd: r.get::<_, Option<String>>(7)?,
+            queued: 0,
+            running: 0,
+            running_generation: None,
+            last_progress: r.get::<_, Option<f64>>(8)?,
+            updated: r.get::<_, Option<f64>>(8)?,
+        })
+    }) else {
+        ev.store = RegStore::Unreadable;
+        return ev;
+    };
+    for (i, row) in rows.flatten().enumerate() {
+        index.insert(row.alias.clone(), i);
+        ev.agents.push(row);
+    }
+    if let Ok(mut st) = conn.prepare(
+        "SELECT alias, state, COUNT(*) FROM messages \
+         WHERE state IN ('queued','submitting','running') \
+         GROUP BY alias, state",
+    ) {
+        if let Ok(rows) = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, u64>(2)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                if let Some(a) = index.get(&row.0).map(|i| &mut ev.agents[*i]) {
+                    if row.1 == "running" {
+                        a.running = row.2;
+                    } else {
+                        a.queued += row.2;
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(mut st) = conn.prepare(
+        "SELECT alias, MAX(COALESCE(completed, started, created)) \
+         FROM messages GROUP BY alias",
+    ) {
+        if let Ok(rows) = st.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<f64>>(1)?))
+        }) {
+            for (alias, at) in rows.flatten() {
+                if let (Some(a), Some(at)) = (index.get(&alias).map(|i| &mut ev.agents[*i]), at) {
+                    a.last_progress = Some(at.max(a.last_progress.unwrap_or(0.0)));
+                }
+            }
+        }
+    }
+    // A running turn's token embeds the endpoint generation that
+    // accepted it (`<kind>-<generation>-<uuid>`) — the one piece of
+    // live-endpoint state readable without the daemon.
+    if let Ok(mut st) = conn.prepare(
+        "SELECT alias, turn_id FROM messages \
+         WHERE state='running' AND turn_id IS NOT NULL",
+    ) {
+        if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
+            for (alias, token) in rows.flatten() {
+                if let Some(a) = index.get(&alias).map(|i| &mut ev.agents[*i]) {
+                    // `<kind>-<generation>-<uuid>`; the generation is a
+                    // simple uuid — 32 hex, no dashes. Any other token
+                    // shape is not generation evidence.
+                    let gen = token
+                        .strip_prefix(&format!("{}-", a.endpoint_kind))
+                        .and_then(|rest| rest.split('-').next())
+                        .filter(|g| g.len() == 32 && g.chars().all(|c| c.is_ascii_hexdigit()));
+                    if let Some(gen) = gen {
+                        a.running_generation = Some(gen.to_string());
+                    }
+                }
+            }
+        }
+    }
+    ev
+}
+
+/// Every pid's `stat` row — the census walk. cwd/exe links are read
+/// only for the handful of session roots afterwards, not per pid.
+fn collect_procs(proc_root: &Path) -> (BTreeMap<u32, ProcStat>, u64, u64) {
+    let mut procs = BTreeMap::new();
+    let mut unreadable = 0_u64;
+    let mut vanished = 0_u64;
+    let Ok(pids) = std::fs::read_dir(proc_root) else {
+        return (procs, unreadable, vanished);
+    };
+    for ent in pids.flatten() {
+        let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        match proc_stat(&ent.path()) {
+            Some(st) => {
+                procs.insert(pid, st);
+            }
+            None if ent.path().exists() => unreadable += 1,
+            None => vanished += 1,
+        }
+    }
+    (procs, unreadable, vanished)
+}
+
+/// Does walking ppid from `pid` reach a session-family ancestor —
+/// cycle-safe, bounded by the process count. A session comm with such
+/// an ancestor is a member of that session's tree, not a root.
+fn has_session_ancestor(pid: u32, procs: &BTreeMap<u32, ProcStat>) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut cur = procs.get(&pid).map(|p| p.ppid).unwrap_or(0);
+    while cur != 0 && seen.insert(cur) {
+        match procs.get(&cur) {
+            None => return false, // parent gone/unreadable — chain ends
+            Some(p) if SESSION_FAMILIES.contains(&comm_family(&p.comm).as_str()) => {
+                return true;
+            }
+            Some(p) => cur = p.ppid,
+        }
+    }
+    false
+}
+
+/// `/proc/<pid>/cwd` — read_link target, with the kernel's
+/// " (deleted)" suffix split out so a dead worktree is visible.
+fn proc_cwd(pid_dir: &Path) -> (Option<PathBuf>, bool) {
+    match std::fs::read_link(pid_dir.join("cwd")) {
+        Ok(p) => {
+            let s = p.to_string_lossy();
+            if let Some(live) = s.strip_suffix(" (deleted)") {
+                (Some(PathBuf::from(live)), true)
+            } else {
+                (Some(p), false)
+            }
+        }
+        Err(_) => (None, false),
+    }
+}
+
+/// `smaps_rollup` `Pss:` in bytes — the proportional figure the audit
+/// validated. `None` = absent (kernel <4.15, fixture) or denied.
+fn proc_pss(pid_dir: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(pid_dir.join("smaps_rollup")).ok()?;
+    let v = text.lines().find_map(|l| l.strip_prefix("Pss:"))?;
+    let kb: u64 = v.trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// `status` `VmSwap:` in bytes — the cost RSS hides (idle wrappers
+/// are swapped out). A readable status without the line means the
+/// kernel reports no swap for the pid — 0, not missing.
+fn proc_swap(pid_dir: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(pid_dir.join("status")).ok()?;
+    let v = text
+        .lines()
+        .find_map(|l| l.strip_prefix("VmSwap:"))
+        .unwrap_or("0");
+    let kb: u64 = v.trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// `status` `Uid:` real uid — the ownership axis a foreign user's
+/// session fails. `None` = status unreadable or field absent: uid
+/// unproven, and unproven is never "ours".
+fn proc_uid(pid_dir: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(pid_dir.join("status")).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// True when the pid lives in a different mount namespace than the
+/// doctor — its `/proc/<pid>/cwd` then resolves in the target's root,
+/// so a cwd string matching a registered repo is not scope proof.
+/// Missing links (fixtures, restricted procfs) read as same-ns.
+fn proc_ns_foreign(proc_root: &Path, pid: u32) -> bool {
+    let ours = std::fs::read_link(proc_root.join("self/ns/mnt"));
+    let theirs = std::fs::read_link(proc_root.join(pid.to_string()).join("ns/mnt"));
+    matches!((ours, theirs), (Ok(o), Ok(t)) if o != t)
+}
+
+/// The per-pid PSS+swap pass, run over a tree's members once each —
+/// partial reads are counted, totals stay measured-not-estimated.
+/// Past `MAX_METRIC_PIDS` the pass stops and marks itself truncated.
+fn tree_metrics(proc_root: &Path, members: &[u32]) -> TreeMetrics {
+    let mut m = TreeMetrics {
+        pss_bytes: 0,
+        swap_bytes: 0,
+        pss_missing: 0,
+        swap_missing: 0,
+        truncated: members.len() > MAX_METRIC_PIDS,
+    };
+    for pid in members.iter().take(MAX_METRIC_PIDS) {
+        let dir = proc_root.join(pid.to_string());
+        match proc_pss(&dir) {
+            Some(b) => m.pss_bytes += b,
+            None => m.pss_missing += 1,
+        }
+        match proc_swap(&dir) {
+            Some(b) => m.swap_bytes += b,
+            None => m.swap_missing += 1,
+        }
+    }
+    m
+}
+
+/// Session roots = topmost session-family pids; each tree is the
+/// transitive descendants of its root, each pid counted once — an
+/// MCP wrapper lands inside its session's tree, never beside it.
+fn session_trees(
+    procs: &BTreeMap<u32, ProcStat>,
+    proc_root: &Path,
+    uptime: Option<f64>,
+) -> Vec<SessionTree> {
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (pid, st) in procs {
+        children.entry(st.ppid).or_default().push(*pid);
+    }
+    let mut roots: Vec<u32> = procs
+        .iter()
+        .filter(|(pid, st)| {
+            SESSION_FAMILIES.contains(&comm_family(&st.comm).as_str())
+                && !has_session_ancestor(**pid, procs)
+        })
+        .map(|(pid, _)| *pid)
+        .collect();
+    roots.sort_unstable();
+    let mut trees = Vec::new();
+    for root in roots {
+        // Visited set: a ppid cycle from mid-walk pid reuse must not
+        // loop the DFS — `members` itself is built from `seen`.
+        let mut members = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(root);
+        let mut stack = vec![root];
+        while let Some(pid) = stack.pop() {
+            members.push(pid);
+            if let Some(kids) = children.get(&pid) {
+                for &kid in kids {
+                    if seen.insert(kid) {
+                        stack.push(kid);
+                    }
+                }
+            }
+        }
+        members.sort_unstable();
+        let st = &procs[&root];
+        let root_dir = proc_root.join(root.to_string());
+        let (cwd, cwd_deleted) = proc_cwd(&root_dir);
+        let started = st.start_jiffies / hz;
+        let member_rows: Vec<(u32, u64)> = members
+            .iter()
+            .map(|p| (*p, procs.get(p).map(|s| s.start_jiffies).unwrap_or(0)))
+            .collect();
+        trees.push(SessionTree {
+            root_pid: root,
+            root_start_jiffies: st.start_jiffies,
+            root_uid: proc_uid(&root_dir),
+            root_ns_foreign: proc_ns_foreign(proc_root, root),
+            root_family: comm_family(&st.comm),
+            root_cwd: cwd,
+            root_cwd_deleted: cwd_deleted,
+            root_cpu_secs: st.cpu_jiffies / hz,
+            age_secs: uptime.map(|u| (u as u64).saturating_sub(started)),
+            members: member_rows,
+            metrics: tree_metrics(proc_root, &members),
+            owner: None,
+            agreement: Agreement::Unknown,
+            agreement_why: String::new(),
+            scope: Scope::Unproven,
+        });
+    }
+    trees
+}
+
+/// Canonicalised `(label, path)` pairs that prove a tree's cwd is
+/// inside this pm — one per registered project repo, plus the pm dir
+/// itself. No pm.yaml → no scope proof → every unowned tree is
+/// `unproven`, never foreign and never a candidate.
+///
+/// A registered path must name a directory INSIDE the host: empty or
+/// relative strings are skipped (`Path::starts_with("")` is true for
+/// everything), canonicalisation must succeed, and a path that
+/// resolves to `/` or to the scan's home dir would scope the whole
+/// host — skipped too. One bad pm.yaml line must never widen scope.
+fn scope_roots(scan: &Scan) -> Vec<(String, PathBuf)> {
+    let mut roots = Vec::new();
+    let Some(pm) = &scan.pm_dir else {
+        return roots;
+    };
+    let home = std::fs::canonicalize(&scan.home).unwrap_or_else(|_| scan.home.clone());
+    let mut push = |label: String, raw: &Path| {
+        let Some(canon) = (raw.is_absolute() && !raw.as_os_str().is_empty())
+            .then(|| std::fs::canonicalize(raw).ok())
+            .flatten()
+        else {
+            return;
+        };
+        if canon == Path::new("/") || canon == home {
+            return;
+        }
+        roots.push((label, canon));
+    };
+    for project in crate::issue::project::list(pm).unwrap_or_default() {
+        for repo in &project.repos {
+            if let Some(path) = &repo.path {
+                let expanded = crate::issue::project::expand_home(path);
+                push(format!("project:{}", project.key), &expanded);
+            }
+        }
+    }
+    push("pm".to_string(), pm);
+    roots
+}
+
+/// What /proc proves about one row's recorded endpoint pid. `Live`
+/// is the only state that may carry ownership; the rest are stale
+/// or unverifiable claims that must fence, never bind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimState {
+    /// No endpoint pid recorded (inbox agents) — not a claim.
+    None,
+    /// pid alive, same uid, start bound by the row's last write.
+    Live,
+    /// Recorded pid is not in /proc — the endpoint is gone.
+    Dead,
+    /// Live pid but started AFTER the row's last write — reuse.
+    Reused,
+    /// Live pid owned by another uid — not this daemon's endpoint.
+    ForeignUid,
+    /// uid or start-time unreadable — the claim can't be proven.
+    Unverifiable,
+}
+
+impl ClaimState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none-recorded",
+            Self::Live => "live",
+            Self::Dead => "dead",
+            Self::Reused => "reused",
+            Self::ForeignUid => "foreign-uid",
+            Self::Unverifiable => "unverifiable",
+        }
+    }
+}
+
+/// Slack between a process's wall-clock start and the row's `updated`
+/// write: open records the pid and bumps `updated` in one step, and
+/// later state writes only push `updated` further out — so a start
+/// within the tolerance is the recorded process, one past it is not.
+const CLAIM_START_TOLERANCE_SECS: f64 = 120.0;
+
+/// Classify one row's endpoint-pid claim against live /proc. The
+/// start-time agreement proof: `updated` is written when the pid is
+/// recorded and on every later state write, so the recorded process
+/// can never have started after it — `proc_start > updated + slack`
+/// means the pid was recycled onto a different process.
+fn classify_claim(
+    a: &RegAgent,
+    procs: &BTreeMap<u32, ProcStat>,
+    proc_root: &Path,
+    uptime: Option<f64>,
+    now: SystemTime,
+    euid: u32,
+) -> ClaimState {
+    let Some(pid) = a.endpoint_pid else {
+        return ClaimState::None;
+    };
+    let Some(st) = procs.get(&pid) else {
+        return ClaimState::Dead;
+    };
+    match proc_uid(&proc_root.join(pid.to_string())) {
+        Some(u) if u != euid => return ClaimState::ForeignUid,
+        None => return ClaimState::Unverifiable,
+        _ => {}
+    }
+    let (Some(up), Some(updated)) = (uptime, a.updated) else {
+        return ClaimState::Unverifiable;
+    };
+    let Ok(now_s) = now.duration_since(std::time::UNIX_EPOCH) else {
+        return ClaimState::Unverifiable;
+    };
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    let start_wall = now_s.as_secs_f64() - up + st.start_jiffies as f64 / hz;
+    if start_wall > updated + CLAIM_START_TOLERANCE_SECS {
+        ClaimState::Reused
+    } else {
+        ClaimState::Live
+    }
+}
+
+/// Does the tree's root cwd sit at or under a row's `agents.cwd` —
+/// i.e. could this be that row's session? Both sides canonicalised;
+/// an unresolvable row cwd proves no overlap.
+fn cwd_overlaps(agent_cwd: Option<&String>, tree_cwd: Option<&PathBuf>) -> bool {
+    let (Some(a), Some(t)) = (agent_cwd, tree_cwd) else {
+        return false;
+    };
+    let ac = std::fs::canonicalize(a).unwrap_or_else(|_| PathBuf::from(a));
+    let tc = std::fs::canonicalize(t).unwrap_or_else(|_| t.clone());
+    tc.starts_with(&ac)
+}
+
+/// The three-way join — live tree ↔ agents row via the recorded
+/// endpoint pid, over an UNSCOPED agents list. Only `Live` claims
+/// (pid+start bound to the row's last write, same uid) may bind; a
+/// pid claimed by two rows is ambiguous for both; and a row whose
+/// recorded pid went stale while its cwd still covers a tree makes
+/// that tree `Unknown`, never `ProcessOnly`. Ambiguity is `Unknown`,
+/// not a guess.
+fn join_ownership(
+    trees: &mut [SessionTree],
+    ev: &RegEvidence,
+    procs: &BTreeMap<u32, ProcStat>,
+    claims: &[ClaimState],
+) {
+    let mut claim: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, a) in ev.agents.iter().enumerate() {
+        if let Some(p) = a.endpoint_pid {
+            claim.entry(p).or_default().push(i);
+        }
+    }
+    let mut members: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut seen_ancestor = std::collections::HashSet::new();
+    for tree in trees.iter_mut() {
+        // The lineage an endpoint pid may legitimately sit on: the
+        // root itself (managed), an ancestor (pty pane pid is the
+        // shell above the provider), or a member of the tree.
+        members.clear();
+        members.extend(tree.members.iter().map(|(pid, _)| *pid));
+        let mut cur = procs.get(&tree.root_pid).map(|p| p.ppid).unwrap_or(0);
+        seen_ancestor.clear();
+        while cur != 0 && seen_ancestor.insert(cur) {
+            match procs.get(&cur) {
+                Some(p) => {
+                    members.insert(cur);
+                    cur = p.ppid;
+                }
+                None => break,
+            }
+        }
+        // Claims on the lineage, split by what /proc proves about them.
+        let mut live_hits: Vec<usize> = Vec::new();
+        let mut stale_hits: Vec<usize> = Vec::new();
+        for (pid, owners) in &claim {
+            if members.contains(pid) {
+                for &i in owners {
+                    match claims[i] {
+                        ClaimState::Live => live_hits.push(i),
+                        ClaimState::None => {}
+                        _ => stale_hits.push(i),
+                    }
+                }
+            }
+        }
+        live_hits.sort_unstable();
+        live_hits.dedup();
+        stale_hits.sort_unstable();
+        stale_hits.dedup();
+        match (live_hits.as_slice(), stale_hits.as_slice()) {
+            ([], []) => {
+                // No row's recorded pid is anywhere on the lineage.
+                // Before calling that ProcessOnly, fence on rows whose
+                // claim went stale while their cwd still covers this
+                // tree — a daemon restart/pane respawn leaves exactly
+                // that shape, and the session may be theirs.
+                let stale_owner = ev.agents.iter().enumerate().find(|(i, a)| {
+                    !matches!(claims[*i], ClaimState::Live | ClaimState::None)
+                        && cwd_overlaps(a.cwd.as_ref(), tree.root_cwd.as_ref())
+                });
+                match (stale_owner, &ev.store) {
+                    (Some((_, a)), _) => {
+                        tree.agreement = Agreement::Unknown;
+                        tree.agreement_why = format!(
+                            "row {} holds a stale endpoint pid under this cwd — \
+                             ownership unproven",
+                            a.alias
+                        );
+                    }
+                    (None, RegStore::Open) => {
+                        tree.agreement = Agreement::ProcessOnly;
+                        tree.agreement_why =
+                            "no agents row claims this tree (unscoped registry read)".to_string();
+                    }
+                    (None, RegStore::Absent) => {
+                        tree.agreement = Agreement::ProcessOnly;
+                        tree.agreement_why =
+                            "no cadence.sqlite3 — no registry rows exist".to_string();
+                    }
+                    (None, RegStore::Unreadable) => {
+                        tree.agreement = Agreement::Unknown;
+                        tree.agreement_why =
+                            "cadence.sqlite3 unreadable — ownership unproven".to_string();
+                    }
+                }
+            }
+            ([], stale) => {
+                tree.agreement = Agreement::Unknown;
+                let why: Vec<String> = stale
+                    .iter()
+                    .map(|&i| format!("{} ({})", ev.agents[i].alias, claims[i].as_str()))
+                    .collect();
+                tree.agreement_why = format!(
+                    "recorded endpoint pid is not the live process — {}",
+                    why.join(", ")
+                );
+            }
+            ([one], []) => {
+                let a = &ev.agents[*one];
+                tree.owner = Some(*one);
+                match (&a.generation, &a.running_generation) {
+                    (Some(recorded), Some(live)) if recorded != live => {
+                        tree.agreement = Agreement::GenerationMismatch;
+                        tree.agreement_why = format!(
+                            "registry generation {}… ≠ running turn's {}",
+                            recorded.chars().take(8).collect::<String>(),
+                            live.chars().take(8).collect::<String>()
+                        );
+                    }
+                    _ => {
+                        tree.agreement = Agreement::Agreed;
+                        tree.agreement_why =
+                            format!("endpoint pid+start claims the tree ({})", a.alias);
+                    }
+                }
+            }
+            (live, stale) => {
+                tree.agreement = Agreement::Unknown;
+                tree.agreement_why = format!(
+                    "endpoint pid claimed by {} live + {} stale registry rows — ambiguous",
+                    live.len(),
+                    stale.len()
+                );
+            }
+        }
+    }
+}
+
+/// cwd → scope verdict. Both sides canonicalised. A deleted cwd only
+/// names where the process stood — the directory is gone, and the
+/// ` (deleted)` suffix is a string a directory can literally carry —
+/// so deletion is `unproven`, not a match. A foreign mount namespace
+/// makes the cwd string incomparable → `unproven`. An unreadable cwd
+/// proves nothing → `unproven`, never foreign.
+fn classify_scope(tree: &mut SessionTree, roots: &[(String, PathBuf)]) {
+    let Some(cwd) = &tree.root_cwd else {
+        tree.scope = Scope::Unproven;
+        return;
+    };
+    if tree.root_cwd_deleted || tree.root_ns_foreign {
+        tree.scope = Scope::Unproven;
+        return;
+    }
+    let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.clone());
+    for (label, root) in roots {
+        if canon.starts_with(root) {
+            tree.scope = Scope::Project(label.clone());
+            return;
+        }
+    }
+    tree.scope = Scope::Foreign;
+}
+
+/// Reclaim verdict for one tree. Candidates are exactly the
+/// ProcessOnly + same-uid + in-scope trees; everything else is
+/// protected with the reason this census can prove. `confidence`
+/// weighs age (the audit's tiers: ~3 days = high, hours = medium)
+/// and accounting completeness.
+fn reclaim_verdict(
+    tree: &SessionTree,
+    ev: &RegEvidence,
+    euid: u32,
+) -> (bool, Option<String>, String, String) {
+    // (candidate, protected_reason, confidence, basis)
+    let protected = |why: String| (false, Some(why), String::new(), String::new());
+    match tree.agreement {
+        Agreement::Agreed => {
+            let alias = tree
+                .owner
+                .map(|i| ev.agents[i].alias.as_str())
+                .unwrap_or("?");
+            protected(format!("owned — registry row {alias}"))
+        }
+        Agreement::GenerationMismatch => {
+            protected("generation disagreement — fenced, never a candidate".to_string())
+        }
+        Agreement::Unknown => protected(format!("unknown — {}", tree.agreement_why)),
+        Agreement::ProcessOnly => {
+            // uid before scope: a foreign user's tree inside a
+            // registered repo is foreign, not a candidate — and a
+            // root whose uid can't be read is unproven.
+            match tree.root_uid {
+                Some(u) if u != euid => {
+                    return protected(format!("root owned by uid {u} — foreign user"));
+                }
+                None => {
+                    return protected("root uid unreadable — ownership unproven".to_string());
+                }
+                _ => {}
+            }
+            match &tree.scope {
+                Scope::Foreign => {
+                    protected("outside this pm's project scope — foreign".to_string())
+                }
+                Scope::Unproven => protected(
+                    "root cwd unreadable, deleted, or in another mount \
+                     namespace — project scope unproven"
+                        .to_string(),
+                ),
+                Scope::Project(_) => {
+                    let mut why = Vec::new();
+                    let mut confidence = match tree.age_secs {
+                        Some(a) if a >= 72 * 3_600 => "high",
+                        Some(a) if a >= 4 * 3_600 => "medium",
+                        _ => "low",
+                    };
+                    match tree.age_secs {
+                        Some(a) => why.push(format!("root age {}h", a / 3_600)),
+                        None => {
+                            confidence = "low";
+                            why.push("age unproven (no /proc/uptime)".to_string());
+                        }
+                    }
+                    if tree.metrics.truncated {
+                        if confidence == "high" {
+                            confidence = "medium";
+                        }
+                        why.push(format!(
+                            "accounting truncated at {} members — totals are a lower bound",
+                            MAX_METRIC_PIDS
+                        ));
+                    }
+                    if tree.metrics.pss_missing + tree.metrics.swap_missing > 0 {
+                        if confidence == "high" {
+                            confidence = "medium";
+                        }
+                        why.push(format!(
+                            "partial accounting ({} pids missing PSS, {} missing swap)",
+                            tree.metrics.pss_missing, tree.metrics.swap_missing
+                        ));
+                    }
+                    (
+                        true,
+                        None,
+                        confidence.to_string(),
+                        format!("unowned and in-scope; {}", why.join("; ")),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// `doctor --host`'s owned-session-tree census — the CAD-188 phase-1
+/// surface. It acts on nothing, but the level follows the evidence:
+/// an unreadable registry is an evidence failure (every tree becomes
+/// `unknown`, and a watchdog keying on the exit code must not see 0),
+/// and a live candidate list warns so `render` actually prints the
+/// authorisation remedy — remedies render only for non-ok levels, so
+/// a constant `Ok` would ship a caveat that cannot print. `session
+/// start`/`end` map warn to exit 1 ("GO with warnings") — honest for
+/// both cases: a human's `claude` in the repo stays visible, and a
+/// broken registry is loud.
+fn check_sessions(scan: &Scan) -> Check {
+    let name = "sessions";
+    let threshold = json!(
+        "warn: registry unreadable, or unowned in-scope session trees present \
+         (dry-run census — never an action)"
+    );
+    if !scan.linux {
+        return check(
+            name,
+            Level::Ok,
+            json!({"skipped": true}),
+            threshold,
+            "session census is linux-only".to_string(),
+            String::new(),
+        );
+    }
+    let ev = registry_evidence(scan);
+    let (procs, unreadable, vanished) = collect_procs(&scan.proc_root);
+    let uptime = proc_uptime(&scan.proc_root);
+    let claims: Vec<ClaimState> = ev
+        .agents
+        .iter()
+        .map(|a| classify_claim(a, &procs, &scan.proc_root, uptime, scan.now, scan.uid))
+        .collect();
+    let mut trees = session_trees(&procs, &scan.proc_root, uptime);
+    join_ownership(&mut trees, &ev, &procs, &claims);
+    let roots = scope_roots(scan);
+    for tree in &mut trees {
+        classify_scope(tree, &roots);
+    }
+    // Registry rows no live tree claimed — the record-only class:
+    // rows with a dead endpoint pid, or none at all (inbox). Still
+    // listed so the census shows the whole registry it read, with
+    // what /proc proved about each recorded endpoint pid.
+    let records_only: Vec<Value> = ev
+        .agents
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !trees.iter().any(|t| t.owner == Some(*i)))
+        .map(|(i, a)| {
+            json!({
+                "alias": a.alias,
+                "provider": a.provider,
+                "endpoint_kind": a.endpoint_kind,
+                "state": a.state,
+                "reason": a.reason,
+                "endpoint_pid": a.endpoint_pid,
+                "endpoint_state": claims[i].as_str(),
+                "cwd": a.cwd,
+                "queued": a.queued,
+                "running": a.running,
+                "last_progress": a.last_progress,
+                "agreement": "record-only",
+            })
+        })
+        .collect();
+    let mut candidates: Vec<(u32, String)> = Vec::new();
+    let mut rows = Vec::new();
+    let mut cand_pss = 0_u64;
+    let mut cand_swap = 0_u64;
+    let mut cand_truncated = false;
+    for tree in &trees {
+        let (candidate, protected, confidence, basis) = reclaim_verdict(tree, &ev, scan.uid);
+        if candidate {
+            cand_truncated |= tree.metrics.truncated;
+            // The detail line is what a human pastes into a terminal —
+            // carry the context a bare pid lacks.
+            candidates.push((
+                tree.root_pid,
+                format!(
+                    "{}({}, {}, uid={}, {}h)",
+                    tree.root_pid,
+                    tree.root_family,
+                    tree.scope.as_str(),
+                    tree.root_uid
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    tree.age_secs.unwrap_or(0) / 3_600
+                ),
+            ));
+            cand_pss += tree.metrics.pss_bytes;
+            cand_swap += tree.metrics.swap_bytes;
+        }
+        let owner = tree.owner.map(|i| &ev.agents[i]);
+        rows.push(json!({
+            "root": {
+                "pid": tree.root_pid,
+                "start_jiffies": tree.root_start_jiffies,
+                "uid": tree.root_uid,
+                "ns_foreign": tree.root_ns_foreign,
+                "family": tree.root_family,
+                "cwd": tree.root_cwd,
+                "cwd_deleted": tree.root_cwd_deleted,
+                "age_secs": tree.age_secs,
+                "cpu_secs": tree.root_cpu_secs,
+            },
+            "alias": owner.map(|a| a.alias.as_str()),
+            "endpoint_kind": owner.map(|a| a.endpoint_kind.as_str()),
+            "generation": owner.and_then(|a| a.generation.as_deref()),
+            "endpoint_pid": owner.and_then(|a| a.endpoint_pid),
+            "state": owner.map(|a| a.state.as_str()),
+            "reason": owner.and_then(|a| a.reason.as_deref()),
+            "pending": owner.map(|a| json!({"queued": a.queued, "running": a.running})),
+            "last_progress": owner.and_then(|a| a.last_progress),
+            "agreement": tree.agreement.as_str(),
+            "agreement_why": tree.agreement_why,
+            "scope": tree.scope.as_str(),
+            "procs": tree.members.len(),
+            "members": tree
+                .members
+                .iter()
+                .map(|(pid, start)| json!({"pid": pid, "start_jiffies": start}))
+                .collect::<Vec<_>>(),
+            "pss_bytes": tree.metrics.pss_bytes,
+            "swap_bytes": tree.metrics.swap_bytes,
+            "pss_missing_pids": tree.metrics.pss_missing,
+            "swap_missing_pids": tree.metrics.swap_missing,
+            "metrics_truncated": tree.metrics.truncated,
+            "reclaim": {
+                "candidate": candidate,
+                "pss_bytes": tree.metrics.pss_bytes,
+                "swap_bytes": tree.metrics.swap_bytes,
+                "confidence": confidence,
+                "basis": basis,
+                "protected": protected,
+            },
+        }));
+    }
+    let owned = trees
+        .iter()
+        .filter(|t| t.agreement == Agreement::Agreed)
+        .count();
+    let process_only = trees
+        .iter()
+        .filter(|t| t.agreement == Agreement::ProcessOnly)
+        .count();
+    let unowned_in_scope = trees
+        .iter()
+        .filter(|t| t.agreement == Agreement::ProcessOnly && matches!(t.scope, Scope::Project(_)))
+        .count();
+    let unowned_foreign = trees
+        .iter()
+        .filter(|t| t.agreement == Agreement::ProcessOnly && t.scope == Scope::Foreign)
+        .count();
+    let unowned_unproven = trees
+        .iter()
+        .filter(|t| t.agreement == Agreement::ProcessOnly && t.scope == Scope::Unproven)
+        .count();
+    let mismatched = trees
+        .iter()
+        .filter(|t| t.agreement == Agreement::GenerationMismatch)
+        .count();
+    let uncertain = trees
+        .iter()
+        .filter(|t| t.agreement == Agreement::Unknown)
+        .count();
+    let foreign_uid = trees
+        .iter()
+        .filter(|t| {
+            t.agreement == Agreement::ProcessOnly && t.root_uid.is_some_and(|u| u != scan.uid)
+        })
+        .count();
+    let registry_scope = match ev.store {
+        RegStore::Open => format!("unscoped — all {} agents rows", ev.agents.len()),
+        RegStore::Absent => "unscoped — store absent (zero rows)".to_string(),
+        RegStore::Unreadable => "unscoped read FAILED — store unreadable".to_string(),
+    };
+    let mut detail = format!(
+        "{} trees: {} owned, {} unowned ({} in-scope / {} foreign / {} unproven / \
+         {} foreign-uid), {} generation-mismatch, {} uncertain; registry {} rows ({})",
+        trees.len(),
+        owned,
+        process_only,
+        unowned_in_scope,
+        unowned_foreign,
+        unowned_unproven,
+        foreign_uid,
+        mismatched,
+        uncertain,
+        ev.agents.len(),
+        ev.store.as_str(),
+    );
+    if !candidates.is_empty() {
+        // PSS shares can overlap across candidate trees, so the sum
+        // is normally an upper bound — but a truncated tree's totals
+        // are a lower bound over its first members, and one of those
+        // in the list makes the aggregate neither: say so.
+        if cand_truncated {
+            detail.push_str(&format!(
+                "; candidates (dry-run) would free ~{} RAM + ~{} swap \
+                 (estimate — PSS overlap and a truncated tree)",
+                human(cand_pss),
+                human(cand_swap)
+            ));
+        } else {
+            detail.push_str(&format!(
+                "; candidates (dry-run) would free ≤{} RAM + ≤{} swap (upper bound)",
+                human(cand_pss),
+                human(cand_swap)
+            ));
+        }
+        detail.push_str(&format!(
+            "; candidates: {}",
+            candidates
+                .iter()
+                .take(8)
+                .map(|(_, d)| d.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+        // Inlined into detail because render() only prints `remedy`
+        // for non-ok checks and candidates stay ok — the caveat must
+        // reach the operator next to the pid list it covers.
+        detail.push_str(
+            "; dry-run — nothing is stopped; any cleanup needs a separately \
+             authorised phase with an ownership recheck at action time",
+        );
+    }
+    if unreadable + vanished > 0 {
+        detail.push_str(&format!(
+            "; {} pids unreadable, {} vanished mid-scan",
+            unreadable, vanished
+        ));
+    }
+    let value = json!({
+        "registry_scope": registry_scope,
+        "registry_agents": ev.agents.len(),
+        "store": ev.store.as_str(),
+        "trees": rows,
+        "records_only": records_only,
+        "candidates": candidates
+            .iter()
+            .map(|(pid, _)| *pid)
+            .collect::<Vec<_>>(),
+        "totals": {
+            "trees": trees.len(),
+            "owned": owned,
+            "process_only": process_only,
+            "unowned_in_scope": unowned_in_scope,
+            "unowned_foreign": unowned_foreign,
+            "unowned_unproven": unowned_unproven,
+            "foreign_uid": foreign_uid,
+            "generation_mismatch": mismatched,
+            "uncertain": uncertain,
+            "candidates": candidates.len(),
+            "candidate_pss_bytes": cand_pss,
+            "candidate_swap_bytes": cand_swap,
+            // False the moment any candidate's metrics were truncated
+            // — a lower-bound tree in the sum means the aggregate is
+            // an estimate, not an upper bound.
+            "candidate_sums_upper_bound": !cand_truncated,
+        },
+        "procs_scanned": procs.len(),
+        "pids_unreadable": unreadable,
+        "pids_vanished": vanished,
+    });
+    let remedy = if candidates.is_empty() {
+        String::new()
+    } else {
+        "dry-run census — nothing is stopped or reaped; per-tree rows are under \
+         checks.sessions.trees in --json. Any cleanup needs a separately authorised \
+         phase with an ownership recheck at action time."
+            .to_string()
+    };
+    // Warn only on evidence failure: an unreadable store means the
+    // census could not classify, and a watchdog must see that. A live
+    // candidate list is a routine condition (a human ran an agent in a
+    // repo) and stays ok — its caveat is inlined in `detail` above.
+    let level = if ev.store == RegStore::Unreadable {
+        Level::Warn
+    } else {
+        Level::Ok
+    };
+    check(name, level, value, threshold, detail, remedy)
+}
+
 // ---------- leaked temp dirs ----------
 
 fn check_temp_dirs(scan: &Scan) -> Check {
@@ -2744,6 +3950,164 @@ mod tests {
             std::os::unix::fs::symlink(target, dir.join("fd").join((i + 3).to_string())).unwrap();
         }
         dir
+    }
+
+    /// proc/<pid>/ shaped for the session census: caller controls
+    /// comm, ppid, cwd and the metric files (`status` VmSwap,
+    /// `smaps_rollup` Pss) — the census never reads argv.
+    fn add_session_proc(
+        proc: &Path,
+        pid: u32,
+        ppid: u32,
+        comm: &str,
+        cwd: Option<&Path>,
+        age_secs: u64,
+        metrics: (Option<u64>, Option<u64>), // (smaps_rollup Pss kB, status VmSwap kB)
+    ) -> PathBuf {
+        let dir = proc.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        let starttime = (1_000_000_u64.saturating_sub(age_secs)) * hz;
+        // Fields after `)`: state, ppid, 17 fillers to field 21,
+        // then starttime (22) and two trailing fields.
+        std::fs::write(
+            dir.join("stat"),
+            format!(
+                "{pid} ({comm}) S {ppid} {} {starttime} 0 0",
+                "1 ".repeat(17)
+            ),
+        )
+        .unwrap();
+        std::fs::write(proc.join("uptime"), "1000000.00 0.00\n").unwrap();
+        if let Some(cwd) = cwd {
+            std::os::unix::fs::symlink(cwd, dir.join("cwd")).unwrap();
+        }
+        if let Some(kb) = metrics.1 {
+            // The real uid line — a test overwriting this file is how
+            // a foreign-user process is faked.
+            let euid = unsafe { libc::geteuid() };
+            std::fs::write(
+                dir.join("status"),
+                format!(
+                    "Name:\t{comm}\nPid:\t{pid}\nUid:\t{euid}\t{euid}\t{euid}\t{euid}\nVmSwap:\t{kb} kB\n"
+                ),
+            )
+            .unwrap();
+        }
+        if let Some(kb) = metrics.0 {
+            std::fs::write(
+                dir.join("smaps_rollup"),
+                format!("{pid}\nPss:               {kb} kB\nPss_Anon:          {kb} kB\n"),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    /// A minimal `cadence.sqlite3` for the census's read-only open —
+    /// the two tables it queries, no migrations needed.
+    fn fake_registry(state_dir: &Path) -> rusqlite::Connection {
+        std::fs::create_dir_all(state_dir).unwrap();
+        let conn = rusqlite::Connection::open(state_dir.join("cadence.sqlite3")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agents(
+                alias TEXT PRIMARY KEY, provider TEXT NOT NULL,
+                endpoint_kind TEXT NOT NULL, role TEXT NOT NULL,
+                cwd TEXT NOT NULL, sandbox TEXT NOT NULL,
+                instructions TEXT, thread_id TEXT, session_id TEXT,
+                model TEXT, pid INTEGER, endpoint TEXT, params TEXT,
+                generation TEXT, state TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1, error TEXT,
+                created REAL NOT NULL, updated REAL NOT NULL);
+             CREATE TABLE messages(
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT UNIQUE NOT NULL, alias TEXT NOT NULL,
+                body TEXT NOT NULL, reply_to TEXT, source TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'queued',
+                turn_id TEXT, result TEXT, error TEXT,
+                created REAL NOT NULL, started REAL, completed REAL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Wall-clock now — `agents.updated` is REAL seconds, and the
+    /// join fences claims whose live pid postdates the row's last
+    /// write, so fixtures need realistic values.
+    fn now_epoch() -> f64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_agent(
+        conn: &rusqlite::Connection,
+        alias: &str,
+        kind: &str,
+        pid: Option<u32>,
+        generation: Option<&str>,
+        state: &str,
+        cwd: &Path,
+        updated: f64,
+    ) {
+        conn.execute(
+            "INSERT INTO agents(alias, provider, endpoint_kind, role, cwd, sandbox, \
+             pid, generation, state, created, updated) \
+             VALUES (?1, 'claude', ?2, 'dev', ?6, 'none', ?3, ?4, ?5, 1.0, ?7)",
+            rusqlite::params![
+                alias,
+                kind,
+                pid.map(|p| p as i64),
+                generation,
+                state,
+                cwd.to_string_lossy().to_string(),
+                updated
+            ],
+        )
+        .unwrap();
+    }
+
+    fn add_message(
+        conn: &rusqlite::Connection,
+        alias: &str,
+        state: &str,
+        turn_id: Option<&str>,
+        completed: Option<f64>,
+    ) {
+        conn.execute(
+            "INSERT INTO messages(id, alias, body, source, state, turn_id, created, completed) \
+             VALUES (lower(hex(randomblob(8))), ?1, 'b', 't', ?2, ?3, 1.0, ?4)",
+            rusqlite::params![alias, state, turn_id, completed],
+        )
+        .unwrap();
+    }
+
+    /// `<pm>/<key>/project.yaml` — one registered repo path.
+    fn add_project(pm: &Path, key: &str, repo_path: &Path) {
+        let dir = pm.join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.yaml"),
+            format!(
+                "key: {key}\nprefix: {key}-\nrepos:\n  - path: {}\n",
+                repo_path.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The `sessions` check's value object out of a full `run`.
+    fn sessions_value(scan: &Scan) -> Value {
+        let report = run(scan);
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "sessions")
+            .unwrap()["value"]
+            .clone()
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -4279,6 +5643,15 @@ mod tests {
             d.join("deps/marker").display().to_string()
         );
 
+        // The lock assertion is independent of stale-worktree quoting.
+        // Retire that linked worktree before the held-lock scan so this
+        // phase exercises only shared-cache lock handling and does not
+        // launch unrelated git probes.
+        git(
+            &repo,
+            &["worktree", "remove", "-f", ".cadence/wt/feat gone"],
+        );
+
         // A held .cargo-lock swaps the rm -rf for an idle note — and
         // with no freeing command emitted, the row's bytes leave the
         // reclaimable total too.
@@ -4286,9 +5659,7 @@ mod tests {
         std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         std::fs::write(&lock, "").unwrap();
         std::fs::write(d.join("deps/cached2.o"), vec![7u8; 8192]).unwrap();
-        let f = std::fs::File::open(&lock).unwrap();
-        use std::os::unix::io::AsRawFd;
-        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let f = crate::worktree::TestFileLock::acquire(&lock);
         let plan = reclaim_plan(&scan);
         let shared_row = plan["rows"]
             .as_array()
@@ -4315,7 +5686,7 @@ mod tests {
             stale_bytes,
             "locked shared row must not count toward the total"
         );
-        drop(f); // probe must see the lock released
+        f.release(); // probe must see the lock released
         assert!(!file_locked(&lock));
     }
 
@@ -4360,6 +5731,7 @@ mod tests {
                 "pipes",
                 "memory",
                 "processes",
+                "sessions",
                 "orphans",
                 "temp-dirs",
                 "worktrees"
@@ -4399,5 +5771,884 @@ mod tests {
         // A pm.yaml without the table is fine too.
         std::fs::write(pm.join("pm.yaml"), "schema: 1\n").unwrap();
         assert!(host_overrides(&pm).is_none());
+    }
+
+    // ---------- session census (CAD-198) ----------
+
+    #[test]
+    fn sessions_tree_counts_members_once_and_sums_pss_swap() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        // devin root → npm wrapper → node server (the MCP stack).
+        add_session_proc(
+            &proc,
+            100,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(100), Some(50)),
+        );
+        add_session_proc(
+            &proc,
+            101,
+            100,
+            "npm",
+            Some(&repo),
+            300_000,
+            (Some(20), Some(200)),
+        );
+        add_session_proc(
+            &proc,
+            102,
+            101,
+            "node",
+            Some(&repo),
+            300_000,
+            (Some(30), Some(300)),
+        );
+        // A second, unrelated claude tree with its own child.
+        add_session_proc(
+            &proc,
+            200,
+            1,
+            "claude",
+            Some(&repo),
+            100_000,
+            (Some(10), Some(5)),
+        );
+        add_session_proc(
+            &proc,
+            201,
+            200,
+            "node",
+            Some(&repo),
+            90_000,
+            (Some(4), Some(1)),
+        );
+        // A process outside any session.
+        add_session_proc(
+            &proc,
+            300,
+            1,
+            "postgres",
+            Some(&repo),
+            10_000,
+            (Some(1), Some(0)),
+        );
+        let v = sessions_value(&scan);
+        let trees = v["trees"].as_array().unwrap();
+        assert_eq!(trees.len(), 2, "{v}");
+        let devin = trees
+            .iter()
+            .find(|t| t["root"]["family"] == "devin")
+            .unwrap();
+        assert_eq!(devin["procs"], 3);
+        assert_eq!(devin["pss_bytes"], 150 * 1024);
+        assert_eq!(devin["swap_bytes"], 550 * 1024);
+        assert_eq!(devin["pss_missing_pids"], 0);
+        // The wrapper stack is inside the tree total — never a
+        // separate family sum and never double-counted.
+        let pids: Vec<u64> = trees
+            .iter()
+            .flat_map(|t| {
+                t["members"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| m["pid"].as_u64().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut dedup = pids.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(pids.len(), dedup.len(), "a pid appears in two trees");
+        assert!(pids.contains(&101) && pids.contains(&102));
+        // pid+start identity is carried, never pid alone.
+        assert_eq!(devin["root"]["pid"], 100);
+        assert!(devin["root"]["start_jiffies"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn sessions_owned_via_managed_root_and_pty_ancestor() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        // Managed: agents.pid IS the provider root.
+        add_session_proc(
+            &proc,
+            200,
+            1,
+            "claude",
+            Some(&repo),
+            5_000,
+            (Some(10), Some(1)),
+        );
+        // Pty: agents.pid is the pane shell (bash) above the devin root.
+        add_session_proc(
+            &proc,
+            50,
+            1,
+            "bash",
+            Some(&repo),
+            400_000,
+            (Some(1), Some(0)),
+        );
+        add_session_proc(
+            &proc,
+            100,
+            50,
+            "devin",
+            Some(&repo),
+            400_000,
+            (Some(9), Some(2)),
+        );
+        let conn = fake_registry(&scan.state_dir);
+        add_agent(
+            &conn,
+            "qa-1",
+            "managed",
+            Some(200),
+            Some("g1"),
+            "idle",
+            &repo,
+            now_epoch(),
+        );
+        add_agent(
+            &conn,
+            "devin-d",
+            "pty",
+            Some(50),
+            Some("g2"),
+            "idle",
+            &repo,
+            now_epoch(),
+        );
+        drop(conn);
+        let v = sessions_value(&scan);
+        let trees = v["trees"].as_array().unwrap();
+        let by_alias = |a: &str| {
+            trees
+                .iter()
+                .find(|t| t["alias"] == a)
+                .unwrap_or_else(|| panic!("no tree owned by {a}: {v}"))
+                .clone()
+        };
+        let managed = by_alias("qa-1");
+        assert_eq!(managed["agreement"], "agreed");
+        assert_eq!(managed["endpoint_kind"], "managed");
+        assert_eq!(managed["generation"], "g1");
+        assert_eq!(managed["reclaim"]["candidate"], false);
+        assert_eq!(managed["reclaim"]["protected"], "owned — registry row qa-1");
+        let pty = by_alias("devin-d");
+        assert_eq!(pty["agreement"], "agreed");
+        assert_eq!(pty["endpoint_pid"], 50);
+        assert_eq!(pty["root"]["pid"], 100);
+    }
+
+    #[test]
+    fn sessions_unowned_in_scope_is_a_dry_run_candidate() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        // No registry at all — provably zero rows → ProcessOnly stands.
+        add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(100), Some(80)),
+        );
+        add_session_proc(
+            &proc,
+            701,
+            700,
+            "node",
+            Some(&repo),
+            300_000,
+            (Some(20), Some(40)),
+        );
+        let v = sessions_value(&scan);
+        assert_eq!(v["store"], "absent");
+        let tree = &v["trees"][0];
+        assert_eq!(tree["agreement"], "process-only");
+        assert_eq!(tree["scope"], "project:cadence");
+        let r = &tree["reclaim"];
+        assert_eq!(r["candidate"], true);
+        // 300_000s ≈ 83h → high confidence.
+        assert_eq!(r["confidence"], "high");
+        assert_eq!(r["pss_bytes"], 120 * 1024);
+        assert_eq!(r["swap_bytes"], 120 * 1024);
+        assert_eq!(v["totals"]["candidates"], 1);
+        // Dry-run only — the check carries no executable action.
+        let report = run(&scan);
+        let c = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "sessions")
+            .unwrap();
+        // Candidates are routine (a human ran an agent in a repo) and
+        // stay ok — only evidence failure (unreadable store) warns.
+        // The authorisation caveat travels in `detail`, since render()
+        // never prints a remedy for an ok check.
+        assert_eq!(c["level"], "ok");
+        assert!(c["detail"]
+            .as_str()
+            .unwrap()
+            .contains("separately authorised phase"));
+        assert!(!c["remedy"].as_str().unwrap().contains("kill"));
+        assert!(c["detail"].as_str().unwrap().contains("700("));
+    }
+
+    #[test]
+    fn sessions_foreign_and_unproven_scopes_protected() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        let foreign = root.path().join("elsewhere");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        // Foreign: cwd outside every registered project.
+        add_session_proc(
+            &proc,
+            500,
+            1,
+            "devin",
+            Some(&foreign),
+            300_000,
+            (Some(1), Some(1)),
+        );
+        // Unproven: no cwd link at all.
+        add_session_proc(&proc, 600, 1, "claude", None, 300_000, (Some(1), Some(1)));
+        let v = sessions_value(&scan);
+        let trees = v["trees"].as_array().unwrap();
+        let f = trees.iter().find(|t| t["root"]["pid"] == 500).unwrap();
+        assert_eq!(f["scope"], "foreign");
+        assert_eq!(f["reclaim"]["candidate"], false);
+        assert!(f["reclaim"]["protected"]
+            .as_str()
+            .unwrap()
+            .contains("foreign"));
+        let u = trees.iter().find(|t| t["root"]["pid"] == 600).unwrap();
+        assert_eq!(u["scope"], "unproven");
+        assert_eq!(u["reclaim"]["candidate"], false);
+        assert_eq!(v["totals"]["candidates"], 0);
+    }
+
+    #[test]
+    fn sessions_unreadable_store_never_proves_unowned() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        std::fs::create_dir_all(&scan.state_dir).unwrap();
+        // A store file that is not sqlite — present but unreadable.
+        std::fs::write(scan.state_dir.join("cadence.sqlite3"), b"not a database").unwrap();
+        let proc = scan.proc_root.clone();
+        add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(1), Some(1)),
+        );
+        let v = sessions_value(&scan);
+        assert_eq!(v["store"], "unreadable");
+        let tree = &v["trees"][0];
+        // Absence is unproven → Unknown → protected, never a candidate.
+        assert_eq!(tree["agreement"], "unknown");
+        assert_eq!(tree["reclaim"]["candidate"], false);
+        assert_eq!(v["totals"]["candidates"], 0);
+    }
+
+    #[test]
+    fn sessions_generation_mismatch_is_fenced() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        add_session_proc(
+            &proc,
+            50,
+            1,
+            "bash",
+            Some(&repo),
+            400_000,
+            (Some(1), Some(0)),
+        );
+        add_session_proc(
+            &proc,
+            100,
+            50,
+            "devin",
+            Some(&repo),
+            400_000,
+            (Some(9), Some(2)),
+        );
+        let conn = fake_registry(&scan.state_dir);
+        let gen_old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let gen_live = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        add_agent(
+            &conn,
+            "devin-d",
+            "pty",
+            Some(50),
+            Some(gen_old),
+            "busy",
+            &repo,
+            now_epoch(),
+        );
+        // A live turn token minted under a DIFFERENT generation —
+        // the endpoint moved under the registry row.
+        add_message(
+            &conn,
+            "devin-d",
+            "running",
+            Some(&format!("pty-{gen_live}-{}", "c".repeat(32))),
+            None,
+        );
+        drop(conn);
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        assert_eq!(tree["agreement"], "generation-mismatch");
+        assert_eq!(tree["reclaim"]["candidate"], false);
+        assert!(tree["reclaim"]["protected"]
+            .as_str()
+            .unwrap()
+            .contains("generation"));
+    }
+
+    #[test]
+    fn sessions_pending_and_progress_surface() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        add_session_proc(
+            &proc,
+            200,
+            1,
+            "claude",
+            Some(&repo),
+            5_000,
+            (Some(10), Some(1)),
+        );
+        let conn = fake_registry(&scan.state_dir);
+        let gen = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let now = now_epoch();
+        // updated is recent enough for a live claim (proc started
+        // ~83min ago); the message timestamp is newer still, so it
+        // must win last_progress.
+        add_agent(
+            &conn,
+            "qa-1",
+            "managed",
+            Some(200),
+            Some(gen),
+            "busy",
+            &repo,
+            now - 300.0,
+        );
+        add_message(&conn, "qa-1", "queued", None, None);
+        add_message(&conn, "qa-1", "queued", None, None);
+        add_message(
+            &conn,
+            "qa-1",
+            "running",
+            Some(&format!("claude-{gen}-{}", "d".repeat(32))),
+            None,
+        );
+        add_message(&conn, "qa-1", "done", None, Some(now + 60.0));
+        drop(conn);
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        assert_eq!(tree["alias"], "qa-1");
+        assert_eq!(tree["state"], "busy");
+        assert_eq!(tree["pending"]["queued"], 2);
+        assert_eq!(tree["pending"]["running"], 1);
+        assert_eq!(tree["last_progress"], now + 60.0);
+        // Running token's generation matches the row — still agreed.
+        assert_eq!(tree["agreement"], "agreed");
+    }
+
+    #[test]
+    fn sessions_never_disclose_argv_or_env() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        let dir = add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(1), Some(1)),
+        );
+        // A bearer secret in argv and env — the census must not read
+        // either file, let alone print them.
+        std::fs::write(dir.join("cmdline"), "devin\0--token\0S3CR3T-BEARER").unwrap();
+        std::fs::write(dir.join("environ"), "GH_TOKEN=S3CR3T-BEARER\0HOME=/u").unwrap();
+        let v = sessions_value(&scan);
+        let text = serde_json::to_string(&v).unwrap();
+        assert!(!text.contains("S3CR3T"), "{text}");
+        assert!(!text.contains("cmdline") && !text.contains("environ"));
+    }
+
+    #[test]
+    fn sessions_partial_metrics_degrade_confidence() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(100), Some(80)),
+        );
+        // Child whose metric files are absent → partial accounting.
+        add_session_proc(&proc, 701, 700, "node", Some(&repo), 300_000, (None, None));
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        assert_eq!(tree["pss_missing_pids"], 1);
+        assert_eq!(tree["swap_missing_pids"], 1);
+        // 83h would be high, but partial accounting caps at medium.
+        assert_eq!(tree["reclaim"]["confidence"], "medium");
+        assert_eq!(tree["reclaim"]["candidate"], true);
+    }
+
+    #[test]
+    fn sessions_foreign_uid_never_candidate() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        // Unowned, in-scope, old — every candidacy trait except uid:
+        // the root belongs to another user.
+        let dir = add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(100), Some(80)),
+        );
+        let euid = unsafe { libc::geteuid() };
+        let foreign = euid + 1;
+        std::fs::write(
+            dir.join("status"),
+            format!("Name:\tdevin\nUid:\t{foreign}\t{foreign}\t{foreign}\t{foreign}\n"),
+        )
+        .unwrap();
+        // No registry — "unowned" is a proven fact; uid still fences.
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        assert_eq!(tree["agreement"], "process-only");
+        assert_eq!(tree["scope"], "project:cadence");
+        assert_eq!(tree["root"]["uid"], foreign);
+        assert_eq!(tree["reclaim"]["candidate"], false);
+        assert!(tree["reclaim"]["protected"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("uid {foreign}")));
+        assert_eq!(v["totals"]["foreign_uid"], 1);
+        assert_eq!(v["totals"]["candidates"], 0);
+    }
+
+    #[test]
+    fn sessions_uid_unreadable_is_protected() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        // No status file at all → uid unproven → never a candidate.
+        add_session_proc(&proc, 700, 1, "devin", Some(&repo), 300_000, (None, None));
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        assert_eq!(tree["root"]["uid"], Value::Null);
+        assert_eq!(tree["reclaim"]["candidate"], false);
+        assert!(tree["reclaim"]["protected"]
+            .as_str()
+            .unwrap()
+            .contains("uid unreadable"));
+    }
+
+    #[test]
+    fn sessions_scope_rejects_empty_relative_and_root_paths() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // A project whose every repo path is hostile to prefix
+        // matching: empty, relative, `/`, and $HOME itself.
+        let pm = scan.pm_dir.as_deref().unwrap();
+        let dir = pm.join("bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.yaml"),
+            format!(
+                "key: bad\nprefix: bad-\nrepos:\n  - path: \"\"\n  - path: relative\n  - path: /\n  - path: {}\n",
+                scan.home.display()
+            ),
+        )
+        .unwrap();
+        let proc = scan.proc_root.clone();
+        add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(1), Some(1)),
+        );
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        // Only the pm dir itself survives validation → the repo cwd
+        // is outside every proven root → foreign, never a candidate.
+        assert_eq!(tree["scope"], "foreign", "{v}");
+        assert_eq!(tree["reclaim"]["candidate"], false);
+        assert_eq!(v["totals"]["candidates"], 0);
+    }
+
+    #[test]
+    fn sessions_stale_endpoint_pid_row_fences_tree() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        // A live unowned tree under the repo…
+        add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(1), Some(1)),
+        );
+        // …and a registry row whose endpoint pid is DEAD while its
+        // cwd still covers the tree — the pane-respawn shape. The
+        // tree may be that agent's session → Unknown, never
+        // process-only.
+        let conn = fake_registry(&scan.state_dir);
+        add_agent(
+            &conn,
+            "ghost-1",
+            "pty",
+            Some(9999),
+            Some("g1"),
+            "idle",
+            &repo,
+            now_epoch() - 500_000.0,
+        );
+        drop(conn);
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        assert_eq!(tree["agreement"], "unknown", "{v}");
+        assert!(tree["agreement_why"].as_str().unwrap().contains("ghost-1"));
+        assert_eq!(tree["reclaim"]["candidate"], false);
+        // The row itself still shows under records_only.
+        let rec = &v["records_only"][0];
+        assert_eq!(rec["alias"], "ghost-1");
+        assert_eq!(rec["endpoint_state"], "dead");
+    }
+
+    #[test]
+    fn sessions_recycled_endpoint_pid_is_unknown_not_agreed() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        // Live devin root — and a registry row naming its pid, but
+        // the row's last write predates this process's start by days:
+        // the pid was recycled; it cannot be the recorded endpoint.
+        add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            5_000,
+            (Some(1), Some(1)),
+        );
+        let conn = fake_registry(&scan.state_dir);
+        add_agent(
+            &conn,
+            "qa-1",
+            "managed",
+            Some(700),
+            Some("g1"),
+            "idle",
+            &repo,
+            now_epoch() - 1_000_000.0,
+        );
+        drop(conn);
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        assert_eq!(tree["agreement"], "unknown", "{v}");
+        assert!(tree["agreement_why"].as_str().unwrap().contains("reused"));
+        assert_eq!(tree["reclaim"]["candidate"], false);
+    }
+
+    #[test]
+    fn sessions_ambiguous_claim_is_unknown() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            5_000,
+            (Some(1), Some(1)),
+        );
+        let conn = fake_registry(&scan.state_dir);
+        for alias in ["a-1", "a-2"] {
+            add_agent(
+                &conn,
+                alias,
+                "managed",
+                Some(700),
+                Some("g1"),
+                "idle",
+                &repo,
+                now_epoch(),
+            );
+        }
+        drop(conn);
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        assert_eq!(tree["agreement"], "unknown", "{v}");
+        assert!(tree["agreement_why"]
+            .as_str()
+            .unwrap()
+            .contains("ambiguous"));
+        assert_eq!(tree["reclaim"]["candidate"], false);
+    }
+
+    #[test]
+    fn sessions_deleted_cwd_is_unproven_not_in_scope() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        let dir = add_session_proc(&proc, 700, 1, "devin", None, 300_000, (Some(1), Some(1)));
+        // The kernel's deleted-marker form: read_link yields the old
+        // path plus the literal suffix — must not string-match into
+        // scope.
+        std::os::unix::fs::symlink(format!("{} (deleted)", repo.display()), dir.join("cwd"))
+            .unwrap();
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        assert_eq!(tree["root"]["cwd_deleted"], true);
+        assert_eq!(tree["scope"], "unproven", "{v}");
+        assert_eq!(tree["reclaim"]["candidate"], false);
+    }
+
+    #[test]
+    fn sessions_foreign_mount_namespace_is_unproven() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        // Our own mnt-ns anchor: proc/self → a fake doctor pid dir.
+        let selfdir = proc.join("900");
+        std::fs::create_dir_all(selfdir.join("ns")).unwrap();
+        std::os::unix::fs::symlink("mnt:[1111]", selfdir.join("ns/mnt")).unwrap();
+        std::os::unix::fs::symlink(&selfdir, proc.join("self")).unwrap();
+        // In-scope cwd but a different mnt ns → not comparable.
+        let a = add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(1), Some(1)),
+        );
+        std::fs::create_dir_all(a.join("ns")).unwrap();
+        std::os::unix::fs::symlink("mnt:[2222]", a.join("ns/mnt")).unwrap();
+        // Same-ns control → normal classification.
+        let b = add_session_proc(
+            &proc,
+            600,
+            1,
+            "claude",
+            Some(&repo),
+            300_000,
+            (Some(1), Some(1)),
+        );
+        std::fs::create_dir_all(b.join("ns")).unwrap();
+        std::os::unix::fs::symlink("mnt:[1111]", b.join("ns/mnt")).unwrap();
+        let v = sessions_value(&scan);
+        let trees = v["trees"].as_array().unwrap();
+        let foreign_ns = trees.iter().find(|t| t["root"]["pid"] == 700).unwrap();
+        assert_eq!(foreign_ns["root"]["ns_foreign"], true);
+        assert_eq!(foreign_ns["scope"], "unproven", "{v}");
+        assert_eq!(foreign_ns["reclaim"]["candidate"], false);
+        let same_ns = trees.iter().find(|t| t["root"]["pid"] == 600).unwrap();
+        assert_eq!(same_ns["root"]["ns_foreign"], false);
+        assert_eq!(same_ns["scope"], "project:cadence");
+    }
+
+    #[test]
+    fn sessions_ppid_cycle_terminates() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let proc = scan.proc_root.clone();
+        // A ppid cycle among session comms — each has a session
+        // ancestor, so neither is a root and the walk must end.
+        add_session_proc(&proc, 800, 801, "devin", None, 5_000, (Some(1), Some(0)));
+        add_session_proc(&proc, 801, 800, "claude", None, 5_000, (Some(1), Some(0)));
+        let v = sessions_value(&scan);
+        assert_eq!(v["trees"].as_array().unwrap().len(), 0, "{v}");
+    }
+
+    #[test]
+    fn sessions_metrics_cap_marks_truncated() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(1), Some(1)),
+        );
+        for pid in 800..(800 + MAX_METRIC_PIDS as u32 + 3) {
+            add_session_proc(
+                &proc,
+                pid,
+                700,
+                "node",
+                Some(&repo),
+                300_000,
+                (Some(1), Some(0)),
+            );
+        }
+        let v = sessions_value(&scan);
+        let tree = &v["trees"][0];
+        assert_eq!(tree["metrics_truncated"], true);
+        // Members list stays complete — only the metric pass is capped.
+        assert_eq!(tree["procs"], MAX_METRIC_PIDS + 4);
+        assert_eq!(tree["reclaim"]["confidence"], "medium");
+        // A truncated tree in the candidate list means the aggregate
+        // is an estimate, not an upper bound — the flag must flip.
+        assert_eq!(tree["reclaim"]["candidate"], true);
+        assert_eq!(v["totals"]["candidate_sums_upper_bound"], false);
+    }
+
+    #[test]
+    fn sessions_unreadable_store_warns_and_exits_nonzero() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        std::fs::create_dir_all(&scan.state_dir).unwrap();
+        std::fs::write(scan.state_dir.join("cadence.sqlite3"), b"not a database").unwrap();
+        let report = run(&scan);
+        let c = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "sessions")
+            .unwrap();
+        // Evidence failure must never exit 0 — a watchdog loop
+        // keying on the exit code learns the store could not be read.
+        assert_ne!(c["level"], "ok", "{c}");
+        assert!(exit_code(&report) >= 1);
+    }
+
+    #[test]
+    fn sessions_candidate_caveat_is_visible() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_project(scan.pm_dir.as_deref().unwrap(), "cadence", &repo);
+        let proc = scan.proc_root.clone();
+        add_session_proc(
+            &proc,
+            700,
+            1,
+            "devin",
+            Some(&repo),
+            300_000,
+            (Some(100), Some(80)),
+        );
+        // A *readable* registry (zero rows) — the candidate check still
+        // reports ok, pinning the warn-only-on-evidence-failure rule so
+        // nobody "fixes" it back.
+        drop(fake_registry(&scan.state_dir));
+        let report = run(&scan);
+        let c = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "sessions")
+            .unwrap();
+        assert_eq!(c["level"], "ok", "{c}");
+        // The caveat must reach the text render — the `remedy` field
+        // holding it is not the point; the printed line is.
+        let text = render(&report);
+        assert!(
+            text.contains("separately authorised phase"),
+            "caveat missing from render:\n{text}"
+        );
     }
 }

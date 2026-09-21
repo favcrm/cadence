@@ -75,6 +75,10 @@ const STALL_TICK: Duration = Duration::from_secs(2);
 /// wrote, a one-minute tick bounds overshoot past `wal_max_bytes` to
 /// ~128 MiB.
 const WAL_TICK: Duration = Duration::from_secs(60);
+/// Persistent monitor reconciliation cadence. Individual registrations
+/// carry their own interval; this tick only bounds how soon a due check
+/// starts after its deadline.
+const MONITOR_TICK: Duration = Duration::from_secs(1);
 /// The daemon's own event stream — `wal_checkpointed` lands here.
 /// Readable via `cadence events daemon`; not a sendable alias.
 const DAEMON_ALIAS: &str = Store::DAEMON_STREAM;
@@ -1066,6 +1070,14 @@ impl Shared {
             "task_fail" => self.rpc_task_fail(params),
             "task_reopen" => self.rpc_task_reopen(params),
             "task_cancel" => self.rpc_task_cancel(params),
+            "monitor_register" => self.rpc_monitor_register(params),
+            "monitor_list" => self.rpc_monitor_list(),
+            "monitor_show" => self.rpc_monitor_show(params),
+            "monitor_heartbeat" => self.rpc_monitor_heartbeat(params),
+            "monitor_alerts" => self.rpc_monitor_alerts(params),
+            "monitor_alert_ack" => self.rpc_monitor_alert_ack(params),
+            "monitor_stop" => self.rpc_monitor_stop(params),
+            "monitor_dispatch" => self.rpc_monitor_dispatch(params),
             "agent_unfence" => self.rpc_unfence(params),
             "agent_stop" => self.rpc_stop(params),
             "agent_remove" => {
@@ -1726,13 +1738,6 @@ impl Shared {
         loop {
             let messages = self.store.inbox_drain(&alias, after)?;
             if !messages.is_empty() || self.closing.load(Ordering::SeqCst) {
-                // Consuming a message with a return address routed its
-                // result — the target actor must not wait out its poll.
-                for m in &messages {
-                    if let Some(target) = &m.reply_to {
-                        self.notify_agent(target);
-                    }
-                }
                 self.wake();
                 let cursor = messages.last().map(|m| m.seq).unwrap_or(after);
                 return Ok(json!({
@@ -2417,6 +2422,253 @@ impl Shared {
         Ok(json!({"task": task.to_json()}))
     }
 
+    fn rpc_monitor_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let tasks = params
+            .get("tasks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::rejected("Monitor registration requires a tasks array"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| Error::rejected("Monitor task ids must be strings"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let owner = optional_str(params, "owner").unwrap_or("operator");
+        let interval = optional_u64(params, "interval_secs").unwrap_or(60);
+        let dispatch_enabled = params
+            .get("dispatch_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (monitor, duplicate) = self.store.register_monitor(
+            required_str(params, "monitor")?,
+            required_str(params, "project")?,
+            owner,
+            interval,
+            &tasks,
+            dispatch_enabled,
+        )?;
+        let (monitor, coverage, open, total) = self.store.monitor_view(&monitor.id)?;
+        self.wake();
+        Ok(json!({
+            "monitor": monitor.to_json(&coverage, open, total),
+            "duplicate": duplicate,
+        }))
+    }
+
+    fn rpc_monitor_list(self: &Arc<Self>) -> Result<Value> {
+        let mut monitors = Vec::new();
+        for monitor in self.store.monitors()? {
+            let (monitor, coverage, open, total) = self.store.monitor_view(&monitor.id)?;
+            monitors.push(monitor.to_json(&coverage, open, total));
+        }
+        Ok(json!({"monitors": monitors}))
+    }
+
+    fn rpc_monitor_show(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let id = required_str(params, "monitor")?;
+        let (monitor, coverage, open, total) = self.store.monitor_view(id)?;
+        Ok(json!({"monitor": monitor.to_json(&coverage, open, total)}))
+    }
+
+    fn rpc_monitor_heartbeat(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let id = required_str(params, "monitor")?;
+        let monitor = self.store.monitor_heartbeat(id)?;
+        let (monitor, coverage, open, total) = self.store.monitor_view(&monitor.id)?;
+        self.wake();
+        Ok(json!({"monitor": monitor.to_json(&coverage, open, total)}))
+    }
+
+    fn rpc_monitor_alerts(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let id = required_str(params, "monitor")?;
+        let after = optional_i64(params, "after").unwrap_or(0);
+        let open_only = params.get("open").and_then(Value::as_bool).unwrap_or(false);
+        let limit = optional_i64(params, "limit").unwrap_or(100);
+        let alerts = self.store.monitor_alerts(id, after, open_only, limit)?;
+        let cursor = alerts.last().map(|a| a.seq).unwrap_or(after);
+        Ok(json!({
+            "monitor": id,
+            "alerts": alerts.iter().map(store::MonitorAlert::to_json).collect::<Vec<_>>(),
+            "cursor": cursor,
+        }))
+    }
+
+    fn rpc_monitor_alert_ack(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let id = required_str(params, "monitor")?;
+        let seq = optional_i64(params, "alert")
+            .ok_or_else(|| Error::rejected("Monitor alert acknowledgement requires --alert"))?;
+        let by = optional_str(params, "by").unwrap_or("operator");
+        let alert = self.store.ack_monitor_alert(id, seq, by)?;
+        self.wake();
+        Ok(json!({"alert": alert.to_json()}))
+    }
+
+    fn rpc_monitor_stop(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        if optional_str(params, "pane").is_some() {
+            return Err(Error::rejected(
+                "monitor stop is an operator action — run it outside a cadence pane",
+            ));
+        }
+        let id = required_str(params, "monitor")?;
+        let monitor = self.store.stop_monitor(id)?;
+        let (monitor, coverage, open, total) = self.store.monitor_view(&monitor.id)?;
+        self.wake();
+        Ok(json!({"monitor": monitor.to_json(&coverage, open, total)}))
+    }
+
+    /// One explicit, guarded handoff into the existing job-dispatch
+    /// transaction. The observer never calls this path on its own.
+    fn rpc_monitor_dispatch(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        if optional_str(params, "pane").is_some() {
+            return Err(Error::rejected(
+                "monitor dispatch is an operator action — run it outside a cadence pane",
+            ));
+        }
+        let monitor_id = required_str(params, "monitor")?;
+        let task_id = required_str(params, "task")?;
+        let monitor = self.store.monitor(monitor_id)?;
+        if monitor.state != "active" {
+            return Err(Error::rejected(format!(
+                "Monitor '{monitor_id}' is {} — dispatch requires an active check",
+                monitor.state
+            )));
+        }
+        if !monitor.dispatch_enabled {
+            return Err(Error::rejected(format!(
+                "Monitor '{monitor_id}' has dispatch disabled — enable it explicitly at registration"
+            )));
+        }
+        if !self.store.monitor_is_covered(monitor_id, task_id)? {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is outside monitor '{monitor_id}' coverage"
+            )));
+        }
+        let task = self.store.task(task_id)?;
+        let job = self.store.job(&task.job_id)?;
+        if job.state != "open" || job.repo.as_deref() != Some(monitor.project.as_str()) {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is not in monitor project '{}' with an open job",
+                monitor.project
+            )));
+        }
+        // A retry of a kickoff already claimed by the worker must reuse the
+        // existing message atomically, even though the worker is now busy.
+        // The duplicate-only store branch never mints a new revision.
+        if matches!(task.state.as_str(), "dispatched" | "running") {
+            if let Some((task, message, duplicate, behind_dead)) =
+                self.store.duplicate_task_dispatch(task_id)?
+            {
+                let _ = self.store.event_public(
+                    store::Store::DAEMON_STREAM,
+                    "monitor_dispatch",
+                    json!({"monitor": monitor_id, "task": task_id,
+                           "message": message, "duplicate": duplicate,
+                           "queued_behind_dead": behind_dead}),
+                );
+                self.wake();
+                return Ok(json!({
+                    "monitor": monitor_id,
+                    "task": task.to_json(),
+                    "message": message,
+                    "duplicate": duplicate,
+                    "queued_behind_dead": behind_dead,
+                }));
+            }
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' has no live kickoff — only draft or revising tasks are eligible"
+            )));
+        }
+        if !matches!(task.state.as_str(), "draft" | "revising") {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is '{}' — only draft or revising tasks are eligible",
+                task.state
+            )));
+        }
+        if task
+            .acceptance
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' has no acceptance criteria — dispatch is refused"
+            )));
+        }
+        let assignee = task
+            .assignee
+            .as_deref()
+            .ok_or_else(|| Error::rejected(format!("Task '{task_id}' has no explicit assignee")))?;
+        let agent = self.store.agent(assignee)?;
+        if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' is a mailbox, not a dispatchable worker"
+            )));
+        }
+        // The fake provider is an in-process fixture and deliberately has no
+        // transport endpoint. Every real actor publishes one when open.
+        let live_endpoint =
+            agent.endpoint.is_some() || (agent.provider == "fake" && agent.endpoint_kind == "fake");
+        if !agent.enabled || !live_endpoint || agent.state != "idle" {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' is not demonstrably idle and live (state {}, endpoint {})",
+                agent.state, live_endpoint
+            )));
+        }
+        if registry::ready_gate(&agent.provider, &agent.endpoint_kind)
+            && agent
+                .params
+                .as_ref()
+                .and_then(|p| p.get("auto_ready"))
+                .and_then(Value::as_str)
+                != Some("verified")
+        {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' requires an explicit readiness claim; automatic dispatch is refused"
+            )));
+        }
+        if self
+            .pending
+            .lock()
+            .unwrap()
+            .values()
+            .any(|request| request.alias == assignee)
+        {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' is waiting on an approval request"
+            )));
+        }
+        if self.store.queued_count(assignee)? > 0 {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' has queued work; dispatch is refused"
+            )));
+        }
+        let unfinished = self.store.tasks_for_assignee(assignee)?;
+        if unfinished.iter().any(|other| other.id != task_id) {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' already has unfinished task work"
+            )));
+        }
+        let (task, message, duplicate, behind_dead) =
+            self.store
+                .dispatch_task(task_id, None, None, &format!("monitor:{monitor_id}"))?;
+        let _ = self.store.event_public(
+            store::Store::DAEMON_STREAM,
+            "monitor_dispatch",
+            json!({"monitor": monitor_id, "task": task_id,
+                   "message": message, "duplicate": duplicate,
+                   "queued_behind_dead": behind_dead}),
+        );
+        self.notify_agent(assignee);
+        self.wake();
+        Ok(json!({
+            "monitor": monitor_id,
+            "task": task.to_json(),
+            "message": message,
+            "duplicate": duplicate,
+            "queued_behind_dead": behind_dead,
+        }))
+    }
+
     fn rpc_job_cancel(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let by = optional_str(params, "by").unwrap_or("operator");
         let job = self.store.cancel_job(required_str(params, "job")?, by)?;
@@ -2564,6 +2816,30 @@ impl Shared {
         while !self.closing.load(Ordering::SeqCst) {
             self.stall_tick();
             std::thread::sleep(STALL_TICK);
+        }
+    }
+
+    /// Reconcile daemon-owned monitor registrations without waking a
+    /// provider. Each check advances its durable cursor together with any
+    /// deduplicated local alerts; failures remain visible as `degraded`.
+    fn run_monitor_watch(self: &Arc<Self>) {
+        while !self.closing.load(Ordering::SeqCst) {
+            let at = epoch_secs();
+            if let Ok(monitors) = self.store.due_monitors(at) {
+                for monitor in monitors {
+                    let result = self.store.check_monitor(&monitor.id, at);
+                    if let Err(error) = result {
+                        let _ = self
+                            .store
+                            .fail_monitor_check(&monitor.id, at, &error.to_string());
+                    }
+                    self.wake();
+                }
+            }
+            let deadline = Instant::now() + MONITOR_TICK;
+            while !self.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
 
@@ -3564,6 +3840,12 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_stall_watch());
+    }
+    // Persistent monitor reconciliation: registrations survive a daemon
+    // restart and are checked without an LLM turn or provider invocation.
+    {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_monitor_watch());
     }
     // WAL watch: provider stores checkpointed while their provider
     // idles — CAD-132, the 30 GiB sessions.db-wal that ate the disk.

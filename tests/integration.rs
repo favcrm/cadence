@@ -2081,15 +2081,44 @@ fn is_filtered_run() -> bool {
     false
 }
 
+/// Nextest launches every test in a process-per-test child and exposes
+/// `NEXTEST=1` plus `NEXTEST_EXECUTION_MODE`. A filtered child cannot
+/// safely acquire the host slot itself. The outer review process owns
+/// the flock and explicitly clears the child path instead.
+fn is_nextest_run() -> bool {
+    std::env::var("NEXTEST").ok().as_deref() == Some("1")
+        || std::env::var("NEXTEST_EXECUTION_MODE").is_ok()
+}
+
+fn nextest_outer_lock_required(
+    nextest: bool,
+    lock_path: Option<&str>,
+    review_held: bool,
+) -> Result<(), &'static str> {
+    if !nextest {
+        return Ok(());
+    }
+    if review_held && lock_path.is_none() {
+        return Ok(());
+    }
+    Err(
+        "nextest requires the external CADENCE_SUITE_LOCK; run `cadence review` or use the pinned outer wrapper",
+    )
+}
+
 fn acquire_suite_slot() -> Result<Option<std::fs::File>, String> {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
-    let Some(path) = std::env::var("CADENCE_SUITE_LOCK")
+    let path = std::env::var("CADENCE_SUITE_LOCK")
         .ok()
-        .filter(|p| !p.is_empty())
-    else {
-        return Ok(None);
-    };
+        .filter(|p| !p.is_empty());
+    let review_held = std::env::var("CADENCE_REVIEW_SUITE_LOCK_HELD")
+        .ok()
+        .as_deref()
+        == Some("1");
+    nextest_outer_lock_required(is_nextest_run(), path.as_deref(), review_held)
+        .map_err(str::to_string)?;
+    let Some(path) = path else { return Ok(None) };
     if is_filtered_run() {
         return Ok(None);
     }
@@ -2163,6 +2192,20 @@ fn acquire_suite_slot() -> Result<Option<std::fs::File>, String> {
         }
         thread::sleep(Duration::from_millis(500));
     }
+}
+
+#[test]
+fn nextest_requires_external_suite_lock_without_nested_flock() {
+    // Ordinary cargo filtered tests retain the historical no-slot path.
+    assert!(nextest_outer_lock_required(false, None, false).is_ok());
+    // Direct nextest is refused whether the caller forgot the path or
+    // supplied one without proving that an outer review owns it.
+    assert!(nextest_outer_lock_required(true, None, false).is_err());
+    assert!(nextest_outer_lock_required(true, Some("/tmp/suite.lock"), false).is_err());
+    // Review's outer Flock is the only accepted child contract: it clears
+    // the path and sets the marker, so no nested flock can deadlock.
+    assert!(nextest_outer_lock_required(true, None, true).is_ok());
+    assert!(nextest_outer_lock_required(true, Some("/tmp/suite.lock"), true).is_err());
 }
 
 fn daemon_opts() -> daemon::ServeOptions {
@@ -6290,6 +6333,140 @@ impl TestDaemon {
             thread::sleep(Duration::from_millis(50));
         }
     }
+
+    /// Poll until an event of `kind` satisfying `pred` exists
+    /// (bounded). Payload-scoped — an earlier event that merely shares
+    /// the kind is never returned (CAD-222: a late `turn_stalled` for
+    /// one message must not answer a wait meant for another's).
+    fn wait_event_where(
+        &self,
+        alias: &str,
+        kind: &str,
+        pred: impl Fn(&Value) -> bool,
+        secs: u64,
+    ) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(e) = self
+                .events(alias)
+                .into_iter()
+                .find(|e| e["kind"].as_str() == Some(kind) && pred(e))
+            {
+                return e;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent {alias} never emitted a matching {kind}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Emit a test-only timing trace for a routed PTY delivery. The daemon's
+/// durable event/message timestamps are the phase clock here: using them
+/// avoids charging the test's 50ms RPC polling to a render or retry phase.
+/// A `submitting` row is the durable attempt-start boundary and a
+/// `paste_not_rendered` row is its completion. The next `submitting` row is
+/// the observable retry wake; no separate wake event exists. This is evidence
+/// for the follow-up audit, not a change to the delivery contract.
+fn emit_park_phase_trace(d: &TestDaemon, test_name: &str, alias: &str, routed_id: &str) {
+    fn at(value: &Value) -> Option<f64> {
+        value["at"].as_f64()
+    }
+
+    fn delta(start: Option<f64>, end: Option<f64>) -> Value {
+        match (start, end) {
+            (Some(start), Some(end)) if end >= start => json!(end - start),
+            _ => Value::Null,
+        }
+    }
+
+    let events = d.events(alias);
+    let starts: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "submitting" && event["payload"]["message"].as_str() == Some(routed_id)
+        })
+        .collect();
+    let misses: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "paste_not_rendered"
+                && event["payload"]["message"].as_str() == Some(routed_id)
+        })
+        .collect();
+    let parked = events.iter().find(|event| {
+        event["kind"] == "delivery_parked"
+            && event["payload"]["message"].as_str() == Some(routed_id)
+    });
+    let show = d.rpc("agent_show", json!({"alias": alias})).unwrap();
+    let message = show["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().find(|message| message["id"] == routed_id));
+    let enqueue_at = message.and_then(|message| message["created"].as_f64());
+    let attempt_phases: Vec<Value> = misses
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let started_at = starts.get(index).and_then(|event| at(event));
+            json!({
+                "attempt": index + 1,
+                "started_at_epoch_s": started_at,
+                "completion_at_epoch_s": at(event),
+                "enqueue_to_start_s": if index == 0 {
+                    delta(enqueue_at, started_at)
+                } else {
+                    Value::Null
+                },
+                "render_attempt_s": delta(started_at, at(event)),
+                "retry": event["payload"]["retry"],
+            })
+        })
+        .collect();
+    let retry_phases: Vec<Value> = misses
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| {
+            json!({
+                "after_attempt": index + 1,
+                "retry_wake_at_epoch_s": starts.get(index + 1).and_then(|event| at(event)),
+                "retry_to_next_attempt_start_s": delta(
+                    at(pair[0]),
+                    starts.get(index + 1).and_then(|event| at(event)),
+                ),
+            })
+        })
+        .collect();
+    let parked_at = parked.and_then(at);
+    let completed_at = message.and_then(|message| message["completed"].as_f64());
+    let final_agent = show.get("agent").map(|agent| {
+        json!({
+            "state": agent["state"],
+            "dead": agent["dead"],
+            "updated_epoch_s": agent["updated"],
+        })
+    });
+    let report = json!({
+        "schema": "cad173.e4a.phase-trace.v1",
+        "test": test_name,
+        "alias": alias,
+        "message": routed_id,
+        "enqueue_at_epoch_s": enqueue_at,
+        "attempts": attempt_phases,
+        "submitting_events": starts.len(),
+        "retry_gaps": retry_phases,
+        "park_at_epoch_s": parked_at,
+        "park_after_attempt4_s": delta(misses.last().and_then(|event| at(event)), parked_at),
+        "failed_state_at_epoch_s": completed_at,
+        "park_to_failed_state_s": delta(parked_at, completed_at),
+        "enqueue_to_failed_state_s": delta(enqueue_at, completed_at),
+        "message_state": message.map(|message| message["state"].clone()),
+        "agent": final_agent,
+        "clock": "durable events.at and messages.created/completed (epoch seconds)",
+        "attempt_boundary": "submitting event is attempt start; paste_not_rendered is completion; next submitting event is the retry wake",
+    });
+    eprintln!("CAD173_E4A_PHASE {report}");
 }
 
 #[test]
@@ -6453,6 +6630,70 @@ fn inbox_collects_direct_send_with_reply_to() {
     assert_eq!(msgs.len(), 1, "{page}");
     assert_eq!(msgs[0]["source"], "worker_result");
     assert!(msgs[0]["body"].as_str().unwrap().contains("did the thing"));
+}
+
+#[test]
+fn inbox_read_receipt_keeps_history_without_waking_reviewer() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    d.register_inbox("obs");
+    d.register_claude("reviewer", Value::Null);
+    d.register("worker");
+    d.wait_agent("reviewer", "idle", 20);
+    d.wait_agent("worker", "idle", 10);
+
+    // A real worker result still lands in the mailbox and must survive the
+    // same drain alongside the acknowledgement-only message.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "worker", "text": "do work", "message": "work-1",
+               "reply_to": "obs"}),
+    )
+    .unwrap();
+    d.wait_message("worker", "work-1", &["completed"], 15);
+
+    // This is the actual receipt path: a mailbox message has a return
+    // address, then the consumer drains it. Completing the read must not
+    // manufacture a worker_result turn for the reviewer.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "obs", "text": "ack me", "message": "receipt-1",
+               "reply_to": "reviewer"}),
+    )
+    .unwrap();
+
+    let page = d.rpc("agent_inbox", json!({"alias": "obs"})).unwrap();
+    let drained = page["messages"].as_array().unwrap();
+    assert_eq!(drained.len(), 2, "{page}");
+    let work = drained
+        .iter()
+        .find(|m| m["source"] == "worker_result")
+        .expect("genuine worker result was not retained");
+    assert!(work["body"].as_str().unwrap().contains("work-1"));
+
+    // The consumed row remains the durable source of truth, including its
+    // receipt marker and original reply address.
+    let obs = d.rpc("agent_show", json!({"alias": "obs"})).unwrap();
+    let receipt = obs["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "receipt-1")
+        .expect("receipt row was not retained");
+    assert_eq!(receipt["state"], "completed");
+    assert_eq!(receipt["reply_to"], "reviewer");
+    assert_eq!(receipt["result"]["via"], "inbox_read");
+
+    // No routed copy means no queued reviewer prompt and no model turn.
+    let reviewer = d.rpc("agent_show", json!({"alias": "reviewer"})).unwrap();
+    assert!(
+        reviewer["messages"].as_array().unwrap().is_empty(),
+        "{reviewer}"
+    );
+    assert!(d
+        .events("reviewer")
+        .iter()
+        .all(|event| event["kind"] != "turn_started"));
 }
 
 #[test]
@@ -7316,6 +7557,12 @@ fn pty_unrendered_worker_result_requeues_then_parks() {
     // Delivered = render-verified `running` (a task then awaits an
     // explicit report, so the agent correctly stays busy on it).
     d.wait_message("pm", "after", &["running"], 20);
+    emit_park_phase_trace(
+        &d,
+        "pty_unrendered_worker_result_requeues_then_parks",
+        "pm",
+        &routed_id,
+    );
 }
 
 #[test]
@@ -9664,6 +9911,7 @@ fn job_event_parks_on_unrendered_pty_pm() {
     d.wait_agent("pm", "idle", 15);
     let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap()["agent"].clone();
     assert_eq!(pm["dead"], false);
+    emit_park_phase_trace(&d, "job_event_parks_on_unrendered_pty_pm", "pm", parked_id);
 }
 
 #[test]
@@ -13085,7 +13333,29 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
-    thread::sleep(Duration::from_secs(7));
+    // Positive window-opened proof before any absence assertion
+    // (CAD-221, the canary pattern from #70's slot-plant test): a
+    // pending brokered request refreshes the turn's activity on every
+    // stall tick, so a wait older than the budget still reporting
+    // silence *under* the budget can only happen while the refresh
+    // path runs. A dead or skipping ticker reports wall-clock age
+    // instead and this loop fails loudly — absence is never asserted
+    // inside a window that may not have opened.
+    let wait_started = Instant::now();
+    let canary_deadline = wait_started + Duration::from_secs(15);
+    loop {
+        let a = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+        let silent = a["silent_secs"].as_u64().unwrap_or(u64::MAX);
+        if wait_started.elapsed() > Duration::from_secs(4) && silent < 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < canary_deadline,
+            "stall ticker never refreshed the brokered wait — the \
+             absence window never provably opened: {a}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     assert!(
         d.events("w1")
             .iter()
@@ -13103,14 +13373,22 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     d.wait_message("w1", "m-need", &["completed"], 15);
 
     // A genuinely silent turn stalls once — then simply ends; no
-    // recovery event is owed for a finished message.
+    // recovery event is owed for a finished message. The wait selects
+    // by payload: a `turn_stalled` for m-need landing late (between
+    // respond and completion on a slow host) must not be returned
+    // here (CAD-222).
     d.rpc(
         "agent_send",
         json!({"alias": "w1", "text": "SLEEP:12", "reply_to": "pm",
                "message": "m-sleep"}),
     )
     .unwrap();
-    let e = d.wait_event("w1", "turn_stalled", 20);
+    let e = d.wait_event_where(
+        "w1",
+        "turn_stalled",
+        |e| e["payload"]["message"].as_str() == Some("m-sleep"),
+        20,
+    );
     assert_eq!(e["payload"]["message"], "m-sleep", "{e}");
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(agent["stalled"], true, "{agent}");
@@ -15200,6 +15478,148 @@ fn dispatch_injects_project_memory_lessons() {
     assert!(!text.contains("claude-only"), "{text}");
 }
 
+/// Explicit-axis matching resolves the current project from cwd and never
+/// searches sibling projects. An explicit `--project` remains available for
+/// callers whose cwd is outside a registered repo.
+#[test]
+fn memory_match_explicit_axes_stay_in_current_project() {
+    let tmp = TempDir::new().unwrap();
+    let pm_dir = tmp.path().join("pm");
+    let repo_a = tmp.path().join("repo-a");
+    let repo_b = tmp.path().join("repo-b");
+    let home = tmp.path().join("home");
+    for dir in [&pm_dir, &repo_a, &repo_b, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path| {
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "test@example.invalid"][..],
+            &["config", "user.name", "test"][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {:?}: {:?}", args, out);
+        }
+    };
+    git(&repo_a);
+    git(&repo_b);
+    let bin = Path::new(env!("CARGO_BIN_EXE_cadence"));
+    let run = |cwd: &Path, args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(tmp.path().join("state"))
+            .args(args)
+            .current_dir(cwd)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.parent().unwrap().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(run(&repo_a, &["issue", "init"]).0);
+    let repo_a_s = repo_a.to_str().unwrap();
+    let repo_b_s = repo_b.to_str().unwrap();
+    assert!(
+        run(
+            &repo_a,
+            &[
+                "issue",
+                "project",
+                "add",
+                "alpha",
+                "--prefix",
+                "A",
+                "--repo",
+                repo_a_s,
+                "--component",
+                "daemon",
+            ],
+        )
+        .0
+    );
+    assert!(
+        run(
+            &repo_a,
+            &[
+                "issue",
+                "project",
+                "add",
+                "beta",
+                "--prefix",
+                "B",
+                "--repo",
+                repo_b_s,
+                "--component",
+                "daemon",
+            ],
+        )
+        .0
+    );
+    let memory = |id: &str, fact: &str| {
+        format!(
+            "---\nid: {id}\ntype: rule\nstatus: accepted\nconfidence: high\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  components:\n    - daemon\n---\n{fact}\n\n**Why:** project boundary regression.\n\n**How to apply:** keep the project boundary.\n"
+        )
+    };
+    for (project, id, fact) in [
+        ("alpha", "alpha-daemon", "alpha fact"),
+        ("beta", "beta-daemon", "beta fact"),
+    ] {
+        let dir = pm_dir.join(project).join("memory");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.md")), memory(id, fact)).unwrap();
+    }
+
+    let (ok, out) = run(
+        &repo_a,
+        &["memory", "match", "--component", "daemon", "--json"],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["context"]["project"], "alpha", "{out}");
+    assert_eq!(out["matched"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out["matched"][0]["project"], "alpha", "{out}");
+    assert_eq!(out["matched"][0]["slug"], "alpha-daemon", "{out}");
+    assert_eq!(out["matched"][0]["fact"], "alpha fact", "{out}");
+
+    let (ok, out) = run(
+        &home,
+        &[
+            "memory",
+            "match",
+            "--project",
+            "beta",
+            "--component",
+            "daemon",
+            "--json",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["context"]["project"], "beta", "{out}");
+    assert_eq!(out["matched"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out["matched"][0]["slug"], "beta-daemon", "{out}");
+}
+
 /// Memory failures degrade, never sink a dispatch: a malformed memory
 /// file fails matching → no lessons + `lessons_error`; a `Lessons:`
 /// suffix that pushes the kickoff body over the pty cap is dropped
@@ -15294,7 +15714,7 @@ fn dispatch_degrades_on_memory_failures() {
     // D-2's title is sized so the kickoff body sits just under the
     // 4000-byte cap — the `Lessons:` suffix is what tips it over.
     let long_title = "x".repeat(3720);
-    for title in ["One".to_string(), long_title] {
+    for title in ["One".to_string(), long_title, "Three".to_string()] {
         assert!(cli(&["issue", "new", &title, "--project", "demo"]).0);
     }
     // One good accepted rule — matching works until the broken file.
@@ -15321,7 +15741,8 @@ fn dispatch_degrades_on_memory_failures() {
     std::fs::write(&note, "# kickoff").unwrap();
     let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
 
-    // Malformed memory file → match fails → degrade, dispatch lands.
+    // Malformed memory file → excluded from the match and named;
+    // the valid rule still reaches the kickoff.
     std::fs::write(
         pm_dir.join("demo/memory/broken.md"),
         "---\nid: [unclosed\n---\nbody\n",
@@ -15338,10 +15759,11 @@ fn dispatch_degrades_on_memory_failures() {
         "pm",
     ]);
     assert!(ok && out["dispatched"] == true, "{out}");
-    assert_eq!(out["lessons"], json!([]), "{out}");
-    assert_eq!(out["lessons_file"], Value::Null, "{out}");
+    assert_eq!(out["lessons"], json!(["good-rule"]), "{out}");
+    let lessons_file = out["lessons_file"].as_str().unwrap_or_default();
+    assert!(lessons_file.ends_with("-lessons.md"), "{out}");
     let err = out["lessons_error"].as_str().unwrap_or_default();
-    assert!(err.contains("memory match failed"), "{out}");
+    assert!(err.contains("broken.md"), "{out}");
     assert!(!out["message"].as_str().unwrap().is_empty());
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     let kick = show["messages"]
@@ -15350,8 +15772,8 @@ fn dispatch_degrades_on_memory_failures() {
         .iter()
         .find(|m| m["id"].as_str() == out["message"].as_str())
         .unwrap();
-    assert!(!kick["body"].as_str().unwrap().contains("Lessons:"));
-    assert!(!d.state.join("dispatch").exists());
+    assert!(kick["body"].as_str().unwrap().contains("Lessons:"));
+    assert!(Path::new(lessons_file).is_file());
 
     // Over-cap: the good rule matches, but the `Lessons:` suffix would
     // push the kickoff body past the 4000-byte pty cap → the suffix
@@ -15386,21 +15808,78 @@ fn dispatch_degrades_on_memory_failures() {
         "original long body sent: {}",
         sent.len()
     );
+    // No new lessons file — D-1's remains the only one — and no
+    // half-written .tmp residue.
+    let names: Vec<String> = std::fs::read_dir(d.state.join("dispatch"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        names.iter().filter(|n| n.ends_with("-lessons.md")).count(),
+        1,
+        "{names:?}"
+    );
+    assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
+
+    // Unwritable lessons dir: `<state>/dispatch` as a plain file →
+    // create_dir_all fails → dispatch still lands, the error is
+    // named, and nothing that looks like a lessons artifact exists.
+    std::fs::remove_dir_all(d.state.join("dispatch")).unwrap();
+    std::fs::write(d.state.join("dispatch"), "not a dir").unwrap();
+    let (ok, out) = cli(&[
+        "dispatch",
+        "D-3",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(ok && out["dispatched"] == true, "{out}");
+    assert_eq!(out["lessons"], json!([]), "{out}");
+    assert_eq!(out["lessons_file"], Value::Null, "{out}");
+    let err = out["lessons_error"].as_str().unwrap_or_default();
+    assert!(err.contains("unwritable"), "{out}");
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let kick = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_str() == out["message"].as_str())
+        .unwrap();
+    assert!(!kick["body"].as_str().unwrap().contains("Lessons:"));
     assert!(
-        !d.state.join("dispatch").exists(),
-        "no lessons file written"
+        d.state.join("dispatch").is_file(),
+        "the placeholder is untouched — no dir or file replaced it"
     );
 
-    // Briefing cap: ten fat accepted rules exceed both bounds — the
-    // section keeps ≤8 entries and ≤4 KiB of items.
+    // Briefing cap: an oversized first rule is skipped, not a stop —
+    // later smaller rules still list, ≤8 entries and ≤4 KiB hold,
+    // and the omission is counted. fat-rule-00's hand-edited 5 KiB
+    // fact alone exceeds the byte budget: under the old `break` it
+    // hid every rule after it.
     let mem_dir = pm_dir.join("demo/memory");
-    for i in 0..10 {
+    let rule = |id: &str, fact: &str| {
+        format!(
+            "---\nid: {id}\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  project: true\n---\n{fact}\n\n**Why:** w\n\n**How to apply:** h\n"
+        )
+    };
+    std::fs::write(
+        mem_dir.join("fat-rule-00.md"),
+        rule("fat-rule-00", &"z".repeat(5 * 1024)),
+    )
+    .unwrap();
+    std::fs::write(
+        mem_dir.join("fat-rule-01-tiny.md"),
+        rule("fat-rule-01-tiny", "t"),
+    )
+    .unwrap();
+    for i in 2..10 {
         std::fs::write(
             mem_dir.join(format!("fat-rule-{i:02}.md")),
-            format!(
-                "---\nid: fat-rule-{i:02}\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  project: true\n---\n{}\n\n**Why:** w\n\n**How to apply:** h\n",
-                "y".repeat(700)
-            ),
+            rule(&format!("fat-rule-{i:02}"), &"y".repeat(700)),
         )
         .unwrap();
     }
@@ -15420,6 +15899,11 @@ fn dispatch_degrades_on_memory_failures() {
     let listed = items.matches("- `fat-rule-").count();
     assert!((1..=8).contains(&listed), "{listed} rules in section");
     assert!(items.len() <= 4 * 1024 + 128, "{} bytes", items.len());
+    // The oversized rule never listed; the tiny rule after it did —
+    // proof the budget skip keeps scanning. The omission is counted.
+    assert!(!items.contains("fat-rule-00`"), "{items}");
+    assert!(items.contains("- `fat-rule-01-tiny`"), "{items}");
+    assert!(items.contains("accepted rule(s) omitted"), "{items}");
 }
 
 // ==== operator IX: cadence status, daemon restart, events tail ====
@@ -16903,6 +17387,7 @@ fn doctor_host_json_reports_all_checks() {
             "pipes",
             "memory",
             "processes",
+            "sessions",
             "orphans",
             "temp-dirs",
             "worktrees"
@@ -19512,4 +19997,964 @@ fn report_issue_conflicts_and_show_scope() {
 
     let (ok, _, (_, out)) = s.cli_at_env(&s.product_repo, &["report", "show", &id], &[]);
     assert!(!ok, "{out}");
+}
+
+// ==================== persistent monitors (CAD-176) ====================
+
+#[test]
+fn monitor_migration_from_v6_bridges_provider_effort_before_v8() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cadence.sqlite3");
+    let store = Store::open(&path).unwrap();
+    drop(store);
+    // Model a v6 database before either change: CAD-176 must reserve the v7
+    // column contract before advancing directly to its v8 tables.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE monitor_alerts;
+         DROP TABLE monitor_tasks;
+         DROP TABLE monitors;
+         ALTER TABLE agents DROP COLUMN effort;
+         UPDATE schema_version SET version=6;",
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&path).unwrap();
+    assert!(store.monitors().unwrap().is_empty());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(agents)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 8);
+    assert!(columns.iter().any(|column| column == "effort"));
+}
+
+#[test]
+fn monitor_migration_after_provider_effort_v7_is_v8() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cadence.sqlite3");
+    let store = Store::open(&path).unwrap();
+    drop(store);
+    // Model PR80 first: v7 owns the effort column and CAD-176 owns the next
+    // slot. Reopening must add monitors without touching the v7 contract.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE monitor_alerts;
+         DROP TABLE monitor_tasks;
+         DROP TABLE monitors;
+         UPDATE schema_version SET version=7;",
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&path).unwrap();
+    assert!(store.monitors().unwrap().is_empty());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(agents)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 8);
+    assert!(columns.iter().any(|column| column == "effort"));
+}
+
+#[test]
+fn monitor_check_failure_is_degraded_without_healthy_claim() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    let (spec, sha) = d.spec_file("degraded-monitor.md", "check failure");
+    let project = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "badjob", "spec": spec,
+               "spec_sha256": sha, "repo": project}),
+    )
+    .unwrap();
+    d.rpc(
+        "task_new",
+        json!({"job": "badjob", "task": "badjob-watch", "assignee": "w1",
+               "acceptance": "observe failures"}),
+    )
+    .unwrap();
+    d.rpc(
+        "monitor_register",
+        json!({"monitor": "bad", "project": project, "owner": "operator",
+               "tasks": ["badjob-watch"], "interval_secs": 1}),
+    )
+    .unwrap();
+    let active = wait_monitor_state(&d, "bad", "active", 5);
+    let last_success = active["last_success_at"].as_f64().unwrap();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    // Invalid event evidence makes the check fail; it must remain visible as
+    // degraded instead of being treated as a healthy empty scan.
+    conn.execute(
+        "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
+         VALUES(?,?,?,?,?,?)",
+        rusqlite::params!["w1", "turn_finished", "{}", "badjob", "badjob-watch", "bad"],
+    )
+    .unwrap();
+    drop(conn);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let monitor = d.rpc("monitor_show", json!({"monitor": "bad"})).unwrap()["monitor"].clone();
+        if monitor["monitoring"] == "degraded" {
+            assert!(
+                monitor["error"].as_str().is_some_and(|e| !e.is_empty()),
+                "{monitor}"
+            );
+            assert_eq!(
+                monitor["last_success_at"].as_f64(),
+                Some(last_success),
+                "{monitor}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "monitor did not degrade: {monitor}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_monitor_state(d: &TestDaemon, monitor: &str, want: &str, secs: u64) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let value = d.rpc("monitor_show", json!({"monitor": monitor})).unwrap()["monitor"].clone();
+        if value["monitoring"].as_str() == Some(want) {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "monitor {monitor} never reached {want}: {value}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn monitor_persists_coverage_heartbeats_and_deduplicates_alerts() {
+    let mut d = TestDaemon::start();
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    let (spec, sha) = d.spec_file("monitor-spec.md", "watch this task");
+    let project = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "mjob", "spec": spec,
+               "spec_sha256": sha, "repo": project}),
+    )
+    .unwrap();
+    d.rpc(
+        "task_new",
+        json!({"job": "mjob", "task": "mjob-watch", "assignee": "w1",
+               "acceptance": "observe the task"}),
+    )
+    .unwrap();
+    let registered = d
+        .rpc(
+            "monitor_register",
+            json!({"monitor": "m1", "project": project,
+                   "owner": "operator", "tasks": ["mjob-watch"],
+                   "interval_secs": 1}),
+        )
+        .unwrap();
+    assert_eq!(
+        registered["monitor"]["monitoring"], "degraded",
+        "{registered}"
+    );
+    assert_eq!(registered["monitor"]["delivery"]["configured"], false);
+    assert_eq!(registered["monitor"]["coverage"], json!(["mjob-watch"]));
+    let active = wait_monitor_state(&d, "m1", "active", 5);
+    assert!(active["last_success_at"].is_number(), "{active}");
+    assert!(active["heartbeat_at"].is_number(), "{active}");
+    assert!(active["next_check_at"].is_number(), "{active}");
+
+    // Receipt-only task events do not manufacture an alert. The monitor
+    // still advances its cursor, but no worker health is inferred.
+    let store = Store::open(&d.state.join("cadence.sqlite3")).unwrap();
+    store
+        .event_public_scoped(
+            "w1",
+            "turn_finished",
+            json!({"message": "m-finished"}),
+            Some("mjob"),
+            Some("mjob-watch"),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(1200));
+    let no_alert = d.rpc("monitor_alerts", json!({"monitor": "m1"})).unwrap();
+    assert!(
+        no_alert["alerts"].as_array().unwrap().is_empty(),
+        "{no_alert}"
+    );
+
+    // Inject one concrete task-scoped stall observation through the same
+    // durable event table the daemon consumes.
+    store
+        .event_public_scoped(
+            "w1",
+            "turn_stalled",
+            json!({"message": "m-stall", "episode": 1}),
+            Some("mjob"),
+            Some("mjob-watch"),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let alert = loop {
+        let page = d.rpc("monitor_alerts", json!({"monitor": "m1"})).unwrap();
+        if let Some(alert) = page["alerts"].as_array().and_then(|a| a.first()) {
+            break alert.clone();
+        }
+        assert!(Instant::now() < deadline, "monitor did not alert: {page}");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(alert["kind"], "turn_stalled", "{alert}");
+    assert_eq!(alert["task"], "mjob-watch");
+    assert_eq!(alert["state"], "open");
+    let cursor = d.rpc("monitor_show", json!({"monitor": "m1"})).unwrap()["monitor"]
+        ["event_cursor"]
+        .as_i64()
+        .unwrap();
+    thread::sleep(Duration::from_millis(1200));
+    let again = d.rpc("monitor_alerts", json!({"monitor": "m1"})).unwrap();
+    assert_eq!(again["alerts"].as_array().unwrap().len(), 1, "{again}");
+    assert!(
+        again["alerts"][0]["event_seq"].as_i64().unwrap() <= cursor,
+        "alert event must be at or behind the durable monitor cursor: {again}"
+    );
+
+    let acked = d
+        .rpc(
+            "monitor_alert_ack",
+            json!({"monitor": "m1", "alert": alert["seq"], "by": "operator"}),
+        )
+        .unwrap();
+    assert_eq!(acked["alert"]["state"], "acknowledged", "{acked}");
+    let open = d
+        .rpc("monitor_alerts", json!({"monitor": "m1", "open": true}))
+        .unwrap();
+    assert!(open["alerts"].as_array().unwrap().is_empty(), "{open}");
+
+    // The registration and cursor survive a daemon restart; the observed
+    // event is not replayed as a second alert.
+    let state = d.state.clone();
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let d2 = TestDaemon::start_on(state);
+    let restored = wait_monitor_state(&d2, "m1", "active", 5);
+    assert_eq!(restored["coverage"], json!(["mjob-watch"]));
+    let after_restart = d2.rpc("monitor_alerts", json!({"monitor": "m1"})).unwrap();
+    assert_eq!(after_restart["alerts"].as_array().unwrap().len(), 1);
+    let _ = d2.rpc("monitor_stop", json!({"monitor": "m1"}));
+}
+
+#[test]
+fn monitor_dispatch_requires_explicit_safe_eligibility() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.register_member("w2", "pm");
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    d.wait_agent("w2", "idle", 10);
+    let (spec, sha) = d.spec_file("dispatch-monitor.md", "safe dispatch");
+    let project = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "djob", "spec": spec,
+               "spec_sha256": sha, "repo": project}),
+    )
+    .unwrap();
+    d.rpc(
+        "task_new",
+        json!({"job": "djob", "task": "djob-ready", "assignee": "w1",
+               "acceptance": "run focused checks"}),
+    )
+    .unwrap();
+    d.rpc(
+        "task_new",
+        json!({"job": "djob", "task": "djob-repeat", "assignee": "w2",
+               "acceptance": "reuse the live kickoff"}),
+    )
+    .unwrap();
+    d.rpc(
+        "monitor_register",
+        json!({"monitor": "dm", "project": project, "owner": "operator",
+               "tasks": ["djob-ready", "djob-repeat"], "interval_secs": 1,
+               "dispatch_enabled": true}),
+    )
+    .unwrap();
+    wait_monitor_state(&d, "dm", "active", 5);
+
+    let result = d
+        .rpc(
+            "monitor_dispatch",
+            json!({"monitor": "dm", "task": "djob-ready"}),
+        )
+        .unwrap();
+    assert_eq!(result["duplicate"], false, "{result}");
+    assert_eq!(result["task"]["state"], "dispatched", "{result}");
+    let kickoff = result["message"].as_str().unwrap().to_string();
+    // Seed a second task with an existing queued kickoff while its worker is
+    // stopped. The monitor retry must take the duplicate-only branch even
+    // though a fresh dispatch would fail the live-worker eligibility gate.
+    d.rpc("agent_stop", json!({"alias": "w2"})).unwrap();
+    d.wait_agent("w2", "stopped", 10);
+    let store = Store::open(&d.state.join("cadence.sqlite3")).unwrap();
+    let (_, existing_kickoff, existing_duplicate, _) = store
+        .dispatch_task("djob-repeat", None, None, "operator")
+        .unwrap();
+    assert!(!existing_duplicate);
+    let duplicate = d
+        .rpc(
+            "monitor_dispatch",
+            json!({"monitor": "dm", "task": "djob-repeat"}),
+        )
+        .unwrap();
+    assert_eq!(duplicate["duplicate"], true, "{duplicate}");
+    assert_eq!(duplicate["message"], existing_kickoff);
+    let messages = d.rpc("agent_show", json!({"alias": "w2"})).unwrap();
+    assert_eq!(
+        messages["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["source"] == "job_dispatch")
+            .count(),
+        1,
+        "{messages}"
+    );
+    assert_ne!(kickoff, existing_kickoff);
+}
+// ---------- CAD-153: cadence audit -------------------------------------
+
+/// A repo whose default branch holds squash-merge subjects `… (#N)`
+/// plus the landed-head commits, so `contains_head` can patch-id
+/// compare. Returns (repo, notes, report, heads) — `heads[i]` is the
+/// headRefOid for PR i+1.
+fn audit_repo(dir: &TempDir) -> (PathBuf, PathBuf, PathBuf, Vec<String>) {
+    let repo = dir.path().join("repo");
+    let notes = dir.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    git_repo(&repo);
+    let g = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // No global identity on CI runners.
+    g(&["config", "user.email", "t@t"]);
+    g(&["config", "user.name", "t"]);
+    let branch = g(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    let mut heads = Vec::new();
+    let mut prs = Vec::new();
+    for n in 1..=3u8 {
+        // The PR head: same change on a side branch.
+        g(&["checkout", "-qb", &format!("pr{n}")]);
+        std::fs::write(repo.join(format!("f{n}.txt")), format!("change {n}")).unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", &format!("work {n}")]);
+        let head = g(&["rev-parse", "HEAD"]);
+        // The squash merge: identical change on the default branch.
+        g(&["checkout", "-q", &branch]);
+        std::fs::write(repo.join(format!("f{n}.txt")), format!("change {n}")).unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", &format!("work {n} (CAD-{n}) (#{n})")]);
+        let merge = g(&["rev-parse", "HEAD"]);
+        prs.push(format!(
+            r#"{{"number":{n},"title":"work {n} (CAD-{n})","headRefOid":"{head}",
+              "mergeCommit":{{"oid":"{merge}"}},"mergedBy":{{"login":"ops-1"}},
+              "mergedAt":"2026-09-20T12:00:0{n}Z"}}"#
+        ));
+        heads.push(head);
+    }
+    let report = dir.path().join("merge-report.json");
+    std::fs::write(
+        &report,
+        format!("{{\"prs\":[{}],\"statuses\":{{}}}}", prs.join(",")),
+    )
+    .unwrap();
+    (repo, notes, report, heads)
+}
+
+/// `cadence audit` fully fixtured — `--merge-report` + `--notes-dir`
+/// replace gh and the notes tree, an empty state dir and PM dir keep
+/// the daemon store and tracker out.
+fn run_audit(
+    state: &Path,
+    pm: &Path,
+    repo: &Path,
+    notes: &Path,
+    report: &Path,
+    extra: &[&str],
+) -> std::process::Output {
+    run_audit_full(state, pm, repo, Some(notes), Some(report), extra, None)
+}
+
+/// The plumbing behind `run_audit`: optional fixture paths (a `None`
+/// `--merge-report` exercises the live `gh` path) plus an optional
+/// PATH override so tests can remove `gh` entirely.
+fn run_audit_full(
+    state: &Path,
+    pm: &Path,
+    repo: &Path,
+    notes: Option<&Path>,
+    report: Option<&Path>,
+    extra: &[&str],
+    path_env: Option<&Path>,
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
+        .arg(state)
+        .arg("audit")
+        .arg("--repo")
+        .arg(repo);
+    if let Some(n) = notes {
+        cmd.arg("--notes-dir").arg(n);
+    }
+    if let Some(r) = report {
+        cmd.arg("--merge-report").arg(r);
+    }
+    cmd.args(extra).env("CADENCE_PM_DIR", pm);
+    if let Some(p) = path_env {
+        cmd.env("PATH", p);
+    }
+    cmd.output().unwrap()
+}
+
+/// A PATH that resolves `git` (the audit shells it constantly) but
+/// has no `gh` — proving neither fixture mode nor the live path can
+/// accidentally reach the real CLI.
+fn path_without_gh(dir: &TempDir) -> PathBuf {
+    let bin = dir.path().join("no-gh-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for p in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let git = p.join("git");
+        if git.is_file() {
+            std::os::unix::fs::symlink(&git, bin.join("git")).unwrap();
+            return bin;
+        }
+    }
+    panic!("no git on PATH to link into {bin:?}");
+}
+
+fn verdict_note(notes: &Path, name: &str, head: &str, from: &str, class: &str) {
+    std::fs::write(
+        notes.join(name),
+        format!(
+            "# Verdict: pass\n> From: `{from}`\n\n## Verdict\npass — head `{head}`\n\n\
+             **Risk: {class} (test trigger)**\n\n**What an auditor should check:** the row.\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn audit_reconstructs_clean_merge() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // Every PR head carries a pass verdict note + SUCCESS status —
+    // the fully clean run. Note filenames (11:59:xx) and status
+    // `created_at` predate `mergedAt` 12:00:0n — a post-merge verdict
+    // is post-hoc evidence, not a merge-time gate.
+    let mut report_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    for (i, h) in heads.iter().enumerate() {
+        verdict_note(
+            &notes,
+            &format!("20260920-1159{i}0-x-p{n}-verdict.md", i = i, n = i + 1),
+            h,
+            "qa-1",
+            "auto",
+        );
+        report_json["statuses"][h] = json!({
+            "statuses": [{
+                "context": "qa-verdict", "state": "SUCCESS",
+                "created_at": "2026-09-20T11:59:30Z",
+                "creator": {"login": "qa-bot"}
+            }]
+        });
+    }
+    std::fs::write(&report, report_json.to_string()).unwrap();
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean rows must not flag:\n{text}"
+    );
+    assert!(text.contains("#1"), "{text}");
+    assert!(text.contains("reviewer qa-1"), "{text}");
+    assert!(text.contains("merger ops-1"), "{text}");
+    assert!(text.contains("contains_head yes"), "{text}");
+    assert!(text.contains("class auto"), "{text}");
+    assert!(text.contains("trigger test trigger"), "{text}");
+    assert!(!text.contains("FLAG"), "{text}");
+    // The root commit shows as a `?` row but is exempt from flags —
+    // it predates the PR process. Any *later* direct push would flag.
+    assert!(text.contains("? init"), "{text}");
+    // Read-only: the repo must be byte-identical afterwards.
+    assert_eq!(git_porcelain(&repo), "", "audit must not dirty the repo");
+}
+
+#[test]
+fn audit_flags_reviewer_equals_merger() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // The note's `From:` is an agent alias — it happens to spell the
+    // same string as the merger's GitHub login, which must NOT flag:
+    // the namespaces differ.
+    verdict_note(
+        &notes,
+        "20260920-115900-x-p3-verdict.md",
+        &heads[2],
+        "ops-1",
+        "auto",
+    );
+    let mut report_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    let status = |login: &str| {
+        json!({
+            heads[2].clone(): {"statuses":[{
+                "context":"qa-verdict","state":"SUCCESS",
+                "created_at":"2026-09-20T11:59:30Z",
+                "creator":{"login":login}
+            }]}
+        })
+    };
+    report_json["statuses"] = status("qa-1");
+    std::fs::write(&report, report_json.to_string()).unwrap();
+
+    // Alias collision alone: no flag.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("reviewer==merger"),
+        "note From: alias must not feed the flag:\n{text}"
+    );
+
+    // Same GitHub identity posted qa-verdict and merged: flag.
+    report_json["statuses"] = status("ops-1");
+    std::fs::write(&report, report_json.to_string()).unwrap();
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "flag must exit 1:\n{text}");
+    assert!(text.contains("FLAG[reviewer==merger]"), "{text}");
+    assert!(text.contains("reviewer@gh ops-1"), "{text}");
+}
+
+#[test]
+fn audit_flags_merge_with_no_verdict_on_head() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, _heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // Empty notes dir, empty statuses — nothing proves a pass.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--limit", "1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "verdict-less head must flag:\n{text}"
+    );
+    assert!(text.contains("FLAG[no-passing-verdict]"), "{text}");
+    assert!(text.contains("verdict unknown"), "{text}");
+    assert!(text.contains("reviewer unknown"), "{text}");
+    // The reasons must accompany the unknowns.
+    let jout = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &notes,
+        &report,
+        &["--limit", "1", "--json"],
+    );
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&jout.stdout)).unwrap();
+    let unknowns = j["merges"][0]["unknowns"].as_array().unwrap();
+    assert!(
+        unknowns.iter().any(|u| u["field"] == "verdict"),
+        "unknown verdict needs a reason: {j}"
+    );
+}
+
+#[test]
+fn audit_json_shape_is_stable() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    verdict_note(
+        &notes,
+        "20260920-115900-x-p1-verdict.md",
+        &heads[0],
+        "qa-1",
+        "auto",
+    );
+
+    let out = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &notes,
+        &report,
+        &["--since", "24h", "--json"],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("--json not one document: {e}\n{text}"));
+    assert_eq!(j["schema"].as_str().unwrap(), "cadence.audit/1");
+    for key in [
+        "repo",
+        "default_ref",
+        "since",
+        "filters",
+        "merges",
+        "summary",
+    ] {
+        assert!(j.get(key).is_some(), "missing top-level {key}: {j}");
+    }
+    let m = &j["merges"][0];
+    for key in [
+        "pr",
+        "title",
+        "merge_sha",
+        "landed_head",
+        "reviewed_head",
+        "contains_head",
+        "qa_verdict_status",
+        "qa_verdict_creator",
+        "status_post_hoc",
+        "verdict",
+        "verdict_post_hoc",
+        "reviewer",
+        "merger",
+        "class",
+        "trigger",
+        "gate_summary",
+        "auditor_check",
+        "residue",
+        "outcome",
+        "flags",
+        "evidence_unavailable",
+        "unknowns",
+    ] {
+        assert!(m.get(key).is_some(), "missing merges[].{key}: {m}");
+    }
+    for key in ["tree_match", "smoke", "daemon_restart", "revert"] {
+        assert!(
+            m["outcome"].get(key).is_some(),
+            "missing outcome.{key}: {m}"
+        );
+    }
+    assert!(j["summary"]["rows"].as_u64().unwrap() >= 3);
+}
+
+#[test]
+fn audit_filters_since_class_project_limit() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    // Tracker: CAD-1 lives under project `alpha`.
+    std::fs::create_dir_all(pm.join("alpha").join("CAD-1")).unwrap();
+    std::fs::write(pm.join("alpha/CAD-1/issue.md"), "---\nid: CAD-1\n---\n").unwrap();
+    verdict_note(
+        &notes,
+        "20260920-115800-x-p1-verdict.md",
+        &heads[0],
+        "qa-1",
+        "auto",
+    );
+    verdict_note(
+        &notes,
+        "20260920-115810-x-p2-verdict.md",
+        &heads[1],
+        "qa-1",
+        "human",
+    );
+
+    // --since far future → no rows.
+    let out = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &notes,
+        &report,
+        &["--since", "2999-01-01"],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("0 merges") || text.contains("no merges"),
+        "{text}"
+    );
+
+    // --limit 2 → exactly two rows.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--limit", "2"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("(2 merges"), "{text}");
+
+    // --class auto → only the auto-classified row.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--class", "auto"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("#1"), "{text}");
+    assert!(!text.contains("#2"), "{text}");
+    // --class human → the human row only.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--class", "human"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("#2"), "{text}");
+    assert!(!text.contains("#1"), "{text}");
+
+    // --project alpha → only CAD-1's row.
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--project", "alpha"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("#1"), "{text}");
+    assert!(!text.contains("#2"), "{text}");
+}
+
+#[test]
+fn audit_fixture_never_shells_gh() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, _heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // PATH really has no gh: if fixture mode shelled out anyway the
+    // spawn would fail and every row would report evidence gaps.
+    let path = path_without_gh(&dir);
+    let out = run_audit_full(
+        &state,
+        &pm,
+        &repo,
+        Some(&notes),
+        Some(&report),
+        &["--json"],
+        Some(&path),
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("fixture mode must not call gh: {e}\n{text}"));
+    // 3 merge subjects + the init commit.
+    assert_eq!(j["merges"].as_array().unwrap().len(), 4);
+    let pr_rows = j["merges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["pr"].as_u64().is_some())
+        .count();
+    assert_eq!(pr_rows, 3);
+    // No row reports a failed channel — the fixture answered everything.
+    assert!(
+        j["merges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["evidence_unavailable"].is_null()),
+        "a spawn attempt would surface as evidence_unavailable: {j}"
+    );
+}
+
+/// gh absent from PATH on the live path: every row is
+/// `unknown — evidence unavailable`, nothing flags, exit 0. Missing
+/// evidence is never an accusation.
+#[test]
+fn audit_gh_unavailable_is_unknown_not_flag() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, _heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // A github origin so the audit resolves a slug and really tries gh;
+    // a verdict note proves notes answered (fail) — the row must still
+    // not flag while gh itself is unreachable.
+    let g = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    };
+    g(&["remote", "add", "origin", "https://github.com/x/y"]);
+    // One non-PR direct push too — even it must not flag with gh down.
+    std::fs::write(repo.join("direct.txt"), "d").unwrap();
+    g(&["add", "."]);
+    g(&["commit", "-qm", "direct push"]);
+
+    let path = path_without_gh(&dir);
+    let out = run_audit_full(
+        &state,
+        &pm,
+        &repo,
+        Some(&notes),
+        None, // no --merge-report: the live gh path, with gh absent
+        &["--json"],
+        Some(&path),
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "unavailable evidence must not flag:\n{text}"
+    );
+    let j: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("--json not one document: {e}\n{text}"));
+    let merges = j["merges"].as_array().unwrap();
+    assert!(!merges.is_empty());
+    for m in merges {
+        assert!(
+            m["flags"].as_array().unwrap().is_empty(),
+            "no flags on missing evidence: {m}"
+        );
+    }
+    // Every row that needed gh reports the gap with its reason.
+    let gap_rows = merges
+        .iter()
+        .filter(|m| !m["evidence_unavailable"].is_null())
+        .count();
+    assert!(
+        gap_rows >= merges.iter().filter(|m| m["pr"].is_u64()).count(),
+        "gh-down PR rows must carry evidence_unavailable: {j}"
+    );
+    assert_eq!(j["summary"]["flagged"].as_u64().unwrap(), 0);
+    // Suppress the unused-fixture warning — this test runs live.
+    let _ = report;
+}
+
+#[test]
+fn audit_evidence_unavailable_is_unknown_not_flag() {
+    let dir = TempDir::new().unwrap();
+    let (repo, _notes, report, _heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // The notes directory does not exist — a verdict note could be in
+    // it. `no-passing-verdict` must not fire: the row is unknown, and
+    // unknown rows exit 0.
+    let missing_notes = dir.path().join("no-such-notes");
+    let out = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &missing_notes,
+        &report,
+        &["--limit", "1"],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "missing evidence is unknown, not a flag:\n{text}"
+    );
+    assert!(!text.contains("FLAG["), "{text}");
+    assert!(text.contains("evidence unavailable"), "{text}");
+
+    // A PR absent from the fixture's `prs` list is likewise a data
+    // gap, not a verdict failure.
+    let mut report_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    report_json["prs"] = json!([]);
+    std::fs::write(&report, report_json.to_string()).unwrap();
+    let notes = dir.path().join("notes");
+    let out = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &notes,
+        &report,
+        &["--limit", "1", "--json"],
+    );
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{j}");
+    let m = &j["merges"][0];
+    assert!(
+        m["flags"].as_array().unwrap().is_empty(),
+        "evidence gaps must not flag: {m}"
+    );
+    assert!(
+        m["evidence_unavailable"]
+            .as_str()
+            .is_some_and(|s| s.contains("no merged PR")),
+        "gap reason must surface: {m}"
+    );
+}
+
+#[test]
+fn audit_post_hoc_verdict_does_not_clear_flag() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    // The verdict note's filename timestamp is *after* the merge —
+    // evidence that arrived post-merge, not a merge-time review.
+    verdict_note(
+        &notes,
+        "20260920-130000-x-p3-verdict.md",
+        &heads[2],
+        "qa-1",
+        "auto",
+    );
+    let out = run_audit(
+        &state,
+        &pm,
+        &repo,
+        &notes,
+        &report,
+        &["--limit", "1", "--json"],
+    );
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(out.status.code(), Some(1), "post-hoc pass must flag: {j}");
+    let m = &j["merges"][0];
+    assert_eq!(m["pr"].as_u64(), Some(3), "{j}");
+    assert_eq!(m["verdict_post_hoc"].as_bool(), Some(true), "{j}");
+    assert!(
+        m["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "no-passing-verdict"),
+        "post-hoc pass must not clear the flag: {m}"
+    );
 }

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { Overview } from "../types";
+import type { MonitorAlert, Monitoring, Overview } from "../types";
 
 const KIND_CHIP: Record<string, string> = {
   merge: "bg-ok/15 text-ok",
@@ -37,6 +37,160 @@ function age(secs: number): string {
   return `${Math.floor(s / 86400)}d`;
 }
 
+function when(epoch: number | null | undefined): string {
+  if (epoch == null) return "never";
+  return new Date(epoch * 1000).toLocaleString();
+}
+
+const MONITOR_STATE_CHIP: Record<string, string> = {
+  active: "bg-ok/15 text-ok",
+  degraded: "bg-fail/10 text-fail",
+  stale: "bg-warn/10 text-warn",
+  stopped: "bg-ink-800 text-ink-400",
+  unavailable: "bg-warn/10 text-warn",
+  off: "bg-ink-800 text-ink-400",
+};
+
+function MonitoringView({
+  data,
+  readOnly,
+  onAck,
+}: {
+  data: Monitoring;
+  readOnly: boolean;
+  onAck: (monitor: string, seq: number) => void;
+}) {
+  return (
+    <section>
+      <div className="slabel mb-2">coordinator</div>
+      <div className="card px-4 py-3.5 space-y-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={`chip ${MONITOR_STATE_CHIP[data.state] ?? "bg-ink-800 text-ink-400"}`}
+          >
+            monitor {data.state}
+          </span>
+          <span className="text-label text-ink-400">
+            last successful scan: {when(data.last_success_at)}
+          </span>
+          <span className="text-micro text-ink-500">
+            next reconciliation: {when(data.next_check_at)}
+          </span>
+        </div>
+
+        <div className="text-micro text-ink-500">
+          local UI visibility only — external push delivery is unconfigured
+        </div>
+
+        {!data.available && (
+          <div className="text-label text-warn">
+            monitor RPC unavailable; persistent monitor health cannot be confirmed
+          </div>
+        )}
+        {data.errors.map((e, i) => (
+          <div key={`${e.monitor ?? "monitor"}-${i}`} className="text-label text-fail">
+            {e.monitor ? `${e.monitor}: ` : ""}{e.error}
+          </div>
+        ))}
+
+        {data.monitors.length > 0 && (
+          <div className="space-y-1 border-t border-ink-700/60 pt-2">
+            {data.monitors.map((monitor) => (
+              <div
+                key={monitor.id}
+                className="flex flex-wrap items-center gap-x-2 gap-y-1 text-micro"
+              >
+                <span
+                  className={`chip !py-[.15rem] ${MONITOR_STATE_CHIP[monitor.monitoring] ?? "bg-ink-800 text-ink-400"}`}
+                >
+                  {monitor.monitoring}
+                </span>
+                <span className="num text-ink-300">{monitor.id}</span>
+                <span className="text-ink-500">owner {monitor.owner}</span>
+                <span className="text-ink-500">
+                  scan {when(monitor.last_success_at)} · last check {when(monitor.last_check_at)}
+                </span>
+                <span className="text-ink-600">
+                  heartbeat {when(monitor.heartbeat_at)} · coverage {monitor.coverage.join(", ") || "none"}
+                </span>
+                {monitor.error && <span className="text-fail">{monitor.error}</span>}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {data.monitors.length === 0 && data.available && (
+          <div className="text-label text-ink-500">
+            no monitor registration is active; autonomous reconciliation is stopped
+          </div>
+        )}
+
+        {data.alerts.length > 0 && (
+          <div className="space-y-2 border-t border-ink-700/60 pt-3">
+            <div className="flex items-center justify-between">
+              <span className="slabel">actionable alerts</span>
+              <span className="num text-micro text-ink-500">
+                {data.open_alerts} open · {data.alerts.length} recorded
+              </span>
+            </div>
+            {data.alerts.map((alert) => (
+              <MonitorAlertView
+                key={`${alert.monitor}-${alert.seq}`}
+                alert={alert}
+                readOnly={readOnly}
+                onAck={onAck}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function MonitorAlertView({
+  alert,
+  readOnly,
+  onAck,
+}: {
+  alert: MonitorAlert;
+  readOnly: boolean;
+  onAck: (monitor: string, seq: number) => void;
+}) {
+  const open = alert.state === "open";
+  return (
+    <div className="rounded border border-ink-700/70 bg-ink-875 px-3 py-2.5 space-y-1.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`chip !py-[.15rem] ${open ? "bg-warn/10 text-warn" : "bg-ink-800 text-ink-500"}`}>
+          {open ? "open" : "acknowledged"}
+        </span>
+        <span className="chip !py-[.15rem] bg-ink-800 text-ink-300">{alert.kind}</span>
+        <span className="num text-micro text-ink-500">{age(alert.age_secs)}</span>
+        <span className="num text-micro text-ink-500">
+          {alert.project} · {alert.monitor} · {alert.task ?? "task unknown"}
+        </span>
+        {open && (
+          <button
+            className="chip ml-auto bg-accent/10 text-accent hover:bg-accent/20 disabled:opacity-50"
+            disabled={readOnly}
+            title={readOnly ? "board is read-only" : "acknowledge this durable monitor alert"}
+            onClick={() => onAck(alert.monitor, alert.seq)}
+          >
+            ack
+          </button>
+        )}
+      </div>
+      <div className="text-label text-ink-200">{alert.next_action}</div>
+      <div className="text-micro text-ink-500">
+        next owner <span className="text-ink-300">{alert.next_owner}</span> · {alert.authority}
+      </div>
+      <div className="text-micro text-ink-600">
+        evidence event {alert.event_seq} · {alert.fingerprint}
+      </div>
+    </div>
+  );
+}
+
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -59,7 +213,15 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-export default function OverviewView({ data }: { data: Overview | null }) {
+export default function OverviewView({
+  data,
+  readOnly,
+  onAck,
+}: {
+  data: Overview | null;
+  readOnly: boolean;
+  onAck: (monitor: string, seq: number) => void;
+}) {
   if (!data) {
     return (
       <div className="px-4 lg:px-8 pt-4 text-label text-ink-500">
@@ -79,6 +241,10 @@ export default function OverviewView({ data }: { data: Overview | null }) {
             <div>daemon unreachable — agent, approval and drift rows are missing</div>
           )}
         </div>
+      )}
+
+      {data.monitoring && (
+        <MonitoringView data={data.monitoring} readOnly={readOnly} onAck={onAck} />
       )}
 
       <section>

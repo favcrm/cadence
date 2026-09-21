@@ -271,23 +271,40 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
             };
             match memory::match_for_issue(pm, &issue_obj, Some(&provider)) {
                 Err(e) => lessons_error = Some(format!("memory match failed: {e}")),
-                Ok(matched) => {
+                Ok((matched, mem_errors)) => {
+                    // Valid records still reach the worker; every file
+                    // that failed to load is named on the issue.
+                    if let Some(line) = memory::load_errors_line(&mem_errors) {
+                        lessons_error = Some(line);
+                    }
                     let (text, slugs) = memory::render_lessons(&matched);
                     if !slugs.is_empty() {
                         let ddir = state_dir.join("dispatch");
                         let file = ddir.join(format!("{mid}-lessons.md"));
+                        // tmp + rename: a failed write never leaves a
+                        // partial or empty lessons artifact behind.
+                        let tmp = ddir.join(format!("{mid}-lessons.tmp"));
                         let prior = b.clone();
                         *b = format!("{prior} Lessons: {}.", file.display());
                         if let Err(e) = check_body(b, &provider) {
                             *b = prior;
-                            lessons_error = Some(format!(
-                                "lessons path pushed the kickoff over the body limit: {e}"
-                            ));
+                            let why =
+                                format!("lessons path pushed the kickoff over the body limit: {e}");
+                            lessons_error = Some(match lessons_error {
+                                Some(prev) => format!("{prev}; {why}"),
+                                None => why,
+                            });
                         } else if let Err(e) = std::fs::create_dir_all(&ddir)
-                            .and_then(|_| std::fs::write(&file, &text))
+                            .and_then(|_| std::fs::write(&tmp, &text))
+                            .and_then(|_| std::fs::rename(&tmp, &file))
                         {
+                            let _ = std::fs::remove_file(&tmp);
                             *b = prior;
-                            lessons_error = Some(format!("lessons file unwritable: {e}"));
+                            let why = format!("lessons file unwritable: {e}");
+                            lessons_error = Some(match lessons_error {
+                                Some(prev) => format!("{prev}; {why}"),
+                                None => why,
+                            });
                         } else {
                             lessons = slugs;
                             lessons_file = Some(file);

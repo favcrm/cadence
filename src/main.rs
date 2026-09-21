@@ -595,6 +595,13 @@ enum Commands {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// Daemon-owned persistent supervision registrations and local alerts.
+    /// Monitor state describes the observer; delivery remains explicitly
+    /// unconfigured in this bounded increment.
+    Monitor {
+        #[command(subcommand)]
+        action: MonitorAction,
+    },
     /// The issue board: folders under the PM dir (`~/pm` or
     /// `CADENCE_PM_DIR`); this CLI is the only writer.
     Issue {
@@ -641,6 +648,12 @@ enum Commands {
         priority: Option<String>,
         #[command(subcommand)]
         action: Option<ReportAction>,
+    },
+    /// Relay local report issues to explicitly configured GitHub projects
+    /// and poll actionable comments without model turns.
+    Intake {
+        #[command(subcommand)]
+        action: IntakeAction,
     },
     /// Shared project memory: reviewed, scoped facts injected into
     /// dispatches and briefings. This CLI is the only writer.
@@ -709,6 +722,38 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Reconstruct every merge on the default branch from stored
+    /// data — verdict notes, commit statuses, tracker folders, daemon
+    /// events — and flag `reviewer==merger` and merges with no passing
+    /// verdict on the exact landed head. Read-only; exits non-zero
+    /// when any row is flagged. See docs/AUDIT.md.
+    Audit {
+        /// Drop merges older than this: 24h, 7d, YYYY-MM-DD or epoch.
+        #[arg(long)]
+        since: Option<String>,
+        /// Keep rows classified auto, notify or human.
+        #[arg(long)]
+        class: Option<String>,
+        /// Keep rows whose tracker issue lives under project P.
+        #[arg(long)]
+        project: Option<String>,
+        /// Emit the payload as one stable JSON document (cadence.audit/1).
+        #[arg(long)]
+        json: bool,
+        /// Cap rows (0 = all; default 200).
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Audit this checkout instead of the cwd.
+        #[arg(long, hide = true)]
+        repo: Option<PathBuf>,
+        /// Fixture the notes directory (default /var/www/agent-notes).
+        #[arg(long, value_name = "PATH", hide = true)]
+        notes_dir: Option<PathBuf>,
+        /// Fixture replacing every `gh` call — the audit never shells
+        /// out when this is set.
+        #[arg(long, value_name = "PATH", hide = true)]
+        merge_report: Option<PathBuf>,
+    },
     /// What needs a human right now: merge-ready PRs, open approvals,
     /// fenced or stalled agents, review/unblocked issues, unread
     /// inboxes, a behind-tracker, deploy drift — each with the exact
@@ -731,6 +776,58 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
     },
+}
+
+#[derive(Subcommand)]
+enum IntakeAction {
+    /// Write or update one project's relay configuration.  The relay is
+    /// disabled unless --enable is explicitly supplied.
+    Configure {
+        /// PM project key whose local intake issues are published.
+        project: String,
+        /// GitHub owner/name. URLs, tokens and credential-shaped values are
+        /// rejected.
+        repo: String,
+        /// Explicitly enable this project.
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        /// Explicitly disable this project while retaining its state.
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+        /// Minimum seconds between non-model polls.
+        #[arg(long, default_value_t = cadence_agent::issue::relay::DEFAULT_POLL_SECONDS,
+              value_parser = clap::value_parser!(u64).range(1..))]
+        poll_seconds: u64,
+        /// Permit on-demand PM dispatch after quota/agent checks.  A sync
+        /// still needs its separate --dispatch flag.
+        #[arg(long)]
+        dispatch: bool,
+        /// PM alias to receive actionable comments.
+        #[arg(long)]
+        pm: Option<String>,
+        /// GitHub login used for self-echo suppression.
+        #[arg(long)]
+        actor: Option<String>,
+    },
+    /// Show config, heartbeat, delivery receipts, cursors and durable action
+    /// states. This never contacts GitHub or a provider.
+    Status {
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one poll with --once, or keep a cheap non-model polling loop.
+    Sync {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        once: bool,
+        /// Permit configured, quota-checked actionable PM dispatches.
+        #[arg(long)]
+        dispatch: bool,
+    },
+    /// Make one receipt eligible for the next sync attempt.
+    Retry { project: String, report: String },
 }
 
 #[derive(Subcommand)]
@@ -896,6 +993,52 @@ enum JobAction {
         #[command(subcommand)]
         action: TaskAction,
     },
+}
+
+#[derive(Subcommand)]
+enum MonitorAction {
+    /// Register an explicit project/task coverage set. Delivery remains
+    /// local and unconfigured; --dispatch only enables the guarded manual
+    /// handoff into existing job dispatch.
+    Register {
+        monitor: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long = "task", required = true)]
+        tasks: Vec<String>,
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        interval_secs: u64,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        dispatch: bool,
+    },
+    /// List persistent monitor registrations and their separate delivery state.
+    List,
+    /// Show one monitor's heartbeat, cursor, coverage, and alert counts.
+    Show { monitor: String },
+    /// Record an explicit caller heartbeat; this is not a worker-health claim.
+    Heartbeat { monitor: String },
+    /// List durable local alerts for one monitor.
+    Alerts {
+        monitor: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long)]
+        open: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+    },
+    /// Acknowledge one local alert.
+    Ack {
+        monitor: String,
+        #[arg(long)]
+        alert: i64,
+    },
+    /// Turn monitoring off for this registration. History is retained.
+    Stop { monitor: String },
+    /// Explicitly pass one covered, eligible task to existing job dispatch.
+    Dispatch { monitor: String, task: String },
 }
 
 #[derive(Subcommand)]
@@ -3465,6 +3608,7 @@ fn run() -> Result<i32> {
             }
         }
         Commands::Job { action } => run_job(&state_dir, &action),
+        Commands::Monitor { action } => run_monitor(&state_dir, &action),
         Commands::Dispatch {
             issue,
             to,
@@ -3536,6 +3680,65 @@ fn run() -> Result<i32> {
             }
             Ok(0)
         }
+        Commands::Intake { action } => match action {
+            IntakeAction::Configure {
+                project,
+                repo,
+                enable,
+                disable,
+                poll_seconds,
+                dispatch,
+                pm,
+                actor,
+            } => {
+                if enable == disable {
+                    return Err(Error::rejected(
+                        "intake configure requires exactly one of --enable or --disable",
+                    ));
+                }
+                let result = cadence_agent::issue::relay::configure(
+                    &state_dir,
+                    &project,
+                    &repo,
+                    enable,
+                    poll_seconds,
+                    dispatch,
+                    pm,
+                    actor,
+                )?;
+                print_json(&result);
+                Ok(0)
+            }
+            IntakeAction::Status { project, .. } => {
+                print_json(&cadence_agent::issue::relay::status(
+                    &state_dir,
+                    project.as_deref(),
+                )?);
+                Ok(0)
+            }
+            IntakeAction::Sync {
+                project,
+                once,
+                dispatch,
+            } => {
+                let pm = cadence_agent::issue::Pm::open_default()?;
+                let result = cadence_agent::issue::relay::run_loop(
+                    &pm.dir,
+                    &state_dir,
+                    project.as_deref(),
+                    dispatch,
+                    once,
+                )?;
+                print_json(&result);
+                Ok(0)
+            }
+            IntakeAction::Retry { project, report } => {
+                print_json(&cadence_agent::issue::relay::retry(
+                    &state_dir, &project, &report,
+                )?);
+                Ok(0)
+            }
+        },
         Commands::Memory { action } => cadence_agent::memory::cli::run(&action, &state_dir),
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
         Commands::Status { group, json, watch } => {
@@ -3593,9 +3796,95 @@ fn run() -> Result<i32> {
                 state_dir,
             }),
         },
+        Commands::Audit {
+            since,
+            class,
+            project,
+            json,
+            limit,
+            repo,
+            notes_dir,
+            merge_report,
+        } => cadence_agent::audit::run(&cadence_agent::audit::AuditOptions {
+            since,
+            class,
+            project,
+            json,
+            limit,
+            repo,
+            notes_dir,
+            merge_report,
+            cwd: std::env::current_dir()?,
+            state_dir,
+        }),
         Commands::Overview { json, watch } => run_overview(&state_dir, json, watch),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
+}
+
+/// The `cadence monitor` tree — thin RPC wrappers. Monitor state and
+/// safety checks live in the daemon so every caller sees one contract.
+fn run_monitor(state_dir: &Path, action: &MonitorAction) -> Result<i32> {
+    let rpc = |method: &str, params: Value| client::rpc(state_dir, method, params);
+    let pane = std::env::var("CADENCE_ALIAS").ok();
+    match action {
+        MonitorAction::Register {
+            monitor,
+            project,
+            tasks,
+            interval_secs,
+            owner,
+            dispatch,
+        } => {
+            print_json(&rpc(
+                "monitor_register",
+                json!({"monitor": monitor, "project": project,
+                       "tasks": tasks, "interval_secs": interval_secs,
+                       "owner": owner.as_deref().or(pane.as_deref())
+                           .unwrap_or("operator"),
+                       "dispatch_enabled": dispatch}),
+            )?);
+        }
+        MonitorAction::List => print_json(&rpc("monitor_list", json!({}))?),
+        MonitorAction::Show { monitor } => {
+            print_json(&rpc("monitor_show", json!({"monitor": monitor}))?);
+        }
+        MonitorAction::Heartbeat { monitor } => {
+            print_json(&rpc("monitor_heartbeat", json!({"monitor": monitor}))?);
+        }
+        MonitorAction::Alerts {
+            monitor,
+            after,
+            open,
+            limit,
+        } => {
+            print_json(&rpc(
+                "monitor_alerts",
+                json!({"monitor": monitor, "after": after,
+                       "open": open, "limit": limit}),
+            )?);
+        }
+        MonitorAction::Ack { monitor, alert } => {
+            print_json(&rpc(
+                "monitor_alert_ack",
+                json!({"monitor": monitor, "alert": alert,
+                       "by": pane.as_deref().unwrap_or("operator")}),
+            )?);
+        }
+        MonitorAction::Stop { monitor } => {
+            print_json(&rpc(
+                "monitor_stop",
+                json!({"monitor": monitor, "pane": pane}),
+            )?);
+        }
+        MonitorAction::Dispatch { monitor, task } => {
+            print_json(&rpc(
+                "monitor_dispatch",
+                json!({"monitor": monitor, "task": task, "pane": pane}),
+            )?);
+        }
+    }
+    Ok(0)
 }
 
 /// The `cadence job` tree — thin RPC wrappers. Validation, transitions
@@ -4990,8 +5279,10 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
             return None;
         }
         // ≤8 entries AND ≤LESSON_MAX_BYTES total — same bound the
-        // dispatch lessons file carries.
+        // dispatch lessons file carries. An over-budget rule is
+        // skipped, not a stop: later smaller rules still list.
         let mut items = String::new();
+        let mut omitted = 0usize;
         for m in rules.iter().take(8) {
             let line = format!(
                 "- `{}`: {} — {}",
@@ -5000,15 +5291,22 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
                 cadence_agent::memory::apply_line(&m.body)
             );
             if items.len() + line.len() + 1 > cadence_agent::memory::LESSON_MAX_BYTES {
-                break;
+                omitted += 1;
+                continue;
             }
             if !items.is_empty() {
                 items.push('\n');
             }
             items.push_str(&line);
         }
+        omitted += rules.len().saturating_sub(8);
+        let more = if omitted > 0 {
+            format!("({omitted} accepted rule(s) omitted — `cadence memory ls` lists all)\n\n")
+        } else {
+            String::new()
+        };
         Some(format!(
-            "## Project memory — accepted rules ({proj_key})\n\n{items}\n\n\
+            "## Project memory — accepted rules ({proj_key})\n\n{items}\n\n{more}\
              `cadence memory match --issue <ID>` lists everything scoped to\n\
              a task; `cadence memory propose` records a new lesson.\n\n",
             proj_key = proj.key
