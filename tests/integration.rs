@@ -2283,7 +2283,7 @@ for line in sys.stdin:
                 "reasoningEffort": effort},
                 "model": model, "reasoningEffort": effort}})
     elif method == "account/rateLimits/read":
-        if mode == "no-quota":
+        if mode in ("no-quota", "quota-recover"):
             emit({"id": mid, "error": {"code": -32601,
                  "message": "rate limits unavailable in this auth mode"}})
         else:
@@ -2308,10 +2308,12 @@ for line in sys.stdin:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
         else:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
-            if mode == "quota-update":
-                emit({"method": "account/rateLimits/updated", "params": {
-                    "accountId": None,
-                    "rateLimits": {"primary": {"usedPercent": 42}}}})
+            if mode in ("quota-update", "quota-recover"):
+                update = {"accountId": None,
+                          "rateLimits": {"primary": {"usedPercent": 42}}}
+                if mode == "quota-recover":
+                    update["accountId"] = "acct-recovered"
+                emit({"method": "account/rateLimits/updated", "params": update})
             emit({"method": "turn/completed", "params": {"turn": {
                 "id": "t-1", "status": "completed", "items": [
                     {"id": "i1", "type": "agentMessage",
@@ -2849,6 +2851,30 @@ fn codex_quota_endpoint_failure_is_explicit_unknown() {
     assert!(agent["quota"]["reason"]
         .as_str()
         .is_some_and(|reason| { reason.contains("unavailable") }));
+}
+
+#[test]
+fn codex_quota_recovers_from_unavailable_to_available() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("quota-recover");
+    d.register_codex("recover");
+    d.wait_agent("recover", "idle", 15);
+    let initial = d.rpc("agent_show", json!({"alias": "recover"})).unwrap()["agent"].clone();
+    assert_eq!(initial["quota"]["state"], "unavailable");
+
+    d.rpc(
+        "agent_send",
+        json!({"alias": "recover", "text": "refresh", "message": "quota-recover"}),
+    )
+    .unwrap();
+    d.wait_message("recover", "quota-recover", &["completed"], 15);
+    let recovered = d.rpc("agent_show", json!({"alias": "recover"})).unwrap()["agent"].clone();
+    assert_eq!(recovered["quota"]["state"], "available");
+    assert_eq!(recovered["quota"]["account_id"], "acct-recovered");
+    assert_eq!(
+        recovered["quota"]["data"]["rateLimits"]["primary"]["usedPercent"],
+        42
+    );
 }
 
 #[test]

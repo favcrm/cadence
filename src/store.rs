@@ -76,7 +76,8 @@ fn quota_state(data: &Value) -> (&'static str, Option<&'static str>) {
     let has_limits = object.get("rateLimits").is_some_and(Value::is_object)
         || object
             .get("rateLimitsByLimitId")
-            .is_some_and(Value::is_object);
+            .and_then(Value::as_object)
+            .is_some_and(|limits| !limits.is_empty());
     if !has_limits {
         return ("unknown", Some("Codex provider omitted rate-limit buckets"));
     }
