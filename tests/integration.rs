@@ -2081,15 +2081,44 @@ fn is_filtered_run() -> bool {
     false
 }
 
+/// Nextest launches every test in a process-per-test child and exposes
+/// `NEXTEST=1` plus `NEXTEST_EXECUTION_MODE`. A filtered child cannot
+/// safely acquire the host slot itself. The outer review process owns
+/// the flock and explicitly clears the child path instead.
+fn is_nextest_run() -> bool {
+    std::env::var("NEXTEST").ok().as_deref() == Some("1")
+        || std::env::var("NEXTEST_EXECUTION_MODE").is_ok()
+}
+
+fn nextest_outer_lock_required(
+    nextest: bool,
+    lock_path: Option<&str>,
+    review_held: bool,
+) -> Result<(), &'static str> {
+    if !nextest {
+        return Ok(());
+    }
+    if review_held && lock_path.is_none() {
+        return Ok(());
+    }
+    Err(
+        "nextest requires the external CADENCE_SUITE_LOCK; run `cadence review` or use the pinned outer wrapper",
+    )
+}
+
 fn acquire_suite_slot() -> Result<Option<std::fs::File>, String> {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
-    let Some(path) = std::env::var("CADENCE_SUITE_LOCK")
+    let path = std::env::var("CADENCE_SUITE_LOCK")
         .ok()
-        .filter(|p| !p.is_empty())
-    else {
-        return Ok(None);
-    };
+        .filter(|p| !p.is_empty());
+    let review_held = std::env::var("CADENCE_REVIEW_SUITE_LOCK_HELD")
+        .ok()
+        .as_deref()
+        == Some("1");
+    nextest_outer_lock_required(is_nextest_run(), path.as_deref(), review_held)
+        .map_err(str::to_string)?;
+    let Some(path) = path else { return Ok(None) };
     if is_filtered_run() {
         return Ok(None);
     }
@@ -2163,6 +2192,20 @@ fn acquire_suite_slot() -> Result<Option<std::fs::File>, String> {
         }
         thread::sleep(Duration::from_millis(500));
     }
+}
+
+#[test]
+fn nextest_requires_external_suite_lock_without_nested_flock() {
+    // Ordinary cargo filtered tests retain the historical no-slot path.
+    assert!(nextest_outer_lock_required(false, None, false).is_ok());
+    // Direct nextest is refused whether the caller forgot the path or
+    // supplied one without proving that an outer review owns it.
+    assert!(nextest_outer_lock_required(true, None, false).is_err());
+    assert!(nextest_outer_lock_required(true, Some("/tmp/suite.lock"), false).is_err());
+    // Review's outer Flock is the only accepted child contract: it clears
+    // the path and sets the marker, so no nested flock can deadlock.
+    assert!(nextest_outer_lock_required(true, None, true).is_ok());
+    assert!(nextest_outer_lock_required(true, Some("/tmp/suite.lock"), true).is_err());
 }
 
 fn daemon_opts() -> daemon::ServeOptions {

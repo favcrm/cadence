@@ -507,6 +507,21 @@ fn run_step(
     })
 }
 
+/// Pass the outer-slot contract to a full-suite child only when this review
+/// actually owns the host flock. A `--no-suite-lock` review must not mint the
+/// held marker because a future nextest command would otherwise bypass its
+/// fail-closed lock check.
+fn suite_child_env(
+    mut suite_env: Vec<(String, String)>,
+    outer_slot_held: bool,
+) -> Vec<(String, String)> {
+    if outer_slot_held {
+        suite_env.push(("CADENCE_SUITE_LOCK".into(), String::new()));
+        suite_env.push(("CADENCE_REVIEW_SUITE_LOCK_HELD".into(), "1".into()));
+    }
+    suite_env
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers — unit-tested without IO
 // ---------------------------------------------------------------------------
@@ -1276,14 +1291,16 @@ pub fn run(opts: &Options) -> Result<i32> {
                 let wait = Instant::now();
                 _suite_guard = Some(Flock::lock_deadline(&path, t.full_secs)?);
                 suite_lock = json!({"path": path,
-                    "waited_ms": wait.elapsed().as_millis()});
+                    "waited_ms": wait.elapsed().as_millis(),
+                    "ownership": "outer-review"});
             }
             report["host_load"] = host_load();
-            // The slot is already held here: the suite's own harness
-            // prelude must not queue behind its parent, so it sees the
-            // variable empty.
-            let mut suite_env = env(gated_tree);
-            suite_env.push(("CADENCE_SUITE_LOCK".into(), String::new()));
+            // The slot is already held here: the suite's own harness prelude
+            // must not queue behind its parent, so it sees the variable empty.
+            // The explicit marker is consumed by the pinned nextest wrapper;
+            // it prevents a nested flock while preserving a fail-closed
+            // direct invocation.
+            let suite_env = suite_child_env(env(gated_tree), _suite_guard.is_some());
             suite_step = Some(run_step(
                 "full-suite",
                 &cfg.full_suite,
@@ -2233,6 +2250,17 @@ gate_secs = 42
         assert_eq!(cfg.timeouts.gate_secs, 42);
         assert_eq!(cfg.timeouts.full_secs, 3600);
         assert_eq!(cfg.stress_pattern.0, vec!["wait_", "sleep"]);
+    }
+
+    #[test]
+    fn suite_child_marker_requires_outer_lock() {
+        let unowned = suite_child_env(vec![("BASE".into(), "1".into())], false);
+        assert_eq!(unowned, vec![("BASE".to_string(), "1".to_string())]);
+
+        let owned = suite_child_env(vec![("BASE".into(), "1".into())], true);
+        assert_eq!(owned[0], ("BASE".to_string(), "1".to_string()));
+        assert!(owned.contains(&("CADENCE_SUITE_LOCK".into(), String::new())));
+        assert!(owned.contains(&("CADENCE_REVIEW_SUITE_LOCK_HELD".into(), "1".into())));
     }
 
     #[test]

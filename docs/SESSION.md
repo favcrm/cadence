@@ -267,6 +267,27 @@ gives up after `CADENCE_SUITE_LOCK_WAIT_SECS` (default 3600).
 `cadence review` refuses its full run while the variable is unset
 (`--no-suite-lock` overrides, `--no-full` skips the suite).
 
+CAD-173's nextest path is deliberately separate from that active cargo
+gate. `scripts/cadence-nextest` verifies the pinned `cargo-nextest
+0.9.145` binary against `.config/cargo-nextest.sha256`, clears the
+`NEXTEST_RETRIES`/`NEXTEST_PROFILE` environment overrides, passes CLI
+`--retries 0`, uses `.config/nextest.toml` with `retries = 0`, and takes
+the same `CADENCE_SUITE_LOCK` in an outer `flock` before launching direct
+runs.
+When `cadence review` owns the slot, `src/review.rs` clears the child's
+lock path and sets an explicit held marker; the wrapper then runs without
+a nested flock. `scripts/nextest-inventory` compares non-empty cargo and
+nextest test-name manifests from the repository root before any runner
+switch, even when the command is invoked from another directory. The checked-in
+review configuration remains on cargo until the human-class installation,
+structured-result, and gate-activation approvals for CAD-173 are recorded.
+
+For an admitted current-head measurement, record two separate runs for
+the cold build and two warm runs, with the exact SHA, pinned version,
+`retries=0`, inventory count, outer lock path, host load, and durations.
+Historical CAD-173 measurements are context and must not be reported as
+current evidence.
+
 A test that fails in the full run but passes alone on both trees is a
 flake sighting: `cadence review` appends it to
 `<state>/reviews/flakes.jsonl` (repo, test, PR, head, base, panic

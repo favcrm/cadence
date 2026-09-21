@@ -1,0 +1,6 @@
+# CAD-173: explicit profile for the pinned wrapper in scripts/cadence-nextest.
+# This file does not activate nextest in cadence-review.toml.
+[profile.cadence]
+# Retries mask flakes and bypass the review flake ledger; keep the gate strict.
+retries = 0
+fail-fast = false

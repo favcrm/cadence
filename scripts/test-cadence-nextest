@@ -1,0 +1,172 @@
+#!/bin/sh
+# Focused CAD-173 contract tests. They never run the repository suite or
+# change the installed toolchain. A checksum-verified binary is needed for
+# execution checks; trust-rejection checks still run when it is unavailable.
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+RUNNER="$ROOT/scripts/cadence-nextest"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/cadence-nextest-contract.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+
+die() {
+    echo "test-cadence-nextest: $*" >&2
+    exit 1
+}
+
+contains() {
+    needle=$1
+    file=$2
+    rg -F -q -- "$needle" "$file" || {
+        echo "--- $file ---" >&2
+        cat "$file" >&2
+        die "expected '$needle'"
+    }
+}
+
+# A binary that only prints the pinned version must still be rejected.
+cat >"$TMP/cargo-nextest" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'cargo-nextest 0.9.145'
+EOF
+chmod +x "$TMP/cargo-nextest"
+if CADENCE_NEXTTEST_BIN="$TMP/cargo-nextest" "$RUNNER" --help \
+    >"$TMP/out" 2>"$TMP/err"; then
+    die "version-only fake binary was accepted"
+fi
+contains "untrusted cargo-nextest executable checksum" "$TMP/err"
+
+PINNED_BIN=${CADENCE_NEXTTEST_TEST_BIN:-/tmp/cadence-nextest-0.9.145/cargo-nextest}
+if [ ! -x "$PINNED_BIN" ]; then
+    printf '%s\n' 'nextest contract checks passed (trusted binary unavailable; execution checks skipped)'
+    exit 0
+fi
+
+if CADENCE_NEXTTEST_BIN="$PINNED_BIN" "$RUNNER" --help \
+    >"$TMP/out" 2>"$TMP/err"; then
+    die "direct invocation without a lock was accepted"
+fi
+contains "requires CADENCE_SUITE_LOCK" "$TMP/err"
+
+if CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$TMP/suite.lock" \
+    "$RUNNER" --retries=1 >"$TMP/out" 2>"$TMP/err"; then
+    die "retry override was accepted"
+fi
+contains "retries are pinned" "$TMP/err"
+
+CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$TMP/suite.lock" \
+    "$RUNNER" --help >"$TMP/direct-help.out"
+contains "Usage: cargo nextest run" "$TMP/direct-help.out"
+
+# The review-owned path must not invoke a second flock. The real pinned
+# runner is used here so the fixture cannot bypass the executable trust check.
+mkdir "$TMP/bin"
+cat >"$TMP/bin/flock" <<'EOF'
+#!/bin/sh
+printf '%s\n' nested >"$FLOCK_LOG"
+exit 99
+EOF
+chmod +x "$TMP/bin/flock"
+PATH="$TMP/bin:/usr/bin:/bin" \
+    CADENCE_NEXTTEST_BIN="$PINNED_BIN" \
+    FLOCK_LOG="$TMP/flock.log" CADENCE_SUITE_LOCK= \
+    CADENCE_REVIEW_SUITE_LOCK_HELD=1 CADENCE_REVIEW_PR=173 \
+    CADENCE_REVIEW_HEAD=0123456789abcdef0123456789abcdef01234567 \
+    "$RUNNER" --help >"$TMP/review-help.out"
+[ ! -e "$TMP/flock.log" ] || die "review child nested the outer flock"
+contains "Usage: cargo nextest run" "$TMP/review-help.out"
+
+# Regression: NEXTEST_RETRIES=3 must not override the profile. The fixture
+# fails once and records each process execution; --retries 0 plus env clearing
+# must leave exactly one record.
+mkdir -p "$TMP/retry-workspace/src"
+cat >"$TMP/retry-workspace/Cargo.toml" <<'EOF'
+[package]
+name = "cadence-nextest-retry-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+cat >"$TMP/retry-workspace/src/lib.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    #[test]
+    fn fail_once_without_retry() {
+        let path = std::env::var("CADENCE_RETRY_COUNT").unwrap();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(file, "attempt").unwrap();
+        panic!("intentional retry fixture failure");
+    }
+}
+EOF
+if NEXTEST_RETRIES=3 CADENCE_RETRY_COUNT="$TMP/retry.count" \
+    CARGO_BUILD_JOBS=4 CADENCE_NEXTTEST_BIN="$PINNED_BIN" \
+    CADENCE_SUITE_LOCK="$TMP/retry.lock" "$RUNNER" \
+    --manifest-path "$TMP/retry-workspace/Cargo.toml" --no-fail-fast \
+    >"$TMP/retry.out" 2>"$TMP/retry.err"; then
+    die "intentional retry fixture unexpectedly passed"
+fi
+[ -s "$TMP/retry.count" ] || {
+    cat "$TMP/retry.out" "$TMP/retry.err" >&2
+    die "retry fixture did not execute"
+}
+attempts=$(wc -l <"$TMP/retry.count" | tr -d ' ')
+[ "$attempts" = 1 ] || {
+    cat "$TMP/retry.out" "$TMP/retry.err" >&2
+    die "NEXTEST_RETRIES override was not neutralized (attempts=$attempts)"
+}
+
+# The outer flock must be held before the nextest child starts. A temporary
+# two-second test gives a separate non-blocking probe time to observe that
+# startup ownership, without touching the repository suite lock.
+mkdir -p "$TMP/startup-workspace/src"
+cat >"$TMP/startup-workspace/Cargo.toml" <<'EOF'
+[package]
+name = "cadence-nextest-startup-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+cat >"$TMP/startup-workspace/src/lib.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn holds_startup_probe_window() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+EOF
+startup_lock="$TMP/startup.lock"
+CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$startup_lock" \
+    CARGO_BUILD_JOBS=4 "$RUNNER" \
+    --manifest-path "$TMP/startup-workspace/Cargo.toml" \
+    >"$TMP/startup.out" 2>"$TMP/startup.err" &
+runner_pid=$!
+observed=0
+attempt=0
+while [ "$attempt" -lt 8 ]; do
+    if [ -e "$startup_lock" ] && ! flock -n "$startup_lock" -c true; then
+        observed=1
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+if ! wait "$runner_pid"; then
+    cat "$TMP/startup.out" "$TMP/startup.err" >&2
+    die "startup lock fixture failed"
+fi
+[ "$observed" = 1 ] || die "outer flock was not held during child startup"
+
+printf '%s\n' 'nextest contract checks passed'
