@@ -1,6 +1,6 @@
 ---
 name: cadence
-description: Operating as a Cadence-managed coding agent — identity, message reporting, peer discovery, and group protocol. Use when CADENCE_ALIAS is set in your environment, when you are told you are a cadence worker/PM, or when asked to dispatch/report work via cadence.
+description: Work on a Cadence development team — identity, reporting, evidence-based delivery and reviewed learning. Use when CADENCE_ALIAS is set, when assigned as a Cadence worker/PM, or when asked to dispatch/report work via Cadence.
 ---
 
 # Cadence agent protocol
@@ -62,7 +62,9 @@ so do not report on them — they carry no `turn_id` for you.
 - Messages must be **single line**, no control characters (pty transport).
 - Long specs live in files; the message body points at the path.
 - If `cadence self` errors with "not inside a cadence-owned pane", you are not
-  cadence-managed — ignore this skill.
+  cadence-managed. Do not claim a native identity or another worker's turn
+  token; use the external reporting route assigned by the project. The work
+  and reflection guidance below still applies to an assigned team member.
 - If the pane/TUI dies, an operator runs `cadence agent resume <alias>`
   (or `cadence resume <group>` for the whole group) — you cannot
   self-revive. A fenced agent's launch summary prints that command.
@@ -109,7 +111,7 @@ Job work (the work axis over messages — see docs/JOBS.md):
 
 ```bash
 cadence job new --pm <you> --spec spec.md --issue CAD-31
-cadence job task add <job> --task <job>-fix --assignee <w> --accept "tests pass"
+cadence job task add <job> --task <job>-fix --assignee <w> --accept "<observable outcome and relevant failure case from spec>"
 cadence job dispatch <task>              # kickoff → worker (revision 1)
 cadence job show <job>                   # task states + kickoff + drift flags
 cadence job events <job> --follow        # scoped event view
@@ -129,3 +131,91 @@ Fresh joins get a `bootstrap-<alias>` kickoff plus the briefing file;
 `join --no-bootstrap` skips both. An inbox is the right `reply_to`/
 group root when results should accumulate for a non-agent consumer —
 the queue is durable and `inbox --wait` blocks instead of polling.
+
+## Development and reflection
+
+Use the project's instructions and existing task/spec as the source of intent.
+Scale this loop to the change; a small fix can use a short issue comment instead
+of another plan document. These are operating instructions, not a claim that
+Cadence schedules retrospectives or enforces all memory checks automatically.
+
+Before dispatch or resuming changed scope:
+
+- **Requirements:** identify the user/use case, desired observable outcome,
+  boundaries and material unknowns. Give the reviewer concrete pass/fail
+  examples; "tests pass" alone is not product acceptance. Include failure,
+  empty, blocked or recovery behavior when relevant. Resolve consequential
+  ambiguity; proceed with reversible independent work under stated assumptions.
+- **Context and memory:** read relevant project design/ADRs and match memory in
+  the explicit project (`cadence memory match --project <project> ...`; inspect
+  `--help` for issue/path/component axes). Inspect sources, scope and applicable
+  versions before using accepted lessons. Proposed, stale or contradicted
+  lessons are hypotheses, not instructions. Record missing or conflicting
+  evidence without borrowing another project's memory implicitly.
+- **Plan:** record the smallest useful increment, dependencies, touched areas,
+  one writer per area, reviewer/result route and proportionate validation.
+  Include rollout/recovery and cleanup ownership when they are in scope. Link
+  existing plans instead of copying them; revise the brief when scope changes.
+
+During implementation and handoff:
+
+- Inspect existing behavior and relevant lessons, then implement within the
+  agreed boundary. Send blockers immediately and evidence at meaningful stage
+  changes; avoid repeated unchanged status turns. Direct results to the role
+  that can act, with PM visibility of exceptions and progress.
+- Follow configured resource/admission rules for **focused tests as well as
+  full suites**. If required build-slot admission is refused or unavailable,
+  report the blocker and use an authorized runner/CI. A direct local command,
+  an advisory alias or an unused slot is not admission. Never label such a run
+  as an admitted gate. Reuse eligible evidence and avoid duplicate full suites.
+- Self-check before handoff; independent QA still reviews the exact change
+  against acceptance, regressions and applicable project standards. Bind the
+  verdict to the actual revision and list checks run, skipped and limitations.
+  QA tests the behavior and relevant failure paths, not just the author's report.
+- Acceptance maps each promised outcome to evidence. Keep implemented,
+  reviewed, merged, installed and operationally verified distinct. A moving
+  head or changed integration tree needs evidence revalidation; passing CI
+  does not itself authorize a merge, deployment, cleanup or message replay.
+
+At a completed increment, QA revision, incident or repeated blocker, append a
+compact reflection to the existing task: **expected outcome; observed evidence;
+cause or unresolved hypothesis; correction; reusable lesson or no lesson; next
+owner/action.** Include what worked. Review requirement ambiguity, plan and
+ownership quality, implementation/resource practice, QA misses or false alarms,
+and acceptance gaps only where evidence warrants it. Do not generate a generic
+checklist report for every trivial edit or spend model turns on empty retros.
+
+## Improve memory and this skill
+
+1. Propose one scoped, reusable claim with `cadence memory propose`, linking
+   source issue/commit/test, rationale, applicability, limits and invalidation
+   conditions. Remove secrets and transient queue/quota state. An incident
+   description alone is not a verified general rule.
+2. A different accountable reviewer/curator checks original evidence and
+   counterexamples before an authorized accept/reject/supersede action. Do not
+   treat the current CLI's permission checks, a confidence label or a refreshed
+   timestamp as proof of independent verification. Record the reviewer and
+   evidence in the task/artifact when the memory schema cannot represent them.
+3. Retrieve relevant accepted lessons at task start/resume and material scope
+   changes. Report which lesson helped, was irrelevant or was contradicted,
+   with evidence. Withhold contradicted guidance from the current task and
+   route it for revalidation; retain history rather than silently rewriting it.
+4. Promote a lesson into a skill change only when it improves a recurring,
+   broadly applicable decision. Keep project-specific design choices in scoped
+   memory/ADRs. Change the smallest instruction, give it a realistic behavioral
+   check and independent review, and retain source/revision and supersession
+   evidence. A lesson cannot enlarge user scope or grant execution permissions.
+
+Curators consolidate at delivery/incident boundaries and batch accumulated
+proposals during a project-defined periodic review; no model call is needed
+when nothing changed. The PM chooses a small measurable improvement (for
+example fewer requirement-driven rework rounds, faster review, or fewer escaped
+defects), names an owner, and checks the result on subsequent comparable work.
+Intervals and thresholds belong to the project, not a universal fixed timer.
+
+For Cadence itself, edit the version-controlled `skill/cadence/SKILL.md` through
+the review process. `src/skill.rs` embeds it; `cadence skill install` and daemon
+startup synchronize the embedded copy to the installed skill. Verify source,
+installed and embedded versions when rolling out a change: a local-only edit
+can be overwritten by an older binary. Notify affected agents at their next
+task boundary; do not assume an already-running context reloads automatically.
