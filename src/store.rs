@@ -1423,6 +1423,10 @@ impl Store {
     fn agent_identity(agent: &Agent) -> Value {
         json!({
             "created": agent.created,
+            // Keep the exact SQLite REAL bits alongside the human-readable
+            // timestamp. JSON number round-tripping can move an epoch f64
+            // by one ULP; the bits are the durable identity comparison.
+            "created_bits": agent.created.to_bits(),
             "provider": agent.provider,
             "endpoint_kind": agent.endpoint_kind,
             "role": agent.role,
@@ -1446,7 +1450,7 @@ impl Store {
         };
         let actual = Self::agent_identity(actual);
         let stable = [
-            "created",
+            "created_bits",
             "provider",
             "endpoint_kind",
             "role",
@@ -4445,6 +4449,57 @@ mod tests {
             .simple()
             .to_string();
         assert_eq!(pm_msgs[0].id, expected);
+    }
+
+    #[test]
+    fn finish_route_identity_survives_timestamp_json_ulp() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        for alias in ["pm", "w1"] {
+            reg(&s, alias, &cwd);
+        }
+        s.enqueue("w1", "do it", Some("pm"), "m1", "user").unwrap();
+
+        // A JSON number at epoch scale can round the same SQLite REAL to
+        // the adjacent f64 when it is serialized and parsed again. Recreate
+        // that harmless presentation drift in the queued binding; the exact
+        // created_bits proof must still admit the original recipient.
+        let (seq, payload): (i64, String) = {
+            let conn = s.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT seq,payload FROM events
+                 WHERE alias='w1' AND kind='queued' ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let mut payload: Value = serde_json::from_str(&payload).unwrap();
+        let created = payload["recipient_identity"]["created"].as_f64().unwrap();
+        payload["recipient_identity"]["created"] =
+            json!(f64::from_bits(created.to_bits().wrapping_add(1)));
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE events SET payload=? WHERE seq=?",
+                rusqlite::params![payload.to_string(), seq],
+            )
+            .unwrap();
+        }
+
+        let m = match s.take_queued("w1").unwrap() {
+            Take::Message(m) => m,
+            _ => panic!("expected worker message"),
+        };
+        s.mark_running("m1", "turn-1").unwrap();
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "text": "done"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.messages("pm").unwrap().len(), 1);
     }
 
     #[test]
