@@ -2235,6 +2235,7 @@ fn daemon_opts() -> daemon::ServeOptions {
 const MOCK_PY: &str = r#"
 import json, os, sys, time
 pidfile, mode = sys.argv[1], sys.argv[2]
+turn_count = 0
 with open(pidfile, "w") as f:
     f.write(str(os.getpid()))
 def emit(msg):
@@ -2300,6 +2301,7 @@ for line in sys.stdin:
                               "resetsAt": 1900100000}},
                 "planType": "mock-pro"}})
     elif method == "turn/start":
+        turn_count += 1
         if mode == "bad-turn":
             emit({"id": mid, "result": {"turn": {}}})
         elif mode == "die-after-start":
@@ -2309,10 +2311,22 @@ for line in sys.stdin:
         else:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
             if mode in ("quota-update", "quota-recover"):
-                update = {"accountId": None,
-                          "rateLimits": {"primary": {"usedPercent": 42}}}
                 if mode == "quota-recover":
-                    update["accountId"] = "acct-recovered"
+                    update = {"accountId": "acct-recovered",
+                              "rateLimits": {"primary": {"usedPercent": 42}}}
+                elif turn_count == 1:
+                    # First update explicitly clears nullable window fields;
+                    # the account id is tested separately as a conservative
+                    # identity field and must survive its explicit null.
+                    update = {"accountId": None,
+                              "rateLimits": {"primary": {
+                                  "usedPercent": 42,
+                                  "windowDurationMins": None,
+                                  "resetsAt": None}}}
+                else:
+                    # The second update omits the nullable fields entirely.
+                    # Omission must preserve their already-cleared state.
+                    update = {"rateLimits": {"primary": {"usedPercent": 44}}}
                 emit({"method": "account/rateLimits/updated", "params": update})
             emit({"method": "turn/completed", "params": {"turn": {
                 "id": "t-1", "status": "completed", "items": [
@@ -2784,7 +2798,7 @@ fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
 }
 
 #[test]
-fn codex_quota_is_provider_bound_and_sparse_updates_are_preserved() {
+fn codex_quota_is_provider_bound_and_sparse_updates_handle_nullable_fields() {
     let d = TestDaemon::start();
     let _mock = d.mock_codex("quota-update");
     let cwd = d.dir.path().to_str().unwrap().to_string();
@@ -2818,20 +2832,66 @@ fn codex_quota_is_provider_bound_and_sparse_updates_are_preserved() {
 
     d.rpc(
         "agent_send",
-        json!({"alias": "quota", "text": "refresh", "message": "quota-refresh"}),
+        json!({"alias": "quota", "text": "clear", "message": "quota-explicit-null"}),
     )
     .unwrap();
-    d.wait_message("quota", "quota-refresh", &["completed"], 15);
+    d.wait_message("quota", "quota-explicit-null", &["completed"], 15);
+    let first = d.rpc("agent_show", json!({"alias": "quota"})).unwrap()["agent"].clone();
+    let quota = &first["quota"];
+    assert_eq!(quota["state"], "available");
+    // Account identity is intentionally conservative: an explicit null does
+    // not erase the provider-bound account id.
+    assert_eq!(quota["account_id"], "acct-codex-test");
+    assert_eq!(quota["data"]["rateLimits"]["primary"]["usedPercent"], 42);
+    // Explicit nullable fields replace the previously reported values with
+    // provider-declared nulls.
+    let primary = &quota["data"]["rateLimits"]["primary"];
+    assert!(
+        primary
+            .get("windowDurationMins")
+            .is_some_and(Value::is_null),
+        "{first}"
+    );
+    assert!(
+        primary.get("resetsAt").is_some_and(Value::is_null),
+        "{first}"
+    );
+    // These provider fields were omitted from the update and remain intact.
+    assert_eq!(quota["data"]["planType"], "mock-pro");
+    assert_eq!(
+        quota["data"]["rateLimitsByLimitId"]["codex"]["windowDurationMins"],
+        10080
+    );
+    assert_eq!(
+        quota["data"]["rateLimitsByLimitId"]["codex"]["usedPercent"],
+        7
+    );
+
+    d.rpc(
+        "agent_send",
+        json!({"alias": "quota", "text": "omit", "message": "quota-omitted"}),
+    )
+    .unwrap();
+    d.wait_message("quota", "quota-omitted", &["completed"], 15);
     let updated = d.rpc("agent_show", json!({"alias": "quota"})).unwrap()["agent"].clone();
     let quota = &updated["quota"];
     assert_eq!(quota["state"], "available");
     assert_eq!(quota["account_id"], "acct-codex-test");
-    assert_eq!(quota["data"]["rateLimits"]["primary"]["usedPercent"], 42);
-    // The sparse update omitted these values; the producer retains them.
-    assert_eq!(
-        quota["data"]["rateLimits"]["primary"]["windowDurationMins"],
-        60
+    assert_eq!(quota["data"]["rateLimits"]["primary"]["usedPercent"], 44);
+    // Omitted fields preserve the explicit null state rather than restoring
+    // the initial values.
+    let primary = &quota["data"]["rateLimits"]["primary"];
+    assert!(
+        primary
+            .get("windowDurationMins")
+            .is_some_and(Value::is_null),
+        "{updated}"
     );
+    assert!(
+        primary.get("resetsAt").is_some_and(Value::is_null),
+        "{updated}"
+    );
+    assert_eq!(quota["data"]["planType"], "mock-pro");
     assert_eq!(
         quota["data"]["rateLimitsByLimitId"]["codex"]["usedPercent"],
         7
