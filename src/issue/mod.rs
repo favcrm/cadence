@@ -274,4 +274,7 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
 - Refs point at PRs/commits/notes/previews/messages/urls. Files go in\n\
   `artifacts/` under `artifact_max_bytes`. The listing is the manifest.\n\
 - Comments are one file each, create-only, named by UTC time + author.\n\
+- Acceptance criteria are authored with cadence issue acceptance <ID>\n\
+  --from <file> as an ordered - [ ]/- [x] checklist; dispatch enforcement\n\
+  remains a later CAD-159 change.\n\
 - Every write is one git commit, serialised on `.write.lock`.\n";

@@ -114,6 +114,11 @@ cadence issue ls --at <rev> [--project p] [--json]
                                             # the board as it was at <rev> —
                                             # cards report status_source: file
 cadence issue show CAD-16 [--json]
+cadence issue acceptance CAD-16 --from acceptance.md
+                                            # replace or insert the unique
+                                            # level-two Acceptance checklist;
+                                            # input is nonempty - [ ]/- [x]
+                                            # lines and unrelated body stays
 cadence issue log CAD-16 [--limit 50]       # parsed git log for the issue
                                             # folder: sha, at, by, kind,
                                             # summary, fields for `set`
@@ -159,6 +164,15 @@ cadence issue lint                          # schema, links, depth, sizes, symli
 cadence issue sync [--no-push] [--dry-run] [--resolve ours|theirs]
 cadence issue set CAD-16 owner=             # empty value clears the field
 ```
+
+Acceptance authoring is deliberately separate from dispatch. The command
+accepts a nonempty checklist file with explicit checked or unchecked state and
+replaces the issue's unique level-two Acceptance section, or inserts that
+section when it is absent. It refuses duplicate headings, malformed or empty
+input, missing issues and missing files before writing. issue show --json
+returns ordered acceptance items with text, checked and done fields; the
+existing global checks counter remains for compatibility. Dispatch enforcement
+for empty acceptance is CAD-159 work and is unchanged here.
 
 Every write is exactly one git commit in the PM repo, made under a lock
 file (`~/pm/.lock`) with atomic `issue.md` replacement. Field values are
