@@ -20,13 +20,15 @@ use super::{descends_from, lock_holders, resolve_on_path, shlex_quote};
 
 /// Bounded wait for the launched Devin TUI to take a native session lock.
 const OPEN_DEADLINE: Duration = Duration::from_secs(30);
-/// How much of the screen bottom counts as the status region: input
-/// line, divider, status bar and a menu tall enough for Devin's
-/// approval select. Approval markers only match inside it — the
-/// transcript above can legitimately show these strings as text.
+/// How much of the screen bottom counts as the menu region: a
+/// numbered approval menu (~12 rows) plus the busy input box and
+/// status bar that can stay visible below it, so the menu's own
+/// chrome sits up to ~18 rows above the frame's end. Only the
+/// menu-exclusive anchors below match inside it — transcript text
+/// quoting a lone option label or legend fragment never counts.
 /// (Busy is anchored tighter still: the status row directly above the
 /// input box — see `analyze_devin`.)
-const STATUS_LINES: usize = 14;
+const MENU_LINES: usize = 24;
 
 /// Devin TUI screen signatures — THE one place they live. A provider
 /// TUI update means editing this table, never the gate logic. Every
@@ -53,18 +55,24 @@ mod devin_screen {
         "(esc twice to interrupt)",
         "Cancel agent (esc twice)",
     ];
-    /// An open select/permission menu — the hint-bar fragments plus the
-    /// option labels only a menu renders. `↑↓ select · ↵ confirm ·
-    /// esc cancel` is the verbatim approval footer; `↓↑ to select` is
-    /// the same control on the directory-trust prompt.
-    pub const APPROVAL: &[&str] = &[
+    /// An open select/permission menu — the anchors below are
+    /// menu-exclusive and a single match decides alone: the
+    /// selection footer's legend, which only ever renders on a menu
+    /// (`↑↓ select · ↵ confirm · esc cancel` verbatim on the approval
+    /// select, `↓↑ to select` on the directory-trust prompt). Anchors
+    /// match on the trimmed row's leading glyph, so a transcript row
+    /// quoting `↵ confirm` mid-sentence stays inert.
+    pub const ANCHOR: &[&str] = &["↑↓ select", "↓↑ to select", "↵ confirm"];
+    /// Option labels and lone legend fragments — quotable inside a
+    /// long transcript, so they only count as a cluster alongside real
+    /// menu structure (a second hint, or numbered option rows).
+    pub const HINT: &[&str] = &[
         "(Approve",
         " to select",
-        "↑↓ select",
-        "↵ confirm",
         "esc cancel",
         "Yes, switch to bypass mode",
         "No, keep",
+        "always allow",
     ];
     /// TUI-side staged queue while busy (A26 sibling: text was staged,
     /// not dropped — still not safe to add to).
@@ -76,6 +84,158 @@ mod devin_screen {
 /// command menu, `!` switches to bash mode, `@` opens the file-picker.
 /// `#` stays a literal draft and is deliberately absent.
 pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
+
+/// A numbered menu option row: `· 3 Yes, …` or the `❭`-led selected
+/// row. Returns the printed number so `approval_answer` can validate a
+/// choice against the rows actually on screen.
+fn option_line(line: &str) -> Option<u32> {
+    let t = line.trim_start();
+    let t = t
+        .strip_prefix('·')
+        .or_else(|| t.strip_prefix('❭'))?
+        .trim_start();
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || !t[digits.len()..].starts_with(char::is_whitespace) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// A footer/legend or option-label row matching hint `h` — anchored
+/// on a legend glyph (`↑↓ select`, `↵ confirm`), a `·`-separated
+/// legend cell (`· esc cancel`), an option row, or the trimmed row's
+/// leading text — so a transcript quoting the same words mid-line
+/// does not count.
+fn hint_row(l: &str, h: &str) -> bool {
+    if !l.contains(h) {
+        return false;
+    }
+    let t = l.trim_start();
+    t.starts_with(h)
+        || t.contains(&format!("· {h}"))
+        || option_line(l).is_some()
+        || t.starts_with('↑')
+        || t.starts_with('↓')
+        || t.starts_with('↵')
+}
+
+/// A row carrying menu structure — a numbered or unnumbered option, a
+/// `·`/`❭`-led select row, or an anchored legend/hint row. The menu's
+/// own subject line (`Allow this tool call?`) is deliberately NOT one:
+/// it is ordinary free text directly above the block.
+fn menu_row(l: &str) -> bool {
+    let t = l.trim_start();
+    option_line(l).is_some()
+        || t.starts_with('·')
+        || t.starts_with('❭')
+        || devin_screen::ANCHOR.iter().any(|a| t.starts_with(a))
+        || devin_screen::HINT.iter().any(|h| hint_row(l, h))
+}
+
+/// A row that can belong to the live bottom frame — menu rows, the
+/// box's `─`/`═` rules, the busy status row, a `Did you know`/`Tip:`
+/// banner row, or transparent blank padding. Anything else is free
+/// text: transcript output, `⏺`/`└` tool echoes, the menu subject.
+fn frame_row(l: &str) -> bool {
+    let t = l.trim_start();
+    t.is_empty()
+        || menu_row(l)
+        || t.chars().filter(|c| matches!(c, '─' | '═')).count() >= 8
+        || devin_screen::SPINNER.iter().any(|m| l.contains(m))
+        || devin_screen::INTERRUPT.iter().any(|m| l.contains(m))
+        || devin_screen::QUEUED.iter().any(|m| l.contains(m))
+        || t.starts_with('✱')
+}
+
+/// The input line at row `i`: a `❭`-led row that is not a numbered
+/// option, whose next non-blank row is never menu chrome — a real
+/// select's `❭` highlight sits on option/legend rows, while the input
+/// row sits on the box's bottom rule, the model bar, or nothing.
+fn input_row(lines: &[&str], i: usize) -> bool {
+    let t = lines[i].trim_start();
+    if !t.starts_with(devin_screen::PROMPT) || option_line(lines[i]).is_some() {
+        return false;
+    }
+    !lines[i + 1..]
+        .iter()
+        .find(|n| !n.trim().is_empty())
+        .is_some_and(|n| menu_row(n))
+}
+
+/// The live menu region is the contiguous run of frame rows walking up
+/// from the bottom — and it ends at the first free-text row. A real
+/// permission menu renders inside the busy frame (option block, legend,
+/// spinner, the `Guide Devin` box) with nothing but chrome between it
+/// and the input row; a transcript quoting a menu verbatim sits above
+/// the cut whenever the agent's own prose or an editable input row
+/// intervenes. That position is the corroboration the legend text
+/// cannot supply — a quoted `↑↓ select` is transcript text too, more
+/// specific but not more trustworthy.
+///
+/// Residual: a quote that adjoins the busy frame verbatim — the
+/// legend as the agent's last printed row, directly against the live
+/// spinner and watermark box — is textually identical to a real menu
+/// and still passes; closing that needs signal outside the screen
+/// text (cursor position, provider state).
+/// An EDITABLE input row — empty, placeholder, or a staged draft,
+/// anything but the busy watermark — vetoes the region outright: a
+/// real approval menu is modal and only ever renders above the busy
+/// box, so menu-looking rows above a live editable `❭` are a quote,
+/// and `answer` would key the choice into the draft.
+fn devin_window<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    let input = (0..lines.len()).rev().find(|i| input_row(lines, *i));
+    match input {
+        Some(i) => {
+            let draft = lines[i]
+                .trim_start()
+                .trim_start_matches(devin_screen::PROMPT)
+                .trim();
+            if !draft.starts_with(devin_screen::BUSY_PLACEHOLDER) {
+                // Editable input: no live menu can exist above it.
+                return &lines[lines.len()..];
+            }
+            let mut start = i;
+            while start > 0 && frame_row(lines[start - 1]) {
+                start -= 1;
+            }
+            &lines[start..i]
+        }
+        // No input row on screen (a bare menu fragment): contiguous
+        // frame rows up from the last row.
+        None => {
+            let mut start = lines.len();
+            while start > 0 && frame_row(lines[start - 1]) {
+                start -= 1;
+            }
+            &lines[start..]
+        }
+    }
+}
+
+/// The line naming what the menu asks: the last non-blank row above
+/// the option list — a `└`-led command detail (`$ printenv FOO`) or a
+/// bare header (`Allow this tool call?`).
+fn menu_subject(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.trim_end().lines().collect();
+    let last_opt = lines.iter().rposition(|l| option_line(l).is_some())?;
+    let mut first_opt = last_opt;
+    while first_opt > 0 && option_line(lines[first_opt - 1]).is_some() {
+        first_opt -= 1;
+    }
+    lines[..first_opt]
+        .iter()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| {
+            l.trim()
+                .trim_start_matches('└')
+                .trim_start_matches('⏺')
+                .trim()
+                .chars()
+                .take(100)
+                .collect()
+        })
+}
 
 /// Reduce a captured Devin screen to gate facts. The last `❭` line is
 /// the input line; text after it that is not the placeholder is a
@@ -92,16 +252,46 @@ pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
 /// blank rows below the real content.
 pub fn analyze_devin(screen: &str) -> Probe {
     let content = screen.trim_end();
-    let tail: String = content
+    // The menu region is wider than the busy anchor: a numbered
+    // approval menu can sit ABOVE a still-visible busy input box, so
+    // its option rows and footer land up to ~18 rows above the frame
+    // end. devin_window first cuts the region to the contiguous frame
+    // chrome walking up from the input row — transcript quoting a menu
+    // verbatim is separated from the live frame by the agent's own
+    // prose, and an editable input row vetoes the region outright.
+    // Anchors (the selection footer's legend, matched on the
+    // trimmed row's leading glyph) decide alone inside the window;
+    // hints (option labels, lone legend fragments) need real menu
+    // structure beside them — numbered option rows or a second hint —
+    // because transcript text can legitimately quote one.
+    let menu_lines: Vec<&str> = content
         .lines()
         .rev()
-        .take(STATUS_LINES)
+        .take(MENU_LINES)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let approval_menu = devin_screen::APPROVAL.iter().any(|m| tail.contains(m));
+        .collect();
+    // Only the contiguous frame chrome walking up from the input row
+    // can be menu structure — a transcript quoting a menu verbatim
+    // leaves the agent's prose between the quote and the live frame,
+    // and an editable `❭` input row vetoes everything above it. The
+    // quoted legend is transcript text too: more specific, not more
+    // trustworthy.
+    let menu_lines: &[&str] = devin_window(&menu_lines);
+    let footer = menu_lines.iter().any(|l| {
+        let t = l.trim_start();
+        devin_screen::ANCHOR.iter().any(|a| t.starts_with(a))
+    });
+    let options = menu_lines
+        .iter()
+        .filter(|l| option_line(l).is_some())
+        .count();
+    let hints = devin_screen::HINT
+        .iter()
+        .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
+        .count();
+    let approval_menu = footer || (options >= 2 && hints >= 1) || hints >= 2;
     let lines: Vec<&str> = screen.lines().collect();
     let prompt_idx = lines
         .iter()
@@ -144,21 +334,30 @@ pub fn analyze_devin(screen: &str) -> Probe {
     let watermark_busy = draft.starts_with(devin_screen::BUSY_PLACEHOLDER);
     let busy_marker = status_busy || watermark_busy;
     let (idle, reason) = if approval_menu {
-        (false, "approval menu is open")
+        (
+            false,
+            menu_subject(content).unwrap_or_else(|| "approval menu is open".to_string()),
+        )
     } else if watermark_busy {
-        (false, "tui is busy (guide watermark in the input line)")
+        (
+            false,
+            "tui is busy (guide watermark in the input line)".to_string(),
+        )
     } else if status_busy {
-        (false, "tui is busy (status row above the input box)")
+        (
+            false,
+            "tui is busy (status row above the input box)".to_string(),
+        )
     } else if !prompt_visible {
-        (false, "no prompt line visible")
+        (false, "no prompt line visible".to_string())
     } else if input_nonempty {
-        (false, "unsubmitted text in the input line")
+        (false, "unsubmitted text in the input line".to_string())
     } else {
-        (true, "idle")
+        (true, "idle".to_string())
     };
     Probe {
         idle,
-        reason: reason.to_string(),
+        reason,
         input_nonempty,
         prompt_visible,
         busy_marker,
@@ -315,6 +514,154 @@ impl TuiProfile for DevinProfile {
          permission prompts in the terminal itself"
     }
 
+    /// Numbered menus take the option's digit key (verified live:
+    /// `8` dismisses the permission select as `No` in one keystroke);
+    /// an unnumbered select falls back to arrows + Enter. The option
+    /// scan sees only the live frame region — `devin_window` cuts
+    /// quoted menu text sitting above the real frame, so a transcript
+    /// can never make this emit a keystroke into the input line.
+    fn approval_answer(&self, screen: &str, choice: &str) -> Result<Vec<String>> {
+        let region: Vec<&str> = screen
+            .trim_end()
+            .lines()
+            .rev()
+            .take(MENU_LINES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let region: &[&str] = devin_window(&region);
+        let options: Vec<u32> = region.iter().filter_map(|l| option_line(l)).collect();
+        let n: u32 = choice.parse().map_err(|_| {
+            Error::rejected(format!(
+                "'{choice}' is not a menu index — Devin menus take the \
+                 option's printed number"
+            ))
+        })?;
+        if n == 0 {
+            return Err(Error::rejected("menu indices start at 1"));
+        }
+        if options.is_empty() {
+            // Unnumbered select: the option block is the contiguous
+            // run of `·`/`❭`-led rows around the `❭` highlight — up
+            // and down, never just the suffix below it, and never a
+            // blind count when no highlight row is on screen. `region`
+            // is already the live frame window.
+            let marker = |l: &&str| {
+                let t = l.trim_start();
+                t.starts_with('·') || t.starts_with('❭')
+            };
+            // The highlight row must have option rows or a legend
+            // right below it — the input box's `❭` is followed by the
+            // box's rules, not menu rows.
+            let sel = region
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(i, l)| {
+                    l.trim_start().starts_with('❭')
+                        && region[i + 1..]
+                            .iter()
+                            .find(|n| !n.trim().is_empty())
+                            .is_some_and(|n| {
+                                marker(n) || devin_screen::HINT.iter().any(|h| hint_row(n, h)) || {
+                                    let t = n.trim_start();
+                                    devin_screen::ANCHOR.iter().any(|a| t.starts_with(a))
+                                }
+                            })
+                })
+                .map(|(i, _)| i)
+                .ok_or_else(|| {
+                    Error::rejected(
+                        "cannot locate the option rows on this menu — \
+                         answer it in the pane",
+                    )
+                })?;
+            let mut start = sel;
+            while start > 0 && marker(&region[start - 1]) {
+                start -= 1;
+            }
+            let mut end = sel;
+            while end + 1 < region.len() && marker(&region[end + 1]) {
+                end += 1;
+            }
+            let count = (end - start + 1) as u32;
+            // A lone `❭` row is the input box, not a one-option menu —
+            // its next non-blank row being a legend made it look like
+            // a sel row, but a real menu always lists a `·` sibling.
+            if count < 2 {
+                return Err(Error::rejected(
+                    "cannot locate the option rows on this menu — \
+                     answer it in the pane",
+                ));
+            }
+            if n > count {
+                return Err(Error::rejected(format!(
+                    "no option {n} on this menu — it lists {count}"
+                )));
+            }
+            let want = (n - 1) as usize;
+            let cur = sel - start;
+            let (dir, steps) = if want >= cur {
+                ("Down", want - cur)
+            } else {
+                ("Up", cur - want)
+            };
+            let mut keys = vec![dir.to_string(); steps];
+            keys.push("Enter".to_string());
+            return Ok(keys);
+        }
+        if !options.contains(&n) {
+            return Err(Error::rejected(format!(
+                "no option {n} on this menu — it lists {}",
+                options
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        // A single digit is one keypress — the menu selects on it
+        // outright. A multi-digit index must never reach tmux as one
+        // literal: `send-keys "10"` presses `1` then `0`, and the
+        // first press alone would pick option 1 while `0` lands as
+        // stray input. Navigate from the highlighted row instead.
+        if n < 10 {
+            return Ok(vec![n.to_string()]);
+        }
+        let region: Vec<&str> = screen
+            .trim_end()
+            .lines()
+            .rev()
+            .take(MENU_LINES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let cur = region
+            .iter()
+            .rev()
+            .find(|l| l.trim_start().starts_with('❭'))
+            .and_then(|l| option_line(l))
+            .filter(|c| options.contains(c))
+            .ok_or_else(|| {
+                Error::rejected(
+                    "cannot locate the highlighted option on this menu — \
+                     answer it in the pane",
+                )
+            })?;
+        let want = options.iter().position(|o| *o == n).unwrap();
+        let at = options.iter().position(|o| *o == cur).unwrap();
+        let (dir, steps) = if want >= at {
+            ("Down", want - at)
+        } else {
+            ("Up", at - want)
+        };
+        let mut keys = vec![dir.to_string(); steps];
+        keys.push("Enter".to_string());
+        Ok(keys)
+    }
+
     fn forbidden_prefixes(&self) -> &'static [char] {
         FORBIDDEN_PREFIXES
     }
@@ -322,7 +669,7 @@ impl TuiProfile for DevinProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze_devin, DevinProfile, STATUS_LINES};
+    use super::{analyze_devin, DevinProfile, MENU_LINES};
     use crate::adapter::pty::profile::TuiProfile;
     use crate::adapter::registry::DEVIN_PERMISSION_MODES;
     use std::path::PathBuf;
@@ -421,6 +768,37 @@ Allow this tool call?
 · 8 No
 ↑↓ select · ↵ confirm · esc cancel";
 
+    /// A numbered menu with ten options — the highlight sits on
+    /// `❭ 1`, and option 10 must be arrowed to: `send-keys "10"`
+    /// would press `1` (selecting it outright) then leak `0`.
+    const LONG_MENU: &str = "\
+Allow this tool call?
+❭ 1 Yes
+· 2 B
+· 3 C
+· 4 D
+· 5 E
+· 6 F
+· 7 G
+· 8 H
+· 9 I
+· 10 No
+↑↓ select · ↵ confirm · esc cancel";
+
+    #[test]
+    fn multi_digit_answer_navigates_instead_of_typing() {
+        let prof = profile(None);
+        // Option 10 is nine rows below the highlighted option 1.
+        assert_eq!(
+            prof.approval_answer(LONG_MENU, "10").unwrap(),
+            vec!["Down", "Down", "Down", "Down", "Down", "Down", "Down", "Down", "Down", "Enter"]
+        );
+        // A single digit still takes its key.
+        assert_eq!(prof.approval_answer(LONG_MENU, "8").unwrap(), vec!["8"]);
+        // Beyond the printed list still refuses.
+        assert!(prof.approval_answer(LONG_MENU, "11").is_err());
+    }
+
     #[test]
     fn idle_prompt_is_pasteable() {
         let p = analyze_devin(IDLE);
@@ -436,7 +814,9 @@ Allow this tool call?
         let p = analyze_devin(APPROVAL);
         assert!(!p.idle);
         assert!(p.approval_menu);
-        assert_eq!(p.reason, "approval menu is open");
+        // The reason names what the menu asks — the line above the
+        // option list.
+        assert_eq!(p.reason, "Allow this tool call?");
     }
 
     #[test]
@@ -568,7 +948,7 @@ SWE-2 Max                                      Alt+Enter for multiline prompts";
         ] {
             screen.push_str(&format!("transcript line: {marker}\n"));
         }
-        for i in 0..STATUS_LINES {
+        for i in 0..MENU_LINES {
             screen.push_str(&format!("ordinary output row {i}\n"));
         }
         screen.push_str(IDLE);
@@ -618,7 +998,53 @@ SWE-2 Max                                      Alt+Enter for multiline prompts";
         let screen = format!("{APPROVAL}{}", "\n".repeat(30));
         let p = analyze_devin(&screen);
         assert!(!p.idle && p.approval_menu, "{:?}", p);
-        assert_eq!(p.reason, "approval menu is open");
+        assert_eq!(p.reason, "Allow this tool call?");
+    }
+
+    #[test]
+    fn approval_menu_above_the_busy_box_is_still_a_menu() {
+        // CAD-102: the incident layout — the numbered menu renders
+        // ABOVE a still-visible busy input box, so its option rows and
+        // footer land ~18 rows above the frame end, outside the busy
+        // anchor. Reading it as "busy (guide watermark)" is the bug:
+        // a menu is not ordinary busy — it needs an operator answer.
+        let screen = "\
+❭ run the shell command: printenv FOO
+ ⏺ Running command
+ └ $ printenv FOO
+
+❭ 1 Yes  (Approve once)
+· 2 Yes, allow `printenv` commands
+· 3 Yes, always allow `printenv` commands in `tmp`
+· 4 Yes, always allow `printenv` commands in all projects
+· 5 Yes, switch to bypass mode
+· 6 Edit command
+· 7 Describe change to command
+· 8 No
+↑↓ select · ↵ confirm · esc cancel
+
+──────────────────────────────────────────────────────────────────
+❭ Guide Devin while it works
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                      Alt+Enter for multiline prompts";
+        let p = analyze_devin(screen);
+        assert!(!p.idle && p.approval_menu, "{:?}", p);
+        // The menu wins over the watermark busy below it — and the
+        // reason names the command being approved, not generic busy.
+        assert_eq!(p.reason, "$ printenv FOO");
+    }
+
+    #[test]
+    fn numbered_options_need_menu_structure() {
+        // Transcript text quoting a lone option label or legend word
+        // stays inert — hints only count beside real menu structure.
+        let screen = "\
+earlier the menu offered `No, keep` as the last choice
+❭ Ask Devin to build features
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                      Alt+Enter for multiline prompts";
+        let p = analyze_devin(screen);
+        assert!(p.idle && !p.approval_menu, "{:?}", p);
     }
 
     #[test]
@@ -635,5 +1061,147 @@ SWE-2 Max                                      Alt+Enter for multiline prompts";
         assert!(!p.idle && p.busy_marker);
         assert_eq!(p.reason, "tui is busy (guide watermark in the input line)");
         assert!(!p.input_nonempty);
+    }
+
+    /// An unnumbered select (`↓↑ to select` legend, `❭`-led
+    /// highlight, `·`-led options) for the answer tests.
+    fn unnumbered_menu() -> &'static str {
+        " Trust this directory?\n❭ Yes, trust it\n· No, keep asking\n↑↓ select · ↵ confirm · esc cancel\n"
+    }
+
+    #[test]
+    fn answer_on_unnumbered_menu_navigates_the_block() {
+        let prof = profile(None);
+        // The highlight sits on option 1 — Down once selects the
+        // second printed option.
+        assert_eq!(
+            prof.approval_answer(unnumbered_menu(), "2").unwrap(),
+            vec!["Down", "Enter"]
+        );
+        assert_eq!(
+            prof.approval_answer(unnumbered_menu(), "1").unwrap(),
+            vec!["Enter"]
+        );
+    }
+
+    #[test]
+    fn answer_counts_options_above_the_highlight() {
+        // The highlight is on the SECOND printed option — option 1 is
+        // the row above it, so `answer 1` moves Up, never Enter.
+        let screen = " Trust this directory?\n· Yes, trust it\n❭ No, keep asking\n↑↓ select · ↵ confirm · esc cancel\n";
+        let prof = profile(None);
+        assert_eq!(
+            prof.approval_answer(screen, "1").unwrap(),
+            vec!["Up", "Enter"]
+        );
+        assert_eq!(prof.approval_answer(screen, "2").unwrap(), vec!["Enter"]);
+    }
+
+    #[test]
+    fn answer_index_is_bounded_by_the_visible_block() {
+        let prof = profile(None);
+        // A huge index must never reach key allocation — the menu
+        // lists two options, so anything past 2 refuses.
+        for choice in ["3", "4000000000", "0"] {
+            assert!(
+                prof.approval_answer(unnumbered_menu(), choice).is_err(),
+                "{choice} must refuse"
+            );
+        }
+        // And a menu shape with no option block at all refuses
+        // outright — never a blind arrow walk.
+        let footer_only = "transcript\n↑↓ select · ↵ confirm · esc cancel\n";
+        assert!(
+            prof.approval_answer(footer_only, "1").is_err(),
+            "unparseable options must refuse"
+        );
+        assert!(prof.approval_answer(footer_only, "4000000000").is_err());
+    }
+
+    #[test]
+    fn quoted_legend_text_is_not_a_menu() {
+        // The same words mid-line in a transcript stay inert — only
+        // glyph-anchored legend rows and option rows count.
+        let screen = "\
+docs say \"esc cancel\" dismisses the prompt and that you can always allow tools
+❭ Ask Devin to build features
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                      Alt+Enter for multiline prompts";
+        let p = analyze_devin(screen);
+        assert!(p.idle && !p.approval_menu, "{:?}", p);
+    }
+
+    /// CAD-102 r6: a transcript that quotes a real menu verbatim —
+    /// anchor, numbered options, the selection legend — above a live
+    /// IDLE input box. The quoted legend is transcript text, so the
+    /// frame decides instead: the agent's own prose sits between the
+    /// quote and the live `❭` box, and an editable input row vetoes
+    /// menu structure outright. `answer` must refuse — the keystroke
+    /// is the consequence that matters, not the probe flag.
+    #[test]
+    fn devin_quoted_menu_above_idle_box_is_inert() {
+        let screen = "\
+● The pane showed:
+
+  Allow this tool call?
+  ❭ 1 Yes  (Approve once)
+  · 2 Yes, allow `env` commands
+  · 8 No
+  ↑↓ select · ↵ confirm · esc cancel
+
+  So it is waiting.
+
+──────────────────────────────────────────────────────────────────
+❭ Ask Devin to build features, fix bugs, or work on your code
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                          Context: 43k / 262k";
+        let p = analyze_devin(screen);
+        assert!(!p.approval_menu, "{p:?}");
+        assert!(p.idle, "{p:?}");
+        let prof = profile(None);
+        assert!(prof.approval_answer(screen, "2").is_err());
+        assert!(prof.approval_answer(screen, "8").is_err());
+        // Even flush against the box — no intervening prose — the
+        // editable `❭` vetoes it.
+        let flush = "\
+Allow this tool call?
+❭ 1 Yes  (Approve once)
+· 8 No
+↑↓ select · ↵ confirm · esc cancel
+──────────────────────────────────────────────────────────────────
+❭ half-typed draft
+──────────────────────────────────────────────────────────────────
+SWE-2 Max                                          Context: 43k / 262k";
+        let p = analyze_devin(flush);
+        assert!(!p.approval_menu && p.input_nonempty, "{p:?}");
+        assert!(prof.approval_answer(flush, "1").is_err());
+    }
+
+    /// The same quote above a live BUSY box: the spinner and the
+    /// `Guide Devin` watermark are real, so the editable-input veto
+    /// does not fire — but the agent's prose between the quote and
+    /// the busy frame still cuts the window, and `answer` must refuse
+    /// rather than fire the digit mid-turn.
+    #[test]
+    fn devin_quoted_menu_above_busy_box_is_inert() {
+        let screen = "\
+● The pane showed:
+
+  Allow this tool call?
+  ❭ 1 Yes  (Approve once)
+  · 2 Yes, allow `env` commands
+  · 8 No
+  ↑↓ select · ↵ confirm · esc cancel
+
+  So it is waiting.
+⠸ Running tools · 2m 10s (esc twice to interrupt)
+──────────
+❭ Guide Devin while it works
+";
+        let p = analyze_devin(screen);
+        assert!(!p.approval_menu, "{p:?}");
+        assert!(p.busy_marker, "{p:?}");
+        let prof = profile(None);
+        assert!(prof.approval_answer(screen, "2").is_err());
     }
 }

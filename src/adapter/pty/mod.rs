@@ -141,6 +141,11 @@ pub struct PtyAdapter {
     /// itself instead of requiring a human `agent ready` claim.
     /// Mutable — `agent set` refreshes it on the live adapter.
     auto_ready: AtomicBool,
+    /// Serialises probe→input sequences that must not interleave: the
+    /// send gate's probe→paste→Enter and `agent answer`'s
+    /// probe→send-keys. Without it a menu closing between the answer's
+    /// capture and its keystroke would land a digit as draft text.
+    paste_lock: Mutex<()>,
     /// The provider TUI this pane runs.
     profile: Box<dyn TuiProfile>,
 }
@@ -414,6 +419,7 @@ impl PtyAdapter {
                     .and_then(|v| v.as_str())
                     == Some("verified"),
             ),
+            paste_lock: Mutex::new(()),
             profile: Box::new(profile),
         })
     }
@@ -510,11 +516,14 @@ impl PtyAdapter {
 
     /// Gate evaluation before any paste: the pane must be live, not in a
     /// tmux mode, and still the session owner — else the endpoint is
-    /// dead. Then readiness: a fresh unconsumed operator claim always
-    /// wins; without one, `auto_ready=verified` agents get a daemon-run
-    /// screen probe (idle pane → self-claim, recorded as a
-    /// `ready_claimed` event by `"daemon"`); anything else requeues for
-    /// a retry.
+    /// dead. Then the screen probe — run before any claim is consumed,
+    /// because an open approval menu is never idle and no claim may
+    /// carry a paste past one (the refusal also costs nothing: no
+    /// claim eaten). Readiness last: a fresh unconsumed operator claim
+    /// always wins; without one, `auto_ready=verified` agents get the
+    /// probe verdict (idle pane → self-claim, recorded as a
+    /// `ready_claimed` event by `"daemon"`); anything else requeues
+    /// for a retry.
     fn check_gate(&self, message_id: &str) -> Result<()> {
         let (session, native) = self.session_and_native();
         if !self.has_session(&session) {
@@ -526,6 +535,19 @@ impl PtyAdapter {
         self.verify_ownership(&session, &native)?;
         if self.pane_value(&session, "#{pane_in_mode}")? != "0" {
             return Err(Error::gate("pane is in a tmux mode (copy/view)"));
+        }
+        // A transient `capture-pane` failure must retry like any other
+        // gate refusal — a provider error here would fail the message
+        // and fence the agent on a flake.
+        let probe = self
+            .probe()
+            .map_err(|e| Error::gate(format!("pane probe failed: {e}")))?;
+        if probe.approval_menu {
+            return Err(Error::gate(format!(
+                "approval menu is open: {} — answer it in the pane or with \
+                 `cadence agent answer {} <choice>`",
+                probe.reason, session
+            )));
         }
         let claimed = {
             // Claims stack FIFO: drop expired heads, consume the oldest
@@ -561,7 +583,6 @@ impl PtyAdapter {
                  terminal is idle with an empty input before submission",
             ));
         }
-        let probe = self.probe()?;
         if probe.idle {
             self.state.lock().unwrap().gate_probe = Some(probe.clone());
             (self.hooks.on_event)(
@@ -872,6 +893,10 @@ impl ProviderAdapter for PtyAdapter {
                 )));
             }
         }
+        // The gate's probe and the paste it admits are one critical
+        // section: a concurrent `agent answer` (or second send) must
+        // not interleave keys between the probe and the paste.
+        let _paste_guard = self.paste_lock.lock().unwrap();
         self.check_gate(client_message_id)?;
 
         let token = {
@@ -918,6 +943,9 @@ impl ProviderAdapter for PtyAdapter {
             ));
         }
         drop(tmp);
+        // Enter committed the turn — the pane state can no longer be
+        // raced by an `agent answer`, so the lock can go.
+        drop(_paste_guard);
 
         // Post-paste verification, bounded by RENDER_DEADLINE: the
         // slice's occurrence count must increase AND the input line must
@@ -1060,6 +1088,45 @@ impl ProviderAdapter for PtyAdapter {
         let session = self.session();
         let cursor = self.cursor_pos(&session);
         Ok(self.profile.analyze(&self.capture_visible()?, cursor))
+    }
+
+    /// `agent answer`: the only input a menu accepts is its own choice
+    /// key — never a paste. The fresh probe must still see the menu;
+    /// anything else refuses so the keystroke cannot land in a prompt,
+    /// a draft, or a running turn.
+    fn answer_approval(&self, choice: &str) -> Result<Probe> {
+        // Serialised against the send gate: the probe that verifies the
+        // menu and the keys it admits are one critical section — a
+        // paste or a second answer cannot interleave between them.
+        let _paste_guard = self.paste_lock.lock().unwrap();
+        let (session, native) = self.session_and_native();
+        if !self.has_session(&session) {
+            return Err(Error::provider("cannot answer: pane is gone"));
+        }
+        self.verify_ownership(&session, &native)?;
+        let screen = self.capture_visible()?;
+        let probe = self.profile.analyze(&screen, self.cursor_pos(&session));
+        if !probe.approval_menu {
+            return Err(Error::rejected(format!(
+                "refusing menu answer — the pane shows no approval menu \
+                 ({}) (inspect with `agent capture`)",
+                probe.reason
+            )));
+        }
+        let keys = self.profile.approval_answer(&screen, choice)?;
+        // `--` ends tmux option parsing so a key name can never be
+        // read as a send-keys flag.
+        let mut args = vec!["send-keys", "-t", session.as_str(), "--"];
+        args.extend(keys.iter().map(String::as_str));
+        self.tmux_ok(&args)?;
+        Ok(probe)
+    }
+
+    fn sample_screen(&self) -> Result<(String, Probe)> {
+        let session = self.session();
+        let screen = self.capture_visible()?;
+        let probe = self.profile.analyze(&screen, self.cursor_pos(&session));
+        Ok((activity_hash(&screen), probe))
     }
 
     fn update_params(&self, params: &Value) {

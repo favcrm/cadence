@@ -77,8 +77,14 @@ fn analyze_stub(screen: &str) -> Probe {
         && !draft.starts_with(stub_screen::BUSY_PLACEHOLDER);
     let watermark_busy = draft.starts_with(stub_screen::BUSY_PLACEHOLDER);
     let busy_marker = region_busy || watermark_busy;
+    let menu_line = || {
+        tail.lines()
+            .find(|l| stub_screen::APPROVAL.iter().any(|m| l.contains(m)))
+            .map(|l| l.trim())
+            .unwrap_or("approval menu is open")
+    };
     let (idle, reason) = if approval_menu {
-        (false, "approval menu is open")
+        (false, menu_line())
     } else if busy_marker {
         (false, "tui is busy")
     } else if !prompt_visible {
@@ -238,6 +244,26 @@ impl TuiProfile for StubProfile {
     fn respond_rejection(&self) -> &'static str {
         "pty endpoints have no approval channel — answer stub \
          permission prompts in the terminal itself"
+    }
+
+    /// The stub's menu takes the choice as a single literal key —
+    /// word characters only, so no option string can smuggle a key
+    /// name the pane never asked for.
+    /// Test-only: accepts `C-c`/`BSpace`-style key names verbatim so a
+    /// test can assert exactly which keys the adapter would send —
+    /// real profiles run a fixed hotkey allowlist instead.
+    fn approval_answer(&self, _screen: &str, choice: &str) -> Result<Vec<String>> {
+        if choice.is_empty()
+            || !choice
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '_'))
+        {
+            return Err(Error::rejected(format!(
+                "'{choice}' is not a menu index — the stub menu takes a \
+                 bare option number or letter"
+            )));
+        }
+        Ok(vec![choice.to_string()])
     }
 
     fn forbidden_prefixes(&self) -> &'static [char] {

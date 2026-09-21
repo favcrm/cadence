@@ -2700,6 +2700,23 @@ impl Store {
         Ok(())
     }
 
+    /// The oldest still-waiting message for the agent — `queued` or
+    /// mid-gate `submitting`. The stall watch tracks it so a pane menu
+    /// blocking delivery is visible before any turn starts.
+    pub fn queued_head(&self, alias: &str) -> Result<Option<Message>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT * FROM messages WHERE alias=? AND state IN
+             ('queued','submitting') ORDER BY seq LIMIT 1",
+            [alias],
+            row_message,
+        ) {
+            Ok(m) => Ok(Some(m)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Latest event seq for `agent_show`'s cursor.
     pub fn event_cursor(&self, alias: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();

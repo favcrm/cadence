@@ -1337,6 +1337,18 @@ enum AgentAction {
     /// prompt_visible, busy_marker, approval_menu}` — the same probe the
     /// verified auto-ready mode runs before self-claiming.
     Probe { alias: String },
+    /// Send one menu-choice keystroke to a pty pane currently probing
+    /// `approval_menu` — refuses anything else, like `agent ready`
+    /// refuses a busy pane. `<choice>` is the option's printed index;
+    /// records `approval_answered` with the answerer and the menu line.
+    Answer {
+        alias: String,
+        /// The option's printed index on the open menu.
+        choice: String,
+        /// Operator note recorded with the answer event.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Merge `key=value` pairs into an agent's endpoint params — e.g.
     /// `agent set <alias> auto_ready=verified` opts a live agent into
     /// daemon-verified readiness.
@@ -2141,17 +2153,32 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
             });
         // One probe per pty agent per invocation — and only for an
         // agent that actually has a pane (a live endpoint); a stopped
-        // or paneless pty agent skips the tmux call entirely.
+        // or paneless pty agent skips the tmux call entirely. The
+        // verdict names the pane states that need a human first: an
+        // approval menu (`approval: <menu line>`), then a pane idle on
+        // a still-running message (`ended?: <age>` — the daemon's
+        // sampled streak, not this one probe), then ordinary verdicts.
         let pane = if kind == "pty" && a["endpoint"].is_string() {
             client::rpc(state_dir, "agent_probe", json!({"alias": alias}))
                 .ok()
                 .map(|p| {
-                    json!({"idle": p["idle"], "reason": p["reason"],
-                    "verdict": if p["idle"].as_bool().unwrap_or(false) {
-                        "idle".to_string()
+                    let idle = p["idle"].as_bool().unwrap_or(false);
+                    let menu = p["approval_menu"].as_bool().unwrap_or(false);
+                    let ended = a["ended_secs"].as_u64();
+                    let verdict = if menu {
+                        format!("approval: {}", p["reason"].as_str().unwrap_or(""))
+                    } else if idle {
+                        match ended {
+                            Some(secs) if running.is_some() => {
+                                format!("ended?: {}", fmt_age(secs as i64))
+                            }
+                            _ => "idle".to_string(),
+                        }
                     } else {
                         format!("busy: {}", p["reason"].as_str().unwrap_or(""))
-                    }})
+                    };
+                    json!({"idle": p["idle"], "reason": p["reason"],
+                           "verdict": verdict})
                 })
         } else {
             None
@@ -3385,6 +3412,18 @@ fn run() -> Result<i32> {
                 }
                 AgentAction::Probe { alias } => {
                     client::rpc(&state_dir, "agent_probe", json!({"alias": alias}))?
+                }
+                AgentAction::Answer {
+                    alias,
+                    choice,
+                    reason,
+                } => {
+                    let by = std::env::var("CADENCE_ALIAS").ok();
+                    client::rpc(
+                        &state_dir,
+                        "agent_answer",
+                        json!({"alias": alias, "choice": choice, "by": by, "note": reason}),
+                    )?
                 }
                 AgentAction::Set {
                     alias,
