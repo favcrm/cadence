@@ -24,6 +24,9 @@ use crate::error::{Error, Result};
 use crate::store::Agent;
 
 const TURN_DEADLINE: Duration = Duration::from_secs(600);
+/// Quota is advisory startup telemetry. A provider/auth mode that does not
+/// expose the endpoint must not hold an agent open for the turn deadline.
+const QUOTA_DEADLINE: Duration = Duration::from_secs(5);
 
 const ENV_SCRUB: &[&str] = &[
     "CODEX_THREAD_ID",
@@ -315,6 +318,9 @@ struct Shared {
     /// Every transport message bumps this — the raw activity clock the
     /// daemon's stall watch reads (`ProviderAdapter::activity_at`).
     last_activity: Mutex<Instant>,
+    /// The last provider-owned rate-limit snapshot. It remains raw JSON;
+    /// the store adds Cadence identity and timestamps before exposure.
+    quota: Mutex<Option<Value>>,
 }
 
 fn shared_state(hooks: AdapterHooks) -> Arc<Shared> {
@@ -326,6 +332,7 @@ fn shared_state(hooks: AdapterHooks) -> Arc<Shared> {
         thread_id: Mutex::new(None),
         active_turn: Mutex::new(None),
         last_activity: Mutex::new(Instant::now()),
+        quota: Mutex::new(None),
     })
 }
 
@@ -372,6 +379,25 @@ impl CodexAdapter {
         }
     }
 
+    /// Read the provider-owned allowance snapshot after the native thread is
+    /// known. A missing endpoint/auth capability is recorded as unknown and
+    /// never prevents the agent from starting.
+    fn read_rate_limits(&self) {
+        match self
+            .transport
+            .request_timeout("account/rateLimits/read", json!({}), QUOTA_DEADLINE)
+        {
+            Ok(data) => self
+                .shared
+                .record_quota("account/rateLimits/read", Some(data), None),
+            Err(_) => self.shared.record_quota(
+                "account/rateLimits/read",
+                None,
+                Some("Codex account/rateLimits/read unavailable"),
+            ),
+        }
+    }
+
     /// One minimal turn so a fresh thread's rollout is persisted and an
     /// official TUI can attach to it. Bounded by its own deadline.
     fn seed_turn(&self, thread_id: &str) -> Result<()> {
@@ -413,6 +439,74 @@ impl CodexAdapter {
 }
 
 impl Shared {
+    /// Merge a sparse provider update. Omitted fields retain their last
+    /// confirmed value, while Codex's nullable window fields explicitly
+    /// replace stale telemetry with a JSON null. Other nullable fields,
+    /// including account identity, remain conservative and retain the last
+    /// confirmed value.
+    fn merge_non_null(target: &mut Value, patch: &Value) {
+        match (target, patch) {
+            (Value::Object(target), Value::Object(patch)) => {
+                for (key, value) in patch {
+                    if value.is_null() {
+                        if matches!(key.as_str(), "resetsAt" | "windowDurationMins") {
+                            target.insert(key.clone(), Value::Null);
+                        }
+                        continue;
+                    }
+                    match target.get_mut(key) {
+                        Some(existing) if existing.is_object() && value.is_object() => {
+                            Self::merge_non_null(existing, value);
+                        }
+                        _ => {
+                            target.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+            (target, patch) if !patch.is_null() => *target = patch.clone(),
+            _ => {}
+        }
+    }
+
+    fn record_quota(&self, source: &str, data: Option<Value>, reason: Option<&str>) {
+        let mut snapshot = json!({
+            "state": if data.is_some() {
+                "reported"
+            } else if reason.is_some() {
+                "unavailable"
+            } else {
+                "unknown"
+            },
+            "source": source,
+        });
+        if let Some(data) = data {
+            snapshot["data"] = data;
+        }
+        if let Some(reason) = reason {
+            snapshot["reason"] = json!(reason);
+        }
+        *self.quota.lock().unwrap() = Some(snapshot);
+    }
+
+    fn merge_quota_update(&self, source: &str, patch: &Value) -> Value {
+        let mut quota = self.quota.lock().unwrap();
+        let snapshot =
+            quota.get_or_insert_with(|| json!({"state": "unknown", "source": source, "data": {}}));
+        if !snapshot.get("data").is_some_and(Value::is_object) {
+            snapshot["data"] = json!({});
+        }
+        let data = snapshot.get_mut("data").expect("quota data inserted");
+        Self::merge_non_null(data, patch);
+        snapshot["state"] = json!("reported");
+        snapshot["source"] = json!(source);
+        snapshot["data"].clone()
+    }
+
+    fn quota_snapshot(&self) -> Option<Value> {
+        self.quota.lock().unwrap().clone()
+    }
+
     fn dispatch(&self, incoming: Incoming) {
         *self.last_activity.lock().unwrap() = Instant::now();
         match incoming {
@@ -452,6 +546,18 @@ impl Shared {
                 }
                 self.emit(method, &params);
             }
+            "account/rateLimits/updated" => {
+                let data = self.merge_quota_update(method, &params);
+                let thread_id = self.thread_id.lock().unwrap().clone();
+                self.emit(
+                    "cadence/codex_quota",
+                    &json!({
+                        "thread_id": thread_id,
+                        "source": method,
+                        "data": data,
+                    }),
+                );
+            }
             "turn/started" | "error" | "serverRequest/resolved" => self.emit(method, &params),
             _ => {}
         }
@@ -476,6 +582,10 @@ impl ProviderAdapter for CodexAdapter {
     /// provider traffic, not only the curated event stream.
     fn activity_at(&self) -> Option<Instant> {
         Some(*self.shared.last_activity.lock().unwrap())
+    }
+
+    fn quota_snapshot(&self) -> Option<Value> {
+        self.shared.quota_snapshot()
     }
 
     fn open(&self, agent: &Agent) -> Result<Identity> {
@@ -584,6 +694,7 @@ impl ProviderAdapter for CodexAdapter {
                     "Codex effective effort is unknown: thread response omitted reasoningEffort",
                 ));
             }
+            self.read_rate_limits();
             // A TUI can only resume a thread whose rollout is persisted —
             // which happens after its first turn. Seed fresh WebSocket
             // threads with one minimal turn so `agent attach` works.
