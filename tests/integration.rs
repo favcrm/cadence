@@ -18597,6 +18597,7 @@ fn doctor_host_json_reports_all_checks() {
             "sessions",
             "orphans",
             "temp-dirs",
+            "task-targets",
             "worktrees",
             "load"
         ]
