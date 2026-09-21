@@ -66,6 +66,9 @@ pub struct Identity {
     pub thread_id: String,
     pub session_id: String,
     pub model: Option<String>,
+    /// Provider-confirmed reasoning effort for the opened native thread,
+    /// when the endpoint reports one (Codex app-server does).
+    pub effort: Option<String>,
     pub pid: u32,
     /// Attachable endpoint (`ws://…`, `tmux://…`) when the kind has one.
     pub endpoint: Option<String>,

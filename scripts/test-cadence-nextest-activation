@@ -1,0 +1,63 @@
+#!/bin/sh
+# CAD-173 activation follow-up fixture. It runs only a temporary crate and
+# verifies that the reviewed profile writes JUnit where review.rs reads it;
+# it never runs the repository suite or changes the installed toolchain.
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+RUNNER="$ROOT/scripts/cadence-nextest"
+PINNED_BIN=${CADENCE_NEXTTEST_TEST_BIN:-/tmp/cadence-nextest-0.9.145/cargo-nextest}
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/cadence-nextest-activation.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+
+die() {
+    echo "test-cadence-nextest-activation: $*" >&2
+    exit 1
+}
+
+if [ ! -x "$PINNED_BIN" ]; then
+    die "trusted cargo-nextest unavailable at $PINNED_BIN; install the pinned task-local artifact first"
+fi
+
+mkdir -p "$TMP/src"
+cat >"$TMP/Cargo.toml" <<'EOF'
+[package]
+name = "cadence-nextest-activation-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+EOF
+cat >"$TMP/src/lib.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixture_pass() {}
+
+    #[test]
+    fn fixture_fail() {
+        panic!("intentional structured-result fixture failure");
+    }
+}
+EOF
+
+lock="$TMP/suite.lock"
+if CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$lock" \
+    CARGO_BUILD_JOBS=4 "$RUNNER" --manifest-path "$TMP/Cargo.toml" \
+    --lib >"$TMP/run.out" 2>"$TMP/run.err"; then
+    die "failing fixture unexpectedly passed"
+fi
+junit="$TMP/target/nextest/cadence/junit.xml"
+[ -s "$junit" ] || die "JUnit report missing at expected profile-resolved path: $junit"
+rg -F -q 'name="tests::fixture_pass"' "$junit" || die "JUnit report omitted passing testcase"
+rg -F -q 'name="tests::fixture_fail"' "$junit" || die "JUnit report omitted failing testcase"
+rg -F -q '<failure' "$junit" || die "JUnit report omitted failure element"
+
+if CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$lock" \
+    CARGO_BUILD_JOBS=4 "$RUNNER" --manifest-path "$TMP/Cargo.toml" \
+    --lib -- definitely_missing --exact >"$TMP/zero.out" 2>"$TMP/zero.err"; then
+    die "zero-test filter unexpectedly passed"
+fi
+
+printf '%s\n' 'nextest activation fixture passed (JUnit path, failure and zero-test guard)'

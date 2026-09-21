@@ -122,6 +122,11 @@ cadence issue diff CAD-16 [<rev>] [--to <rev>]
                                             # counts, comment/artifact files
 cadence issue blame CAD-16                  # per field: the entry that last
                                             # changed it (value, sha, at, by)
+cadence issue retro CAD-16 [--json]         # read-only retrospective: rounds,
+                                            # caught defects, flakes, timings,
+                                            # proposed lessons + explicit
+                                            # unknowns from tracker/notes/
+                                            # store evidence — nothing written
 cadence issue trailer CAD-16                # prints `Issue: CAD-16` — the
                                             # trailer line for code commits
 cadence issue start CAD-16                  # mints .cadence/wt/cad-16-<slug> on
@@ -322,6 +327,15 @@ the `Issue: <ID>` trailer — as JSON.
   `<name>.local` sibling, and a path that is a symlink to somewhere
   else — an operator's own link — is refused, not silently
   half-shared.
+- The worktree gets a `.env` with `CARGO_BUILD_JOBS` and
+  `CADENCE_BUILD_SLOT` for the slot service (docs/PROTOCOL.md). To
+  keep `issue finish`'s clean-tree guard green, `issue start` appends
+  the root-anchored patterns `/.env` and `/.env.tmp` to the repo's
+  `info/exclude` — under flock, idempotent — which for a linked
+  worktree is the COMMON git dir: the entries are permanent and cover
+  every worktree's and the main checkout's root `.env`. Deleting them
+  is manual (edit `<common-git-dir>/info/exclude`); `issue finish`
+  deliberately does not, because other worktrees still use theirs.
 - One tracker commit records a `branch` ref (label = repo basename)
   and a `worktree` ref (absolute path), the status/owner updates and
   the CAD-42 `Issue:`/`Actor:` trailers under subject

@@ -167,6 +167,68 @@ export interface OverviewProject {
   oldest_review_age?: number | null;
 }
 
+export interface MonitorAlert {
+  seq: number;
+  monitor: string;
+  project: string;
+  monitor_owner: string;
+  task?: string | null;
+  event_seq: number;
+  fingerprint: string;
+  kind: string;
+  payload: unknown;
+  state: "open" | "acknowledged" | string;
+  attempts: number;
+  last_error?: string | null;
+  created: number;
+  updated: number;
+  age_secs: number;
+  next_action: string;
+  next_owner: string;
+  authority: string;
+  evidence: {
+    monitor: string;
+    alert_seq: number;
+    event_seq: number;
+    fingerprint: string;
+    payload: unknown;
+  };
+}
+
+export interface MonitorRow {
+  id: string;
+  project: string;
+  owner: string;
+  interval_secs: number;
+  monitoring: "active" | "degraded" | "stale" | "off" | string;
+  heartbeat_at?: number | null;
+  last_check_at?: number | null;
+  last_success_at?: number | null;
+  next_check_at?: number | null;
+  event_cursor: number;
+  coverage: string[];
+  delivery: { configured: boolean; state: string; push?: boolean; detail?: string };
+  dispatch_enabled: boolean;
+  open_alerts: number;
+  total_alerts: number;
+  error?: string | null;
+  alerts?: MonitorAlert[];
+  alerts_error?: string;
+}
+
+export interface Monitoring {
+  available: boolean;
+  state: "active" | "degraded" | "stale" | "stopped" | "unavailable" | string;
+  last_success_at?: number | null;
+  last_check_at?: number | null;
+  next_check_at?: number | null;
+  open_alerts: number;
+  errors: { monitor?: string; error: string }[];
+  delivery: { configured: boolean; state: string; push: boolean; detail: string };
+  monitors: MonitorRow[];
+  alerts: MonitorAlert[];
+}
+
 /** `GET /api/overview` — everything derived, nothing stored. */
 export interface Overview {
   needs_me: NeedsMe[];
@@ -174,6 +236,7 @@ export interface Overview {
   projects: OverviewProject[];
   github: { state: "ok" | "cached" | "stale" | "unavailable"; error?: string | null; at?: number };
   daemon: { reachable: boolean; build_commit?: string; build_time?: string; started_at?: number; info?: string };
+  monitoring?: Monitoring;
   generated_at: number;
 }
 
@@ -182,7 +245,52 @@ export interface AgentTask {
   task: string;
   task_state: string;
   issue: string;
-  message?: { id: string; task?: string; turn_id?: string; created?: string } | null;
+  /** Task title from the job ledger, when one was supplied. */
+  title?: string | null;
+  /** Job id/title/state are the source of current-work context. */
+  job?: string | null;
+  job_title?: string | null;
+  job_state?: string | null;
+  message?: {
+    id: string;
+    task?: string;
+    turn_id?: string;
+    created?: string;
+    summary?: string | null;
+  } | null;
+}
+
+export type UsageState =
+  | "available"
+  | "unknown"
+  | "stale"
+  | "error"
+  | "unavailable"
+  | "blocked";
+
+/** Account/pool-scoped provider allowance telemetry. Optional because the
+ * current daemon has no quota collector for most providers. */
+export interface UsageLimit {
+  state?: UsageState | string | null;
+  used?: number | null;
+  used_percent?: number | null;
+  remaining?: number | null;
+  limit?: number | null;
+  unit?: string | null;
+  window?: string | null;
+  window_seconds?: number | null;
+  reset_at?: string | null;
+  source?: string | null;
+  observed_at?: string | null;
+  updated_at?: string | null;
+  message?: string | null;
+  reason?: string | null;
+  pool?: {
+    id?: string | null;
+    label?: string | null;
+    agents?: string[];
+    count?: number | null;
+  } | null;
 }
 
 export interface Agent {
@@ -190,8 +298,21 @@ export interface Agent {
   provider: string;
   endpoint_kind: string;
   state: string;
+  role?: string | null;
   group: string;
   group_root?: boolean;
+  /** Provider evidence: reported effective value beside launch config. */
+  model?: string | null;
+  model_reported?: string | null;
+  model_configured?: string | null;
+  model_source?: string | null;
+  effort?: string | null;
+  effort_reported?: string | null;
+  effort_source?: string | null;
+  effort_applicable?: boolean | null;
+  /** Optional account/pool allowance view; absent means unavailable. */
+  quota?: UsageLimit | null;
+  usage_limit?: UsageLimit | null;
   running: number;
   queued: number;
   unknown: number;
@@ -201,8 +322,20 @@ export interface Agent {
   on: string[];
   tasks?: AgentTask[];
   /** First running message, reduced. */
-  message?: { id: string; task?: string; turn_id?: string; created?: string } | null;
-  running_messages?: { id: string; task?: string; turn_id?: string; created?: string }[];
+  message?: {
+    id: string;
+    task?: string;
+    turn_id?: string;
+    created?: string;
+    summary?: string | null;
+  } | null;
+  running_messages?: {
+    id: string;
+    task?: string;
+    turn_id?: string;
+    created?: string;
+    summary?: string | null;
+  }[];
   /** The daemon's fence text — already names the recovery commands. */
   recovery?: string | null;
   /** Concrete resume command for a stopped pane, e.g. `devin -r devin-x`. */
@@ -245,6 +378,15 @@ export interface AgentDetail {
     thread_id?: string | null;
     session_id?: string | null;
     model?: string | null;
+    model_reported?: string | null;
+    model_configured?: string | null;
+    model_source?: string | null;
+    effort?: string | null;
+    effort_reported?: string | null;
+    effort_source?: string | null;
+    effort_applicable?: boolean | null;
+    quota?: UsageLimit | null;
+    usage_limit?: UsageLimit | null;
     pid?: number | null;
     state: string;
     enabled: boolean;
@@ -260,7 +402,13 @@ export interface AgentDetail {
   };
   queued: number;
   unknown: number;
-  running: { id: string; task?: string; turn_id?: string; created?: string }[];
+  running: {
+    id: string;
+    task?: string;
+    turn_id?: string;
+    created?: string;
+    summary?: string | null;
+  }[];
   events: {
     seq: number;
     alias: string;

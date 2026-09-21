@@ -24,12 +24,17 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start() -> Self {
+        Self::start_opts(daemon_opts())
+    }
+
+    /// `start` with explicit daemon options — slot tests shrink the
+    /// pools this way.
+    fn start_opts(opts: daemon::ServeOptions) -> Self {
         suite_slot();
         let dir = TempDir::new().unwrap();
         let state = dir.path().to_path_buf();
         std::fs::create_dir_all(&state).unwrap();
         let owned = state.clone();
-        let opts = daemon_opts();
         let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
         let daemon = Self {
             dir,
@@ -42,10 +47,15 @@ impl TestDaemon {
 
     /// Start a daemon over a pre-seeded state directory.
     fn start_on(state: PathBuf) -> Self {
+        Self::start_on_opts(state, daemon_opts())
+    }
+
+    /// `start_on` with explicit daemon options — slot tests shrink the
+    /// pools or inject the clock this way.
+    fn start_on_opts(state: PathBuf, opts: daemon::ServeOptions) -> Self {
         suite_slot();
         let dir = TempDir::new().unwrap(); // keeps lifetime uniform
         let owned = state.clone();
-        let opts = daemon_opts();
         let handle = thread::spawn(move || daemon::serve_with(&owned, opts));
         let daemon = Self {
             dir,
@@ -874,6 +884,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
                     thread_id: "th-mismatch".into(),
                     session_id: "s-mismatch".into(),
                     model: None,
+                    effort: None,
                     pid: 1,
                     endpoint: None,
                     generation: None,
@@ -2081,15 +2092,44 @@ fn is_filtered_run() -> bool {
     false
 }
 
+/// Nextest launches every test in a process-per-test child and exposes
+/// `NEXTEST=1` plus `NEXTEST_EXECUTION_MODE`. A filtered child cannot
+/// safely acquire the host slot itself. The outer review process owns
+/// the flock and explicitly clears the child path instead.
+fn is_nextest_run() -> bool {
+    std::env::var("NEXTEST").ok().as_deref() == Some("1")
+        || std::env::var("NEXTEST_EXECUTION_MODE").is_ok()
+}
+
+fn nextest_outer_lock_required(
+    nextest: bool,
+    lock_path: Option<&str>,
+    review_held: bool,
+) -> Result<(), &'static str> {
+    if !nextest {
+        return Ok(());
+    }
+    if review_held && lock_path.is_none() {
+        return Ok(());
+    }
+    Err(
+        "nextest requires the external CADENCE_SUITE_LOCK; run `cadence review` or use the pinned outer wrapper",
+    )
+}
+
 fn acquire_suite_slot() -> Result<Option<std::fs::File>, String> {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
-    let Some(path) = std::env::var("CADENCE_SUITE_LOCK")
+    let path = std::env::var("CADENCE_SUITE_LOCK")
         .ok()
-        .filter(|p| !p.is_empty())
-    else {
-        return Ok(None);
-    };
+        .filter(|p| !p.is_empty());
+    let review_held = std::env::var("CADENCE_REVIEW_SUITE_LOCK_HELD")
+        .ok()
+        .as_deref()
+        == Some("1");
+    nextest_outer_lock_required(is_nextest_run(), path.as_deref(), review_held)
+        .map_err(str::to_string)?;
+    let Some(path) = path else { return Ok(None) };
     if is_filtered_run() {
         return Ok(None);
     }
@@ -2165,10 +2205,28 @@ fn acquire_suite_slot() -> Result<Option<std::fs::File>, String> {
     }
 }
 
+#[test]
+fn nextest_requires_external_suite_lock_without_nested_flock() {
+    // Ordinary cargo filtered tests retain the historical no-slot path.
+    assert!(nextest_outer_lock_required(false, None, false).is_ok());
+    // Direct nextest is refused whether the caller forgot the path or
+    // supplied one without proving that an outer review owns it.
+    assert!(nextest_outer_lock_required(true, None, false).is_err());
+    assert!(nextest_outer_lock_required(true, Some("/tmp/suite.lock"), false).is_err());
+    // Review's outer Flock is the only accepted child contract: it clears
+    // the path and sets the marker, so no nested flock can deadlock.
+    assert!(nextest_outer_lock_required(true, None, true).is_ok());
+    assert!(nextest_outer_lock_required(true, Some("/tmp/suite.lock"), true).is_err());
+}
+
 fn daemon_opts() -> daemon::ServeOptions {
     daemon::ServeOptions {
         provider_env: test_env(),
         stall_sample_secs: TEST_STALL_SAMPLE.with(std::sync::Arc::clone),
+        // Explicit defaults keep test daemons hermetic — a real pm.yaml
+        // [host] table on the dev host must never leak into a test.
+        slots: Some(cadence_agent::slots::SlotConfig::default()),
+        slot_clock: None,
     }
 }
 
@@ -2189,6 +2247,25 @@ for line in sys.stdin:
     if method == "initialize":
         if mode == "slow-init": time.sleep(30)
         emit({"id": mid, "result": {"serverInfo": {"name": "mock", "version": "0"}}})
+    elif method == "model/list":
+        # Metadata-only response: configured Codex tests can exercise the
+        # pair validator without making a paid model turn.
+        if mode == "bad-model-list":
+            emit({"id": mid, "result": {}})
+        else:
+            emit({"id": mid, "result": {"data": [
+                {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna",
+                 "isDefault": False,
+                 "supportedReasoningEfforts": [
+                     {"reasoningEffort": "low"},
+                     {"reasoningEffort": "medium"},
+                     {"reasoningEffort": "high"},
+                     {"reasoningEffort": "xhigh"},
+                     {"reasoningEffort": "max"}]},
+                {"id": "mock-model", "model": "mock-model",
+                 "isDefault": True,
+                 "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]}
+            ], "nextCursor": None}})
     elif method in ("thread/start", "thread/resume"):
         # Record the launch payload before answering so tests can read
         # exactly what reached the wire (<pidfile>.requests).
@@ -2198,7 +2275,13 @@ for line in sys.stdin:
         if mode == "bad-thread":
             emit({"id": mid, "result": {"thread": {}}})
         else:
-            emit({"id": mid, "result": {"thread": {"id": "th-1", "sessionId": "s-1"}}})
+            launch = msg.get("params", {})
+            effort = launch.get("config", {}).get("model_reasoning_effort", "medium")
+            model = launch.get("model", "mock-model")
+            emit({"id": mid, "result": {"thread": {
+                "id": "th-1", "sessionId": "s-1", "model": model,
+                "reasoningEffort": effort},
+                "model": model, "reasoningEffort": effort}})
     elif method == "turn/start":
         if mode == "bad-turn":
             emit({"id": mid, "result": {"turn": {}}})
@@ -2445,13 +2528,32 @@ def handle(conn):
                 time.sleep(30)
             send_json(conn, {"id": mid, "result": {
                 "serverInfo": {"name": "mock-ws", "version": "0"}}})
+        elif method == "model/list":
+            send_json(conn, {"id": mid, "result": {"data": [
+                {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna",
+                 "isDefault": False,
+                 "supportedReasoningEfforts": [
+                     {"reasoningEffort": "low"},
+                     {"reasoningEffort": "medium"},
+                     {"reasoningEffort": "high"},
+                     {"reasoningEffort": "xhigh"},
+                     {"reasoningEffort": "max"}]},
+                {"id": "mock-model", "model": "mock-model",
+                 "isDefault": True,
+                 "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]}
+            ], "nextCursor": None}})
         elif method in ("thread/start", "thread/resume"):
             # Record the launch payload before answering (<pidfile>.requests).
             with open(pidfile + ".requests", "a") as rf:
                 rf.write(json.dumps({"method": method,
                                      "params": msg.get("params", {})}) + "\n")
-            send_json(conn, {"id": mid, "result": {
-                "thread": {"id": "th-1", "sessionId": "s-1"}}})
+            launch = msg.get("params", {})
+            effort = launch.get("config", {}).get("model_reasoning_effort", "medium")
+            model = launch.get("model", "mock-model")
+            send_json(conn, {"id": mid, "result": {"thread": {
+                "id": "th-1", "sessionId": "s-1", "model": model,
+                "reasoningEffort": effort},
+                "model": model, "reasoningEffort": effort}})
         elif method == "turn/start":
             text = ""
             try:
@@ -2646,6 +2748,102 @@ fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     assert_eq!(reqs[1]["method"], "thread/resume");
     assert_eq!(reqs[1]["params"]["approvalPolicy"], "never");
     assert_eq!(reqs[1]["params"]["threadId"], "th-1");
+}
+
+#[test]
+fn codex_model_effort_are_validated_reported_and_replayed_on_resume() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "luna", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("luna", "idle", 15);
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+    assert_eq!(reqs[0]["method"], "thread/start");
+    assert_eq!(reqs[0]["params"]["model"], "gpt-5.6-luna");
+    assert_eq!(reqs[0]["params"]["config"]["model_reasoning_effort"], "max");
+    let agent = d.rpc("agent_show", json!({"alias": "luna"})).unwrap()["agent"].clone();
+    assert_eq!(agent["model_configured"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["model_reported"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["model_effective"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["effort_configured"], "max", "{agent}");
+    assert_eq!(agent["effort_reported"], "max", "{agent}");
+    assert_eq!(agent["effort_effective"], "max", "{agent}");
+
+    d.rpc("agent_stop", json!({"alias": "luna"})).unwrap();
+    d.wait_agent("luna", "stopped", 15);
+    d.rpc("agent_resume", json!({"alias": "luna"})).unwrap();
+    d.wait_agent("luna", "idle", 15);
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs.len(), 2, "{reqs:?}");
+    assert_eq!(reqs[1]["method"], "thread/resume");
+    assert_eq!(reqs[1]["params"]["threadId"], "th-1");
+    assert_eq!(reqs[1]["params"]["model"], "gpt-5.6-luna");
+    assert_eq!(reqs[1]["params"]["config"]["model_reasoning_effort"], "max");
+}
+
+#[test]
+fn codex_model_effort_pair_rejection_is_visible() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "bad-luna", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"ultra\"}"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("bad-luna", "attention", 15);
+    let error = agent["error"].as_str().unwrap_or_default();
+    assert!(error.contains("provider rejected effort"), "{error}");
+    assert!(error.contains("gpt-5.6-luna"), "{error}");
+    assert!(error.contains("max"), "{error}");
+}
+
+#[test]
+fn codex_model_availability_unknown_is_visible() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("bad-model-list");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "unknown-luna", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\"}"}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("unknown-luna", "attention", 15);
+    let error = agent["error"].as_str().unwrap_or_default();
+    assert!(error.contains("availability unknown"), "{error}");
+    assert!(!error.contains("provider rejected"), "{error}");
+}
+
+#[test]
+fn codex_ws_model_effort_are_replayed_and_reported() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "luna-ws", "provider": "codex",
+               "endpoint_kind": "managed-ws", "cwd": cwd,
+               "params": "{\"model\":\"gpt-5.6-luna\",\"effort\":\"max\"}"}),
+    )
+    .unwrap();
+    d.wait_agent("luna-ws", "idle", 15);
+    let agent = d.rpc("agent_show", json!({"alias": "luna-ws"})).unwrap()["agent"].clone();
+    assert_eq!(agent["model_effective"], "gpt-5.6-luna", "{agent}");
+    assert_eq!(agent["effort_effective"], "max", "{agent}");
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs[0]["params"]["model"], "gpt-5.6-luna");
+    assert_eq!(reqs[0]["params"]["config"]["model_reasoning_effort"], "max");
 }
 
 #[test]
@@ -6302,6 +6500,140 @@ impl TestDaemon {
             thread::sleep(Duration::from_millis(50));
         }
     }
+
+    /// Poll until an event of `kind` satisfying `pred` exists
+    /// (bounded). Payload-scoped — an earlier event that merely shares
+    /// the kind is never returned (CAD-222: a late `turn_stalled` for
+    /// one message must not answer a wait meant for another's).
+    fn wait_event_where(
+        &self,
+        alias: &str,
+        kind: &str,
+        pred: impl Fn(&Value) -> bool,
+        secs: u64,
+    ) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(e) = self
+                .events(alias)
+                .into_iter()
+                .find(|e| e["kind"].as_str() == Some(kind) && pred(e))
+            {
+                return e;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent {alias} never emitted a matching {kind}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Emit a test-only timing trace for a routed PTY delivery. The daemon's
+/// durable event/message timestamps are the phase clock here: using them
+/// avoids charging the test's 50ms RPC polling to a render or retry phase.
+/// A `submitting` row is the durable attempt-start boundary and a
+/// `paste_not_rendered` row is its completion. The next `submitting` row is
+/// the observable retry wake; no separate wake event exists. This is evidence
+/// for the follow-up audit, not a change to the delivery contract.
+fn emit_park_phase_trace(d: &TestDaemon, test_name: &str, alias: &str, routed_id: &str) {
+    fn at(value: &Value) -> Option<f64> {
+        value["at"].as_f64()
+    }
+
+    fn delta(start: Option<f64>, end: Option<f64>) -> Value {
+        match (start, end) {
+            (Some(start), Some(end)) if end >= start => json!(end - start),
+            _ => Value::Null,
+        }
+    }
+
+    let events = d.events(alias);
+    let starts: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "submitting" && event["payload"]["message"].as_str() == Some(routed_id)
+        })
+        .collect();
+    let misses: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "paste_not_rendered"
+                && event["payload"]["message"].as_str() == Some(routed_id)
+        })
+        .collect();
+    let parked = events.iter().find(|event| {
+        event["kind"] == "delivery_parked"
+            && event["payload"]["message"].as_str() == Some(routed_id)
+    });
+    let show = d.rpc("agent_show", json!({"alias": alias})).unwrap();
+    let message = show["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().find(|message| message["id"] == routed_id));
+    let enqueue_at = message.and_then(|message| message["created"].as_f64());
+    let attempt_phases: Vec<Value> = misses
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let started_at = starts.get(index).and_then(|event| at(event));
+            json!({
+                "attempt": index + 1,
+                "started_at_epoch_s": started_at,
+                "completion_at_epoch_s": at(event),
+                "enqueue_to_start_s": if index == 0 {
+                    delta(enqueue_at, started_at)
+                } else {
+                    Value::Null
+                },
+                "render_attempt_s": delta(started_at, at(event)),
+                "retry": event["payload"]["retry"],
+            })
+        })
+        .collect();
+    let retry_phases: Vec<Value> = misses
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| {
+            json!({
+                "after_attempt": index + 1,
+                "retry_wake_at_epoch_s": starts.get(index + 1).and_then(|event| at(event)),
+                "retry_to_next_attempt_start_s": delta(
+                    at(pair[0]),
+                    starts.get(index + 1).and_then(|event| at(event)),
+                ),
+            })
+        })
+        .collect();
+    let parked_at = parked.and_then(at);
+    let completed_at = message.and_then(|message| message["completed"].as_f64());
+    let final_agent = show.get("agent").map(|agent| {
+        json!({
+            "state": agent["state"],
+            "dead": agent["dead"],
+            "updated_epoch_s": agent["updated"],
+        })
+    });
+    let report = json!({
+        "schema": "cad173.e4a.phase-trace.v1",
+        "test": test_name,
+        "alias": alias,
+        "message": routed_id,
+        "enqueue_at_epoch_s": enqueue_at,
+        "attempts": attempt_phases,
+        "submitting_events": starts.len(),
+        "retry_gaps": retry_phases,
+        "park_at_epoch_s": parked_at,
+        "park_after_attempt4_s": delta(misses.last().and_then(|event| at(event)), parked_at),
+        "failed_state_at_epoch_s": completed_at,
+        "park_to_failed_state_s": delta(parked_at, completed_at),
+        "enqueue_to_failed_state_s": delta(enqueue_at, completed_at),
+        "message_state": message.map(|message| message["state"].clone()),
+        "agent": final_agent,
+        "clock": "durable events.at and messages.created/completed (epoch seconds)",
+        "attempt_boundary": "submitting event is attempt start; paste_not_rendered is completion; next submitting event is the retry wake",
+    });
+    eprintln!("CAD173_E4A_PHASE {report}");
 }
 
 #[test]
@@ -7392,6 +7724,12 @@ fn pty_unrendered_worker_result_requeues_then_parks() {
     // Delivered = render-verified `running` (a task then awaits an
     // explicit report, so the agent correctly stays busy on it).
     d.wait_message("pm", "after", &["running"], 20);
+    emit_park_phase_trace(
+        &d,
+        "pty_unrendered_worker_result_requeues_then_parks",
+        "pm",
+        &routed_id,
+    );
 }
 
 #[test]
@@ -9740,6 +10078,7 @@ fn job_event_parks_on_unrendered_pty_pm() {
     d.wait_agent("pm", "idle", 15);
     let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap()["agent"].clone();
     assert_eq!(pm["dead"], false);
+    emit_park_phase_trace(&d, "job_event_parks_on_unrendered_pty_pm", "pm", parked_id);
 }
 
 #[test]
@@ -13161,7 +13500,29 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
-    thread::sleep(Duration::from_secs(7));
+    // Positive window-opened proof before any absence assertion
+    // (CAD-221, the canary pattern from #70's slot-plant test): a
+    // pending brokered request refreshes the turn's activity on every
+    // stall tick, so a wait older than the budget still reporting
+    // silence *under* the budget can only happen while the refresh
+    // path runs. A dead or skipping ticker reports wall-clock age
+    // instead and this loop fails loudly — absence is never asserted
+    // inside a window that may not have opened.
+    let wait_started = Instant::now();
+    let canary_deadline = wait_started + Duration::from_secs(15);
+    loop {
+        let a = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+        let silent = a["silent_secs"].as_u64().unwrap_or(u64::MAX);
+        if wait_started.elapsed() > Duration::from_secs(4) && silent < 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < canary_deadline,
+            "stall ticker never refreshed the brokered wait — the \
+             absence window never provably opened: {a}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     assert!(
         d.events("w1")
             .iter()
@@ -13179,14 +13540,22 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     d.wait_message("w1", "m-need", &["completed"], 15);
 
     // A genuinely silent turn stalls once — then simply ends; no
-    // recovery event is owed for a finished message.
+    // recovery event is owed for a finished message. The wait selects
+    // by payload: a `turn_stalled` for m-need landing late (between
+    // respond and completion on a slow host) must not be returned
+    // here (CAD-222).
     d.rpc(
         "agent_send",
         json!({"alias": "w1", "text": "SLEEP:12", "reply_to": "pm",
                "message": "m-sleep"}),
     )
     .unwrap();
-    let e = d.wait_event("w1", "turn_stalled", 20);
+    let e = d.wait_event_where(
+        "w1",
+        "turn_stalled",
+        |e| e["payload"]["message"].as_str() == Some("m-sleep"),
+        20,
+    );
     assert_eq!(e["payload"]["message"], "m-sleep", "{e}");
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(agent["stalled"], true, "{agent}");
@@ -17838,7 +18207,7 @@ fn overview_drift_reports_commits_after_build() {
     assert_eq!(row["command"], "cadence daemon restart --when-idle --ui");
 }
 
-/// `doctor --host --json` on the real host: one object, six named
+/// `doctor --host --json` on the real host: one object, the named
 /// checks, each ok|warn|fail, exit code the worst level. What the host
 /// measures is its own business — this only proves the surface runs
 /// and reports honestly, never which level comes back.
@@ -17880,7 +18249,8 @@ fn doctor_host_json_reports_all_checks() {
             "sessions",
             "orphans",
             "temp-dirs",
-            "worktrees"
+            "worktrees",
+            "load"
         ]
     );
     for c in report["checks"].as_array().unwrap() {
@@ -20828,4 +21198,1199 @@ fn audit_post_hoc_verdict_does_not_clear_flag() {
             .any(|f| f == "no-passing-verdict"),
         "post-hoc pass must not clear the flag: {m}"
     );
+}
+
+// ---------- CAD-113: build slots ----------
+
+/// A daemon with a shrunken slot config — hermetic (ServeOptions wins
+/// over pm.yaml, so no host config can leak in).
+fn slot_opts(build: usize, suite: usize, starve: u64, priority: &[&str]) -> daemon::ServeOptions {
+    slot_opts_clock(build, suite, starve, priority, None)
+}
+
+/// `slot_opts` with an injected slot clock: a shared counter the test
+/// advances instead of sleeping — starvation tests stay deterministic
+/// under host load.
+fn slot_opts_clock(
+    build: usize,
+    suite: usize,
+    starve: u64,
+    priority: &[&str],
+    clock: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+) -> daemon::ServeOptions {
+    daemon::ServeOptions {
+        slots: Some(cadence_agent::slots::SlotConfig {
+            build_slots: build,
+            suite_slots: suite,
+            starve_secs: starve,
+            priority_lanes: priority.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }),
+        slot_clock: clock.map(|c| {
+            std::sync::Arc::new(move || c.load(std::sync::atomic::Ordering::Relaxed) as f64)
+                as std::sync::Arc<dyn Fn() -> f64 + Send + Sync>
+        }),
+        ..daemon_opts()
+    }
+}
+
+/// Plant `alias` as a live pty pane rooted at `pid` — the endpoint
+/// facts the slot caller-identity derivation reads (CAD-113). The row
+/// stays otherwise inert: registered as an actorless `inbox` pair and
+/// marked `enabled=0`, so neither a register-time `set_identity` nor a
+/// restart's relaunch sweep can overwrite or detach the planted facts.
+/// `slot_*` RPCs derive caller identity from `SO_PEERCRED` + /proc
+/// ancestry, so a test lane is only reachable from processes whose
+/// ancestry includes this pid.
+fn plant_pane(d: &TestDaemon, alias: &str, pid: u32) {
+    // Register as an `inbox` mailbox: the pair owns no actor, so no
+    // async `set_identity` can land after this plant and overwrite
+    // the pid (`agent_register` on an existing alias errors —
+    // idempotent on a daemon restarted over a kept state dir). And
+    // `enabled=0` keeps a restarted daemon's relaunch sweep from
+    // spawning a pty actor for the row — its open cannot verify a
+    // planted pane and the exit-detach clears the pid the pane map
+    // resolves callers by (the CAD-113 CI flake).
+    let _ = d.rpc(
+        "agent_register",
+        json!({"alias": alias, "provider": "inbox",
+               "endpoint_kind": "inbox",
+               "cwd": d.dir.path().to_str().unwrap()}),
+    );
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET endpoint_kind='pty', pid=?1, enabled=0, \
+            generation='planted', session_id='planted' WHERE alias=?2",
+        rusqlite::params![pid as i64, alias],
+    )
+    .unwrap();
+}
+
+/// The lane every in-process `d.rpc` slot call derives: the test
+/// process's own pid planted as this alias's pane.
+const SELF_LANE: &str = "pane-self";
+
+/// Plant the test process itself as `SELF_LANE`'s pane — after this,
+/// `d.rpc` slot calls and `Command`-spawned cadence CLIs all run as
+/// that lane (their ancestry always includes the test pid).
+fn plant_self(d: &TestDaemon) {
+    plant_pane(d, SELF_LANE, std::process::id());
+}
+
+/// A long-lived `bash` whose pid is planted as a lane's pane:
+/// commands written to its stdin run as its children, so their
+/// socket-peer identity derives that lane — the only way to get a
+/// second connection identity in-process tests can't reach.
+struct LaneShell {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+    dir: TempDir,
+    seq: u64,
+}
+
+impl LaneShell {
+    fn spawn(home: &Path) -> LaneShell {
+        let mut child = std::process::Command::new("bash")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .env("HOME", home)
+            .envs(test_env().vars())
+            .spawn()
+            .unwrap();
+        LaneShell {
+            stdin: child.stdin.take().unwrap(),
+            stdout: BufReader::new(child.stdout.take().unwrap()),
+            child,
+            dir: TempDir::new().unwrap(),
+            seq: 0,
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Run a bash fragment under this lane; answer (exit code, output).
+    fn run(&mut self, cmd: &str) -> (i64, String) {
+        let tag = format!("__lane_rc_{}__", self.seq);
+        self.seq += 1;
+        // The bare `echo` first guarantees the marker opens a fresh
+        // line even when the command's output ends mid-line.
+        writeln!(self.stdin, "{{ {cmd} ; }} 2>&1; rc=$?; echo; echo {tag}$rc").unwrap();
+        self.stdin.flush().unwrap();
+        let mut out = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.stdout.read_line(&mut line).unwrap() > 0,
+                "lane shell exited while running: {cmd}"
+            );
+            if let Some(rc) = line.strip_prefix(&tag) {
+                return (rc.trim().parse().unwrap(), out);
+            }
+            out.push_str(&line);
+        }
+    }
+
+    /// `cadence <args>` run under this lane's identity.
+    fn cadence(&mut self, state: &Path, args: &str) -> (i64, String) {
+        self.run(&format!(
+            "{} --state-dir {} {args}",
+            env!("CARGO_BIN_EXE_cadence"),
+            state.display()
+        ))
+    }
+
+    /// One raw JSONL RPC under this lane's identity — the answer is
+    /// the wire frame (`{"ok":…, "result"|"error":…}`).
+    fn rpc(&mut self, state: &Path, method: &str, params: Value) -> Value {
+        let req = self.dir.path().join(format!("req-{}.json", self.seq));
+        std::fs::write(
+            &req,
+            cadence_agent::proto::request(method, params).to_string(),
+        )
+        .unwrap();
+        let (rc, out) = self.run(&format!(
+            "python3 -c 'import socket,sys;\
+             s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);\
+             s.sendall(open(sys.argv[2],\"rb\").read()+b\"\\n\");\
+             print(s.makefile().readline())' {} {}",
+            client::socket_path(state).display(),
+            req.display()
+        ));
+        assert_eq!(rc, 0, "lane rpc failed: {out}");
+        serde_json::from_str(out.trim()).unwrap()
+    }
+}
+
+impl Drop for LaneShell {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `slot_acquire` with the test process's pid — alive for the whole
+/// test, so the pid check never reaps a live waiter here. The lane
+/// param is ignored by the daemon (identity is the connection's);
+/// callers pass SELF_LANE for honesty.
+fn slot_acquire(d: &TestDaemon, kind: &str, lane: &str, req: &str) -> Value {
+    slot_acquire_pid(d, kind, lane, std::process::id(), req)
+}
+
+/// `slot_acquire` claiming an explicit pid — must be the test process
+/// or one of its /proc ancestors, or the daemon refuses.
+fn slot_acquire_pid(d: &TestDaemon, kind: &str, lane: &str, pid: u32, req: &str) -> Value {
+    d.rpc(
+        "slot_acquire",
+        json!({"kind": kind, "lane": lane, "pid": pid,
+               "request_id": req}),
+    )
+    .unwrap()
+}
+
+/// `slot_release` naming the holding (lane, pid) — the identity the
+/// grant was bound to.
+fn slot_release(d: &TestDaemon, token: &str, lane: &str, pid: u32) -> Value {
+    d.rpc(
+        "slot_release",
+        json!({"token": token, "lane": lane, "pid": pid}),
+    )
+    .unwrap()
+}
+
+/// N+1 acquires: the last queues until a release, FIFO order is kept,
+/// and slot events land on the caller's stream. Every call here runs
+/// as `SELF_LANE` — identity is connection-derived (CAD-113).
+#[test]
+fn slot_acquire_queues_until_release() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let g1 = slot_acquire(&d, "build", SELF_LANE, "r1");
+    assert_eq!(g1["granted"], true);
+    let t1 = g1["token"].as_str().unwrap().to_string();
+    assert!(t1.starts_with("slot-"), "the daemon mints the token: {t1}");
+    // The next acquire queues — answered, never hung.
+    let q = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(q["granted"], false);
+    assert_eq!(q["position"], 1);
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert_eq!(s["pools"]["build"]["held"].as_array().unwrap().len(), 1);
+    // The owner sees its own token — the hold's pid is on its chain.
+    assert_eq!(
+        s["pools"]["build"]["held"][0]["token"], t1,
+        "the holding process's own chain sees its token"
+    );
+    let waiting = s["waiting"].as_array().unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0]["lane"], SELF_LANE);
+    // A re-poll keeps the original place — same request id, same
+    // position, no second slot_waited.
+    let q = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(q["position"], 1);
+    // Release frees the pool; the waiter's next poll grants.
+    slot_release(&d, &t1, SELF_LANE, std::process::id());
+    let g2 = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(g2["granted"], true);
+    let t2 = g2["token"].as_str().unwrap().to_string();
+    assert_ne!(t2, t1, "each grant mints a fresh token");
+    // And a re-poll of a granted id returns the same token (the CLI's
+    // poll loop depends on this idempotency).
+    let again = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(again["token"], t2);
+    let kinds = |a: &str| {
+        d.events(a)
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let own = kinds(SELF_LANE);
+    assert!(own.contains(&"slot_acquired".to_string()));
+    assert!(own.contains(&"slot_released".to_string()));
+    assert_eq!(
+        own.iter().filter(|k| *k == "slot_waited").count(),
+        1,
+        "one slot_waited for the whole wait: {own:?}"
+    );
+}
+
+/// A holder whose pid dies frees its slot on the next acquire —
+/// nothing kills the work, the slot just stops being owed by a corpse.
+/// The hold binds to a lane shell's pid: killing the shell kills the
+/// hold's owner.
+#[test]
+fn slot_dead_holder_is_reaped() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let mut holder = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", holder.pid());
+    // The holder's child claims its own pane — `$$` in the shell is
+    // the planted pane pid itself.
+    let g = holder.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": holder.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(g["ok"], true, "{g}");
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    holder.child.kill().unwrap();
+    holder.child.wait().unwrap(); // reap the zombie so kill(pid,0) answers ESRCH
+    let g2 = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(g2["granted"], true, "dead holder's slot must free");
+    // The reap names the cause on the dead lane's stream.
+    let evs = d.events("dev-1");
+    assert!(
+        evs.iter()
+            .any(|e| e["kind"].as_str() == Some("slot_released")
+                && e["payload"]["reason"].as_str() == Some("holder died")),
+        "{evs:?}"
+    );
+    // Releasing the dead token is a named refusal, not a silent pass
+    // — and nobody can claim the dead pid anyway.
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": token, "pid": std::process::id()}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("Unknown slot token"), "{err}");
+}
+
+/// BLOCKER: two callers sharing a request_id — the second queues, it
+/// never adopts the first's hold; a same-identity re-poll does. The
+/// "different pid" is the test's own parent — a second pid on the
+/// connection's ancestry that may legitimately be claimed (CAD-113).
+#[test]
+fn slot_duplicate_request_id_different_pid_queues() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let parent = std::os::unix::process::parent_id();
+    let g1 = slot_acquire_pid(&d, "build", SELF_LANE, parent, "r1");
+    assert_eq!(g1["granted"], true);
+    // Same request_id claiming a different pid — a different caller:
+    // queued, never granted the first's hold.
+    let q = slot_acquire(&d, "build", SELF_LANE, "r1");
+    assert_eq!(q["granted"], false, "must not adopt another caller's hold");
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert_eq!(s["waiting"].as_array().unwrap().len(), 1);
+    // The true holder re-polls and still gets its own token.
+    let again = slot_acquire_pid(&d, "build", SELF_LANE, parent, "r1");
+    assert_eq!(again["token"], g1["token"]);
+}
+
+/// BLOCKER: release binds to the holding (lane, pid) — both derived
+/// from the connection now. A foreign lane's release is a named
+/// refusal; a claimed pid off the caller's own ancestry is refused
+/// before the token is even looked at. The hold survives both.
+#[test]
+fn slot_release_foreign_caller_is_rejected() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let mut foreign = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-2", foreign.pid());
+    let g = slot_acquire(&d, "build", SELF_LANE, "r1");
+    let token = g["token"].as_str().unwrap().to_string();
+    // The foreign lane knows the token but its derived lane doesn't
+    // match the hold — refused. (The `pid` claim is honest here.)
+    let f = foreign.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": token, "pid": foreign.pid()}),
+    );
+    assert_eq!(f["ok"], false, "{f}");
+    assert!(
+        f["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("another caller"),
+        "{f}"
+    );
+    // A claimed pid off the caller's own chain — a sibling lane's pid
+    // is a live pid the shell does not descend from — is refused
+    // outright, before the token is even looked at.
+    let sibling = LaneShell::spawn(home.path());
+    let f = foreign.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": token, "pid": sibling.pid()}),
+    );
+    assert_eq!(f["ok"], false, "{f}");
+    assert!(
+        f["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot claim"),
+        "{f}"
+    );
+    // The hold still stands — the pool stays full.
+    let q = slot_acquire(&d, "build", SELF_LANE, "r2");
+    assert_eq!(q["granted"], false, "failed release must not free the slot");
+    // And the true holder releases normally.
+    slot_release(&d, &token, SELF_LANE, std::process::id());
+}
+
+/// ACCEPTANCE: `slot_status` reveals a token only to the connection
+/// whose derived identity owns the hold — two real lanes. The owner
+/// sees its token; a foreign lane passing the owner's `lane` sees the
+/// hold but never the token (CAD-113 identity fork, option A).
+#[test]
+fn slot_status_reveals_tokens_only_to_the_owner() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut owner = LaneShell::spawn(home.path());
+    plant_pane(&d, "owner", owner.pid());
+    plant_self(&d); // the foreign observer
+    let g = owner.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": owner.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(g["result"]["granted"], true, "{g}");
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    // The owner's own status reveals its token — via the real CLI
+    // too: the cadence child derives this lane from its ancestry.
+    let s = owner.rpc(&d.state, "slot_status", json!({}));
+    let held = s["result"]["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held[0]["token"], token, "owner sees its own token");
+    let (rc, out) = owner.cadence(&d.state, "build-slot status --json");
+    assert_eq!(rc, 0, "{out}");
+    let cli: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        cli["pools"]["build"]["held"][0]["token"], token,
+        "owner CLI sees its own token"
+    );
+    // The foreign lane's status sees the hold but not the token —
+    // even naming the owner's lane in the request.
+    let s = d.rpc("slot_status", json!({"lane": "owner"})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1);
+    assert!(
+        held[0].get("token").is_none(),
+        "foreign caller must not see the token: {held:?}"
+    );
+    assert_eq!(held[0]["lane"], "owner");
+}
+
+/// ACCEPTANCE: a `slot_acquire` whose claimed `pid` is not the socket
+/// peer or one of its /proc ancestors is refused — the daemon never
+/// rebinds it (CAD-113 identity fork, option A).
+#[test]
+fn slot_acquire_refuses_a_pid_off_the_caller_chain() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut lane = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", lane.pid());
+    // A sibling lane's pid is live but off this caller's ancestry.
+    let other = LaneShell::spawn(home.path());
+    let r = lane.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": other.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot claim"),
+        "{r}"
+    );
+    // Nothing queued or held under either identity.
+    plant_self(&d);
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert!(s["waiting"].as_array().unwrap().is_empty());
+    assert!(s["pools"]["build"]["held"].as_array().unwrap().is_empty());
+    // An honest claim — the caller's own pid — grants normally.
+    let g = lane.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": lane.pid(), "request_id": "r2"}),
+    );
+    assert_eq!(g["result"]["granted"], true, "{g}");
+}
+
+/// ACCEPTANCE: a caller detached from every registered pane derives
+/// no identity at all — all three slot RPCs refuse it, and nothing is
+/// stamped `operator` (the PR-#71 fail-open pattern, closed here).
+#[test]
+fn slot_rpc_refuses_an_underivable_caller() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    // `stray` descends from the test process but nothing in its
+    // ancestry is a registered pty pane — no pane is planted for it.
+    let mut stray = LaneShell::spawn(home.path());
+    // `observer` is a real lane so we can inspect the pools afterward.
+    let mut observer = LaneShell::spawn(home.path());
+    plant_pane(&d, "observer", observer.pid());
+    for (method, params) in [
+        (
+            "slot_acquire",
+            json!({"kind": "build", "pid": stray.pid(), "request_id": "r1"}),
+        ),
+        (
+            "slot_release",
+            json!({"token": "slot-x", "pid": stray.pid()}),
+        ),
+        ("slot_status", json!({})),
+    ] {
+        let r = stray.rpc(&d.state, method, params);
+        assert_eq!(r["ok"], false, "{method}: {r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("caller identity underivable"),
+            "{method} must refuse identity-less callers: {r}"
+        );
+    }
+    // Nothing was recorded — and especially not as `operator`.
+    let s = observer.rpc(&d.state, "slot_status", json!({}));
+    assert_eq!(s["ok"], true, "{s}");
+    assert!(s["result"]["waiting"].as_array().unwrap().is_empty());
+    assert!(s["result"]["pools"]["build"]["held"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(
+        !s["result"].to_string().contains("operator"),
+        "no operator identity may appear: {}",
+        s["result"]
+    );
+}
+
+/// BLOCKER (r3): `slot_acquired` rides the victim's event stream —
+/// readable by any local caller via `agent_events`. It must never
+/// carry the token: token+lane+pid are the entire release credential,
+/// so a peer's stream can never be mined for one. (r5: the victim is
+/// a real second connection identity — a lane shell.)
+#[test]
+fn slot_acquired_event_cannot_release_a_peers_hold() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut victim = LaneShell::spawn(home.path());
+    plant_pane(&d, "victim", victim.pid());
+    plant_self(&d); // the snoop: every d.rpc runs as SELF_LANE
+    let g = victim.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": victim.pid(), "request_id": "r1"}),
+    );
+    assert_eq!(g["ok"], true, "{g}");
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    // The peer reads the victim's stream — sees the acquisition…
+    let ev = d
+        .events("victim")
+        .into_iter()
+        .find(|e| e["kind"].as_str() == Some("slot_acquired"))
+        .expect("victim emitted slot_acquired");
+    assert!(
+        ev["payload"].get("token").is_none() && !ev["payload"].to_string().contains(&token),
+        "slot_acquired leaks the release credential: {}",
+        ev["payload"]
+    );
+    // …but the visible fields can't release anything: a guessed token
+    // is an unknown-token rejection and the hold survives.
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": "slot-guess", "pid": std::process::id()}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("Unknown slot token"), "{err}");
+    // Even the real token under a foreign identity is refused — the
+    // derived lane (pane-self) is not the hold's lane, whatever the
+    // request's `lane` field claims.
+    let err = d
+        .rpc(
+            "slot_release",
+            json!({"token": token, "lane": "victim", "pid": std::process::id()}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("another caller"), "{err}");
+    // And status passing the victim's lane still shows no token.
+    let s = d.rpc("slot_status", json!({"lane": "victim"})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1);
+    assert!(held[0].get("token").is_none(), "foreign token hidden");
+    // The owner releases normally under its own connection identity.
+    let r = victim.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": token, "pid": victim.pid()}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+}
+
+/// BLOCKER: holds survive a daemon restart — persisted slots.json is
+/// revalidated at boot: live holders keep their slots (never
+/// re-granted), dead holders are dropped with a named reason.
+#[test]
+fn slot_restart_revalidates_holders() {
+    let state = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let d = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    // Two holds: one bound to a lane shell that dies before the
+    // restart, one bound to the test process which outlives it.
+    let mut doomed = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", doomed.pid());
+    let g = doomed.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": doomed.pid(), "request_id": "r0"}),
+    );
+    assert_eq!(g["ok"], true, "{g}");
+    plant_self(&d);
+    let live = slot_acquire(&d, "build", SELF_LANE, "r1");
+    assert_eq!(live["granted"], true);
+    let live_tok = live["token"].as_str().unwrap().to_string();
+    let live_pid = std::process::id();
+    doomed.child.kill().unwrap();
+    doomed.child.wait().unwrap();
+    drop(d); // shutdown → serve returns → state dir kept
+    let d2 = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    // The agent rows persisted but a clean shutdown clears endpoint
+    // fields — re-stamp the live pane's facts before deriving.
+    plant_pane(&d2, SELF_LANE, live_pid);
+    // The live hold survived with its token intact; the dead one's
+    // slot was reaped — one held, one free.
+    let s = d2.rpc("slot_status", json!({})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "one live holder survives: {held:?}");
+    assert_eq!(held[0]["token"], live_tok);
+    assert_eq!(held[0]["pid"], live_pid);
+    // The boot reap named the dead holder's cause on its lane.
+    let evs = d2.events("dev-1");
+    assert!(
+        evs.iter()
+            .any(|e| e["kind"].as_str() == Some("slot_released")
+                && e["payload"]["reason"].as_str() == Some("holder died")),
+        "{evs:?}"
+    );
+    // And an acquire never re-grants the survivor's slot — one free
+    // slot grants once, then the pool is full again.
+    let g = slot_acquire(&d2, "build", SELF_LANE, "r9");
+    assert_eq!(g["granted"], true);
+    let q = slot_acquire(&d2, "build", SELF_LANE, "r10");
+    assert_eq!(q["granted"], false, "restarted holds keep the pool bounded");
+    // The survivor still releases by its minted token.
+    slot_release(&d2, &live_tok, SELF_LANE, live_pid);
+}
+
+/// Regression for CI 35542407390: a planted pane row must survive a
+/// daemon restart's relaunch sweep untouched. The sweep relaunches
+/// every enabled actor-owning row; an actor whose open can't verify
+/// the planted pane exit-detaches it — clearing the pid/generation
+/// the caller-identity pane map resolves by — or a real open's
+/// `set_identity` overwrites it. Either way the next slot call fails
+/// closed ("descends from no registered pane"). plant_pane's rows are
+/// actorless (`inbox` pair) and `enabled=0`, so the sweep never
+/// touches them: the planted facts persist through the whole window.
+#[test]
+fn slot_planted_pane_row_survives_restart() {
+    let state = TempDir::new().unwrap();
+    let live_pid = std::process::id();
+    let d = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    plant_pane(&d, SELF_LANE, live_pid);
+    let g = slot_acquire(&d, "build", SELF_LANE, "r1");
+    assert_eq!(g["granted"], true, "{g}");
+    // Canary in the pre-fix shape — an enabled (fake, pty) row the boot
+    // relaunch sweep must launch. Its actor's adapter build fails
+    // deterministically and the exit-detach emits `attention`. The alias
+    // sorts after every other agent, so once its outcome lands the sweep
+    // has spawned an actor for every earlier row.
+    let conn = rusqlite::Connection::open(state.path().join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,
+            state,enabled,pid,generation,session_id,created,updated)
+         VALUES('zz-canary','fake','pty','worker',?1,'read-only',
+            'stopped',1,0,'planted','planted',0,0)",
+        [state.path().to_str().unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+    drop(d);
+    let d2 = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    plant_pane(&d2, SELF_LANE, live_pid);
+    // Positive window-closed signal (CAD-221): never assert absence
+    // inside a window that may not have opened. The canary's `attention`
+    // proves the sweep ran and an actor outcome landed on the very path
+    // that would destroy a vulnerable planted row — the lane assertion
+    // below is made only after that window provably closed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if d2
+            .events("zz-canary")
+            .iter()
+            .any(|e| e["kind"].as_str() == Some("attention"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "canary never detached — the relaunch sweep did not run: {:?}",
+            d2.events("zz-canary")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let conn = rusqlite::Connection::open(state.path().join("cadence.sqlite3")).unwrap();
+    let p: i64 = conn
+        .query_row("SELECT pid FROM agents WHERE alias=?", [SELF_LANE], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(p as u32, live_pid, "no actor clobbered the plant");
+    assert!(
+        !d2.events(SELF_LANE)
+            .iter()
+            .any(|e| e["kind"].as_str() == Some("attention")),
+        "no actor should ever have launched: {:?}",
+        d2.events(SELF_LANE)
+    );
+    let g = slot_acquire(&d2, "build", SELF_LANE, "r9");
+    assert_eq!(g["granted"], true, "{g}");
+}
+
+/// `starve_secs` promotes a long waiter ahead of a priority lane:
+/// priority wins inside the window, the starved waiter wins after it.
+/// The slot clock is injected — the test advances it instead of
+/// sleeping, so timing stays exact under host load. The waiter lanes
+/// are real connection identities — one lane shell each (CAD-113).
+#[test]
+fn slot_starve_promotes_long_waiter() {
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let d = TestDaemon::start_opts(slot_opts_clock(1, 1, 3, &["qa-1"], Some(clock.clone())));
+    let home = TempDir::new().unwrap();
+    plant_self(&d);
+    let mut dev = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-2", dev.pid());
+    let mut qa = LaneShell::spawn(home.path());
+    plant_pane(&d, "qa-1", qa.pid());
+    let h1 = slot_acquire(&d, "build", SELF_LANE, "h1")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Ordinary waiter first, priority waiter second.
+    let w = dev.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": dev.pid(), "request_id": "w1"}),
+    );
+    assert_eq!(w["result"]["granted"], false, "{w}");
+    let w = qa.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "test", "pid": qa.pid(), "request_id": "w2"}),
+    );
+    assert_eq!(w["result"]["granted"], false, "{w}");
+    slot_release(&d, &h1, SELF_LANE, std::process::id());
+    // Inside the starve window the reviewer lane's test wins.
+    let g = qa.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "test", "pid": qa.pid(), "request_id": "w2"}),
+    );
+    assert_eq!(
+        g["result"]["granted"], true,
+        "priority lane should outrank: {g}"
+    );
+    let w2 = g["result"]["token"].as_str().unwrap().to_string();
+    // Once w1 has waited past starve_secs it outranks even a new
+    // priority request — the never-starve bound.
+    clock.store(4, std::sync::atomic::Ordering::Relaxed);
+    let w = qa.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "test", "pid": qa.pid(), "request_id": "w3"}),
+    );
+    assert_eq!(w["result"]["granted"], false, "{w}");
+    let r = qa.rpc(
+        &d.state,
+        "slot_release",
+        json!({"token": w2, "pid": qa.pid()}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    let g = dev.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": dev.pid(), "request_id": "w1"}),
+    );
+    assert_eq!(
+        g["result"]["granted"], true,
+        "starved waiter must outrank priority: {g}"
+    );
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    let w3 = s["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["request_id"] == "w3")
+        .expect("w3 still queued");
+    assert_eq!(w3["priority"], true);
+}
+
+/// suite draws on its own pool — a full suite queue never jams the
+/// build lanes, and `test` shares the build pool. The two pool users
+/// claim different pids on this connection's own ancestry (CAD-113):
+/// the cross-pool deadlock guard keys on `(lane, pid)`, so the same
+/// process must never hold one pool while queueing the other.
+#[test]
+fn slot_pools_are_independent() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let me = std::process::id();
+    let parent = std::os::unix::process::parent_id();
+    assert_eq!(
+        slot_acquire_pid(&d, "suite", SELF_LANE, me, "s1")["granted"],
+        true
+    );
+    assert_eq!(
+        slot_acquire_pid(&d, "suite", SELF_LANE, me, "s2")["granted"],
+        false,
+        "second suite must queue"
+    );
+    // The suite pool being full does not touch build.
+    assert_eq!(
+        slot_acquire_pid(&d, "build", SELF_LANE, parent, "b1")["granted"],
+        true
+    );
+    // test shares the build pool — now full too.
+    assert_eq!(
+        slot_acquire_pid(&d, "test", SELF_LANE, parent, "t1")["granted"],
+        false
+    );
+}
+
+/// The CLI: `--wait-secs 0` fails fast with a named error, a free slot
+/// grants a bare token, release returns it, and `status` shows the
+/// pool both ways.
+#[test]
+fn build_slot_cli_acquire_release_status() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let t1 = slot_acquire(&d, "build", SELF_LANE, "r1")["token"]
+        .as_str()
+        .unwrap()
+        .to_string(); // build pool full
+    let me = std::process::id().to_string(); // the CLI child's parent
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "acquire",
+            "build",
+            "--wait-secs",
+            "0",
+            "--pid",
+            &me,
+        ],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("No build slot free"), "{err}");
+    // --pid is required — a bare acquire refuses rather than binding
+    // a transient parent the work outlives.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "acquire", "build", "--wait-secs", "0"],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--pid"));
+    // Free it through the CLI — release names the holding lane; the
+    // default pid (the CLI's parent = this test) matches the hold.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "release", &t1, "--lane", "dev-1"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("released slot-"));
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "acquire",
+            "build",
+            "--wait-secs",
+            "0",
+            "--lane",
+            "dev-9",
+            "--pid",
+            &me,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        token.starts_with("slot-"),
+        "bare minted token on stdout: {token:?}"
+    );
+    // The token round-trips: release by exactly what acquire printed,
+    // same lane, same default pid.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "release", &token, "--lane", "dev-9"],
+    );
+    assert!(out.status.success());
+    // `--lane` is advisory only (CAD-113): the daemon derives the
+    // caller's lane from the connection, so a release naming another
+    // lane still acts on — and only on — the caller's own hold.
+    let g = slot_acquire(&d, "build", SELF_LANE, "r9");
+    let t9 = g["token"].as_str().unwrap().to_string();
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "release", &t9, "--lane", "dev-2"],
+    );
+    assert!(
+        out.status.success(),
+        "own hold releases whatever --lane claims: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // status --json shows the empty pool; bad kind is a named error.
+    let out = cadence_at(home.path(), &d.state, &["build-slot", "status", "--json"]);
+    let s: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(s["pools"]["build"]["held"].as_array().unwrap().is_empty());
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "acquire",
+            "bogus",
+            "--wait-secs",
+            "0",
+            "--pid",
+            &me,
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("build, test or suite"));
+}
+
+/// `cadence status` carries the slot line — table and --json agree.
+#[test]
+fn status_footer_shows_slots() {
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    plant_self(&d);
+    slot_acquire(&d, "build", SELF_LANE, "r1");
+    slot_acquire(&d, "build", SELF_LANE, "r2");
+    slot_acquire(&d, "build", SELF_LANE, "r3"); // the waiter
+    let home = TempDir::new().unwrap();
+    let out = cadence_at(home.path(), &d.state, &["status"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("slots: 2/2 build, 0/1 suite; waiting: 1"),
+        "{text}"
+    );
+    let out = cadence_at(home.path(), &d.state, &["status", "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["footer"]["slots"]["pools"]["build"]["held"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(v["footer"]["slots"]["waiting"].as_array().unwrap().len(), 1);
+}
+
+/// `issue start` writes the worktree slot env: `CARGO_BUILD_JOBS` from
+/// `[host] jobs_per_lane` plus the helper path — idempotent, and a
+/// foreign line in an existing `.env` survives.
+#[test]
+fn issue_start_writes_slot_env() {
+    let d = TestDaemon::start();
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]).0);
+    assert!(cli(&["issue", "new", "One", "--project", "demo"]).0);
+    // The [host] override lands before the start reads it.
+    let pm_yaml = pm_dir.join("pm.yaml");
+    let mut yaml = std::fs::read_to_string(&pm_yaml).unwrap();
+    yaml.push_str("host:\n  jobs_per_lane: 7\n");
+    std::fs::write(&pm_yaml, yaml).unwrap();
+    let (ok, out) = cli(&["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let env_file = PathBuf::from(out["slot_env"]["path"].as_str().unwrap());
+    assert_eq!(
+        env_file,
+        Path::new(out["worktree"].as_str().unwrap()).join(".env")
+    );
+    let text = std::fs::read_to_string(&env_file).unwrap();
+    assert!(text.contains("CARGO_BUILD_JOBS=7"), "{text}");
+    assert!(text.contains("CADENCE_BUILD_SLOT="), "{text}");
+    assert!(text.contains("cadence"), "{text}");
+    // Created 0600 — the file may hold build secrets someday.
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // A second start is idempotent and keeps foreign lines — and an
+    // existing file's mode survives the atomic rewrite.
+    std::fs::write(&env_file, format!("OTHER=1\n{text}")).unwrap();
+    std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let (ok, _) = cli(&["issue", "start", "D-1"]);
+    assert!(ok);
+    let text = std::fs::read_to_string(&env_file).unwrap();
+    assert_eq!(text.matches("CARGO_BUILD_JOBS=").count(), 1, "{text}");
+    assert!(text.contains("OTHER=1"), "{text}");
+    assert_eq!(
+        std::fs::metadata(&env_file).unwrap().permissions().mode() & 0o777,
+        0o640,
+        "existing mode preserved"
+    );
+    drop(d);
+}
+
+/// `build-slot run` binds the hold to the REAL command process: the
+/// CLI acquires with its own pid then execs, so the slot's holder IS
+/// the running command — its exit frees the slot.
+#[test]
+fn build_slot_run_binds_the_real_process() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "build-slot",
+            "run",
+            "build",
+            "--wait-secs",
+            "5",
+            "--",
+            "sleep",
+            "30",
+        ])
+        .env("HOME", home.path())
+        .envs(test_env().vars())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // After exec the spawned pid IS `sleep 30` — the hold must bind
+    // to exactly that process, not a wrapper that already exited.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = d.rpc("slot_status", json!({"lane": "unknown"})).unwrap();
+        let held = s["pools"]["build"]["held"].as_array().unwrap();
+        if held
+            .iter()
+            .any(|h| h["pid"].as_u64() == Some(child.id() as u64))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "run never held the slot: {s}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // The command's exit frees its slot on the next read.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let s = d.rpc("slot_status", json!({"lane": "unknown"})).unwrap();
+    assert!(
+        s["pools"]["build"]["held"].as_array().unwrap().is_empty(),
+        "the command's exit frees its slot: {s}"
+    );
+    // A short command exits cleanly through run.
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "run",
+            "build",
+            "--wait-secs",
+            "5",
+            "--",
+            "true",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The CLI's queued path: `--wait-secs > 0` polls until a release
+/// frees the pool — and `--pid` binds the hold to the named holder
+/// (this test process, the CLI's parent).
+#[test]
+fn build_slot_cli_wait_then_grant() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let t1 = slot_acquire(&d, "build", SELF_LANE, "r1")["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let me = std::process::id().to_string();
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "build-slot",
+            "acquire",
+            "build",
+            "--wait-secs",
+            "15",
+            "--lane",
+            "dev-9",
+            "--pid",
+            &me,
+        ])
+        .env("HOME", home.path())
+        .envs(test_env().vars())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Let it queue — the waiter shows in status, then a release
+    // frees the pool and the next poll grants.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = d.rpc("slot_status", json!({"lane": "dev-9"})).unwrap();
+        if !s["waiting"].as_array().unwrap().is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "CLI never queued: {s}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    slot_release(&d, &t1, SELF_LANE, std::process::id());
+    let out = cli.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(token.starts_with("slot-"), "minted token: {token}");
+    // The explicit --pid bound the hold to the named pid — the test
+    // process, still alive. The CLI's `--lane dev-9` was advisory:
+    // the derived lane is this pane's alias.
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held[0]["pid"].as_u64().unwrap() as u32, std::process::id());
+    assert_eq!(held[0]["lane"], SELF_LANE);
+    slot_release(&d, &token, SELF_LANE, std::process::id());
 }

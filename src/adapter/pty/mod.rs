@@ -48,6 +48,7 @@ pub mod claude;
 pub mod cursor;
 pub mod devin;
 pub mod profile;
+mod render;
 pub mod stub;
 
 pub use claude::{analyze_claude, ClaudeProfile};
@@ -70,6 +71,7 @@ use crate::error::{Error, Result};
 use crate::store::Agent;
 
 use super::{AdapterHooks, Identity, Probe, ProviderAdapter, ProviderEnv, TurnResult};
+use render::{RenderDecision, RenderObservation, RenderOutcome};
 
 /// How long an operator readiness claim stays valid for one send.
 const READY_TTL: Duration = Duration::from_secs(60);
@@ -307,6 +309,27 @@ pub(crate) fn descends_from(mut pid: u32, pane_pid: u32) -> bool {
             .unwrap_or(0);
     }
     false
+}
+
+/// The process's /proc ancestry chain — itself first, then each PPid
+/// link up to (excluding) init. Fail-closed for connection-bound
+/// caller identity (CAD-113): an unreadable or malformed link yields
+/// `None`, never a partial chain — a caller whose ancestry cannot be
+/// verified must inherit no identity at all. A detached caller
+/// (`setsid`) reparents to init, so its chain is just itself — which
+/// no registered pane can match.
+pub(crate) fn caller_chain(mut pid: u32) -> Option<Vec<u32>> {
+    let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while pid > 1 && seen.insert(pid) {
+        chain.push(pid);
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        pid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse().ok())?;
+    }
+    Some(chain)
 }
 
 /// A pty provider's forbidden input prefixes — the profile's own list,
@@ -781,6 +804,7 @@ impl ProviderAdapter for PtyAdapter {
             thread_id: native.clone(),
             session_id: native,
             model: None,
+            effort: None,
             pid: pane_pid,
             endpoint: Some(endpoint),
             generation: Some(generation),
@@ -829,6 +853,7 @@ impl ProviderAdapter for PtyAdapter {
             thread_id: adoption.native_session.clone(),
             session_id: adoption.native_session.clone(),
             model: None,
+            effort: None,
             pid: pane_pid,
             endpoint: Some(endpoint),
             generation: Some(adoption.generation.clone()),
@@ -928,43 +953,51 @@ impl ProviderAdapter for PtyAdapter {
         // means Enter never submitted (a staged draft is not a turn).
         // A miss inside the bound is evidence of a dropped paste, never
         // proof; the daemon decides per message kind what a miss means.
-        let deadline = Instant::now() + RENDER_DEADLINE;
-        let mut rendered = false;
+        let render_started = Instant::now();
+        let mut render_decision = RenderDecision::new(RENDER_DEADLINE);
         loop {
             let screen = self.capture_visible()?;
-            if normalize_screen(&screen).matches(&slice).count() > before_count {
-                rendered = true;
+            let observation = if normalize_screen(&screen).matches(&slice).count() > before_count {
                 let cursor = self.cursor_pos(&session);
-                if !self.profile.analyze(&screen, cursor).input_nonempty {
-                    break;
+                RenderObservation::Visible {
+                    input_nonempty: self.profile.analyze(&screen, cursor).input_nonempty,
                 }
+            } else {
+                RenderObservation::NotVisible
+            };
+            match render_decision.observe(render_started.elapsed(), observation) {
+                Some(RenderOutcome::Submitted) => break,
+                Some(outcome @ (RenderOutcome::Staged | RenderOutcome::NotRendered)) => {
+                    // The miss carries what the pane actually showed — the
+                    // screen tail before the paste and after the deadline,
+                    // plus the probe verdict that admitted the send — so a
+                    // fence records evidence, not just a verdict.
+                    let reason = match outcome {
+                        RenderOutcome::Staged => {
+                            "paste rendered in the input line but was never submitted — \
+                             Enter not observed; the draft is left untouched"
+                        }
+                        RenderOutcome::NotRendered => {
+                            "pasted text never rendered in the pane — the TUI dropped it"
+                        }
+                        RenderOutcome::Submitted => unreachable!(),
+                    };
+                    let claim_probe = self
+                        .state
+                        .lock()
+                        .unwrap()
+                        .gate_probe
+                        .as_ref()
+                        .map(Probe::to_json);
+                    return Err(Error::not_rendered(crate::error::RenderMiss {
+                        reason: reason.to_string(),
+                        before_tail: screen_tail(&before, 12),
+                        after_tail: screen_tail(&screen, 12),
+                        claim_probe,
+                    }));
+                }
+                None => std::thread::sleep(Duration::from_millis(150)),
             }
-            if Instant::now() >= deadline {
-                // The miss carries what the pane actually showed — the
-                // screen tail before the paste and after the deadline,
-                // plus the probe verdict that admitted the send — so a
-                // fence records evidence, not just a verdict.
-                let reason = if rendered {
-                    "paste rendered in the input line but was never submitted — \
-                     Enter not observed; the draft is left untouched"
-                } else {
-                    "pasted text never rendered in the pane — the TUI dropped it"
-                };
-                let claim_probe = self
-                    .state
-                    .lock()
-                    .unwrap()
-                    .gate_probe
-                    .as_ref()
-                    .map(Probe::to_json);
-                return Err(Error::not_rendered(crate::error::RenderMiss {
-                    reason: reason.to_string(),
-                    before_tail: screen_tail(&before, 12),
-                    after_tail: screen_tail(&screen, 12),
-                    claim_probe,
-                }));
-            }
-            std::thread::sleep(Duration::from_millis(150));
         }
 
         on_started(&token);

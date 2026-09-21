@@ -1,0 +1,125 @@
+#!/bin/sh
+# CAD-173: pinned, zero-retry nextest runner.
+#
+# Usage (after human approval installs the pinned binary):
+#   scripts/cadence-nextest --test integration
+#
+# Direct invocations take the canonical outer host lock. `cadence review`
+# already owns that lock in src/review.rs; it clears the child lock path and
+# sets CADENCE_REVIEW_SUITE_LOCK_HELD=1, so this wrapper never nests flock.
+set -eu
+
+PINNED_NEXTEST_VERSION=0.9.145
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+BIN=${CADENCE_NEXTTEST_BIN:-cargo-nextest}
+PROFILE="$ROOT/.config/nextest.toml"
+TRUST_MANIFEST="$ROOT/.config/cargo-nextest.sha256"
+
+die() {
+    echo "cadence-nextest: $*" >&2
+    exit 1
+}
+
+[ -f "$PROFILE" ] || die "missing pinned profile: $PROFILE"
+[ -f "$TRUST_MANIFEST" ] || die "missing trusted artifact manifest: $TRUST_MANIFEST"
+
+BIN_PATH=$(command -v "$BIN" 2>/dev/null) ||
+    die "pinned cargo-nextest $PINNED_NEXTEST_VERSION is not installed"
+[ -f "$BIN_PATH" ] && [ -x "$BIN_PATH" ] ||
+    die "cargo-nextest path is not an executable file: $BIN_PATH"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required to verify cargo-nextest"
+command -v awk >/dev/null 2>&1 || die "awk is required to read the trusted artifact manifest"
+
+artifact_name=${BIN_PATH##*/}
+expected_sha256=$(awk -v name="$artifact_name" \
+    '$1 !~ /^#/ && $2 == name { print $1; exit }' "$TRUST_MANIFEST")
+[ -n "$expected_sha256" ] ||
+    die "no trusted checksum for executable '$artifact_name'"
+actual_sha256=$(sha256sum "$BIN_PATH" 2>/dev/null) ||
+    die "could not checksum cargo-nextest executable: $BIN_PATH"
+actual_sha256=${actual_sha256%% *}
+[ "$actual_sha256" = "$expected_sha256" ] ||
+    die "untrusted cargo-nextest executable checksum: expected $expected_sha256, got $actual_sha256"
+
+version=$("$BIN_PATH" --version 2>&1) || die "could not query $BIN_PATH --version"
+case "$version" in
+    "cargo-nextest $PINNED_NEXTEST_VERSION"*) ;;
+    *) die "wrong cargo-nextest version: expected $PINNED_NEXTEST_VERSION, got '$version'" ;;
+esac
+
+SUBCOMMAND=run
+if [ "${1:-}" = list ]; then
+    SUBCOMMAND=list
+    shift
+fi
+
+blocked_no_tests=
+for arg in "$@"; do
+    if [ -n "$blocked_no_tests" ]; then
+        case "$arg" in
+            -*) ;;
+            *) die "profile, config and retries are pinned; do not override '$blocked_no_tests $arg'" ;;
+        esac
+    fi
+    case "$arg" in
+        --retries|--retries=*|--profile|--profile=*|--config-file|--config-file=*)
+            die "profile, config and retries are pinned; do not override '$arg'" ;;
+        --no-tests)
+            blocked_no_tests=$arg
+            ;;
+        --no-tests=*)
+            die "profile, config and retries are pinned; do not override '$arg'" ;;
+    esac
+done
+if [ -n "$blocked_no_tests" ]; then
+    die "profile, config and retries are pinned; do not override '$blocked_no_tests'"
+fi
+
+cd "$ROOT" || die "cannot enter cadence repository root: $ROOT"
+
+run_nextest() {
+    if [ "$SUBCOMMAND" = run ]; then
+        exec env -u NEXTEST_RETRIES -u NEXTEST_PROFILE \
+            "$BIN_PATH" nextest "$SUBCOMMAND" \
+            --config-file "$PROFILE" \
+            --profile cadence \
+            --retries 0 \
+            --no-tests fail \
+            "$@"
+    fi
+    exec env -u NEXTEST_RETRIES -u NEXTEST_PROFILE \
+        "$BIN_PATH" nextest "$SUBCOMMAND" \
+        --config-file "$PROFILE" \
+        --profile cadence \
+        "$@"
+}
+
+# Listing is metadata-only and does not need the host suite slot.
+if [ "$SUBCOMMAND" = list ]; then
+    run_nextest "$@"
+fi
+
+if [ "${CADENCE_REVIEW_SUITE_LOCK_HELD:-}" = 1 ]; then
+    [ -z "${CADENCE_SUITE_LOCK:-}" ] ||
+        die "review-owned nextest child must receive an empty CADENCE_SUITE_LOCK"
+    [ -n "${CADENCE_REVIEW_PR:-}" ] ||
+        die "review-owned marker missing CADENCE_REVIEW_PR"
+    [ -n "${CADENCE_REVIEW_HEAD:-}" ] ||
+        die "review-owned marker missing CADENCE_REVIEW_HEAD"
+    run_nextest "$@"
+fi
+
+LOCK=${CADENCE_SUITE_LOCK:-}
+[ -n "$LOCK" ] ||
+    die "direct nextest requires CADENCE_SUITE_LOCK; use cadence review or set an explicit lock path"
+command -v flock >/dev/null 2>&1 || die "flock is required for the outer suite lock"
+
+# The outer process owns the lock. Its child has an empty path and an
+# explicit review-style marker, so process-per-test nextest workers cannot
+# re-flock the same descriptor and deadlock.
+exec flock "$LOCK" env \
+    CADENCE_SUITE_LOCK= \
+    CADENCE_REVIEW_SUITE_LOCK_HELD=1 \
+    CADENCE_REVIEW_PR="${CADENCE_REVIEW_PR:-direct}" \
+    CADENCE_REVIEW_HEAD="${CADENCE_REVIEW_HEAD:-direct}" \
+    "$0" "$@"

@@ -26,6 +26,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::adapter::registry;
 use crate::client;
+use crate::doctor::host::redact_argv;
 use crate::error::{Error, Result};
 use crate::issue::{board, history, model, project, write as issue_write, Pm};
 use crate::proc::{self, BoundedError};
@@ -531,10 +532,22 @@ mod embedded {
     });
 }
 
-/// task id → (issue id, task state) for every task that belongs to an
-/// issue-bound job — the join that makes agent binding exact instead of
-/// scanning message text for issue-shaped tokens.
-fn task_issue_map(state_dir: &Path) -> HashMap<String, (String, String)> {
+/// One task assignment enriched with its job context for the board. The
+/// join stays exact: agent tasks are joined through the job's task rows and
+/// `jobs.issue_id`, never by scanning message text for issue-shaped tokens.
+#[derive(Clone)]
+struct TaskBinding {
+    issue: String,
+    task_state: String,
+    task_title: Option<String>,
+    job: String,
+    job_title: Option<String>,
+    job_state: String,
+}
+
+/// task id → issue/job context for every task that belongs to an
+/// issue-bound job.
+fn task_issue_map(state_dir: &Path) -> HashMap<String, TaskBinding> {
     let mut map = HashMap::new();
     let Ok(list) = client::rpc(state_dir, "job_list", json!({"all": true})) else {
         return map;
@@ -552,22 +565,61 @@ fn task_issue_map(state_dir: &Path) -> HashMap<String, (String, String)> {
         let Ok(show) = client::rpc(state_dir, "job_show", json!({"job": job_id})) else {
             continue;
         };
+        let job_title = show["job"]["title"].as_str().map(str::to_string);
+        let job_state = show["job"]["state"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
         for task in show["job"]["tasks"].as_array().cloned().unwrap_or_default() {
             if let (Some(tid), Some(state)) = (task["id"].as_str(), task["state"].as_str()) {
-                map.insert(tid.to_string(), (issue.clone(), state.to_string()));
+                map.insert(
+                    tid.to_string(),
+                    TaskBinding {
+                        issue: issue.clone(),
+                        task_state: state.to_string(),
+                        task_title: task["title"].as_str().map(str::to_string),
+                        job: job_id.to_string(),
+                        job_title: job_title.clone(),
+                        job_state: job_state.clone(),
+                    },
+                );
             }
         }
     }
     map
 }
 
-/// One running message reduced for the board: id, task, turn token.
+/// Keep an ad-hoc current-message description useful without putting the
+/// queued prompt or provider credentials in browser JSON. The shared argv
+/// scrubber handles credential-shaped flags, headers, URIs and token forms;
+/// the character cap keeps one large prompt from becoming an agent row.
+fn current_message_summary(m: &Value) -> Option<String> {
+    let body = m["body"].as_str()?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let head: String = body.chars().take(512).collect();
+    let tokens: Vec<String> = head.split_whitespace().map(str::to_string).collect();
+    let safe = redact_argv(&tokens);
+    if safe.is_empty() {
+        return None;
+    }
+    let mut summary: String = safe.chars().take(180).collect();
+    if safe.chars().count() > 180 {
+        summary.push('…');
+    }
+    Some(summary)
+}
+
+/// One running message reduced for the board: id, task, turn token and a
+/// bounded redacted description for ad-hoc current work.
 fn running_json(m: &Value) -> Value {
     json!({
         "id": m["id"],
         "task": m["task_id"],
         "turn_id": m["turn_id"],
         "created": m["created"],
+        "summary": current_message_summary(m),
     })
 }
 
@@ -625,6 +677,17 @@ fn agents_payload(state_dir: &Path) -> Value {
             out.push(json!({
                 "alias": alias, "provider": agent["provider"],
                 "endpoint_kind": agent["endpoint_kind"],
+                "role": agent["role"],
+                "model": agent["model"],
+                "model_reported": agent["model_reported"],
+                "model_configured": agent["model_configured"],
+                "model_source": agent["model_source"],
+                "effort": agent["effort"],
+                "effort_reported": agent["effort_reported"],
+                "effort_source": agent["effort_source"],
+                "effort_applicable": agent["effort_applicable"],
+                "quota": agent["quota"],
+                "usage_limit": agent["usage_limit"],
                 "state": "inbox", "group": agent["params"]["upstream"].as_str().unwrap_or(alias),
                 "group_root": agent["params"]["upstream"].is_null(),
                 "running": 0, "queued": 0, "unknown": 0, "parked": 0,
@@ -676,11 +739,11 @@ fn agents_payload(state_dir: &Path) -> Value {
         let mut bound: Vec<Value> = Vec::new();
         for tid in agent["tasks"].as_array().cloned().unwrap_or_default() {
             let Some(tid) = tid.as_str() else { continue };
-            let Some((issue, task_state)) = task_map.get(tid) else {
+            let Some(binding) = task_map.get(tid) else {
                 continue;
             };
-            if !on.contains(issue) {
-                on.push(issue.clone());
+            if !on.contains(&binding.issue) {
+                on.push(binding.issue.clone());
             }
             let message = running_msgs
                 .iter()
@@ -688,17 +751,26 @@ fn agents_payload(state_dir: &Path) -> Value {
                 .cloned()
                 .unwrap_or(Value::Null);
             bound.push(json!({
-                "task": tid, "task_state": task_state, "issue": issue,
+                "task": tid,
+                "task_state": binding.task_state,
+                "title": binding.task_title,
+                "issue": binding.issue,
+                "job": binding.job,
+                "job_title": binding.job_title,
+                "job_state": binding.job_state,
                 "message": message,
             }));
-            by_issue.entry(issue.clone()).or_default().push(json!({
-                "alias": alias,
-                "task": tid,
-                "task_state": task_state,
-                "state": agent["state"],
-                "message": message["id"].clone(),
-                "resume": resume,
-            }));
+            by_issue
+                .entry(binding.issue.clone())
+                .or_default()
+                .push(json!({
+                    "alias": alias,
+                    "task": tid,
+                    "task_state": binding.task_state,
+                    "state": agent["state"],
+                    "message": message["id"].clone(),
+                    "resume": resume,
+                }));
         }
         let fenced = unknown > 0 || agent["state"].as_str() == Some("attention");
         totals["running"] = json!(totals["running"].as_i64().unwrap_or(0) + running);
@@ -718,6 +790,21 @@ fn agents_payload(state_dir: &Path) -> Value {
             "alias": alias,
             "provider": agent["provider"],
             "endpoint_kind": agent["endpoint_kind"],
+            "role": agent["role"],
+            // Preserve provider evidence so the UI can distinguish a
+            // confirmed effective model from a requested/configured one.
+            "model": agent["model"],
+            "model_reported": agent["model_reported"],
+            "model_configured": agent["model_configured"],
+            "model_source": agent["model_source"],
+            "effort": agent["effort"],
+            "effort_reported": agent["effort_reported"],
+            "effort_source": agent["effort_source"],
+            "effort_applicable": agent["effort_applicable"],
+            // Quota integrations can add this account/pool-scoped view;
+            // absent data stays absent and is rendered unavailable below.
+            "quota": agent["quota"],
+            "usage_limit": agent["usage_limit"],
             "state": agent["state"],
             "group": agent["params"]["upstream"].as_str().unwrap_or(alias),
             "group_root": agent["params"]["upstream"].is_null(),
@@ -779,9 +866,9 @@ fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result<Value, Str
     let task_map = task_issue_map(state_dir);
     let mut issues: Vec<&str> = Vec::new();
     for t in tasks.as_array().cloned().unwrap_or_default() {
-        if let Some((issue, _)) = t.as_str().and_then(|tid| task_map.get(tid)) {
-            if !issues.contains(&issue.as_str()) {
-                issues.push(issue);
+        if let Some(binding) = t.as_str().and_then(|tid| task_map.get(tid)) {
+            if !issues.contains(&binding.issue.as_str()) {
+                issues.push(&binding.issue);
             }
         }
     }
@@ -1101,6 +1188,56 @@ fn write_route(
     opts: &ServeOpts,
     send: &dyn Fn(Request, HttpResp),
 ) {
+    // Monitor acknowledgement: this is a daemon-owned durable write, kept
+    // beside (and behind the same browser write guards as) tracker writes.
+    // The UI never mutates the monitor SQLite store directly, which keeps a
+    // board built from a newer binary compatible with an older live daemon.
+    if let Some(tail) = path.strip_prefix("/api/monitors/") {
+        let mut segs = tail.split('/');
+        let monitor = segs.next().unwrap_or_default();
+        let alerts = segs.next().unwrap_or_default();
+        let seq = segs.next().unwrap_or_default();
+        let ack = segs.next().unwrap_or_default();
+        let shape_ok = *method == Method::Post
+            && !monitor.is_empty()
+            && alerts == "alerts"
+            && seq.parse::<i64>().is_ok_and(|n| n > 0)
+            && ack == "ack"
+            && segs.next().is_none();
+        if !shape_ok {
+            send(request, err_response(404, "no such monitor write route"));
+            return;
+        }
+        if opts.read_only {
+            send(
+                request,
+                guard_fail("read_only", "board is read-only — writes are disabled"),
+            );
+            return;
+        }
+        if let Err(resp) = write_guard(&request, "application/json", opts) {
+            send(request, resp);
+            return;
+        }
+        // `MonitorAlert` uses the protocol identifier grammar for its audit
+        // actor.  The browser actor includes a display suffix, so retain a
+        // conservative operator identity here rather than passing an invalid
+        // or user-controlled value to the daemon.
+        let seq = seq.parse::<i64>().unwrap_or_default();
+        match client::rpc(
+            state_dir,
+            "monitor_alert_ack",
+            json!({"monitor": monitor, "alert": seq, "by": "operator"}),
+        ) {
+            Ok(value) => send(
+                request,
+                json_response(json!({"ok": true, "alert": value["alert"]})),
+            ),
+            Err(error) => send(request, err_response(400, &error.to_string())),
+        }
+        return;
+    }
+
     // Memory curation: POST /api/memories/<project>/<slug>/accept|reject
     // — same guarded write path as the CLI; the commit actor is the
     // request-attributed one (`request_actor`), as on /api/issues.
@@ -1542,9 +1679,9 @@ fn agents_fp(state_dir: &Path, list: &Value) -> u64 {
     value_fp(&json!(parts))
 }
 
-/// Poll the three board inputs once a second and push
-/// `issues|agents|jobs` event names into `tx` on change. The baseline
-/// is taken before the loop so a fresh client only sees deltas.
+/// Poll the board inputs once a second and push
+/// `issues|agents|jobs|monitoring` event names into `tx` on change. The
+/// baseline is taken before the loop so a fresh client only sees deltas.
 /// `__tick` is the per-second liveness probe: the reader drops it, and
 /// a failed send means the client hung up — stop polling the daemon.
 fn watch_changes(
@@ -1553,6 +1690,7 @@ fn watch_changes(
     mut tracker: Option<std::time::SystemTime>,
     mut jobs: u64,
     mut agents: u64,
+    mut monitoring: u64,
     tx: std::sync::mpsc::Sender<&'static str>,
 ) {
     loop {
@@ -1585,6 +1723,15 @@ fn watch_changes(
                 }
             }
         }
+        if let Ok(list) = client::rpc(&state_dir, "monitor_list", json!({})) {
+            let fp = value_fp(&list);
+            if fp != monitoring {
+                monitoring = fp;
+                if tx.send("monitoring").is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1607,6 +1754,9 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     let agents0 = client::rpc(state_dir, "agent_list", json!({}))
         .map(|l| agents_fp(state_dir, &l))
         .unwrap_or(0);
+    let monitoring0 = client::rpc(state_dir, "monitor_list", json!({}))
+        .map(|l| value_fp(&l))
+        .unwrap_or(0);
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
                 Cache-Control: no-store\r\nConnection: close\r\n\r\n";
     if w.write_all(head.as_bytes())
@@ -1618,7 +1768,7 @@ fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
     std::thread::spawn({
         let (state_dir, pm_dir) = (state_dir.to_path_buf(), pm_dir.to_path_buf());
-        move || watch_changes(state_dir, pm_dir, tracker0, jobs0, agents0, tx)
+        move || watch_changes(state_dir, pm_dir, tracker0, jobs0, agents0, monitoring0, tx)
     });
     let frame = |w: &mut dyn Write, bytes: &[u8]| -> bool {
         w.write_all(bytes).and_then(|_| w.flush()).is_ok()
@@ -2724,7 +2874,8 @@ fn qr_term(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_type, static_file};
+    use super::{content_type, running_json, static_file};
+    use serde_json::json;
 
     /// Brand files sit at the dist root (Vite copies `ui/public/`); they
     /// must come back as themselves with an image type, never as the
@@ -2744,6 +2895,18 @@ mod tests {
         let (name, _) = static_file(Some(dist.path()), "/apple-touch-icon.png").unwrap();
         assert_eq!(content_type(&name), "image/png");
         assert!(static_file(Some(dist.path()), "/../favicon.svg").is_none());
+    }
+
+    #[test]
+    fn current_message_summary_is_bounded_and_redacted() {
+        let message = running_json(&json!({
+            "id": "m1",
+            "body": "investigate this issue password=super-secret and keep the useful context visible"
+        }));
+        let summary = message["summary"].as_str().unwrap();
+        assert!(summary.contains("investigate this issue"));
+        assert!(!summary.contains("super-secret"));
+        assert!(summary.chars().count() <= 181);
     }
 
     /// The embedded build answers the same three paths.
