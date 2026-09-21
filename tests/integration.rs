@@ -10368,29 +10368,67 @@ fn task_attached_send_and_self() {
 
 #[test]
 fn job_event_parks_on_unrendered_pty_pm() {
-    let d = TestDaemon::start();
-    let mock = d.mock_devin();
-    d.register_devin_opts("pm", json!({"auto_ready": "verified"}));
-    d.wait_agent("pm", "idle", 20);
-    d.register_member("w1", "pm");
-    d.wait_agent("w1", "idle", 10);
-    let (spec, sha) = d.spec_file("spec.md", "pty pm park test");
-    d.job_new("pm", "j1", &spec, &sha);
-    d.rpc(
-        "task_new",
-        json!({"job": "j1", "task": "j1-t2", "assignee": "w1",
-               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
-    )
-    .unwrap();
-    let r = d.job_dispatch("j1-t2", json!({})).unwrap();
-    let k = r["message"].as_str().unwrap().to_string();
-    d.wait_message("w1", &k, &["completed"], 15);
-    d.wait_task("j1-t2", "review", 15);
-
-    // The PM pane swallows before the verdict notification lands.
-    atomic_write(d.pane_file(&mock, "pm", "swallow"), "1");
-    d.job_verdict("j1-t2", SHA_A, "pass", Some("rev"), None)
+    let state_dir = TempDir::new().unwrap();
+    let mock_dir = TempDir::new().unwrap();
+    let mock = install_mock_devin(mock_dir.path());
+    let state = state_dir.path();
+    let cwd = state.to_str().unwrap();
+    let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+    store
+        .register_agent(&NewAgent {
+            alias: "pm",
+            provider: "devin",
+            endpoint_kind: "pty",
+            role: "pm",
+            cwd,
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(r#"{"auto_ready":"verified"}"#),
+        })
         .unwrap();
+    let spec = state.join("spec.md");
+    let spec_body = b"pty pm park test";
+    std::fs::write(&spec, spec_body).unwrap();
+    use sha2::{Digest, Sha256};
+    let spec_sha = format!("{:x}", Sha256::digest(spec_body));
+    store
+        .create_job(
+            "j1",
+            Some("pty pm park test"),
+            spec.to_str().unwrap(),
+            &spec_sha,
+            "pm",
+            None,
+            None,
+            None,
+            2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    // Seed the notification through the same Store::job_notice →
+    // route_job_event path used by job verdict, while leaving worker
+    // dispatch/review lifecycle coverage to the other job tests. The
+    // queued row is present before daemon boot, so no second Store can
+    // reset an active endpoint and the daemon sees its normal wake path.
+    store
+        .job_notice(
+            "j1-t1",
+            "verified",
+            "fixture:job_event_park",
+            "fixture routed job event",
+        )
+        .unwrap();
+    drop(store);
+    let socket_dir = mock.dir.join("tmux-state").join(socket_for(state));
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    atomic_write(socket_dir.join("pm.swallow"), "1");
+    let d = TestDaemon::start_on(state.to_path_buf());
+    d.wait_agent("pm", "idle", 20);
 
     // The job_event notification requeues bounded, then parks — the
     // PM pane survives, never fenced.
