@@ -187,35 +187,92 @@ fn auth_header(tok: &str) -> bool {
     matches!(head.as_str(), "authorization" | "proxy-authorization")
 }
 
-/// Emit `[REDACTED]` for `toks[i]` (trailing whitespace kept) and
-/// keep eating while a quote the value opened stays unclosed —
-/// `--password "correct horse battery"` collapses the span to one
-/// marker inside the quotes.
-fn eat_value_at(toks: &[(&str, &str)], i: usize, out: &mut String) -> usize {
-    let (tok, ws) = toks[i];
-    let Some(q) = tok.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
-        out.push_str(REDACTED);
-        out.push_str(ws);
-        return i + 1;
-    };
-    out.push(q);
-    out.push_str(REDACTED);
-    if tok.len() > q.len_utf8() && tok.ends_with(q) {
-        out.push(q);
-        out.push_str(ws);
-        return i + 1;
-    }
-    let mut j = i + 1;
-    while j < toks.len() {
-        let (t, w) = toks[j];
-        j += 1;
-        if t.ends_with(q) {
-            out.push(q);
-            out.push_str(w);
-            break;
+/// Find an unescaped closing quote. Values are prose, not shell input, but
+/// honoring a backslash keeps an escaped quote from ending the mask early.
+fn quote_end(s: &str, q: char) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == q {
+            return Some(i);
         }
     }
-    j
+    None
+}
+
+/// Consume tokens after an already-emitted opening quote. The secret value
+/// is collapsed to one marker; only the closing quote, token suffix and the
+/// whitespace after the closing token are retained. A missing close carries
+/// the quote state into the next line.
+fn consume_quote_tail(
+    toks: &[(&str, &str)],
+    start: usize,
+    q: char,
+    out: &mut String,
+) -> (usize, bool) {
+    let mut j = start;
+    while j < toks.len() {
+        let (tok, ws) = toks[j];
+        if let Some(pos) = quote_end(tok, q) {
+            out.push(q);
+            out.push_str(&tok[pos + q.len_utf8()..]);
+            out.push_str(ws);
+            return (j + 1, true);
+        }
+        j += 1;
+    }
+    (j, false)
+}
+
+/// Emit a quoted secret value beginning at `open_at` in `toks[i].0`.
+/// `open_at` is zero for a separate value (`--password "secret"`) and
+/// points after `=`/`:` for a glued value (`--password="secret words"`).
+fn emit_quoted_value(
+    toks: &[(&str, &str)],
+    i: usize,
+    open_at: usize,
+    q: char,
+    out: &mut String,
+    open_quote: &mut Option<char>,
+) -> usize {
+    let (tok, ws) = toks[i];
+    out.push_str(&tok[..open_at]);
+    out.push(q);
+    out.push_str(REDACTED);
+    let value_start = open_at + q.len_utf8();
+    if let Some(pos) = quote_end(&tok[value_start..], q) {
+        let close = value_start + pos;
+        out.push(q);
+        out.push_str(&tok[close + q.len_utf8()..]);
+        out.push_str(ws);
+        return i + 1;
+    }
+    let (next, closed) = consume_quote_tail(toks, i + 1, q, out);
+    if !closed {
+        *open_quote = Some(q);
+    }
+    next
+}
+
+/// Emit `[REDACTED]` for `toks[i]` (trailing whitespace kept) and carry an
+/// unclosed quote into later lines. `--password "correct horse battery"`
+/// collapses the span to one marker inside the quotes.
+fn eat_value_at(
+    toks: &[(&str, &str)],
+    i: usize,
+    out: &mut String,
+    open_quote: &mut Option<char>,
+) -> usize {
+    let (tok, ws) = toks[i];
+    if let Some(q) = tok.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+        return emit_quoted_value(toks, i, 0, q, out, open_quote);
+    }
+    out.push_str(REDACTED);
+    out.push_str(ws);
+    i + 1
 }
 
 /// `?name=value&…` inside a token — mask each query parameter whose
@@ -244,8 +301,9 @@ fn mask_query_params(tok: &str) -> String {
 
 /// Scrub one line of free prose, whitespace preserved. `carry_eat`
 /// carries a pending `key:`/`key=` value across the line boundary so
-/// `password:\n  hunter2` still masks `hunter2`.
-fn scrub_line(line: &str, carry_eat: &mut bool, out: &mut String) {
+/// `password:\n  hunter2` still masks `hunter2`; `open_quote` carries a
+/// quoted value across the same boundary.
+fn scrub_line(line: &str, carry_eat: &mut bool, open_quote: &mut Option<char>, out: &mut String) {
     let toks = tokens(line);
     // Leading whitespace is indentation — verbatim.
     let lead = line
@@ -253,9 +311,17 @@ fn scrub_line(line: &str, carry_eat: &mut bool, out: &mut String) {
         .unwrap_or(line.len());
     out.push_str(&line[..lead]);
     let mut i = 0;
+    if let Some(q) = *open_quote {
+        let (next, closed) = consume_quote_tail(&toks, i, q, out);
+        if !closed {
+            return;
+        }
+        *open_quote = None;
+        i = next;
+    }
     if *carry_eat && i < toks.len() {
         *carry_eat = false;
-        i = eat_value_at(&toks, i, out);
+        i = eat_value_at(&toks, i, out, open_quote);
     }
     while i < toks.len() {
         let (tok, ws) = toks[i];
@@ -276,23 +342,30 @@ fn scrub_line(line: &str, carry_eat: &mut bool, out: &mut String) {
             out.push_str(": ");
             out.push_str(REDACTED);
             match q {
-                Some(q) if tok.len() > q.len_utf8() && tok.ends_with(q) => {
-                    out.push(q);
-                    out.push_str(ws);
-                    i += 1;
-                }
                 Some(q) => {
-                    let mut j = i + 1;
-                    while j < toks.len() {
-                        let (t, w) = toks[j];
-                        j += 1;
-                        if t.ends_with(q) {
+                    let name_start = q.len_utf8();
+                    let value_start = name_start + name_end + 1;
+                    if value_start < tok.len() {
+                        if let Some(pos) = quote_end(&tok[value_start..], q) {
+                            let close = value_start + pos;
                             out.push(q);
-                            out.push_str(w);
-                            break;
+                            out.push_str(&tok[close + q.len_utf8()..]);
+                            out.push_str(ws);
+                            i += 1;
+                        } else {
+                            let (next, closed) = consume_quote_tail(&toks, i + 1, q, out);
+                            if !closed {
+                                *open_quote = Some(q);
+                            }
+                            i = next;
                         }
+                    } else {
+                        let (next, closed) = consume_quote_tail(&toks, i + 1, q, out);
+                        if !closed {
+                            *open_quote = Some(q);
+                        }
+                        i = next;
                     }
-                    i = j;
                 }
                 None => break,
             }
@@ -305,7 +378,7 @@ fn scrub_line(line: &str, carry_eat: &mut bool, out: &mut String) {
             out.push_str(tok);
             out.push_str(ws);
             if toks.get(i + 1).is_some_and(|(n, _)| !secret_flag(n)) {
-                i = eat_value_at(&toks, i + 1, out);
+                i = eat_value_at(&toks, i + 1, out, open_quote);
             } else {
                 *carry_eat = i + 1 >= toks.len();
                 i += 1;
@@ -328,22 +401,41 @@ fn scrub_line(line: &str, carry_eat: &mut bool, out: &mut String) {
         // non-empty value follows the separator; `key=`/`key:` alone
         // fall through to the trailing-separator rule, which eats the
         // next token.
-        if let Some(eq) = bare.find('=') {
-            if eq + 1 < bare.len() && name_is_secret(bare[..eq].trim_start_matches('-')) {
-                out.push_str(&bare[..eq + 1]);
-                out.push_str(REDACTED);
-                out.push_str(ws);
-                i += 1;
+        if let Some(eq) = tok.find('=') {
+            let name = tok[..eq].trim_matches(|c| c == '"' || c == '\'');
+            if eq + 1 < tok.len() && name_is_secret(name.trim_start_matches('-')) {
+                let value_start = eq + 1;
+                if let Some(q) = tok[value_start..]
+                    .chars()
+                    .next()
+                    .filter(|c| matches!(c, '"' | '\''))
+                {
+                    i = emit_quoted_value(&toks, i, value_start, q, out, open_quote);
+                } else {
+                    out.push_str(&tok[..value_start]);
+                    out.push_str(REDACTED);
+                    out.push_str(ws);
+                    i += 1;
+                }
                 continue;
             }
         }
-        if let Some(c) = bare.find(':') {
-            if c + 1 < bare.len() && name_is_secret(&bare[..c]) {
-                out.push_str(&bare[..c]);
-                out.push(':');
-                out.push_str(REDACTED);
-                out.push_str(ws);
-                i += 1;
+        if let Some(c) = tok.find(':') {
+            let name = tok[..c].trim_matches(|c| c == '"' || c == '\'');
+            if c + 1 < tok.len() && name_is_secret(name) {
+                let value_start = c + 1;
+                if let Some(q) = tok[value_start..]
+                    .chars()
+                    .next()
+                    .filter(|c| matches!(c, '"' | '\''))
+                {
+                    i = emit_quoted_value(&toks, i, value_start, q, out, open_quote);
+                } else {
+                    out.push_str(&tok[..value_start]);
+                    out.push_str(REDACTED);
+                    out.push_str(ws);
+                    i += 1;
+                }
                 continue;
             }
         }
@@ -356,7 +448,7 @@ fn scrub_line(line: &str, carry_eat: &mut bool, out: &mut String) {
             out.push_str(tok);
             out.push_str(ws);
             if toks.get(i + 1).is_some_and(|(n, _)| !secret_flag(n)) {
-                i = eat_value_at(&toks, i + 1, out);
+                i = eat_value_at(&toks, i + 1, out, open_quote);
             } else {
                 *carry_eat = i + 1 >= toks.len();
                 i += 1;
@@ -377,7 +469,7 @@ fn scrub_line(line: &str, carry_eat: &mut bool, out: &mut String) {
                     out.push_str(ntok);
                     out.push_str(nws);
                     if toks.get(i + 2).is_some_and(|(n, _)| !secret_flag(n)) {
-                        i = eat_value_at(&toks, i + 2, out);
+                        i = eat_value_at(&toks, i + 2, out, open_quote);
                     } else {
                         *carry_eat = i + 2 >= toks.len();
                         i += 2;
@@ -409,6 +501,7 @@ fn scrub_body(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_pem = false;
     let mut carry_eat = false;
+    let mut open_quote = None;
     for chunk in text.split_inclusive('\n') {
         let (line, eol) = match chunk.strip_suffix('\n') {
             Some(l) => (l, "\n"),
@@ -426,7 +519,7 @@ fn scrub_body(text: &str) -> String {
             }
             continue;
         }
-        scrub_line(line, &mut carry_eat, &mut out);
+        scrub_line(line, &mut carry_eat, &mut open_quote, &mut out);
         out.push_str(eol);
     }
     out
@@ -615,15 +708,15 @@ pub fn file(
     if body.trim().is_empty() {
         return Err(Error::rejected("Report body is empty — pass -m or --file"));
     }
-    // Title comes from the ORIGINAL first line, before the prose
-    // scrubber — then it is scrubbed (single line) and capped.
-    let title = cap_chars(scrub_body(first_line(&body)).trim_end(), TITLE_MAX);
+    // Scrub the complete body before splitting the title. Pending key/value,
+    // PEM and quoted-span state must survive the title/body boundary.
+    let body = scrub_body(&body);
+    let title = cap_chars(first_line(&body), TITLE_MAX);
     let rest = body
         .split_once('\n')
         .map(|x| x.1)
         .unwrap_or("")
         .trim_matches('\n');
-    let rest = scrub_body(rest);
     let context = context_block(state_dir, cwd);
     let reporter = std::env::var("CADENCE_ALIAS")
         .ok()

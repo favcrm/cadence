@@ -19783,7 +19783,7 @@ fn report_preserves_multiline_body() {
 #[test]
 fn report_redacts_prose_secret_forms() {
     let s = ReportFx::new();
-    let rows: [(&str, &str); 6] = [
+    let rows: [(&str, &str); 9] = [
         (
             "Auth header\nAuthorization: Basic dXNlcjpwYXNzd29yZA==",
             "dXNlcjpwYXNzd29yZA==",
@@ -19799,6 +19799,15 @@ fn report_redacts_prose_secret_forms() {
             "pem\n-----BEGIN RSA PRIVATE KEY-----\nMIIabc123\n-----END RSA PRIVATE KEY-----\ntail",
             "MIIabc123",
         ),
+        (
+            "password:\n  synthetic_boundary_value",
+            "synthetic_boundary_value",
+        ),
+        ("Example\n--password=\"first second third\"", "second"),
+        (
+            "Example\n--password \"first\n synthetic_quote_tail\" ordinary tail",
+            "synthetic_quote_tail",
+        ),
     ];
     for (i, (body, gone)) in rows.iter().enumerate() {
         let (ok, out) = s.cli_at(&s.product_repo, &["report", "--kind", "bug", "-m", body]);
@@ -19807,12 +19816,76 @@ fn report_redacts_prose_secret_forms() {
         assert!(!stored.contains(gone), "row {i}: {stored}");
         assert!(stored.contains("[REDACTED]"), "row {i}: {stored}");
     }
+    // A PEM marker may itself be the title, so exercise the `--file` path
+    // because clap treats a leading `-----` inline value as an option.
+    let pem_file = s._tmp.path().join("pem-title.txt");
+    std::fs::write(
+        &pem_file,
+        "-----BEGIN RSA PRIVATE KEY-----\nsynthetic_pem_payload\n-----END RSA PRIVATE KEY-----",
+    )
+    .unwrap();
+    let (ok, out) = s.cli_at(
+        &s.product_repo,
+        &[
+            "report",
+            "--kind",
+            "bug",
+            "--file",
+            pem_file.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "{out}");
+    let stored = s.issue_body("cadence", "C-10");
+    assert!(!stored.contains("synthetic_pem_payload"), "{stored}");
+    assert!(stored.contains("[REDACTED]"), "{stored}");
     // The URL keeps its non-secret query params and path.
     let stored = s.issue_body("cadence", "C-5");
     assert!(
         stored.contains("https://api/x?api_key=[REDACTED]&page=2"),
         "{stored}"
     );
+}
+
+/// Boundary redaction also applies to comments on existing issues, not just
+/// newly filed intake rows.
+#[test]
+fn report_comment_redacts_boundary_secret_forms() {
+    let s = ReportFx::new();
+    let (ok, out) = s.cli(&["issue", "new", "Target", "--project", "product"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let body = r#"password:
+  synthetic_comment_boundary
+
+Example
+--password="first synthetic_comment_glued"
+
+-----BEGIN RSA PRIVATE KEY-----
+synthetic_comment_pem
+-----END RSA PRIVATE KEY-----
+
+Example
+--password "first
+ synthetic_comment_quote" ordinary tail"#;
+    let (ok, out) = s.cli(&["report", "--issue", &id, "--kind", "bug", "-m", body]);
+    assert!(ok, "{out}");
+    let comments = s.pm_dir.join("product").join(&id).join("comments");
+    let comment = std::fs::read_dir(&comments)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let stored = std::fs::read_to_string(comment).unwrap();
+    for gone in [
+        "synthetic_comment_boundary",
+        "synthetic_comment_glued",
+        "synthetic_comment_pem",
+        "synthetic_comment_quote",
+    ] {
+        assert!(!stored.contains(gone), "{gone}: {stored}");
+    }
+    assert!(stored.contains("[REDACTED]"), "{stored}");
 }
 
 /// Round 2: control characters reach neither the stored issue nor
