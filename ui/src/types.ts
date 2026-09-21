@@ -272,6 +272,10 @@ export type UsageState =
  * current daemon has no quota collector for most providers. */
 export interface UsageLimit {
   state?: UsageState | string | null;
+  provider?: string | null;
+  assignee?: string | null;
+  account_id?: string | null;
+  thread_id?: string | null;
   used?: number | null;
   used_percent?: number | null;
   remaining?: number | null;
@@ -285,6 +289,9 @@ export interface UsageLimit {
   updated_at?: string | null;
   message?: string | null;
   reason?: string | null;
+  /** Provider-owned buckets are preserved without collapsing them into a
+   * synthetic scalar. */
+  data?: Record<string, unknown> | null;
   pool?: {
     id?: string | null;
     label?: string | null;

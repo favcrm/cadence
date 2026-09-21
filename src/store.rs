@@ -30,6 +30,116 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 
+fn quota_now_iso() -> String {
+    crate::issue::time::iso(crate::issue::time::now_epoch())
+}
+
+/// Merge a sparse provider update. Omitted fields retain their last confirmed
+/// value, while Codex's nullable window fields explicitly replace stale
+/// telemetry with a JSON null. Other nullable fields, including account
+/// identity, remain conservative and retain the last confirmed value.
+fn merge_quota_json(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(target), Value::Object(patch)) => {
+            for (key, value) in patch {
+                if value.is_null() {
+                    if matches!(key.as_str(), "resetsAt" | "windowDurationMins") {
+                        target.insert(key.clone(), Value::Null);
+                    }
+                    continue;
+                }
+                match target.get_mut(key) {
+                    Some(existing) if existing.is_object() && value.is_object() => {
+                        merge_quota_json(existing, value);
+                    }
+                    _ => {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (target, patch) if !patch.is_null() => *target = patch.clone(),
+        _ => {}
+    }
+}
+
+fn quota_state(data: &Value) -> (&'static str, Option<&'static str>) {
+    let Some(object) = data.as_object() else {
+        return (
+            "unknown",
+            Some("Codex rate-limit response was not an object"),
+        );
+    };
+    let account_id = object
+        .get("accountId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if account_id.is_none() {
+        return ("unknown", Some("Codex provider omitted account id"));
+    }
+    let has_limits = object.get("rateLimits").is_some_and(Value::is_object)
+        || object
+            .get("rateLimitsByLimitId")
+            .and_then(Value::as_object)
+            .is_some_and(|limits| !limits.is_empty());
+    if !has_limits {
+        return ("unknown", Some("Codex provider omitted rate-limit buckets"));
+    }
+    ("available", None)
+}
+
+fn canonical_quota(
+    alias: &str,
+    provider: &str,
+    thread_id: &str,
+    snapshot: &Value,
+    observed_at: &str,
+) -> Value {
+    let data = snapshot.get("data").cloned().unwrap_or(Value::Null);
+    let (computed_state, computed_reason) = quota_state(&data);
+    let state = if computed_state == "available" {
+        "available"
+    } else {
+        snapshot
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                matches!(
+                    *value,
+                    "unknown" | "unavailable" | "error" | "blocked" | "stale"
+                )
+            })
+            .unwrap_or("unknown")
+    };
+    let reason = if state == "available" {
+        None
+    } else {
+        snapshot
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or(computed_reason)
+    };
+    let mut result = json!({
+        "provider": provider,
+        "assignee": alias,
+        "account_id": data.get("accountId").cloned().unwrap_or(Value::Null),
+        "thread_id": thread_id,
+        "state": state,
+        "source": snapshot
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("provider quota telemetry"),
+        "observed_at": observed_at,
+        "updated_at": observed_at,
+        "data": data,
+    });
+    if let Some(reason) = reason {
+        result["reason"] = json!(reason);
+    }
+    result
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub seq: i64,
@@ -69,6 +179,9 @@ pub struct Agent {
     pub endpoint: Option<String>,
     /// Endpoint-specific registration options (`{"session": …}` for pty).
     pub params: Option<Value>,
+    /// Provider-owned allowance telemetry. This is deliberately separate
+    /// from `params`, which callers may edit for endpoint options.
+    pub quota: Option<Value>,
     /// Minted by the owning adapter on every `open`; submission tokens
     /// embed it so reports from a previous endpoint generation fail.
     pub generation: Option<String>,
@@ -419,6 +532,9 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         params: row
             .get::<_, Option<String>>("params")?
             .and_then(|p| serde_json::from_str(&p).ok()),
+        quota: row
+            .get::<_, Option<String>>("quota")?
+            .and_then(|q| serde_json::from_str(&q).ok()),
         generation: row.get("generation")?,
         state: row.get("state")?,
         enabled: row.get::<_, i64>("enabled")? != 0,
@@ -464,6 +580,7 @@ impl Agent {
             },
             "enabled": self.enabled, "error": self.error,
             "endpoint": self.endpoint, "params": self.params,
+            "quota": self.quota,
             "generation": self.generation,
             // Last state write — `session end` measures idleness from it.
             "updated": self.updated,
@@ -859,6 +976,23 @@ impl Store {
                     ON monitor_alerts(monitor_id, seq);
                  UPDATE schema_version SET version=8;",
             )?;
+            tx.commit()?;
+        }
+        if version < 9 {
+            // v9: provider-owned allowance telemetry. It is kept in its own
+            // column so caller-editable `params` can never become quota
+            // evidence. The column check makes a half-applied migration
+            // converge on reopen.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(agents)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !columns.iter().any(|column| column == "quota") {
+                tx.execute_batch("ALTER TABLE agents ADD COLUMN quota TEXT")?;
+            }
+            tx.execute("UPDATE schema_version SET version=9", [])?;
             tx.commit()?;
         }
         let store = Self {
@@ -2297,7 +2431,19 @@ impl Store {
     /// `tmux://…`) when the endpoint kind exposes one; `generation`
     /// partitions submission tokens per endpoint life.
     pub fn set_identity(&self, alias: &str, id: &crate::adapter::Identity) -> Result<()> {
-        self.set_identity_inner(alias, id, None)
+        self.set_identity_inner(alias, id, None, None)
+    }
+
+    /// Persist provider-owned quota telemetry atomically with a newly opened
+    /// native identity. The adapter snapshot is wrapped with the authoritative
+    /// store alias/provider/thread so caller-controlled fields cannot spoof it.
+    pub fn set_identity_with_quota(
+        &self,
+        alias: &str,
+        id: &crate::adapter::Identity,
+        quota: Option<Value>,
+    ) -> Result<()> {
+        self.set_identity_inner(alias, id, None, quota.as_ref())
     }
 
     /// `set_identity` after a hot-restart adoption: the endpoint was
@@ -2311,7 +2457,20 @@ impl Store {
         id: &crate::adapter::Identity,
         entries: &[AdoptEntry],
     ) -> Result<()> {
-        self.set_identity_inner(alias, id, Some(entries))
+        self.set_identity_inner(alias, id, Some(entries), None)
+    }
+
+    /// Adopted identity variant retaining the same atomic quota binding as a
+    /// plain open. Managed Codex currently cannot adopt, but the API keeps the
+    /// identity/quota contract explicit for adapters that can.
+    pub fn set_identity_adopted_with_quota(
+        &self,
+        alias: &str,
+        id: &crate::adapter::Identity,
+        entries: &[AdoptEntry],
+        quota: Option<Value>,
+    ) -> Result<()> {
+        self.set_identity_inner(alias, id, Some(entries), quota.as_ref())
     }
 
     fn set_identity_inner(
@@ -2319,9 +2478,21 @@ impl Store {
         alias: &str,
         id: &crate::adapter::Identity,
         adopted: Option<&[AdoptEntry]>,
+        quota: Option<&Value>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
+        let agent = self.agent_in(&tx, alias)?;
+        let quota = quota.map(|snapshot| {
+            canonical_quota(
+                alias,
+                &agent.provider,
+                &id.thread_id,
+                snapshot,
+                &quota_now_iso(),
+            )
+            .to_string()
+        });
         // A fresh endpoint generation cannot claim reports for turns
         // submitted through the previous one — fence them as unknown.
         // Every adopted entry stays `running`; a plain open protects
@@ -2345,7 +2516,7 @@ impl Store {
         tx.execute(&sql, rusqlite::params_from_iter(params))?;
         tx.execute(
             "UPDATE agents SET thread_id=?,session_id=?,model=?,effort=?,pid=?,
-                endpoint=?,generation=?,state='idle',updated=? WHERE alias=?",
+                endpoint=?,generation=?,quota=?,state='idle',updated=? WHERE alias=?",
             params![
                 id.thread_id,
                 id.session_id,
@@ -2354,6 +2525,7 @@ impl Store {
                 id.pid as i64,
                 id.endpoint,
                 id.generation,
+                quota,
                 now(),
                 alias
             ],
@@ -2378,6 +2550,62 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Persist a provider notification only while it still belongs to the
+    /// current provider/thread identity. Returns `false` for a stale or
+    /// mismatched notification; such traffic must never overwrite a newer
+    /// endpoint's allowance record.
+    pub fn update_provider_quota(
+        &self,
+        alias: &str,
+        provider: &str,
+        expected_thread_id: &str,
+        snapshot: &Value,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let agent = self.agent_in(&tx, alias)?;
+        if agent.provider != provider || agent.thread_id.as_deref() != Some(expected_thread_id) {
+            return Ok(false);
+        }
+        let mut data = agent
+            .quota
+            .as_ref()
+            .and_then(|quota| quota.get("data"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let patch = snapshot.get("data").unwrap_or(snapshot);
+        merge_quota_json(&mut data, patch);
+        let merged = json!({
+            "state": "reported",
+            "source": snapshot
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("account/rateLimits/updated"),
+            "data": data,
+        });
+        let observed_at = quota_now_iso();
+        let canonical = canonical_quota(alias, provider, expected_thread_id, &merged, &observed_at);
+        tx.execute(
+            "UPDATE agents SET quota=? WHERE alias=?",
+            params![canonical.to_string(), alias],
+        )?;
+        Self::event(
+            &tx,
+            alias,
+            "quota_updated",
+            json!({
+                "provider": provider,
+                "account_id": canonical["account_id"],
+                "thread_id": expected_thread_id,
+                "state": canonical["state"],
+                "source": canonical["source"],
+                "observed_at": canonical["observed_at"],
+            }),
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Merge `patch` (a JSON object of string keys/values) into the
@@ -4722,6 +4950,63 @@ mod tests {
         assert_eq!(s.agent("a1").unwrap().state, "stopped");
     }
 
+    #[test]
+    fn provider_quota_update_is_fenced_to_current_thread() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        s.register_agent(&NewAgent {
+            alias: "codex",
+            provider: "codex",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+        })
+        .unwrap();
+        let identity = crate::adapter::Identity {
+            thread_id: "current-thread".into(),
+            session_id: "session".into(),
+            model: Some("mock-model".into()),
+            effort: Some("medium".into()),
+            pid: 1,
+            endpoint: None,
+            generation: None,
+            attach: None,
+        };
+        s.set_identity_with_quota(
+            "codex",
+            &identity,
+            Some(json!({
+                "state": "reported",
+                "source": "account/rateLimits/read",
+                "data": {"accountId": "acct", "rateLimits": {
+                    "primary": {"usedPercent": 10}
+                }}
+            })),
+        )
+        .unwrap();
+        let accepted = s
+            .update_provider_quota(
+                "codex",
+                "codex",
+                "old-thread",
+                &json!({
+                    "source": "account/rateLimits/updated",
+                    "data": {"accountId": "spoof", "rateLimits": {
+                        "primary": {"usedPercent": 99}
+                    }}
+                }),
+            )
+            .unwrap();
+        assert!(!accepted);
+        let quota = s.agent("codex").unwrap().quota.unwrap();
+        assert_eq!(quota["thread_id"], "current-thread");
+        assert_eq!(quota["account_id"], "acct");
+        assert_eq!(quota["data"]["rateLimits"]["primary"]["usedPercent"], 10);
+    }
+
     /// A crash between ALTER and the version bump must not wedge the
     /// database: the migration is one transaction, and a half-applied
     /// state (column present, version still 1) converges on reopen.
@@ -4786,7 +5071,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         Store::open(&db).unwrap();
     }
 
@@ -4851,7 +5136,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 8);
+            assert_eq!(v, 9);
         }
         // Half-applied: v4 objects present but version rolled back —
         // reopening must converge, not fail on duplicates.
@@ -4886,7 +5171,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 8);
+            assert_eq!(v, 9);
         }
     }
 

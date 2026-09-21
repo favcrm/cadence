@@ -250,6 +250,13 @@ pub trait ProviderAdapter: Send + Sync {
     fn activity_at(&self) -> Option<std::time::Instant> {
         None
     }
+    /// Provider-owned allowance telemetry captured during `open`, when this
+    /// adapter has a bounded source for it. The returned object is an
+    /// adapter snapshot only; the store binds provider, assignee, thread,
+    /// and timestamps before exposing it as `agent.quota`.
+    fn quota_snapshot(&self) -> Option<Value> {
+        None
+    }
 }
 
 /// Build the adapter for an agent's `provider`/`endpoint_kind`.

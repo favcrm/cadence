@@ -2259,6 +2259,7 @@ fn daemon_opts() -> daemon::ServeOptions {
 const MOCK_PY: &str = r#"
 import json, os, sys, time
 pidfile, mode = sys.argv[1], sys.argv[2]
+turn_count = 0
 with open(pidfile, "w") as f:
     f.write(str(os.getpid()))
 def emit(msg):
@@ -2306,7 +2307,25 @@ for line in sys.stdin:
                 "id": "th-1", "sessionId": "s-1", "model": model,
                 "reasoningEffort": effort},
                 "model": model, "reasoningEffort": effort}})
+    elif method == "account/rateLimits/read":
+        if mode in ("no-quota", "quota-recover"):
+            emit({"id": mid, "error": {"code": -32601,
+                 "message": "rate limits unavailable in this auth mode"}})
+        else:
+            emit({"id": mid, "result": {
+                "accountId": "acct-codex-test",
+                "rateLimits": {
+                    "primary": {"usedPercent": 23,
+                                 "windowDurationMins": 60,
+                                 "resetsAt": 1900000000},
+                    "secondary": None},
+                "rateLimitsByLimitId": {
+                    "codex": {"usedPercent": 7,
+                              "windowDurationMins": 10080,
+                              "resetsAt": 1900100000}},
+                "planType": "mock-pro"}})
     elif method == "turn/start":
+        turn_count += 1
         if mode == "bad-turn":
             emit({"id": mid, "result": {"turn": {}}})
         elif mode == "die-after-start":
@@ -2315,6 +2334,24 @@ for line in sys.stdin:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
         else:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
+            if mode in ("quota-update", "quota-recover"):
+                if mode == "quota-recover":
+                    update = {"accountId": "acct-recovered",
+                              "rateLimits": {"primary": {"usedPercent": 42}}}
+                elif turn_count == 1:
+                    # First update explicitly clears nullable window fields;
+                    # the account id is tested separately as a conservative
+                    # identity field and must survive its explicit null.
+                    update = {"accountId": None,
+                              "rateLimits": {"primary": {
+                                  "usedPercent": 42,
+                                  "windowDurationMins": None,
+                                  "resetsAt": None}}}
+                else:
+                    # The second update omits the nullable fields entirely.
+                    # Omission must preserve their already-cleared state.
+                    update = {"rateLimits": {"primary": {"usedPercent": 44}}}
+                emit({"method": "account/rateLimits/updated", "params": update})
             emit({"method": "turn/completed", "params": {"turn": {
                 "id": "t-1", "status": "completed", "items": [
                     {"id": "i1", "type": "agentMessage",
@@ -2578,6 +2615,16 @@ def handle(conn):
                 "id": "th-1", "sessionId": "s-1", "model": model,
                 "reasoningEffort": effort},
                 "model": model, "reasoningEffort": effort}})
+        elif method == "account/rateLimits/read":
+            if mode == "no-quota":
+                send_json(conn, {"id": mid, "error": {"code": -32601,
+                    "message": "rate limits unavailable in this auth mode"}})
+            else:
+                send_json(conn, {"id": mid, "result": {
+                    "accountId": "acct-codex-test",
+                    "rateLimits": {"primary": {"usedPercent": 23,
+                        "windowDurationMins": 60, "resetsAt": 1900000000}},
+                    "rateLimitsByLimitId": {}, "planType": "mock-pro"}})
         elif method == "turn/start":
             text = ""
             try:
@@ -2772,6 +2819,146 @@ fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     assert_eq!(reqs[1]["method"], "thread/resume");
     assert_eq!(reqs[1]["params"]["approvalPolicy"], "never");
     assert_eq!(reqs[1]["params"]["threadId"], "th-1");
+}
+
+#[test]
+fn codex_quota_is_provider_bound_and_sparse_updates_handle_nullable_fields() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("quota-update");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "quota", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"quota\":{\"state\":\"available\",\"used_percent\":100}}"}),
+    )
+    .unwrap();
+    d.wait_agent("quota", "idle", 15);
+
+    let initial = d.rpc("agent_show", json!({"alias": "quota"})).unwrap()["agent"].clone();
+    let quota = &initial["quota"];
+    assert_eq!(quota["provider"], "codex");
+    assert_eq!(quota["assignee"], "quota");
+    assert_eq!(quota["account_id"], "acct-codex-test");
+    assert_eq!(quota["thread_id"], "th-1");
+    assert_eq!(quota["state"], "available");
+    assert_eq!(quota["data"]["rateLimits"]["primary"]["usedPercent"], 23);
+    assert_eq!(
+        quota["data"]["rateLimitsByLimitId"]["codex"]["usedPercent"],
+        7
+    );
+    assert!(quota["observed_at"]
+        .as_str()
+        .is_some_and(|value| value.contains('T')));
+    // A caller-supplied params value never becomes provider evidence.
+    assert_eq!(initial["params"]["quota"]["used_percent"], 100);
+    assert_eq!(quota["used_percent"], Value::Null);
+
+    d.rpc(
+        "agent_send",
+        json!({"alias": "quota", "text": "clear", "message": "quota-explicit-null"}),
+    )
+    .unwrap();
+    d.wait_message("quota", "quota-explicit-null", &["completed"], 15);
+    let first = d.rpc("agent_show", json!({"alias": "quota"})).unwrap()["agent"].clone();
+    let quota = &first["quota"];
+    assert_eq!(quota["state"], "available");
+    // Account identity is intentionally conservative: an explicit null does
+    // not erase the provider-bound account id.
+    assert_eq!(quota["account_id"], "acct-codex-test");
+    assert_eq!(quota["data"]["rateLimits"]["primary"]["usedPercent"], 42);
+    // Explicit nullable fields replace the previously reported values with
+    // provider-declared nulls.
+    let primary = &quota["data"]["rateLimits"]["primary"];
+    assert!(
+        primary
+            .get("windowDurationMins")
+            .is_some_and(Value::is_null),
+        "{first}"
+    );
+    assert!(
+        primary.get("resetsAt").is_some_and(Value::is_null),
+        "{first}"
+    );
+    // These provider fields were omitted from the update and remain intact.
+    assert_eq!(quota["data"]["planType"], "mock-pro");
+    assert_eq!(
+        quota["data"]["rateLimitsByLimitId"]["codex"]["windowDurationMins"],
+        10080
+    );
+    assert_eq!(
+        quota["data"]["rateLimitsByLimitId"]["codex"]["usedPercent"],
+        7
+    );
+
+    d.rpc(
+        "agent_send",
+        json!({"alias": "quota", "text": "omit", "message": "quota-omitted"}),
+    )
+    .unwrap();
+    d.wait_message("quota", "quota-omitted", &["completed"], 15);
+    let updated = d.rpc("agent_show", json!({"alias": "quota"})).unwrap()["agent"].clone();
+    let quota = &updated["quota"];
+    assert_eq!(quota["state"], "available");
+    assert_eq!(quota["account_id"], "acct-codex-test");
+    assert_eq!(quota["data"]["rateLimits"]["primary"]["usedPercent"], 44);
+    // Omitted fields preserve the explicit null state rather than restoring
+    // the initial values.
+    let primary = &quota["data"]["rateLimits"]["primary"];
+    assert!(
+        primary
+            .get("windowDurationMins")
+            .is_some_and(Value::is_null),
+        "{updated}"
+    );
+    assert!(
+        primary.get("resetsAt").is_some_and(Value::is_null),
+        "{updated}"
+    );
+    assert_eq!(quota["data"]["planType"], "mock-pro");
+    assert_eq!(
+        quota["data"]["rateLimitsByLimitId"]["codex"]["usedPercent"],
+        7
+    );
+}
+
+#[test]
+fn codex_quota_endpoint_failure_is_explicit_unknown() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("no-quota");
+    d.register_codex("no-quota");
+    d.wait_agent("no-quota", "idle", 15);
+    let agent = d.rpc("agent_show", json!({"alias": "no-quota"})).unwrap()["agent"].clone();
+    assert_eq!(agent["quota"]["state"], "unavailable");
+    assert_eq!(agent["quota"]["account_id"], Value::Null);
+    assert_eq!(agent["quota"]["data"], Value::Null);
+    assert!(agent["quota"]["reason"]
+        .as_str()
+        .is_some_and(|reason| { reason.contains("unavailable") }));
+}
+
+#[test]
+fn codex_quota_recovers_from_unavailable_to_available() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("quota-recover");
+    d.register_codex("recover");
+    d.wait_agent("recover", "idle", 15);
+    let initial = d.rpc("agent_show", json!({"alias": "recover"})).unwrap()["agent"].clone();
+    assert_eq!(initial["quota"]["state"], "unavailable");
+
+    d.rpc(
+        "agent_send",
+        json!({"alias": "recover", "text": "refresh", "message": "quota-recover"}),
+    )
+    .unwrap();
+    d.wait_message("recover", "quota-recover", &["completed"], 15);
+    let recovered = d.rpc("agent_show", json!({"alias": "recover"})).unwrap()["agent"].clone();
+    assert_eq!(recovered["quota"]["state"], "available");
+    assert_eq!(recovered["quota"]["account_id"], "acct-recovered");
+    assert_eq!(
+        recovered["quota"]["data"]["rateLimits"]["primary"]["usedPercent"],
+        42
+    );
 }
 
 #[test]
@@ -21048,7 +21235,7 @@ fn monitor_migration_from_v6_bridges_provider_effort_before_v8() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(columns.iter().any(|column| column == "effort"));
 }
 
@@ -21082,7 +21269,7 @@ fn monitor_migration_after_provider_effort_v7_is_v8() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(columns.iter().any(|column| column == "effort"));
 }
 

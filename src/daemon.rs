@@ -479,6 +479,29 @@ impl Shared {
         // provider lifecycle traffic and the explicit `cadence/*`
         // channel (ack, tool_use, message_report) alike.
         self.bump_activity(alias);
+        if method == "cadence/codex_quota" {
+            let thread_id = params.get("thread_id").and_then(Value::as_str);
+            if let Some(thread_id) = thread_id {
+                match self
+                    .store
+                    .update_provider_quota(alias, "codex", thread_id, &params)
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = self.store.event_public(
+                            alias,
+                            "quota_update_ignored",
+                            json!({"reason": "provider thread no longer current"}),
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("codex quota update for '{alias}' failed: {error}");
+                    }
+                }
+            }
+            self.wake();
+            return;
+        }
         // `cadence/<kind>` is the adapter's own bookkeeping channel —
         // recorded verbatim, not provider traffic.
         if let Some(kind) = method.strip_prefix("cadence/") {
@@ -767,8 +790,16 @@ impl Shared {
                 .insert(alias.to_string(), attach);
         }
         match &adoption {
-            Some(entries) => self.store.set_identity_adopted(alias, &identity, entries)?,
-            None => self.store.set_identity(alias, &identity)?,
+            Some(entries) => self.store.set_identity_adopted_with_quota(
+                alias,
+                &identity,
+                entries,
+                adapter.quota_snapshot(),
+            )?,
+            None => {
+                self.store
+                    .set_identity_with_quota(alias, &identity, adapter.quota_snapshot())?
+            }
         }
         self.wake();
         let mut gate_notice: Option<String> = None;
