@@ -128,6 +128,7 @@ export default function Drawer({
     tags: string;
     body: string;
   } | null>(null);
+  const [sourceView, setSourceView] = useState(false);
   const [bodyPreview, setBodyPreview] = useState(false);
   const [linkKind, setLinkKind] = useState("blocked_by");
   const [linkTarget, setLinkTarget] = useState("");
@@ -521,18 +522,33 @@ export default function Drawer({
               </section>
 
               <section>
-                <div className="flex items-baseline gap-2 mb-2">
+                <div className="flex flex-wrap items-baseline gap-2 mb-2">
                   <h3 className="text-cardtitle font-semibold text-ink-100">
-                    Issue file
+                    Issue body
                   </h3>
-                  <span className="kicker">the source of truth</span>
+                  <span className="kicker">{sourceView ? "raw source" : "rendered markdown"}</span>
+                  <button
+                    className="lnk num text-micro ml-auto"
+                    onClick={() => setSourceView((open) => !open)}
+                    aria-pressed={sourceView}
+                  >
+                    {sourceView ? "read rendered" : "view source"}
+                  </button>
                 </div>
-                <div className="num text-micro text-ink-400 mb-2 break-all">
-                  {relPath(detail.path, pmDir)}
-                </div>
-                <pre className="num text-label leading-relaxed rounded-lg border border-ink-700 bg-ink-900 p-4 text-ink-300 !whitespace-pre overflow-x-auto">
-                  {file ?? detail.body}
-                </pre>
+                {sourceView ? (
+                  <>
+                    <div className="num text-micro text-ink-400 mb-2 break-all">
+                      {relPath(detail.path, pmDir)}
+                    </div>
+                    <pre className="num text-label leading-relaxed rounded-lg border border-ink-700 bg-ink-900 p-4 text-ink-300 !whitespace-pre-wrap break-words overflow-x-auto">
+                      {file ?? detail.body}
+                    </pre>
+                  </>
+                ) : (
+                  <div className="issue-reader rounded-lg border border-ink-700 bg-ink-900 px-4 py-3 text-secondary text-ink-300">
+                    <Md text={detail.body} onOpen={onOpen} />
+                  </div>
+                )}
               </section>
 
               <section>

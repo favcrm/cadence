@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { fmtTime } from "../fmt";
+import { agentIsUnassigned, agentMatchesProject, issueProjectMap } from "../scope";
 import type {
   Agent,
   AgentDetail,
   AgentTask,
   AgentsPayload,
+  IssueCard,
   UsageLimit,
 } from "../types";
 
@@ -585,20 +587,40 @@ function AgentDrawer({
 
 export default function Agents({
   payload,
+  issues,
+  project,
   onOpenIssue,
   loading = false,
   error = null,
 }: {
   payload: AgentsPayload | null;
+  issues: IssueCard[];
+  project: string;
   onOpenIssue: (id: string) => void;
   loading?: boolean;
   error?: string | null;
 }) {
   const [open, setOpen] = useState<string | null>(null);
-  const agents = (payload?.agents ?? [])
+  const issueProjects = issueProjectMap(issues);
+  const allAgents = payload?.agents ?? [];
+  const agents = allAgents
+    .filter((agent) => agentMatchesProject(agent, project, issueProjects))
     .slice()
     .sort((a, b) => rank(a) - rank(b) || a.alias.localeCompare(b.alias));
-  const totals = payload?.totals;
+  const globalAgents = allAgents.filter((agent) => agentIsUnassigned(agent, issueProjects));
+  const otherProjectAgents = project === "all"
+    ? []
+    : allAgents.filter((agent) => !agentMatchesProject(agent, project, issueProjects) && !agentIsUnassigned(agent, issueProjects));
+  const totals = agents.reduce(
+    (sum, agent) => ({
+      running: sum.running + agent.running,
+      queued: sum.queued + agent.queued,
+      fenced: sum.fenced + (agent.fenced ? 1 : 0),
+      parked: sum.parked + agent.parked,
+      inboxes: sum.inboxes + (agent.inbox ? 1 : 0),
+    }),
+    { running: 0, queued: 0, fenced: 0, parked: 0, inboxes: 0 },
+  );
   // A refresh error is an observation about the new request. It must not
   // erase the last successful rows already held in `payload`.
   const showRows = payload !== null || (!loading && !error);
@@ -613,10 +635,18 @@ export default function Agents({
           Agents
         </h1>
         <span className="kicker">
-          {agents.length} registered · {totals?.fenced ?? 0} fenced ·{" "}
+          {agents.length} in {project === "all" ? "all projects" : project} · {totals?.fenced ?? 0} fenced ·{" "}
           {totals?.queued ?? 0} queued
         </span>
       </div>
+
+      {project !== "all" && (globalAgents.length > 0 || otherProjectAgents.length > 0) && (
+        <div className="card mb-4 px-4 py-3 text-label text-ink-400 border-ink-700">
+          <span className="text-ink-200">Scope is exact issue/job ownership.</span>{" "}
+          {globalAgents.length > 0 && `${globalAgents.length} global or unassigned observation${globalAgents.length === 1 ? " remains" : "s remain"}. `}
+          {otherProjectAgents.length > 0 && `${otherProjectAgents.length} other-project agent${otherProjectAgents.length === 1 ? " is" : "s are"} available in All projects.`}
+        </div>
+      )}
 
       {payload?.daemon === "unreachable" && (
         <div className="card mb-4 px-4 py-3 text-secondary text-warn border-warn/40">
@@ -633,6 +663,24 @@ export default function Agents({
         <div className="card mb-4 px-4 py-5 text-secondary text-fail border-fail/40" role="alert">
           could not load agent observations — {error}
         </div>
+      )}
+
+      {showRows && project !== "all" && globalAgents.length > 0 && (
+        <details className="mb-4">
+          <summary className="cursor-pointer text-micro text-ink-400 hover:text-ink-200">
+            Global or unassigned agents · {globalAgents.length}
+          </summary>
+          <p className="text-micro text-ink-500 mt-2">
+            These agents have no exact issue binding in the current payload and are not assigned to {project}.
+          </p>
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {globalAgents.map((agent) => (
+              <button key={agent.alias} className="chip bg-ink-800 text-ink-300 hover:text-accent" onClick={() => setOpen(agent.alias)}>
+                {agent.alias} · {stateLabel(agent)}
+              </button>
+            ))}
+          </div>
+        </details>
       )}
 
       {/* Phone: stacked agent cards — the table's columns don't fit 390px. */}
