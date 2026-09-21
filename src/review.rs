@@ -84,6 +84,53 @@ pub struct Timeouts {
     pub gh_secs: u64,
 }
 
+/// The subprocess backend used for the full suite and isolated reruns.
+/// Keeping this explicit prevents a nextest suite from being adjudicated by
+/// a cargo child with different process and retry semantics.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewBackend {
+    #[default]
+    Cargo,
+    Nextest,
+}
+
+/// Machine-readable result format emitted by the configured backend.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResultFormat {
+    #[default]
+    Cargo,
+    Junit,
+}
+
+fn default_result_path() -> String {
+    "target/nextest/cadence/junit.xml".into()
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RunnerConfig {
+    /// Backend used by both `full_suite` and `test_command`.
+    #[serde(default)]
+    pub backend: ReviewBackend,
+    /// How an individual command proves what ran and what failed.
+    #[serde(default)]
+    pub result_format: ResultFormat,
+    /// Repo-relative report path written by a structured backend.
+    #[serde(default = "default_result_path")]
+    pub result_path: String,
+}
+
+impl Default for RunnerConfig {
+    fn default() -> Self {
+        Self {
+            backend: ReviewBackend::Cargo,
+            result_format: ResultFormat::Cargo,
+            result_path: default_result_path(),
+        }
+    }
+}
+
 fn t_prepare() -> u64 {
     900
 }
@@ -141,6 +188,10 @@ pub struct ReviewConfig {
     pub stress_pattern: Patterns,
     #[serde(default)]
     pub timeouts: Timeouts,
+    /// Optional runner contract. The default preserves the historical cargo
+    /// text path; nextest activation must opt into a structured report.
+    #[serde(default)]
+    pub runner: RunnerConfig,
 }
 
 impl ReviewConfig {
@@ -178,7 +229,58 @@ impl ReviewConfig {
                 path.display()
             )));
         }
+        if cfg.runner.result_format == ResultFormat::Junit
+            && !safe_rel_path(&cfg.runner.result_path)
+        {
+            return Err(Error::rejected(format!(
+                "{}: runner.result_path must be a safe repo-relative path",
+                path.display()
+            )));
+        }
+        if cfg.runner.backend == ReviewBackend::Nextest {
+            if cfg.runner.result_format != ResultFormat::Junit {
+                return Err(Error::rejected(format!(
+                    "{}: nextest requires runner.result_format = 'junit'",
+                    path.display()
+                )));
+            }
+            if !command_mentions_nextest(&cfg.full_suite)
+                || !command_mentions_nextest(&cfg.test_command)
+            {
+                return Err(Error::rejected(format!(
+                    "{}: nextest backend requires both full_suite and test_command to use scripts/cadence-nextest",
+                    path.display()
+                )));
+            }
+            if !cfg.test_command.contains("--exact") || !cfg.test_command.contains("--") {
+                return Err(Error::rejected(format!(
+                    "{}: nextest test_command must use an exact libtest filter after '--'",
+                    path.display()
+                )));
+            }
+        }
         Ok(cfg)
+    }
+}
+
+fn command_mentions_nextest(command: &str) -> bool {
+    command.split_whitespace().any(|part| {
+        part.trim_matches(|c| c == '\'' || c == '"')
+            .ends_with("cadence-nextest")
+    })
+}
+
+fn backend_label(backend: ReviewBackend) -> &'static str {
+    match backend {
+        ReviewBackend::Cargo => "cargo",
+        ReviewBackend::Nextest => "nextest",
+    }
+}
+
+fn result_format_label(format: ResultFormat) -> &'static str {
+    match format {
+        ResultFormat::Cargo => "cargo-text",
+        ResultFormat::Junit => "junit",
     }
 }
 
@@ -445,6 +547,246 @@ fn tail(text: &str, n: usize) -> Vec<String> {
         .collect()
 }
 
+/// One testcase from a structured backend report. JUnit keeps names in the
+/// same bare form accepted by libtest, which lets the isolated command use
+/// the exact filter without guessing at package or binary prefixes.
+#[derive(Clone, Debug)]
+struct TestCaseResult {
+    name: String,
+    outcome: &'static str,
+    duration_s: Option<f64>,
+}
+
+/// The smallest structured evidence needed by the review path: non-empty
+/// testcase coverage, failure names, and per-test timings. Missing or empty
+/// evidence is deliberately invalid so a successful process cannot launder a
+/// zero-test or missing-report run into a pass.
+#[derive(Clone, Debug)]
+struct TestRunSummary {
+    valid: bool,
+    test_count: u64,
+    passed: u64,
+    failed: u64,
+    skipped: u64,
+    tests: Vec<TestCaseResult>,
+    failed_tests: Vec<String>,
+    reason: Option<String>,
+}
+
+impl TestRunSummary {
+    fn invalid(reason: impl Into<String>) -> Self {
+        Self {
+            valid: false,
+            test_count: 0,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            tests: Vec::new(),
+            failed_tests: Vec::new(),
+            reason: Some(reason.into()),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let tests: Vec<Value> = self
+            .tests
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "outcome": t.outcome,
+                    "duration_s": t.duration_s,
+                })
+            })
+            .collect();
+        json!({
+            "format": "junit",
+            "valid": self.valid,
+            "test_count": self.test_count,
+            "passed": self.passed,
+            "failed": self.failed,
+            "skipped": self.skipped,
+            "tests": tests,
+            "failed_tests": self.failed_tests,
+            "reason": self.reason,
+        })
+    }
+
+    fn executed_count(&self) -> u64 {
+        self.passed + self.failed
+    }
+}
+
+/// Parse the Jenkins XML emitted by cargo-nextest's configured JUnit
+/// profile. This intentionally accepts only the small generated subset we
+/// need instead of adding an XML dependency to the CLI; malformed, missing,
+/// and empty documents remain invalid and therefore fail closed.
+fn parse_junit(text: &str) -> TestRunSummary {
+    let mut root_seen = false;
+    let mut tests = Vec::new();
+    let mut current: Option<usize> = None;
+    let mut stack: Vec<String> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some((end, raw)) = next_xml_tag(text, cursor) {
+        cursor = end;
+        let tag = raw.trim();
+        if tag.starts_with("?") || tag.starts_with('!') {
+            continue;
+        }
+        let closing = tag.starts_with('/');
+        let self_closing = tag.ends_with('/');
+        let name = xml_tag_name(tag);
+        if name.is_empty() {
+            return TestRunSummary::invalid("JUnit report has an empty tag name");
+        }
+        if closing {
+            if stack.pop().as_deref() != Some(name) {
+                return TestRunSummary::invalid("JUnit report has mismatched closing tags");
+            }
+        } else if !self_closing {
+            stack.push(name.to_string());
+        }
+        if name == "testsuites" && !closing {
+            root_seen = true;
+        } else if name == "testcase" && !closing {
+            let Some(raw_name) = xml_attr(tag, "name") else {
+                return TestRunSummary::invalid("JUnit testcase has no name");
+            };
+            let name = xml_unescape(&raw_name);
+            if name.is_empty() {
+                return TestRunSummary::invalid("JUnit testcase has an empty name");
+            }
+            let duration_s = xml_attr(tag, "time").and_then(|v| v.parse::<f64>().ok());
+            tests.push(TestCaseResult {
+                name,
+                outcome: "pass",
+                duration_s,
+            });
+            current = Some(tests.len() - 1);
+            if self_closing {
+                current = None;
+            }
+        } else if !closing && matches!(name, "failure" | "error" | "flakyFailure") {
+            if let Some(i) = current {
+                tests[i].outcome = "fail";
+            }
+        } else if !closing && name == "skipped" {
+            if let Some(i) = current {
+                if tests[i].outcome == "pass" {
+                    tests[i].outcome = "skipped";
+                }
+            }
+        } else if closing && name == "testcase" {
+            current = None;
+        }
+    }
+
+    if !stack.is_empty() {
+        return TestRunSummary::invalid("JUnit report ended before closing all tags");
+    }
+    if !root_seen {
+        return TestRunSummary::invalid("JUnit report has no <testsuites> root");
+    }
+    if tests.is_empty() {
+        return TestRunSummary::invalid("JUnit report contained zero testcases");
+    }
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut skipped = 0;
+    let mut failed_tests = Vec::new();
+    for test in &tests {
+        match test.outcome {
+            "pass" => passed += 1,
+            "fail" => {
+                failed += 1;
+                failed_tests.push(test.name.clone());
+            }
+            "skipped" => skipped += 1,
+            _ => {}
+        }
+    }
+    failed_tests.sort();
+    failed_tests.dedup();
+    let reason =
+        (passed + failed == 0).then(|| "JUnit report contained no executed testcases".to_string());
+    TestRunSummary {
+        valid: true,
+        test_count: tests.len() as u64,
+        passed,
+        failed,
+        skipped,
+        tests,
+        failed_tests,
+        reason,
+    }
+}
+
+fn parse_junit_file(path: &Path) -> TestRunSummary {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_junit(&text),
+        Err(e) => {
+            TestRunSummary::invalid(format!("JUnit report {} unavailable: {e}", path.display()))
+        }
+    }
+}
+
+fn next_xml_tag(text: &str, from: usize) -> Option<(usize, &str)> {
+    let start = from + text[from..].find('<')?;
+    let end = start + text[start..].find('>')? + 1;
+    Some((end, &text[start + 1..end - 1]))
+}
+
+fn xml_tag_name(tag: &str) -> &str {
+    tag.trim_start_matches('/')
+        .trim_end_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+}
+
+fn xml_attr(tag: &str, wanted: &str) -> Option<String> {
+    let mut rest = tag.trim_start_matches('/').trim();
+    let name = xml_tag_name(rest);
+    rest = rest.get(name.len()..)?.trim_start();
+    while !rest.is_empty() {
+        let key_end = rest
+            .find(|c: char| c.is_ascii_whitespace() || c == '=')
+            .unwrap_or(rest.len());
+        let key = &rest[..key_end];
+        rest = rest[key_end..].trim_start();
+        if !rest.starts_with('=') {
+            rest = rest
+                .find(char::is_whitespace)
+                .map(|i| rest[i..].trim_start())
+                .unwrap_or("");
+            continue;
+        }
+        rest = rest[1..].trim_start();
+        let quote = rest.chars().next()?;
+        if quote != '\'' && quote != '"' {
+            return None;
+        }
+        let value = &rest[quote.len_utf8()..];
+        let end = value.find(quote)?;
+        let parsed = value[..end].to_string();
+        rest = rest[quote.len_utf8() + end + quote.len_utf8()..].trim_start();
+        if key == wanted {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 /// One recorded command execution for the report.
 struct Step {
     name: String,
@@ -457,6 +799,8 @@ struct Step {
     /// Full stdout+stderr — kept for failure-name extraction, never
     /// serialized into the report.
     output: String,
+    /// Optional structured result written by the configured backend.
+    result: Option<TestRunSummary>,
 }
 
 impl Step {
@@ -468,6 +812,7 @@ impl Step {
             "outcome": self.outcome,
             "exit": self.exit,
             "tail": self.tail,
+            "result": self.result.as_ref().map(TestRunSummary::to_json),
         })
     }
 }
@@ -480,6 +825,32 @@ fn run_step(
     env: &[(String, String)],
     secs: u64,
 ) -> Result<Step> {
+    run_step_with_result(name, cmd, cwd, env, secs, None)
+}
+
+/// Run a step and, when configured, consume the report produced by the
+/// backend. The report is removed before launch so a stale previous run can
+/// never be mistaken for current evidence.
+fn run_step_with_result(
+    name: &str,
+    cmd: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    secs: u64,
+    result_path: Option<&Path>,
+) -> Result<Step> {
+    if let Some(path) = result_path {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::rejected(format!(
+                    "cannot clear prior structured result {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+    }
     let started = Instant::now();
     let mut sh = Command::new("sh");
     sh.arg("-c").arg(cmd).current_dir(cwd);
@@ -489,13 +860,24 @@ fn run_step(
     let out = run_cmd(&mut sh, Duration::from_secs(secs))?;
     let duration_ms = started.elapsed().as_millis();
     let combined = format!("{}\n{}", out.stdout, out.stderr);
-    let (outcome, tail) = if out.timed_out {
+    let (mut outcome, mut tail) = if out.timed_out {
         ("timeout", tail(&combined, TAIL_LINES))
     } else if out.status == Some(0) {
         ("ok", Vec::new())
     } else {
         ("fail", tail(&combined, TAIL_LINES))
     };
+    let result = result_path.map(parse_junit_file);
+    if let Some(summary) = &result {
+        if (!summary.valid || summary.executed_count() == 0) && outcome == "ok" {
+            outcome = "fail";
+            tail = summary
+                .reason
+                .as_deref()
+                .map(|reason| vec![reason.to_string()])
+                .unwrap_or_else(|| vec!["structured result was invalid".into()]);
+        }
+    }
     Ok(Step {
         name: name.to_string(),
         cmd: cmd.to_string(),
@@ -504,6 +886,7 @@ fn run_step(
         exit: out.status,
         tail,
         output: combined,
+        result,
     })
 }
 
@@ -520,6 +903,61 @@ fn suite_child_env(
         suite_env.push(("CADENCE_REVIEW_SUITE_LOCK_HELD".into(), "1".into()));
     }
     suite_env
+}
+
+fn runner_result_path(cwd: &Path, runner: &RunnerConfig) -> Option<PathBuf> {
+    (runner.result_format == ResultFormat::Junit).then(|| cwd.join(&runner.result_path))
+}
+
+/// Render the full-suite object with the stable CAD-173 consumer fields at
+/// its top level. Keep the nested step/result shape as well: review reports
+/// already written by this branch use it, while the acceptance contract
+/// intentionally addresses the concise `.full_suite.tests[]` path.
+fn full_suite_report(step: Option<&Step>, command: &str, retries: u64) -> Value {
+    let mut report = match step {
+        Some(step) => step.to_json(),
+        None => json!({
+            "outcome": "skipped",
+            "reason": "--no-full",
+            "cmd": command,
+        }),
+    };
+    // Keep the acceptance path in seconds while retaining duration_ms for
+    // existing report consumers and markdown rendering. A skipped suite has
+    // no measurement, so its schema value is explicit null rather than an
+    // invented duration.
+    report["duration_s"] = step
+        .map(|step| json!(step.duration_ms as f64 / 1000.0))
+        .unwrap_or(Value::Null);
+    report["retries"] = json!(retries);
+    let structured = step
+        .and_then(|step| step.result.as_ref())
+        .map(TestRunSummary::to_json);
+    report["tests"] = structured
+        .as_ref()
+        .map(|result| result["tests"].clone())
+        .unwrap_or_else(|| json!([]));
+    if let Some(structured) = structured {
+        for key in [
+            "valid",
+            "test_count",
+            "passed",
+            "failed",
+            "skipped",
+            "failed_tests",
+            "reason",
+        ] {
+            report[key] = structured[key].clone();
+        }
+    }
+    report
+}
+
+/// Publish both names for the equal-conditions rows. `failures` is retained
+/// for existing report consumers; `isolated` is the CAD-173 contract path.
+fn set_failure_reports(report: &mut Value, comparisons: &[Value]) {
+    report["failures"] = json!(comparisons);
+    report["isolated"] = json!(comparisons);
 }
 
 // ---------------------------------------------------------------------------
@@ -828,16 +1266,41 @@ fn count_before(s: &str, unit: &str) -> Option<u64> {
     s[..idx].trim_end().rsplit(' ').next()?.parse().ok()
 }
 
+fn structured_failed_tests(step: &Step) -> Vec<String> {
+    step.result
+        .as_ref()
+        .filter(|r| r.valid)
+        .map(|r| r.failed_tests.clone())
+        .unwrap_or_default()
+}
+
 /// pass | fail | unknown — `unknown` means "could not run": timeout,
 /// missing file, prepare failure, or a filter that matched zero tests.
 /// A non-zero exit IS a test failure; the command ran.
 fn classify_isolated(step: &Step) -> &'static str {
     match step.outcome {
-        "ok" => match test_totals(&step.output) {
-            Some((0, 0)) => "unknown",
-            _ => "pass",
+        "ok" => match &step.result {
+            Some(result)
+                if !result.valid || result.test_count == 0 || result.executed_count() == 0 =>
+            {
+                "unknown"
+            }
+            Some(result) if result.failed > 0 => "fail",
+            Some(_) => "pass",
+            None => match test_totals(&step.output) {
+                Some((0, 0)) => "unknown",
+                _ => "pass",
+            },
         },
-        "fail" => "fail",
+        "fail" => {
+            if step.result.as_ref().is_some_and(|result| {
+                !result.valid || result.test_count == 0 || result.executed_count() == 0
+            }) {
+                "unknown"
+            } else {
+                "fail"
+            }
+        }
         _ => "unknown",
     }
 }
@@ -878,6 +1341,35 @@ fn find_test_file(dir: &Path, name: &str, globs: &[String], git_secs: u64) -> Op
 /// executed for `reason`.
 fn unknown_side(reason: &str) -> Value {
     json!({"outcome": "unknown", "reason": reason})
+}
+
+/// Preserve a failed full-suite observation when the backend did not emit a
+/// testcase name. The row carries a null `test` field: a synthetic name would
+/// turn missing evidence into a false attribution. `result` is the gated
+/// isolated classification and remains `unknown`, so the verdict stays
+/// blocking until a named testcase can be compared.
+fn unknown_full_suite_row(step: &Step) -> Value {
+    let reason = step
+        .result
+        .as_ref()
+        .and_then(|result| result.reason.as_deref())
+        .unwrap_or("full suite failed without a named testcase");
+    let gated_reason = format!("full suite testcase evidence unavailable: {reason}");
+    let base_reason = "full suite emitted no testcase name for base comparison";
+    let gated = unknown_side(&gated_reason);
+    let base = unknown_side(base_reason);
+    json!({
+        "source": "full_suite",
+        "test": null,
+        "in_run": step.outcome,
+        "result": "unknown",
+        "gated": gated.clone(),
+        "base": base.clone(),
+        "isolated_gated": gated,
+        "isolated_base": base,
+        "verdict": "inconclusive",
+        "reason": reason,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,6 +1687,12 @@ pub fn run(opts: &Options) -> Result<i32> {
         "merge": merge,
         "worktree": tree.dir.to_string_lossy(),
         "no_full": !opts.full,
+        "runner": {
+            "backend": backend_label(cfg.runner.backend),
+            "result_format": result_format_label(cfg.runner.result_format),
+            "result_path": cfg.runner.result_path,
+            "retries": 0,
+        },
         "schema_migration": !schema_hits.is_empty(),
         "schema_hits": schema_hits,
         "started_at": time::iso(time::now_epoch()),
@@ -1218,6 +1716,7 @@ pub fn run(opts: &Options) -> Result<i32> {
     let mut stress_results: Vec<Value> = Vec::new();
     let mut suite_step: Option<Step> = None;
     let mut suite_lock = Value::Null;
+    let gated_result_path = runner_result_path(&tree.dir, &cfg.runner);
 
     if !prepare_failed {
         let mut gates_failed = false;
@@ -1231,6 +1730,7 @@ pub fn run(opts: &Options) -> Result<i32> {
                     exit: None,
                     tail: Vec::new(),
                     output: String::new(),
+                    result: None,
                 });
                 continue;
             }
@@ -1252,23 +1752,21 @@ pub fn run(opts: &Options) -> Result<i32> {
             let mut runs = Vec::new();
             let mut unknown = 0u32;
             for i in 0..opts.stress {
-                let s = run_step(
+                let s = run_step_with_result(
                     &format!("stress-{}-{}", nt.name, i + 1),
                     &cmd,
                     &tree.dir,
                     &env(gated_tree),
                     t.stress_secs,
+                    gated_result_path.as_deref(),
                 )?;
-                // A "pass" that ran zero tests means the filter missed —
-                // that is `unknown`, not `ok`.
-                let outcome = if s.outcome == "ok" && test_totals(&s.output) == Some((0, 0)) {
-                    "unknown"
-                } else {
-                    s.outcome
-                };
+                // A successful process with no structured testcase means the
+                // filter missed (or the report disappeared) — unknown, not
+                // an okay stress run.
+                let outcome = classify_isolated(&s);
                 match outcome {
                     "unknown" => unknown += 1,
-                    o if o != "ok" => failures += 1,
+                    "fail" => failures += 1,
                     _ => {}
                 }
                 runs.push(json!({"run": i + 1, "outcome": outcome,
@@ -1301,23 +1799,20 @@ pub fn run(opts: &Options) -> Result<i32> {
             // it prevents a nested flock while preserving a fail-closed
             // direct invocation.
             let suite_env = suite_child_env(env(gated_tree), _suite_guard.is_some());
-            suite_step = Some(run_step(
+            suite_step = Some(run_step_with_result(
                 "full-suite",
                 &cfg.full_suite,
                 &tree.dir,
                 &suite_env,
                 t.full_secs,
+                gated_result_path.as_deref(),
             )?);
         }
     }
     report["gates"] = json!(gate_steps.iter().map(Step::to_json).collect::<Vec<_>>());
     report["stress"] = json!(stress_results);
     report["suite_lock"] = suite_lock;
-    report["full_suite"] = match &suite_step {
-        Some(s) => s.to_json(),
-        None => json!({"outcome": "skipped", "reason": "--no-full",
-            "cmd": cfg.full_suite}),
-    };
+    report["full_suite"] = full_suite_report(suite_step.as_ref(), &cfg.full_suite, 0);
 
     // Equal-conditions compare: every failing test name, rerun alone
     // on the gated tree and alone on the base head.
@@ -1326,7 +1821,11 @@ pub fn run(opts: &Options) -> Result<i32> {
         if s.outcome == "ok" || s.outcome == "skipped" {
             continue;
         }
-        failures_to_check.extend(extract_failed_tests(&s.output));
+        failures_to_check.extend(if s.result.is_some() {
+            structured_failed_tests(s)
+        } else {
+            extract_failed_tests(&s.output)
+        });
     }
     failures_to_check.extend(
         stress_results
@@ -1360,12 +1859,16 @@ pub fn run(opts: &Options) -> Result<i32> {
                 break;
             }
         }
+        let base_result_path = runner_result_path(&base_tree.dir, &cfg.runner);
         for name in &failures_to_check {
             // Names come from test output the PR controls — validate
             // before they reach a shell, and never execute a bad one.
             if !valid_test_name(name) {
                 comparisons.push(json!({
                     "test": name, "in_run": "fail",
+                    "result": "unknown",
+                    "gated": unknown_side("test name failed validation"),
+                    "base": unknown_side("test name failed validation"),
                     "isolated_gated": unknown_side("test name failed validation"),
                     "isolated_base": unknown_side("test name failed validation"),
                     "verdict": "inconclusive",
@@ -1380,6 +1883,9 @@ pub fn run(opts: &Options) -> Result<i32> {
             let Some(file) = file.filter(|f| safe_rel_path(f)) else {
                 comparisons.push(json!({
                     "test": name, "in_run": "fail",
+                    "result": "unknown",
+                    "gated": unknown_side("test file not found under test_globs"),
+                    "base": unknown_side("test file not found under test_globs"),
                     "isolated_gated": unknown_side("test file not found under test_globs"),
                     "isolated_base": unknown_side("test file not found under test_globs"),
                     "verdict": "inconclusive",
@@ -1392,23 +1898,25 @@ pub fn run(opts: &Options) -> Result<i32> {
                 body: String::new(),
             };
             let cmd = test_command(&cfg.test_command, &nt);
-            let on_gated = run_step(
+            let on_gated = run_step_with_result(
                 "compare-gated",
                 &cmd,
                 &tree.dir,
                 &env(gated_tree),
                 t.test_secs,
+                gated_result_path.as_deref(),
             )?;
             let gated = classify_isolated(&on_gated);
             let (base, base_tail, base_reason) = if !base_ready {
                 ("unknown", Vec::new(), Some("base prepare failed"))
             } else {
-                let on_base = run_step(
+                let on_base = run_step_with_result(
                     "compare-base",
                     &cmd,
                     &base_tree.dir,
                     &env("base"),
                     t.test_secs,
+                    base_result_path.as_deref(),
                 )?;
                 let c = classify_isolated(&on_base);
                 (
@@ -1465,6 +1973,9 @@ pub fn run(opts: &Options) -> Result<i32> {
             let mut row = json!({
                 "test": name, "cmd": cmd,
                 "in_run": "fail",
+                "result": gated,
+                "gated": gated_side.clone(),
+                "base": base_side.clone(),
                 "isolated_gated": gated_side,
                 "isolated_base": base_side,
                 "verdict": verdict,
@@ -1476,7 +1987,24 @@ pub fn run(opts: &Options) -> Result<i32> {
         }
         drop(base_tree);
     }
-    report["failures"] = json!(comparisons);
+    // A failed full suite without a named testcase is still evidence that
+    // blocks the review. Keep one explicit unknown row so the report cannot
+    // look like a successful empty comparison set; never invent a testcase
+    // name to satisfy the shape.
+    let suite_without_named_failures = suite_step.as_ref().is_some_and(|step| {
+        matches!(step.outcome, "fail" | "timeout")
+            && if step.result.is_some() {
+                structured_failed_tests(step).is_empty()
+            } else {
+                extract_failed_tests(&step.output).is_empty()
+            }
+    });
+    if suite_without_named_failures {
+        if let Some(step) = suite_step.as_ref() {
+            comparisons.push(unknown_full_suite_row(step));
+        }
+    }
+    set_failure_reports(&mut report, &comparisons);
     report["base_prepare"] = json!(base_prepare_steps
         .iter()
         .map(Step::to_json)
@@ -1677,6 +2205,18 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
     );
     let comparisons = report["failures"].as_array().cloned().unwrap_or_default();
     for f in &comparisons {
+        if f["source"] == "full_suite" && f["result"] == "unknown" {
+            push_reason(
+                &mut level,
+                &mut reasons,
+                2,
+                format!(
+                    "full suite produced no executable testcase evidence — {}",
+                    f["reason"].as_str().unwrap_or("reason unavailable")
+                ),
+            );
+            continue;
+        }
         let name = f["test"].as_str().unwrap_or("?");
         match f["verdict"].as_str() {
             Some("regression") => push_reason(
@@ -2178,6 +2718,7 @@ index 555..666 100644
             exit: None,
             tail: vec![],
             output: output.to_string(),
+            result: None,
         };
         assert_eq!(
             classify_isolated(&step("ok", "test result: ok. 3 passed; 0 failed")),
@@ -2250,6 +2791,201 @@ gate_secs = 42
         assert_eq!(cfg.timeouts.gate_secs, 42);
         assert_eq!(cfg.timeouts.full_secs, 3600);
         assert_eq!(cfg.stress_pattern.0, vec!["wait_", "sleep"]);
+        assert_eq!(cfg.runner.backend, ReviewBackend::Cargo);
+        assert_eq!(cfg.runner.result_format, ResultFormat::Cargo);
+    }
+
+    #[test]
+    fn junit_results_name_failures_and_reject_zero_tests() {
+        let xml = r#"<?xml version="1.0"?>
+<testsuites tests="2" failures="1">
+  <testsuite name="cadence-agent::integration" tests="2" failures="1">
+    <testcase name="healthy_test" time="0.125"></testcase>
+    <testcase name="broken_test" time="0.25"><failure type="test failure">boom</failure></testcase>
+  </testsuite>
+</testsuites>"#;
+        let summary = parse_junit(xml);
+        assert!(summary.valid);
+        assert_eq!(summary.test_count, 2);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.failed_tests, vec!["broken_test"]);
+        assert_eq!(summary.tests[0].duration_s, Some(0.125));
+
+        let zero = parse_junit("<testsuites tests=\"0\"></testsuites>");
+        assert!(!zero.valid);
+        assert_eq!(zero.test_count, 0);
+        assert!(zero.reason.unwrap().contains("zero testcases"));
+
+        let missing_dir = tempfile::tempdir().unwrap();
+        let missing = parse_junit_file(&missing_dir.path().join("junit.xml"));
+        assert!(!missing.valid);
+        assert!(missing.reason.unwrap().contains("unavailable"));
+
+        let malformed = parse_junit("<testsuites><testsuite><testcase name=\"x\">");
+        assert!(!malformed.valid);
+        assert!(malformed.reason.unwrap().contains("closing all tags"));
+    }
+
+    #[test]
+    fn junit_ignored_only_is_unknown_not_failure() {
+        let ignored = parse_junit(
+            r#"<testsuites tests="1" skipped="1" failures="0">
+  <testsuite name="ignored" tests="1" skipped="1" failures="0">
+    <testcase name="ignored_case"><skipped/></testcase>
+  </testsuite>
+</testsuites>"#,
+        );
+        assert!(ignored.valid);
+        assert_eq!(ignored.test_count, 1);
+        assert_eq!(ignored.executed_count(), 0);
+        assert_eq!(
+            ignored.reason.as_deref(),
+            Some("JUnit report contained no executed testcases")
+        );
+
+        let step = |outcome: &'static str, result: TestRunSummary| Step {
+            name: "ignored_case".into(),
+            cmd: "scripts/cadence-nextest --test integration -- ignored_case --exact".into(),
+            duration_ms: 0,
+            outcome,
+            exit: Some(4),
+            tail: Vec::new(),
+            output: String::new(),
+            result: Some(result),
+        };
+        assert_eq!(classify_isolated(&step("fail", ignored.clone())), "unknown");
+        assert_eq!(classify_isolated(&step("ok", ignored)), "unknown");
+
+        let executed = parse_junit(
+            r#"<testsuites tests="1" skipped="0" failures="0">
+  <testsuite name="executed" tests="1" skipped="0" failures="0">
+    <testcase name="executed_case"/>
+  </testsuite>
+</testsuites>"#,
+        );
+        assert_eq!(executed.executed_count(), 1);
+        assert_eq!(classify_isolated(&step("ok", executed)), "pass");
+    }
+
+    #[test]
+    fn report_exposes_cad173_schema_and_preserves_legacy_paths() {
+        let summary = parse_junit(
+            r#"<testsuites tests="1" skipped="0" failures="0">
+  <testsuite name="contract" tests="1" skipped="0" failures="0">
+    <testcase name="executed_case" time="0.125"/>
+  </testsuite>
+</testsuites>"#,
+        );
+        let step = Step {
+            name: "full-suite".into(),
+            cmd: "scripts/cadence-nextest --all-targets".into(),
+            duration_ms: 125,
+            outcome: "ok",
+            exit: Some(0),
+            tail: Vec::new(),
+            output: String::new(),
+            result: Some(summary),
+        };
+        let full = full_suite_report(Some(&step), "scripts/cadence-nextest", 0);
+
+        // Canonical CAD-173 consumers read the concise top-level fields.
+        assert_eq!(full["retries"], 0);
+        assert_eq!(full["duration_s"], 0.125);
+        assert_eq!(full["tests"].as_array().unwrap().len(), 1);
+        assert_eq!(full["tests"][0]["name"], "executed_case");
+        // Existing consumers retain the nested step/result representation.
+        assert_eq!(full["result"]["tests"].as_array().unwrap().len(), 1);
+
+        let gated = json!({"outcome": "pass"});
+        let base = json!({"outcome": "pass"});
+        let row = json!({
+            "test": "executed_case",
+            "result": "pass",
+            "gated": gated.clone(),
+            "base": base.clone(),
+            "isolated_gated": gated,
+            "isolated_base": base,
+            "verdict": "flake-under-load",
+        });
+        let mut report = json!({});
+        set_failure_reports(&mut report, &[row]);
+        assert_eq!(report["isolated"][0]["gated"]["outcome"], "pass");
+        assert_eq!(report["isolated"][0]["result"], "pass");
+        assert_eq!(report["failures"][0]["isolated_base"]["outcome"], "pass");
+    }
+
+    #[test]
+    fn no_execution_full_suite_evidence_is_unknown_and_blocks() {
+        let all_skipped = parse_junit(
+            r#"<testsuites tests="1" skipped="1" failures="0">
+  <testsuite name="ignored" tests="1" skipped="1" failures="0">
+    <testcase name="ignored_case"><skipped/></testcase>
+  </testsuite>
+</testsuites>"#,
+        );
+        assert!(all_skipped.valid);
+        assert_eq!(all_skipped.executed_count(), 0);
+
+        let missing_dir = tempfile::tempdir().unwrap();
+        let missing = parse_junit_file(&missing_dir.path().join("junit.xml"));
+        let malformed = parse_junit("<testsuites><testsuite><testcase name=\"x\">");
+        let cases = [missing, malformed, all_skipped];
+        for summary in cases {
+            let step = Step {
+                name: "full-suite".into(),
+                cmd: "scripts/cadence-nextest --all-targets".into(),
+                duration_ms: 250,
+                outcome: "fail",
+                exit: Some(0),
+                tail: Vec::new(),
+                output: String::new(),
+                result: Some(summary),
+            };
+            let row = unknown_full_suite_row(&step);
+            assert_eq!(row["source"], "full_suite");
+            assert_eq!(row["result"], "unknown");
+            assert_eq!(row["verdict"], "inconclusive");
+            assert!(row["test"].is_null(), "must not invent a testcase name");
+            assert_eq!(row["gated"]["outcome"], "unknown");
+            assert_eq!(row["base"]["outcome"], "unknown");
+
+            let mut report = json!({
+                "merge": {}, "prepare": [], "gates": [], "stress": [],
+                "open_pr_conflicts": [], "full_suite": {"outcome": "fail"}
+            });
+            set_failure_reports(&mut report, &[row]);
+            assert_eq!(report["isolated"].as_array().unwrap().len(), 1);
+            assert_eq!(suggest(&report, false).0, "blocked");
+        }
+    }
+
+    #[test]
+    fn nextest_config_requires_same_exact_backend_for_isolation() {
+        let toml = r#"
+prepare = ["make deps"]
+gates = ["cargo fmt --check"]
+full_suite = "scripts/cadence-nextest --test integration"
+test_globs = ["tests/**"]
+test_command = "scripts/cadence-nextest --test {target} -- {test} --exact"
+[runner]
+backend = "nextest"
+result_format = "junit"
+result_path = "target/nextest/cadence/junit.xml"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), toml).unwrap();
+        let cfg = ReviewConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.runner.backend, ReviewBackend::Nextest);
+        assert_eq!(cfg.runner.result_format, ResultFormat::Junit);
+
+        let mismatched = toml.replace(
+            "test_command = \"scripts/cadence-nextest --test {target} -- {test} --exact\"",
+            "test_command = \"cargo test --test {target} {test}\"",
+        );
+        std::fs::write(dir.path().join(CONFIG_FILE), mismatched).unwrap();
+        let err = ReviewConfig::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("both full_suite and test_command"), "{err}");
     }
 
     #[test]

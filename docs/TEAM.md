@@ -92,9 +92,10 @@ message of their turn; pty developers report with `cadence message result`.
    optional CAD-173 nextest wrapper verifies the reviewed executable
    digest, takes this lock before launching the process-per-test harness,
    and forces zero retries. A review child receives an explicit outer-held
-   marker and never nests `flock`. The checked-in review gate remains
-   cargo until human approval records the pinned runner and its
-   structured-result/activation changes.
+   marker and never nests `flock`. The activation candidate records JUnit
+   testcase names, outcomes, counts and durations; a missing or empty report
+   is blocking evidence, and the full and isolated commands must use the same
+   exact-filter backend. Human approval still gates this config change.
 8. Never paste other processes' command lines or tool output verbatim into PRs, issues or notes; scan for secrets before any outward write.
 9. A pty pane that probes idle while its message is still running has stopped; a numbered menu is an approval prompt, not work.
 10. Git commands that may open an editor run with `GIT_EDITOR=true`.

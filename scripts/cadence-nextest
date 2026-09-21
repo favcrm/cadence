@@ -53,12 +53,27 @@ if [ "${1:-}" = list ]; then
     shift
 fi
 
+blocked_no_tests=
 for arg in "$@"; do
+    if [ -n "$blocked_no_tests" ]; then
+        case "$arg" in
+            -*) ;;
+            *) die "profile, config and retries are pinned; do not override '$blocked_no_tests $arg'" ;;
+        esac
+    fi
     case "$arg" in
         --retries|--retries=*|--profile|--profile=*|--config-file|--config-file=*)
             die "profile, config and retries are pinned; do not override '$arg'" ;;
+        --no-tests)
+            blocked_no_tests=$arg
+            ;;
+        --no-tests=*)
+            die "profile, config and retries are pinned; do not override '$arg'" ;;
     esac
 done
+if [ -n "$blocked_no_tests" ]; then
+    die "profile, config and retries are pinned; do not override '$blocked_no_tests'"
+fi
 
 cd "$ROOT" || die "cannot enter cadence repository root: $ROOT"
 
@@ -69,6 +84,7 @@ run_nextest() {
             --config-file "$PROFILE" \
             --profile cadence \
             --retries 0 \
+            --no-tests fail \
             "$@"
     fi
     exec env -u NEXTEST_RETRIES -u NEXTEST_PROFILE \
