@@ -7999,6 +7999,32 @@ fn pty_unrendered_worker_result_requeues_then_parks() {
         .as_str()
         .unwrap()
         .to_string();
+    // A dropped paste can leave the real TUI briefly showing its busy
+    // interrupt hint before the next retry. This gate refusal must not reset
+    // the routed delivery's render-miss budget.
+    d.wait_event_where(
+        "pm",
+        "paste_not_rendered",
+        |event| event["payload"]["message"] == routed_id && event["payload"]["attempt"] == 1,
+        20,
+    );
+    atomic_write(
+        d.pane_file(&mock, "pm", "tui-state"),
+        "⠸ Thinking · 12s (esc twice to interrupt)\n❭ Guide Devin while it works\n",
+    );
+    let gate = d.wait_event_where(
+        "pm",
+        "gate_wait",
+        |event| {
+            event["payload"]["message"] == routed_id
+                && event["payload"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("busy"))
+        },
+        15,
+    );
+    assert!(gate["payload"]["reason"].as_str().unwrap().contains("busy"));
+    std::fs::remove_file(d.pane_file(&mock, "pm", "tui-state")).unwrap();
     // At-least-once: bounded requeues with paste_not_rendered evidence,
     // then the delivery is PARKED — a notification must never fence the
     // recipient or kill its pane.
@@ -8016,6 +8042,11 @@ fn pty_unrendered_worker_result_requeues_then_parks() {
         .filter(|e| e["kind"].as_str() == Some("paste_not_rendered"))
         .collect();
     assert_eq!(misses.len(), 4, "{:?}", misses);
+    let attempts: Vec<Value> = misses
+        .iter()
+        .map(|event| event["payload"]["attempt"].clone())
+        .collect();
+    assert_eq!(attempts, vec![json!(1), json!(2), json!(3), json!(4)]);
     assert!(misses.iter().take(3).all(|e| e["payload"]["retry"] == true));
     let show = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
     let msg = show["messages"]

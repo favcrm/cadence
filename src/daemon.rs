@@ -807,6 +807,7 @@ impl Shared {
         // Proven paste misses per message — a TUI that looks idle but
         // keeps dropping pastes must not be re-fed forever.
         let mut unrendered: u32 = 0;
+        let mut unrendered_message: Option<String> = None;
         loop {
             if self.closing.load(Ordering::SeqCst) {
                 return Ok(());
@@ -825,6 +826,14 @@ impl Shared {
                     ctl.wake.wait_until(Instant::now() + Duration::from_secs(5));
                 }
                 Take::Message(message) => {
+                    // A gate refusal requeues the same message, so its
+                    // proven render-miss budget must survive the wait. If a
+                    // queued row was cancelled while waiting, start the next
+                    // row with a fresh budget instead of inheriting its count.
+                    if unrendered_message.as_deref() != Some(message.id.as_str()) {
+                        unrendered = 0;
+                        unrendered_message = Some(message.id.clone());
+                    }
                     let started_id = message.id.clone();
                     let shared = Arc::clone(self);
                     let watch = Arc::clone(ctl);
@@ -848,6 +857,7 @@ impl Shared {
                             gate_notice = None;
                             gate_waits = 0;
                             unrendered = 0;
+                            unrendered_message = None;
                         }
                         // The paste did not render within the deadline:
                         // evidence of a dropped or unsubmitted delivery.
@@ -909,6 +919,7 @@ impl Shared {
                                 )?;
                                 let _ = self.store.set_agent_state_if(alias, "idle", "busy");
                                 unrendered = 0;
+                                unrendered_message = None;
                                 self.wake();
                             } else {
                                 return self.unknown(
@@ -937,7 +948,6 @@ impl Shared {
                             // is only the fallback for a busy pane.
                             let wait = Duration::from_secs((5u64 << gate_waits.min(3)).min(30));
                             gate_waits = gate_waits.saturating_add(1);
-                            unrendered = 0;
                             ctl.wake.wait_until(Instant::now() + wait);
                         }
                         Err(Error::OutcomeUnknown(error)) => {
