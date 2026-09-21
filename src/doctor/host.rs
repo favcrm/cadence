@@ -527,9 +527,10 @@ const DIR_WALK_BUDGET: usize = 200_000;
 /// each inode once per call (cargo's hardlinked uplifts can't double
 /// up) and stays on the starting path's device, `du -x`-style, so a
 /// row's bytes are what `rm -rf` frees *on that filesystem*. Skips
-/// anything that vanishes or denies mid-walk — a watchdog walk races
-/// with the processes it watches. Returns `(bytes, truncated)`; a
-/// truncated walk is a lower bound, not the real size.
+/// anything that vanishes mid-walk — a watchdog walk races with the
+/// processes it watches. A directory that exists but cannot be listed
+/// marks the walk truncated: the byte count is a lower bound, not a
+/// complete measurement. Returns `(bytes, truncated)`.
 fn dir_size(path: &Path) -> (u64, bool) {
     let (bytes, truncated, _) = dir_size_limited(path, DIR_WALK_BUDGET);
     (bytes, truncated)
@@ -546,10 +547,24 @@ fn dir_size_limited(path: &Path, budget: usize) -> (u64, bool, usize) {
     let root_dev = std::fs::metadata(path).ok().map(|m| m.dev());
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // Absence is an empty measurement. Permission and I/O
+            // failures are a lower bound: `truncated == false` would
+            // otherwise look like a finished walk of nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if dir.as_path() == path {
+                    return (0, false, 0);
+                }
+                continue;
+            }
+            Err(_) => return (total, true, visited),
         };
-        for ent in entries.flatten() {
+        for ent in entries {
+            let ent = match ent {
+                Ok(ent) => ent,
+                Err(_) => return (total, true, visited),
+            };
             if visited >= budget {
                 return (total, true, visited);
             }
@@ -3547,6 +3562,21 @@ fn configured_cargo_target(scan: &Scan) -> Option<PathBuf> {
     normalize_abs(&joined)
 }
 
+/// Keep the stronger gap. `unreadable` must not collapse back to
+/// `incomplete` when a later entry fails a milder check.
+fn note_record(status: &mut &'static str, next: &'static str) {
+    fn rank(s: &str) -> u8 {
+        match s {
+            "unreadable" => 3,
+            "incomplete" => 2,
+            _ => 0,
+        }
+    }
+    if rank(next) > rank(status) {
+        *status = next;
+    }
+}
+
 /// Issue ids whose worktree ref records this cargo target. Symlinked
 /// issue files and project dirs are skipped rather than followed; a
 /// skip or a read error makes the search status incomplete so a
@@ -3567,35 +3597,54 @@ fn recorded_cargo_targets(pm: Option<&Path>) -> (BTreeMap<PathBuf, Vec<String>>,
     };
     let mut status = "complete";
     let mut seen = 0_usize;
-    for project in projects.flatten() {
+    for project in projects {
+        let project = match project {
+            Ok(project) => project,
+            Err(_) => {
+                note_record(&mut status, "incomplete");
+                continue;
+            }
+        };
         let Ok(kind) = project.file_type() else {
-            status = "incomplete";
+            note_record(&mut status, "incomplete");
             continue;
         };
         if !kind.is_dir() {
             continue;
         }
         let Ok(issues) = std::fs::read_dir(project.path()) else {
-            status = "unreadable";
+            note_record(&mut status, "unreadable");
             continue;
         };
-        for issue in issues.flatten() {
+        for issue in issues {
             if seen >= TASK_TARGET_ISSUE_BUDGET {
                 return (map, "truncated");
             }
+            let issue = match issue {
+                Ok(issue) => issue,
+                Err(_) => {
+                    note_record(&mut status, "incomplete");
+                    continue;
+                }
+            };
             let Ok(kind) = issue.file_type() else {
-                status = "incomplete";
+                note_record(&mut status, "incomplete");
                 continue;
             };
             if !kind.is_dir() {
                 continue;
             }
             let file = issue.path().join("issue.md");
-            let Ok(meta) = std::fs::symlink_metadata(&file) else {
-                continue;
+            let meta = match std::fs::symlink_metadata(&file) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    note_record(&mut status, "incomplete");
+                    continue;
+                }
             };
             if meta.file_type().is_symlink() {
-                status = "incomplete";
+                note_record(&mut status, "incomplete");
                 continue;
             }
             if !meta.is_file() {
@@ -3603,15 +3652,15 @@ fn recorded_cargo_targets(pm: Option<&Path>) -> (BTreeMap<PathBuf, Vec<String>>,
             }
             seen += 1;
             if meta.len() > 1_048_576 {
-                status = "incomplete";
+                note_record(&mut status, "incomplete");
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&file) else {
-                status = "incomplete";
+                note_record(&mut status, "incomplete");
                 continue;
             };
             let Ok((front, _)) = crate::issue::parse::parse_issue(&text) else {
-                status = "incomplete";
+                note_record(&mut status, "incomplete");
                 continue;
             };
             for r in &front.refs {
@@ -3622,7 +3671,7 @@ fn recorded_cargo_targets(pm: Option<&Path>) -> (BTreeMap<PathBuf, Vec<String>>,
                     continue;
                 };
                 let Some(path) = normalize_abs(Path::new(raw)) else {
-                    status = "incomplete";
+                    note_record(&mut status, "incomplete");
                     continue;
                 };
                 let ids = map.entry(path).or_default();
@@ -3791,8 +3840,9 @@ struct ProcSeen {
 }
 
 /// One pass over `proc_root`. Cwd and exe are `read_link` results —
-/// the link text, not a followed target. `partial` means at least one
-/// pid denied both links, so a row with no hit is not "none observed".
+/// the link text, not a followed target. `partial` means a pid denied
+/// both links or a directory entry could not be read, so a row with
+/// no hit is not proof that nothing references it.
 fn task_target_proc_hits(proc_root: &Path, roots: &[PathBuf]) -> (Vec<ProcSeen>, &'static str) {
     let mut hits = roots
         .iter()
@@ -3806,7 +3856,14 @@ fn task_target_proc_hits(proc_root: &Path, roots: &[PathBuf]) -> (Vec<ProcSeen>,
     };
     let mut seen = 0_usize;
     let mut partial = false;
-    for ent in entries.flatten() {
+    for ent in entries {
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(_) => {
+                partial = true;
+                continue;
+            }
+        };
         if seen >= TASK_TARGET_PROC_BUDGET {
             return (hits, "truncated");
         }
@@ -3876,11 +3933,22 @@ fn check_task_targets(scan: &Scan) -> Check {
     let mut temp_scan = "complete";
     match std::fs::read_dir(&scan.temp_dir) {
         Ok(entries) => {
-            for (n, ent) in entries.flatten().enumerate() {
+            let mut n = 0_usize;
+            for ent in entries {
                 if n >= TASK_TARGET_TEMP_BUDGET {
                     temp_scan = "truncated";
                     break;
                 }
+                let ent = match ent {
+                    Ok(ent) => ent,
+                    Err(_) => {
+                        if temp_scan == "complete" {
+                            temp_scan = "incomplete";
+                        }
+                        continue;
+                    }
+                };
+                n += 1;
                 if !legacy_task_target_name(&ent.file_name()) {
                     continue;
                 }
@@ -3933,7 +4001,8 @@ fn check_task_targets(scan: &Scan) -> Check {
     let mut rows: Vec<Value> = Vec::new();
     let mut pressure_count = 0_u64;
     let mut pressure_bytes = 0_u64;
-    let mut attention = temp_scan != "complete" || scan_truncated;
+    let record_gap = !matches!(record_search, "complete" | "no-tracker");
+    let mut attention = temp_scan != "complete" || scan_truncated || record_gap;
     for (cand, hit) in selected.iter().zip(hits.iter()) {
         let path = &cand.path;
         let issues = recorded.get(path).cloned().unwrap_or_default();
@@ -4139,6 +4208,10 @@ fn check_task_targets(scan: &Scan) -> Check {
             format!(
                 "temp dir {} unreadable — task targets not inventoried",
                 scan.temp_dir.display()
+            )
+        } else if record_gap || temp_scan != "complete" || proc_scan != "complete" {
+            format!(
+                "none listed — temp {temp_scan}, tracker {record_search}, proc {proc_scan}; not a conclusive absence"
             )
         } else {
             "none".to_string()
@@ -5132,6 +5205,29 @@ mod tests {
     fn real_bytes(path: &Path, bytes: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, vec![7u8; bytes]).unwrap();
+    }
+
+    /// Puts `mode` back before the owning `TempDir` is removed. Declare
+    /// it after the `TempDir` so this drops first.
+    struct RestoreMode {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    fn deny_directory(path: &Path) -> RestoreMode {
+        let restore = RestoreMode {
+            path: path.to_path_buf(),
+            mode: 0o755,
+        };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        restore
     }
 
     fn set_mtime_old(path: &Path, secs_ago: i64) {
@@ -6639,6 +6735,140 @@ mod tests {
         assert_eq!(row["ownership"], "name-only");
         assert_eq!(row["proven"], false);
         assert_eq!(row["safe_to_delete"], false);
+    }
+
+    #[test]
+    fn dir_size_limited_unreadable_directory_is_truncated() {
+        let root = TempDir::new().unwrap();
+        let missing = root.path().join("missing-cad233");
+        let (bytes, truncated, visited) = dir_size_limited(&missing, 32);
+        assert_eq!(bytes, 0);
+        assert!(!truncated);
+        assert_eq!(visited, 0);
+
+        let dir = root.path().join("sized");
+        std::fs::create_dir_all(dir.join("open")).unwrap();
+        real_bytes(&dir.join("open/seen.bin"), 4096);
+        let (open_bytes, open_truncated, _) = dir_size_limited(&dir, 32);
+        assert!(!open_truncated);
+        assert!(open_bytes >= 4096);
+
+        let secret = dir.join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        real_bytes(&secret.join("hidden.bin"), 80_000);
+        let _restore = deny_directory(&secret);
+        let (bytes, truncated, _) = dir_size_limited(&dir, 32);
+        assert!(truncated);
+        assert!(bytes < 80_000, "hidden bytes were counted: {bytes}");
+        assert!(bytes >= open_bytes);
+    }
+
+    #[test]
+    fn task_targets_unreadable_child_is_not_a_finished_measurement() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let dir = scan.temp_dir.join("cad420-partial-target");
+        std::fs::create_dir_all(dir.join("secret")).unwrap();
+        real_bytes(&dir.join("seen.bin"), 2048);
+        real_bytes(&dir.join("secret/hidden.bin"), 80_000);
+        let _restore = deny_directory(&dir.join("secret"));
+        let c = check_task_targets(&scan);
+        let row = task_row(&c.value, "cad420-partial-target");
+        assert_eq!(row["bytes_truncated"], true);
+        assert_eq!(row["safe_to_delete"], false);
+        assert_eq!(row["reclaim_candidate"], false);
+        assert_eq!(row["action"], "none");
+        assert_eq!(c.value["scan_truncated"], true);
+        assert_eq!(c.value["safe_to_delete"], false);
+        assert_eq!(c.level, Level::Warn);
+        assert!(row["bytes"].as_u64().unwrap() < 80_000);
+        let blob = serde_json::to_string(&c.to_json()).unwrap();
+        assert!(!blob.contains("rm "), "{blob}");
+    }
+
+    #[test]
+    fn task_targets_denied_issue_record_is_not_conclusive() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let pm = scan.pm_dir.clone().unwrap();
+        let hidden = pm.join("cadence").join("CAD-420");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(
+            hidden.join("issue.md"),
+            format!(
+                "---\nid: CAD-420\ntitle: t\nstatus: doing\npriority: P2\nrefs:\n  - kind: worktree\n    path: {}\n    cargo_target: {}\ncreated: 2026-09-19T00:00:00Z\n---\n\nbody\n",
+                scan.cwd.display(),
+                scan.temp_dir.join("cad420-recorded-target").display(),
+            ),
+        )
+        .unwrap();
+        write_issue(&pm, "cadence", "CAD-421", "doing", "");
+        let _restore = deny_directory(&hidden);
+        std::fs::create_dir_all(scan.temp_dir.join("cad420-recorded-target")).unwrap();
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["record_search"], "incomplete");
+        assert_eq!(c.value["record_conclusive"], false);
+        let row = task_row(&c.value, "cad420-recorded-target");
+        assert_eq!(row["ownership"], "name-only");
+        assert_eq!(row["proven"], false);
+        assert_eq!(row["safe_to_delete"], false);
+        assert_eq!(row["reclaim_candidate"], false);
+        assert_eq!(c.level, Level::Warn);
+        assert_ne!(c.detail, "none");
+    }
+
+    #[test]
+    fn task_targets_unreadable_tracker_with_no_rows_is_not_none() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let pm = scan.pm_dir.clone().unwrap();
+        std::fs::remove_dir_all(&pm).unwrap();
+        std::fs::write(&pm, b"not a directory").unwrap();
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["record_search"], "unreadable");
+        assert_eq!(c.value["record_conclusive"], false);
+        assert_eq!(c.value["count"], 0);
+        assert_eq!(c.value["safe_to_delete"], false);
+        assert_ne!(c.detail, "none");
+        assert!(c.detail.contains("unreadable"), "{}", c.detail);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.remedy.is_empty());
+    }
+
+    #[test]
+    fn task_targets_denied_proc_dir_is_not_a_complete_idle_scan() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let pid = scan.proc_root.join("4242");
+        std::fs::create_dir_all(&pid).unwrap();
+        let _restore = deny_directory(&pid);
+        std::fs::create_dir_all(scan.temp_dir.join("cad421-proc-target")).unwrap();
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["proc_scan"], "partial");
+        let row = task_row(&c.value, "cad421-proc-target");
+        assert_eq!(row["cwd_exe"], "none-observed");
+        assert_eq!(row["activity"], "unproven");
+        assert_eq!(row["safe_to_delete"], false);
+        assert_eq!(row["reclaim_candidate"], false);
+        assert_eq!(row["action"], "none");
+        assert!(c.detail.contains("not proof"), "{}", c.detail);
+        assert!(c.detail.contains("partial"), "{}", c.detail);
+    }
+
+    #[test]
+    fn task_targets_unreadable_temp_dir_is_not_an_empty_inventory() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        std::fs::create_dir_all(scan.temp_dir.join("cad422-hidden-target")).unwrap();
+        let _restore = deny_directory(&scan.temp_dir);
+        let c = check_task_targets(&scan);
+        assert_eq!(c.value["temp_scan"], "unreadable");
+        assert_eq!(c.value["count"], 0);
+        assert_eq!(c.value["safe_to_delete"], false);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.contains("unreadable"), "{}", c.detail);
+        assert_ne!(c.detail, "none");
+        assert!(c.remedy.is_empty());
     }
 
     #[test]
