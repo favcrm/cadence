@@ -211,7 +211,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             }
             let from_text = from
                 .as_ref()
-                .map(|path| std::fs::read_to_string(path))
+                .map(std::fs::read_to_string)
                 .transpose()
                 .map_err(|e| Error::rejected(format!("cannot read proposal source: {e}")))?;
             let out = client::rpc(

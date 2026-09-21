@@ -885,16 +885,24 @@ pub fn propose_native(
 /// Submit one native review receipt. All reads that decide the revision are
 /// repeated under the existing PM lock, so a concurrent edit cannot leave a
 /// receipt attached to a different claim.
+pub struct ReviewRequest<'a> {
+    pub operation: &'a str,
+    pub verdict: &'a str,
+    pub evidence: &'a str,
+    pub expected_digest: &'a str,
+}
+
 pub fn submit_review(
     pm: &Pm,
     flag: Option<&str>,
     slug: &str,
-    operation: &str,
-    verdict: &str,
-    evidence: &str,
-    expected_digest: &str,
+    request: &ReviewRequest<'_>,
     actor: &NativeIdentity,
 ) -> Result<Value> {
+    let operation = request.operation;
+    let verdict = request.verdict;
+    let evidence = request.evidence;
+    let expected_digest = request.expected_digest;
     if !matches!(operation, "accept" | "verify") {
         return Err(Error::rejected(
             "memory review operation must be accept or verify",
@@ -1827,10 +1835,12 @@ mod tests {
             &pm,
             Some("demo"),
             "lesson",
-            "accept",
-            "pass",
-            "worker-a acceptance evidence",
-            &digest,
+            &ReviewRequest {
+                operation: "accept",
+                verdict: "pass",
+                evidence: "worker-a acceptance evidence",
+                expected_digest: &digest,
+            },
             &worker_a,
         )
         .unwrap();
@@ -1838,10 +1848,12 @@ mod tests {
             &pm,
             Some("demo"),
             "lesson",
-            "accept",
-            "pass",
-            "worker-b acceptance evidence",
-            &digest,
+            &ReviewRequest {
+                operation: "accept",
+                verdict: "pass",
+                evidence: "worker-b acceptance evidence",
+                expected_digest: &digest,
+            },
             &worker_b,
         )
         .unwrap();
@@ -1863,10 +1875,12 @@ mod tests {
                 &pm,
                 Some("demo"),
                 "lesson",
-                "verify",
-                "pass",
-                evidence,
-                &digest,
+                &ReviewRequest {
+                    operation: "verify",
+                    verdict: "pass",
+                    evidence,
+                    expected_digest: &digest,
+                },
                 worker,
             )
             .unwrap();
@@ -1894,10 +1908,12 @@ mod tests {
                 &pm,
                 Some("demo"),
                 "lesson",
-                "verify",
-                "pass",
-                evidence,
-                &digest,
+                &ReviewRequest {
+                    operation: "verify",
+                    verdict: "pass",
+                    evidence,
+                    expected_digest: &digest,
+                },
                 worker,
             )
             .unwrap();

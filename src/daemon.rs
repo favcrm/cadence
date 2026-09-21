@@ -1486,14 +1486,17 @@ impl Shared {
         Self::reject_memory_identity_claims(params)?;
         let actor = self.memory_actor(peer_pid)?;
         let pm = crate::issue::Pm::open_default()?;
+        let request = memory::ReviewRequest {
+            operation: required_str(params, "operation")?,
+            verdict: required_str(params, "verdict")?,
+            evidence: required_str(params, "evidence")?,
+            expected_digest: required_str(params, "digest")?,
+        };
         memory::submit_review(
             &pm,
             optional_str(params, "project"),
             required_str(params, "slug")?,
-            required_str(params, "operation")?,
-            required_str(params, "verdict")?,
-            required_str(params, "evidence")?,
-            required_str(params, "digest")?,
+            &request,
             &actor,
         )
     }
