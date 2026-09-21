@@ -993,6 +993,30 @@ fn restart_preserves_attention_fence_without_unknowns() {
         .iter()
         .all(|r| r["alias"] != "mismatch"));
     assert_eq!(d.message_state("mismatch", "m2"), "queued");
+
+    // A real CLI restart must not label this unchanged fence as a new
+    // restart failure. The healthy agent still relaunches; the fenced
+    // agent must neither execute its queued work nor lose its error.
+    let home = TempDir::new().unwrap();
+    let out = cadence_at(home.path(), &d.state, &["daemon", "restart"]);
+    // Stop the detached replacement before asserting the restart outcome.
+    let restarted = d.wait_agent("mismatch", "attention", 15);
+    d.wait_agent("healthy", "idle", 15);
+    let queued = d.message_state("mismatch", "m2");
+    let stop = cadence_at(home.path(), &d.state, &["daemon", "stop"]);
+    assert!(stop.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "unchanged fence failed restart: {stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("Existing fences retained: mismatch"),
+        "{stdout}"
+    );
+    assert_eq!(queued, "queued");
+    assert_eq!(restarted["error"], agent["error"]);
 }
 
 #[test]
