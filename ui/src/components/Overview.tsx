@@ -1,8 +1,8 @@
-import { useState } from "react";
 import type { MonitorAlert, Monitoring, Overview } from "../types";
 
 const KIND_CHIP: Record<string, string> = {
   merge: "bg-ok/15 text-ok",
+  intake: "bg-info/10 text-info",
   approval: "bg-warn/10 text-warn",
   fenced: "bg-fail/10 text-fail",
   stalled: "bg-warn/10 text-warn",
@@ -11,12 +11,14 @@ const KIND_CHIP: Record<string, string> = {
   review_no_pr: "bg-ink-800 text-ink-300",
   blocked_ready: "bg-accent/10 text-accent",
   ci_red: "bg-fail/10 text-fail",
+  silent_end: "bg-warn/10 text-warn",
   inbox_unread: "bg-warn/10 text-warn",
   tracker_behind: "bg-ink-800 text-ink-400",
 };
 
 const KIND_LABEL: Record<string, string> = {
   merge: "merge",
+  intake: "intake",
   approval: "approval",
   fenced: "fenced",
   stalled: "stalled",
@@ -25,6 +27,7 @@ const KIND_LABEL: Record<string, string> = {
   review_no_pr: "review",
   blocked_ready: "unblocked",
   ci_red: "ci red",
+  silent_end: "silent end",
   inbox_unread: "inbox",
   tracker_behind: "behind",
 };
@@ -51,15 +54,99 @@ const MONITOR_STATE_CHIP: Record<string, string> = {
   off: "bg-ink-800 text-ink-400",
 };
 
+const NEED_GROUPS = [
+  { key: "decision", label: "Needs your decision", kinds: new Set(["approval"]) },
+  { key: "team", label: "Team handling", kinds: new Set(["merge", "intake", "fenced", "stalled", "review_no_pr", "blocked_ready", "pr_no_verdict", "ci_red", "silent_end"]) },
+  { key: "dependency", label: "Waiting on dependency", kinds: new Set(["drift"]) },
+  { key: "info", label: "Information", kinds: new Set(["inbox_unread", "tracker_behind"]) },
+] as const;
+
+function needGroup(kind: string): (typeof NEED_GROUPS)[number] {
+  return NEED_GROUPS.find((group) => group.kinds.has(kind)) ?? NEED_GROUPS[1];
+}
+
+function needLabel(kind: string): string {
+  return KIND_LABEL[kind] ?? "unknown / unclassified";
+}
+
+function projectMatches(value: string | null | undefined, project: string): boolean {
+  return project === "all" || value === project;
+}
+
+function isGlobalProject(value: string | null | undefined): boolean {
+  return !value || value === "global" || value === "unknown";
+}
+
+function NeedRows({ rows }: { rows: Overview["needs_me"] }) {
+  const grouped = NEED_GROUPS.map((group) => ({
+    ...group,
+    rows: rows.filter((row) => needGroup(row.kind).key === group.key),
+  })).filter((group) => group.rows.length > 0);
+  return (
+    <div className="space-y-3">
+      {grouped.map((group) => (
+        <details key={group.key} open={group.key === "decision" || group.key === "dependency"}>
+          <summary className="flex items-center gap-2 mb-1.5 cursor-pointer list-none">
+            <span className="slabel">{group.label}</span>
+            <span className="num text-micro text-ink-500">{group.rows.length}</span>
+          </summary>
+          <div className="space-y-1.5 mt-1.5">
+            {group.rows.map((n, i) => (
+              <div
+                key={`${n.kind}-${n.title}-${i}`}
+                className="card px-3.5 py-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5"
+              >
+                <span className={`chip ${KIND_CHIP[n.kind] ?? "bg-ink-800 text-ink-400"}`}>
+                  {needLabel(n.kind)}
+                </span>
+                <span className="num text-label text-ink-500 w-9 shrink-0">
+                  {age(n.age)}
+                </span>
+                <span className="min-w-0 flex-1 basis-[12rem] text-label text-ink-200">
+                  {n.link ? (
+                    <a href={n.link} target="_blank" rel="noreferrer" className="hover:text-accent">
+                      {n.title}
+                    </a>
+                  ) : (
+                    n.title
+                  )}
+                </span>
+                <span className="chip bg-ink-800 text-ink-500 shrink-0">
+                  {n.project || "global"}
+                </span>
+                <details className="basis-full sm:basis-auto sm:ml-auto min-w-0">
+                  <summary className="cursor-pointer text-micro text-accent list-none hover:underline">
+                    details
+                  </summary>
+                  <div className="mt-1.5 rounded border border-ink-700 bg-ink-900 px-2.5 py-2 text-micro text-ink-400">
+                    <div className="text-ink-300">kind {n.kind} · observed {age(n.age)} ago · source {n.project || "global host"}</div>
+                    <code className="num block mt-1 whitespace-pre-wrap break-words">{n.command}</code>
+                  </div>
+                </details>
+              </div>
+            ))}
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+
 function MonitoringView({
   data,
+  project,
   readOnly,
   onAck,
 }: {
   data: Monitoring;
+  project: string;
   readOnly: boolean;
   onAck: (monitor: string, seq: number) => void;
 }) {
+  const monitors = data.monitors.filter((monitor) => projectMatches(monitor.project, project));
+  const globalMonitors = data.monitors.filter((monitor) => isGlobalProject(monitor.project));
+  const alerts = data.alerts.filter((alert) => projectMatches(alert.project, project));
+  const globalAlerts = data.alerts.filter((alert) => isGlobalProject(alert.project));
   return (
     <section>
       <div className="slabel mb-2">coordinator</div>
@@ -93,9 +180,9 @@ function MonitoringView({
           </div>
         ))}
 
-        {data.monitors.length > 0 && (
+        {monitors.length > 0 && (
           <div className="space-y-1 border-t border-ink-700/60 pt-2">
-            {data.monitors.map((monitor) => (
+            {monitors.map((monitor) => (
               <div
                 key={monitor.id}
                 className="flex flex-wrap items-center gap-x-2 gap-y-1 text-micro"
@@ -122,21 +209,23 @@ function MonitoringView({
           </div>
         )}
 
-        {data.monitors.length === 0 && data.available && (
+        {monitors.length === 0 && data.available && (
           <div className="text-label text-ink-500">
-            no monitor registration is active; autonomous reconciliation is stopped
+            {project === "all"
+              ? "no monitor registration is active; autonomous reconciliation is stopped"
+              : `no monitor registration is attached to ${project}`}
           </div>
         )}
 
-        {data.alerts.length > 0 && (
+        {alerts.length > 0 && (
           <div className="space-y-2 border-t border-ink-700/60 pt-3">
             <div className="flex items-center justify-between">
               <span className="slabel">actionable alerts</span>
               <span className="num text-micro text-ink-500">
-                {data.open_alerts} open · {data.alerts.length} recorded
+                {alerts.filter((alert) => alert.state === "open").length} open · {alerts.length} recorded
               </span>
             </div>
-            {data.alerts.map((alert) => (
+            {alerts.map((alert) => (
               <MonitorAlertView
                 key={`${alert.monitor}-${alert.seq}`}
                 alert={alert}
@@ -145,6 +234,36 @@ function MonitoringView({
               />
             ))}
           </div>
+        )}
+
+        {project !== "all" && globalAlerts.length > 0 && (
+          <details className="border-t border-ink-700/60 pt-3">
+            <summary className="cursor-pointer text-micro text-ink-400 hover:text-ink-200">
+              Global or unassigned alerts · {globalAlerts.length}
+            </summary>
+            <div className="mt-2 space-y-2">
+              {globalAlerts.map((alert) => (
+                <MonitorAlertView key={`${alert.monitor}-${alert.seq}`} alert={alert} readOnly={readOnly} onAck={onAck} />
+              ))}
+            </div>
+          </details>
+        )}
+        {project !== "all" && globalMonitors.length > 0 && (
+          <details className="border-t border-ink-700/60 pt-3">
+            <summary className="cursor-pointer text-micro text-ink-400 hover:text-ink-200">
+              Global or unassigned monitors · {globalMonitors.length}
+            </summary>
+            <div className="mt-2 space-y-1 text-micro text-ink-500">
+              {globalMonitors.map((monitor) => (
+                <div key={monitor.id} className="flex flex-wrap gap-2">
+                  <span className="num text-ink-300">{monitor.id}</span>
+                  <span>{monitor.monitoring}</span>
+                  <span>owner {monitor.owner}</span>
+                  <span>coverage {monitor.coverage.join(", ") || "none"}</span>
+                </div>
+              ))}
+            </div>
+          </details>
         )}
       </div>
     </section>
@@ -195,34 +314,14 @@ function MonitorAlertView({
   );
 }
 
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <button
-      className="chip bg-ink-800 !py-[.15rem] text-ink-400 hover:text-accent shrink-0"
-      title={`copy: ${text}`}
-      onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(text);
-          setCopied(true);
-          window.setTimeout(() => setCopied(false), 1400);
-        } catch {
-          // Clipboard needs a secure context — the command stays
-          // visible in the title for hand-copying.
-        }
-      }}
-    >
-      {copied ? "copied" : "copy"}
-    </button>
-  );
-}
-
 export default function OverviewView({
   data,
+  project,
   readOnly,
   onAck,
 }: {
   data: Overview | null;
+  project: string;
   readOnly: boolean;
   onAck: (monitor: string, seq: number) => void;
 }) {
@@ -234,8 +333,24 @@ export default function OverviewView({
     );
   }
   const drift = data.drift;
+  const scopedNeeds = data.needs_me.filter((need) => projectMatches(need.project, project));
+  const globalNeeds = data.needs_me.filter((need) => isGlobalProject(need.project));
+  const scopedProjects = data.projects.filter((item) => projectMatches(item.key, project));
+  const otherProjectCount = project === "all" ? 0 : data.projects.filter((item) => item.key !== project).length;
+  const scopedDrift = project === "all" || !drift.project || drift.project === project;
   return (
     <div className="px-4 lg:px-8 pt-4 pb-10 space-y-5 max-w-[68rem]">
+      <header className="flex flex-wrap items-end gap-3">
+        <div>
+          <div className="slabel">workspace</div>
+          <h1 className="text-section font-semibold text-ink-100 mt-1">
+            {project === "all" ? "All projects" : project}
+          </h1>
+        </div>
+        <span className="kicker">
+          exact project ownership · unresolved work stays visible
+        </span>
+      </header>
       {(data.github.state === "unavailable" || !data.daemon.reachable) && (
         <div className="card border-warn/40 px-4 py-3 text-secondary text-warn">
           {data.github.state === "unavailable" && (
@@ -248,61 +363,37 @@ export default function OverviewView({
       )}
 
       {data.monitoring && (
-        <MonitoringView data={data.monitoring} readOnly={readOnly} onAck={onAck} />
+        <MonitoringView
+          data={data.monitoring}
+          project={project}
+          readOnly={readOnly}
+          onAck={onAck}
+        />
       )}
 
       <section>
-        <div className="slabel mb-2">needs me</div>
-        {data.needs_me.length === 0 ? (
+        <div className="slabel mb-2">needs me · {project === "all" ? "all projects" : project}</div>
+        {scopedNeeds.length === 0 ? (
           <div className="card px-4 py-6 text-center text-label text-ink-500">
-            nothing waiting on a human
+            nothing waiting on a human for this project
           </div>
         ) : (
-          <div className="space-y-1.5">
-            {data.needs_me.map((n, i) => (
-              <div
-                key={i}
-                className="card px-3.5 py-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5"
-              >
-                <span className={`chip ${KIND_CHIP[n.kind] ?? "bg-ink-800 text-ink-400"}`}>
-                  {KIND_LABEL[n.kind] ?? n.kind}
-                </span>
-                <span className="num text-label text-ink-500 w-9 shrink-0">
-                  {age(n.age)}
-                </span>
-                <span className="min-w-0 flex-1 basis-[12rem] text-label text-ink-200">
-                  {n.link ? (
-                    <a
-                      href={n.link}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="hover:text-accent"
-                    >
-                      {n.title}
-                    </a>
-                  ) : (
-                    n.title
-                  )}
-                  {n.project && (
-                    <span className="text-ink-500"> · {n.project}</span>
-                  )}
-                </span>
-                <span className="flex basis-full sm:basis-auto items-center gap-1.5 min-w-0">
-                  <code className="num text-micro text-ink-400 truncate max-w-[16rem] sm:max-w-[26rem]">
-                    {n.command}
-                  </code>
-                  <CopyButton text={n.command} />
-                </span>
-              </div>
-            ))}
-          </div>
+          <NeedRows rows={scopedNeeds} />
+        )}
+        {project !== "all" && globalNeeds.length > 0 && (
+          <details className="mt-4">
+            <summary className="cursor-pointer text-micro text-ink-400 hover:text-ink-200">
+              Global or unassigned observations · {globalNeeds.length}
+            </summary>
+            <div className="mt-2"><NeedRows rows={globalNeeds} /></div>
+          </details>
         )}
       </section>
 
       <section>
         <div className="slabel mb-2">deploy drift</div>
         <div className="card px-4 py-3.5">
-          {drift.known ? (
+          {scopedDrift && drift.known ? (
             drift.count === 0 ? (
               <div className="text-label text-ink-300">
                 <span className="text-ok">up to date</span> — {drift.project} is
@@ -333,19 +424,23 @@ export default function OverviewView({
                 )}
               </div>
             )
-          ) : (
+          ) : scopedDrift ? (
             <div className="text-label text-ink-500">
               {drift.reason ?? "cannot tell"}
+            </div>
+          ) : (
+            <div className="text-label text-ink-500">
+              deployment snapshot belongs to <span className="text-ink-200">{drift.project ?? "global host"}</span>; no drift is attributed to {project}
             </div>
           )}
         </div>
       </section>
 
-      {data.projects.length > 0 && (
+      {scopedProjects.length > 0 && (
         <section>
-          <div className="slabel mb-2">projects</div>
+          <div className="slabel mb-2">project summary</div>
           <div className="card divide-y divide-ink-700/60">
-            {data.projects.map((p) => {
+            {scopedProjects.map((p) => {
               const counts = Object.entries(p.open_by_status)
                 .sort(([a], [b]) => a.localeCompare(b))
                 .map(([k, v]) => `${k}:${v}`)
@@ -367,6 +462,11 @@ export default function OverviewView({
               );
             })}
           </div>
+          {otherProjectCount > 0 && (
+            <p className="text-micro text-ink-500 mt-2">
+              {otherProjectCount} other project summaries remain in All projects.
+            </p>
+          )}
         </section>
       )}
     </div>

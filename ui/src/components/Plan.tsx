@@ -25,17 +25,19 @@ const ITERS: [string, string, string, string][] = [
 export default function Plan() {
   return (
     <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
-      <div className="grid xl:grid-cols-3 gap-x-8 gap-y-10">
-        <div className="xl:col-span-2 space-y-16 max-w-[62rem]">
+      <div className="plan-grid grid xl:grid-cols-3 gap-x-8 gap-y-10">
+        <div className="xl:col-span-2 min-w-0 space-y-16 max-w-[62rem]">
           <section className="reveal">
             <div className="flex items-baseline gap-3 mb-4">
               <h2 className="text-section font-semibold text-ink-100">
-                Files are the truth
+                Cadence help
               </h2>
-              <span className="kicker">the board is a view</span>
+              <span className="kicker">implementation reference · not a project plan</span>
             </div>
             <p className="text-body leading-[1.55] max-w-[68ch]">
-              An internal tracker for one host and one operator. One folder per
+              This page explains the current Cadence implementation. It is static
+              help for the board, not the selected project&apos;s context or plan.
+              One folder per
               issue in a private directory outside every repo. The agent-notes
               chain keeps holding evidence. Cadence keeps holding runtime
               state. The board reads all three and writes only issue folders.
