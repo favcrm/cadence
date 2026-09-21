@@ -1,7 +1,13 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { fmtTime } from "../fmt";
-import type { Agent, AgentDetail, AgentsPayload } from "../types";
+import type {
+  Agent,
+  AgentDetail,
+  AgentTask,
+  AgentsPayload,
+  UsageLimit,
+} from "../types";
 
 const STATE_CHIP: Record<string, string> = {
   busy: "bg-info/10 text-info",
@@ -9,6 +15,9 @@ const STATE_CHIP: Record<string, string> = {
   stopped: "bg-ink-800 text-ink-400",
   attention: "bg-fail/10 text-fail",
   inbox: "bg-ink-800 text-ink-500",
+  approval: "bg-warn/10 text-warn",
+  queued: "bg-info/10 text-info",
+  "quota blocked": "bg-fail/10 text-fail",
 };
 
 const STATE_DOT: Record<string, string> = {
@@ -17,6 +26,9 @@ const STATE_DOT: Record<string, string> = {
   stopped: "bg-ink-600",
   attention: "bg-fail",
   inbox: "bg-ink-700",
+  approval: "bg-warn",
+  queued: "bg-info",
+  "quota blocked": "bg-fail",
 };
 
 /// Table order: fenced first, then working, idle, stopped, mailboxes.
@@ -31,7 +43,12 @@ function rank(a: Agent): number {
 function stateLabel(a: Agent): string {
   if (a.fenced) return "attention";
   if (a.inbox) return "inbox";
+  if (a.state === "blocked_by_quota" || a.quota?.state === "blocked") {
+    return "quota blocked";
+  }
+  if (a.state === "waiting_input") return "approval";
   if (a.running > 0) return "busy";
+  if (a.queued > 0) return "queued";
   return a.state;
 }
 
@@ -49,6 +66,221 @@ function RecoveryBlock({ text }: { text: string }) {
     <pre className="mt-1.5 whitespace-pre-wrap rounded border border-fail/30 bg-fail/5 px-2.5 py-2 text-micro text-fail/90 font-mono">
       {text}
     </pre>
+  );
+}
+
+const TERMINAL_TASK_STATES = new Set(["verified", "done", "cancelled", "failed"]);
+
+function activeTasks(a: Agent): AgentTask[] {
+  return (a.tasks ?? []).filter((task) => !TERMINAL_TASK_STATES.has(task.task_state));
+}
+
+function profileModel(a: Agent): { value: string; note: string; mismatch?: string } {
+  const effective = a.model_reported ?? a.model ?? null;
+  const configured = a.model_configured ?? null;
+  if (effective) {
+    return {
+      value: effective,
+      note: "confirmed",
+      mismatch:
+        configured && configured !== effective ? `configured ${configured}` : undefined,
+    };
+  }
+  if (configured) return { value: configured, note: "configured" };
+  if (a.model_source === "provider default") {
+    return { value: "provider default", note: "effective model unknown" };
+  }
+  return { value: "unknown", note: "no provider evidence" };
+}
+
+function profileEffort(a: Agent): { value: string; note: string } {
+  if (a.effort_applicable === false || a.effort_source === "not_applicable") {
+    return { value: "n/a", note: "provider does not report effort" };
+  }
+  const effective = a.effort_reported ?? null;
+  if (effective) return { value: effective, note: "confirmed" };
+  if (a.effort) return { value: a.effort, note: "configured" };
+  return { value: "unknown", note: "no provider evidence" };
+}
+
+function usageFor(a: Agent): UsageLimit | null {
+  return a.quota ?? a.usage_limit ?? null;
+}
+
+function usageText(a: Agent): { value: string; note: string; tone: string } {
+  const quota = usageFor(a);
+  if (!quota) {
+    return {
+      value: "unavailable",
+      note: "provider quota telemetry is not integrated",
+      tone: "text-ink-500",
+    };
+  }
+  const state = quota.state ?? "unknown";
+  if (state === "error") {
+    return { value: "error", note: quota.message ?? quota.reason ?? "quota query failed", tone: "text-fail" };
+  }
+  if (state === "stale") {
+    return {
+      value: "stale",
+      note: [
+        quota.observed_at ? `last update ${fmtTime(quota.observed_at)}` : "last update unknown",
+        quota.window,
+        quota.source ? `source ${quota.source}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      tone: "text-warn",
+    };
+  }
+  if (state === "blocked") {
+    return { value: "blocked", note: quota.reason ?? "provider reported a quota block", tone: "text-fail" };
+  }
+  if (state !== "available") {
+    return { value: "unknown", note: quota.reason ?? "allowance not reported", tone: "text-ink-500" };
+  }
+  // Null means unavailable; zero is a real value and must remain visible.
+  const unit = quota.unit ? ` ${quota.unit}` : "";
+  const remaining = quota.remaining != null ? `${quota.remaining}${unit} remaining` : null;
+  const used = quota.used != null ? `${quota.used}${unit} used` : null;
+  const limit = quota.limit != null ? `${quota.limit}${unit} limit` : null;
+  const usedAgainstLimit =
+    quota.used != null && quota.limit != null
+      ? `${quota.used}/${quota.limit}${unit} used`
+      : null;
+  const percent = quota.used_percent != null ? `${quota.used_percent}% used` : null;
+  const value = remaining ?? usedAgainstLimit ?? used ?? percent ?? limit ?? "available";
+  const window = quota.window ? `${quota.window}` : null;
+  const reset = quota.reset_at ? `reset ${fmtTime(quota.reset_at)}` : null;
+  const pool = quota.pool
+    ? `shared${quota.pool.label ? ` · ${quota.pool.label}` : ""}${
+        quota.pool.count != null ? ` · ${quota.pool.count} agents` : ""
+      }`
+    : null;
+  const poolAgents = quota.pool?.agents?.length
+    ? `agents ${quota.pool.agents.join(", ")}`
+    : null;
+  const lastUpdate = quota.updated_at ?? quota.observed_at;
+  return {
+    value,
+    note: [
+      window,
+      reset,
+      pool,
+      poolAgents,
+      lastUpdate ? `last update ${fmtTime(lastUpdate)}` : null,
+      quota.source ? `source ${quota.source}` : null,
+    ]
+      .filter(Boolean)
+      .join(" · ") || "reported",
+    tone: "text-ink-300",
+  };
+}
+
+function taskLabel(task: AgentTask): string {
+  const title = task.title ?? "untitled task";
+  const issue = task.issue ? `${task.issue} · ` : "";
+  const job = task.job_title ?? task.job;
+  const jobText = job ? ` · ${job}` : "";
+  return `${issue}${title}${jobText}`;
+}
+
+function WorkBlock({
+  agent,
+  onOpenIssue,
+}: {
+  agent: Agent;
+  onOpenIssue?: (id: string) => void;
+}) {
+  const tasks = activeTasks(agent);
+  const runningTaskIds = new Set(
+    (agent.running_messages ?? []).map((message) => message.task).filter(Boolean),
+  );
+  const work = tasks.map((task) => ({
+    task,
+    live: runningTaskIds.has(task.task),
+  }));
+  const blocked = agent.state === "blocked_by_quota" || agent.quota?.state === "blocked";
+  const approval = agent.state === "waiting_input";
+  if (work.length > 0) {
+    return (
+      <div className="space-y-1.5 min-w-0">
+        {blocked && <div className="text-fail">blocked by quota</div>}
+        {approval && <div className="text-warn">waiting for approval</div>}
+        {work.map(({ task, live }) => (
+          <div key={task.task} className="min-w-0">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <i className={`w-1.5 h-1.5 rounded-full shrink-0 ${live ? "bg-info" : "bg-ink-600"}`} />
+              {task.issue && onOpenIssue ? (
+                <button
+                  className="lnk num shrink-0"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onOpenIssue(task.issue);
+                  }}
+                >
+                  {task.issue}
+                </button>
+              ) : null}
+              <span className="truncate text-ink-200" title={taskLabel(task)}>
+                {task.title ?? task.task}
+              </span>
+            </div>
+            <div className="num text-micro text-ink-500 pl-3">
+              {live ? "running" : task.task_state}
+              {task.job_title ? ` · ${task.job_title}` : task.job ? ` · ${task.job}` : ""}
+              {task.job_state ? ` · stage ${task.job_state}` : ""}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (blocked) return <span className="text-fail">blocked by quota</span>;
+  if (approval) return <span className="text-warn">waiting for approval</span>;
+  if (agent.running > 0) {
+    const summaries = (agent.running_messages ?? [])
+      .map((message) => message.summary)
+      .filter((summary): summary is string => Boolean(summary))
+      .join(" · ");
+    const ids = (agent.running_messages ?? [])
+      .map((message) => message.id)
+      .filter(Boolean)
+      .join(" · ");
+    return (
+      <span className="text-info" title={summaries || ids || "ad-hoc running"}>
+        ad-hoc running{summaries ? ` · ${summaries}` : ids ? ` · ${ids}` : ""}
+      </span>
+    );
+  }
+  if (agent.queued > 0) return <span className="text-info">{agent.queued} queued</span>;
+  if (agent.unknown > 0) return <span className="text-fail">{agent.unknown} needs review</span>;
+  if (agent.inbox) return <span className="text-ink-500">mailbox</span>;
+  if (agent.state === "idle") return <span className="text-ink-500">idle · no active work</span>;
+  if (agent.state === "stopped") return <span className="text-ink-500">stopped · no active work</span>;
+  return <span className="text-ink-500">{agent.state || "unknown"}</span>;
+}
+
+function ProfileBlock({ agent }: { agent: Agent }) {
+  const model = profileModel(agent);
+  const effort = profileEffort(agent);
+  const usage = usageText(agent);
+  return (
+    <div className="space-y-1 min-w-[9rem]">
+      <div className="num text-ink-200 truncate" title={`${model.value} · ${model.note}`}>
+        {model.value}
+      </div>
+      <div className="num text-micro text-ink-500">
+        model {model.note}
+        {model.mismatch ? ` · ${model.mismatch}` : ""}
+      </div>
+      <div className="num text-ink-300">effort {effort.value}</div>
+      <div className="num text-micro text-ink-500">{effort.note}</div>
+      <div className={`num text-ink-300 ${usage.tone}`}>{usage.value}</div>
+      <div className="num text-micro text-ink-500" title={usage.note}>
+        {usage.note}
+      </div>
+    </div>
   );
 }
 
@@ -270,6 +502,11 @@ function AgentDrawer({
                             task {m.task}
                           </span>
                         )}
+                        {m.summary && (
+                          <span className="num text-micro text-ink-400 truncate" title={m.summary}>
+                            {m.summary}
+                          </span>
+                        )}
                         {m.created && (
                           <span className="num text-micro text-ink-500 ml-auto">
                             {fmtTime(m.created)}
@@ -349,15 +586,22 @@ function AgentDrawer({
 export default function Agents({
   payload,
   onOpenIssue,
+  loading = false,
+  error = null,
 }: {
   payload: AgentsPayload | null;
   onOpenIssue: (id: string) => void;
+  loading?: boolean;
+  error?: string | null;
 }) {
   const [open, setOpen] = useState<string | null>(null);
   const agents = (payload?.agents ?? [])
     .slice()
     .sort((a, b) => rank(a) - rank(b) || a.alias.localeCompare(b.alias));
   const totals = payload?.totals;
+  // A refresh error is an observation about the new request. It must not
+  // erase the last successful rows already held in `payload`.
+  const showRows = payload !== null || (!loading && !error);
 
   return (
     <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
@@ -380,8 +624,19 @@ export default function Agents({
         </div>
       )}
 
+      {loading && (
+        <div className="card mb-4 px-4 py-5 text-secondary text-ink-400" role="status">
+          loading agent observations…
+        </div>
+      )}
+      {error && (
+        <div className="card mb-4 px-4 py-5 text-secondary text-fail border-fail/40" role="alert">
+          could not load agent observations — {error}
+        </div>
+      )}
+
       {/* Phone: stacked agent cards — the table's columns don't fit 390px. */}
-      <div className="sm:hidden space-y-2.5 reveal" style={{ animationDelay: "80ms" }}>
+      {showRows && <div className="sm:hidden space-y-2.5 reveal" style={{ animationDelay: "80ms" }}>
         {agents.map((a) => {
           const st = stateLabel(a);
           return (
@@ -419,6 +674,12 @@ export default function Agents({
                 <span className="num text-ink-300">
                   {a.group_root ? "root" : a.group}
                 </span>
+                <span className="slabel">role</span>
+                <span className="num text-ink-300">{a.role ?? "unknown"}</span>
+                <span className="slabel">model</span>
+                <div><ProfileBlock agent={a} /></div>
+                <span className="slabel">current work</span>
+                <div className="min-w-0"><WorkBlock agent={a} onOpenIssue={onOpenIssue} /></div>
                 {a.on.length > 0 && (
                   <>
                     <span className="slabel">on issue</span>
@@ -481,19 +742,20 @@ export default function Agents({
             No agents registered.
           </div>
         )}
-      </div>
+      </div>}
 
-      <div className="hidden sm:block card overflow-hidden reveal" style={{ animationDelay: "80ms" }}>
-        <table className="w-full text-label">
+      {showRows && <div className="hidden sm:block card overflow-hidden reveal" style={{ animationDelay: "80ms" }}>
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[64rem] text-label">
           <thead>
             <tr className="border-b border-ink-700 text-left">
               <th className="slabel font-normal px-4 py-2.5">agent</th>
               <th className="slabel font-normal px-3 py-2.5">provider</th>
               <th className="slabel font-normal px-3 py-2.5">state</th>
               <th className="slabel font-normal px-3 py-2.5">group</th>
-              <th className="slabel font-normal px-3 py-2.5">on issue</th>
-              <th className="slabel font-normal px-3 py-2.5">running</th>
-              <th className="slabel font-normal px-3 py-2.5">queued</th>
+              <th className="slabel font-normal px-3 py-2.5">model / effort / usage</th>
+              <th className="slabel font-normal px-3 py-2.5">current work</th>
+              <th className="slabel font-normal px-3 py-2.5">queue</th>
               <th className="slabel font-normal px-3 py-2.5">last activity</th>
               <th className="slabel font-normal px-3 py-2.5">recovery</th>
             </tr>
@@ -509,8 +771,11 @@ export default function Agents({
                     a.fenced ? "bg-fail/[.04]" : ""
                   }`}
                 >
-                  <td className="px-4 py-2.5">
+                  <td className="px-4 py-2.5 align-top">
                     <span className="num text-ink-100">{a.alias}</span>
+                    <div className="num text-micro text-ink-500 truncate" title={a.role ?? "role unknown"}>
+                      {a.role ?? "role unknown"}
+                    </div>
                     {a.fenced && <RecoveryBlock text={a.recovery ?? "fenced"} />}
                   </td>
                   <td className="px-3 py-2.5 align-top">
@@ -530,37 +795,16 @@ export default function Agents({
                     </span>
                   </td>
                   <td className="px-3 py-2.5 align-top">
-                    <div className="flex flex-wrap gap-1">
-                      {a.on.map((id) => (
-                        <button
-                          key={id}
-                          className="lnk"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onOpenIssue(id);
-                          }}
-                        >
-                          {id}
-                        </button>
-                      ))}
-                    </div>
+                    <ProfileBlock agent={a} />
                   </td>
                   <td className="px-3 py-2.5 align-top">
-                    <span className="num text-ink-200">{a.running}</span>
-                    {a.message?.id && (
-                      <div
-                        className="num text-micro text-ink-500 mt-0.5"
-                        title={a.message.turn_id ?? undefined}
-                      >
-                        {a.message.id}
-                      </div>
-                    )}
+                    <WorkBlock agent={a} onOpenIssue={onOpenIssue} />
                   </td>
                   <td className="px-3 py-2.5 align-top">
                     <span className={`num ${a.unknown > 0 ? "text-fail" : "text-ink-200"}`}>
-                      {a.queued}
-                      {a.unknown > 0 ? ` +${a.unknown} unk` : ""}
+                      {a.running} running · {a.queued} queued
                     </span>
+                    {a.unknown > 0 && <div className="num text-micro text-fail mt-0.5">{a.unknown} unknown</div>}
                   </td>
                   <td className="px-3 py-2.5 align-top">
                     <span className="num text-ink-400">
@@ -599,14 +843,15 @@ export default function Agents({
             })}
             {agents.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-4 py-8 text-center text-ink-500">
+                <td colSpan={9} className="px-4 py-8 text-center text-ink-500">
                   No agents registered.
                 </td>
               </tr>
             )}
           </tbody>
         </table>
-      </div>
+        </div>
+      </div>}
 
       <footer className="mt-8 pt-4 border-t border-ink-700 text-label text-ink-500 num">
         daemon agent_list + agent_show · binding via tasks × jobs.issue_id ·
