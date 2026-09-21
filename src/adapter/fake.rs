@@ -70,6 +70,7 @@ impl ProviderAdapter for FakeAdapter {
             thread_id: format!("fake-thread-{}", agent.alias),
             session_id: format!("fake-session-{}", agent.alias),
             model: Some("fake-1".to_string()),
+            effort: None,
             pid: std::process::id(),
             endpoint: None,
             generation: None,
