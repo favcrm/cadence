@@ -1,5 +1,5 @@
 #!/bin/sh
-# CAD-173: compare the complete integration test inventory without running it.
+# CAD-173: compare a complete Rust test inventory without running it.
 # Both manifests must be non-empty before diffing; an empty command result is
 # dependency failure, never proof of equivalent coverage.
 set -eu
@@ -16,10 +16,26 @@ die() {
 
 command -v jq >/dev/null 2>&1 || die "jq is required to parse nextest list JSON"
 
+case "$TARGET" in
+    integration)
+        CARGO_TARGET_ARGS="--test integration"
+        NEXTEST_TARGET_ARGS="--test integration"
+        ;;
+    all-targets)
+        CARGO_TARGET_ARGS="--all-targets"
+        NEXTEST_TARGET_ARGS="--all-targets"
+        ;;
+    *)
+        die "unsupported target '$TARGET' (use integration or all-targets)"
+        ;;
+esac
+
 # libtest prints one `name: test` line per case. Keep only those lines so
 # cargo warnings and the final summary cannot masquerade as test names.
-cargo test --manifest-path "$ROOT/Cargo.toml" --test "$TARGET" -- --list >"$TMP/cargo.list" ||
-    die "cargo test --test $TARGET -- --list failed"
+# Fixed target arguments are selected above, so this unquoted expansion is
+# deliberately a two-argument Cargo invocation for either inventory mode.
+cargo test --manifest-path "$ROOT/Cargo.toml" $CARGO_TARGET_ARGS --locked -- --list >"$TMP/cargo.list" ||
+    die "cargo inventory for $TARGET failed"
 awk '
     /^[[:space:]]*[^[:space:]].*: test[[:space:]]*$/ {
         sub(/^[[:space:]]+/, ""); sub(/[[:space:]]*: test[[:space:]]*$/, ""); print
@@ -27,7 +43,7 @@ awk '
 ' "$TMP/cargo.list" | sort -u >"$TMP/cargo.names"
 
 # nextest's documented JSON list exposes each suite's `testcases` map.
-"$ROOT/scripts/cadence-nextest" list --test "$TARGET" --message-format json \
+"$ROOT/scripts/cadence-nextest" list $NEXTEST_TARGET_ARGS --locked --message-format json \
     >"$TMP/nextest.json" || die "pinned nextest list failed"
 jq -er '
     [."rust-suites"[]?.testcases? | keys[]] | unique | .[]
@@ -38,7 +54,7 @@ jq -er '
 [ -s "$TMP/nextest.names" ] || die "nextest inventory is empty"
 
 if ! diff -u "$TMP/cargo.names" "$TMP/nextest.names"; then
-    die "cargo and nextest inventories differ for --test $TARGET"
+    die "cargo and nextest inventories differ for $TARGET"
 fi
 
 count=$(wc -l <"$TMP/cargo.names" | tr -d ' ')

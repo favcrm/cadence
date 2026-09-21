@@ -5,6 +5,13 @@ on:
   push:
     branches: [main, 'feat/**']
 
+# A new commit supersedes an in-flight PR run, but protected main pushes and
+# separate PR numbers never cancel one another. Pushes from feat/** retain
+# their own non-canceling ref group, so the existing trigger remains explicit.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -15,6 +22,7 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal --component rustfmt
@@ -22,20 +30,51 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal --component clippy
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal
-      - run: cargo test --all-targets
+      # PR93 is an explicit dependency of this CI follow-up. Its installer
+      # and wrapper verify the reviewed archive/binary, force retries=0, and
+      # force --no-tests fail; no tool is installed into PATH or the repo.
+      - name: Install pinned cargo-nextest (PR93 dependency)
+        env:
+          CADENCE_NEXTTEST_INSTALL_DIR: ${{ runner.temp }}/cadence-nextest-0.9.145
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          scripts/install-cadence-nextest
+          echo "CADENCE_NEXTTEST_BIN=${RUNNER_TEMP}/cadence-nextest-0.9.145/cargo-nextest" >> "$GITHUB_ENV"
+      # The all-targets inventory must be non-empty and exactly equal between
+      # Cargo and nextest before the process-per-test runner starts. This
+      # covers lib, bin, board, and integration; it is not integration-only.
+      - name: Verify all-targets inventory parity
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: scripts/nextest-inventory all-targets
+      - name: Run all Rust targets with pinned nextest
+        env:
+          CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          CARGO_BUILD_JOBS: 4
+        run: scripts/cadence-nextest --all-targets --locked
+      # cargo-nextest intentionally does not execute Rust doctests. Keep
+      # doctests visible as a separate locked Cargo step rather than silently
+      # dropping that coverage from cargo test --all-targets semantics.
+      - name: Run Rust doctests with locked Cargo
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: cargo test --doc --locked
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install stable --profile minimal
@@ -43,6 +82,7 @@ jobs:
 
   ui:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: ui
