@@ -494,7 +494,7 @@ fn validate_monitor_alert_response<'a>(
         }
         if !matches!(
             alert.get("state").and_then(Value::as_str),
-            Some("open") | Some("acknowledged")
+            Some("open") | Some("acknowledged") | Some("resolved")
         ) {
             return Err(format!("monitor_alerts row {index} has unsupported state"));
         }

@@ -79,9 +79,6 @@ const WAL_TICK: Duration = Duration::from_secs(60);
 /// carry their own interval; this tick only bounds how soon a due check
 /// starts after its deadline.
 const MONITOR_TICK: Duration = Duration::from_secs(1);
-/// Provider allowance evidence is admission evidence, not a standing grant.
-/// Without a fresh provider-tagged sample the automatic path fails closed.
-const QUOTA_EVIDENCE_MAX_AGE_SECS: f64 = 300.0;
 /// The daemon's own event stream — `wal_checkpointed` lands here.
 /// Readable via `cadence events daemon`; not a sendable alias.
 const DAEMON_ALIAS: &str = Store::DAEMON_STREAM;
@@ -2544,57 +2541,51 @@ impl Shared {
         self.monitor_dispatch_task(monitor_id, task_id, false)
     }
 
-    fn automatic_quota_error(agent: &Agent) -> Option<String> {
-        let quota = agent.params.as_ref().and_then(|params| {
-            params
-                .get("quota")
-                .or_else(|| params.get("usage_limit"))
-                .filter(|value| !value.is_null())
-        });
-        let Some(quota) = quota else {
-            return Some("quota unknown: no account allowance telemetry".to_string());
-        };
-        if quota.get("source").and_then(Value::as_str) != Some("provider") {
-            return Some("quota unknown: provider evidence source is not declared".to_string());
-        }
-        if quota.get("agent").and_then(Value::as_str) != Some(agent.alias.as_str()) {
-            return Some("quota unknown: allowance is not bound to this agent".to_string());
-        }
-        let Some(observed_at) = quota.get("observed_at").and_then(Value::as_f64) else {
-            return Some("quota unknown: provider evidence has no timestamp".to_string());
-        };
-        let age = epoch_secs() - observed_at;
-        if !age.is_finite() || age < -30.0 || age > QUOTA_EVIDENCE_MAX_AGE_SECS {
-            return Some("quota unknown: provider allowance evidence is stale".to_string());
-        }
-        let Some(state) = quota.get("state").and_then(Value::as_str) else {
-            return Some("quota unknown: allowance telemetry has no state".to_string());
-        };
-        if state != "available" {
-            return Some(format!(
-                "quota {}",
-                quota.get("reason").and_then(Value::as_str).unwrap_or(state)
-            ));
-        }
-        if quota.get("unlimited").and_then(Value::as_bool) == Some(true) {
-            return None;
-        }
-        if quota.get("used_percent").and_then(Value::as_f64) == Some(100.0) {
-            return Some("quota exhausted".to_string());
-        }
-        match quota.get("remaining").and_then(Value::as_i64) {
-            Some(remaining) if remaining > 0 => None,
-            Some(_) => Some("quota exhausted".to_string()),
-            None => Some("quota unknown: allowance telemetry has no remaining count".to_string()),
-        }
-    }
-
     fn monitor_dispatch_task(
         self: &Arc<Self>,
         monitor_id: &str,
         task_id: &str,
         automatic: bool,
     ) -> Result<Value> {
+        if automatic {
+            // Hold the pending-request mutex across the store transaction.
+            // The snapshot contains every alias, while the transaction
+            // re-reads the task's current assignee before applying it, so an
+            // approval arriving concurrently cannot be missed or bypassed.
+            let pending = self.pending.lock().unwrap();
+            let pending_aliases: HashSet<String> = pending
+                .values()
+                .map(|request| request.alias.clone())
+                .collect();
+            let (task, message, duplicate, behind_dead) =
+                self.store.dispatch_automatic_monitor_task(
+                    monitor_id,
+                    task_id,
+                    &pending_aliases,
+                    &format!("monitor:{monitor_id}"),
+                )?;
+            drop(pending);
+            let assignee = task.assignee.clone().ok_or_else(|| {
+                Error::internal("automatic dispatch returned a task without an assignee")
+            })?;
+            let _ = self.store.event_public(
+                store::Store::DAEMON_STREAM,
+                "monitor_dispatch",
+                json!({"monitor": monitor_id, "task": task_id,
+                       "message": message, "duplicate": duplicate,
+                       "queued_behind_dead": behind_dead,
+                       "automatic": true}),
+            );
+            self.notify_agent(&assignee);
+            self.wake();
+            return Ok(json!({
+                "monitor": monitor_id,
+                "task": task.to_json(),
+                "message": message,
+                "duplicate": duplicate,
+                "queued_behind_dead": behind_dead,
+            }));
+        }
         let monitor = self.store.monitor(monitor_id)?;
         if monitor.state != "active" {
             return Err(Error::rejected(format!(
@@ -2627,6 +2618,12 @@ impl Shared {
             if let Some((task, message, duplicate, behind_dead)) =
                 self.store.duplicate_task_dispatch(task_id)?
             {
+                self.store.resolve_monitor_dispatch_blocked(
+                    monitor_id,
+                    task_id,
+                    epoch_secs(),
+                    "monitor_dispatch",
+                )?;
                 // The durable job-dispatch row is already the idempotency
                 // evidence for an automatic retry. Manual RPC callers keep
                 // their historical event for every explicit invocation;
@@ -2679,11 +2676,6 @@ impl Shared {
                 "Assignee '{assignee}' is a mailbox, not a dispatchable worker"
             )));
         }
-        if automatic {
-            if let Some(reason) = Self::automatic_quota_error(&agent) {
-                return Err(Error::rejected(reason));
-            }
-        }
         // The fake provider is an in-process fixture and deliberately has no
         // transport endpoint. Every real actor publishes one when open.
         let live_endpoint =
@@ -2731,6 +2723,12 @@ impl Shared {
         let (task, message, duplicate, behind_dead) =
             self.store
                 .dispatch_task(task_id, None, None, &format!("monitor:{monitor_id}"))?;
+        self.store.resolve_monitor_dispatch_blocked(
+            monitor_id,
+            task_id,
+            epoch_secs(),
+            "monitor_dispatch",
+        )?;
         let _ = self.store.event_public(
             store::Store::DAEMON_STREAM,
             "monitor_dispatch",

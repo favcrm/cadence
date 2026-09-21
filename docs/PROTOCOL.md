@@ -857,7 +857,7 @@ acknowledged, paste_not_rendered, delivery_parked, inbox_read,
 params_updated, reconciled, relaunch_skipped, attention,
 turn_stalled, turn_resumed, monitor_registered, monitor_alert,
 monitor_alert_ack, monitor_degraded, monitor_dispatch,
-monitor_dispatch_blocked, monitor_off,
+monitor_dispatch_blocked, monitor_dispatch_resolved, monitor_off,
 stop_requested`. `wait>0` long-polls
 up to 30s.
 
@@ -975,7 +975,9 @@ missing event, an idle row, or a successful database read.
 Only concrete, task-scoped events from the monitor's explicit coverage
 can create alerts. `(monitor, event fingerprint)` is unique, so a crash
 or restart can repeat a read without creating a duplicate alert. Alerts
-are local records with `open`/`acknowledged` state. Delivery is reported
+are local records with `open`, `acknowledged`, or `resolved` state. A
+dispatch-blocked alert moves to `resolved` when the covered task acquires a
+durable kickoff; operator acknowledgement remains a separate action. Delivery is reported
 separately as `{configured:false,state:"unconfigured"}` in this bounded
 increment; no provider, GitHub, or production notification is activated.
 

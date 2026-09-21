@@ -30,6 +30,56 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 
+/// Provider allowance evidence is admission evidence, not a standing grant.
+/// Automatic dispatch fails closed when the latest provider-tagged sample is
+/// absent, stale, or says that no allowance remains.
+const QUOTA_EVIDENCE_MAX_AGE_SECS: f64 = 300.0;
+
+fn automatic_quota_error(agent: &Agent) -> Option<String> {
+    let quota = agent.params.as_ref().and_then(|params| {
+        params
+            .get("quota")
+            .or_else(|| params.get("usage_limit"))
+            .filter(|value| !value.is_null())
+    });
+    let Some(quota) = quota else {
+        return Some("quota unknown: no account allowance telemetry".to_string());
+    };
+    if quota.get("source").and_then(Value::as_str) != Some("provider") {
+        return Some("quota unknown: provider evidence source is not declared".to_string());
+    }
+    if quota.get("agent").and_then(Value::as_str) != Some(agent.alias.as_str()) {
+        return Some("quota unknown: allowance is not bound to this agent".to_string());
+    }
+    let Some(observed_at) = quota.get("observed_at").and_then(Value::as_f64) else {
+        return Some("quota unknown: provider evidence has no timestamp".to_string());
+    };
+    let age = now() - observed_at;
+    if !age.is_finite() || age < -30.0 || age > QUOTA_EVIDENCE_MAX_AGE_SECS {
+        return Some("quota unknown: provider allowance evidence is stale".to_string());
+    }
+    let Some(state) = quota.get("state").and_then(Value::as_str) else {
+        return Some("quota unknown: allowance telemetry has no state".to_string());
+    };
+    if state != "available" {
+        return Some(format!(
+            "quota {}",
+            quota.get("reason").and_then(Value::as_str).unwrap_or(state)
+        ));
+    }
+    if quota.get("unlimited").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    if quota.get("used_percent").and_then(Value::as_f64) == Some(100.0) {
+        return Some("quota exhausted".to_string());
+    }
+    match quota.get("remaining").and_then(Value::as_i64) {
+        Some(remaining) if remaining > 0 => None,
+        Some(_) => Some("quota exhausted".to_string()),
+        None => Some("quota unknown: allowance telemetry has no remaining count".to_string()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub seq: i64,
@@ -3033,6 +3083,213 @@ impl Store {
         Ok(live_id.map(|message| (task, message, true, false)))
     }
 
+    /// Dispatch a covered task from the automatic monitor path. Every
+    /// durable admission fact that can race another monitor tick — monitor
+    /// scope, task/job state, worker identity, provider allowance evidence,
+    /// pending approval snapshot, queue occupancy, and unfinished work — is
+    /// read under the same SQLite transaction that enqueues the kickoff.
+    ///
+    /// `pending_aliases` is collected while the daemon holds its pending
+    /// request mutex. The lock order is therefore pending map -> store
+    /// connection, matching the other approval paths and making the
+    /// approval guard part of this admission boundary.
+    pub fn dispatch_automatic_monitor_task(
+        &self,
+        monitor_id: &str,
+        task_id: &str,
+        pending_aliases: &HashSet<String>,
+        by: &str,
+    ) -> Result<(Task, String, bool, bool)> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let monitor = self.monitor_in(&tx, monitor_id)?;
+        if monitor.state != "active" {
+            return Err(Error::rejected(format!(
+                "Monitor '{monitor_id}' is {} — dispatch requires an active check",
+                monitor.state
+            )));
+        }
+        if !monitor.dispatch_enabled {
+            return Err(Error::rejected(format!(
+                "Monitor '{monitor_id}' has dispatch disabled — enable it explicitly at registration"
+            )));
+        }
+        if !monitor.auto_dispatch_enabled {
+            return Err(Error::rejected(format!(
+                "Monitor '{monitor_id}' has automatic dispatch disabled — opt in explicitly at registration"
+            )));
+        }
+        if !self
+            .monitor_coverage_in(&tx, monitor_id)?
+            .iter()
+            .any(|covered| covered == task_id)
+        {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is outside monitor '{monitor_id}' coverage"
+            )));
+        }
+
+        let task = self.task_in(&tx, task_id)?;
+        let job = self.job_in(&tx, &task.job_id)?;
+        if job.state != "open" || job.repo.as_deref() != Some(monitor.project.as_str()) {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is not in monitor project '{}' with an open job",
+                monitor.project
+            )));
+        }
+        let assignee = task
+            .assignee
+            .as_deref()
+            .ok_or_else(|| Error::rejected(format!("Task '{task_id}' has no explicit assignee")))?;
+        let worker = self.agent_in(&tx, assignee)?;
+        self.check_group_member(&job, &worker)?;
+
+        // A retry of a still-live kickoff is idempotent and must remain
+        // possible even if the worker is now busy or has a pending prompt.
+        if matches!(task.state.as_str(), "dispatched" | "running") {
+            let live_id = task
+                .dispatch_message
+                .as_deref()
+                .and_then(|message| self.message_in(&tx, message).ok().flatten())
+                .filter(|message| !is_terminal(&message.state))
+                .map(|message| message.id);
+            if let Some(live_id) = live_id {
+                self.resolve_monitor_dispatch_blocked_tx(&tx, monitor_id, task_id, now(), by)?;
+                tx.commit()?;
+                return Ok((task, live_id, true, false));
+            }
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' has no live kickoff — only draft or revising tasks are eligible"
+            )));
+        }
+        if !matches!(task.state.as_str(), "draft" | "revising") {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' is '{}' — only draft or revising tasks are eligible",
+                task.state
+            )));
+        }
+        if task
+            .acceptance
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(Error::rejected(format!(
+                "Task '{task_id}' has no acceptance criteria — dispatch is refused"
+            )));
+        }
+        if !registry::has_actor(&worker.provider, &worker.endpoint_kind) {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' is a mailbox, not a dispatchable worker"
+            )));
+        }
+        if let Some(reason) = automatic_quota_error(&worker) {
+            return Err(Error::rejected(reason));
+        }
+        // The fake provider is an in-process fixture and deliberately has no
+        // transport endpoint. Real actors publish one when open.
+        let live_endpoint = worker.endpoint.is_some()
+            || (worker.provider == "fake" && worker.endpoint_kind == "fake");
+        if !worker.enabled || !live_endpoint || worker.state != "idle" {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' is not demonstrably idle and live (state {}, endpoint {})",
+                worker.state, live_endpoint
+            )));
+        }
+        if registry::ready_gate(&worker.provider, &worker.endpoint_kind)
+            && worker
+                .params
+                .as_ref()
+                .and_then(|params| params.get("auto_ready"))
+                .and_then(Value::as_str)
+                != Some("verified")
+        {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' requires an explicit readiness claim; automatic dispatch is refused"
+            )));
+        }
+        if pending_aliases.contains(assignee) {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' is waiting on an approval request"
+            )));
+        }
+        let queued: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'",
+            [assignee],
+            |row| row.get(0),
+        )?;
+        if queued > 0 {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' has queued work; dispatch is refused"
+            )));
+        }
+        let unfinished: Option<String> = tx
+            .query_row(
+                "SELECT id FROM tasks
+                 WHERE assignee=? AND id<>?
+                   AND state NOT IN ('verified','done','cancelled','failed')
+                 ORDER BY updated LIMIT 1",
+                params![assignee, task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if unfinished.is_some() {
+            return Err(Error::rejected(format!(
+                "Assignee '{assignee}' already has unfinished task work"
+            )));
+        }
+
+        let revision = task.revision + 1;
+        let attempt: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE task_id=? AND source='job_dispatch'",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let kickoff = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("cadence-dispatch:{task_id}:r{revision}:a{attempt}").as_bytes(),
+        )
+        .simple()
+        .to_string();
+        let body = kickoff_body(&job, &task, revision, &kickoff, &worker);
+        let reply_to = (assignee != job.pm_alias).then_some(job.pm_alias.as_str());
+        let (duplicate, _state) = self.enqueue_tx(
+            &tx,
+            assignee,
+            &body,
+            reply_to,
+            &kickoff,
+            "job_dispatch",
+            Some(task_id),
+        )?;
+        if duplicate {
+            tx.commit()?;
+            return Ok((task, kickoff, true, false));
+        }
+        let at = now();
+        tx.execute(
+            "UPDATE tasks SET state='dispatched',revision=?,assignee=?,
+             dispatch_message=?,head_sha=NULL,error=NULL,updated=?
+             WHERE id=?",
+            params![revision, assignee, kickoff, at, task_id],
+        )?;
+        Self::event_scoped(
+            &tx,
+            &job.pm_alias,
+            "task_dispatched",
+            json!({"task": task_id, "job": job.id, "assignee": assignee,
+                   "revision": revision, "message": kickoff, "by": by,
+                   "automatic": true}),
+            Some(&job.id),
+            Some(task_id),
+        )?;
+        self.resolve_monitor_dispatch_blocked_tx(&tx, monitor_id, task_id, at, by)?;
+        let dispatched = self.task_in(&tx, task_id)?;
+        tx.commit()?;
+        let behind_dead = worker.endpoint.is_none()
+            && registry::has_actor(&worker.provider, &worker.endpoint_kind);
+        Ok((dispatched, kickoff, false, behind_dead))
+    }
+
     pub fn monitor_heartbeat(&self, id: &str) -> Result<Monitor> {
         let conn = self.conn.lock().unwrap();
         let t = now();
@@ -3219,12 +3476,13 @@ impl Store {
         let action =
             "Inspect the guard reason, resolve the explicit task/worker prerequisite, then retry";
         let seq = if let Some((seq, event_seq, state, previous_reason)) = previous {
-            let next_state =
-                if state == "acknowledged" && previous_reason.as_deref() != Some(reason) {
-                    "open"
-                } else {
-                    state.as_str()
-                };
+            let next_state = match state.as_str() {
+                // A later refusal is a new episode after a successful
+                // dispatch; make the durable alert visible again.
+                "resolved" => "open",
+                "acknowledged" if previous_reason.as_deref() != Some(reason) => "open",
+                state => state,
+            };
             let payload = json!({
                 "monitor": id,
                 "task_id": task_id,
@@ -3286,6 +3544,88 @@ impl Store {
         };
         tx.commit()?;
         self.monitor_alert_in(&conn, seq)
+    }
+
+    /// Close a dispatch-blocked alert once the same covered task has a
+    /// durable kickoff. This is a state transition backed by the dispatch
+    /// transaction for automatic work; the public method lets an explicit
+    /// operator dispatch repair the same stale alert as well.
+    fn resolve_monitor_dispatch_blocked_tx(
+        &self,
+        tx: &Connection,
+        id: &str,
+        task_id: &str,
+        at: f64,
+        by: &str,
+    ) -> Result<()> {
+        let fingerprint = format!("dispatch-blocked:{task_id}");
+        let Some((seq, state, payload)) = tx
+            .query_row(
+                "SELECT seq,state,payload FROM monitor_alerts
+                 WHERE monitor_id=? AND fingerprint=?",
+                params![id, fingerprint],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
+        if state == "resolved" {
+            return Ok(());
+        }
+        let mut payload = serde_json::from_str::<Value>(&payload).unwrap_or_else(|_| json!({}));
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("resolved_at".to_string(), json!(at));
+            object.insert(
+                "resolution".to_string(),
+                json!("automatic dispatch succeeded"),
+            );
+            object.insert("resolved_by".to_string(), json!(by));
+        } else {
+            payload = json!({
+                "monitor": id,
+                "task_id": task_id,
+                "resolved_at": at,
+                "resolution": "automatic dispatch succeeded",
+                "resolved_by": by,
+            });
+        }
+        tx.execute(
+            "UPDATE monitor_alerts SET payload=?,state='resolved',last_error=NULL,
+             updated=? WHERE seq=?",
+            params![payload.to_string(), at, seq],
+        )?;
+        Self::event_scoped(
+            tx,
+            Self::DAEMON_STREAM,
+            "monitor_dispatch_resolved",
+            json!({"monitor": id, "task": task_id, "alert": seq,
+                   "by": by, "automatic": by.starts_with("monitor:")}),
+            None,
+            Some(task_id),
+        )?;
+        Ok(())
+    }
+
+    pub fn resolve_monitor_dispatch_blocked(
+        &self,
+        id: &str,
+        task_id: &str,
+        at: f64,
+        by: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        self.monitor_in(&tx, id)?;
+        self.resolve_monitor_dispatch_blocked_tx(&tx, id, task_id, at, by)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn stop_monitor(&self, id: &str) -> Result<Monitor> {
