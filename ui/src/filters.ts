@@ -43,8 +43,13 @@ export function readFilters(q: URLSearchParams): BoardFilters {
 
 export function writeFilters(q: URLSearchParams, f: BoardFilters) {
   for (const [facet, key] of PARAMS) {
+    // The caller starts from the current query string so unrelated state such
+    // as the selected project/view survives. Remove each managed key first so
+    // clearing a facet cannot leave stale filters in a copied URL.
+    q.delete(key);
     if (f[facet].length) q.set(key, f[facet].join(","));
   }
+  q.delete("group");
   if (f.groupByEpic) q.set("group", "epic");
 }
 
