@@ -104,9 +104,13 @@ printf '  - provider quota exhaustion admission/recovery: no job/monitor quota c
 unsupported=$((unsupported + 1))
 printf '  - policy-authorized merge: job accept records merged_sha evidence; Cadence does not execute or authorize git/GitHub merge\n'
 unsupported=$((unsupported + 1))
+printf '  - moved PR head between review and merge: local task SHA guards pass, but no remote head watch or merge binding exists in this fixture\n'
+unsupported=$((unsupported + 1))
 printf '  - exactly one actionable UI escalation per unresolved cause: local alert dedupe exists, delivery is unconfigured and no coordinator escalation state exists\n'
 unsupported=$((unsupported + 1))
 printf '  - real-provider smoke and actual deployed-version proof: intentionally omitted; no live credentials, daemon activation, or deployment is allowed in this fixture gate\n'
+unsupported=$((unsupported + 1))
+printf '  - independently reviewed lesson promotion and later dispatch injection: retro is a preview and memory acceptance remains a separate curator action\n'
 
 result=PASS
 exit_code=0
