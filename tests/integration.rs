@@ -6363,6 +6363,112 @@ impl TestDaemon {
     }
 }
 
+/// Emit a test-only timing trace for a routed PTY delivery. The daemon's
+/// durable event/message timestamps are the phase clock here: using them
+/// avoids charging the test's 50ms RPC polling to a render or retry phase.
+/// A `submitting` row is the durable attempt-start boundary and a
+/// `paste_not_rendered` row is its completion. The next `submitting` row is
+/// the observable retry wake; no separate wake event exists. This is evidence
+/// for the follow-up audit, not a change to the delivery contract.
+fn emit_park_phase_trace(d: &TestDaemon, test_name: &str, alias: &str, routed_id: &str) {
+    fn at(value: &Value) -> Option<f64> {
+        value["at"].as_f64()
+    }
+
+    fn delta(start: Option<f64>, end: Option<f64>) -> Value {
+        match (start, end) {
+            (Some(start), Some(end)) if end >= start => json!(end - start),
+            _ => Value::Null,
+        }
+    }
+
+    let events = d.events(alias);
+    let starts: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "submitting" && event["payload"]["message"].as_str() == Some(routed_id)
+        })
+        .collect();
+    let misses: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event["kind"] == "paste_not_rendered"
+                && event["payload"]["message"].as_str() == Some(routed_id)
+        })
+        .collect();
+    let parked = events.iter().find(|event| {
+        event["kind"] == "delivery_parked"
+            && event["payload"]["message"].as_str() == Some(routed_id)
+    });
+    let show = d.rpc("agent_show", json!({"alias": alias})).unwrap();
+    let message = show["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().find(|message| message["id"] == routed_id));
+    let enqueue_at = message.and_then(|message| message["created"].as_f64());
+    let attempt_phases: Vec<Value> = misses
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let started_at = starts.get(index).and_then(|event| at(event));
+            json!({
+                "attempt": index + 1,
+                "started_at_epoch_s": started_at,
+                "completion_at_epoch_s": at(event),
+                "enqueue_to_start_s": if index == 0 {
+                    delta(enqueue_at, started_at)
+                } else {
+                    Value::Null
+                },
+                "render_attempt_s": delta(started_at, at(event)),
+                "retry": event["payload"]["retry"],
+            })
+        })
+        .collect();
+    let retry_phases: Vec<Value> = misses
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| {
+            json!({
+                "after_attempt": index + 1,
+                "retry_wake_at_epoch_s": starts.get(index + 1).and_then(|event| at(event)),
+                "retry_to_next_attempt_start_s": delta(
+                    at(pair[0]),
+                    starts.get(index + 1).and_then(|event| at(event)),
+                ),
+            })
+        })
+        .collect();
+    let parked_at = parked.and_then(at);
+    let completed_at = message.and_then(|message| message["completed"].as_f64());
+    let final_agent = show.get("agent").map(|agent| {
+        json!({
+            "state": agent["state"],
+            "dead": agent["dead"],
+            "updated_epoch_s": agent["updated"],
+        })
+    });
+    let report = json!({
+        "schema": "cad173.e4a.phase-trace.v1",
+        "test": test_name,
+        "alias": alias,
+        "message": routed_id,
+        "enqueue_at_epoch_s": enqueue_at,
+        "attempts": attempt_phases,
+        "submitting_events": starts.len(),
+        "retry_gaps": retry_phases,
+        "park_at_epoch_s": parked_at,
+        "park_after_attempt4_s": delta(misses.last().and_then(|event| at(event)), parked_at),
+        "failed_state_at_epoch_s": completed_at,
+        "park_to_failed_state_s": delta(parked_at, completed_at),
+        "enqueue_to_failed_state_s": delta(enqueue_at, completed_at),
+        "message_state": message.map(|message| message["state"].clone()),
+        "agent": final_agent,
+        "clock": "durable events.at and messages.created/completed (epoch seconds)",
+        "attempt_boundary": "submitting event is attempt start; paste_not_rendered is completion; next submitting event is the retry wake",
+    });
+    eprintln!("CAD173_E4A_PHASE {report}");
+}
+
 #[test]
 fn inbox_registers_as_durable_mailbox() {
     let d = TestDaemon::start();
@@ -7451,6 +7557,12 @@ fn pty_unrendered_worker_result_requeues_then_parks() {
     // Delivered = render-verified `running` (a task then awaits an
     // explicit report, so the agent correctly stays busy on it).
     d.wait_message("pm", "after", &["running"], 20);
+    emit_park_phase_trace(
+        &d,
+        "pty_unrendered_worker_result_requeues_then_parks",
+        "pm",
+        &routed_id,
+    );
 }
 
 #[test]
@@ -9799,6 +9911,7 @@ fn job_event_parks_on_unrendered_pty_pm() {
     d.wait_agent("pm", "idle", 15);
     let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap()["agent"].clone();
     assert_eq!(pm["dead"], false);
+    emit_park_phase_trace(&d, "job_event_parks_on_unrendered_pty_pm", "pm", parked_id);
 }
 
 #[test]
