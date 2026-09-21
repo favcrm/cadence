@@ -1511,13 +1511,18 @@ fn read_body(text: Option<String>, file: Option<PathBuf>) -> Result<String> {
 /// passes [`cadence_agent::issue::report::BODY_MAX`]; the cap error
 /// itself comes from `report::file`).
 fn read_body_capped(text: Option<String>, file: Option<PathBuf>, max: u64) -> Result<String> {
+    // Read one byte beyond a bounded body so the caller can reject an
+    // oversized input without buffering it in full. `u64::MAX` is the
+    // uncapped send path; saturating keeps that path from overflowing
+    // while still being effectively unlimited for any file or stdin.
+    let read_limit = max.saturating_add(1);
     if let Some(text) = text {
         return Ok(text);
     }
     if let Some(file) = file {
         let mut body = String::new();
         std::fs::File::open(&file)?
-            .take(max + 1)
+            .take(read_limit)
             .read_to_string(&mut body)?;
         return Ok(body);
     }
@@ -1525,7 +1530,9 @@ fn read_body_capped(text: Option<String>, file: Option<PathBuf>, max: u64) -> Re
         return Err(Error::rejected("Provide --text or --file"));
     }
     let mut body = String::new();
-    std::io::stdin().take(max + 1).read_to_string(&mut body)?;
+    std::io::stdin()
+        .take(read_limit)
+        .read_to_string(&mut body)?;
     Ok(body)
 }
 

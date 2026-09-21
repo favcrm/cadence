@@ -6421,6 +6421,65 @@ fn send_verb_matches_message_send() {
     d.wait_message("w1", "m-verb", &["completed"], 15);
 }
 
+/// The uncapped send path must read complete file and stdin bodies before
+/// enqueueing them. Exercise both CLI input forms against a real temporary
+/// daemon so a successful exit also proves the full body was persisted.
+#[test]
+fn send_file_and_stdin_persist_full_bodies() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+
+    let file_body = "file body\nwith a second line\n";
+    let file = d.dir.path().join("send-body.txt");
+    std::fs::write(&file, file_body).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "send",
+            "w1",
+            "--file",
+            file.to_str().unwrap(),
+            "--message",
+            "m-file-body",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let message = d.wait_message("w1", "m-file-body", &["completed"], 15);
+    assert_eq!(message["body"], file_body);
+
+    let stdin_body = "stdin body\nwith a second line\n";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["send", "w1", "--message", "m-stdin-body"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin_body.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let message = d.wait_message("w1", "m-stdin-body", &["completed"], 15);
+    assert_eq!(message["body"], stdin_body);
+}
+
 // ==== inbox endpoint kind ====
 
 impl TestDaemon {
