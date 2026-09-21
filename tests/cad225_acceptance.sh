@@ -12,12 +12,36 @@ set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 LOG_ROOT=${CAD225_LOG_ROOT:-${TMPDIR:-/tmp}/cad225-acceptance-$$}
+NEXTEST_BIN=${CADENCE_NEXTTEST_BIN:-/tmp/cadence-nextest-0.9.145/cargo-nextest}
+SUITE_LOCK=${CADENCE_SUITE_LOCK:-/home/ubuntu/.local/state/cadence/suite.lock}
 mkdir -p "$LOG_ROOT"
+mkdir -p "$(dirname -- "$SUITE_LOCK")"
 
 passed=0
 failed=0
 unsupported=0
+harness_passed=0
+harness_failed=0
 failed_labels=
+
+write_summary() {
+    cat >"$LOG_ROOT/summary.txt" <<EOF
+CAD225 result: $result
+head_commit: $head_commit
+tree: $tree_sha
+tree_clean_before: $tree_clean_before
+tree_clean_after: $tree_clean_after
+head_unchanged: $head_unchanged
+supported_passed: $passed
+supported_failed: $failed
+harness_checks_passed: $harness_passed
+harness_checks_failed: $harness_failed
+unsupported_steps: $unsupported
+logs: $LOG_ROOT
+failed_labels:${failed_labels:- none}
+EOF
+    cat "$LOG_ROOT/summary.txt"
+}
 
 run_case() {
     label=$1
@@ -47,15 +71,21 @@ run_cargo_case() {
     case "$target" in
         integration)
             run_case "$label" env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
-                cargo test --locked --test integration "$filter" -- --exact --nocapture "$@"
+                CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
+                "$ROOT/scripts/cadence-nextest" --test integration \
+                -E "test($filter)" "$@"
             ;;
         board)
             run_case "$label" env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
-                cargo test --locked --test board "$filter" -- --exact --nocapture "$@"
+                CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
+                "$ROOT/scripts/cadence-nextest" --test board \
+                -E "test($filter)" "$@"
             ;;
         lib)
             run_case "$label" env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
-                cargo test --locked --lib "$filter" -- --exact --nocapture "$@"
+                CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
+                "$ROOT/scripts/cadence-nextest" --lib \
+                -E "test($filter)" "$@"
             ;;
         *)
             printf 'unknown test target %s\n' "$target" >&2
@@ -65,9 +95,68 @@ run_cargo_case() {
     esac
 }
 
+run_expected_missing_filter() {
+    label=$1
+    target=$2
+    filter=$3
+    log="$LOG_ROOT/$label.log"
+    case "$target" in
+        integration) target_args="--test integration" ;;
+        board) target_args="--test board" ;;
+        lib) target_args="--lib" ;;
+        *)
+            harness_failed=$((harness_failed + 1))
+            failed_labels="$failed_labels $label"
+            printf '  result: FAIL (unknown target %s)\n' "$target"
+            return
+            ;;
+    esac
+    printf 'HARNESS %s\n' "$label"
+    printf '  command: env CARGO_BUILD_JOBS=%s CADENCE_NEXTTEST_BIN=%s CADENCE_SUITE_LOCK=%s %s %s -E test(%s)\n' \
+        "${CARGO_BUILD_JOBS:-4}" "$NEXTEST_BIN" "$SUITE_LOCK" \
+        "$ROOT/scripts/cadence-nextest" "$target_args" "$filter"
+    if env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
+        CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
+        "$ROOT/scripts/cadence-nextest" $target_args -E "test($filter)" \
+        >"$log" 2>&1; then
+        harness_failed=$((harness_failed + 1))
+        failed_labels="$failed_labels $label"
+        printf '  result: FAIL (missing filter was accepted; log %s)\n' "$log"
+        tail -30 "$log" >&2 || true
+    elif grep -Eiq 'no tests to run|0 tests run' "$log"; then
+        harness_passed=$((harness_passed + 1))
+        printf '  result: PASS (pinned runner rejected empty selection; log %s)\n' "$log"
+    else
+        harness_failed=$((harness_failed + 1))
+        failed_labels="$failed_labels $label"
+        printf '  result: FAIL (runner failed for an unrelated reason; log %s)\n' "$log"
+        tail -30 "$log" >&2 || true
+    fi
+}
+
 cd "$ROOT" || exit 1
 head_commit=$(git rev-parse HEAD)
 tree_sha=$(git rev-parse HEAD^{tree})
+initial_status=$(git status --porcelain --untracked-files=all)
+tree_clean_before=yes
+tree_clean_after=unknown
+head_unchanged=unknown
+if [ -n "$initial_status" ]; then
+    tree_clean_before=no
+    result=FAIL
+    failed=1
+    failed_labels=" initial_dirty_tree"
+    printf 'INITIAL TREE DIRTY; refusing to claim a clean tested tree:\n%s\n' "$initial_status" >&2
+    tree_clean_after=no
+    head_unchanged=yes
+    write_summary
+    exit 1
+fi
+
+# The wrapper supplies --no-tests fail and a pinned binary/checksum. This
+# expected-failure probe proves a renamed or missing filter cannot silently
+# turn into a green case with zero executed tests.
+run_expected_missing_filter missing_filter_rejected integration cad225_missing_filter_probe
 
 # Goal/plan/task creation and the complete existing job state machine:
 # dispatch, durable completion, independent review, revision, verified edge
@@ -112,9 +201,31 @@ printf '  - real-provider smoke and actual deployed-version proof: intentionally
 unsupported=$((unsupported + 1))
 printf '  - independently reviewed lesson promotion and later dispatch injection: retro is a preview and memory acceptance remains a separate curator action\n'
 
+post_status=$(git status --porcelain --untracked-files=all)
+post_head=$(git rev-parse HEAD)
+post_tree=$(git rev-parse HEAD^{tree})
+if [ -n "$post_status" ]; then
+    tree_clean_after=no
+else
+    tree_clean_after=yes
+fi
+if [ "$post_head" = "$head_commit" ] && [ "$post_tree" = "$tree_sha" ]; then
+    head_unchanged=yes
+else
+    head_unchanged=no
+fi
+if [ "$tree_clean_after" != yes ] || [ "$head_unchanged" != yes ]; then
+    failed=$((failed + 1))
+    failed_labels="$failed_labels tested_tree_changed"
+    printf 'TESTED TREE CHANGED; refusing to claim the recorded head/tree:\n' >&2
+    printf '  start: %s %s\n' "$head_commit" "$tree_sha" >&2
+    printf '  end:   %s %s\n' "$post_head" "$post_tree" >&2
+    printf '%s\n' "$post_status" >&2
+fi
+
 result=PASS
 exit_code=0
-if [ "$failed" -gt 0 ]; then
+if [ "$failed" -gt 0 ] || [ "$harness_failed" -gt 0 ]; then
     result=FAIL
     exit_code=1
 elif [ "$unsupported" -gt 0 ]; then
@@ -122,15 +233,5 @@ elif [ "$unsupported" -gt 0 ]; then
     exit_code=2
 fi
 
-cat >"$LOG_ROOT/summary.txt" <<EOF
-CAD225 result: $result
-head_commit: $head_commit
-tree: $tree_sha
-supported_passed: $passed
-supported_failed: $failed
-unsupported_steps: $unsupported
-logs: $LOG_ROOT
-failed_labels:${failed_labels:- none}
-EOF
-cat "$LOG_ROOT/summary.txt"
+write_summary
 exit "$exit_code"
