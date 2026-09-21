@@ -3638,6 +3638,11 @@ hold_fmt = os.environ.get("MOCK_TMUX_HOLD_FMT", "")
 if hold and cmd == os.environ.get("MOCK_TMUX_HOLD_CMD", "display-message") \
         and (not hold_fmt or hold_fmt in rest):
     time.sleep(hold)
+# MOCK_TMUX_FAIL=<cmd> makes that subcommand die — deterministic
+# failure injection, e.g. a transient capture-pane outage while a
+# gate probe runs.
+if cmd and cmd == os.environ.get("MOCK_TMUX_FAIL", ""):
+    die("mock injected failure")
 if cmd == "new-session":
     name = rest[rest.index("-s") + 1]
     cwd = rest[rest.index("-c") + 1] if "-c" in rest else os.getcwd()
@@ -3715,6 +3720,11 @@ if cmd == "capture-pane":
     # make the pane look busy, approval-blocked, etc.
     try: out += open(sess_path(name, "tui-state")).read()
     except FileNotFoundError: pass
+    # Real tmux only prints the pane with `-p` — without it the capture
+    # lands in the paste buffer and stdout stays empty. Emulate that so
+    # a dropped `-p` fails loudly here the way it does on a real pane.
+    if "-p" not in rest:
+        sys.exit(0)
     sys.stdout.write(out); sys.exit(0)
 if cmd == "load-buffer":
     open(os.path.join(state, "buffer"), "w").write(open(rest[-1]).read())
@@ -3729,9 +3739,11 @@ if cmd == "paste-buffer":
     sys.exit(0)
 if cmd == "send-keys":
     name = rest[rest.index("-t") + 1]
-    key = rest[-1]
-    aappend(sess_path(name, "input"),
-            "<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
+    for key in rest[rest.index("-t") + 2:]:
+        if key == "--":  # ends tmux option parsing — not a key
+            continue
+        aappend(sess_path(name, "input"),
+                "<ENTER>" if key == "Enter" else "<KEY:" + key + ">")
     sys.exit(0)
 if cmd == "set-option":
     # Record option writes so tests can assert pane defaults.
@@ -13655,10 +13667,11 @@ fn stall_secs_zero_disables_and_live_set_rearms() {
     assert_eq!(e["payload"]["message"], "m-zero", "{e}");
 }
 
-/// The ticker only samples panes while a turn runs: captures stop when
-/// nothing is in flight.
+/// The ticker samples every live pty pane — idle included, so an
+/// approval menu raised with no message in flight still surfaces —
+/// and stops only when the agent does.
 #[test]
-fn pty_stall_sampling_stops_when_nothing_runs() {
+fn pty_stall_sampling_runs_while_the_pane_lives() {
     let d = TestDaemon::start();
     let mock = d.mock_stub();
     stall_sample(1);
@@ -13671,14 +13684,8 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
             .unwrap_or_default()
             .len()
     };
-    d.rpc(
-        "agent_send",
-        json!({"alias": "w1", "text": "do work", "message": "ms6"}),
-    )
-    .unwrap();
-    d.wait_message("w1", "ms6", &["running"], 15);
-    // While the turn runs, captures grow — poll, don't assume a tick
-    // landed inside a fixed sleep.
+    // Nothing has ever been sent — an idle-but-live pane still
+    // samples: the approval-menu watch needs the frames.
     let baseline = captures();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut grew = false;
@@ -13689,7 +13696,7 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
         }
         thread::sleep(Duration::from_millis(200));
     }
-    assert!(grew, "no samples while a turn runs: {baseline}");
+    assert!(grew, "idle pane was never sampled: {baseline}");
 
     // Stopping the pane mid-sampling returns promptly — the ticker
     // never holds the adapter across a capture.
@@ -13709,9 +13716,690 @@ fn pty_stall_sampling_stops_when_nothing_runs() {
     assert_eq!(
         captures(),
         idle_count,
-        "capture-pane ran while nothing was running"
+        "capture-pane ran after the agent stopped"
     );
     stall_sample(0);
+}
+
+// ---- CAD-102: approval menus are a probe state, not busy churn ----
+
+/// The real Devin permission menu — option rows and the selection
+/// footer ABOVE a still-visible busy input box (the CAD-102 incident
+/// layout): everything the analyzer must see sits ~11 rows above the
+/// frame end.
+const DEVIN_MENU: &str = "\
+❭ run the shell command: printenv FOO
+ ⏺ Running command
+ └ $ printenv FOO
+
+❭ 1 Yes  (Approve once)
+· 2 Yes, allow `printenv` commands
+· 3 Yes, always allow `printenv` commands in `tmp`
+· 4 Yes, always allow `printenv` commands in all projects
+· 5 Yes, switch to bypass mode
+· 6 Edit command
+· 7 Describe change to command
+· 8 No
+↑↓ select · ↵ confirm · esc cancel
+⠸ Thinking · 5s (esc twice to interrupt)
+❭ Guide Devin while it works
+";
+
+/// A numbered menu over the busy box is `approval_menu`, never busy:
+/// the gate refuses pastes under it (the claim survives untouched),
+/// `agent answer` sends the option's one keystroke and records
+/// `approval_answered`, and the sampled rise lands an `approval_menu`
+/// event with the menu line.
+#[test]
+fn pty_approval_menu_blocks_pastes_and_answers() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "do work", "message": "m1"}),
+    )
+    .unwrap();
+    let token1 = pty_token(&d, "dv", "m1");
+
+    // The menu appears mid-turn.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let rise = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(rise["payload"]["message"], "m1", "{rise}");
+    assert_eq!(rise["payload"]["line"], "$ printenv FOO", "{rise}");
+
+    // The probe reads the menu line, not busy churn.
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["approval_menu"], true, "{probe}");
+    assert_eq!(probe["reason"], "$ printenv FOO", "{probe}");
+    // The views carry the menu line while the turn runs.
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(show["pane_menu"], "$ printenv FOO", "{show}");
+
+    // A paste under the menu is refused: m2 queues behind a gate_wait
+    // naming the menu, and no claim is eaten by the refusal.
+    d.rpc("agent_ready", json!({"alias": "dv", "force": true}))
+        .unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "wait for idle", "message": "m2"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("dv", "gate_wait", 15);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("approval menu"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("dv", "m2"), "queued");
+
+    // `agent answer` validates the choice against the visible menu —
+    // 9 is not on it — then sends the one digit key.
+    assert!(d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "9"}))
+        .is_err());
+    let answered = d
+        .rpc(
+            "agent_answer",
+            json!({"alias": "dv", "choice": "8", "by": "test-op"}),
+        )
+        .unwrap();
+    assert_eq!(answered["state"], "answered", "{answered}");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap();
+    assert!(
+        input.ends_with("<KEY:8>"),
+        "the digit key, never a paste: {input}"
+    );
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["choice"], "8", "{ev}");
+    assert_eq!(ev["payload"]["line"], "$ printenv FOO", "{ev}");
+    // Identity is derived from the peer pid — the test process sits
+    // outside every pane, so `by` is `operator` when it holds a
+    // foreign terminal (a suite on a pty) and `unknown` when fully
+    // detached; the supplied name survives only as a claim.
+    let want = if (0..=2).any(|fd| {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
+    }) {
+        "operator"
+    } else {
+        "unknown"
+    };
+    assert_eq!(ev["payload"]["by"], want, "{ev}");
+    assert_eq!(ev["payload"]["claimed_by"], "test-op", "{ev}");
+    assert_eq!(ev["payload"]["probe"]["approval_menu"], true, "{ev}");
+
+    // With the menu cleared (operator closed it), the surviving claim
+    // delivers m2 — no second `agent ready` needed: the refusal ate
+    // nothing. And an answer on a non-menu pane refuses.
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    assert!(d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "8"}))
+        .is_err());
+    d.wait_message("dv", "m2", &["running"], 20);
+    let token2 = pty_token(&d, "dv", "m2");
+    for (id, token) in [("m1", &token1), ("m2", &token2)] {
+        d.rpc(
+            "message_report",
+            json!({"message": id, "token": token, "kind": "result",
+                   "text": "done"}),
+        )
+        .unwrap();
+        d.wait_message("dv", id, &["completed"], 10);
+    }
+    stall_sample(0);
+}
+
+/// A turn that ends at the idle prompt without reporting is detected
+/// by the sampled probe: `turn_silent_end` fires once per message
+/// carrying the age and the admitting probe, the views flag it
+/// (`silent_ended`, `ended_secs`, `ended?:` in status, an overview
+/// needs-me row), and a `--ready` send is the one-command recovery.
+/// The message itself is never auto-resolved.
+#[test]
+fn pty_silent_end_fires_once_and_recovers() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    stall_sample(1);
+    d.register_stub(
+        "w1",
+        json!({"auto_ready": "verified", "silent_end_secs": 4}),
+    );
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "do work", "message": "ms9"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "w1", "ms9");
+
+    // The stub pane returns to `» stub ready` after the submission —
+    // the message still runs but the probe reads idle.
+    let e = d.wait_event("w1", "turn_silent_end", 40);
+    assert_eq!(e["payload"]["message"], "ms9", "{e}");
+    assert!(e["payload"]["age_secs"].as_u64().unwrap_or(0) >= 4, "{e}");
+    assert_eq!(e["payload"]["probe"]["idle"], true, "{e}");
+    assert!(
+        e["payload"]["last_activity"].as_f64().unwrap_or(0.0) > 0.0,
+        "{e}"
+    );
+
+    // Once per message: the pane stays idle but no second event fires.
+    thread::sleep(Duration::from_secs(6));
+    assert_eq!(wait_event_count(&d, "w1", "turn_silent_end", 1, 2).len(), 1);
+
+    // The views flag it: show/list carry silent_ended + ended_secs,
+    // status renders `ended?:`, and the overview needs-me row names
+    // the ready-gated recovery command.
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(show["silent_ended"], true, "{show}");
+    assert!(show["ended_secs"].as_u64().unwrap_or(0) >= 4, "{show}");
+    let row = d.rpc("agent_list", json!({})).unwrap()["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"].as_str() == Some("w1"))
+        .cloned()
+        .unwrap();
+    assert_eq!(row["silent_ended"], true, "{row}");
+    let table = status_table(&d.state, &[]);
+    assert!(table.contains("ended?:"), "{table}");
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    let ended = needs
+        .iter()
+        .find(|n| n["kind"] == "silent_end")
+        .expect("silent_end row");
+    assert_eq!(
+        ended["command"],
+        "cadence send w1 --ready --text \"continue …\""
+    );
+    assert!(ended["title"].as_str().unwrap().contains("w1"));
+
+    // The message is flagged, never auto-resolved — and the remedy is
+    // the documented ready-gated follow-up verbatim: the idle pane
+    // passes the claim probe and the new turn proceeds normally.
+    assert_eq!(d.message_state("w1", "ms9"), "running");
+    let (ok, sent) = cadence_cli(
+        &d.state,
+        &["send", "w1", "--ready", "--text", "continue"],
+        &[],
+    );
+    assert!(ok, "{sent}");
+    let ms10 = sent["message"].as_str().unwrap().to_string();
+    let token2 = pty_token(&d, "w1", &ms10);
+    for (id, t) in [("ms9", &token), (ms10.as_str(), &token2)] {
+        d.rpc(
+            "message_report",
+            json!({"message": id, "token": t, "kind": "result",
+                   "text": "done"}),
+        )
+        .unwrap();
+        d.wait_message("w1", id, &["completed"], 10);
+    }
+    stall_sample(0);
+}
+
+/// A menu that opens BEFORE any turn starts — the pane sits blocked
+/// with a message still queued — must surface identically to a
+/// mid-turn one: `approval_menu` fires against the queued head
+/// (marked `queued`), the views carry `pane_menu`, the needs-me row
+/// names the answer command, and `agent answer` unblocks delivery.
+#[test]
+fn pty_queued_menu_surfaces_and_answers() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    // The menu opens first; the send behind it can only queue.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "blocked send", "message": "mq"}),
+    )
+    .unwrap();
+    // `queued` or `submitting` — the delivery loop may have already
+    // claimed the head and be gate-waiting on the menu; it cannot be
+    // running while the pane shows a menu.
+    let st = d.message_state("dv", "mq");
+    assert!(st == "queued" || st == "submitting", "{st}");
+
+    // The queued head is tracked for menu detection: the event names
+    // the waiting message and marks it queued, the views carry the
+    // menu line with no running turn at all.
+    let rise = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(rise["payload"]["message"], "mq", "{rise}");
+    assert_eq!(rise["payload"]["queued"], true, "{rise}");
+    assert_eq!(rise["payload"]["line"], "$ printenv FOO", "{rise}");
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(show["pane_menu"], "$ printenv FOO", "{show}");
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    assert!(
+        needs.iter().any(|n| n["kind"] == "approval_menu"
+            && n["command"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("cadence agent answer dv ")),
+        "{needs:?}"
+    );
+
+    // A garbage index is rejected at the RPC — the count never
+    // reaches a key vector — and the daemon answers normally after.
+    let err = d
+        .rpc(
+            "agent_answer",
+            json!({"alias": "dv", "choice": "4000000000"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("no option 4000000000"), "{err}");
+    // And a menu whose option block cannot be parsed refuses rather
+    // than walking blind — the legend anchor alone, no option rows.
+    atomic_write(
+        d.pane_file(&mock, "dv", "tui-state"),
+        "↑↓ select · ↵ confirm · esc cancel\n⠸ Thinking · 5s (esc twice to interrupt)\n",
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["approval_menu"], true, "{probe}");
+    assert!(d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "1"}))
+        .is_err());
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    // Answering the menu unblocks the queued send — the pane claims
+    // cleanly once the operator's menu is gone. A real TUI consumes
+    // the answer key; the mock leaves it staged, so clear the input
+    // file the way an answered menu would.
+    d.rpc("agent_answer", json!({"alias": "dv", "choice": "8"}))
+        .unwrap();
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    atomic_write(d.pane_file(&mock, "dv", "input"), "");
+    d.rpc("agent_ready", json!({"alias": "dv"})).unwrap();
+    d.wait_message("dv", "mq", &["running"], 20);
+    let token = pty_token(&d, "dv", "mq");
+    d.rpc(
+        "message_report",
+        json!({"message": "mq", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "mq", &["completed"], 10);
+    stall_sample(0);
+}
+
+/// A menu raised on a pane with NO message at all still surfaces —
+/// the stall watch samples idle panes, the event fires `idle: true`
+/// and attributes no message, and the needs-me row names the remedy.
+#[test]
+fn pty_idle_pane_menu_surfaces() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    // Nothing was ever sent — the menu arrives on a quiet pane.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let rise = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(rise["payload"]["idle"], true, "{rise}");
+    assert_eq!(rise["payload"]["line"], "$ printenv FOO", "{rise}");
+    assert!(rise["payload"]["message"].is_null(), "{rise}");
+    let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+    assert_eq!(show["pane_menu"], "$ printenv FOO", "{show}");
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let needs = view["needs_me"].as_array().unwrap();
+    assert!(
+        needs.iter().any(|n| n["kind"] == "approval_menu"
+            && n["command"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("cadence agent answer dv ")),
+        "{needs:?}"
+    );
+
+    // The operator can answer it straight away.
+    d.rpc("agent_answer", json!({"alias": "dv", "choice": "8"}))
+        .unwrap();
+    stall_sample(0);
+}
+
+/// A menu that closes and later reopens is a NEW approval — the same
+/// subject must fire `approval_menu` again. The event history is
+/// scoped to the open menu: it clears when the menu closes, so the
+/// second occurrence is never deduped away.
+#[test]
+fn pty_menu_event_refires_after_close() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    stall_sample(1);
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let first = d.wait_event("dv", "approval_menu", 20);
+    assert_eq!(first["payload"]["line"], "$ printenv FOO", "{first}");
+
+    // Menu closes — the idle screen returns. The sampler must observe
+    // at least one non-menu frame before the reopen.
+    std::fs::remove_file(d.pane_file(&mock, "dv", "tui-state")).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
+        if show["pane_menu"].is_null() {
+            break;
+        }
+        assert!(deadline.elapsed() < Duration::from_secs(20), "{show}");
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    // The same menu reopens — same subject — and fires again.
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    let events = wait_event_count(&d, "dv", "approval_menu", 2, 20);
+    assert_eq!(events[1]["payload"]["line"], "$ printenv FOO", "{events:?}");
+    stall_sample(0);
+}
+
+/// The answerer's identity is derived from the socket peer's pid
+/// walking its /proc ancestry into a pane — never from a `by` the
+/// client chose. A caller inside the target's own pane is refused
+/// outright; inside another agent's pane it stamps that agent.
+#[test]
+fn pty_answer_derives_caller_from_peer_pid() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.register_devin_opts("peer", json!({}));
+    d.wait_agent("dv", "idle", 20);
+    d.wait_agent("peer", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    // Point a pane pid at this test process and every RPC it makes
+    // descends from that pane — the unforgeable "caller is inside
+    // the agent" signal.
+    let me = std::process::id() as i64;
+    let set_pid = |alias: &str, pid: i64| {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE agents SET pid=?1 WHERE alias=?2",
+            rusqlite::params![pid, alias],
+        )
+        .unwrap();
+    };
+
+    // Self-approval refuses before any key is sent — even with `by`
+    // claiming to be an operator.
+    set_pid("dv", me);
+    let err = d
+        .rpc(
+            "agent_answer",
+            json!({"alias": "dv", "choice": "8", "by": "operator"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("its own pane"), "{err}");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+
+    // A caller inside ANOTHER agent's pane stamps that agent; a `by`
+    // claiming otherwise is kept only as a claim.
+    set_pid("dv", 999_999_999);
+    set_pid("peer", me);
+    d.rpc(
+        "agent_answer",
+        json!({"alias": "dv", "choice": "8", "by": "dv"}),
+    )
+    .unwrap();
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["by"], "peer", "{ev}");
+    assert_eq!(ev["payload"]["by_kind"], "agent", "{ev}");
+    assert_eq!(ev["payload"]["claimed_by"], "dv", "{ev}");
+    assert_eq!(ev["payload"]["caller_pid"], me, "{ev}");
+
+    // Outside every pane the caller is an operator only when it holds
+    // a foreign terminal — this test process inherits one when the
+    // suite runs on a pty, none under piped CI — and `unknown`
+    // otherwise. A `by` naming the target is a claim, not an
+    // attribution either way.
+    set_pid("peer", 999_999_999);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+    d.rpc(
+        "agent_answer",
+        json!({"alias": "dv", "choice": "1", "by": "dv"}),
+    )
+    .unwrap();
+    let on_tty = (0..=2).any(|fd| {
+        std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
+    });
+    let want = if on_tty { "operator" } else { "unknown" };
+    let evs = wait_event_count(&d, "dv", "approval_answered", 2, 10);
+    assert_eq!(evs[1]["payload"]["by"], want, "{evs:?}");
+    assert_eq!(evs[1]["payload"]["by_kind"], want, "{evs:?}");
+    assert_eq!(evs[1]["payload"]["claimed_by"], "dv", "{evs:?}");
+}
+
+/// `setsid` detaches the caller from the pane's /proc ancestry — the
+/// self-approval guard must still see through it. The pane's own
+/// `CADENCE_ALIAS` env survives the detach, so `setsid env
+/// CADENCE_ALIAS=<self> cadence agent answer <self>` is refused rather
+/// than stamped `operator`. A detached caller carrying another pane's
+/// alias attributes to that pane — an agent, never an operator.
+#[test]
+fn pty_answer_setsid_cannot_launder_self_approval() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.register_devin_opts("peer", json!({}));
+    d.wait_agent("dv", "idle", 20);
+    d.wait_agent("peer", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    // The detached call names its own pane in env — refused, no key
+    // reaches the input, no event is stamped.
+    let out = std::process::Command::new("setsid")
+        .arg("env")
+        .arg("CADENCE_ALIAS=dv")
+        .arg(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "answer", "dv", "8"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "self-answer must refuse: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+    let events = d.rpc("agent_events", json!({"alias": "dv"})).unwrap();
+    assert!(
+        !events.to_string().contains("approval_answered"),
+        "self-answer must not stamp an event: {events}"
+    );
+
+    // Detached and carrying ANOTHER pane's env — stamps that pane as
+    // the agent, not `operator`.
+    let out = std::process::Command::new("setsid")
+        .arg("env")
+        .arg("CADENCE_ALIAS=peer")
+        .arg(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "answer", "dv", "8"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["by"], "peer", "{ev}");
+    assert_eq!(ev["payload"]["by_kind"], "agent", "{ev}");
+}
+
+/// A *full* detach — `env -u CADENCE_ALIAS setsid sh -c 'cadence agent
+/// answer <self> </dev/null >/dev/null 2>&1'` — clears ancestry, env
+/// and tty at once. The caller matches nothing, so the honest stamp is
+/// `unknown`, never `operator`: `operator` needs positive terminal
+/// evidence the detached process cannot carry.
+#[test]
+fn pty_answer_full_detach_stamps_unknown() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
+
+    let out = std::process::Command::new("setsid")
+        .arg("env")
+        .arg("-u")
+        .arg("CADENCE_ALIAS")
+        .arg(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["agent", "answer", "dv", "8"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "unmatched-but-unproven caller answers as unknown: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ev = d.wait_event("dv", "approval_answered", 10);
+    assert_eq!(ev["payload"]["by"], "unknown", "{ev}");
+    assert_eq!(ev["payload"]["by_kind"], "unknown", "{ev}");
+}
+
+/// A transcript that quotes a real menu verbatim — anchor, `❯`-led
+/// numbered run and all — cannot flip the pane: a live menu replaces
+/// the input box's interior, so the boxed `❯` prompt still rendered
+/// below the quote proves the menu-looking rows are text. The probe
+/// stays inert and `agent answer` refuses rather than keying a digit
+/// into the live input line.
+#[test]
+fn pty_claude_quoted_menu_above_input_box_is_inert() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    d.register_claude_pty("cl", json!({"auto_ready": "verified"}));
+    d.wait_agent("cl", "idle", 20);
+    atomic_write(
+        d.claude_pane_file(&mock, "cl", "tui-state"),
+        "● I reproduced it. The pane printed:\n\n    Do you want to proceed?\n    ❯ 1. Yes\n      2. No, and tell Claude what to do differently\n\n  So it is waiting on you.\n────────────────────\n❯ \n",
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "cl"})).unwrap();
+    assert_eq!(probe["approval_menu"], false, "{probe}");
+    assert_eq!(probe["idle"], true, "{probe}");
+    let err = d
+        .rpc("agent_answer", json!({"alias": "cl", "choice": "2"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("no approval menu"), "{err}");
+    let input =
+        std::fs::read_to_string(d.claude_pane_file(&mock, "cl", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+}
+
+/// Same class on the Devin profile (CAD-102 r6): a verbatim quoted
+/// menu above the live idle input box probes inert — the legend is
+/// transcript text, and the editable `❭` row vetoes the region —
+/// and `agent answer` refuses rather than keying the digit into the
+/// input line.
+#[test]
+fn pty_devin_quoted_menu_above_input_box_is_inert() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+    atomic_write(
+        d.pane_file(&mock, "dv", "tui-state"),
+        "● The pane showed:\n\n  Allow this tool call?\n  ❭ 1 Yes  (Approve once)\n  · 2 Yes, allow `env` commands\n  · 8 No\n  ↑↓ select · ↵ confirm · esc cancel\n\n  So it is waiting.\n\n────────────────────\n❭ Ask Devin to build features, fix bugs, or work on your code\n────────────────────\nSWE-2 Max   Context: 43k / 262k\n",
+    );
+    let probe = d.rpc("agent_probe", json!({"alias": "dv"})).unwrap();
+    assert_eq!(probe["approval_menu"], false, "{probe}");
+    assert_eq!(probe["idle"], true, "{probe}");
+    let err = d
+        .rpc("agent_answer", json!({"alias": "dv", "choice": "2"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("no approval menu"), "{err}");
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv", "input")).unwrap_or_default();
+    assert!(!input.contains("<KEY"), "no key sent: {input}");
+}
+
+/// A transient `capture-pane` failure inside the gate probe refuses
+/// the send like a busy pane — `gate_wait`, message still queued —
+/// never an actor-fatal provider error. The daemon survives and the
+/// send delivers once the outage clears.
+#[test]
+fn pty_gate_probe_failure_is_a_gate_refusal() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin_opts("dv", json!({"auto_ready": "verified"}));
+    d.wait_agent("dv", "idle", 20);
+
+    // `MOCK_TMUX_FAIL` is process-global — a parallel test's mock
+    // calls could trip on it inside this window. The outage is
+    // seconds-long and the failure mode (a gate retry) is benign, so
+    // the knob stays env-global rather than growing a per-pane
+    // failure file.
+    std::env::set_var("MOCK_TMUX_FAIL", "capture-pane");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv", "text": "during outage", "message": "mf"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("dv", "gate_wait", 15);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("pane probe failed"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("dv", "mf"), "queued");
+    std::env::remove_var("MOCK_TMUX_FAIL");
+
+    d.wait_message("dv", "mf", &["running"], 20);
+    let token = pty_token(&d, "dv", "mf");
+    d.rpc(
+        "message_report",
+        json!({"message": "mf", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv", "mf", &["completed"], 10);
+}
+
+/// `agent answer` is a menu channel only: a pane with no menu refuses
+/// (idle, busy or fenced alike), and a non-pty endpoint has no such
+/// channel at all.
+#[test]
+fn pty_answer_refuses_without_a_menu() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register_stub("w1", json!({}));
+    d.register("fx");
+    d.wait_agent("w1", "idle", 20);
+    d.wait_agent("fx", "idle", 10);
+    let err = d
+        .rpc("agent_answer", json!({"alias": "w1", "choice": "1"}))
+        .unwrap_err();
+    assert!(err.to_string().contains("no approval menu"), "{err}");
+    let err = d
+        .rpc("agent_answer", json!({"alias": "fx", "choice": "1"}))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no approval-menu channel"),
+        "{err}"
+    );
 }
 
 // ---- CAD-55: `cadence dispatch` + `cadence issue finish` against a live daemon ----
@@ -16218,6 +16906,9 @@ fn tmux_call_count(mock: &MockDevin, state: &Path, cmd: &str) -> usize {
 
 #[test]
 fn status_rows_probe_once_and_footer() {
+    // The stall watch now samples idle panes too — park it far out so
+    // a tick cannot land inside the capture-count window below.
+    stall_sample(3600);
     let d = TestDaemon::start();
     let mock = d.mock_devin();
     let _chatty = d.mock_claude("chatty", None);
@@ -16290,6 +16981,19 @@ fn status_rows_probe_once_and_footer() {
         &pm_dir,
         &["issue", "set", "CAD-3", "owner=w1"],
     );
+    // The stall watch samples each new pty pane once at registration —
+    // the interval only gates REPEATS, so `stall_sample(3600)` cannot
+    // hold that first capture back. Under suite load the watch's first
+    // tick can land this late; wait it out so the window below counts
+    // only the status probes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while tmux_call_count(&mock, &d.state, "capture-pane") < 2 {
+        assert!(
+            deadline.elapsed() < Duration::from_secs(20),
+            "first stall samples for dv1/dv2 never landed"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
     let captures_before = tmux_call_count(&mock, &d.state, "capture-pane");
     let view = status_json(&d.state, &[], &[("CADENCE_PM_DIR", &pm_dir)]);
     let agents = view["agents"].as_array().unwrap();

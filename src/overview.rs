@@ -126,6 +126,18 @@ pub fn cmd_agent_show(alias: &str) -> String {
     format!("cadence agent show {alias}")
 }
 
+/// The menu-answer command for a pty pane probing `approval_menu` —
+/// `<choice>` is the option's printed index on the open menu.
+pub fn cmd_agent_answer(alias: &str) -> String {
+    format!("cadence agent answer {alias} <choice>")
+}
+
+/// The ready-gated continue for a silently ended turn: the pane
+/// provably probes idle, so `--ready` claims and pastes in one step.
+pub fn cmd_send_ready(alias: &str) -> String {
+    format!("cadence send {alias} --ready --text \"continue …\"")
+}
+
 pub fn cmd_inbox(alias: &str) -> String {
     format!("cadence inbox {alias}")
 }
@@ -949,6 +961,30 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
                 "",
                 None,
                 &cmd_agent_show(alias),
+            ));
+        }
+        // A sampled approval menu ranks with brokered approvals — the
+        // pane is waiting on a human either way.
+        if let Some(line) = show["agent"]["pane_menu"].as_str() {
+            needs.push(item(
+                20,
+                "approval_menu",
+                &format!("agent {alias} approval menu: {line}"),
+                age,
+                "",
+                None,
+                &cmd_agent_answer(alias),
+            ));
+        }
+        if show["agent"]["silent_ended"].as_bool().unwrap_or(false) {
+            needs.push(item(
+                40,
+                "silent_end",
+                &format!("agent {alias} turn ended at an idle pane — never reported"),
+                show["agent"]["ended_secs"].as_f64().unwrap_or(age as f64) as i64,
+                "",
+                None,
+                &cmd_send_ready(alias),
             ));
         }
         if a["provider"].as_str() == Some(registry::INBOX) && queued > 0 {

@@ -39,6 +39,11 @@ const OPEN_DEADLINE: Duration = Duration::from_secs(30);
 /// select. Busy/approval markers only match inside it — the transcript
 /// above can legitimately show these strings as text.
 const STATUS_LINES: usize = 16;
+/// The wider window a menu may occupy: a permission prompt (~10 rows)
+/// plus the input box and status bar that can stay visible below it.
+/// Menu anchors only match inside it — the transcript above can
+/// legitimately quote the same strings.
+const MENU_LINES: usize = 24;
 
 /// Claude TUI screen signatures — THE one place they live. A provider
 /// TUI update means editing this table, never the gate logic. Every
@@ -55,17 +60,21 @@ mod claude_screen {
     /// On-screen markers while a turn is running: the spinner line's
     /// interrupt hint and a tool call's pending marker.
     pub const BUSY: &[&str] = &["esc to interrupt", "Waiting…"];
-    /// An open select/permission menu — the permission prompt's title
-    /// and footer, plus the workspace-trust dialog (both its observed
-    /// 2.1.x wording and the older prompt shape).
-    pub const APPROVAL: &[&str] = &[
+    /// An open select/permission menu — the anchors are the permission
+    /// prompt's title plus the workspace-trust dialog in both observed
+    /// 2.1.x wordings. They are natural-language rows, so a match only
+    /// counts beside real menu structure (a numbered option run, a
+    /// `❯`-led option, or a hint legend); an indented transcript row
+    /// quoting the same words stays inert. The hints are footer
+    /// fragments — quotable in a long transcript, so they decide only
+    /// as a cluster alongside menu structure.
+    pub const ANCHOR: &[&str] = &[
         "Do you want to proceed?",
-        "Esc to cancel",
-        "Tab to amend",
         "Quick safety check",
         "Yes, I trust this folder",
         "Do you trust the files in this folder?",
     ];
+    pub const HINT: &[&str] = &["Esc to cancel", "Tab to amend", "Enter to confirm"];
 }
 
 /// Leading characters Claude's TUI interprets before the prompt text —
@@ -73,6 +82,209 @@ mod claude_screen {
 /// mode, `/` opens the command menu, `@` opens the agent/file picker.
 /// `#` stays a literal draft and is deliberately absent.
 pub const FORBIDDEN_PREFIXES: &[char] = &['/', '!', '@'];
+
+/// A numbered menu option row: `❯ 1. Yes` or `   2. …` — returns the
+/// printed number so `approval_answer` can validate a choice against
+/// the rows actually on screen.
+fn option_line(line: &str) -> Option<u32> {
+    let t = line.trim_start().trim_start_matches('❯').trim_start();
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || !t[digits.len()..].starts_with('.') {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The bottom-most contiguous run of `N.` rows, but only when it is
+/// real menu structure: a `❯`-led option row inside the run, or the
+/// anchored menu legend directly after it. A markdown numbered list
+/// quoted in the transcript satisfies neither — it is never a menu's
+/// options.
+fn numbered_block(lines: &[&str]) -> Vec<u32> {
+    // Only rows below the live input box can be menu structure —
+    // a quoted menu sitting above the box is transcript text.
+    let lines = menu_window(lines);
+    let mut runs: Vec<Vec<(usize, u32)>> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if let Some(n) = option_line(l) {
+            match runs.last_mut() {
+                // A run is contiguous rows numbered sequentially — a
+                // restart (`1. … 2. … 1. …`) is a new list, and only
+                // the bottom-most run can be the menu's.
+                Some(r) if r.last().unwrap().0 + 1 == i && n == r.last().unwrap().1 + 1 => {
+                    r.push((i, n))
+                }
+                _ => runs.push(vec![(i, n)]),
+            }
+        }
+    }
+    let Some(run) = runs.last() else {
+        return Vec::new();
+    };
+    let end = run.last().unwrap().0;
+    // The `❯` must be a menu's indented highlight — a column-0 `❯`
+    // is a transcript echo of the operator's own input, never a menu
+    // option.
+    let has_selected = run.iter().any(|(i, _)| sel_row(lines, *i));
+    let legend_after = lines[end + 1..]
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| claude_screen::HINT.iter().any(|h| hint_row(l, h)));
+    if has_selected || legend_after {
+        run.iter().map(|(_, n)| *n).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// A footer/legend row matching hint `h` — anchored on the trimmed
+/// row's leading text or a `·`-separated legend cell (`Enter to
+/// confirm · Esc to cancel`), so a transcript quoting the same words
+/// mid-line does not count.
+fn hint_row(l: &str, h: &str) -> bool {
+    l.contains(h) && (l.trim_start().starts_with(h) || l.contains(&format!("· {h}")))
+}
+
+/// True when row `i` is the boxed input line: a `❯`-led row whose
+/// previous row is the `─` border. Menu option lists lead with `❯`
+/// too but are never boxed.
+fn boxed(lines: &[&str], i: usize) -> bool {
+    i > 0 && {
+        let above = lines[i - 1].trim();
+        !above.is_empty() && above.chars().all(|c| c == claude_screen::BORDER)
+    }
+}
+
+/// The menu's highlighted option row: an *indented* `❯`-led row that
+/// is not the boxed input line. Menu rows sit inside the dialog's
+/// inset (` ❯ 1. Yes`); a column-0 `❯` row is the input box or a
+/// transcript echo of the operator's own submitted text — never a
+/// menu highlight.
+fn sel_row(lines: &[&str], i: usize) -> bool {
+    let l = lines[i];
+    l.len() != l.trim_start().len() && l.trim_start().starts_with('❯') && !boxed(lines, i)
+}
+
+/// The live menu region is the rows BELOW the last boxed `❯` input
+/// prompt. A real permission menu renders in place of the box's
+/// interior — it can sit under a still-drawn prompt, but never above
+/// one: a transcript that quotes a menu verbatim always has the live
+/// input box below the quote. That frame position is the corroboration
+/// screen-local text cannot fake.
+fn menu_window<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    let floor = (0..lines.len())
+        .rev()
+        .find(|i| boxed(lines, *i) && lines[*i].trim_start().starts_with(claude_screen::PROMPT));
+    match floor {
+        Some(f) => &lines[f + 1..],
+        None => lines,
+    }
+}
+
+/// The open option block as `(selected row, block start, block end,
+/// corroborated)`. The block is the contiguous run of rows around the
+/// highlighted `❯` row where an option row is `❯`-led at the
+/// highlight's indent or carries its text at the highlight's column
+/// (subject and context rows sit at other indents). A lone `❯` row is
+/// not a one-option menu — a real menu always lists at least one
+/// sibling option — so the block must reach at least two rows or it is
+/// transcript text, not a menu.
+///
+/// Even so, an indented transcript `❯` plus a same-column sibling
+/// satisfies the shape — the block is *corroborated* only by what a
+/// transcript cannot fake at the same indent: a numbered option inside
+/// the run, or the anchored menu legend directly below it (at most one
+/// blank row between, as real menus render). An uncorroborated block
+/// never sets `approval_menu` and is never answered.
+fn option_block(lines: &[&str]) -> Option<(usize, usize, usize, bool)> {
+    // Only rows below the live input box can be menu structure —
+    // a quoted menu sitting above the box is transcript text.
+    let lines = menu_window(lines);
+    // The LAST non-boxed `❯` row: a transcript `❯` echo above the menu
+    // would otherwise be mistaken for the highlight.
+    let sel = (0..lines.len()).rev().find(|i| sel_row(lines, *i))?;
+    // The column the highlighted option's text starts at — `❯` is
+    // one glyph plus its trailing space.
+    let sel_indent = lines[sel].find('❯').unwrap_or(0);
+    let sel_col = sel_indent + 2;
+    let opt = |i: usize| -> bool {
+        let l = lines[i];
+        let t = l.trim_start();
+        // Blank, border and hint rows end the block. Anchor rows
+        // are *not* excluded — `Yes, I trust this folder` is both
+        // an anchor and a real option; subject rows sit at a
+        // different column than options anyway.
+        if t.is_empty()
+            || t.chars().all(|c| c == claude_screen::BORDER)
+            || claude_screen::HINT.iter().any(|h| hint_row(l, h))
+        {
+            return false;
+        }
+        (t.starts_with('❯') && l.find('❯') == Some(sel_indent))
+            || (l.len() - t.len() == sel_col && !t.starts_with('$') && !t.starts_with("Tip:"))
+    };
+    let mut start = sel;
+    while start > 0 && opt(start - 1) {
+        start -= 1;
+    }
+    let mut end = sel;
+    while end + 1 < lines.len() && opt(end + 1) {
+        end += 1;
+    }
+    if end - start + 1 < 2 {
+        return None;
+    }
+    let numbered = (start..=end).any(|i| option_line(lines[i]).is_some());
+    let legend_below = lines[end + 1..]
+        .iter()
+        .take(2)
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| claude_screen::HINT.iter().any(|h| hint_row(l, h)));
+    Some((sel, start, end, numbered || legend_below))
+}
+
+/// The line naming what the menu asks. A `Do you want to proceed?`
+/// prompt carries its detail rows above the question — the command
+/// first, then its description — so the furthest row inside the block
+/// names the command. Trust dialogs name themselves by the anchor
+/// row (`Quick safety check: …`).
+fn menu_subject(screen: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.trim_end().lines().collect();
+    let q = lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with("Do you want to proceed?"));
+    if let Some(q) = q {
+        let mut subject = None;
+        let mut blanks = 0;
+        for l in lines[..q].iter().rev() {
+            let t = l.trim();
+            if t.is_empty() {
+                blanks += 1;
+                if blanks > 1 {
+                    break;
+                }
+                continue;
+            }
+            if t.starts_with("Tip:") || t.chars().all(|c| c == claude_screen::BORDER) {
+                break;
+            }
+            subject = Some(t.chars().take(100).collect());
+            blanks = 0;
+        }
+        if subject.is_some() {
+            return subject;
+        }
+    }
+    lines
+        .iter()
+        .rev()
+        .take(MENU_LINES)
+        .find(|l| {
+            let t = l.trim_start();
+            t.starts_with("Quick safety check") || t.starts_with("Do you trust")
+        })
+        .map(|l| l.trim().chars().take(100).collect())
+}
 
 /// Reduce a captured Claude screen to gate facts. The last boxed `❯`
 /// line is the input box; text after it is a draft — except ghost
@@ -96,7 +308,63 @@ pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
-    let approval_menu = claude_screen::APPROVAL.iter().any(|m| tail.contains(m));
+    // Menu evidence lives in the wider menu window — a permission
+    // prompt plus a still-visible input box can push its rows above
+    // the busy anchor. Anchors decide alone but only matched on the
+    // trimmed row's leading text; hints (footer fragments, matched
+    // row-anchored) need real menu structure beside them — numbered
+    // option rows or the highlighted `❯` option row — so a transcript
+    // quoting these strings stays text, never a menu.
+    let menu_lines: Vec<&str> = content
+        .lines()
+        .rev()
+        .take(MENU_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    // Only rows below the last boxed `❯` prompt can be menu structure:
+    // a transcript quoting a real menu sits above the still-live input
+    // box — the frame position is the corroboration its text cannot
+    // fake. The slice applies to every menu scan uniformly.
+    let menu_lines: &[&str] = menu_window(&menu_lines);
+    // Natural-language anchors are ordinary sentence text — an
+    // indented transcript row that starts with `Do you want to
+    // proceed?` is identical in shape to the real prompt, so the
+    // anchor only decides beside real menu structure: a numbered
+    // option run, a highlighted `❯` option, or an anchored legend
+    // row. Numbered rows must form a real option block — a `❯`-led
+    // row inside the run or the menu legend right after it — a
+    // markdown list in transcript text satisfies neither.
+    let anchor = menu_lines.iter().any(|l| {
+        let t = l.trim_start();
+        claude_screen::ANCHOR.iter().any(|a| t.starts_with(a))
+    });
+    let numbered = numbered_block(menu_lines);
+    // `highlighted` means a real option block *with corroboration* —
+    // an indented `❯` plus a same-column sibling is transcript-fakeable,
+    // so the block alone never suffices (numbered rows inside it or the
+    // legend directly below are what count).
+    let highlighted = option_block(menu_lines).is_some_and(|(.., c)| c);
+    let hints = claude_screen::HINT
+        .iter()
+        .filter(|h| menu_lines.iter().any(|l| hint_row(l, h)))
+        .count();
+    // A lone legend row is quotable text too — it corroborates only as
+    // a pair of distinct hints, or sitting within a row or two of the
+    // anchor it belongs to (a `cat`ed doc puts them far apart).
+    let hint_near_anchor = menu_lines.iter().enumerate().any(|(i, l)| {
+        claude_screen::HINT.iter().any(|h| hint_row(l, h))
+            && (i.saturating_sub(2)..=i + 2).any(|j| {
+                menu_lines.get(j).is_some_and(|a| {
+                    let t = a.trim_start();
+                    claude_screen::ANCHOR.iter().any(|s| t.starts_with(s))
+                })
+            })
+    });
+    let legend_ok = hints >= 2 || hint_near_anchor;
+    let approval_menu = (anchor && (numbered.len() >= 2 || highlighted || legend_ok))
+        || (legend_ok && (numbered.len() >= 2 || highlighted));
     let busy_marker = claude_screen::BUSY.iter().any(|m| tail.contains(m));
     // The input box is a `❯`-leading line whose previous row is the
     // `─` border — menu option lists lead with `❯` too but are never
@@ -131,19 +399,25 @@ pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
         };
     let input_nonempty = !draft.is_empty() && !ghost;
     let (idle, reason) = if approval_menu {
-        (false, "approval menu is open")
+        (
+            false,
+            menu_subject(content).unwrap_or_else(|| "approval menu is open".to_string()),
+        )
     } else if busy_marker {
-        (false, "tui is busy (interrupt marker on screen)")
+        (
+            false,
+            "tui is busy (interrupt marker on screen)".to_string(),
+        )
     } else if !prompt_visible {
-        (false, "no prompt line visible")
+        (false, "no prompt line visible".to_string())
     } else if input_nonempty {
-        (false, "unsubmitted text in the input line")
+        (false, "unsubmitted text in the input line".to_string())
     } else {
-        (true, "idle")
+        (true, "idle".to_string())
     };
     Probe {
         idle,
-        reason: reason.to_string(),
+        reason,
         input_nonempty,
         prompt_visible,
         busy_marker,
@@ -464,6 +738,112 @@ impl TuiProfile for ClaudeProfile {
          permission prompts in the terminal itself"
     }
 
+    /// Numbered permission menus take the option's digit key; an
+    /// unnumbered select (the trust dialog) falls back to arrows +
+    /// Enter, bounded by the option rows on screen.
+    fn approval_answer(&self, screen: &str, choice: &str) -> Result<Vec<String>> {
+        let region: Vec<&str> = screen
+            .trim_end()
+            .lines()
+            .rev()
+            .take(MENU_LINES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        // Only a qualified option run counts — a markdown numbered
+        // list in the transcript would otherwise take the numbered
+        // branch and answer a digit an unnumbered dialog ignores.
+        let numbered: Vec<u32> = numbered_block(&region);
+        let n: u32 = choice.parse().map_err(|_| {
+            Error::rejected(format!(
+                "'{choice}' is not a menu index — Claude menus take the \
+                 option's printed number"
+            ))
+        })?;
+        // A one-row "numbered run" is a stray `N.` line, not a menu —
+        // real menus list at least two options.
+        if numbered.len() >= 2 {
+            if !numbered.contains(&n) {
+                return Err(Error::rejected(format!(
+                    "no option {n} on this menu — it lists {}",
+                    numbered
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            // A single digit is one keypress. A multi-digit index
+            // must never reach tmux as one literal — `send-keys
+            // "10"` presses `1` then `0`, and a menu that selects
+            // on the first press would pick option 1 while `0`
+            // leaks as input. Navigate from the highlight instead.
+            if n < 10 {
+                return Ok(vec![n.to_string()]);
+            }
+            let sel = (0..region.len()).rev().find(|i| sel_row(&region, *i));
+            let cur = sel
+                .and_then(|i| option_line(region[i]))
+                .filter(|c| numbered.contains(c))
+                .ok_or_else(|| {
+                    Error::rejected(
+                        "cannot locate the highlighted option on this \
+                         menu — answer it in the pane",
+                    )
+                })?;
+            let want = numbered.iter().position(|o| *o == n).unwrap();
+            let at = numbered.iter().position(|o| *o == cur).unwrap();
+            let (dir, steps) = if want >= at {
+                ("Down", want - at)
+            } else {
+                ("Up", at - want)
+            };
+            let mut keys = vec![dir.to_string(); steps];
+            keys.push("Enter".to_string());
+            return Ok(keys);
+        }
+        // Unnumbered select: navigate the whole printed option block
+        // up and down from the highlighted `❯` row — never just the
+        // suffix below it. `option_block` requires a real sibling set
+        // around an indented `❯` row, so a transcript `❯` echo beside
+        // anchor text cannot be answered as a menu.
+        let (sel, start, end, corroborated) = option_block(&region).ok_or_else(|| {
+            Error::rejected(
+                "cannot locate the option rows on this menu — answer \
+                 it in the pane",
+            )
+        })?;
+        // An indentation-inferred block is transcript-fakeable — only
+        // a numbered option or the anchored legend directly below makes
+        // it a menu worth keying.
+        if !corroborated {
+            return Err(Error::rejected(
+                "the option block is inferred from indentation only — no \
+                 numbered option or legend corroborates it; answer it \
+                 in the pane",
+            ));
+        }
+        let count = (end - start + 1) as u32;
+        if n == 0 || n > count {
+            return Err(Error::rejected(format!(
+                "no option {n} on this menu — it lists {count}"
+            )));
+        }
+        // Navigate from the highlighted row — it is not necessarily
+        // the first option.
+        let want = (n - 1) as usize;
+        let cur = sel - start;
+        let (dir, steps) = if want >= cur {
+            ("Down", want - cur)
+        } else {
+            ("Up", cur - want)
+        };
+        let mut keys = vec![dir.to_string(); steps];
+        keys.push("Enter".to_string());
+        Ok(keys)
+    }
+
     fn forbidden_prefixes(&self) -> &'static [char] {
         FORBIDDEN_PREFIXES
     }
@@ -471,7 +851,9 @@ impl TuiProfile for ClaudeProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze_claude, proc_start_ticks, STATUS_LINES};
+    use super::{analyze_claude, proc_start_ticks, ClaudeProfile, STATUS_LINES};
+    use crate::adapter::pty::profile::TuiProfile;
+    use std::path::PathBuf;
 
     /// Real captures from a live claude 2.1.275 pane (CAD-17),
     /// committed under tests/fixtures/claude-tui/.
@@ -547,7 +929,9 @@ mod tests {
         let p = analyze_claude(&fixture("approval.txt"), None);
         assert!(!p.idle);
         assert!(p.approval_menu);
-        assert_eq!(p.reason, "approval menu is open");
+        // The reason names the command being approved — the furthest
+        // detail row above the proceed question.
+        assert_eq!(p.reason, "touch /tmp/claude-obs-marker-7");
     }
 
     #[test]
@@ -625,5 +1009,243 @@ mod tests {
         let stat =
             "1234 (node) S 1 1234 1234 0 -1 4194304 500 0 0 0 10 5 0 0 20 0 1 0 130881239 100 200";
         assert_eq!(proc_start_ticks(stat).as_deref(), Some("130881239"));
+    }
+
+    /// A profile for `approval_answer` tests — the method only reads
+    /// the screen, so the launch fields are dummies.
+    fn profile() -> ClaudeProfile {
+        ClaudeProfile {
+            sessions_dir: PathBuf::from("/tmp"),
+            command: "claude".to_string(),
+            model: None,
+            effort: None,
+            permission_mode: None,
+            allowed_tools: Vec::new(),
+            real: false,
+        }
+    }
+
+    /// The trust dialog's option block — ` Security guide` sits right
+    /// above the highlight at a different indent and must never count
+    /// as an option.
+    fn trust_menu() -> &'static str {
+        " Quick safety check: Is this a project you trust?\n \n Security guide\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n"
+    }
+
+    #[test]
+    fn unnumbered_answer_navigates_the_block() {
+        let prof = profile();
+        assert_eq!(
+            prof.approval_answer(trust_menu(), "2").unwrap(),
+            vec!["Down", "Enter"]
+        );
+        assert_eq!(
+            prof.approval_answer(trust_menu(), "1").unwrap(),
+            vec!["Enter"]
+        );
+    }
+
+    #[test]
+    fn answer_counts_options_above_the_highlight() {
+        // The highlight is on the SECOND printed option — `answer 1`
+        // must move Up to the first row, never confirm `No, exit`.
+        let screen = " Security guide\n   Yes, I trust this folder\n ❯ No, exit\n Enter to confirm · Esc to cancel\n";
+        let prof = profile();
+        assert_eq!(
+            prof.approval_answer(screen, "1").unwrap(),
+            vec!["Up", "Enter"]
+        );
+        assert_eq!(prof.approval_answer(screen, "2").unwrap(), vec!["Enter"]);
+    }
+
+    #[test]
+    fn answer_index_is_bounded_by_the_visible_block() {
+        let prof = profile();
+        for choice in ["3", "4000000000", "0"] {
+            assert!(
+                prof.approval_answer(trust_menu(), choice).is_err(),
+                "{choice} must refuse"
+            );
+        }
+        // Footer chrome with no option block refuses outright — never
+        // a blind arrow walk.
+        let footer_only = "transcript\n Enter to confirm · Esc to cancel\n";
+        assert!(prof.approval_answer(footer_only, "1").is_err());
+        assert!(prof.approval_answer(footer_only, "4000000000").is_err());
+    }
+
+    #[test]
+    fn multi_digit_answer_navigates_instead_of_typing() {
+        // `send-keys "10"` would press `1` (selecting option 1 on a
+        // digit-key menu) and leak `0` — a multi-digit index arrows
+        // from the highlighted row instead.
+        let menu = " Do you want to proceed?\n ❯ 1. Yes\n   2. A\n   3. B\n   4. C\n   5. D\n   6. E\n   7. F\n   8. G\n   9. H\n   10. No\n Enter to confirm · Esc to cancel\n";
+        let prof = profile();
+        assert_eq!(
+            prof.approval_answer(menu, "10").unwrap(),
+            vec!["Down", "Down", "Down", "Down", "Down", "Down", "Down", "Down", "Down", "Enter"]
+        );
+        assert_eq!(prof.approval_answer(menu, "3").unwrap(), vec!["3"]);
+        assert!(prof.approval_answer(menu, "11").is_err());
+        // A numbered menu with no `❯` highlight refuses rather than
+        // guessing where the arrows start from.
+        let no_highlight = " Do you want to proceed?\n   1. Yes\n   2. A\n   3. B\n   4. C\n   5. D\n   6. E\n   7. F\n   8. G\n   9. H\n   10. No\n Enter to confirm · Esc to cancel\n";
+        assert!(prof.approval_answer(no_highlight, "10").is_err());
+    }
+
+    #[test]
+    fn quoted_anchor_text_is_not_a_menu() {
+        // The anchor strings quoted mid-line in a transcript stay
+        // text — detection matches on the trimmed row's leading text.
+        let idle = fixture("idle.txt");
+        for quoted in [
+            "earlier it asked \"Do you want to proceed?\" — transcript",
+            "the log shows \"Quick safety check\" in passing",
+            "docs mention \"Yes, I trust this folder\" as an option",
+            "it printed \"Do you trust the files in this folder?\" once",
+        ] {
+            let p = analyze_claude(&format!("{idle}\n{quoted}"), Some((2, 0)));
+            assert!(!p.approval_menu, "{quoted}: {:?}", p);
+        }
+    }
+
+    #[test]
+    fn quoted_footer_text_is_not_a_menu() {
+        // Footer fragments mid-line are not menu rows — a menu needs
+        // the anchored legend or the `❯` highlight beside them.
+        let idle = fixture("idle.txt");
+        for quoted in [
+            "press \"Esc to cancel\" to dismiss it",
+            "or use \"Enter to confirm\" per the docs",
+        ] {
+            let p = analyze_claude(&format!("{idle}\n{quoted}"), Some((2, 0)));
+            assert!(!p.approval_menu, "{quoted}: {:?}", p);
+        }
+    }
+
+    #[test]
+    fn indented_anchor_without_structure_is_not_a_menu() {
+        // The round-3 livelock: a transcript row that LEADS with the
+        // anchor once indented satisfies the trimmed `starts_with`,
+        // and the bare anchor used to flip the pane to
+        // `approval_menu` — gating every send forever. With no
+        // option block and no legend beside it the row is inert.
+        let idle = fixture("idle.txt");
+        for line in [
+            "    Do you want to proceed?",
+            "      Quick safety check — mentioned above",
+            "   Do you trust the files in this folder?",
+        ] {
+            let p = analyze_claude(&format!("{idle}\n{line}"), Some((2, 0)));
+            assert!(!p.approval_menu, "{line}: {:?}", p);
+        }
+    }
+
+    #[test]
+    fn markdown_numbered_list_is_not_a_menu() {
+        // `option_line` matches any `N.` row — a markdown list in the
+        // transcript must not parse as menu options: no `❯`-led row
+        // inside the run and no legend after it.
+        let idle = fixture("idle.txt");
+        let list = "the plan:\n    1. gather context\n    2. draft the patch\n    3. run tests\n";
+        let p = analyze_claude(&format!("{idle}\n{list}"), Some((2, 0)));
+        assert!(!p.approval_menu, "{p:?}");
+        // And it cannot force the numbered answer path: a list above
+        // a real unnumbered dialog leaves the ❯ block in charge.
+        let screen = " 1. gather\n 2. draft\n 3. test\n Quick safety check\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n";
+        let prof = profile();
+        assert_eq!(
+            prof.approval_answer(screen, "2").unwrap(),
+            vec!["Down", "Enter"]
+        );
+    }
+
+    #[test]
+    fn transcript_prompt_echoes_are_not_a_menu() {
+        // Captured verbatim from a live pane: a submitted prompt's
+        // `❯`-echo sits at column 0 and a wrapped continuation line
+        // can start with the anchor — together they once parsed as a
+        // two-row menu and livelocked sends. Column-0 `❯` rows are
+        // echoes or the input box, never a menu highlight.
+        let screen = "❯ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n  Do you want to proceed?\n● API Error: safeguards flagged this message\n\n❯ \n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        let prof = profile();
+        assert!(prof.approval_answer(screen, "1").is_err());
+        // Two adjacent echoes still are not a menu: neither is the
+        // indented highlight a real option block needs.
+        let screen = "❯ first prompt\n❯ second prompt\n  Do you want to proceed?\n❯ \n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        assert!(prof.approval_answer(screen, "1").is_err());
+    }
+
+    #[test]
+    fn indented_echo_with_a_sibling_is_not_a_menu() {
+        // Round-4 review: an *indented* transcript `❯` passes sel_row,
+        // and a transcript row landing at the same column reads as its
+        // sibling — the two-row block used to set `approval_menu` and
+        // `answer` then keyed a live input box. Indentation alone never
+        // corroborates: only a numbered option inside the run or the
+        // anchored legend directly below does.
+        let screen = "  Do you want to proceed? — I'll ask first.\n    ❯ npm run dev\n      vite v5 ready\n\n❯ \n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        let prof = profile();
+        let err = prof.approval_answer(screen, "2").unwrap_err();
+        assert!(err.to_string().contains("indentation only"), "{err}");
+    }
+
+    #[test]
+    fn legend_below_the_block_corroborates_it() {
+        // The same two-row block WITH the menu legend directly below
+        // is a real select — corroboration is what separates it from
+        // transcript text.
+        let screen = " ❯ npm run dev\n   vite v5 ready\n\n Enter to confirm · Esc to cancel\n";
+        let p = analyze_claude(screen, None);
+        assert!(p.approval_menu, "{p:?}");
+        let prof = profile();
+        assert_eq!(
+            prof.approval_answer(screen, "2").unwrap(),
+            vec!["Down", "Enter"]
+        );
+    }
+
+    #[test]
+    fn lone_legend_far_from_the_anchor_is_not_a_menu() {
+        // A `cat`ed doc can quote an anchor and a hint row far apart —
+        // one hint only corroborates beside the anchor it belongs to
+        // (within two rows); a stray `Esc to cancel` in scrollback is
+        // text, never a menu.
+        let screen = " Do you want to proceed?\n unrelated output row\n another row\n and one more\n Esc to cancel\n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        // …but the hint beside its anchor is a real menu's legend.
+        let screen = " Do you want to proceed?\n Esc to cancel\n ❯ 1. Yes\n   2. No\n";
+        let p = analyze_claude(screen, None);
+        assert!(p.approval_menu, "{p:?}");
+    }
+
+    #[test]
+    fn quoted_menu_above_the_live_input_box_is_not_a_menu() {
+        // Round-5 review: corroboration is screen-local text, so an
+        // agent quoting the pane verbatim satisfies every textual
+        // check — anchor, a `❯`-led numbered run, the works. What the
+        // quote cannot fake is the frame: a live menu replaces the
+        // input box's interior, so a boxed `❯` prompt below the block
+        // proves the block is transcript. `answer` must refuse too —
+        // a digit keyed here lands in a live input line.
+        let screen = "● I reproduced it. The pane printed:\n\n    Do you want to proceed?\n    ❯ 1. Yes\n      2. No, and tell Claude what to do differently\n\n  So it is waiting on you.\n────────────────────\n❯ \n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu, "{p:?}");
+        assert!(p.idle, "{p:?}");
+        let prof = profile();
+        assert!(prof.approval_answer(screen, "2").is_err());
+        // The same quote with the input box still populated — a draft
+        // under the quote must stay a draft, never a menu.
+        let screen = "● the pane printed:\n    Do you want to proceed?\n    ❯ 1. Yes\n      2. No\n────────────────────\n❯ half-typed reply\n";
+        let p = analyze_claude(screen, None);
+        assert!(!p.approval_menu && p.input_nonempty, "{p:?}");
+        assert!(prof.approval_answer(screen, "1").is_err());
     }
 }
