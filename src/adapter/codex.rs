@@ -439,15 +439,19 @@ impl CodexAdapter {
 }
 
 impl Shared {
-    /// Merge a sparse provider update without letting a nullable field erase
-    /// the last confirmed value. Codex documents
-    /// `account/rateLimits/updated` as a rolling update, so this deliberately
-    /// preserves omitted and null fields.
+    /// Merge a sparse provider update. Omitted fields retain their last
+    /// confirmed value, while Codex's nullable window fields explicitly
+    /// replace stale telemetry with a JSON null. Other nullable fields,
+    /// including account identity, remain conservative and retain the last
+    /// confirmed value.
     fn merge_non_null(target: &mut Value, patch: &Value) {
         match (target, patch) {
             (Value::Object(target), Value::Object(patch)) => {
                 for (key, value) in patch {
                     if value.is_null() {
+                        if matches!(key.as_str(), "resetsAt" | "windowDurationMins") {
+                            target.insert(key.clone(), Value::Null);
+                        }
                         continue;
                     }
                     match target.get_mut(key) {

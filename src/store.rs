@@ -34,14 +34,18 @@ fn quota_now_iso() -> String {
     crate::issue::time::iso(crate::issue::time::now_epoch())
 }
 
-/// Merge a sparse provider update while retaining the last non-null value.
-/// Codex's rate-limit notification is explicitly sparse; a nullable field in
-/// one update means unavailable, not a confirmed reset of prior telemetry.
+/// Merge a sparse provider update. Omitted fields retain their last confirmed
+/// value, while Codex's nullable window fields explicitly replace stale
+/// telemetry with a JSON null. Other nullable fields, including account
+/// identity, remain conservative and retain the last confirmed value.
 fn merge_quota_json(target: &mut Value, patch: &Value) {
     match (target, patch) {
         (Value::Object(target), Value::Object(patch)) => {
             for (key, value) in patch {
                 if value.is_null() {
+                    if matches!(key.as_str(), "resetsAt" | "windowDurationMins") {
+                        target.insert(key.clone(), Value::Null);
+                    }
                     continue;
                 }
                 match target.get_mut(key) {
