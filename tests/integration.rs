@@ -20778,12 +20778,45 @@ fn slot_planted_pane_row_survives_restart() {
     plant_pane(&d, SELF_LANE, live_pid);
     let g = slot_acquire(&d, "build", SELF_LANE, "r1");
     assert_eq!(g["granted"], true, "{g}");
+    // Canary in the pre-fix shape — an enabled (fake, pty) row the boot
+    // relaunch sweep must launch. Its actor's adapter build fails
+    // deterministically and the exit-detach emits `attention`. The alias
+    // sorts after every other agent, so once its outcome lands the sweep
+    // has spawned an actor for every earlier row.
+    let conn = rusqlite::Connection::open(state.path().join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,
+            state,enabled,pid,generation,session_id,created,updated)
+         VALUES('zz-canary','fake','pty','worker',?1,'read-only',
+            'stopped',1,0,'planted','planted',0,0)",
+        [state.path().to_str().unwrap()],
+    )
+    .unwrap();
+    drop(conn);
     drop(d);
     let d2 = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
     plant_pane(&d2, SELF_LANE, live_pid);
-    // Hold the window where a relaunched actor would detach the row;
-    // with the fix no actor exists — nothing can land.
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Positive window-closed signal (CAD-221): never assert absence
+    // inside a window that may not have opened. The canary's `attention`
+    // proves the sweep ran and an actor outcome landed on the very path
+    // that would destroy a vulnerable planted row — the lane assertion
+    // below is made only after that window provably closed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if d2
+            .events("zz-canary")
+            .iter()
+            .any(|e| e["kind"].as_str() == Some("attention"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "canary never detached — the relaunch sweep did not run: {:?}",
+            d2.events("zz-canary")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     let conn = rusqlite::Connection::open(state.path().join("cadence.sqlite3")).unwrap();
     let p: i64 = conn
         .query_row("SELECT pid FROM agents WHERE alias=?", [SELF_LANE], |r| {
