@@ -19,6 +19,7 @@ This plan adds a reviewable, opt-in nextest runner for cadence's integration sui
 - **REQ-001**: Provide one checked-in runner that verifies `cargo-nextest` is exactly version `0.9.145` and matches the checked-in trusted executable SHA-256 before executing a test command.
 - **REQ-002**: Force the nextest profile to `retries = 0` and reject caller arguments that attempt to raise or replace retries.
 - **REQ-007**: Clear `NEXTEST_RETRIES`/`NEXTEST_PROFILE` and pass CLI `--retries 0` on every run path so a caller environment cannot override the reviewed profile.
+- **REQ-008**: Anchor both Cargo and nextest listing commands to the repository root so inventory evidence is independent of the caller's working directory.
 - **REQ-003**: Acquire `CADENCE_SUITE_LOCK` with an outer `flock` before launching direct nextest; when `cadence review` already holds that lock, run the child without nested flock and with an explicit held marker.
 - **REQ-004**: Make the integration harness refuse direct nextest execution when the outer lock contract is absent, while preserving ordinary cargo filtered tests and the review child's explicit empty-path contract.
 - **REQ-005**: Provide a non-empty, deterministic inventory check proving cargo and nextest expose the same complete integration test set; preserve unit, binary, board, and integration coverage in the review gates.
@@ -103,6 +104,7 @@ This plan adds a reviewable, opt-in nextest runner for cadence's integration sui
 - **TEST-002**: The same local fixture proves retries cannot be supplied by caller, `NEXTEST_RETRIES` is neutralized with CLI `--retries 0`, and direct invocation requires `CADENCE_SUITE_LOCK`.
 - **TEST-003**: The same local fixture proves `CADENCE_REVIEW_SUITE_LOCK_HELD=1` with an empty child lock path runs without a second flock.
 - **TEST-008**: The same local fixture runs a temporary two-second test and observes a non-blocking probe denied by the outer lock while the child is starting/running.
+- **TEST-009**: Inventory invocation from outside the repository resolves the current Cargo manifest and nextest config before comparing names.
 - **TEST-004**: Focused Rust test proves nextest detection rejects filtered execution without the review-held marker and ordinary cargo filtering remains allowed.
 - **TEST-005**: Inventory command proves both manifests are non-empty and equal before reporting success; missing nextest reports an honest dependency failure.
 - **TEST-006**: Current-head `cargo test --test integration -- --list`, `cargo test --lib --bins --test board --no-run`, and equivalent inventory/build checks preserve unit/bin/board/integration coverage without a full-suite run in this lane.

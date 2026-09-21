@@ -60,6 +60,8 @@ for arg in "$@"; do
     esac
 done
 
+cd "$ROOT" || die "cannot enter cadence repository root: $ROOT"
+
 run_nextest() {
     if [ "$SUBCOMMAND" = run ]; then
         exec env -u NEXTEST_RETRIES -u NEXTEST_PROFILE \

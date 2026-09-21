@@ -277,7 +277,8 @@ runs.
 When `cadence review` owns the slot, `src/review.rs` clears the child's
 lock path and sets an explicit held marker; the wrapper then runs without
 a nested flock. `scripts/nextest-inventory` compares non-empty cargo and
-nextest test-name manifests before any runner switch. The checked-in
+nextest test-name manifests from the repository root before any runner
+switch, even when the command is invoked from another directory. The checked-in
 review configuration remains on cargo until the human-class installation,
 structured-result, and gate-activation approvals for CAD-173 are recorded.
 
