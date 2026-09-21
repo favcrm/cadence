@@ -48,6 +48,7 @@ pub mod claude;
 pub mod cursor;
 pub mod devin;
 pub mod profile;
+mod render;
 pub mod stub;
 
 pub use claude::{analyze_claude, ClaudeProfile};
@@ -70,6 +71,7 @@ use crate::error::{Error, Result};
 use crate::store::Agent;
 
 use super::{AdapterHooks, Identity, Probe, ProviderAdapter, ProviderEnv, TurnResult};
+use render::{RenderDecision, RenderObservation, RenderOutcome};
 
 /// How long an operator readiness claim stays valid for one send.
 const READY_TTL: Duration = Duration::from_secs(60);
@@ -900,43 +902,51 @@ impl ProviderAdapter for PtyAdapter {
         // means Enter never submitted (a staged draft is not a turn).
         // A miss inside the bound is evidence of a dropped paste, never
         // proof; the daemon decides per message kind what a miss means.
-        let deadline = Instant::now() + RENDER_DEADLINE;
-        let mut rendered = false;
+        let render_started = Instant::now();
+        let mut render_decision = RenderDecision::new(RENDER_DEADLINE);
         loop {
             let screen = self.capture_visible()?;
-            if normalize_screen(&screen).matches(&slice).count() > before_count {
-                rendered = true;
+            let observation = if normalize_screen(&screen).matches(&slice).count() > before_count {
                 let cursor = self.cursor_pos(&session);
-                if !self.profile.analyze(&screen, cursor).input_nonempty {
-                    break;
+                RenderObservation::Visible {
+                    input_nonempty: self.profile.analyze(&screen, cursor).input_nonempty,
                 }
+            } else {
+                RenderObservation::NotVisible
+            };
+            match render_decision.observe(render_started.elapsed(), observation) {
+                Some(RenderOutcome::Submitted) => break,
+                Some(outcome @ (RenderOutcome::Staged | RenderOutcome::NotRendered)) => {
+                    // The miss carries what the pane actually showed — the
+                    // screen tail before the paste and after the deadline,
+                    // plus the probe verdict that admitted the send — so a
+                    // fence records evidence, not just a verdict.
+                    let reason = match outcome {
+                        RenderOutcome::Staged => {
+                            "paste rendered in the input line but was never submitted — \
+                             Enter not observed; the draft is left untouched"
+                        }
+                        RenderOutcome::NotRendered => {
+                            "pasted text never rendered in the pane — the TUI dropped it"
+                        }
+                        RenderOutcome::Submitted => unreachable!(),
+                    };
+                    let claim_probe = self
+                        .state
+                        .lock()
+                        .unwrap()
+                        .gate_probe
+                        .as_ref()
+                        .map(Probe::to_json);
+                    return Err(Error::not_rendered(crate::error::RenderMiss {
+                        reason: reason.to_string(),
+                        before_tail: screen_tail(&before, 12),
+                        after_tail: screen_tail(&screen, 12),
+                        claim_probe,
+                    }));
+                }
+                None => std::thread::sleep(Duration::from_millis(150)),
             }
-            if Instant::now() >= deadline {
-                // The miss carries what the pane actually showed — the
-                // screen tail before the paste and after the deadline,
-                // plus the probe verdict that admitted the send — so a
-                // fence records evidence, not just a verdict.
-                let reason = if rendered {
-                    "paste rendered in the input line but was never submitted — \
-                     Enter not observed; the draft is left untouched"
-                } else {
-                    "pasted text never rendered in the pane — the TUI dropped it"
-                };
-                let claim_probe = self
-                    .state
-                    .lock()
-                    .unwrap()
-                    .gate_probe
-                    .as_ref()
-                    .map(Probe::to_json);
-                return Err(Error::not_rendered(crate::error::RenderMiss {
-                    reason: reason.to_string(),
-                    before_tail: screen_tail(&before, 12),
-                    after_tail: screen_tail(&screen, 12),
-                    claim_probe,
-                }));
-            }
-            std::thread::sleep(Duration::from_millis(150));
         }
 
         on_started(&token);
