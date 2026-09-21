@@ -122,6 +122,11 @@ cadence issue diff CAD-16 [<rev>] [--to <rev>]
                                             # counts, comment/artifact files
 cadence issue blame CAD-16                  # per field: the entry that last
                                             # changed it (value, sha, at, by)
+cadence issue retro CAD-16 [--json]         # read-only retrospective: rounds,
+                                            # caught defects, flakes, timings,
+                                            # proposed lessons + explicit
+                                            # unknowns from tracker/notes/
+                                            # store evidence — nothing written
 cadence issue trailer CAD-16                # prints `Issue: CAD-16` — the
                                             # trailer line for code commits
 cadence issue start CAD-16                  # mints .cadence/wt/cad-16-<slug> on
