@@ -2282,6 +2282,23 @@ for line in sys.stdin:
                 "id": "th-1", "sessionId": "s-1", "model": model,
                 "reasoningEffort": effort},
                 "model": model, "reasoningEffort": effort}})
+    elif method == "account/rateLimits/read":
+        if mode == "no-quota":
+            emit({"id": mid, "error": {"code": -32601,
+                 "message": "rate limits unavailable in this auth mode"}})
+        else:
+            emit({"id": mid, "result": {
+                "accountId": "acct-codex-test",
+                "rateLimits": {
+                    "primary": {"usedPercent": 23,
+                                 "windowDurationMins": 60,
+                                 "resetsAt": 1900000000},
+                    "secondary": None},
+                "rateLimitsByLimitId": {
+                    "codex": {"usedPercent": 7,
+                              "windowDurationMins": 10080,
+                              "resetsAt": 1900100000}},
+                "planType": "mock-pro"}})
     elif method == "turn/start":
         if mode == "bad-turn":
             emit({"id": mid, "result": {"turn": {}}})
@@ -2291,6 +2308,10 @@ for line in sys.stdin:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
         else:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
+            if mode == "quota-update":
+                emit({"method": "account/rateLimits/updated", "params": {
+                    "accountId": None,
+                    "rateLimits": {"primary": {"usedPercent": 42}}}})
             emit({"method": "turn/completed", "params": {"turn": {
                 "id": "t-1", "status": "completed", "items": [
                     {"id": "i1", "type": "agentMessage",
@@ -2554,6 +2575,16 @@ def handle(conn):
                 "id": "th-1", "sessionId": "s-1", "model": model,
                 "reasoningEffort": effort},
                 "model": model, "reasoningEffort": effort}})
+        elif method == "account/rateLimits/read":
+            if mode == "no-quota":
+                send_json(conn, {"id": mid, "error": {"code": -32601,
+                    "message": "rate limits unavailable in this auth mode"}})
+            else:
+                send_json(conn, {"id": mid, "result": {
+                    "accountId": "acct-codex-test",
+                    "rateLimits": {"primary": {"usedPercent": 23,
+                        "windowDurationMins": 60, "resetsAt": 1900000000}},
+                    "rateLimitsByLimitId": {}, "planType": "mock-pro"}})
         elif method == "turn/start":
             text = ""
             try:
@@ -2748,6 +2779,76 @@ fn codex_approval_policy_defaults_to_never_and_replays_on_resume() {
     assert_eq!(reqs[1]["method"], "thread/resume");
     assert_eq!(reqs[1]["params"]["approvalPolicy"], "never");
     assert_eq!(reqs[1]["params"]["threadId"], "th-1");
+}
+
+#[test]
+fn codex_quota_is_provider_bound_and_sparse_updates_are_preserved() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("quota-update");
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "quota", "provider": "codex",
+               "endpoint_kind": "managed", "cwd": cwd,
+               "params": "{\"quota\":{\"state\":\"available\",\"used_percent\":100}}"}),
+    )
+    .unwrap();
+    d.wait_agent("quota", "idle", 15);
+
+    let initial = d.rpc("agent_show", json!({"alias": "quota"})).unwrap()["agent"].clone();
+    let quota = &initial["quota"];
+    assert_eq!(quota["provider"], "codex");
+    assert_eq!(quota["assignee"], "quota");
+    assert_eq!(quota["account_id"], "acct-codex-test");
+    assert_eq!(quota["thread_id"], "th-1");
+    assert_eq!(quota["state"], "available");
+    assert_eq!(quota["data"]["rateLimits"]["primary"]["usedPercent"], 23);
+    assert_eq!(
+        quota["data"]["rateLimitsByLimitId"]["codex"]["usedPercent"],
+        7
+    );
+    assert!(quota["observed_at"]
+        .as_str()
+        .is_some_and(|value| value.contains('T')));
+    // A caller-supplied params value never becomes provider evidence.
+    assert_eq!(initial["params"]["quota"]["used_percent"], 100);
+    assert_eq!(quota["used_percent"], Value::Null);
+
+    d.rpc(
+        "agent_send",
+        json!({"alias": "quota", "text": "refresh", "message": "quota-refresh"}),
+    )
+    .unwrap();
+    d.wait_message("quota", "quota-refresh", &["completed"], 15);
+    let updated = d.rpc("agent_show", json!({"alias": "quota"})).unwrap()["agent"].clone();
+    let quota = &updated["quota"];
+    assert_eq!(quota["state"], "available");
+    assert_eq!(quota["account_id"], "acct-codex-test");
+    assert_eq!(quota["data"]["rateLimits"]["primary"]["usedPercent"], 42);
+    // The sparse update omitted these values; the producer retains them.
+    assert_eq!(
+        quota["data"]["rateLimits"]["primary"]["windowDurationMins"],
+        60
+    );
+    assert_eq!(
+        quota["data"]["rateLimitsByLimitId"]["codex"]["usedPercent"],
+        7
+    );
+}
+
+#[test]
+fn codex_quota_endpoint_failure_is_explicit_unknown() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("no-quota");
+    d.register_codex("no-quota");
+    d.wait_agent("no-quota", "idle", 15);
+    let agent = d.rpc("agent_show", json!({"alias": "no-quota"})).unwrap()["agent"].clone();
+    assert_eq!(agent["quota"]["state"], "unavailable");
+    assert_eq!(agent["quota"]["account_id"], Value::Null);
+    assert_eq!(agent["quota"]["data"], Value::Null);
+    assert!(agent["quota"]["reason"]
+        .as_str()
+        .is_some_and(|reason| { reason.contains("unavailable") }));
 }
 
 #[test]
