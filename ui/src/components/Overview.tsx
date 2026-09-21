@@ -107,6 +107,9 @@ function MonitoringView({
                 </span>
                 <span className="num text-ink-300">{monitor.id}</span>
                 <span className="text-ink-500">owner {monitor.owner}</span>
+                <span className="text-ink-600">
+                  dispatch {monitor.auto_dispatch_enabled ? "automatic opt-in" : monitor.dispatch_enabled ? "manual" : "off"}
+                </span>
                 <span className="text-ink-500">
                   scan {when(monitor.last_success_at)} · last check {when(monitor.last_check_at)}
                 </span>
@@ -158,11 +161,12 @@ function MonitorAlertView({
   onAck: (monitor: string, seq: number) => void;
 }) {
   const open = alert.state === "open";
+  const stateLabel = alert.state === "resolved" ? "resolved" : open ? "open" : "acknowledged";
   return (
     <div className="rounded border border-ink-700/70 bg-ink-875 px-3 py-2.5 space-y-1.5">
       <div className="flex flex-wrap items-center gap-2">
         <span className={`chip !py-[.15rem] ${open ? "bg-warn/10 text-warn" : "bg-ink-800 text-ink-500"}`}>
-          {open ? "open" : "acknowledged"}
+          {stateLabel}
         </span>
         <span className="chip !py-[.15rem] bg-ink-800 text-ink-300">{alert.kind}</span>
         <span className="num text-micro text-ink-500">{age(alert.age_secs)}</span>
