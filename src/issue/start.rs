@@ -4,6 +4,8 @@
 //! to `doing`, print the CAD-42 trailer. `--job` additionally opens
 //! an M3 job whose task is already scoped to the worktree.
 
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -415,6 +417,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     }
     drop(_lock);
 
+    // CAD-113: the worktree's slot environment — a write failure is
+    // reported, never silently swallowed.
+    let slot_env = match write_slot_env(&wt_dir, &pm.dir) {
+        Ok(path) => json!({"path": path}),
+        Err(e) => json!({"error": e.to_string()}),
+    };
     let mut out = json!({
         "issue": front.id,
         "repo": root,
@@ -424,6 +432,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "trailer": format!("Issue: {}", front.id),
         "created": created,
         "target_dir": cargo_target,
+        "slot_env": slot_env,
     });
     if let (Some(job), Some((state_dir, spec, spec_sha256))) = (&args.job, job_probe) {
         let created_job = client::rpc(
@@ -445,4 +454,106 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         out["task"] = json!(format!("{job_id}-t1"));
     }
     Ok(out)
+}
+
+/// CAD-113: the worktree's build-slot environment — `CARGO_BUILD_JOBS`
+/// from `[host] jobs_per_lane` (default 4) and the `build-slot` helper
+/// path, so a worker never has to remember flags. Idempotent: lines we
+/// own are rewritten, everything else in an existing `.env` survives.
+/// Atomic (tmp + rename — a reader never sees a torn file), refuses to
+/// write through a symlink, keeps an existing file's mode and creates
+/// 0600.
+fn write_slot_env(wt_dir: &Path, pm_dir: &Path) -> Result<PathBuf> {
+    // The generated env must never dirty the worktree — `issue
+    // finish`'s clean-tree guard reads `git status`. `.git/info/
+    // exclude` covers untracked `.env` without touching tracked files
+    // (a linked worktree resolves this to the COMMON git dir, so the
+    // anchored `/.env` entry applies at every worktree's root and the
+    // main checkout's — permanently; see docs/BOARD.md). The flock
+    // serializes concurrent `issue start`s: check-and-append under
+    // LOCK_EX can never double-write.
+    let mut exclude = PathBuf::from(git(wt_dir, &["rev-parse", "--git-path", "info/exclude"])?);
+    if exclude.is_relative() {
+        exclude = wt_dir.join(exclude);
+    }
+    if let Some(dir) = exclude.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(&exclude)?;
+    {
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(Error::internal(format!(
+                "flock {}: {}",
+                exclude.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut text = String::new();
+        f.read_to_string(&mut text)?;
+        let covered: Vec<&str> = text.lines().map(|l| l.trim()).collect();
+        // Anchored to the worktree root — a bare `.env` would hide
+        // `.env` at ANY depth in EVERY worktree forever. An existing
+        // unanchored entry still counts as coverage (superset), so a
+        // host that ran the older writer never gains a duplicate.
+        for p in ["/.env", "/.env.tmp"] {
+            let bare = &p[1..];
+            if !covered.iter().any(|l| *l == p || *l == bare) {
+                writeln!(f, "{p}")?;
+            }
+        }
+        // flock releases with the fd on drop.
+    }
+    let jobs = crate::doctor::host::host_overrides(pm_dir)
+        .and_then(|o| o.jobs_per_lane)
+        .unwrap_or(4);
+    let helper = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cadence"));
+    let file = wt_dir.join(".env");
+    let owned = ["CARGO_BUILD_JOBS=", "CADENCE_BUILD_SLOT="];
+    let mut text = String::new();
+    let mut mode = 0o600;
+    if let Ok(meta) = std::fs::symlink_metadata(&file) {
+        if meta.file_type().is_symlink() {
+            return Err(Error::rejected(format!(
+                "{} is a symlink — refusing to write the slot env through it",
+                file.display()
+            )));
+        }
+        mode = meta.permissions().mode() & 0o777;
+        if let Ok(existing) = std::fs::read_to_string(&file) {
+            for line in existing.lines() {
+                if !owned.iter().any(|p| line.starts_with(p)) {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    text.push_str(&format!("CARGO_BUILD_JOBS={jobs}\n"));
+    text.push_str(&format!("CADENCE_BUILD_SLOT={}\n", helper.display()));
+    // `.env.tmp` sits beside the target and is excluded above too, so
+    // even a SIGKILL mid-write can never leave a dirty worktree.
+    let tmp = wt_dir.join(".env.tmp");
+    let write = || -> Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, &file)?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(file)
 }
