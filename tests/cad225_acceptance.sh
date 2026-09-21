@@ -12,10 +12,9 @@ set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 LOG_ROOT=${CAD225_LOG_ROOT:-${TMPDIR:-/tmp}/cad225-acceptance-$$}
-NEXTEST_BIN=${CADENCE_NEXTTEST_BIN:-/tmp/cadence-nextest-0.9.145/cargo-nextest}
-SUITE_LOCK=${CADENCE_SUITE_LOCK:-/home/ubuntu/.local/state/cadence/suite.lock}
+NEXTEST_BIN=${CADENCE_NEXTTEST_BIN:-cargo-nextest}
+SUITE_LOCK=${CADENCE_SUITE_LOCK:-}
 mkdir -p "$LOG_ROOT"
-mkdir -p "$(dirname -- "$SUITE_LOCK")"
 
 passed=0
 failed=0
@@ -72,20 +71,20 @@ run_cargo_case() {
         integration)
             run_case "$label" env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
                 CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
-                "$ROOT/scripts/cadence-nextest" --test integration \
-                -E "test($filter)" "$@"
+                "$ROOT/scripts/cadence-nextest" --test integration --locked \
+                -E "test(=$filter)" "$@"
             ;;
         board)
             run_case "$label" env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
                 CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
-                "$ROOT/scripts/cadence-nextest" --test board \
-                -E "test($filter)" "$@"
+                "$ROOT/scripts/cadence-nextest" --test board --locked \
+                -E "test(=$filter)" "$@"
             ;;
         lib)
             run_case "$label" env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
                 CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
-                "$ROOT/scripts/cadence-nextest" --lib \
-                -E "test($filter)" "$@"
+                "$ROOT/scripts/cadence-nextest" --lib --locked \
+                -E "test(=$filter)" "$@"
             ;;
         *)
             printf 'unknown test target %s\n' "$target" >&2
@@ -101,9 +100,9 @@ run_expected_missing_filter() {
     filter=$3
     log="$LOG_ROOT/$label.log"
     case "$target" in
-        integration) target_args="--test integration" ;;
-        board) target_args="--test board" ;;
-        lib) target_args="--lib" ;;
+        integration) target_args="--test integration --locked" ;;
+        board) target_args="--test board --locked" ;;
+        lib) target_args="--lib --locked" ;;
         *)
             harness_failed=$((harness_failed + 1))
             failed_labels="$failed_labels $label"
@@ -112,12 +111,12 @@ run_expected_missing_filter() {
             ;;
     esac
     printf 'HARNESS %s\n' "$label"
-    printf '  command: env CARGO_BUILD_JOBS=%s CADENCE_NEXTTEST_BIN=%s CADENCE_SUITE_LOCK=%s %s %s -E test(%s)\n' \
+    printf '  command: env CARGO_BUILD_JOBS=%s CADENCE_NEXTTEST_BIN=%s CADENCE_SUITE_LOCK=%s %s %s -E test(=%s)\n' \
         "${CARGO_BUILD_JOBS:-4}" "$NEXTEST_BIN" "$SUITE_LOCK" \
         "$ROOT/scripts/cadence-nextest" "$target_args" "$filter"
     if env CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
         CADENCE_NEXTTEST_BIN="$NEXTEST_BIN" CADENCE_SUITE_LOCK="$SUITE_LOCK" \
-        "$ROOT/scripts/cadence-nextest" $target_args -E "test($filter)" \
+        "$ROOT/scripts/cadence-nextest" $target_args -E "test(=$filter)" \
         >"$log" 2>&1; then
         harness_failed=$((harness_failed + 1))
         failed_labels="$failed_labels $label"
@@ -153,6 +152,22 @@ if [ -n "$initial_status" ]; then
     exit 1
 fi
 
+# The shared runner intentionally has no lock-path default.  Requiring the
+# caller to provide it prevents this fixture harness from silently bypassing
+# the host-wide suite admission contract.  CADENCE_NEXTTEST_BIN still follows
+# the runner's portable cargo-nextest default above.
+if [ -z "$SUITE_LOCK" ]; then
+    result=FAIL
+    failed=1
+    failed_labels=" missing_suite_lock"
+    printf 'CADENCE_SUITE_LOCK is required; set the canonical host lock or use cadence review\n' >&2
+    tree_clean_after=yes
+    head_unchanged=yes
+    write_summary
+    exit 1
+fi
+mkdir -p "$(dirname -- "$SUITE_LOCK")"
+
 # The wrapper supplies --no-tests fail and a pinned binary/checksum. This
 # expected-failure probe proves a renamed or missing filter cannot silently
 # turn into a green case with zero executed tests.
@@ -187,9 +202,9 @@ run_cargo_case retro_preview board retro_reports_rounds_defects_flakes_and_unkno
 
 printf '\nUNSUPPORTED CAD225 acceptance steps on current main:\n'
 unsupported=$((unsupported + 1))
-printf '  - unattended opt-in scheduler: monitor watch records alerts only; it never calls monitor_dispatch\n'
+printf '  - unattended opt-in scheduler end-to-end: CAD-176 PR100 owns the coordinator; this fixture does not exercise that pending coordinator or its post-merge behavior\n'
 unsupported=$((unsupported + 1))
-printf '  - provider quota exhaustion admission/recovery: no job/monitor quota contract exists; relay quota is separate\n'
+printf '  - provider quota exhaustion admission/recovery: PR100 requires fresh provider-tagged evidence, but no real provider producer/current-production signal exists; live quota recovery is outside this fixture\n'
 unsupported=$((unsupported + 1))
 printf '  - policy-authorized merge: job accept records merged_sha evidence; Cadence does not execute or authorize git/GitHub merge\n'
 unsupported=$((unsupported + 1))
