@@ -4279,6 +4279,15 @@ mod tests {
             d.join("deps/marker").display().to_string()
         );
 
+        // The lock assertion is independent of stale-worktree quoting.
+        // Retire that linked worktree before the held-lock scan so this
+        // phase exercises only shared-cache lock handling and does not
+        // launch unrelated git probes.
+        git(
+            &repo,
+            &["worktree", "remove", "-f", ".cadence/wt/feat gone"],
+        );
+
         // A held .cargo-lock swaps the rm -rf for an idle note — and
         // with no freeing command emitted, the row's bytes leave the
         // reclaimable total too.
@@ -4286,9 +4295,7 @@ mod tests {
         std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         std::fs::write(&lock, "").unwrap();
         std::fs::write(d.join("deps/cached2.o"), vec![7u8; 8192]).unwrap();
-        let f = std::fs::File::open(&lock).unwrap();
-        use std::os::unix::io::AsRawFd;
-        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let f = crate::worktree::TestFileLock::acquire(&lock);
         let plan = reclaim_plan(&scan);
         let shared_row = plan["rows"]
             .as_array()
@@ -4315,7 +4322,7 @@ mod tests {
             stale_bytes,
             "locked shared row must not count toward the total"
         );
-        drop(f); // probe must see the lock released
+        f.release(); // probe must see the lock released
         assert!(!file_locked(&lock));
     }
 
