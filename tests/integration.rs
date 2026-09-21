@@ -21151,7 +21151,7 @@ fn monitor_migration_from_v6_bridges_provider_effort_before_v8() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(columns.iter().any(|column| column == "effort"));
 }
 
@@ -21185,7 +21185,7 @@ fn monitor_migration_after_provider_effort_v7_is_v8() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(columns.iter().any(|column| column == "effort"));
 }
 
