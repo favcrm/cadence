@@ -923,12 +923,14 @@ fn full_suite_report(step: Option<&Step>, command: &str, retries: u64) -> Value 
         }),
     };
     report["retries"] = json!(retries);
-    report["tests"] = step
+    let structured = step
         .and_then(|step| step.result.as_ref())
-        .map(|result| result.to_json()["tests"].clone())
+        .map(TestRunSummary::to_json);
+    report["tests"] = structured
+        .as_ref()
+        .map(|result| result["tests"].clone())
         .unwrap_or_else(|| json!([]));
-    if let Some(result) = step.and_then(|step| step.result.as_ref()) {
-        let structured = result.to_json();
+    if let Some(structured) = structured {
         for key in [
             "valid",
             "test_count",
