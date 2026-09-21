@@ -167,6 +167,67 @@ export interface OverviewProject {
   oldest_review_age?: number | null;
 }
 
+export interface MonitorAlert {
+  seq: number;
+  monitor: string;
+  project: string;
+  monitor_owner: string;
+  task?: string | null;
+  event_seq: number;
+  fingerprint: string;
+  kind: string;
+  payload: unknown;
+  state: "open" | "acknowledged" | string;
+  attempts: number;
+  last_error?: string | null;
+  created: number;
+  updated: number;
+  age_secs: number;
+  next_action: string;
+  next_owner: string;
+  authority: string;
+  evidence: {
+    monitor: string;
+    alert_seq: number;
+    event_seq: number;
+    fingerprint: string;
+    payload: unknown;
+  };
+}
+
+export interface MonitorRow {
+  id: string;
+  project: string;
+  owner: string;
+  interval_secs: number;
+  monitoring: "active" | "degraded" | "off" | string;
+  heartbeat_at?: number | null;
+  last_check_at?: number | null;
+  last_success_at?: number | null;
+  next_check_at?: number | null;
+  event_cursor: number;
+  delivery: { configured: boolean; state: string; push?: boolean; detail?: string };
+  dispatch_enabled: boolean;
+  open_alerts: number;
+  total_alerts: number;
+  error?: string | null;
+  alerts?: MonitorAlert[];
+  alerts_error?: string;
+}
+
+export interface Monitoring {
+  available: boolean;
+  state: "active" | "degraded" | "stopped" | "unavailable" | string;
+  last_success_at?: number | null;
+  last_check_at?: number | null;
+  next_check_at?: number | null;
+  open_alerts: number;
+  errors: { monitor?: string; error: string }[];
+  delivery: { configured: boolean; state: string; push: boolean; detail: string };
+  monitors: MonitorRow[];
+  alerts: MonitorAlert[];
+}
+
 /** `GET /api/overview` — everything derived, nothing stored. */
 export interface Overview {
   needs_me: NeedsMe[];
@@ -174,6 +235,7 @@ export interface Overview {
   projects: OverviewProject[];
   github: { state: "ok" | "cached" | "stale" | "unavailable"; error?: string | null; at?: number };
   daemon: { reachable: boolean; build_commit?: string; build_time?: string; started_at?: number; info?: string };
+  monitoring?: Monitoring;
   generated_at: number;
 }
 

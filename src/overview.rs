@@ -161,6 +161,269 @@ pub fn cmd_issue_set_ready(id: &str) -> String {
 pub const CMD_ISSUE_SYNC: &str = "cadence issue sync";
 pub const CMD_RESTART_WHEN_IDLE: &str = "cadence daemon restart --when-idle --ui";
 
+/// The monitor daemon deliberately has no external delivery provider in this
+/// increment.  The board can still make its durable local inbox useful by
+/// projecting the daemon's evidence into the overview and letting an operator
+/// acknowledge an alert there.
+fn monitor_alert_action(kind: &str, monitor_owner: &str) -> (&'static str, String, &'static str) {
+    match kind {
+        "approval_menu" => (
+            "Review the approval request",
+            "operator".to_string(),
+            "operator approval required",
+        ),
+        "attention" => (
+            "Resolve the worker attention request",
+            "operator".to_string(),
+            "operator reconciliation required",
+        ),
+        "turn_silent_end" => (
+            "Reconcile the silent turn outcome",
+            "operator".to_string(),
+            "operator reconciliation required",
+        ),
+        "draft_pending" => (
+            "Route the draft to an independent reviewer",
+            "reviewer".to_string(),
+            "independent review required",
+        ),
+        "delivery_parked" => (
+            "Inspect the parked delivery before retrying",
+            monitor_owner.to_string(),
+            "monitor owner may retry; delivery is not automatic",
+        ),
+        "paste_not_rendered" => (
+            "Inspect the PTY render miss and recover the worker",
+            monitor_owner.to_string(),
+            "monitor owner may recover the worker",
+        ),
+        "turn_stalled" => (
+            "Inspect the stalled turn and reconcile its worker",
+            monitor_owner.to_string(),
+            "monitor owner may reconcile the worker",
+        ),
+        _ => (
+            "Inspect the monitor evidence and choose the next owner",
+            monitor_owner.to_string(),
+            "operator decision required",
+        ),
+    }
+}
+
+fn local_monitor_delivery() -> Value {
+    json!({
+        "configured": false,
+        "state": "ui_local_only",
+        "push": false,
+        "detail": "Durable alerts are visible and acknowledged in this UI; external push delivery is unconfigured",
+    })
+}
+
+/// Build the UI-facing monitoring projection from daemon RPC rows.  Keeping
+/// this pure makes the state axes testable without opening the live store:
+/// `last_success_at` is a completed check, while heartbeat and next-check
+/// timestamps remain separate evidence.
+fn monitoring_view(
+    monitors: Vec<Value>,
+    alerts_by_monitor: HashMap<String, Vec<Value>>,
+    alert_errors: HashMap<String, String>,
+    now: i64,
+) -> Value {
+    let mut state = "stopped";
+    let mut last_success_at: Option<f64> = None;
+    let mut last_check_at: Option<f64> = None;
+    let mut next_check_at: Option<f64> = None;
+    let mut open_alerts = 0i64;
+    let mut errors = Vec::new();
+    let mut all_alerts = Vec::new();
+    let mut monitor_rows = Vec::new();
+
+    for mut monitor in monitors {
+        let id = monitor["id"].as_str().unwrap_or_default().to_string();
+        let raw_state = monitor["monitoring"].as_str().unwrap_or("off");
+        match raw_state {
+            "degraded" => state = "degraded",
+            "active" if state != "degraded" => state = "active",
+            _ => {}
+        }
+        for (field, target) in [
+            ("last_success_at", &mut last_success_at),
+            ("last_check_at", &mut last_check_at),
+        ] {
+            if let Some(value) = monitor[field].as_f64() {
+                if target.is_none_or(|current| value > current) {
+                    *target = Some(value);
+                }
+            }
+        }
+        if let Some(value) = monitor["next_check_at"].as_f64() {
+            if next_check_at.is_none_or(|current| value < current) {
+                next_check_at = Some(value);
+            }
+        }
+        // `active` is a claim about a completed observer pass, not a
+        // heartbeat.  Once the recorded schedule is overdue, surface the
+        // monitor as stale even if the daemon stopped before it could write
+        // a degraded row.  A missing success proof is stale as well.
+        let overdue = matches!(raw_state, "active" | "degraded")
+            && (monitor["next_check_at"]
+                .as_f64()
+                .is_none_or(|next| next <= now as f64)
+                || (raw_state == "active" && monitor["last_success_at"].is_null()));
+        if overdue {
+            monitor["stale"] = json!(true);
+            monitor["monitoring"] = json!("stale");
+            if state != "degraded" {
+                state = "stale";
+            }
+            let stale_error = if monitor["last_success_at"].is_null() {
+                "active monitor has no successful scan evidence"
+            } else {
+                "scheduled monitor reconciliation is overdue"
+            };
+            if monitor["error"].is_null() {
+                monitor["error"] = json!(stale_error);
+            }
+            errors.push(json!({"monitor": id, "error": monitor["error"]}));
+        }
+        if !overdue {
+            if let Some(error) = monitor["error"].as_str().filter(|s| !s.is_empty()) {
+                errors.push(json!({"monitor": id, "error": error}));
+            }
+        }
+        if let Some(error) = alert_errors.get(&id) {
+            errors.push(json!({"monitor": id, "error": error}));
+            monitor["alerts_error"] = json!(error);
+        }
+        let mut rows = Vec::new();
+        for alert in alerts_by_monitor.get(&id).cloned().unwrap_or_default() {
+            let kind = alert["kind"].as_str().unwrap_or("alert");
+            let (next_action, next_owner, authority) =
+                monitor_alert_action(kind, monitor["owner"].as_str().unwrap_or("operator"));
+            let created = alert["created"].as_f64().unwrap_or(now as f64);
+            let age_secs = ((now as f64 - created).max(0.0)).round() as i64;
+            if alert["state"].as_str() == Some("open") {
+                open_alerts += 1;
+            }
+            let row = json!({
+                "seq": alert["seq"],
+                "monitor": id,
+                "project": monitor["project"],
+                "monitor_owner": monitor["owner"],
+                "task": alert["task"],
+                "event_seq": alert["event_seq"],
+                "fingerprint": alert["fingerprint"],
+                "kind": alert["kind"],
+                "payload": alert["payload"],
+                "state": alert["state"],
+                "attempts": alert["attempts"],
+                "last_error": alert["last_error"],
+                "created": alert["created"],
+                "updated": alert["updated"],
+                "age_secs": age_secs,
+                "next_action": next_action,
+                "next_owner": next_owner,
+                "authority": authority,
+                "evidence": {
+                    "monitor": id,
+                    "alert_seq": alert["seq"],
+                    "event_seq": alert["event_seq"],
+                    "fingerprint": alert["fingerprint"],
+                    "payload": alert["payload"],
+                },
+            });
+            rows.push(row.clone());
+            all_alerts.push(row);
+        }
+        monitor["alerts"] = json!(rows);
+        monitor_rows.push(monitor);
+    }
+
+    if monitor_rows.is_empty() {
+        state = "stopped";
+    }
+    all_alerts.sort_by_key(|a| a["seq"].as_i64().unwrap_or(0));
+    let latest = |value: Option<f64>| value.map(|v| v as i64);
+    json!({
+        "available": true,
+        "state": state,
+        "last_success_at": latest(last_success_at),
+        "last_check_at": latest(last_check_at),
+        "next_check_at": next_check_at.map(|v| v as i64),
+        "open_alerts": open_alerts,
+        "errors": errors,
+        "delivery": local_monitor_delivery(),
+        "monitors": monitor_rows,
+        "alerts": all_alerts,
+    })
+}
+
+/// Read monitor health and durable alerts through the daemon socket.  The
+/// board is allowed to show an explicit unavailable state when the daemon is
+/// older than the monitor RPC; it must not open the live SQLite store itself.
+pub fn monitoring(state_dir: &Path) -> Value {
+    let now = now_epoch();
+    let list = match client::rpc(state_dir, "monitor_list", json!({})) {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "available": false,
+                "state": "unavailable",
+                "last_success_at": Value::Null,
+                "last_check_at": Value::Null,
+                "next_check_at": Value::Null,
+                "open_alerts": 0,
+                "errors": [{"error": error.to_string()}],
+                "delivery": local_monitor_delivery(),
+                "monitors": [],
+                "alerts": [],
+            });
+        }
+    };
+    let Some(rows) = list["monitors"].as_array() else {
+        return json!({
+            "available": false,
+            "state": "unavailable",
+            "last_success_at": Value::Null,
+            "last_check_at": Value::Null,
+            "next_check_at": Value::Null,
+            "open_alerts": 0,
+            "errors": [{"error": "monitor_list response missing monitors"}],
+            "delivery": local_monitor_delivery(),
+            "monitors": [],
+            "alerts": [],
+        });
+    };
+    let monitors = rows.to_vec();
+    let mut alerts_by_monitor = HashMap::new();
+    let mut alert_errors = HashMap::new();
+    for monitor in &monitors {
+        let Some(id) = monitor["id"].as_str() else {
+            continue;
+        };
+        match client::rpc(
+            state_dir,
+            "monitor_alerts",
+            json!({"monitor": id, "open": false, "limit": 100}),
+        ) {
+            Ok(value) => {
+                if let Some(rows) = value["alerts"].as_array() {
+                    alerts_by_monitor.insert(id.to_string(), rows.to_vec());
+                } else {
+                    alert_errors.insert(
+                        id.to_string(),
+                        "monitor_alerts response missing alerts".to_string(),
+                    );
+                }
+            }
+            Err(error) => {
+                alert_errors.insert(id.to_string(), error.to_string());
+            }
+        }
+    }
+    monitoring_view(monitors, alerts_by_monitor, alert_errors, now)
+}
+
 /// A needs-me row before the urgency sort.
 struct Item {
     rank: u8,
@@ -871,6 +1134,7 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
         "projects": projects_out,
         "github": gh_state,
         "daemon": daemon,
+        "monitoring": monitoring(state_dir),
         "generated_at": now,
     })
 }
@@ -970,6 +1234,88 @@ mod tests {
         let kinds: Vec<&str> = v.iter().map(|i| i.json["kind"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["merge", "pr_no_verdict", "pr_no_verdict"]);
         assert_eq!(v[1].json["title"], "c"); // older first within a kind
+    }
+
+    #[test]
+    fn monitoring_projection_keeps_real_scan_and_actionable_alert_evidence() {
+        let monitors = vec![json!({
+            "id": "watch-cadence",
+            "project": "cadence",
+            "owner": "watchdog",
+            "monitoring": "degraded",
+            "last_success_at": 90.0,
+            "last_check_at": 110.0,
+            "next_check_at": 170.0,
+            "delivery": {"configured": false, "state": "unconfigured"},
+            "error": "socket closed",
+        })];
+        let mut alerts_by_monitor = HashMap::new();
+        alerts_by_monitor.insert(
+            "watch-cadence".to_string(),
+            vec![json!({
+                "seq": 7,
+                "monitor": "watch-cadence",
+                "task": "cad-176-t1",
+                "event_seq": 44,
+                "fingerprint": "turn-stalled:44",
+                "kind": "turn_stalled",
+                "payload": {"message": "synthetic evidence"},
+                "state": "open",
+                "attempts": 1,
+                "last_error": Value::Null,
+                "created": 100.0,
+                "updated": 100.0,
+            })],
+        );
+
+        let view = monitoring_view(monitors, alerts_by_monitor, HashMap::new(), 130);
+        assert_eq!(view["state"], "degraded");
+        assert_eq!(view["last_success_at"], 90);
+        assert_eq!(view["last_check_at"], 110);
+        assert_eq!(view["open_alerts"], 1);
+        assert_eq!(view["delivery"]["configured"], false);
+        assert_eq!(view["delivery"]["push"], false);
+        let alert = &view["alerts"][0];
+        assert_eq!(alert["age_secs"], 30);
+        assert_eq!(alert["next_owner"], "watchdog");
+        assert_eq!(alert["authority"], "monitor owner may reconcile the worker");
+        assert_eq!(alert["evidence"]["event_seq"], 44);
+        assert_eq!(alert["evidence"]["fingerprint"], "turn-stalled:44");
+    }
+
+    #[test]
+    fn monitoring_projection_reports_stopped_without_registration() {
+        let view = monitoring_view(Vec::new(), HashMap::new(), HashMap::new(), 130);
+        assert_eq!(view["available"], true);
+        assert_eq!(view["state"], "stopped");
+        assert_eq!(view["last_success_at"], Value::Null);
+        assert!(view["alerts"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn monitoring_projection_marks_overdue_active_scan_stale() {
+        let view = monitoring_view(
+            vec![json!({
+                "id": "watch",
+                "project": "cadence",
+                "owner": "watchdog",
+                "monitoring": "active",
+                "last_success_at": 90.0,
+                "last_check_at": 90.0,
+                "next_check_at": 100.0,
+                "error": Value::Null,
+            })],
+            HashMap::new(),
+            HashMap::new(),
+            101,
+        );
+        assert_eq!(view["state"], "stale");
+        assert_eq!(view["monitors"][0]["monitoring"], "stale");
+        assert_eq!(view["monitors"][0]["stale"], true);
+        assert_eq!(
+            view["errors"][0]["error"],
+            "scheduled monitor reconciliation is overdue"
+        );
     }
 
     fn git(repo: &Path, args: &[&str]) {
