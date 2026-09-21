@@ -6290,6 +6290,34 @@ impl TestDaemon {
             thread::sleep(Duration::from_millis(50));
         }
     }
+
+    /// Poll until an event of `kind` satisfying `pred` exists
+    /// (bounded). Payload-scoped — an earlier event that merely shares
+    /// the kind is never returned (CAD-222: a late `turn_stalled` for
+    /// one message must not answer a wait meant for another's).
+    fn wait_event_where(
+        &self,
+        alias: &str,
+        kind: &str,
+        pred: impl Fn(&Value) -> bool,
+        secs: u64,
+    ) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(e) = self
+                .events(alias)
+                .into_iter()
+                .find(|e| e["kind"].as_str() == Some(kind) && pred(e))
+            {
+                return e;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent {alias} never emitted a matching {kind}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 #[test]
@@ -13149,7 +13177,29 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     )
     .unwrap();
     d.wait_agent("w1", "waiting_input", 10);
-    thread::sleep(Duration::from_secs(7));
+    // Positive window-opened proof before any absence assertion
+    // (CAD-221, the canary pattern from #70's slot-plant test): a
+    // pending brokered request refreshes the turn's activity on every
+    // stall tick, so a wait older than the budget still reporting
+    // silence *under* the budget can only happen while the refresh
+    // path runs. A dead or skipping ticker reports wall-clock age
+    // instead and this loop fails loudly — absence is never asserted
+    // inside a window that may not have opened.
+    let wait_started = Instant::now();
+    let canary_deadline = wait_started + Duration::from_secs(15);
+    loop {
+        let a = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+        let silent = a["silent_secs"].as_u64().unwrap_or(u64::MAX);
+        if wait_started.elapsed() > Duration::from_secs(4) && silent < 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < canary_deadline,
+            "stall ticker never refreshed the brokered wait — the \
+             absence window never provably opened: {a}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     assert!(
         d.events("w1")
             .iter()
@@ -13167,14 +13217,22 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     d.wait_message("w1", "m-need", &["completed"], 15);
 
     // A genuinely silent turn stalls once — then simply ends; no
-    // recovery event is owed for a finished message.
+    // recovery event is owed for a finished message. The wait selects
+    // by payload: a `turn_stalled` for m-need landing late (between
+    // respond and completion on a slow host) must not be returned
+    // here (CAD-222).
     d.rpc(
         "agent_send",
         json!({"alias": "w1", "text": "SLEEP:12", "reply_to": "pm",
                "message": "m-sleep"}),
     )
     .unwrap();
-    let e = d.wait_event("w1", "turn_stalled", 20);
+    let e = d.wait_event_where(
+        "w1",
+        "turn_stalled",
+        |e| e["payload"]["message"].as_str() == Some("m-sleep"),
+        20,
+    );
     assert_eq!(e["payload"]["message"], "m-sleep", "{e}");
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(agent["stalled"], true, "{agent}");
