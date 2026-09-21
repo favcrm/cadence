@@ -302,6 +302,49 @@ pub(crate) fn file_locked(path: &Path) -> bool {
     lock_held(path).unwrap_or(false)
 }
 
+/// Test-only holder for a synthetic cargo lock. Releasing with `flock` is
+/// deliberate: closing one descriptor does not release an open-file-
+/// description lock while duplicate references still exist.
+#[cfg(test)]
+pub(crate) struct TestFileLock {
+    file: Option<std::fs::File>,
+}
+
+#[cfg(test)]
+impl TestFileLock {
+    pub(crate) fn acquire(path: &Path) -> Self {
+        let file = std::fs::File::open(path).expect("lock fixture");
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) },
+            0,
+            "lock fixture"
+        );
+        Self { file: Some(file) }
+    }
+
+    pub(crate) fn release(mut self) {
+        let file = self.file.take().expect("lock fixture already released");
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) },
+            0,
+            "unlock fixture"
+        );
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestFileLock {
+    fn drop(&mut self) {
+        let Some(file) = self.file.take() else {
+            return;
+        };
+        use std::os::unix::io::AsRawFd;
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// Point a worktree's cargo builds at the shared dep cache: inside
 /// `<wt>/target/debug`, the hashed-content subdirs become symlinks to
 /// `<root>/.cadence/target/shared/debug/<name>` (merging any existing
@@ -677,6 +720,22 @@ mod tests {
     }
 
     #[test]
+    fn file_lock_probe_releases_a_cloned_holder() {
+        let dir = TempDir::new().unwrap();
+        let lock = dir.path().join(".cargo-lock");
+        std::fs::write(&lock, "").unwrap();
+        let holder = std::fs::File::open(&lock).unwrap();
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let clone = holder.try_clone().unwrap();
+        assert!(file_locked(&lock));
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(holder);
+        assert!(!file_locked(&lock));
+        drop(clone);
+    }
+
+    #[test]
     fn configure_refuses_half_shared_when_lock_held() {
         let repo = git_repo();
         let wt = repo.path();
@@ -691,9 +750,7 @@ mod tests {
         }
         let lock = debug.join(".cargo-lock");
         std::fs::write(&lock, "").unwrap();
-        let f = std::fs::File::open(&lock).unwrap();
-        use std::os::unix::io::AsRawFd;
-        assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let f = TestFileLock::acquire(&lock);
         let e = configure_cargo_target(wt, repo.path(), true).unwrap_err();
         assert!(
             e.to_string()
@@ -715,7 +772,7 @@ mod tests {
         assert!(!shared_target_dir(repo.path())
             .join("debug/deps/lane-artifact.rlib")
             .exists());
-        drop(f);
+        f.release();
         // And it plants cleanly once the build is done — artifacts
         // merge into the cache, dirs become links.
         assert_eq!(
