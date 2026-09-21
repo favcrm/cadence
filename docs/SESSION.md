@@ -289,6 +289,12 @@ zero-test evidence is unknown/blocking rather than a pass. The config change
 remains human-class and must not be merged or activated until the installation,
 structured-result, and gate-activation approvals for CAD-173 are recorded.
 
+The CI follow-up uses the same reviewed wrapper for `--all-targets` after a
+non-empty Cargo/nextest inventory comparison covering the library, binary,
+board, and integration targets. Because nextest does not execute Rust
+doctests, CI runs `cargo test --doc --locked` as a separate explicit step;
+doctests are not silently treated as part of the four-target parity count.
+
 For an admitted current-head measurement, record two separate runs for
 the cold build and two warm runs, with the exact SHA, pinned version,
 `retries=0`, inventory count, outer lock path, host load, and durations.
