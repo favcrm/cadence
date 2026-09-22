@@ -2754,7 +2754,8 @@ impl Shared {
                 task.id
             ));
         }
-        if let Some(v) = self.store.verdicts_for_task(&task.id)?.last() {
+        let verdicts = self.store.verdicts_for_task(&task.id)?;
+        if let Some(v) = store::current_verdict(task.revision, &verdicts) {
             j["latest_verdict"] = v.to_json();
         }
         Ok(j)
