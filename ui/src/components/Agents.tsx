@@ -78,22 +78,70 @@ function activeTasks(a: Agent): AgentTask[] {
   return (a.tasks ?? []).filter((task) => !TERMINAL_TASK_STATES.has(task.task_state));
 }
 
-function profileModel(a: Agent): { value: string; note: string; mismatch?: string } {
-  const effective = a.model_reported ?? a.model ?? null;
+function provenanceLabel(source: string | null | undefined): string | null {
+  switch (source) {
+    case "explicit":
+      return "explicit launch model";
+    case "explicit_provider_default":
+      return "explicit provider-native";
+    case "role_default":
+      return "role default";
+    case "provider_baseline":
+      return "provider baseline";
+    case "provider_default":
+      return "provider-native default";
+    case "legacy_configured":
+      return "saved before model defaults";
+    case "legacy_provider_default":
+      return "saved before model defaults";
+    default:
+      return null;
+  }
+}
+
+function profileModel(a: Agent): { value: string; note: string; mismatch?: string; provenance?: string } {
+  const reported = a.model_reported ?? a.model ?? null;
   const configured = a.model_configured ?? null;
-  if (effective) {
+  const provenance = provenanceLabel(a.model_selection?.source);
+  const lookup = a.model_lookup_role ?? a.model_selection?.lookup_role;
+  const provenanceText = [provenance, lookup ? `lookup ${lookup}` : null]
+    .filter(Boolean)
+    .join(" · ");
+  if (a.model_selection === null && (a.provider === "devin" || a.provider === "inbox")) {
     return {
-      value: effective,
-      note: "confirmed",
-      mismatch:
-        configured && configured !== effective ? `configured ${configured}` : undefined,
+      value: reported ?? "unsupported",
+      note: "model selection unsupported",
+      provenance: provenanceText || undefined,
     };
   }
-  if (configured) return { value: configured, note: "configured" };
-  if (a.model_source === "provider default") {
-    return { value: "provider default", note: "effective model unknown" };
+  if (reported) {
+    return {
+      value: reported,
+      note: "reported",
+      mismatch:
+        configured && configured !== reported ? `configured ${configured}` : undefined,
+      provenance: provenanceText || undefined,
+    };
   }
-  return { value: "unknown", note: "no provider evidence" };
+  if (configured) {
+    return {
+      value: configured,
+      note: "configured",
+      provenance: provenanceText || undefined,
+    };
+  }
+  if (a.model_source === "provider default") {
+    return {
+      value: "provider default",
+      note: "reported model unknown",
+      provenance: provenanceText || undefined,
+    };
+  }
+  return {
+    value: "unknown",
+    note: "no provider evidence",
+    provenance: provenanceText || undefined,
+  };
 }
 
 function profileEffort(a: Agent): { value: string; note: string } {
@@ -277,6 +325,9 @@ function ProfileBlock({ agent }: { agent: Agent }) {
         model {model.note}
         {model.mismatch ? ` · ${model.mismatch}` : ""}
       </div>
+      {model.provenance && (
+        <div className="num text-micro text-ink-500">{model.provenance}</div>
+      )}
       <div className="num text-ink-300">effort {effort.value}</div>
       <div className="num text-micro text-ink-500">{effort.note}</div>
       <div className={`num text-ink-300 ${usage.tone}`}>{usage.value}</div>
@@ -725,7 +776,10 @@ export default function Agents({
                   {a.group_root ? "root" : a.group}
                 </span>
                 <span className="slabel">role</span>
-                <span className="num text-ink-300">{a.role ?? "unknown"}</span>
+                <span className="num text-ink-300">
+                  {a.role ?? "unknown"}
+                  {a.team_role ? ` · team ${a.team_role}` : ""}
+                </span>
                 <span className="slabel">model</span>
                 <div><ProfileBlock agent={a} /></div>
                 <span className="slabel">current work</span>

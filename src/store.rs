@@ -235,6 +235,8 @@ pub struct Agent {
     pub provider: String,
     pub endpoint_kind: String,
     pub role: String,
+    /// Model-preference role. Independent of runtime `role`.
+    pub team_role: Option<String>,
     pub cwd: String,
     pub sandbox: String,
     pub instructions: Option<String>,
@@ -248,6 +250,9 @@ pub struct Agent {
     pub endpoint: Option<String>,
     /// Endpoint-specific registration options (`{"session": …}` for pty).
     pub params: Option<Value>,
+    /// How `params.model` was chosen. Null on endpoints that cannot
+    /// accept a model; legacy rows derive a label at read time.
+    pub model_selection: Option<Value>,
     /// Provider-owned allowance telemetry. This is deliberately separate
     /// from `params`, which callers may edit for endpoint options.
     pub quota: Option<Value>,
@@ -455,6 +460,17 @@ pub struct NewAgent<'a> {
     pub instructions: Option<&'a str>,
     /// Endpoint-specific options as a JSON object (`{"session": "…"}`).
     pub params: Option<&'a str>,
+    /// Model-preference role. `None` looks up the runtime role.
+    pub team_role: Option<&'a str>,
+    /// `inherit` (default) or `provider_default`.
+    pub model_policy: Option<&'a str>,
+}
+
+/// The committed model-defaults document and its revision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelDefaultsSnapshot {
+    pub revision: i64,
+    pub config: crate::model_defaults::ModelDefaults,
 }
 
 pub struct Store {
@@ -604,6 +620,7 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         provider: row.get("provider")?,
         endpoint_kind: row.get("endpoint_kind")?,
         role: row.get("role")?,
+        team_role: row.get("team_role")?,
         cwd: row.get("cwd")?,
         sandbox: row.get("sandbox")?,
         instructions: row.get("instructions")?,
@@ -615,6 +632,9 @@ fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         endpoint: row.get("endpoint")?,
         params: row
             .get::<_, Option<String>>("params")?
+            .and_then(|p| serde_json::from_str(&p).ok()),
+        model_selection: row
+            .get::<_, Option<String>>("model_selection")?
             .and_then(|p| serde_json::from_str(&p).ok()),
         quota: row
             .get::<_, Option<String>>("quota")?
@@ -633,10 +653,23 @@ impl Agent {
         self.params.as_ref()?.get(key)?.as_str()
     }
 
+    fn presented_selection(&self) -> Value {
+        if let Some(selection) = &self.model_selection {
+            return selection.clone();
+        }
+        crate::model_defaults::legacy_selection(
+            registry::supports_model(&self.provider, &self.endpoint_kind),
+            self.team_role.as_deref(),
+            &self.role,
+            self.param_str("model"),
+        )
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "alias": self.alias, "provider": self.provider,
             "endpoint_kind": self.endpoint_kind, "role": self.role,
+            "team_role": self.team_role,
             "cwd": self.cwd, "sandbox": self.sandbox,
             "thread_id": self.thread_id, "session_id": self.session_id,
             "model": self.model, "pid": self.pid, "state": self.state,
@@ -651,6 +684,8 @@ impl Agent {
             } else {
                 "provider default"
             },
+            "model_lookup_role": self.presented_selection().get("lookup_role").cloned().unwrap_or(Value::Null),
+            "model_selection": self.presented_selection(),
             "effort": self.param_str("effort"),
             "effort_configured": self.param_str("effort"),
             "effort_reported": self.effort,
@@ -1115,6 +1150,34 @@ impl Store {
             tx.execute("UPDATE schema_version SET version=10", [])?;
             tx.commit()?;
         }
+        if version < 11 {
+            // v11: daemon-wide model defaults plus per-agent team role and
+            // model provenance. Existing rows stay null so resume does not
+            // re-resolve a default that did not exist when they launched.
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(agents)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            let tx = conn.unchecked_transaction()?;
+            if !columns.iter().any(|column| column == "team_role") {
+                tx.execute_batch("ALTER TABLE agents ADD COLUMN team_role TEXT")?;
+            }
+            if !columns.iter().any(|column| column == "model_selection") {
+                tx.execute_batch("ALTER TABLE agents ADD COLUMN model_selection TEXT")?;
+            }
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS model_defaults(
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    revision INTEGER NOT NULL,
+                    document TEXT NOT NULL);
+                 INSERT INTO model_defaults(id, revision, document)
+                   SELECT 1, 0, '{\"schema\":1,\"providers\":{}}'
+                   WHERE NOT EXISTS (SELECT 1 FROM model_defaults WHERE id = 1);
+                 UPDATE schema_version SET version=11;",
+            )?;
+            tx.commit()?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
             adoptions: Mutex::new(std::collections::HashMap::new()),
@@ -1554,6 +1617,23 @@ impl Store {
         }
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
+        let defaults = Self::read_model_defaults_tx(&tx)?;
+        let resolved = crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
+            provider: new.provider,
+            endpoint_kind: new.endpoint_kind,
+            runtime_role: new.role,
+            team_role: new.team_role,
+            model_policy: new.model_policy,
+            params: new.params,
+            config: &defaults.config,
+            revision: defaults.revision,
+        })?;
+        let selection = resolved.model_selection.as_ref().map(Value::to_string);
+        let merged_params = match resolved.params.as_deref() {
+            Some(raw) => serde_json::from_str(raw)?,
+            None => json!({}),
+        };
+        registry::validate_launch_params(new.provider, new.endpoint_kind, &merged_params)?;
         // Inbox agents are durable mailboxes, not processes: they
         // register directly into `idle` with a stable pseudo-endpoint
         // (so `dead` reads false) and never spawn an actor.
@@ -1563,18 +1643,20 @@ impl Store {
             ("starting", None)
         };
         tx.execute(
-            "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,
-                               instructions,params,state,endpoint,created,updated)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO agents(alias,provider,endpoint_kind,role,team_role,cwd,sandbox,
+                               instructions,params,model_selection,state,endpoint,created,updated)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 new.alias,
                 new.provider,
                 new.endpoint_kind,
                 new.role,
+                resolved.team_role,
                 new.cwd,
                 new.sandbox,
                 new.instructions,
-                new.params,
+                resolved.params,
+                selection,
                 state,
                 endpoint,
                 now(),
@@ -1586,7 +1668,8 @@ impl Store {
             new.alias,
             "registered",
             json!({"provider": new.provider,
-                   "endpoint_kind": new.endpoint_kind, "role": new.role}),
+                   "endpoint_kind": new.endpoint_kind, "role": new.role,
+                   "team_role": resolved.team_role}),
         )?;
         tx.commit()?;
         Ok(())
@@ -2829,27 +2912,170 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
-        let mut merged = agent.params.unwrap_or_else(|| json!({}));
+        let mut merged = agent.params.clone().unwrap_or_else(|| json!({}));
         let target = merged
             .as_object_mut()
             .ok_or_else(|| Error::internal("stored params are not an object"))?;
         let patch = patch
             .as_object()
             .ok_or_else(|| Error::rejected("params patch must be a JSON object"))?;
+        let model_selection = if patch.contains_key("model") {
+            if !registry::supports_model(&agent.provider, &agent.endpoint_kind) {
+                return Err(Error::invalid(
+                    "unsupported_model_setting",
+                    format!(
+                        "provider '{}' endpoint '{}' does not accept a model",
+                        agent.provider, agent.endpoint_kind
+                    ),
+                ));
+            }
+            let lookup = agent
+                .team_role
+                .clone()
+                .unwrap_or_else(|| agent.role.clone());
+            match patch.get("model") {
+                Some(Value::Null) => Some(crate::model_defaults::explicit_override_selection(
+                    &lookup, None,
+                )?),
+                Some(Value::String(model)) => {
+                    let model = crate::model_defaults::validate_model_id(model)?;
+                    Some(crate::model_defaults::explicit_override_selection(
+                        &lookup,
+                        Some(&model),
+                    )?)
+                }
+                Some(_) => {
+                    return Err(Error::invalid(
+                        "invalid_model",
+                        "model must be a non-empty string",
+                    ))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         for (k, v) in patch {
-            if v.is_null() {
+            if k == "model" {
+                match v {
+                    Value::Null => {
+                        target.remove(k);
+                    }
+                    Value::String(model) => {
+                        let model = crate::model_defaults::validate_model_id(model)?;
+                        target.insert(k.clone(), json!(model));
+                    }
+                    _ => {
+                        return Err(Error::invalid(
+                            "invalid_model",
+                            "model must be a non-empty string",
+                        ))
+                    }
+                }
+            } else if v.is_null() {
                 target.remove(k);
             } else {
                 target.insert(k.clone(), v.clone());
             }
         }
-        tx.execute(
-            "UPDATE agents SET params=?,updated=? WHERE alias=?",
-            params![merged.to_string(), now(), alias],
-        )?;
+        let stored_params = merged.to_string();
+        if stored_params.len() > 4_000 {
+            return Err(Error::invalid(
+                "params_too_large",
+                "params must be a JSON object of at most 4000 characters",
+            ));
+        }
+        if let Some(selection) = &model_selection {
+            tx.execute(
+                "UPDATE agents SET params=?,model_selection=?,updated=? WHERE alias=?",
+                params![stored_params, selection.to_string(), now(), alias],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE agents SET params=?,updated=? WHERE alias=?",
+                params![stored_params, now(), alias],
+            )?;
+        }
         Self::event(&tx, alias, "params_updated", json!({"patch": patch}))?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn model_defaults(&self) -> Result<ModelDefaultsSnapshot> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let snapshot = Self::read_model_defaults_tx(&tx)?;
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    /// Replace the singleton document when `document` names the current
+    /// revision. The audit event commits with the row or not at all.
+    pub fn replace_model_defaults(
+        &self,
+        document: &str,
+        attribution: Option<&str>,
+    ) -> Result<ModelDefaultsSnapshot> {
+        let write = crate::model_defaults::parse_settings_document(document)?;
+        let attribution = crate::model_defaults::normalize_attribution(attribution)?;
+        let stored = serde_json::to_string(&write.config)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let current = Self::read_model_defaults_tx(&tx)?;
+        if current.revision != write.expected_revision {
+            return Err(Error::conflict(
+                current.revision,
+                format!(
+                    "model defaults revision is {}, not {}",
+                    current.revision, write.expected_revision
+                ),
+            ));
+        }
+        let next = current.revision.checked_add(1).ok_or_else(|| {
+            Error::invalid("invalid_request", "model defaults revision overflowed")
+        })?;
+        let at = now();
+        tx.execute(
+            "UPDATE model_defaults SET revision=?, document=? WHERE id=1",
+            params![next, stored],
+        )?;
+        Self::event(
+            &tx,
+            Self::DAEMON_STREAM,
+            "model_defaults_updated",
+            json!({
+                "revision": next,
+                "before": current.config,
+                "after": write.config,
+                "attribution": attribution.actor,
+                "transport": attribution.transport,
+                "at": at,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(ModelDefaultsSnapshot {
+            revision: next,
+            config: write.config,
+        })
+    }
+
+    fn read_model_defaults_tx(tx: &Connection) -> Result<ModelDefaultsSnapshot> {
+        let (revision, document): (i64, String) = tx
+            .query_row(
+                "SELECT revision, document FROM model_defaults WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::internal("model defaults row is missing")
+                }
+                other => Error::from(other),
+            })?;
+        let mut config: crate::model_defaults::ModelDefaults = serde_json::from_str(&document)
+            .map_err(|err| Error::internal(format!("stored model defaults are invalid: {err}")))?;
+        crate::model_defaults::validate_config(&mut config)?;
+        Ok(ModelDefaultsSnapshot { revision, config })
     }
 
     /// Forget every remembered native-session handle in one write.
@@ -5403,6 +5629,8 @@ mod tests {
             sandbox: "read-only",
             instructions: None,
             params: None,
+            team_role: None,
+            model_policy: None,
         })
         .unwrap();
     }
@@ -5732,6 +5960,8 @@ mod tests {
             sandbox: "read-only",
             instructions: None,
             params: None,
+            team_role: None,
+            model_policy: None,
         })
         .unwrap();
         let identity = crate::adapter::Identity {
@@ -5795,6 +6025,7 @@ mod tests {
             provider: "codex".into(),
             endpoint_kind: "managed-ws".into(),
             role: "worker".into(),
+            team_role: None,
             cwd: "/tmp".into(),
             sandbox: "read-only".into(),
             instructions: None,
@@ -5807,6 +6038,7 @@ mod tests {
             // Even a complete-looking caller value cannot substitute for
             // provider-owned evidence.
             params: Some(json!({"quota": {"source": "provider", "remaining": 99}})),
+            model_selection: None,
             quota: Some(valid),
             generation: None,
             state: "idle".into(),
@@ -5901,7 +6133,7 @@ mod tests {
             conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         Store::open(&db).unwrap();
     }
 
@@ -5966,7 +6198,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 10);
+            assert_eq!(v, 11);
         }
         // Half-applied: v4 objects present but version rolled back —
         // reopening must converge, not fail on duplicates.
@@ -6001,7 +6233,7 @@ mod tests {
                 .unwrap()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(v, 10);
+            assert_eq!(v, 11);
         }
     }
 
@@ -6017,6 +6249,8 @@ mod tests {
             sandbox: "read-only",
             instructions: None,
             params: Some(&json!({"upstream": "pm"}).to_string()),
+            team_role: None,
+            model_policy: None,
         })
         .unwrap();
         s.create_job(
@@ -6373,6 +6607,8 @@ mod tests {
             sandbox: "read-only",
             instructions: None,
             params: Some(&json!({"upstream": "pm"}).to_string()),
+            team_role: None,
+            model_policy: None,
         })
         .unwrap();
     }
@@ -6683,6 +6919,8 @@ mod tests {
             sandbox: "read-only",
             instructions: None,
             params: Some(&json!({"upstream": "pm"}).to_string()),
+            team_role: None,
+            model_policy: None,
         })
         .unwrap();
         s.create_task(
@@ -6722,5 +6960,243 @@ mod tests {
         assert!(b2.len() <= 4000);
         assert!(!b2.contains("Correlation"), "{b2}");
         assert!(b2.ends_with("reported revision."), "{b2}");
+    }
+
+    fn defaults_body(revision: i64, providers: &str) -> String {
+        format!(
+            r#"{{"expected_revision":{revision},"config":{{"schema":1,"providers":{providers}}}}}"#
+        )
+    }
+
+    fn claude_worker<'a>(alias: &'a str, cwd: &'a str, team: Option<&'a str>) -> NewAgent<'a> {
+        NewAgent {
+            alias,
+            provider: "claude",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd,
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: team,
+            model_policy: None,
+        }
+    }
+
+    #[test]
+    fn model_defaults_migrate_conflict_and_keep_existing_rows() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let cwd_s = cwd.to_str().unwrap().to_string();
+        s.register_agent(&NewAgent {
+            alias: "legacy",
+            provider: "claude",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: &cwd_s,
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(r#"{"model":"kept"}"#),
+            team_role: None,
+            model_policy: Some("provider_default"),
+        })
+        .unwrap_err();
+        s.register_agent(&NewAgent {
+            alias: "legacy",
+            provider: "claude",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: &cwd_s,
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(r#"{"model":"kept"}"#),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        let before = s.agent("legacy").unwrap();
+        assert_eq!(before.param_str("model"), Some("kept"));
+        assert_eq!(
+            before.model_selection.as_ref().unwrap()["source"],
+            "explicit"
+        );
+        let snap = s.model_defaults().unwrap();
+        assert_eq!(snap.revision, 0);
+        assert!(snap.config.providers.is_empty());
+
+        let doc = defaults_body(
+            0,
+            r#"{"claude":{"default":{"mode":"model","model":"baseline-a"},"roles":{"qa":{"mode":"model","model":"qa-model"}}}}"#,
+        );
+        let path = dir.path().join("t.sqlite3");
+        let other = Store::open(&path).unwrap();
+        let saved = s.replace_model_defaults(&doc, None).unwrap();
+        assert_eq!(saved.revision, 1);
+        let conflict = other.replace_model_defaults(&doc, Some("operator (ui)"));
+        let err = conflict.unwrap_err();
+        assert_eq!(err.kind(), "conflict");
+        assert_eq!(err.revision(), Some(1));
+        assert_eq!(s.model_defaults().unwrap().revision, 1);
+        let legacy = s.agent("legacy").unwrap();
+        assert_eq!(legacy.param_str("model"), Some("kept"));
+        assert_eq!(
+            legacy.model_selection.as_ref().unwrap()["source"],
+            "explicit"
+        );
+
+        let bad = defaults_body(
+            1,
+            r#"{"nope":{"default":{"mode":"provider_default"},"roles":{}}}"#,
+        );
+        assert!(s.replace_model_defaults(&bad, None).is_err());
+        assert_eq!(s.model_defaults().unwrap().revision, 1);
+
+        let events = s.events(Store::DAEMON_STREAM, 0, 20).unwrap();
+        let audit = events
+            .iter()
+            .find(|event| event.kind == "model_defaults_updated")
+            .unwrap();
+        assert_eq!(audit.payload["revision"], 1);
+        assert_eq!(audit.payload["attribution"], "local");
+        assert_eq!(audit.payload["transport"], "local");
+        assert!(audit.payload["before"].is_object());
+        assert!(audit.payload["after"].is_object());
+
+        s.register_agent(&claude_worker("ops1", &cwd_s, Some("ops")))
+            .unwrap();
+        let ops = s.agent("ops1").unwrap();
+        assert_eq!(ops.role, "worker");
+        assert_eq!(ops.team_role.as_deref(), Some("devops"));
+        assert_eq!(ops.param_str("model"), Some("baseline-a"));
+        assert_eq!(
+            ops.model_selection.as_ref().unwrap()["source"],
+            "provider_baseline"
+        );
+        s.register_agent(&claude_worker("qa1", &cwd_s, Some("qa")))
+            .unwrap();
+        let qa = s.agent("qa1").unwrap();
+        assert_eq!(qa.role, "worker");
+        assert_eq!(qa.team_role.as_deref(), Some("qa"));
+        assert_eq!(qa.param_str("model"), Some("qa-model"));
+        assert_eq!(
+            qa.model_selection.as_ref().unwrap()["source"],
+            "role_default"
+        );
+        assert_eq!(qa.model_selection.as_ref().unwrap()["revision"], 1);
+        assert_eq!(qa.to_json()["model_source"], "configured");
+        assert_eq!(qa.to_json()["model_configured"], "qa-model");
+
+        let next = defaults_body(
+            1,
+            r#"{"claude":{"default":{"mode":"model","model":"baseline-b"},"roles":{}}}"#,
+        );
+        s.replace_model_defaults(&next, Some("operator (ui)"))
+            .unwrap();
+        assert_eq!(s.agent("qa1").unwrap().param_str("model"), Some("qa-model"));
+        s.register_agent(&claude_worker("fresh", &cwd_s, None))
+            .unwrap();
+        let fresh = s.agent("fresh").unwrap();
+        assert_eq!(fresh.param_str("model"), Some("baseline-b"));
+        assert_eq!(
+            fresh.model_selection.as_ref().unwrap()["source"],
+            "provider_baseline"
+        );
+
+        s.set_params("fresh", &json!({"model": " "})).unwrap_err();
+        assert_eq!(
+            s.agent("fresh").unwrap().param_str("model"),
+            Some("baseline-b")
+        );
+        s.set_params("fresh", &json!({"model": "pinned"})).unwrap();
+        s.set_params("fresh", &json!({"model": Value::Null}))
+            .unwrap();
+        let cleared = s.agent("fresh").unwrap();
+        assert!(cleared.param_str("model").is_none());
+        assert_eq!(
+            cleared.model_selection.as_ref().unwrap()["source"],
+            "explicit_provider_default"
+        );
+        assert_eq!(s.agent("qa1").unwrap().param_str("model"), Some("qa-model"));
+
+        s.register_agent(&NewAgent {
+            alias: "box",
+            provider: "inbox",
+            endpoint_kind: "inbox",
+            role: "worker",
+            cwd: &cwd_s,
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: Some("pm"),
+            model_policy: None,
+        })
+        .unwrap();
+        let inbox = s.agent("box").unwrap();
+        assert!(inbox.param_str("model").is_none());
+        assert!(inbox.model_selection.is_none());
+        assert_eq!(inbox.role, "worker");
+        assert_eq!(inbox.team_role.as_deref(), Some("pm"));
+        assert!(
+            s.set_params("box", &json!({"model": "nope"}))
+                .unwrap_err()
+                .code()
+                == Some("unsupported_model_setting")
+        );
+        assert!(s
+            .agent("box")
+            .unwrap()
+            .params
+            .unwrap_or(json!({}))
+            .get("model")
+            .is_none());
+
+        s.register_agent(&NewAgent {
+            alias: "pmbox",
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "worker",
+            cwd: &cwd_s,
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: Some("pm"),
+            model_policy: None,
+        })
+        .unwrap();
+        s.enqueue("qa1", "note", Some("pmbox"), "m-role", "user")
+            .unwrap();
+        let queued = s
+            .events("qa1", 0, 20)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "queued")
+            .unwrap();
+        assert_eq!(queued.payload["recipient_identity"]["role"], "worker");
+        assert!(queued.payload["recipient_identity"]
+            .get("team_role")
+            .is_none());
+
+        let dup = s.register_agent(&claude_worker("qa1", &cwd_s, Some("dev")));
+        assert!(dup.unwrap_err().to_string().contains("UNIQUE"));
+        assert_eq!(s.agent("qa1").unwrap().team_role.as_deref(), Some("qa"));
+
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.model_defaults().unwrap().revision, 2);
+        assert_eq!(
+            reopened.agent("qa1").unwrap().param_str("model"),
+            Some("qa-model")
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE agents SET model_selection=NULL WHERE alias='legacy'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let labeled = Store::open(&path).unwrap().agent("legacy").unwrap();
+        assert_eq!(
+            labeled.to_json()["model_selection"]["source"],
+            "legacy_configured"
+        );
     }
 }

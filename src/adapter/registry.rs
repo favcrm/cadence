@@ -413,8 +413,12 @@ pub static SPECS: &[EndpointSpec] = &[
     },
 ];
 
+/// `health.capabilities` entry for daemon-wide model defaults.
+pub const MODEL_DEFAULTS_CAPABILITY: &str = "model_defaults";
+
 /// Daemon-level features reported alongside the per-spec capability
 /// names — not properties of any one endpoint.
+
 const DAEMON_FEATURES: &[&str] = &[
     "agent_registry",
     "durable_queue",
@@ -423,7 +427,79 @@ const DAEMON_FEATURES: &[&str] = &[
     "revision_bound_verdicts",
     "approval_brokering",
     "result_routing",
+    MODEL_DEFAULTS_CAPABILITY,
 ];
+
+/// Whether this endpoint accepts a launch `model` param. Test doubles
+/// and internal profiles are excluded even if a future spec lists one.
+pub fn supports_model(provider: &str, kind: &str) -> bool {
+    match spec_opt(provider, kind) {
+        Some(spec) if !spec.internal && spec.provider != "fake" && provider != "fake" => {
+            spec.launch_params.contains(&"model")
+        }
+        _ => false,
+    }
+}
+
+/// One provider row for the settings matrix. Ineligible rows stay visible
+/// so the operator can see why that provider has no model default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelProviderRow {
+    pub id: &'static str,
+    pub eligible: bool,
+    pub kinds: Vec<&'static str>,
+    pub limitation: Option<&'static str>,
+}
+
+/// Public providers in registry order. Inbox, fake, and internal
+/// profiles are omitted. Devin remains as an ineligible row.
+pub fn model_provider_matrix() -> &'static [ModelProviderRow] {
+    static ROWS: LazyLock<Vec<ModelProviderRow>> = LazyLock::new(|| {
+        let mut rows: Vec<ModelProviderRow> = Vec::new();
+        for spec in SPECS {
+            if spec.internal || spec.provider == INBOX || spec.provider == "fake" {
+                continue;
+            }
+            let eligible_kind = spec.launch_params.contains(&"model");
+            if let Some(row) = rows.iter_mut().find(|row| row.id == spec.provider) {
+                if !row.kinds.contains(&spec.endpoint_kind) {
+                    row.kinds.push(spec.endpoint_kind);
+                }
+                if eligible_kind {
+                    row.eligible = true;
+                    row.limitation = None;
+                }
+                continue;
+            }
+            let limitation = if !eligible_kind && spec.provider == "devin" {
+                Some(
+                    "Devin does not accept a model at launch. Cadence cannot apply a model default to Devin agents.",
+                )
+            } else if !eligible_kind {
+                Some("This provider does not accept a launch model.")
+            } else {
+                None
+            };
+            rows.push(ModelProviderRow {
+                id: spec.provider,
+                eligible: eligible_kind,
+                kinds: vec![spec.endpoint_kind],
+                limitation,
+            });
+        }
+        rows
+    });
+    &ROWS
+}
+
+/// Providers whose settings may store a baseline.
+pub fn model_provider_ids() -> Vec<&'static str> {
+    model_provider_matrix()
+        .iter()
+        .filter(|row| row.eligible)
+        .map(|row| row.id)
+        .collect()
+}
 
 /// `health.capabilities`: daemon features plus each spec's contribution,
 /// generated from the table — never hand-listed per provider.
@@ -1042,11 +1118,29 @@ mod tests {
             "revision_bound_verdicts",
             "approval_brokering",
             "result_routing",
+            "model_defaults",
             "fake_provider_tests",
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 16);
+        assert_eq!(caps.len(), 17);
+    }
+
+    #[test]
+    fn model_matrix_keeps_devin_and_drops_test_doubles() {
+        let rows = model_provider_matrix();
+        let ids: Vec<&str> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, vec!["codex", "claude", "devin", "cursor"]);
+        assert!(rows.iter().any(|row| row.id == "claude" && row.eligible));
+        assert!(rows
+            .iter()
+            .any(|row| { row.id == "devin" && !row.eligible && row.limitation.is_some() }));
+        assert!(rows.iter().all(|row| row.id != "fake" && row.id != "inbox"));
+        assert!(supports_model("claude", "managed"));
+        assert!(supports_model("cursor", "pty"));
+        assert!(!supports_model("devin", "pty"));
+        assert!(!supports_model("fake", "fake"));
+        assert!(!supports_model("inbox", "inbox"));
     }
 
     #[test]

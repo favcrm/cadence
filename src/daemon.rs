@@ -1123,6 +1123,8 @@ impl Shared {
                 Ok(json!({"state": "stopping"}))
             }
             "agent_register" => self.rpc_register(params),
+            "model_defaults_get" => self.rpc_model_defaults_get(),
+            "model_defaults_set" => self.rpc_model_defaults_set(params),
             "agent_list" => {
                 let mut agents = Vec::new();
                 for agent in self.store.agents()? {
@@ -1634,6 +1636,8 @@ impl Shared {
         let endpoint =
             optional_str(params, "endpoint_kind").unwrap_or(registry::DEFAULT_ENDPOINT_KIND);
         let role = optional_str(params, "role").unwrap_or("worker");
+        let team_role = optional_text(params, "team_role")?;
+        let model_policy = optional_text(params, "model_policy")?;
         let cwd = optional_str(params, "cwd");
         let sandbox = optional_str(params, "sandbox").unwrap_or("read-only");
         let instructions = optional_str(params, "instructions");
@@ -1668,6 +1672,8 @@ impl Shared {
             sandbox,
             instructions,
             params: agent_params,
+            team_role,
+            model_policy,
         })?;
         // A mailbox has no actor — it is `idle` with its pseudo-endpoint
         // from registration and simply accrues queued messages.
@@ -1679,6 +1685,53 @@ impl Shared {
         }
         self.launch_actor(alias)?;
         Ok(json!({"alias": alias, "state": "starting", "provider": provider}))
+    }
+
+    fn rpc_model_defaults_get(self: &Arc<Self>) -> Result<Value> {
+        self.model_defaults_snapshot()
+    }
+
+    fn rpc_model_defaults_set(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let document = match params.get("document") {
+            Some(Value::String(raw)) => raw.as_str(),
+            Some(_) => {
+                return Err(Error::invalid(
+                    "invalid_request",
+                    "'document' must be a string",
+                ))
+            }
+            None => {
+                return Err(Error::invalid(
+                    "invalid_request",
+                    "Missing required parameter 'document'",
+                ))
+            }
+        };
+        let attribution = optional_text(params, "attribution")?;
+        self.store.replace_model_defaults(document, attribution)?;
+        self.model_defaults_snapshot()
+    }
+
+    fn model_defaults_snapshot(self: &Arc<Self>) -> Result<Value> {
+        let snapshot = self.store.model_defaults()?;
+        let agents = self.store.agents()?;
+        let observed: Vec<crate::model_defaults::ObservedModel> = agents
+            .iter()
+            .map(|agent| crate::model_defaults::ObservedModel {
+                provider: agent.provider.as_str(),
+                configured: agent
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("model"))
+                    .and_then(Value::as_str),
+                reported: agent.model.as_deref(),
+            })
+            .collect();
+        Ok(crate::model_defaults::snapshot_json(
+            snapshot.revision,
+            &snapshot.config,
+            &observed,
+        ))
     }
 
     fn rpc_send(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -4468,6 +4521,19 @@ fn optional_str<'a>(params: &'a Value, field: &str) -> Option<&'a str> {
     params.get(field).and_then(Value::as_str)
 }
 
+/// A present string field. JSON null and omission are both absent; any
+/// other type is a rejection rather than a silent skip.
+fn optional_text<'a>(params: &'a Value, field: &str) -> Result<Option<&'a str>> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(Error::invalid(
+            "invalid_request",
+            format!("'{field}' must be a string"),
+        )),
+    }
+}
+
 fn optional_u64(params: &Value, field: &str) -> Option<u64> {
     params.get(field).and_then(Value::as_u64)
 }
@@ -5120,6 +5186,8 @@ mod tests {
                 sandbox: "read-only",
                 instructions: None,
                 params: None,
+                team_role: None,
+                model_policy: None,
             })
             .unwrap();
     }
@@ -5199,6 +5267,8 @@ mod tests {
                 sandbox: "read-only",
                 instructions: None,
                 params: None,
+                team_role: None,
+                model_policy: None,
             })
             .unwrap();
         shared
@@ -5346,6 +5416,8 @@ mod tests {
                 sandbox: "read-only",
                 instructions: None,
                 params: None,
+                team_role: None,
+                model_policy: None,
             })
             .unwrap();
         shared

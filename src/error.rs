@@ -25,12 +25,25 @@ pub struct RenderMiss {
     pub claim_probe: Option<serde_json::Value>,
 }
 
+/// A wire error that carries a stable `code` and, for revision
+/// conflicts, the current revision. `kind` stays `rejected` for invalid
+/// input and `conflict` when a caller must reload rather than retry.
+#[derive(Debug)]
+pub struct Structured {
+    pub kind: &'static str,
+    pub code: String,
+    pub message: String,
+    pub revision: Option<i64>,
+}
+
 #[derive(Debug)]
 pub enum Error {
     Rejected(String),
     Provider(String),
     OutcomeUnknown(String),
     Internal(String),
+    /// Invalid input or a revision conflict, with a stable code.
+    Structured(Structured),
     /// The endpoint is not safe to submit to right now; the message
     /// returns to `queued` and is retried, never failed or pasted blind.
     GateRefused(String),
@@ -68,6 +81,36 @@ impl Error {
     pub fn not_rendered(miss: RenderMiss) -> Self {
         Self::NotRendered(miss)
     }
+    /// Invalid input with a stable code. The wire kind stays `rejected`.
+    pub fn invalid(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "rejected",
+            code: code.to_string(),
+            message: message.into(),
+            revision: None,
+        })
+    }
+    /// Revision mismatch. `revision` is the current stored revision.
+    pub fn conflict(revision: i64, message: impl Into<String>) -> Self {
+        Self::Structured(Structured {
+            kind: "conflict",
+            code: "revision_conflict".to_string(),
+            message: message.into(),
+            revision: Some(revision),
+        })
+    }
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Structured(structured) => Some(structured.code.as_str()),
+            _ => None,
+        }
+    }
+    pub fn revision(&self) -> Option<i64> {
+        match self {
+            Self::Structured(structured) => structured.revision,
+            _ => None,
+        }
+    }
     /// Stable wire kind for [`crate::proto`].
     pub fn kind(&self) -> &'static str {
         match self {
@@ -82,6 +125,7 @@ impl Error {
             // Internal to the actor loop — never a wire answer: the
             // daemon classifies it into requeue or `unknown` first.
             Self::NotRendered(_) => "not_rendered",
+            Self::Structured(structured) => structured.kind,
         }
     }
 }
@@ -95,6 +139,7 @@ impl fmt::Display for Error {
             | Self::Internal(m)
             | Self::GateRefused(m)
             | Self::PreWrite(m) => f.write_str(m),
+            Self::Structured(m) => f.write_str(&m.message),
             Self::NotRendered(m) => f.write_str(&m.reason),
         }
     }

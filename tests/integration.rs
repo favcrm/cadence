@@ -402,6 +402,8 @@ fn restart_fences_unknown_inflight() {
                 sandbox: "read-only",
                 instructions: None,
                 params: None,
+                team_role: None,
+                model_policy: None,
             })
             .unwrap();
         store.enqueue("w1", "work", None, "m1", "user").unwrap();
@@ -463,6 +465,8 @@ fn restart_keeps_original_unknown_reason_beside_later_inflight() {
                 sandbox: "read-only",
                 instructions: None,
                 params: None,
+                team_role: None,
+                model_policy: None,
             })
             .unwrap();
         store.enqueue("w1", "first", None, "m1", "user").unwrap();
@@ -928,6 +932,8 @@ fn daemon_restart_skips_fenced_and_relaunches_healthy() {
                     sandbox: "read-only",
                     instructions: None,
                     params: None,
+                    team_role: None,
+                    model_policy: None,
                 })
                 .unwrap();
         }
@@ -992,6 +998,8 @@ fn restart_preserves_attention_fence_without_unknowns() {
                     sandbox: "read-only",
                     instructions: None,
                     params: None,
+                    team_role: None,
+                    model_policy: None,
                 })
                 .unwrap();
         }
@@ -10680,6 +10688,8 @@ fn restart_fences_task_kickoff_and_job_show_reports_drift() {
                 sandbox: "read-only",
                 instructions: None,
                 params: None,
+                team_role: None,
+                model_policy: None,
             })
             .unwrap();
         store
@@ -10692,6 +10702,8 @@ fn restart_fences_task_kickoff_and_job_show_reports_drift() {
                 sandbox: "read-only",
                 instructions: None,
                 params: Some(&json!({"upstream": "pm"}).to_string()),
+                team_role: None,
+                model_policy: None,
             })
             .unwrap();
         store
@@ -10830,6 +10842,8 @@ fn job_event_parks_on_unrendered_pty_pm() {
             sandbox: "read-only",
             instructions: None,
             params: Some(r#"{"auto_ready":"verified"}"#),
+            team_role: None,
+            model_policy: None,
         })
         .unwrap();
     let spec = state.join("spec.md");
@@ -12834,6 +12848,8 @@ fn message_cancel_races_claim_atomically() {
             sandbox: "read-only",
             instructions: None,
             params: None,
+            team_role: None,
+            model_policy: None,
         })
         .unwrap();
     for i in 0..40 {
@@ -15216,6 +15232,8 @@ fn dispatch_kickoff_and_finish_guards() {
                     sandbox: "read-only",
                     instructions: None,
                     params,
+                    team_role: None,
+                    model_policy: None,
                 })
                 .unwrap();
         }
@@ -15665,6 +15683,8 @@ fn dispatch_records_ref_before_send() {
                     sandbox: "read-only",
                     instructions: None,
                     params,
+                    team_role: None,
+                    model_policy: None,
                 })
                 .unwrap();
         }
@@ -15852,6 +15872,8 @@ fn finish_guard_per_worktree() {
                     sandbox: "read-only",
                     instructions: None,
                     params,
+                    team_role: None,
+                    model_policy: None,
                 })
                 .unwrap();
         }
@@ -15870,6 +15892,8 @@ fn finish_guard_per_worktree() {
                 sandbox: "read-only",
                 instructions: None,
                 params: Some("{\"upstream\":\"pm\"}"),
+                team_role: None,
+                model_policy: None,
             })
             .unwrap();
         store
@@ -17688,6 +17712,8 @@ fn dispatch_injects_project_memory_lessons() {
                     sandbox: "read-only",
                     instructions: None,
                     params,
+                    team_role: None,
+                    model_policy: None,
                 })
                 .unwrap();
         }
@@ -18086,6 +18112,8 @@ fn dispatch_degrades_on_memory_failures() {
                     sandbox: "read-only",
                     instructions: None,
                     params,
+                    team_role: None,
+                    model_policy: None,
                 })
                 .unwrap();
         }
@@ -22571,7 +22599,7 @@ fn monitor_migration_from_v6_bridges_provider_effort_before_v8_v9_and_v10() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert!(columns.iter().any(|column| column == "effort"));
     let monitor_columns: Vec<String> = conn
         .prepare("PRAGMA table_info(monitors)")
@@ -22615,7 +22643,7 @@ fn monitor_migration_after_provider_effort_v7_is_v8_v9_and_v10() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert!(columns.iter().any(|column| column == "effort"));
     let monitor_columns: Vec<String> = conn
         .prepare("PRAGMA table_info(monitors)")
@@ -22660,7 +22688,7 @@ fn monitor_migration_from_v8_defaults_auto_dispatch_off() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[test]
@@ -22700,7 +22728,7 @@ fn monitor_migration_repairs_legacy_pr100_schema9_without_quota() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert!(agent_columns.iter().any(|column| column == "quota"));
     assert!(monitor_columns
         .iter()
@@ -25440,4 +25468,233 @@ fn build_slot_cli_wait_then_grant() {
     assert_eq!(held[0]["pid"].as_u64().unwrap() as u32, std::process::id());
     assert_eq!(held[0]["lane"], SELF_LANE);
     slot_release(&d, &token, SELF_LANE, std::process::id());
+}
+
+fn cadence_bin(state: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// Inherited defaults, explicit override, resume stability, and a mock
+/// argv that receives the resolved model. No paid provider is launched.
+#[test]
+fn model_defaults_register_resume_and_mock_argv() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude("ok", None);
+    let health = d.rpc("health", json!({})).unwrap();
+    assert!(health["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cap| cap == "model_defaults"));
+    let cwd = d.dir.path().to_str().unwrap();
+    let doc_a = r#"{"expected_revision":0,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"baseline-a"},"roles":{"qa":{"mode":"model","model":"qa-model"},"dev":{"mode":"provider_default"}}}}}}"#;
+    d.rpc("model_defaults_set", json!({"document": doc_a}))
+        .unwrap();
+
+    let conflict = cadence_bin(
+        &d.state,
+        &[
+            "agent",
+            "register",
+            "nope",
+            "--provider",
+            "claude",
+            "--endpoint",
+            "managed",
+            "--cwd",
+            cwd,
+            "--param",
+            "model=sonnet",
+            "--provider-default-model",
+        ],
+    );
+    assert!(
+        !conflict.status.success(),
+        "explicit model and provider-default must conflict"
+    );
+    assert!(
+        String::from_utf8_lossy(&conflict.stderr).contains("provider-default-model"),
+        "{}",
+        String::from_utf8_lossy(&conflict.stderr)
+    );
+    let unsupported = cadence_bin(
+        &d.state,
+        &[
+            "agent",
+            "register",
+            "d1",
+            "--provider",
+            "devin",
+            "--endpoint",
+            "pty",
+            "--cwd",
+            cwd,
+            "--provider-default-model",
+        ],
+    );
+    assert!(!unsupported.status.success());
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("does not accept a model"));
+
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake", "cwd": cwd, "role": "pm"}),
+    )
+    .unwrap();
+    let joined = cadence_bin(
+        &d.state,
+        &[
+            "join",
+            "pm",
+            "claude",
+            "--alias",
+            "qa-cli",
+            "--team-role",
+            "qa",
+            "--detach",
+            "--no-bootstrap",
+        ],
+    );
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    d.wait_agent("qa-cli", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "qa-cli", "text": "boot", "message": "m-qa"}),
+    )
+    .unwrap();
+    d.wait_message("qa-cli", "m-qa", &["completed"], 20);
+    let argv_file = mock.pidfile.with_extension("pid.argv");
+    let argv = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv.contains("--model\nqa-model"), "{argv}");
+    assert!(
+        !argv.contains("team_role") && !argv.contains("devops"),
+        "{argv}"
+    );
+    let qa = d.rpc("agent_show", json!({"alias": "qa-cli"})).unwrap()["agent"].clone();
+    assert_eq!(qa["role"], "worker");
+    assert_eq!(qa["team_role"], "qa");
+    assert_eq!(qa["model_selection"]["source"], "role_default");
+    assert_eq!(qa["model_selection"]["model"], "qa-model");
+    assert_eq!(qa["model_configured"], "qa-model");
+    assert_eq!(qa["model_reported"], "mock-claude");
+    assert_ne!(qa["model_configured"], qa["model_reported"]);
+
+    let explicit = cadence_bin(
+        &d.state,
+        &[
+            "agent",
+            "register",
+            "explicit",
+            "--provider",
+            "claude",
+            "--endpoint",
+            "managed",
+            "--cwd",
+            cwd,
+            "--team-role",
+            "qa",
+            "--param",
+            "model=explicit-model",
+        ],
+    );
+    assert!(
+        explicit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    d.wait_agent("explicit", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "explicit", "text": "boot", "message": "m-ex"}),
+    )
+    .unwrap();
+    d.wait_message("explicit", "m-ex", &["completed"], 20);
+    let argv = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv.contains("--model\nexplicit-model"), "{argv}");
+    let shown = d.rpc("agent_show", json!({"alias": "explicit"})).unwrap();
+    assert_eq!(shown["agent"]["model_selection"]["source"], "explicit");
+    assert!(shown["agent"]["model_selection"]["revision"].is_null());
+
+    let doc_b = r#"{"expected_revision":1,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"baseline-b"},"roles":{}}}}}"#;
+    d.rpc("model_defaults_set", json!({"document": doc_b}))
+        .unwrap();
+    d.rpc("agent_stop", json!({"alias": "qa-cli"})).unwrap();
+    d.rpc("agent_resume", json!({"alias": "qa-cli"})).unwrap();
+    d.wait_agent("qa-cli", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "qa-cli", "text": "again", "message": "m-resume"}),
+    )
+    .unwrap();
+    d.wait_message("qa-cli", "m-resume", &["completed"], 20);
+    let argv = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv.contains("--model\nqa-model"), "{argv}");
+    assert!(!argv.contains("baseline-b"), "{argv}");
+
+    d.rpc(
+        "agent_register",
+        json!({"alias": "fresh", "provider": "claude", "endpoint_kind": "managed", "cwd": cwd, "role": "worker"}),
+    )
+    .unwrap();
+    d.wait_agent("fresh", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "fresh", "text": "boot", "message": "m-fresh"}),
+    )
+    .unwrap();
+    d.wait_message("fresh", "m-fresh", &["completed"], 20);
+    let argv = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(argv.contains("--model\nbaseline-b"), "{argv}");
+
+    d.rpc(
+        "agent_set",
+        json!({"alias": "fresh", "next_launch": true, "patch": {"model": null}}),
+    )
+    .unwrap();
+    let cleared = d.rpc("agent_show", json!({"alias": "fresh"})).unwrap()["agent"].clone();
+    assert!(cleared["params"].get("model").is_none() || cleared["params"]["model"].is_null());
+    assert_eq!(
+        cleared["model_selection"]["source"],
+        "explicit_provider_default"
+    );
+    d.rpc("agent_stop", json!({"alias": "fresh"})).unwrap();
+    d.rpc("agent_resume", json!({"alias": "fresh"})).unwrap();
+    d.wait_agent("fresh", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "fresh", "text": "native", "message": "m-native"}),
+    )
+    .unwrap();
+    d.wait_message("fresh", "m-native", &["completed"], 20);
+    let argv = std::fs::read_to_string(&argv_file).unwrap();
+    assert!(!argv.contains("--model"), "{argv}");
+
+    d.rpc(
+        "agent_register",
+        json!({"alias": "box", "provider": "inbox", "endpoint_kind": "inbox", "team_role": "ops"}),
+    )
+    .unwrap();
+    let inbox = d.rpc("agent_show", json!({"alias": "box"})).unwrap()["agent"].clone();
+    assert!(inbox["model_selection"].is_null());
+    assert!(inbox["model_configured"].is_null());
+    assert_eq!(inbox["team_role"], "devops");
+    assert_eq!(inbox["role"], "worker");
+
+    let again = d.rpc(
+        "agent_register",
+        json!({"alias": "qa-cli", "provider": "claude", "endpoint_kind": "managed", "cwd": cwd, "team_role": "dev"}),
+    );
+    assert!(again.unwrap_err().to_string().contains("UNIQUE"));
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "qa-cli"})).unwrap()["agent"]["params"]["model"],
+        "qa-model"
+    );
 }

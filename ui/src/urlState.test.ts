@@ -53,6 +53,10 @@ equal(overviewUrl.get("project"), "cadence");
 equal(overviewUrl.has("tab"), false);
 equal(overviewUrl.has("view"), false);
 
+const settings = readAppUrlState("?tab=settings&project=cadence", "kanban");
+equal(settings.tab, "settings");
+equal(settings.project, "cadence");
+
 let stored: string | null = null;
 const storage = {
   getItem: () => stored,

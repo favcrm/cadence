@@ -21,11 +21,12 @@ existing daemon's health.
 Request: `{"method": "<name>", "params": {...}}`
 
 Response: `{"ok": true, "result": {...}}` or
-`{"ok": false, "error": {"kind": "rejected|provider|unknown|internal", "message": "..."}}`
+`{"ok": false, "error": {"kind": "rejected|provider|unknown|internal|conflict", "message": "...", "code"?: "...", "revision"?: n}}`
 
 Error kinds:
 
-- `rejected` — invalid or disallowed request; nothing was attempted.
+- `rejected` — invalid or disallowed request; nothing was attempted. Structured rejections also carry `code`.
+- `conflict` — a revision check failed. `code` is `revision_conflict` and `revision` is the current stored revision. Nothing was written.
 - `provider` — the provider explicitly rejected the request.
 - `unknown` — transport failed after the request may have reached the
   provider. The attempt is preserved for review; never retried blindly.
@@ -37,9 +38,11 @@ Error kinds:
 |---|---|---|
 | `health` | — | `{state:"ready", protocol:1, capabilities:[...]}` |
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded), writes the clean-stop marker, then exits |
-| `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?` | `{alias,state:"starting"|"idle",provider}` |
+| `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?, team_role?, model_policy?` | `{alias,state:"starting"|"idle",provider}`. `team_role` is model-lookup metadata (`ops` normalizes to `devops`); it does not change runtime `role`. `model_policy` is `inherit` (default) or `provider_default` |
 | `agent_list` | — | `{agents:[Agent+tasks+capabilities]}` — `tasks` names the alias's non-terminal task assignments; `capabilities` is the registry descriptor |
-| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown, inbox?}` — `unknown` counts unreconciled unknowns fencing the agent; passive `inbox` evidence includes queued count, oldest age, last receipt/progress, and `semantic_completion:"external_consumer_required"`; it is never a drain or completion claim. `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_effective`, `model_source` (`configured` or `provider default`), `effort_configured`, `effort_reported`, `effort_effective` and legacy `effort` — also on every `agent_list` row |
+| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown, inbox?}` — `unknown` counts unreconciled unknowns fencing the agent; passive `inbox` evidence includes queued count, oldest age, last receipt/progress, and `semantic_completion:"external_consumer_required"`; it is never a drain or completion claim. `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_effective`, `model_source` (`configured` or `provider default`), `effort_configured`, `effort_reported`, `effort_effective` and legacy `effort` — also on every `agent_list` row. `team_role`, `model_lookup_role`, and `model_selection` (`source`, `lookup_role`, `revision`, `model`) record how a launch model was chosen. Unsupported endpoints leave `model_selection` null. Existing rows without stored provenance are labeled `legacy_configured` or `legacy_provider_default` at read time |
+| `model_defaults_get` | — | `{revision, config, providers, roles}` — daemon-wide provider baselines and team-role overrides. Suggestions are previously observed model ids, not a catalog. Does not start provider processes |
+| `model_defaults_set` | `document` (raw JSON string `{expected_revision, config}`), `attribution?` | the same snapshot as get, after an atomic revision bump. Mismatched `expected_revision` is `kind:"conflict"`, `code:"revision_conflict"`, with `revision` set to the current value and no write. Omitted attribution is transport `local` / actor `local`; a present attribution is transport `board` |
 | `agent_send` | `alias, text, message?, reply_to?, source?, task?` | `{message,state,duplicate}` — `task` attaches the delivery to a task for indexing |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after?, wait(<=30), tail?` | `{events:[Event], cursor, has_older}` — `tail:true` returns the newest page (50) in ascending order instead of paging forward from `after` |
@@ -313,9 +316,12 @@ spec):
 `health.capabilities` and `doctor.capabilities` are generated from the
 same table plus daemon-level features (`agent_registry`,
 `durable_queue`, `operator_reconcile`, `job_lifecycle`,
-`revision_bound_verdicts`, `approval_brokering`, `result_routing`) —
+`revision_bound_verdicts`, `approval_brokering`, `result_routing`,
+`model_defaults`) —
 never hand-listed per provider. Adding a provider or kind means one
 `SPECS` entry; every check, capability list and doctor probe follows.
+A board that sees a reachable daemon without `model_defaults` reports
+the settings route as unsupported instead of guessing from an error string.
 
 ## pty endpoints (providers `devin`, `claude`, `cursor`)
 
