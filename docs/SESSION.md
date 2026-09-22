@@ -487,6 +487,56 @@ In this order:
    memories ride the next `dispatch` kickoff as a `Lessons:` file and
    project `rule`s appear in every briefing — that is the loop closing.
 
+### Post-merge CI on main
+
+Policy (CAD-228): **every commit pushed to `main` is verified**, one run at
+a time, oldest first. Pull requests keep cancel-stale behaviour. The
+`concurrency:` block in `.github/workflows/ci.yml` implements it:
+
+| Event | Group | Running run | Pending runs |
+|-------|-------|-------------|--------------|
+| `pull_request` | `ci-<PR number>` | cancelled by a newer head | at most one; a newer head replaces it (`queue: single`) |
+| `push` to `main` or `feat/**` | `ci-<ref>` | never cancelled | up to 100 wait, oldest first (`queue: max`); only a 101st is cancelled |
+
+Before this, pushes used GitHub's default single pending slot, even though
+`cancel-in-progress` was false. When three merges landed inside one run,
+the second one's pending run was cancelled with zero jobs and that SHA was
+never verified. Runs 35607746920 (a3e6f8f) and 35615227527 (4a9e3e8) are
+the two cases on record. GitHub rejects `queue: max` together with
+`cancel-in-progress: true`, so both keys are expressions on the event and
+a single run never gets both.
+
+Cost, measured from the 25 most recent completed main runs before the
+change: median wall-clock `T` = 6.55 min (the `test` job is the long
+pole), median 11.7 job-minutes per run (15 once each job is rounded up to
+a whole minute). For `N` pushes that land while one run is going:
+
+| N rapid pushes | Old policy: runs / job-min / latest verified after | New policy: runs / job-min / latest verified after | SHAs verified, old vs new |
+|---|---|---|---|
+| 1 | 1 / 11.7 / 6.6 min | 1 / 11.7 / 6.6 min | 1/1 vs 1/1 |
+| 2 | 2 / 23.4 / 13.1 min | 2 / 23.4 / 13.1 min | 2/2 vs 2/2 |
+| 3 | 2 / 23.4 / 13.1 min | 3 / 35.2 / 19.7 min | 2/3 vs 3/3 |
+| 5 | 2 / 23.4 / 13.1 min | 5 / 58.6 / 32.8 min | 2/5 vs 5/5 |
+
+The concurrency block landed with #94 (2026-09-21). In the 34 main pushes
+from then to 2026-09-22, there were two bursts of three, and each one lost
+a SHA. There were also a few bursts of two, which lost nothing. Under the
+new policy those two bursts would have cost about 23 more job-minutes over
+two days. The repo is public, so
+standard hosted runners are not billed. The real cost is that in a burst,
+the newest SHA waits one extra `T` for each extra push ahead of it. Runs
+stay serial (one per group), so the queue is bounded and never becomes
+unbounded parallel CI.
+
+Reading main CI: a `cancelled` run on a main SHA is **not** a test
+failure, and it is **not** a pass either. That SHA is unverified until
+its own run succeeds, or until a descendant on main succeeds, and even
+then it is only "covered by" that descendant, never passed. Under this
+policy a cancelled main run should only come from a manual cancel or a
+queue past 100. Check it with
+`gh run list --workflow ci.yml --branch main --json databaseId,headSha,status,conclusion`,
+and look at the zero-job runs with `gh run view <id> --json jobs`.
+
 ## 8. When something goes wrong
 
 | Symptom | Meaning | Do |
