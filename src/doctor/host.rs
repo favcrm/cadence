@@ -1911,12 +1911,25 @@ fn is_secret_flag(arg: &str) -> bool {
     secret_name(name) || (!arg.starts_with("--") && matches!(name, "p" | "a" | "u"))
 }
 
+/// Display-text boundary. ASCII whitespace and Unicode spaces (NBSP,
+/// em space, and the rest of `char::is_whitespace`) both count. A
+/// shell does not split on NBSP; a flag and value divided by one are
+/// still ambiguous credential-bearing diagnostic text, so the value
+/// must not stay visible.
+fn diagnostic_ws(c: char) -> bool {
+    c.is_whitespace()
+}
+
+fn has_diagnostic_ws(s: &str) -> bool {
+    s.chars().any(diagnostic_ws)
+}
+
 /// One argv element is a shell command when it carries whitespace and
 /// is not already a single header or a secret-named assignment. Those
 /// two stay whole: splitting `Authorization: Basic …` or
 /// `--password=two words` would put the tail back on the page.
 fn shell_blob_arg(arg: &str) -> bool {
-    arg.chars().any(|c| c.is_ascii_whitespace()) && !header_unit(arg) && !sealed_assignment(arg)
+    has_diagnostic_ws(arg) && !header_unit(arg) && !sealed_assignment(arg)
 }
 
 /// `Name: value` as one element — the colon rule already redacts the
@@ -1933,7 +1946,7 @@ fn header_unit(arg: &str) -> bool {
         return false;
     }
     let (left, right) = arg.split_once(':').unwrap();
-    if left.chars().any(|c| c.is_ascii_whitespace()) {
+    if has_diagnostic_ws(left) {
         return false;
     }
     secret_name(left)
@@ -1950,7 +1963,7 @@ fn sealed_assignment(arg: &str) -> bool {
     let Some((name, value)) = arg.split_once('=') else {
         return false;
     };
-    if name.is_empty() || name.chars().any(|c| c.is_ascii_whitespace()) {
+    if name.is_empty() || has_diagnostic_ws(name) {
         return false;
     }
     let flagged = name.starts_with('-');
@@ -1961,7 +1974,7 @@ fn sealed_assignment(arg: &str) -> bool {
     if secret_name(bare) {
         return true;
     }
-    !value.chars().any(|c| c.is_ascii_whitespace())
+    !has_diagnostic_ws(value)
 }
 
 /// `sh -c` is the outer element (depth 0). Each quoted command inside
@@ -1978,20 +1991,30 @@ struct ShellWord<'a> {
 
 /// Bounded word split for one command element. Single and double
 /// quotes group a word (so a value can contain spaces); a quote
-/// mid-word (`don't`) stays literal. `$`, backticks and backslashes
-/// are expansions or escapes — the split fails closed instead of
-/// guessing. Nothing here is executed.
+/// mid-word (`don't`) stays literal. Unicode spaces are character
+/// boundaries in the diagnostic text, not shell metacharacters.
+/// `$`, backticks and backslashes are expansions or escapes — the
+/// split fails closed instead of guessing. Nothing here is executed.
 fn split_shell_words(s: &str) -> std::result::Result<Vec<ShellWord<'_>>, ()> {
     let b = s.as_bytes();
     let mut words = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        if b[i].is_ascii_whitespace() {
-            i += 1;
+        let Some(ch) = s[i..].chars().next() else {
+            break;
+        };
+        if diagnostic_ws(ch) {
+            i += ch.len_utf8();
             continue;
         }
         let start = i;
-        while i < b.len() && !b[i].is_ascii_whitespace() {
+        while i < b.len() {
+            let Some(ch) = s[i..].chars().next() else {
+                break;
+            };
+            if diagnostic_ws(ch) {
+                break;
+            }
             match b[i] {
                 b'\\' | b'$' | b'`' => return Err(()),
                 b'\'' | b'"' if i == start || b[i - 1] == b'=' => {
@@ -2140,7 +2163,7 @@ fn redact_shell_blob(s: &str, depth: u8) -> String {
     let logicals: Vec<String> = words
         .iter()
         .map(|w| {
-            if w.logical.chars().any(|c| c.is_ascii_whitespace())
+            if has_diagnostic_ws(&w.logical)
                 && !header_unit(&w.logical)
                 && !sealed_assignment(&w.logical)
             {
@@ -2180,10 +2203,13 @@ fn redact_shell_blob(s: &str, depth: u8) -> String {
 /// credential shape or the 32+ char high-entropy token shape.
 ///
 /// An element that itself holds a command (`sh -c 'run --token …'`)
-/// is split once on unquoted whitespace and run through those same
-/// rules, so a secret inside the script is not printed. Quotes are
-/// grouping only — this is not a shell parser and it never executes
-/// the text. `$`, backticks and backslashes fail closed: the element
+/// is split once on unquoted whitespace, including Unicode spaces,
+/// and run through those same rules, so a secret inside the script
+/// is not printed. A Unicode space is not shell syntax; it is only
+/// a character boundary so a flag value cannot hide against the
+/// flag. Quotes are grouping only — this is not a shell parser and
+/// it never executes the text. `$`, backticks and backslashes fail
+/// closed: the element
 /// is withheld when a secret flag, assignment, header or credential
 /// shape is still visible, and left unchanged when it is not. A
 /// secret-named `NAME=value` that occupies the whole element still
@@ -6554,6 +6580,47 @@ mod tests {
             let out = redact_argv(&["sh", "-c", script]);
             assert!(!out.contains("s3cr3tvalue"), "{script} -> {out}");
             assert!(out.contains("[REDACTED]"), "{script} -> {out}");
+        }
+    }
+
+    /// Unicode whitespace is not a shell separator. The QA fixture
+    /// `run --token<NBSP>s3cr3tvalue` is still ambiguous
+    /// credential-bearing diagnostic text: the value must not remain
+    /// visible, while benign Unicode text is unchanged.
+    #[test]
+    fn redact_argv_unicode_whitespace_hides_flag_value() {
+        let secret = "s3cr3tvalue";
+        let ascii = redact_argv(&["sh", "-c", "run --token s3cr3tvalue && echo ok"]);
+        assert!(!ascii.contains(secret), "{ascii}");
+        assert!(ascii.contains("echo ok"), "{ascii}");
+        assert!(ascii.contains("--token"), "{ascii}");
+        // NBSP, then em space — one other Unicode space.
+        for sep in ['\u{00a0}', '\u{2003}'] {
+            let script = format!("run --token{sep}{secret}");
+            let out = redact_argv(&["sh", "-c", &script]);
+            assert!(
+                !out.contains(secret),
+                "U+{:04X} leaked in {out}",
+                sep as u32
+            );
+            assert!(out.contains("[REDACTED]"), "U+{:04X} {out}", sep as u32);
+            assert!(out.contains("run"), "{out}");
+            assert!(out.contains("--token"), "{out}");
+            let glued = format!("--token{sep}{secret}");
+            let direct = redact_argv(&["tool", &glued]);
+            assert!(!direct.contains(secret), "U+{:04X} {direct}", sep as u32);
+            assert!(direct.contains("--token"), "{direct}");
+        }
+        for script in [
+            "echo café",
+            "echo hello\u{00a0}world",
+            "echo hello\u{2003}world",
+        ] {
+            assert_eq!(
+                redact_argv(&["sh", "-c", script]),
+                format!("sh -c {script}"),
+                "{script:?}"
+            );
         }
     }
 
