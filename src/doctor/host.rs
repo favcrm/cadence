@@ -543,6 +543,7 @@ fn dir_size(path: &Path) -> (u64, bool) {
 fn dir_size_limited(path: &Path, budget: usize) -> (u64, bool, usize) {
     let mut total = 0u64;
     let mut visited = 0_usize;
+    let mut truncated = false;
     let mut inodes = std::collections::HashSet::new();
     let root_dev = std::fs::metadata(path).ok().map(|m| m.dev());
     let mut stack = vec![path.to_path_buf()];
@@ -550,20 +551,28 @@ fn dir_size_limited(path: &Path, budget: usize) -> (u64, bool, usize) {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             // Absence is an empty measurement. Permission and I/O
-            // failures are a lower bound: `truncated == false` would
-            // otherwise look like a finished walk of nothing.
+            // failures make the result a lower bound (`truncated`), but
+            // the walk goes on: stopping at the first unreadable dir
+            // would drop readable siblings depending on readdir order
+            // (CAD-262).
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if dir.as_path() == path {
                     return (0, false, 0);
                 }
                 continue;
             }
-            Err(_) => return (total, true, visited),
+            Err(_) => {
+                truncated = true;
+                continue;
+            }
         };
         for ent in entries {
             let ent = match ent {
                 Ok(ent) => ent,
-                Err(_) => return (total, true, visited),
+                Err(_) => {
+                    truncated = true;
+                    break;
+                }
             };
             if visited >= budget {
                 return (total, true, visited);
@@ -581,7 +590,7 @@ fn dir_size_limited(path: &Path, budget: usize) -> (u64, bool, usize) {
             }
         }
     }
-    (total, false, visited)
+    (total, truncated, visited)
 }
 
 /// POSIX single-quoting for a path emitted inside a shell command —
@@ -7296,6 +7305,37 @@ mod tests {
         assert!(truncated);
         assert!(bytes < 80_000, "hidden bytes were counted: {bytes}");
         assert!(bytes >= open_bytes);
+    }
+
+    /// CAD-262: an unreadable subdir must not hide readable siblings,
+    /// whatever order readdir yields them in. With eight readable
+    /// siblings around one unreadable dir, a walk that stops at the
+    /// first error only counts them all when the unreadable one happens
+    /// to be listed first (about 1 in 9), so an order-dependent walk
+    /// fails here almost every run.
+    #[test]
+    fn dir_size_limited_counts_every_readable_sibling_of_an_unreadable_dir() {
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("sized");
+        let names = ["a0", "b1", "c2", "d3", "w4", "x5", "y6", "z7"];
+        for name in names {
+            real_bytes(&dir.join(name).join("seen.bin"), 4096);
+        }
+        let (all_open, open_truncated, _) = dir_size_limited(&dir, 256);
+        assert!(!open_truncated);
+        assert!(all_open >= 8 * 4096, "{all_open}");
+        let secret = dir.join("m-secret");
+        real_bytes(&secret.join("hidden.bin"), 80_000);
+        let _restore = deny_directory(&secret);
+        let (bytes, truncated, _) = dir_size_limited(&dir, 256);
+        assert!(truncated, "an unreadable subdir is a lower bound");
+        assert_eq!(
+            bytes, all_open,
+            "every readable sibling counted, hidden bytes not"
+        );
+        // An unreadable root is still a truncated empty measurement.
+        let (bytes, truncated, visited) = dir_size_limited(&secret, 256);
+        assert_eq!((bytes, truncated, visited), (0, true, 0));
     }
 
     #[test]
