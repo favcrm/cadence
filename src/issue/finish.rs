@@ -2,7 +2,9 @@
 //! and branch once the work has landed. The guard is per worktree,
 //! not per agent: it refuses only while the worktree is actually in
 //! use — a live message whose dispatch recorded this worktree (the
-//! issue's `message` refs, or a job task's recorded worktree), a pane
+//! issue's `message` refs, or a job task's recorded worktree), an
+//! unreconciled `unknown` message bound the same way or held by a
+//! registered agent whose cwd is on the worktree, a pane
 //! process tree with cwd inside it, or any process standing in it —
 //! plus a dirty worktree (ignored paths don't count) and a branch
 //! whose work survives nowhere — merged into the repo's default
@@ -503,6 +505,11 @@ pub(crate) struct DaemonView {
     /// `task_show`) — reported as the deferred meta-block's reason.
     enum_unreachable: Option<String>,
     enum_inconclusive: Option<String>,
+    /// Agent rows from `agent_list` (alias, cwd, and the rest of the
+    /// list payload). Empty when the daemon is down or the list failed
+    /// — that failure is `enum_unreachable` / `enum_inconclusive`, not
+    /// a guess that no cwd is on the worktree.
+    agents: Vec<Value>,
 }
 
 fn daemon_view(state_dir: &Path) -> DaemonView {
@@ -512,6 +519,7 @@ fn daemon_view(state_dir: &Path) -> DaemonView {
         task_errors: std::collections::HashMap::new(),
         enum_unreachable: None,
         enum_inconclusive: None,
+        agents: Vec::new(),
     };
     if !v.up {
         return v;
@@ -519,6 +527,7 @@ fn daemon_view(state_dir: &Path) -> DaemonView {
     match client::rpc(state_dir, "agent_list", json!({})) {
         Ok(list) => {
             for a in list["agents"].as_array().into_iter().flatten() {
+                v.agents.push(a.clone());
                 for tid in a["tasks"]
                     .as_array()
                     .into_iter()
@@ -863,11 +872,58 @@ fn push_alias(aliases: &mut Vec<String>, a: &str) {
     }
 }
 
+/// Whether `cwd` is the worktree directory or a child of it. The
+/// worktree path is canonical when that directory exists and lexical
+/// otherwise. A sibling whose name only shares a prefix does not match.
+fn cwd_on_worktree(wt_dir: &Path, cwd: &Path) -> bool {
+    if cwd.as_os_str().is_empty() {
+        return false;
+    }
+    let base = if wt_dir.exists() {
+        wt_dir
+            .canonicalize()
+            .unwrap_or_else(|_| wt_dir.to_path_buf())
+    } else {
+        wt_dir.to_path_buf()
+    };
+    let candidate = if cwd.exists() {
+        cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+    } else {
+        cwd.to_path_buf()
+    };
+    candidate == base || candidate.starts_with(&base)
+}
+
+/// Aliases from `agent_list` whose cwd is this worktree. A missing
+/// list is not "nobody" — the caller already records that enumeration
+/// failure. Historical cwds are not retained here.
+fn cwd_holder_aliases(view: &DaemonView, wt_dir: Option<&Path>) -> Vec<String> {
+    let Some(dir) = wt_dir else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for agent in &view.agents {
+        let Some(alias) = agent["alias"].as_str() else {
+            continue;
+        };
+        let Some(cwd) = agent["cwd"].as_str().filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        if cwd_on_worktree(dir, Path::new(cwd)) {
+            push_alias(&mut out, alias);
+        }
+    }
+    out
+}
+
 /// The per-worktree guard plus the unchanged dirty/survivability
 /// checks, evaluated read-only against a shared daemon `view` and
 /// merge `ev`idence. In-use means THIS worktree: a live message
-/// recorded against it, a pane tree with cwd inside it, or any
-/// process standing in it. An owner busy elsewhere does not block.
+/// recorded against it, an unreconciled `unknown` message bound to it
+/// or held by a registered agent whose cwd is on it, a pane tree with
+/// cwd inside it, or any process standing in it. A reconciled agent
+/// whose cwd is still this path does not block. An owner busy
+/// elsewhere does not block.
 /// Agent checks run only when the daemon socket exists (`view.up`):
 /// a stopped daemon means "no agents" and the /proc and pane scans
 /// carry the check. When it answers, only a TRANSPORT failure blocks
@@ -926,6 +982,14 @@ fn inspect(view: &DaemonView, state_dir: &Path, t: &Target, ev: &Evidence) -> Ch
                 }
             }
         }
+        // Current registry cwd only — not every historical path the
+        // row ever had. A child of the worktree counts; a different
+        // worktree does not. An unknown on one of these aliases blocks
+        // even when the message itself is not bound here.
+        let cwd_holders = cwd_holder_aliases(view, t.wt_dir.as_deref());
+        for alias in &cwd_holders {
+            push_alias(&mut aliases, alias);
+        }
         if let Some(e) = &view.enum_unreachable {
             push_once(
                 &mut deferred,
@@ -959,19 +1023,37 @@ fn inspect(view: &DaemonView, state_dir: &Path, t: &Target, ev: &Evidence) -> Ch
                     // work for every owner kind.
                     let dead = show["agent"]["dead"].as_bool() == Some(true);
                     let inbox = show["agent"]["endpoint_kind"].as_str() == Some("inbox");
+                    let cwd_holder = cwd_holders.iter().any(|a| a == alias);
                     let mut bound_msg = None;
+                    let mut unknown_msg = None;
                     for m in show["messages"].as_array().into_iter().flatten() {
-                        let live = match m["state"].as_str().unwrap_or_default() {
+                        let state = m["state"].as_str().unwrap_or_default();
+                        let unknown = state == "unknown";
+                        // `unknown` is in-use whenever it is bound to this
+                        // worktree. A cwd holder blocks on any unknown,
+                        // bound or not. Queued still waits for a live
+                        // non-inbox owner; a stale fence error with zero
+                        // unknowns is not a hold.
+                        let live = match state {
                             "running" | "submitting" => true,
                             "queued" => !dead && !inbox,
+                            "unknown" => true,
                             _ => false,
                         };
                         if !live {
                             continue;
                         }
+                        if unknown && cwd_holder {
+                            unknown_msg = Some(m);
+                            break;
+                        }
                         match message_bound(view, state_dir, m, t) {
                             Bound::Yes => {
-                                bound_msg = Some(m);
+                                if unknown {
+                                    unknown_msg = Some(m);
+                                } else {
+                                    bound_msg = Some(m);
+                                }
                                 break;
                             }
                             Bound::No => {}
@@ -996,7 +1078,16 @@ fn inspect(view: &DaemonView, state_dir: &Path, t: &Target, ev: &Evidence) -> Ch
                             ),
                         }
                     }
-                    if let Some(msg) = bound_msg {
+                    if let Some(msg) = unknown_msg {
+                        blocks.push(Block {
+                            tag: "unreconciled-unknown".to_string(),
+                            reason: format!(
+                                "Agent '{alias}' has unreconciled unknown message {} — \
+                                 reconcile it before finishing this worktree, or pass --force",
+                                msg["id"].as_str().unwrap_or_default()
+                            ),
+                        });
+                    } else if let Some(msg) = bound_msg {
                         let body: String = msg["body"]
                             .as_str()
                             .unwrap_or_default()
