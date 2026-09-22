@@ -57,6 +57,18 @@ export default function App() {
   const [agentsError, setAgentsError] = useState<string | null>(null);
   const agentsLoaded = useRef(false);
   const [overview, setOverview] = useState<Overview | null>(null);
+  // A failed read keeps the last good payload; only a failure with
+  // nothing loaded yet reads as "unavailable" (CAD-249).
+  const [overviewFailed, setOverviewFailed] = useState(false);
+  const loadOverview = useCallback(() => {
+    api
+      .overview()
+      .then((next) => {
+        setOverview(next);
+        setOverviewFailed(false);
+      })
+      .catch(() => setOverviewFailed(true));
+  }, []);
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [openId, setOpenId] = useState<string | null>(initial.openId);
@@ -165,9 +177,7 @@ export default function App() {
       })
       .catch((e) => setAgentsError(String(e.message ?? e)))
       .finally(() => setAgentsLoading(false));
-    if (tabRef.current === "overview") {
-      api.overview().then(setOverview).catch(() => setOverview(null));
-    }
+    if (tabRef.current === "overview") loadOverview();
     if (openId) {
       api
         .issue(openId)
@@ -178,10 +188,8 @@ export default function App() {
 
   // And whenever it becomes the visible tab.
   useEffect(() => {
-    if (tab === "overview") {
-      api.overview().then(setOverview).catch(() => setOverview(null));
-    }
-  }, [tab]);
+    if (tab === "overview") loadOverview();
+  }, [tab, loadOverview]);
 
   useEffect(refresh, [refresh]);
 
@@ -469,6 +477,7 @@ export default function App() {
         {tab === "overview" && (
           <OverviewView
             data={overview}
+            failed={overviewFailed}
             project={project}
             readOnly={readOnly}
             onAck={ackMonitor}

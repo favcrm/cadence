@@ -20084,6 +20084,279 @@ fn overview_drift_reports_commits_after_build() {
     assert_eq!(row["command"], "cadence daemon restart --when-idle --ui");
 }
 
+/// `cadence overview` with extra args — the raw output, success or not.
+fn overview_cmd(home: &Path, state: &Path, pm: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state)
+        .args(["overview", "--json"])
+        .args(args)
+        .env("HOME", home)
+        .env("CADENCE_PM_DIR", pm)
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap()
+}
+
+/// CAD-252: `--project` and `--group` scope the merged rows; a key the
+/// tracker or the fleet does not know is an error naming the key.
+#[test]
+fn overview_scope_flags_filter_rows_and_reject_unknown_keys() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let pm = TempDir::new().unwrap();
+    // A git checkout the tracker declares as project `cadence`'s repo;
+    // agents working inside it attribute to that project.
+    let repo = TempDir::new().unwrap();
+    git_at(repo.path(), &["init", "-q"]);
+    let repo_s = repo.path().to_str().unwrap().to_string();
+    issue_cli(home.path(), &d.state, pm.path(), &["issue", "init"]);
+    issue_cli(
+        home.path(),
+        &d.state,
+        pm.path(),
+        &[
+            "issue", "project", "add", "cadence", "--prefix", "CAD", "--repo", &repo_s,
+        ],
+    );
+    // Group `pm`: an inbox root with worker w1 in the project repo.
+    // w2 is its own root, outside every project.
+    d.register_inbox("pm");
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": repo_s, "params": json!({"upstream": "pm"}).to_string()}),
+    )
+    .unwrap();
+    d.register("w2");
+    for w in ["w1", "w2"] {
+        d.wait_agent(w, "idle", 10);
+        fence_agent(&d, w, &format!("x-{w}"));
+    }
+    let fenced = |v: &Value| -> Vec<String> {
+        let mut out: Vec<String> = v["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["kind"] == "fenced")
+            .map(|n| n["subject"]["id"].as_str().unwrap().to_string())
+            .collect();
+        out.sort();
+        out
+    };
+    let run = |args: &[&str]| -> Value {
+        let out = overview_cmd(home.path(), &d.state, pm.path(), args);
+        assert!(
+            out.status.success(),
+            "overview {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    let all = run(&[]);
+    assert_eq!(fenced(&all), ["w1", "w2"], "{all}");
+    let w1 = all["needs_me"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["subject"]["id"] == "w1")
+        .unwrap();
+    assert_eq!(w1["subject"]["kind"], "agent", "{w1}");
+    assert_eq!(w1["cause"], "fenced", "{w1}");
+    assert_eq!(w1["project"], "cadence", "attributed by cwd: {w1}");
+
+    let group = run(&["--group", "pm"]);
+    assert_eq!(fenced(&group), ["w1"], "{group}");
+    assert_eq!(group["scope"]["group"], "pm");
+    let project = run(&["--project", "cadence"]);
+    assert_eq!(fenced(&project), ["w1"], "{project}");
+    assert_eq!(project["projects"].as_array().unwrap().len(), 1);
+
+    for (flag, key) in [("--project", "nope-project"), ("--group", "nope-group")] {
+        let out = overview_cmd(home.path(), &d.state, pm.path(), &[flag, key]);
+        assert!(!out.status.success(), "{flag} {key} must fail");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(key), "{flag}: {err}");
+    }
+}
+
+// ==== CAD-251: an inbox nobody drains warns, never refuses ====
+
+/// A mailbox with endpoint params (thresholds, upstream).
+fn register_inbox_with(d: &TestDaemon, alias: &str, params: Value) {
+    d.rpc(
+        "agent_register",
+        json!({"alias": alias, "provider": "inbox", "endpoint_kind": "inbox",
+               "params": params.to_string()}),
+    )
+    .unwrap();
+}
+
+/// Sends into an undrained mailbox past its unread threshold carry a
+/// `warning` (receipt field + CLI stderr) and still queue; a recently
+/// drained mailbox never warns. Routed results have no caller to warn,
+/// so the mailbox's event stream records one `inbox_unconsumed` per
+/// idle window. Status and overview name the stale inbox with its
+/// count, oldest age and owner.
+#[test]
+fn inbox_without_consumer_warns_on_send_and_route() {
+    stall_sample(1); // the inbox sweep rides the screen-sample cadence
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    const WINDOW: u64 = 6;
+    let limits = |extra: Value| {
+        let mut p = json!({"inbox_warn_unread": 2, "inbox_warn_idle_secs": WINDOW});
+        p.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        p
+    };
+    register_inbox_with(&d, "stale", limits(json!({})));
+    register_inbox_with(&d, "drained", limits(json!({})));
+    // `routed` belongs to group root `boss`, so `boss` owns it.
+    d.register_inbox("boss");
+    register_inbox_with(&d, "routed", limits(json!({"upstream": "boss"})));
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w1", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "params": json!({"upstream": "routed"}).to_string()}),
+    )
+    .unwrap();
+    d.wait_agent("w1", "idle", 10);
+    let send = |alias: &str, id: &str| {
+        d.rpc(
+            "agent_send",
+            json!({"alias": alias, "text": "note", "message": id}),
+        )
+        .unwrap()
+    };
+    let job = |id: &str| {
+        send("w1", id);
+        d.wait_message("w1", id, &["completed"], 15);
+    };
+
+    // A young backlog is not stale: over the threshold, inside the window.
+    for i in 0..3 {
+        for alias in ["stale", "drained"] {
+            let r = send(alias, &format!("{alias}-a{i}"));
+            assert!(r["warning"].is_null(), "{r}");
+        }
+        job(&format!("j-a{i}"));
+    }
+    thread::sleep(Duration::from_millis(WINDOW * 1000 + 300));
+
+    // Routed results into the now-stale `routed` mailbox have no caller
+    // to warn: its stream records one event, owned by the group root —
+    // and another routed result inside the window adds none.
+    let e = d.wait_event("routed", "inbox_unconsumed", 15);
+    assert_eq!(e["payload"]["stale"], true, "{e}");
+    assert_eq!(e["payload"]["owner"], "boss", "{e}");
+    assert!(e["payload"]["unread"].as_u64().unwrap_or(0) >= 3, "{e}");
+    job("j-b0");
+    thread::sleep(Duration::from_millis(1500));
+    let kinds = event_kinds(&d, "routed");
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "inbox_unconsumed").count(),
+        1,
+        "{kinds:?}"
+    );
+
+    // `drained` is read; nothing warns for it afterwards.
+    let drained_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let page = d.rpc("agent_inbox", json!({"alias": "drained"})).unwrap();
+    assert_eq!(page["messages"].as_array().unwrap().len(), 3, "{page}");
+    for i in 0..3 {
+        let r = send("drained", &format!("drained-b{i}"));
+        assert!(r["warning"].is_null(), "recently drained: {r}");
+    }
+    // `stale` was never read: the send warns and still queues.
+    let r = send("stale", "stale-b0");
+    assert_eq!(r["state"], "queued", "warned, never refused: {r}");
+    let w = r["warning"].as_str().expect("stale inbox warns");
+    assert!(
+        w.contains("'stale'") && w.contains("4 unread") && w.contains("owner operator"),
+        "{w}"
+    );
+    // The CLI says it on stderr; stdout stays the JSON receipt.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["send", "stale", "--text", "cli note"])
+        .env("HOME", home.path())
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("warning: inbox 'stale' has no consumer"),
+        "{err}"
+    );
+    let receipt: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(receipt["warning"].is_string(), "{receipt}");
+    thread::sleep(Duration::from_millis(2500));
+    let late: Vec<Value> = d
+        .events("drained")
+        .into_iter()
+        .filter(|e| e["kind"] == "inbox_unconsumed")
+        .filter(|e| e["at"].as_f64().unwrap_or(0.0) >= drained_at)
+        .collect();
+    assert!(
+        late.is_empty(),
+        "a recently drained inbox never warns: {late:?}"
+    );
+
+    // Status footer and overview name the stale inboxes.
+    let status = status_json(&d.state, &[], &[("HOME", home.path())]);
+    let stale: Vec<&Value> = status["footer"]["stale_inboxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .collect();
+    let names: Vec<&str> = stale.iter().filter_map(|s| s["alias"].as_str()).collect();
+    assert!(
+        names.contains(&"stale") && names.contains(&"routed"),
+        "{status}"
+    );
+    assert!(!names.contains(&"drained"), "{status}");
+    let routed = stale.iter().find(|s| s["alias"] == "routed").unwrap();
+    assert_eq!(routed["owner"], "boss", "{status}");
+    assert!(
+        routed["oldest_unread_age_secs"].as_u64().unwrap_or(0) >= WINDOW,
+        "{status}"
+    );
+    let table = status_table(&d.state, &[("HOME", home.path())]);
+    assert!(table.contains("stale inboxes (no consumer): "), "{table}");
+
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let row = view["needs_me"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["subject"]["id"] == "routed")
+        .cloned()
+        .expect("stale inbox row");
+    assert_eq!(row["kind"], "inbox_stale", "{row}");
+    assert_eq!(row["owner"], "boss", "{row}");
+    let causes: Vec<&str> = row["causes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["cause"].as_str())
+        .collect();
+    assert_eq!(causes, ["inbox_stale", "inbox_unread"], "{row}");
+    stall_sample(0);
+}
+
 /// `doctor --host --json` on the real host: one object, the named
 /// checks, each ok|warn|fail, exit code the worst level. What the host
 /// measures is its own business — this only proves the surface runs

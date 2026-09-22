@@ -2186,7 +2186,7 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
         }
         "/api/overview" => send(
             request,
-            json_response(crate::overview::overview(state_dir, pm_dir)),
+            json_response(crate::overview::overview_board(state_dir, pm_dir)),
         ),
         "/api/projects" => match Pm::at(pm_dir) {
             Ok(pm) => {

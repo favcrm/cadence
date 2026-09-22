@@ -840,7 +840,9 @@ enum Commands {
     /// What needs a human right now: merge-ready PRs, open approvals,
     /// fenced or stalled agents, review/unblocked issues, unread
     /// inboxes, a behind-tracker, deploy drift — each with the exact
-    /// command. The same payload as the board's Overview screen.
+    /// command. The same payload as the board's Overview screen. Rows
+    /// naming the same agent, issue or PR merge into one row listing
+    /// its causes.
     Overview {
         /// Emit the payload as JSON instead of the aligned list.
         #[arg(long)]
@@ -848,6 +850,14 @@ enum Commands {
         /// Re-render every <secs> until interrupted.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         watch: Option<u64>,
+        /// Scope rows to one tracker project key (an unknown key is an
+        /// error).
+        #[arg(long)]
+        project: Option<String>,
+        /// Scope rows to one group root and its members, as
+        /// `cadence status --group` does (an unknown root is an error).
+        #[arg(long)]
+        group: Option<String>,
     },
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
@@ -2714,11 +2724,21 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
 /// summary, rendered as an aligned list (or the raw payload with
 /// `--json`). Read-only: every source degrades rather than failing the
 /// screen.
-fn run_overview(state_dir: &Path, json_out: bool, watch: Option<u64>) -> Result<i32> {
+fn run_overview(
+    state_dir: &Path,
+    json_out: bool,
+    watch: Option<u64>,
+    scope: cadence_agent::overview::Scope,
+) -> Result<i32> {
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let pm_dir = cadence_agent::issue::default_dir().unwrap_or_default();
+    let opts = cadence_agent::overview::Options {
+        scope,
+        ..cadence_agent::overview::Options::cli()
+    };
     loop {
-        let view = cadence_agent::overview::overview(state_dir, &pm_dir);
+        let view = cadence_agent::overview::overview_with(state_dir, &pm_dir, &opts)
+            .map_err(Error::rejected)?;
         if json_out {
             print_json(&view);
         } else {
@@ -2761,8 +2781,18 @@ fn print_overview(view: &Value) {
         for n in &needs {
             let title = n["title"].as_str().unwrap_or_default();
             let title: String = title.chars().take(52).collect();
+            // One row per subject: every cause, most severe first.
+            let causes: Vec<&str> = n["causes"]
+                .as_array()
+                .map(|cs| cs.iter().filter_map(|c| c["cause"].as_str()).collect())
+                .unwrap_or_default();
+            let kind = if causes.is_empty() {
+                n["kind"].as_str().unwrap_or_default().to_string()
+            } else {
+                causes.join("+")
+            };
             let row = [
-                n["kind"].as_str().unwrap_or_default().to_string(),
+                kind,
                 fmt_age(n["age"].as_i64().unwrap_or(0)),
                 n["project"].as_str().unwrap_or_default().to_string(),
                 title,
@@ -2854,6 +2884,16 @@ fn print_overview(view: &Value) {
     }
     if !view["daemon"]["reachable"].as_bool().unwrap_or(false) {
         println!("daemon: unreachable — agent, approval and drift rows absent");
+    }
+    // CAD-249: sources that missed their bound — the screen narrowed.
+    for d in view["degraded"].as_array().cloned().unwrap_or_default() {
+        let subject = d["subject"].as_str().filter(|s| !s.is_empty());
+        println!(
+            "degraded: {}{}: {}",
+            d["source"].as_str().unwrap_or("?"),
+            subject.map(|s| format!(" {s}")).unwrap_or_default(),
+            d["detail"].as_str().unwrap_or("")
+        );
     }
 }
 
@@ -4418,7 +4458,15 @@ fn run() -> Result<i32> {
             cwd: std::env::current_dir()?,
             state_dir,
         }),
-        Commands::Overview { json, watch } => run_overview(&state_dir, json, watch),
+        Commands::Overview {
+            json,
+            watch,
+            project,
+            group,
+        } => {
+            let scope = cadence_agent::overview::Scope { project, group };
+            run_overview(&state_dir, json, watch, scope)
+        }
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
 }

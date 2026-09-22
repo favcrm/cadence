@@ -14,6 +14,7 @@ const KIND_CHIP: Record<string, string> = {
   ci_red: "bg-fail/10 text-fail",
   silent_end: "bg-warn/10 text-warn",
   inbox_unread: "bg-warn/10 text-warn",
+  inbox_stale: "bg-warn/10 text-warn",
   tracker_behind: "bg-ink-800 text-ink-400",
 };
 
@@ -81,6 +82,16 @@ function NeedRows({ rows }: { rows: Overview["needs_me"] }) {
                 <span className={`chip ${KIND_CHIP[n.kind] ?? "bg-ink-800 text-ink-400"}`}>
                   {needLabel(n.kind)}
                 </span>
+                {/* One row per subject: the further causes ride along. */}
+                {(n.causes ?? []).slice(1).map((c) => (
+                  <span
+                    key={c.cause}
+                    className={`chip ${KIND_CHIP[c.cause] ?? "bg-ink-800 text-ink-400"}`}
+                    title={c.title}
+                  >
+                    + {needLabel(c.cause)}
+                  </span>
+                ))}
                 <span className="num text-label text-ink-500 w-9 shrink-0">
                   {age(n.age)}
                 </span>
@@ -298,11 +309,13 @@ function MonitorAlertView({
 
 export default function OverviewView({
   data,
+  failed = false,
   project,
   readOnly,
   onAck,
 }: {
   data: Overview | null;
+  failed?: boolean;
   project: string;
   readOnly: boolean;
   onAck: (monitor: string, seq: number) => void;
@@ -310,7 +323,9 @@ export default function OverviewView({
   if (!data) {
     return (
       <div className="px-4 lg:px-8 pt-4 text-label text-ink-500">
-        overview unavailable — the board server could not build the view
+        {failed
+          ? "overview unavailable — the board server could not build the view"
+          : "loading overview…"}
       </div>
     );
   }
@@ -333,7 +348,9 @@ export default function OverviewView({
           exact project ownership · unresolved work stays visible
         </span>
       </header>
-      {(data.github.state === "unavailable" || !data.daemon.reachable) && (
+      {(data.github.state === "unavailable" ||
+        !data.daemon.reachable ||
+        (data.degraded ?? []).length > 0) && (
         <div className="card border-warn/40 px-4 py-3 text-secondary text-warn">
           {data.github.state === "unavailable" && (
             <div>github unavailable — PR and CI rows are missing</div>
@@ -341,6 +358,12 @@ export default function OverviewView({
           {!data.daemon.reachable && (
             <div>daemon unreachable — agent, approval and drift rows are missing</div>
           )}
+          {(data.degraded ?? []).map((d, i) => (
+            <div key={i}>
+              degraded · {d.source}
+              {d.subject ? ` ${d.subject}` : ""} — {d.detail}
+            </div>
+          ))}
         </div>
       )}
 
