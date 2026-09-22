@@ -25905,3 +25905,119 @@ fn agent_show_reports_missing_briefing() {
             .unwrap()
     );
 }
+
+/// CAD-214: email-style flags on `message send` / `send` fail with the
+/// real usage line, not clap's `-- --to` value tip.
+#[test]
+fn send_email_flags_print_real_usage() {
+    let state = TempDir::new().unwrap();
+    for verb in [&["message", "send"][..], &["send"][..]] {
+        let usage = format!("cadence {} <ALIAS> --text <body>", verb.join(" "));
+        for flag in ["--to", "--subject", "--body", "--cc"] {
+            for tail in [&[flag, "x"][..], &["pm", "--text", "hi", flag, "x"][..]] {
+                let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+                    .arg("--state-dir")
+                    .arg(state.path())
+                    .args(verb)
+                    .args(tail)
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(out.status.code(), Some(2), "{verb:?} {tail:?}: {stderr}");
+                assert!(stderr.contains(&usage), "{verb:?} {tail:?}: {stderr}");
+                assert!(
+                    stderr.contains(&format!("no `{flag}` flag")),
+                    "{verb:?} {tail:?}: {stderr}"
+                );
+                assert!(!stderr.contains("-- --"), "{verb:?} {tail:?}: {stderr}");
+                assert!(stderr.contains("SUBJECT:"), "{verb:?} {tail:?}: {stderr}");
+            }
+        }
+    }
+    // Other unknown flags keep clap's own error.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state.path())
+        .args(["send", "pm", "--bogus"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument '--bogus'"));
+    // `--help` documents the SUBJECT convention.
+    for verb in [&["message", "send"][..], &["send"][..]] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .args(verb)
+            .arg("--help")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(help.contains("SUBJECT: <topic>"), "{verb:?}: {help}");
+    }
+}
+
+/// CAD-214: `--text` and `-m` carry the body on `message send`, `send`
+/// and `issue comment` alike.
+#[test]
+fn body_flags_match_on_send_and_comment() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    let sends: [(&[&str], &str, &str); 4] = [
+        (&["message", "send"], "--text", "b-ms-text"),
+        (&["message", "send"], "-m", "b-ms-m"),
+        (&["send"], "--text", "b-s-text"),
+        (&["send"], "-m", "b-s-m"),
+    ];
+    for (verb, flag, id) in sends {
+        let mut args = verb.to_vec();
+        args.extend(["w1", flag, id, "--message", id]);
+        let out = launch_cli(&d, &args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let m = d.wait_message("w1", id, &["completed"], 15);
+        assert_eq!(m["body"], id, "{args:?}");
+    }
+
+    let pm_dir = d.dir.path().join("pm");
+    let home = d.dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence")).parent().unwrap();
+    let issue = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    issue(&["issue", "init"]);
+    issue(&["issue", "project", "add", "demo", "--prefix", "D"]);
+    issue(&["issue", "new", "One", "--project", "demo"]);
+    issue(&["issue", "comment", "D-1", "-m", "comment-via-m"]);
+    issue(&["issue", "comment", "D-1", "--text", "comment-via-text"]);
+    let show = issue(&["issue", "show", "D-1"]);
+    for want in ["comment-via-m", "comment-via-text"] {
+        assert!(show.contains(want), "{want}: {show}");
+    }
+}

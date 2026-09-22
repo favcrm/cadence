@@ -381,11 +381,20 @@ enum Commands {
     /// Enqueue a durable message to an agent — the hot-path alias for
     /// `message send`. Returns once the message is durable; delivery and
     /// reporting continue asynchronously.
+    ///
+    /// `cadence send <ALIAS> --text <body>`: the recipient is the
+    /// positional alias and the body is `--text`, `-m` or `--file`.
+    /// There are no email-style `--to`, `--subject`, `--body` or `--cc`
+    /// flags.
+    ///
+    /// Multi-topic reports: open the body with a `SUBJECT: <topic>`
+    /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
+    /// so the recipient can scan topics; there is no subject field.
     Send {
         /// Agent alias or provider-native id.
         alias: String,
         /// Literal single-line body.
-        #[arg(long, conflicts_with = "file")]
+        #[arg(short = 'm', long, conflicts_with = "file")]
         text: Option<String>,
         /// Read the body from a file.
         #[arg(long)]
@@ -1534,10 +1543,22 @@ enum SessionAction {
 #[derive(Subcommand)]
 enum MessageAction {
     /// Enqueue a message; returns once it is durable.
+    ///
+    /// `cadence message send <ALIAS> --text <body>`: the recipient is
+    /// the positional alias and the body is `--text`, `-m` or `--file`.
+    /// There are no email-style `--to`, `--subject`, `--body` or `--cc`
+    /// flags.
+    ///
+    /// Multi-topic reports: open the body with a `SUBJECT: <topic>`
+    /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
+    /// so the recipient can scan topics; there is no subject field.
     Send {
+        /// Agent alias or provider-native id.
         alias: String,
-        #[arg(long, conflicts_with = "file")]
+        /// Literal body.
+        #[arg(short = 'm', long, conflicts_with = "file")]
         text: Option<String>,
+        /// Read the body from a file.
         #[arg(long)]
         file: Option<PathBuf>,
         /// Idempotency key; retries with the same id+content dedupe.
@@ -3269,8 +3290,52 @@ fn stop_group(state_dir: &Path, group: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// Email-style flags callers guess for `message send` / `send`.
+const EMAIL_FLAGS: [&str; 4] = ["--to", "--subject", "--body", "--cc"];
+
+/// `message send --to …` would get clap's `to pass '--to' as a value,
+/// use '-- --to'` tip, which steers the caller to smuggle the flag in as
+/// text. Swap that for the real usage line; every other parse error
+/// (help and version included) passes through untouched.
+fn email_flag_error(err: &clap::Error) -> Option<clap::Error> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if err.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    let Some(ContextValue::String(arg)) = err.get(ContextKind::InvalidArg) else {
+        return None;
+    };
+    let flag = arg.split('=').next().unwrap_or_default();
+    if !EMAIL_FLAGS.contains(&flag) {
+        return None;
+    }
+    // The usage line names the subcommand the parse failed in.
+    let Some(ContextValue::StyledStr(usage)) = err.get(ContextKind::Usage) else {
+        return None;
+    };
+    let usage = usage.to_string();
+    let verb = if usage.contains(" message send ") {
+        "message send"
+    } else if usage.contains(" send ") {
+        "send"
+    } else {
+        return None;
+    };
+    Some(clap::Error::raw(
+        ErrorKind::UnknownArgument,
+        format!(
+            "`cadence {verb}` has no `{flag}` flag — it takes no email-style \
+             --to/--subject/--body/--cc; the recipient is the positional alias\n\n\
+             Usage: cadence {verb} <ALIAS> --text <body>\n\n\
+             \x20 body: --text <body>, -m <body> or --file <path>\n\
+             \x20 multi-topic report: open the body with `SUBJECT: <topic>`\n\n\
+             For more information, try 'cadence {verb} --help'.\n"
+        ),
+    ))
+}
+
 fn run() -> Result<i32> {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
     let state_dir = match cli.state_dir {
         Some(dir) => dir,
         None => client::state_dir()?,
