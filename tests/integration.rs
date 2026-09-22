@@ -16384,6 +16384,8 @@ fn finish_holds_unreconciled_unknown() {
                     sandbox: "read-only",
                     instructions: None,
                     params: None,
+                    team_role: None,
+                    model_policy: None,
                 })
                 .unwrap();
             store.set_enabled(alias, false).unwrap();
