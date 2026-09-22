@@ -235,10 +235,7 @@ fn store_rows(state_dir: &Path, id: &str) -> (Value, Vec<Value>, Option<String>)
             Some("no daemon store — jobs/tasks/verdicts corroboration unavailable".into()),
         );
     }
-    let conn = match rusqlite::Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) {
+    let conn = match crate::store::open_read_only(&path) {
         Ok(c) => c,
         Err(e) => {
             return (
