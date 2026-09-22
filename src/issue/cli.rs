@@ -506,6 +506,19 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             };
             filter.validate()?;
             let pm = open_pm()?;
+            // An unknown key must not read as an empty project that
+            // invites `issue new` into the wrong place. `--at` may name
+            // a project that existed only in history, so it is exempt.
+            if let (Some(want), None) = (project.as_deref(), at) {
+                let keys: Vec<String> =
+                    project::list(&pm.dir)?.into_iter().map(|p| p.key).collect();
+                if !keys.iter().any(|k| k == want) {
+                    return Err(Error::rejected(format!(
+                        "unknown project '{want}' — known: {}",
+                        keys.join(", ")
+                    )));
+                }
+            }
             let (views, at_meta) = match at {
                 Some(rev) => {
                     let (meta, views) = history::ls_at(&pm.dir, rev, project.as_deref())?;

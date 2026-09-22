@@ -3918,6 +3918,22 @@ fn issue_bulk_edits_are_one_atomic_commit() {
 }
 
 #[test]
+fn issue_ls_unknown_project_is_an_error() {
+    let (pm, state) = tags_fixture();
+    let (pm, state) = (pm.path(), state.path());
+    let (ok, out, err) = cli_out_err(pm, state, &["issue", "ls", "--project", "nope", "--json"]);
+    assert!(!ok, "unknown project must fail: {out}");
+    assert!(err.contains("unknown project 'nope'"), "{err}");
+    let known = err.split("known:").nth(1).unwrap_or("");
+    assert!(
+        known.contains('x') && known.contains('y'),
+        "error lists known keys: {err}"
+    );
+    let (ok, out) = cli(pm, state, &["issue", "ls", "--project", "x", "--json"]);
+    assert!(ok, "{out}");
+}
+
+#[test]
 fn issue_ls_filters_and_epics_match_the_api() {
     let (pm, state) = tags_fixture();
     let (pm, state) = (pm.path(), state.path());

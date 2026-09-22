@@ -538,7 +538,8 @@ the `ready_claimed` event records `"forced": true` alongside the probe
 verdict it overrode. A refused send returns the message to `queued`
 (event `gate_wait`) and retries; it is never pasted blind and never
 dropped. Message text is a single line of 1–4000 chars with no
-control characters, delivered
+control characters (`agent_send` to a pty agent refuses a body with
+control characters up front instead of answering `queued`), delivered
 literally via `load-buffer` + `paste-buffer -p` + `Enter` — no shell
 interpretation. A body whose first non-space character is in the
 profile's forbidden-prefix list is rejected `PreWrite` *before* the

@@ -2738,12 +2738,10 @@ fn print_overview(view: &Value) {
                 commit,
                 drift["ref"].as_str().unwrap_or("?")
             );
+            // `pr` is parsed from the subject's own `(#N)` tail, so the
+            // subject already carries it.
             for c in drift["commits"].as_array().cloned().unwrap_or_default() {
-                let pr = c["pr"]
-                    .as_u64()
-                    .map(|n| format!(" (#{n})"))
-                    .unwrap_or_default();
-                println!("    · {}{}", c["subject"].as_str().unwrap_or(""), pr);
+                println!("    · {}", c["subject"].as_str().unwrap_or(""));
             }
         }
     } else {
