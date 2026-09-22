@@ -4,6 +4,7 @@
 //! done on pass else review); the full set forms the issue's notes
 //! chain in the drawer.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::issue::time;
@@ -136,6 +137,30 @@ pub(crate) fn note_kind(name: &str) -> String {
         .unwrap_or_else(|| "note".to_string())
 }
 
+/// One `.md` note from a directory entry, with the issue its header
+/// tags — `None` for non-notes and untagged notes.
+fn read_note(entry: &std::fs::DirEntry) -> Option<(String, Note)> {
+    let name = entry.file_name().to_string_lossy().to_string();
+    if !name.ends_with(".md") {
+        return None;
+    }
+    let path = entry.path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    let id = header_issue(&text)?;
+    let note = Note {
+        at: time::note_name_to_iso(&name).unwrap_or_default(),
+        kind: note_kind(&name),
+        title: text
+            .lines()
+            .find(|l| l.starts_with("# "))
+            .map(|l| l.trim_start_matches('#').trim().to_string())
+            .unwrap_or_default(),
+        name,
+        path,
+    };
+    Some((id, note))
+}
+
 /// Every note in `notes_dir` tagged `Issue: <id>`, oldest first.
 /// Filenames carry the UTC timestamp so name order is chronological.
 pub fn chain(notes_dir: &Path, id: &str) -> Vec<Note> {
@@ -144,31 +169,34 @@ pub fn chain(notes_dir: &Path, id: &str) -> Vec<Note> {
         return notes;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".md") {
-            continue;
+        if let Some((tagged, note)) = read_note(&entry) {
+            if tagged == id {
+                notes.push(note);
+            }
         }
-        let path = entry.path();
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if header_issue(&text).as_deref() != Some(id) {
-            continue;
-        }
-        notes.push(Note {
-            at: time::note_name_to_iso(&name).unwrap_or_default(),
-            kind: note_kind(&name),
-            title: text
-                .lines()
-                .find(|l| l.starts_with("# "))
-                .map(|l| l.trim_start_matches('#').trim().to_string())
-                .unwrap_or_default(),
-            name,
-            path,
-        });
     }
     notes.sort_by(|a, b| a.name.cmp(&b.name));
     notes
+}
+
+/// Every tagged note in `notes_dir` grouped by issue id, each chain
+/// oldest first — one directory walk and one read per note, where a
+/// per-issue [`chain`] re-reads the whole directory for every issue
+/// (a board render over hundreds of issues was seconds of I/O).
+pub fn index(notes_dir: &Path) -> HashMap<String, Vec<Note>> {
+    let mut by_issue: HashMap<String, Vec<Note>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(notes_dir) else {
+        return by_issue;
+    };
+    for entry in entries.flatten() {
+        if let Some((id, note)) = read_note(&entry) {
+            by_issue.entry(id).or_default().push(note);
+        }
+    }
+    for notes in by_issue.values_mut() {
+        notes.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    by_issue
 }
 
 /// The derived status from the newest tagged note, if any.
@@ -177,7 +205,13 @@ pub fn chain(notes_dir: &Path, id: &str) -> Vec<Note> {
 /// [`crate::issue::board::derive_status`].
 pub fn derive(notes_dir: &Path, id: &str) -> Option<(&'static str, Note)> {
     let latest = chain(notes_dir, id).into_iter().next_back()?;
-    let status = match latest.kind.as_str() {
+    let status = derive_from(&latest)?;
+    Some((status, latest))
+}
+
+/// The status one newest note derives — `None` for a plain note.
+pub fn derive_from(latest: &Note) -> Option<&'static str> {
+    Some(match latest.kind.as_str() {
         "kickoff" => "doing",
         "qa" => "review",
         "verdict" => {
@@ -189,8 +223,7 @@ pub fn derive(notes_dir: &Path, id: &str) -> Option<(&'static str, Note)> {
             }
         }
         _ => return None,
-    };
-    Some((status, latest))
+    })
 }
 
 #[cfg(test)]
