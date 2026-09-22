@@ -913,3 +913,11 @@ CAD-110, since three of them change those tickets' scope.
   separation-of-duties prior art (GitHub, CODEOWNERS, GitLab, Kubernetes
   RBAC, AWS permission boundaries). Feeds §5.1.1, §5.3 and §5.4. Its
   unverified items are tracked as CAD-130.
+
+## Note (2026-09-22)
+
+Daemon-wide model defaults add nullable `agents.team_role` as lookup
+metadata for a host model policy. That field is not a runtime role and
+does not implement this ADR. Authorization stays on `agents.role`
+(`pm` or `worker`), including memory finalization. `ops` is only a
+launch-input alias of the stored team role `devops`.

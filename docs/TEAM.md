@@ -160,6 +160,17 @@ message of their turn; pty developers report with `cadence message result`.
 | Developers | Devin default | n/a | Long autonomous turns in a terminal |
 | Subagents for code reads | Opus | default | Always pass the model explicitly |
 
+Daemon-wide model defaults are a host fallback for **new** registrations.
+Precedence is explicit launch model, then the team-role default, then the
+provider baseline, then the provider-native default. `--team-role` (`ops`
+stored as `devops`) chooses that lookup only. Runtime `pm` / `worker`
+authorization is unchanged, including memory finalization. Resume keeps
+the model saved on the agent. Codex, Claude, and Cursor accept a launch
+model; Devin does not, and the settings page says so. The board Settings
+tab edits the daemon document; it is not scoped to the selected project.
+Recovery is a provider or role reset in that document, or an explicit
+next-launch model set/clear on one agent. Neither rewrites other agents.
+
 ## Skills per role
 
 Skills are loaded from `~/.claude/skills` (Claude agents) and named in

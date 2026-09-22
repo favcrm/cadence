@@ -711,6 +711,9 @@ fn agents_payload(state_dir: &Path) -> Value {
                 "alias": alias, "provider": agent["provider"],
                 "endpoint_kind": agent["endpoint_kind"],
                 "role": agent["role"],
+                "team_role": agent["team_role"],
+                "model_selection": agent["model_selection"],
+                "model_lookup_role": agent["model_lookup_role"],
                 "model": agent["model"],
                 "model_reported": agent["model_reported"],
                 "model_configured": agent["model_configured"],
@@ -824,6 +827,9 @@ fn agents_payload(state_dir: &Path) -> Value {
             "provider": agent["provider"],
             "endpoint_kind": agent["endpoint_kind"],
             "role": agent["role"],
+            "team_role": agent["team_role"],
+            "model_selection": agent["model_selection"],
+            "model_lookup_role": agent["model_lookup_role"],
             // Preserve provider evidence so the UI can distinguish a
             // confirmed effective model from a requested/configured one.
             "model": agent["model"],
@@ -1207,6 +1213,147 @@ fn sanitize_actor(raw: &str) -> Option<String> {
     Some(tok.to_string())
 }
 
+fn coded_response(status: u16, code: &str, message: &str, revision: Option<i64>) -> HttpResp {
+    let body = serde_json::to_vec_pretty(&json!({
+        "error": message,
+        "code": code,
+        "revision": revision,
+    }))
+    .unwrap_or_default();
+    let mut resp = Response::from_data(body).with_status_code(StatusCode(status));
+    resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+    resp
+}
+
+fn health_supports_model_defaults(health: &Value) -> bool {
+    health["capabilities"].as_array().is_some_and(|caps| {
+        caps.iter()
+            .any(|cap| cap.as_str() == Some(registry::MODEL_DEFAULTS_CAPABILITY))
+    })
+}
+
+fn daemon_unavailable(err: &Error) -> bool {
+    err.to_string().starts_with("Daemon is not reachable")
+}
+
+/// Health capability is the compatibility gate. An older daemon stays
+/// reachable and answers `health` without `model_defaults`.
+fn require_model_defaults(state_dir: &Path) -> std::result::Result<(), HttpResp> {
+    match client::rpc(state_dir, "health", json!({})) {
+        Err(err) => Err(coded_response(
+            503,
+            "daemon_unavailable",
+            &err.to_string(),
+            None,
+        )),
+        Ok(health) => {
+            if health_supports_model_defaults(&health) {
+                Ok(())
+            } else {
+                Err(coded_response(
+                    501,
+                    "unsupported_daemon",
+                    "this daemon does not support model defaults",
+                    None,
+                ))
+            }
+        }
+    }
+}
+
+fn settings_rpc_error(err: Error) -> HttpResp {
+    if daemon_unavailable(&err) {
+        return coded_response(503, "daemon_unavailable", &err.to_string(), None);
+    }
+    if err.kind() == "conflict" {
+        return coded_response(409, "revision_conflict", &err.to_string(), err.revision());
+    }
+    if err.kind() == "internal" {
+        return err_response(500, &err.to_string());
+    }
+    let code = err.code().unwrap_or("invalid_request");
+    coded_response(400, code, &err.to_string(), err.revision())
+}
+
+fn model_defaults_get(state_dir: &Path, read_only: bool) -> HttpResp {
+    if let Err(resp) = require_model_defaults(state_dir) {
+        return resp;
+    }
+    match client::rpc(state_dir, "model_defaults_get", json!({})) {
+        Ok(mut snapshot) => {
+            if let Some(obj) = snapshot.as_object_mut() {
+                obj.insert("read_only".to_string(), json!(read_only));
+            }
+            json_response(snapshot)
+        }
+        Err(err) => settings_rpc_error(err),
+    }
+}
+
+fn read_settings_body(request: &mut Request) -> std::result::Result<Vec<u8>, HttpResp> {
+    let cap = crate::model_defaults::MAX_HTTP_BODY_BYTES as u64;
+    let mut buf = Vec::new();
+    let mut limited = request.as_reader().take(cap + 1);
+    if let Err(e) = limited.read_to_end(&mut buf) {
+        return Err(coded_response(
+            400,
+            "invalid_request",
+            &format!("body read failed: {e}"),
+            None,
+        ));
+    }
+    if buf.len() as u64 > cap {
+        return Err(coded_response(
+            400,
+            "invalid_request",
+            &format!("settings body exceeds {cap} bytes"),
+            None,
+        ));
+    }
+    Ok(buf)
+}
+
+fn model_defaults_post(request: &mut Request, state_dir: &Path, opts: &ServeOpts) -> HttpResp {
+    if opts.read_only {
+        return guard_fail("read_only", "board is read-only — writes are disabled");
+    }
+    if let Err(resp) = write_guard(request, "application/json", opts) {
+        return resp;
+    }
+    if let Err(resp) = require_model_defaults(state_dir) {
+        return resp;
+    }
+    let bytes = match read_settings_body(request) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let document = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            return coded_response(
+                400,
+                "invalid_request",
+                "settings body must be UTF-8 JSON",
+                None,
+            )
+        }
+    };
+    let actor = request_actor(request, opts);
+    match client::rpc(
+        state_dir,
+        "model_defaults_set",
+        json!({"document": document, "attribution": actor}),
+    ) {
+        Ok(mut snapshot) => {
+            if let Some(obj) = snapshot.as_object_mut() {
+                obj.insert("read_only".to_string(), json!(false));
+            }
+            json_response(snapshot)
+        }
+        Err(err) => settings_rpc_error(err),
+    }
+}
+
 /// Dispatch POST/PATCH/DELETE on the write routes. Every route passes
 /// `write_guard` before reading a body or touching the PM dir, and every
 /// op goes through `issue::write` — one write path for CLI and API.
@@ -1221,6 +1368,15 @@ fn write_route(
     opts: &ServeOpts,
     send: &dyn Fn(Request, HttpResp),
 ) {
+    if path == "/api/settings/model-defaults" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = model_defaults_post(&mut request, state_dir, opts);
+        send(request, resp);
+        return;
+    }
     // Monitor acknowledgement: this is a daemon-owned durable write, kept
     // beside (and behind the same browser write guards as) tracker writes.
     // The UI never mutates the monitor SQLite store directly, which keeps a
@@ -1884,6 +2040,9 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                     "daemon": daemon,
                 })),
             );
+        }
+        "/api/settings/model-defaults" => {
+            send(request, model_defaults_get(state_dir, opts.read_only));
         }
         "/api/health" => {
             let pm = Pm::at(pm_dir).ok();
@@ -2905,7 +3064,7 @@ fn qr_term(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_type, running_json, static_file};
+    use super::{content_type, health_supports_model_defaults, running_json, static_file};
     use serde_json::json;
 
     /// Brand files sit at the dist root (Vite copies `ui/public/`); they
@@ -2938,6 +3097,17 @@ mod tests {
         assert!(summary.contains("investigate this issue"));
         assert!(!summary.contains("super-secret"));
         assert!(summary.chars().count() <= 181);
+    }
+
+    #[test]
+    fn model_defaults_capability_distinguishes_an_older_daemon() {
+        assert!(health_supports_model_defaults(&json!({
+            "capabilities": ["agent_registry", "model_defaults"]
+        })));
+        assert!(!health_supports_model_defaults(&json!({
+            "capabilities": ["agent_registry"]
+        })));
+        assert!(!health_supports_model_defaults(&json!({})));
     }
 
     /// The embedded build answers the same three paths.

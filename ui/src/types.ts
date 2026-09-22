@@ -372,6 +372,15 @@ export interface Agent {
   endpoint_kind: string;
   state: string;
   role?: string | null;
+  /** Model-preference role. Independent of runtime `role`. */
+  team_role?: string | null;
+  model_lookup_role?: string | null;
+  model_selection?: {
+    source?: string | null;
+    lookup_role?: string | null;
+    revision?: number | null;
+    model?: string | null;
+  } | null;
   group: string;
   group_root?: boolean;
   /** Provider evidence: reported effective value beside launch config. */
@@ -586,4 +595,43 @@ export interface MemoryCard {
 /** GET /api/memories/<project>/<slug> — card + raw body. */
 export interface MemoryDetail extends MemoryCard {
   body: string;
+}
+
+export interface ModelSelector {
+  mode: "model" | "provider_default";
+  model?: string;
+}
+
+export interface ProviderModelDefaults {
+  default: ModelSelector;
+  roles: Record<string, ModelSelector>;
+}
+
+export interface ModelDefaultsConfig {
+  schema: number;
+  providers: Record<string, ProviderModelDefaults>;
+}
+
+export interface ModelProviderInfo {
+  id: string;
+  label: string;
+  eligible: boolean;
+  kinds: string[];
+  suggestions: string[];
+  suggestions_note: string;
+  limitation?: string | null;
+}
+
+export interface ModelRoleInfo {
+  id: string;
+  label: string;
+}
+
+/** GET/POST /api/settings/model-defaults */
+export interface ModelDefaultsSnapshot {
+  revision: number;
+  config: ModelDefaultsConfig;
+  providers: ModelProviderInfo[];
+  roles: ModelRoleInfo[];
+  read_only: boolean;
 }
