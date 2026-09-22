@@ -7787,6 +7787,163 @@ fn pty_auto_ready_waits_on_busy_pane_then_delivers() {
     assert_eq!(claim["payload"]["by"], "daemon");
 }
 
+/// Send `text` to a fake worker that replies to `pm`, and return the
+/// routed delivery id once the worker's own turn has completed. The
+/// route and the completion commit together.
+fn route_worker_result(d: &TestDaemon, worker: &str, pm: &str, id: &str, text: &str) -> String {
+    d.rpc(
+        "agent_send",
+        json!({"alias": worker, "text": text, "message": id, "reply_to": pm}),
+    )
+    .unwrap();
+    d.wait_message(worker, id, &["completed"], 15);
+    d.rpc("agent_show", json!({"alias": pm})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| {
+            m["source"] == "worker_result" && m["body"].as_str().unwrap_or_default().contains(id)
+        })
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Idle pty, `auto_ready` unset, no `agent ready`: a routed
+/// `worker_result` is submitted within 2s of the route (the missing
+/// wake must not hide behind the 5s empty-queue poll). The same pane
+/// then refuses a `source=user` send.
+#[test]
+fn pty_routed_notice_delivers_idle_without_claim() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("pm", None);
+    d.register("w1");
+    d.wait_agent("pm", "idle", 20);
+    d.wait_agent("w1", "idle", 10);
+    let routed_id = route_worker_result(&d, "w1", "pm", "work-1", "review this pane");
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(2);
+    let mut submitted = false;
+    while Instant::now() < deadline {
+        let state = d.message_state("pm", &routed_id);
+        if state == "running" || state == "completed" {
+            submitted = true;
+            break;
+        }
+        assert_ne!(state, "failed", "routed notice failed before submit");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        submitted,
+        "routed notice still {} after {:?} — wake did not beat the empty-queue poll",
+        d.message_state("pm", &routed_id),
+        started.elapsed()
+    );
+    let done = d.wait_message("pm", &routed_id, &["completed"], 10);
+    assert_eq!(done["result"]["via"], "pty_deliver", "{done}");
+    let claim = d
+        .events("pm")
+        .into_iter()
+        .find(|e| e["kind"].as_str() == Some("ready_claimed"))
+        .expect("routed paste recorded no ready_claimed");
+    assert_eq!(claim["payload"]["by"], "daemon", "{claim}");
+    assert_eq!(claim["payload"]["reason"], "routed", "{claim}");
+    assert_eq!(claim["payload"]["probe"]["idle"], true, "{claim}");
+    // The mock commits Enter by moving the draft onto the screen and
+    // clearing the input file, same as the auto-ready paste check.
+    let pasted = std::fs::read_to_string(d.pane_file(&mock, "pm", "screen")).unwrap_or_default()
+        + &std::fs::read_to_string(d.pane_file(&mock, "pm", "input")).unwrap_or_default();
+    assert!(pasted.contains("work-1"), "{pasted}");
+
+    // The unclaimed flag must not leak onto the next user paste.
+    d.wait_agent("pm", "idle", 10);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "pm", "text": "user task stays queued", "message": "u1",
+               "source": "user"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("pm", "gate_wait", 10);
+    assert_eq!(wait["payload"]["message"], "u1", "{wait}");
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("agent ready"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("pm", "u1"), "queued");
+    let after = std::fs::read_to_string(d.pane_file(&mock, "pm", "screen")).unwrap_or_default()
+        + &std::fs::read_to_string(d.pane_file(&mock, "pm", "input")).unwrap_or_default();
+    assert!(!after.contains("user task stays queued"), "{after}");
+}
+
+/// A busy pane still refuses a routed notice: `gate_wait`, no paste.
+#[test]
+fn pty_routed_notice_waits_on_busy_pane() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("pm", None);
+    d.register("w1");
+    d.wait_agent("pm", "idle", 20);
+    d.wait_agent("w1", "idle", 10);
+    atomic_write(
+        d.pane_file(&mock, "pm", "tui-state"),
+        "⠸ Thinking · 12s (esc twice to interrupt)\n❭ Guide Devin while it works\n",
+    );
+    let routed_id = route_worker_result(&d, "w1", "pm", "work-busy", "notice while busy");
+    let wait = d.wait_event_where(
+        "pm",
+        "gate_wait",
+        |event| event["payload"]["message"] == routed_id,
+        10,
+    );
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("busy"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("pm", &routed_id), "queued");
+    assert!(std::fs::read_to_string(d.pane_file(&mock, "pm", "input"))
+        .unwrap_or_default()
+        .is_empty());
+}
+
+/// An open approval menu refuses a routed notice the same way it
+/// refuses a claimed paste. Reuses the Devin menu fixture.
+#[test]
+fn pty_routed_notice_waits_on_approval_menu() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("pm", None);
+    d.register("w1");
+    d.wait_agent("pm", "idle", 20);
+    d.wait_agent("w1", "idle", 10);
+    atomic_write(d.pane_file(&mock, "pm", "tui-state"), DEVIN_MENU);
+    let routed_id = route_worker_result(&d, "w1", "pm", "work-menu", "notice under menu");
+    let wait = d.wait_event_where(
+        "pm",
+        "gate_wait",
+        |event| event["payload"]["message"] == routed_id,
+        10,
+    );
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("approval menu"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("pm", &routed_id), "queued");
+    assert!(std::fs::read_to_string(d.pane_file(&mock, "pm", "input"))
+        .unwrap_or_default()
+        .is_empty());
+}
+
 #[test]
 fn pty_probe_busy_markers_survive_trailing_blank_rows() {
     let d = TestDaemon::start();
