@@ -2737,6 +2737,12 @@ for line in sys.stdin:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
         else:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
+            if mode == "heartbeat":
+                # ~3.6s of streamed activity, never silent for long.
+                for _ in range(12):
+                    time.sleep(0.3)
+                    emit({"method": "item/agentMessage/delta",
+                          "params": {"turnId": "t-1", "delta": "."}})
             if mode in ("quota-update", "quota-recover"):
                 if mode == "quota-recover":
                     update = {"accountId": "acct-recovered",
@@ -3136,6 +3142,17 @@ impl TestDaemon {
             "agent_register",
             json!({"alias": alias, "provider": "codex",
                    "endpoint_kind": endpoint_kind, "cwd": cwd}),
+        )
+        .unwrap();
+    }
+
+    fn register_codex_params(&self, alias: &str, endpoint_kind: &str, params: Value) {
+        let cwd = self.dir.path().to_str().unwrap().to_string();
+        self.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "codex",
+                   "endpoint_kind": endpoint_kind, "cwd": cwd,
+                   "params": params.to_string()}),
         )
         .unwrap();
     }
@@ -9688,6 +9705,50 @@ fn claude_max_turn_fences_chatty() {
         "{m1}"
     );
     d.wait_agent("w1", "attention", 15);
+}
+
+/// CAD-227: codex turn liveness is activity-based like claude's — a
+/// turn streaming past the idle window completes; a silent one fences.
+#[test]
+fn codex_idle_window_counts_activity() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("heartbeat");
+    d.register_codex_params("cx1", "managed", json!({"turn_idle_secs": 2}));
+    d.wait_agent("cx1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cx1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("cx1", "m1", &["completed"], 30);
+    assert!(
+        m1["result"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("MOCK_OK"),
+        "{m1}"
+    );
+}
+
+#[test]
+fn codex_silent_turn_fences_after_idle_window() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("silent");
+    d.register_codex_params("cx1", "managed", json!({"turn_idle_secs": 2}));
+    d.wait_agent("cx1", "idle", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "cx1", "text": "hi", "message": "m1"}),
+    )
+    .unwrap();
+    let m1 = d.wait_message("cx1", "m1", &["unknown"], 30);
+    assert!(
+        m1["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("No provider event for 2s"),
+        "{m1}"
+    );
 }
 
 // ==== brokered claude permissions (cadence mcp-permission) ====
