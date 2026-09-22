@@ -514,15 +514,19 @@ fn finalization_for<'a>(
     cycle: Option<u64>,
     digest: &str,
 ) -> Option<&'a FinalizationReceipt> {
-    front.finalizations.iter().find(|receipt| {
-        receipt.operation == operation
-            && cycle.is_none_or(|expected| receipt.cycle == expected)
-            && receipt.digest == digest
-            && receipt.finalizer.role == "pm"
-            && !receipt.finalizer.alias.is_empty()
-            && !receipt.finalizer.generation.is_empty()
-            && !receipt.finalized_at.is_empty()
-    })
+    front
+        .finalizations
+        .iter()
+        .filter(|receipt| {
+            receipt.operation == operation
+                && cycle.is_none_or(|expected| receipt.cycle == expected)
+                && receipt.digest == digest
+                && receipt.finalizer.role == "pm"
+                && !receipt.finalizer.alias.is_empty()
+                && !receipt.finalizer.generation.is_empty()
+                && !receipt.finalized_at.is_empty()
+        })
+        .max_by_key(|receipt| receipt.cycle)
 }
 
 fn next_verify_cycle(front: &Front) -> u64 {
@@ -539,19 +543,19 @@ fn next_verify_cycle(front: &Front) -> u64 {
 /// Whether a memory has the authenticated quorum needed for operation, and
 /// a precise reason when it does not. This is used both by finalization and
 /// by all retrieval paths; status alone is never enough.
-pub fn quorum_status(mem: &Memory, operation: &str) -> (bool, String) {
+fn quorum_status_for_cycle(mem: &Memory, operation: &str, cycle: u64) -> (bool, String) {
     let Some(author) = mem.front.author_proof.as_ref() else {
         return (
             false,
             "review blocked: proposer has no authenticated native identity".to_string(),
         );
     };
-    let Some(cycle) = operation_cycle(&mem.front, operation) else {
+    if cycle == 0 {
         return (
             false,
-            format!("review blocked: no active {operation} review cycle"),
+            format!("review blocked: invalid {operation} review cycle"),
         );
-    };
+    }
     let digest = semantic_digest(mem);
     let author_id = author.stable_id();
     let contributor_ids: std::collections::HashSet<String> = mem
@@ -624,6 +628,16 @@ pub fn quorum_status(mem: &Memory, operation: &str) -> (bool, String) {
     )
 }
 
+pub fn quorum_status(mem: &Memory, operation: &str) -> (bool, String) {
+    let Some(cycle) = operation_cycle(&mem.front, operation) else {
+        return (
+            false,
+            format!("review blocked: no active {operation} review cycle"),
+        );
+    };
+    quorum_status_for_cycle(mem, operation, cycle)
+}
+
 /// Retrieval eligibility is stricter than a lifecycle status. Accepted
 /// records must retain their PM acceptance finalization; once a fresh verify
 /// cycle is opened, worker receipts do not make the lesson eligible until a
@@ -642,11 +656,21 @@ pub fn retrieval_status(mem: &Memory) -> (bool, String) {
         );
     }
     let digest = semantic_digest(mem);
-    if finalization_for(&mem.front, "accept", None, &digest).is_none() {
+    let Some(accept_finalization) = finalization_for(&mem.front, "accept", None, &digest) else {
         return (
             false,
             "review blocked: accepted record has no matching PM acceptance finalization"
                 .to_string(),
+        );
+    };
+    let (accept_quorum, accept_reason) =
+        quorum_status_for_cycle(mem, "accept", accept_finalization.cycle);
+    if !accept_quorum {
+        return (
+            false,
+            format!(
+                "review blocked: acceptance finalization is not backed by a current quorum: {accept_reason}"
+            ),
         );
     }
     if let Some(operation) = mem.front.active_operation.as_deref() {
@@ -659,6 +683,15 @@ pub fn retrieval_status(mem: &Memory) -> (bool, String) {
         );
     }
     if let Some(receipt) = finalization_for(&mem.front, "verify", None, &digest) {
+        let (verify_quorum, verify_reason) = quorum_status_for_cycle(mem, "verify", receipt.cycle);
+        if !verify_quorum {
+            return (
+                false,
+                format!(
+                    "review blocked: verify finalization is not backed by a current quorum: {verify_reason}"
+                ),
+            );
+        }
         return (
             true,
             format!(
@@ -1964,7 +1997,33 @@ mod tests {
             .push(receipt(&proof("worker-a", 2), "accept", 1, &digest));
         mem.front
             .reviews
-            .push(receipt(&proof("worker-a", 9), "accept", 1, &digest));
+            .push(receipt(&proof("worker-b", 3), "accept", 1, &digest));
+        mem.front
+            .finalizations
+            .push(finalization(&proof("pm", 4), "accept", 1, &digest));
+        assert!(retrieval_status(&mem).0);
+        // A later record corruption cannot make a finalized cycle eligible:
+        // the PM receipt is durable evidence of what was finalized, not a
+        // replacement for rechecking its retained worker receipts.
+        mem.front.reviews[1] = receipt(&proof("worker-a", 9), "accept", 1, &digest);
+        assert!(!retrieval_status(&mem).0);
+    }
+
+    #[test]
+    fn finalized_quorum_requires_both_retained_receipts() {
+        let mut mem = memory("accepted", 1, Some(proof("author", 1)));
+        let digest = semantic_digest(&mem);
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-a", 2), "accept", 1, &digest));
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-b", 3), "accept", 1, &digest));
+        mem.front
+            .finalizations
+            .push(finalization(&proof("pm", 4), "accept", 1, &digest));
+        assert!(retrieval_status(&mem).0);
+        mem.front.reviews.pop();
         assert!(!retrieval_status(&mem).0);
     }
 
@@ -2038,6 +2097,9 @@ mod tests {
             .push(finalization(&proof("pm", 4), "verify", 2, &digest));
         mem.front.active_operation = None;
         assert!(retrieval_status(&mem).0);
+        mem.front.reviews[2].verdict = "revise".to_string();
+        assert!(!retrieval_status(&mem).0);
+        mem.front.reviews[2].verdict = "pass".to_string();
 
         // A finalized verify cycle is consumed.  The next cycle starts at
         // three and cannot reuse the two workers' cycle-two receipts.
@@ -2056,5 +2118,9 @@ mod tests {
             .push(finalization(&proof("pm", 4), "verify", 3, &digest));
         mem.front.active_operation = None;
         assert!(retrieval_status(&mem).0);
+        // The latest finalized verify cycle is authoritative.  Keeping an
+        // older valid cycle cannot hide corruption in cycle three.
+        mem.front.reviews[4].verdict = "revise".to_string();
+        assert!(!retrieval_status(&mem).0);
     }
 }

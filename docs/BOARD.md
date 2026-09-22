@@ -651,10 +651,12 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 
 ### API — writes
 
-Every write goes through `issue::write` — the same functions the CLI
-runs — so the API is a second front door, not a second writer. Each
-successful call is exactly one git commit whose subject carries the
-actor: `CAD-16: set status=review (operator (ui))`.
+Every issue write goes through `issue::write` — the same functions the
+CLI runs — so the API is a second front door, not a second writer. Memory
+authority is separate: browser HTTP has no native socket/PTY identity and
+is refused after the normal write guards. Each successful issue call is
+exactly one git commit whose subject carries the actor:
+`CAD-16: set status=review (operator (ui))`.
 
 | Route | Body | Returns |
 |---|---|---|
@@ -665,8 +667,8 @@ actor: `CAD-16: set status=review (operator (ui))`.
 | `POST /api/issues/:id/refs` | `{kind, url\|path, label?, if_rev?}` — exactly one of url/path | `200` |
 | `POST /api/issues/:id/comments` | `{body, if_rev?}` — author `operator`, kind `ui`, markdown stored verbatim | `200` |
 | `POST /api/issues/:id/artifacts?name=<base>` | raw bytes, create-only | `200` |
-| `POST /api/memories/:project/:slug/accept` | `{body?}` — curator-gated like `memory accept`; `body` replaces the markdown as the curator's edit | `200` |
-| `POST /api/memories/:project/:slug/reject` | `{}` — curator-gated like `memory reject` | `200` |
+| `POST /api/memories/:project/:slug/accept` | `{body?}` — guarded route shape, then refused because HTTP cannot prove a native agent endpoint; body edits are never accepted | `400` with an actionable refusal |
+| `POST /api/memories/:project/:slug/reject` | `{}` — refused for the same missing native endpoint proof | `400` with an actionable refusal |
 
 Success bodies are `{issue, card, warnings}` — the fresh payloads, so
 the UI needs no second fetch. `warnings` notes a `ready`/`doing`/`review`

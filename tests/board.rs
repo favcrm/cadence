@@ -9,7 +9,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cadence_agent::issue::board;
+use cadence_agent::issue::{board, time};
 use cadence_agent::store::Store;
 use cadence_agent::ui;
 use cadence_agent::{client, daemon};
@@ -5783,145 +5783,186 @@ fn propose(pm: &Path, state: &Path, slug: &str, kind: &str, extra: &[&str]) -> (
     mem_cli(pm, state, &args)
 }
 
-fn accept(pm: &Path, state: &Path, slug: &str) -> (bool, Value) {
-    mem_cli(pm, state, &["accept", slug, "--project", "mem"])
+/// Write an explicitly legacy/unverified fixture for reader tests.  It is
+/// intentionally not an authority-bearing setup: accepted records without
+/// native proposer/review/finalization receipts must remain visible but
+/// blocked from retrieval.  Native write coverage belongs to the daemon
+/// integration tests, where the socket can prove a live PTY endpoint.
+fn legacy_memory(
+    pm: &Path,
+    slug: &str,
+    kind: &str,
+    extra: &[&str],
+    status: &str,
+    verified_at: Option<&str>,
+) {
+    let mut project = false;
+    let mut components = Vec::new();
+    let mut paths = Vec::new();
+    let mut providers = Vec::new();
+    let mut tags = Vec::new();
+    let mut confidence = "medium";
+    let mut source = None;
+    let mut i = 0;
+    while i < extra.len() {
+        match extra[i] {
+            "--scope-project" => {
+                project = true;
+                i += 1;
+            }
+            "--scope-component" => {
+                components.push(extra[i + 1]);
+                i += 2;
+            }
+            "--scope-path" => {
+                paths.push(extra[i + 1]);
+                i += 2;
+            }
+            "--scope-provider" => {
+                providers.push(extra[i + 1]);
+                i += 2;
+            }
+            "--scope-tag" => {
+                tags.push(extra[i + 1]);
+                i += 2;
+            }
+            "--confidence" => {
+                confidence = extra[i + 1];
+                i += 2;
+            }
+            "--source" => {
+                source = Some(extra[i + 1]);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    let mut yaml = format!(
+        "id: {slug}\ntype: {kind}\nstatus: {status}\nconfidence: {confidence}\ncreated: 2026-01-01T00:00:00Z\n"
+    );
+    if let Some(source) = source {
+        yaml.push_str(&format!("source: {source}\n"));
+    }
+    if let Some(verified_at) = verified_at {
+        yaml.push_str(&format!("verified_at: {verified_at}\n"));
+    }
+    yaml.push_str("scope:\n");
+    if project {
+        yaml.push_str("  project: true\n");
+    }
+    if !components.is_empty() {
+        yaml.push_str("  components:\n");
+        for value in components {
+            yaml.push_str(&format!("    - {value}\n"));
+        }
+    }
+    if !paths.is_empty() {
+        yaml.push_str("  paths:\n");
+        for value in paths {
+            yaml.push_str(&format!("    - \"{value}\"\n"));
+        }
+    }
+    if !providers.is_empty() {
+        yaml.push_str("  providers:\n");
+        for value in providers {
+            yaml.push_str(&format!("    - {value}\n"));
+        }
+    }
+    if !tags.is_empty() {
+        yaml.push_str("  tags:\n");
+        for value in tags {
+            yaml.push_str(&format!("    - {value}\n"));
+        }
+    }
+    std::fs::create_dir_all(pm.join("mem/memory")).unwrap();
+    std::fs::write(
+        pm.join(format!("mem/memory/{slug}.md")),
+        format!(
+            "---\n{yaml}---\n\n{}",
+            mem_body(&format!("fact for {slug}"))
+        ),
+    )
+    .unwrap();
 }
 
 #[test]
-fn memory_round_trip_and_trailers() {
+fn memory_writes_require_native_identity() {
     let (_t, pm, state, _repo) = mem_fx();
-
-    // propose: one commit, status proposed, author=operator.
     let before = commits(&pm);
-    let (ok, out) = propose(
+
+    // A CLI process is not itself an enrolled native endpoint.  Every
+    // authority-bearing write therefore fails before creating a file or
+    // tracker commit; the native daemon integration owns the positive path.
+    let (ok, err) = propose(
         &pm,
         &state,
         "pipe-drain",
         "gotcha",
         &["--scope-path", "src/**"],
     );
-    assert!(ok, "{out}");
-    assert_eq!(out["status"], "proposed");
-    assert_eq!(commits(&pm), before + 1);
-    let (_, log) = git(&pm, &["log", "-1", "--format=%B"]);
-    assert!(log.contains("Memory: pipe-drain"), "{log}");
-    assert!(log.contains("Actor: operator"), "{log}");
-    assert!(!log.contains("Issue:"), "{log}");
-    let file = pm.join("mem/memory/pipe-drain.md");
-    let text = std::fs::read_to_string(&file).unwrap();
-    assert!(text.contains("status: proposed"), "{text}");
-    assert!(text.contains("author: operator"), "{text}");
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("Daemon is not reachable"),
+        "{err}"
+    );
+    assert!(!pm.join("mem/memory/pipe-drain.md").exists());
+    assert_eq!(
+        commits(&pm),
+        before,
+        "failed native write changed the tracker"
+    );
 
-    // accept: status + verified_at stamped, one commit. cli_run strips
-    // CADENCE_ALIAS, so the curator resolves to the operator — the
-    // environment-based actor model records `Actor: operator` rather
-    // than an agent alias (a pane's accept would carry its alias).
-    let before = commits(&pm);
-    let (ok, out) = accept(&pm, &state, "pipe-drain");
-    assert!(ok, "{out}");
-    let text = std::fs::read_to_string(&file).unwrap();
-    assert!(text.contains("status: accepted"), "{text}");
-    assert!(text.contains("verified_at:"), "{text}");
-    assert_eq!(commits(&pm), before + 1);
-    let (_, log) = git(&pm, &["log", "-1", "--format=%B"]);
-    assert!(log.contains("Actor: operator"), "{log}");
-
-    // verify refreshes verified_at — commit a stale stamp first so
-    // the refresh is a guaranteed tracker diff (an uncommitted pin
-    // would just be overwritten back to HEAD's stamp). Rapid
-    // re-verifies then hit a same-second no-op within a couple of
-    // calls — a boundary may fall between any two, so allow several.
-    let text = std::fs::read_to_string(&file)
-        .unwrap()
-        .replace("verified_at:", "verified_at: 2020-01-01T00:00:00Z # was ");
-    std::fs::write(&file, text).unwrap();
-    git_hooked(&pm, &["add", "-A"]);
-    let (ci_ok, ci_out) = git_hooked(&pm, &["commit", "-qm", "pin stale verified_at"]);
-    assert!(ci_ok, "pin commit refused: {ci_out}");
-    let before = commits(&pm);
-    let (ok, out) = mem_cli(&pm, &state, &["verify", "pipe-drain", "--project", "mem"]);
-    assert!(ok && out["committed"] == true, "{out}");
-    assert_eq!(commits(&pm), before + 1);
-    let mut noop = false;
-    for _ in 0..8 {
-        let (ok, out) = mem_cli(&pm, &state, &["verify", "pipe-drain", "--project", "mem"]);
-        assert!(ok, "{out}");
-        if out["committed"] == json!(false) {
-            noop = true;
-            break;
-        }
-    }
-    assert!(noop, "verify never hit a same-second no-op");
-
-    // reject: second memory goes proposed → rejected.
-    let (ok, _) = propose(&pm, &state, "dead-idea", "decision", &["--scope-project"]);
-    assert!(ok);
-    let (ok, out) = mem_cli(&pm, &state, &["reject", "dead-idea", "--project", "mem"]);
-    assert!(ok, "{out}");
-    let text = std::fs::read_to_string(pm.join("mem/memory/dead-idea.md")).unwrap();
-    assert!(text.contains("status: rejected"), "{text}");
-
-    // supersede: one commit marks old superseded + new gains the link.
-    let (ok, _) = propose(
+    legacy_memory(
         &pm,
-        &state,
-        "pipe-drain-v2",
+        "pipe-drain",
         "gotcha",
         &["--scope-path", "src/**"],
+        "proposed",
+        None,
     );
-    assert!(ok);
-    let before = commits(&pm);
-    let (ok, out) = mem_cli(
-        &pm,
-        &state,
-        &[
+    for args in [
+        vec!["accept", "pipe-drain", "--project", "mem"],
+        vec!["reject", "pipe-drain", "--project", "mem"],
+        vec!["verify", "pipe-drain", "--project", "mem"],
+        vec![
             "supersede",
             "pipe-drain",
-            "pipe-drain-v2",
+            "pipe-drain-new",
             "--project",
             "mem",
         ],
-    );
-    assert!(ok, "{out}");
-    assert_eq!(out["old_status"], "superseded");
-    assert_eq!(
-        commits(&pm),
-        before + 1,
-        "supersede is one write = one commit"
-    );
-    let old = std::fs::read_to_string(&file).unwrap();
-    let new = std::fs::read_to_string(pm.join("mem/memory/pipe-drain-v2.md")).unwrap();
-    assert!(old.contains("status: superseded"), "{old}");
-    assert!(new.contains("supersedes: pipe-drain"), "{new}");
-    assert!(new.contains("status: accepted"), "{new}");
-
-    // lint: the whole tracker is clean (memory dir included).
-    let (ok, out) = mem_cli(&pm, &state, &["lint"]);
-    assert!(ok && out["ok"] == true, "{out}");
-    let (ok, out) = cli(&pm, &state, &["issue", "lint"]);
-    assert!(ok && out["ok"] == true, "{out}");
-
-    // show + ls.
-    let (ok, out) = mem_cli(&pm, &state, &["show", "pipe-drain-v2", "--json"]);
-    assert!(ok && out["slug"] == "pipe-drain-v2", "{out}");
-    let (ok, out) = mem_cli(&pm, &state, &["ls", "--status", "superseded", "--json"]);
-    assert!(
-        ok && out["memories"].as_array().unwrap().len() == 1,
-        "{out}"
-    );
+    ] {
+        let (ok, err) = mem_cli(&pm, &state, &args);
+        assert!(!ok, "{args:?} unexpectedly wrote: {err}");
+        assert!(
+            err["error"]
+                .as_str()
+                .unwrap()
+                .contains("Daemon is not reachable"),
+            "{args:?}: {err}"
+        );
+    }
+    let text = std::fs::read_to_string(pm.join("mem/memory/pipe-drain.md")).unwrap();
+    assert!(text.contains("status: proposed"), "{text}");
 }
 
 #[test]
 fn memory_write_guards() {
     let (_t, pm, state, _repo) = mem_fx();
-    let (ok, _) = propose(&pm, &state, "curated", "rule", &["--scope-project"]);
-    assert!(ok);
+    legacy_memory(
+        &pm,
+        "curated",
+        "rule",
+        &["--scope-project"],
+        "proposed",
+        None,
+    );
 
-    // A cadence worker pane cannot accept/reject/supersede/verify —
-    // the daemon can't even prove PM status here (down) so it fails
-    // closed. `verify` is gated too: verified_at feeds ranking and
-    // staleness, and it means "a curator re-checked this", not "a
-    // worker touched it".
+    // An operator or environment alias is not a native endpoint proof.
+    // Every authority-bearing action fails closed while the daemon is down.
     for args in [
         vec!["accept", "curated", "--project", "mem"],
         vec!["reject", "curated", "--project", "mem"],
@@ -5933,14 +5974,14 @@ fn memory_write_guards() {
             err["error"]
                 .as_str()
                 .unwrap()
-                .contains("daemon is unreachable"),
+                .contains("Daemon is not reachable"),
             "{err}"
         );
     }
     let text = std::fs::read_to_string(pm.join("mem/memory/curated.md")).unwrap();
     assert!(text.contains("status: proposed"), "{text}");
 
-    // …but the worker CAN propose, with its alias as author.
+    // …and the same alias cannot turn a CLI process into a proposer.
     let (ok, out) = mem_cli_env(
         &pm,
         &state,
@@ -5958,11 +5999,18 @@ fn memory_write_guards() {
         ],
         &[("CADENCE_ALIAS", "w1")],
     );
-    assert!(ok, "{out}");
-    let text = std::fs::read_to_string(pm.join("mem/memory/w-lesson.md")).unwrap();
-    assert!(text.contains("author: w1"), "{text}");
+    assert!(!ok, "{out}");
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap()
+            .contains("Daemon is not reachable"),
+        "{out}"
+    );
+    assert!(!pm.join("mem/memory/w-lesson.md").exists());
 
-    // Bad bodies/components refuse before any write.
+    // The daemon is consulted before write-time validation, so malformed
+    // request content cannot use the CLI as a local validation bypass.
     let (ok, err) = mem_cli(
         &pm,
         &state,
@@ -5980,7 +6028,10 @@ fn memory_write_guards() {
         ],
     );
     assert!(
-        !ok && err["error"].as_str().unwrap().contains("**Why:**"),
+        !ok && err["error"]
+            .as_str()
+            .unwrap()
+            .contains("Daemon is not reachable"),
         "{err}"
     );
     let (ok, err) = mem_cli(
@@ -6001,7 +6052,10 @@ fn memory_write_guards() {
         ],
     );
     assert!(
-        !ok && err["error"].as_str().unwrap().contains("Unknown component"),
+        !ok && err["error"]
+            .as_str()
+            .unwrap()
+            .contains("Daemon is not reachable"),
         "{err}"
     );
     // Lint flags a dangling supersedes on a hand-edited file.
@@ -6028,10 +6082,13 @@ fn memory_write_guards() {
 }
 
 #[test]
-fn memory_match_ranking() {
+fn memory_match_blocks_legacy_records() {
     let (_t, pm, state, repo) = mem_fx();
 
-    // The ten-memory fixture across every scope axis.
+    // The ten-memory fixture across every scope axis. These are deliberately
+    // legacy accepted records: their scope metadata remains readable, but
+    // retrieval must refuse them because they have no native proposer and
+    // PM finalization proof.
     let specs: [(&str, &str, &[&str]); 10] = [
         (
             "r-project",
@@ -6061,26 +6118,24 @@ fn memory_match_ranking() {
         ("x-other", "gotcha", &["--scope-component", "other"]),
     ];
     for (slug, kind, extra) in &specs {
-        let (ok, out) = propose(&pm, &state, slug, kind, extra);
-        assert!(ok, "{slug}: {out}");
-        let (ok, out) = accept(&pm, &state, slug);
-        assert!(ok, "{slug}: {out}");
+        legacy_memory(
+            &pm,
+            slug,
+            kind,
+            extra,
+            "accepted",
+            Some("2026-01-01T00:00:00Z"),
+        );
     }
-    // accept stamps wall-clock verified_at — pin it so same-type,
-    // same-confidence pairs rank by the deterministic slug tiebreak
-    // rather than by which side of a second boundary they landed on.
-    for (slug, ..) in &specs {
-        let f = pm.join(format!("mem/memory/{slug}.md"));
-        let text = std::fs::read_to_string(&f)
-            .unwrap()
-            .replace("verified_at:", "verified_at: 2026-01-01T00:00:00Z # was ");
-        std::fs::write(&f, text).unwrap();
-    }
-    git_hooked(&pm, &["add", "-A"]);
-    git_hooked(&pm, &["commit", "-qm", "pin verified_at"]);
     // A proposed (not yet accepted) twin must never match.
-    let (ok, _) = propose(&pm, &state, "pending", "rule", &["--scope-project"]);
-    assert!(ok);
+    legacy_memory(
+        &pm,
+        "pending",
+        "rule",
+        &["--scope-project"],
+        "proposed",
+        None,
+    );
 
     // Issue M-1: component daemon + tags [flaky] + a code commit
     // touching src/adapter/x.rs — path/tag/component/provider axes
@@ -6132,25 +6187,12 @@ fn memory_match_ranking() {
         .iter()
         .map(|m| m["slug"].as_str().unwrap())
         .collect();
-    // rule > gotcha > recipe > decision, then confidence, then slug.
-    assert_eq!(
-        slugs,
-        vec![
-            "r-project",
-            "r-comp",
-            "r-low",
-            "g-comp-hi",
-            "g-tag",
-            "g-comp-lo",
-            "c-path",
-            "c-prov",
-            "d-prov",
-        ],
-        "{slugs:?}"
+    assert!(
+        slugs.is_empty(),
+        "legacy records must stay blocked: {slugs:?}"
     );
-    assert!(!slugs.contains(&"x-other") && !slugs.contains(&"pending"));
 
-    // M-2 matches only the two project:true rules.
+    // M-2 also has no eligible native records.
     let (ok, out) = mem_cli(&pm, &state, &["match", "--issue", "M-2", "--json"]);
     assert!(ok, "{out}");
     let slugs: Vec<&str> = out["matched"]
@@ -6159,7 +6201,7 @@ fn memory_match_ranking() {
         .iter()
         .map(|m| m["slug"].as_str().unwrap())
         .collect();
-    assert_eq!(slugs, vec!["r-project", "r-low"], "{slugs:?}");
+    assert!(slugs.is_empty(), "{slugs:?}");
 
     // Explicit-axis match without an issue.
     let (ok, out) = mem_cli(
@@ -6181,34 +6223,32 @@ fn memory_match_ranking() {
         .iter()
         .map(|m| m["slug"].as_str().unwrap())
         .collect();
-    // union semantics: project:true still applies; 'other' adds x-other.
-    assert_eq!(slugs, vec!["r-project", "r-low", "x-other"], "{slugs:?}");
+    assert!(slugs.is_empty(), "{slugs:?}");
 }
 
 #[test]
 fn memory_stale_flags_changed_paths() {
     let (_t, pm, state, repo) = mem_fx();
-    let (ok, _) = propose(
+    let verified = time::iso(time::now_epoch());
+    legacy_memory(
         &pm,
-        &state,
         "src-watch",
         "rule",
         &["--scope-path", "src/**"],
+        "accepted",
+        Some(&verified),
     );
-    assert!(ok);
-    let (ok, _) = propose(
+    legacy_memory(
         &pm,
-        &state,
         "docs-watch",
         "rule",
         &["--scope-path", "docs/**"],
+        "accepted",
+        Some(&verified),
     );
-    assert!(ok);
-    for slug in ["src-watch", "docs-watch"] {
-        let (ok, out) = accept(&pm, &state, slug);
-        assert!(ok, "{out}");
-    }
-    // verified_at == now; the change must land strictly after.
+    // verified_at == now; the change must land strictly after. Staleness is
+    // an informational reader path and does not require trust in a legacy
+    // acceptance receipt.
     std::thread::sleep(Duration::from_millis(1100));
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/changed.rs"), "x").unwrap();
@@ -6250,7 +6290,7 @@ fn memory_stale_flags_changed_paths() {
 }
 
 #[test]
-fn memory_seed_lessons_import() {
+fn memory_seed_lessons_require_native_identity() {
     let (_t, pm, state, _repo) = mem_fx();
     // The kickoff's seed list — ten lessons, verbatim.
     let lessons: [(&str, &str); 10] = [
@@ -6277,7 +6317,17 @@ fn memory_seed_lessons_import() {
                 ),
             ],
         );
-        assert!(ok, "{slug}: {out}");
+        assert!(
+            !ok,
+            "{slug} unexpectedly imported without native identity: {out}"
+        );
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap()
+                .contains("Daemon is not reachable"),
+            "{slug}: {out}"
+        );
     }
     let (ok, out) = mem_cli(&pm, &state, &["lint"]);
     assert!(ok && out["ok"] == true, "{out}");
@@ -6285,13 +6335,11 @@ fn memory_seed_lessons_import() {
     assert!(ok && out["ok"] == true, "{out}");
     let (ok, out) = mem_cli(&pm, &state, &["ls", "--project", "mem", "--json"]);
     assert!(ok);
-    assert_eq!(out["memories"].as_array().unwrap().len(), 10, "{out}");
+    assert_eq!(out["memories"].as_array().unwrap().len(), 0, "{out}");
 }
 
-/// `ui run` as a subprocess with a sanitized env — the in-process
-/// `start_ui` inherits our CADENCE_ALIAS, which makes memory writes hit
-/// the worker-pane curator gate. Kills the child on drop so a failed
-/// assert leaves no listener behind.
+/// `ui run` as a subprocess with a sanitized env. Kills the child on drop
+/// so a failed assert leaves no listener behind.
 struct UiProc(std::process::Child);
 impl Drop for UiProc {
     fn drop(&mut self) {
@@ -6345,8 +6393,14 @@ fn spawn_ui(pm: &Path, state: &Path) -> (u16, UiProc) {
 #[test]
 fn memory_ui_list_detail_accept() {
     let (_t, pm, state, _repo) = mem_fx();
-    let (ok, _) = propose(&pm, &state, "ui-mem", "rule", &["--scope-project"]);
-    assert!(ok);
+    legacy_memory(
+        &pm,
+        "ui-mem",
+        "rule",
+        &["--scope-project"],
+        "proposed",
+        None,
+    );
     let (port, _ui) = spawn_ui(&pm, &state);
     let host = format!("127.0.0.1:{port}");
 
@@ -6378,22 +6432,34 @@ fn memory_ui_list_detail_accept() {
     );
     assert_eq!(status, 403);
 
-    // Guarded accept through the same write path as the CLI.
+    // The CSRF guard permits the request shape, but HTTP still cannot prove
+    // the native PTY identity required for memory authority. The route must
+    // refuse without changing the legacy record.
+    let before = std::fs::read_to_string(pm.join("mem/memory/ui-mem.md")).unwrap();
     let (status, _, body) =
         write_json(port, "POST", "/api/memories/mem/ui-mem/accept", &host, "{}");
-    assert_eq!(status, 200, "{body}");
-    let resp: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(resp["memory"]["status"], "accepted");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("native agent endpoint"), "{body}");
     let text = std::fs::read_to_string(pm.join("mem/memory/ui-mem.md")).unwrap();
-    assert!(text.contains("status: accepted"), "{text}");
+    assert_eq!(text, before);
 
-    // Guarded reject on a second memory.
-    let (ok, _) = propose(&pm, &state, "ui-no", "gotcha", &["--scope-project"]);
-    assert!(ok);
+    // Reject is equally authority-bearing and therefore equally refused.
+    legacy_memory(
+        &pm,
+        "ui-no",
+        "gotcha",
+        &["--scope-project"],
+        "proposed",
+        None,
+    );
+    let before = std::fs::read_to_string(pm.join("mem/memory/ui-no.md")).unwrap();
     let (status, _, body) = write_json(port, "POST", "/api/memories/mem/ui-no/reject", &host, "{}");
-    assert_eq!(status, 200, "{body}");
-    let resp: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(resp["memory"]["status"], "rejected");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("native agent endpoint"), "{body}");
+    assert_eq!(
+        std::fs::read_to_string(pm.join("mem/memory/ui-no.md")).unwrap(),
+        before
+    );
 }
 
 /// `cadence …` returning (ok, stdout, stderr) — load warnings go to
@@ -6430,8 +6496,14 @@ fn cli_out_err(pm: &Path, state: &Path, args: &[&str]) -> (bool, String, String)
 #[test]
 fn memory_load_errors_surface_in_cli_and_api() {
     let (_t, pm, state, _repo) = mem_fx();
-    let (ok, _) = propose(&pm, &state, "good-mem", "rule", &["--scope-project"]);
-    assert!(ok);
+    legacy_memory(
+        &pm,
+        "good-mem",
+        "rule",
+        &["--scope-project"],
+        "proposed",
+        None,
+    );
     std::fs::write(
         pm.join("mem/memory/broken.md"),
         "---\nid: [unclosed\n---\nbody\n",
@@ -6518,12 +6590,18 @@ fn memory_absent_dir_empty_unreadable_dir_errors() {
 #[test]
 fn memory_overcomplex_glob_quarantined_at_load() {
     let (_t, pm, state, _repo) = mem_fx();
-    let (ok, out) = propose(&pm, &state, "good-rule", "rule", &["--scope-project"]);
-    assert!(ok, "{out}");
-    let (ok, out) = accept(&pm, &state, "good-rule");
-    assert!(ok, "{out}");
+    legacy_memory(
+        &pm,
+        "good-rule",
+        "rule",
+        &["--scope-project"],
+        "accepted",
+        Some("2026-01-01T00:00:00Z"),
+    );
     // The evil file is accepted and project-scoped — it would match
-    // everything; its hand-edited glob quarantines it instead.
+    // everything; its hand-edited glob quarantines it instead. The valid
+    // sibling remains readable, but both legacy records stay ineligible for
+    // retrieval without native receipts.
     std::fs::write(
         pm.join("mem/memory/evil-glob.md"),
         "---\nid: evil-glob\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nscope:\n  project: true\n  paths:\n    - \"**a**a**a**\"\n---\nfact\n\n**Why:** w\n\n**How to apply:** h\n",
@@ -6550,9 +6628,10 @@ fn memory_overcomplex_glob_quarantined_at_load() {
     assert!(errs.contains("too complex"), "{errs}");
     assert!(errs.contains("quarantined"), "{errs}");
 
-    // Match — `evil-glob` never reaches glob_match; the good rule
-    // still applies. The test completing is the bounded-execution
-    // proof (a matched `**a**a**a**` could otherwise hang).
+    // Match — `evil-glob` never reaches glob_match. The valid legacy rule
+    // is visible but blocked by retrieval proof, so the result is empty;
+    // the test still proves the adversarial glob is quarantined before any
+    // matcher can execute it.
     let (ok, out) = mem_cli(
         &pm,
         &state,
@@ -6565,7 +6644,7 @@ fn memory_overcomplex_glob_quarantined_at_load() {
         .iter()
         .map(|m| m["slug"].as_str().unwrap())
         .collect();
-    assert_eq!(slugs, vec!["good-rule"], "{out}");
+    assert!(slugs.is_empty(), "{out}");
     assert!(
         out["load_errors"]
             .as_array()
@@ -6616,10 +6695,14 @@ fn memory_lint_bounds_fact_bytes_and_glob() {
 #[test]
 fn memory_malformed_timestamp_is_safe() {
     let (_t, pm, state, _repo) = mem_fx();
-    let (ok, _) = propose(&pm, &state, "bad-date", "rule", &["--scope-project"]);
-    assert!(ok);
-    let (ok, _) = accept(&pm, &state, "bad-date");
-    assert!(ok);
+    legacy_memory(
+        &pm,
+        "bad-date",
+        "rule",
+        &["--scope-project"],
+        "accepted",
+        Some("2026-01-01T00:00:00Z"),
+    );
     let file = pm.join("mem/memory/bad-date.md");
     let text = std::fs::read_to_string(&file)
         .unwrap()

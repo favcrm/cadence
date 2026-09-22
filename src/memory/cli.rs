@@ -55,7 +55,8 @@ pub enum MemoryAction {
         #[arg(long)]
         id: Option<String>,
     },
-    /// Finalize a proposed memory after two native worker reviews.
+    /// Finalize a proposed memory after two distinct native PM/worker reviews
+    /// from non-author, non-contributor endpoints.
     Accept {
         /// Memory slug.
         slug: String,
@@ -73,7 +74,7 @@ pub enum MemoryAction {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Submit one native worker review. The daemon derives the reviewer
+    /// Submit one native independent PM/worker review. The daemon derives the reviewer
     /// from the Unix socket peer; the digest must be supplied explicitly.
     Review {
         slug: String,

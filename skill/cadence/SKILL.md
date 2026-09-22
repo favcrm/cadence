@@ -194,11 +194,13 @@ checklist report for every trivial edit or spend model turns on empty retros.
    source issue/commit/test, rationale, applicability, limits and invalidation
    conditions. Remove secrets and transient queue/quota state. An incident
    description alone is not a verified general rule.
-2. A different accountable reviewer/curator checks original evidence and
-   counterexamples before an authorized accept/reject/supersede action. Do not
-   treat the current CLI's permission checks, a confidence label or a refreshed
-   timestamp as proof of independent verification. Record the reviewer and
-   evidence in the task/artifact when the memory schema cannot represent them.
+2. Two distinct accountable PM/worker reviewers, neither the author nor a
+   contributor, check the same revision's original evidence and counterexamples
+   before an authenticated PM finalizes it. Native endpoint identity is the
+   proof of independence; the CLI's permission checks, a confidence label or a
+   refreshed timestamp are not. Record reviewer receipts and evidence in the
+   memory when supported, otherwise retain them in the task/artifact. An
+   external alias or operator claim cannot substitute for native identity.
 3. Retrieve relevant accepted lessons at task start/resume and material scope
    changes. Report which lesson helped, was irrelevant or was contradicted,
    with evidence. Withhold contradicted guidance from the current task and
