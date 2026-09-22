@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -56,10 +56,7 @@ fn drain_limited(
         let mut exceeded = false;
         if let Some(mut pipe) = pipe {
             let mut chunk = [0u8; 8192];
-            loop {
-                let Ok(read) = pipe.read(&mut chunk) else {
-                    break;
-                };
+            while let Ok(read) = pipe.read(&mut chunk) {
                 if read == 0 {
                     break;
                 }
@@ -126,10 +123,7 @@ fn receive_limited(
     deadline: Instant,
 ) -> Option<(Vec<u8>, bool)> {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(result) => Some(result),
-        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
-    }
+    receiver.recv_timeout(remaining).ok()
 }
 
 /// Run `cmd` to completion or `timeout`, whichever is first. stdin is
