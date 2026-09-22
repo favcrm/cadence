@@ -172,7 +172,7 @@ pub struct Front {
     /// verify/revalidation cycles are distinct from initial acceptance.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub review_cycle: u64,
-    /// The worker-review operation currently collecting receipts.  It is
+    /// The review operation currently collecting receipts.  It is
     /// cleared only by an authenticated PM finalization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_operation: Option<String>,
@@ -2119,6 +2119,215 @@ mod tests {
         assert_eq!(accepted.body, body);
         assert_eq!(semantic_digest(&accepted), digest);
         assert!(retrieval_status(&accepted).0);
+    }
+
+    #[test]
+    fn native_review_refuses_scope_and_source_changes_after_load() {
+        let (_dir, pm) = mutation_fixture();
+        let author = native("worker-author", 1);
+        let reviewer = native("worker-reviewer", 2);
+        let body = "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
+        propose_native(
+            &pm,
+            "demo",
+            "rule",
+            &Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-191"),
+            Some("high"),
+            None,
+            Some(body),
+            Some("stale-review"),
+            &author,
+        )
+        .unwrap();
+        let (_, loaded) = find(&pm, Some("demo"), "stale-review").unwrap();
+        let digest = semantic_digest(&loaded);
+        let path = loaded.path.clone();
+
+        // Simulate another writer changing the file after a reviewer loaded
+        // its digest. The RPC reloads under the PM lock and must refuse the
+        // stale review without appending a receipt.
+        let mut changed_source = loaded.clone();
+        changed_source.front.source = Some("CAD-191-revised".to_string());
+        save_mem(&changed_source).unwrap();
+        let before_refused_source = std::fs::read(&path).unwrap();
+        let err = submit_review(
+            &pm,
+            Some("demo"),
+            "stale-review",
+            &ReviewRequest {
+                operation: "accept",
+                verdict: "pass",
+                evidence: "stale source review",
+                expected_digest: &digest,
+            },
+            &reviewer,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("revision changed"), "{err}");
+        assert_eq!(before_refused_source, std::fs::read(&path).unwrap());
+        let (_, after_source) = find(&pm, Some("demo"), "stale-review").unwrap();
+        assert!(after_source.front.reviews.is_empty());
+        assert_eq!(
+            after_source.front.source.as_deref(),
+            Some("CAD-191-revised")
+        );
+
+        // Restore the original loaded revision, then exercise the same
+        // reload boundary with an applicability change rather than source.
+        save_mem(&loaded).unwrap();
+        let mut changed_scope = loaded.clone();
+        changed_scope.front.scope.paths = vec!["src/**".to_string()];
+        save_mem(&changed_scope).unwrap();
+        let before_refused_scope = std::fs::read(&path).unwrap();
+        let err = submit_review(
+            &pm,
+            Some("demo"),
+            "stale-review",
+            &ReviewRequest {
+                operation: "accept",
+                verdict: "pass",
+                evidence: "stale scope review",
+                expected_digest: &digest,
+            },
+            &reviewer,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("revision changed"), "{err}");
+        assert_eq!(before_refused_scope, std::fs::read(&path).unwrap());
+        let (_, after_scope) = find(&pm, Some("demo"), "stale-review").unwrap();
+        assert!(after_scope.front.reviews.is_empty());
+        assert_eq!(after_scope.front.scope.paths, vec!["src/**".to_string()]);
+    }
+
+    #[test]
+    fn review_in_wrong_project_refuses_without_mutating_memory() {
+        let (dir, pm) = mutation_fixture();
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join("project.yaml"),
+            "key: other\nprefix: O\ncomponents: []\n",
+        )
+        .unwrap();
+        let author = native("worker-author", 1);
+        let reviewer = native("worker-reviewer", 2);
+        propose_native(
+            &pm,
+            "demo",
+            "rule",
+            &Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-191"),
+            Some("high"),
+            None,
+            Some("fact\n\n**Why:** evidence\n\n**How to apply:** use it\n"),
+            Some("project-bound"),
+            &author,
+        )
+        .unwrap();
+        let (_, mem) = find(&pm, Some("demo"), "project-bound").unwrap();
+        let digest = semantic_digest(&mem);
+        let before = std::fs::read(&mem.path).unwrap();
+        let err = submit_review(
+            &pm,
+            Some("other"),
+            "project-bound",
+            &ReviewRequest {
+                operation: "accept",
+                verdict: "pass",
+                evidence: "wrong project",
+                expected_digest: &digest,
+            },
+            &reviewer,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Unknown memory"), "{err}");
+        assert_eq!(before, std::fs::read(&mem.path).unwrap());
+        let (_, unchanged) = find(&pm, Some("demo"), "project-bound").unwrap();
+        assert!(unchanged.front.reviews.is_empty());
+        assert!(unchanged.front.active_operation.is_none());
+    }
+
+    #[test]
+    fn supersede_refusal_preserves_existing_memory_bytes() {
+        let (_dir, pm) = mutation_fixture();
+        let author = native("worker-author", 1);
+        let pm_actor = native("pm", 2);
+        propose_native(
+            &pm,
+            "demo",
+            "rule",
+            &Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-191"),
+            Some("medium"),
+            None,
+            Some("old fact\n\n**Why:** evidence\n\n**How to apply:** use it\n"),
+            Some("old-memory"),
+            &author,
+        )
+        .unwrap();
+        let (_, old) = find(&pm, Some("demo"), "old-memory").unwrap();
+        let before = std::fs::read(&old.path).unwrap();
+        let err =
+            supersede_native(&pm, Some("demo"), "old-memory", "new-memory", &pm_actor).unwrap_err();
+        assert!(
+            err.to_string().contains("crash-atomic pair recovery"),
+            "{err}"
+        );
+        assert_eq!(before, std::fs::read(&old.path).unwrap());
+        assert!(!memory_dir(&pm, "demo").join("new-memory.md").exists());
+    }
+
+    #[test]
+    fn retrieval_rejects_persisted_self_finalizer_corruption() {
+        let (_dir, pm) = mutation_fixture();
+        let author = native("pm-author", 1);
+        propose_native(
+            &pm,
+            "demo",
+            "rule",
+            &Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-191"),
+            Some("high"),
+            None,
+            Some("self-finalized fact\n\n**Why:** corrupt persisted receipt\n\n**How to apply:** refuse it\n"),
+            Some("corrupt-finalizer"),
+            &author,
+        )
+        .unwrap();
+        let (_, mut corrupted) = find(&pm, Some("demo"), "corrupt-finalizer").unwrap();
+        corrupted.front.status = "accepted".to_string();
+        corrupted.front.review_cycle = 1;
+        let digest = semantic_digest(&corrupted);
+        corrupted.front.reviews = vec![
+            receipt(&proof("worker-a", 2), "accept", 1, &digest),
+            receipt(&proof("worker-b", 3), "accept", 1, &digest),
+        ];
+        // Use a distinct registration to prove alias reuse cannot launder a
+        // proposer into an authenticated PM finalizer after persistence.
+        corrupted.front.finalizations =
+            vec![finalization(&proof("pm-author", 99), "accept", 1, &digest)];
+        corrupted.front.active_operation = None;
+        save_mem(&corrupted).unwrap();
+
+        let (_, loaded) = find(&pm, Some("demo"), "corrupt-finalizer").unwrap();
+        let before = std::fs::read(&loaded.path).unwrap();
+        let (eligible, reason) = retrieval_status(&loaded);
+        assert!(!eligible);
+        assert!(reason.contains("no matching PM acceptance finalization"));
+        assert_eq!(before, std::fs::read(&loaded.path).unwrap());
     }
 
     #[test]
