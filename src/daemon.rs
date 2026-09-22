@@ -18,7 +18,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -323,6 +323,9 @@ impl Drop for StopReservation<'_> {
     }
 }
 
+/// generation, pane pid, native session — one row per live PTY alias.
+type ShutdownFacts = HashMap<String, (String, u32, String)>;
+
 pub struct Shared {
     pub store: Store,
     /// Broadcast on any queue/event change.
@@ -335,6 +338,11 @@ pub struct Shared {
     answered: Mutex<HashMap<String, (String, Value)>>,
     lifecycle: Mutex<Lifecycle>,
     closing: AtomicBool,
+    /// PTY endpoint facts captured by [`Shared::begin_closing`] before
+    /// any actor is woken. Idle actors detach on that wake and clear
+    /// `pid`/`generation`; reading the rows later loses the adoption
+    /// record. `None` until shutdown is requested.
+    shutdown_facts: Mutex<Option<ShutdownFacts>>,
     provider_log_dir: PathBuf,
     state_dir: PathBuf,
     /// How each agent's endpoint last came up (`"adopted"` /
@@ -390,6 +398,7 @@ impl Shared {
             answered: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(Lifecycle::default()),
             closing: AtomicBool::new(false),
+            shutdown_facts: Mutex::new(None),
             provider_log_dir,
             state_dir: state_dir.to_path_buf(),
             open_attach: Mutex::new(HashMap::new()),
@@ -1110,8 +1119,7 @@ impl Shared {
                 "started_at": self.started_at,
             })),
             "shutdown" => {
-                self.closing.store(true, Ordering::SeqCst);
-                self.wake();
+                self.begin_closing();
                 Ok(json!({"state": "stopping"}))
             }
             "agent_register" => self.rpc_register(params),
@@ -4174,6 +4182,24 @@ impl Shared {
         }
     }
 
+    /// Request shutdown. Capture PTY adoption facts first, then set
+    /// `closing` and wake actors. Both the shutdown RPC and the signal
+    /// handler come through here: an idle actor parked in `wait_until`
+    /// returns as soon as it is woken and `set_state_detached` clears
+    /// `pid`/`generation` before `serve` reaches [`Shared::shutdown`].
+    /// Snapshotting inside `shutdown` loses that race and
+    /// `shutdown_entries` then omits the alias.
+    fn begin_closing(&self) {
+        {
+            let mut slot = self.shutdown_facts.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(self.store.pty_endpoint_facts().unwrap_or_default());
+            }
+        }
+        self.closing.store(true, Ordering::SeqCst);
+        self.wake();
+    }
+
     /// Graceful daemon stop: the only path that may write the
     /// hot-restart marker. Pty actors are never interrupted here —
     /// `interrupt()` sends C-c into the pane, which could cancel the
@@ -4186,10 +4212,15 @@ impl Shared {
     /// interrupt-and-grace path: their provider process dies with the
     /// daemon either way.
     fn shutdown(&self) {
-        // Endpoint facts must be read while the panes are still live on
-        // the agent rows — detach clears `pid`/`generation`/`endpoint`.
-        // The marker's message rows are read last, after the drain.
-        let facts = self.store.pty_endpoint_facts().unwrap_or_default();
+        // Facts come from `begin_closing`, taken before the wake that
+        // lets an idle actor detach. Re-reading the agent rows here is
+        // the former snapshot and is empty once that detach has run.
+        // The marker's message rows are still read last, after the drain.
+        let captured = self.shutdown_facts.lock().unwrap().clone();
+        let facts = match captured {
+            Some(facts) => facts,
+            None => self.store.pty_endpoint_facts().unwrap_or_default(),
+        };
         let owned: Vec<(String, Arc<AgentCtl>)> = self
             .lifecycle
             .lock()
@@ -4643,6 +4674,13 @@ pub struct ServeOptions {
     /// The slot clock — `None` is `mono_secs`; tests inject a
     /// counter they advance on demand instead of sleeping.
     pub slot_clock: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
+    /// Test seam (CAD-241). When set, `serve` waits here after
+    /// shutdown is requested and before `Shared::shutdown` — where
+    /// endpoint facts used to be read. Production leaves it unset. The
+    /// waiter observes that idle actors have already detached, then
+    /// waits on the same barrier so the marker is written after that
+    /// detach.
+    pub release_shutdown_snapshot: Option<Arc<Barrier>>,
 }
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
@@ -4910,8 +4948,7 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
         .map_err(|e| Error::internal(format!("signal hook: {e}")))?;
         thread::spawn(move || {
             for _ in signals.forever() {
-                shared.closing.store(true, Ordering::SeqCst);
-                shared.wake();
+                shared.begin_closing();
             }
         });
     }
@@ -4953,6 +4990,12 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
             }
             Err(e) => return Err(e.into()),
         }
+    }
+    // Former facts snapshot lived in `shutdown`. A test holds this
+    // barrier until it has observed idle actors detach, which is the
+    // interleaving that used to erase adoption facts.
+    if let Some(gate) = &opts.release_shutdown_snapshot {
+        gate.wait();
     }
     shared.shutdown();
     let _ = std::fs::remove_file(&socket_path);

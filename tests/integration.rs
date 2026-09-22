@@ -1766,11 +1766,283 @@ fn pty_hot_restart_adopts_multiple_running_turns() {
     }
 }
 
+/// Releases the CAD-241 snapshot barrier once, including when the test
+/// panics, so `serve` cannot stay parked after a failed assertion.
+struct SnapshotGate {
+    barrier: Option<Arc<Barrier>>,
+}
+
+impl SnapshotGate {
+    fn release(&mut self) {
+        if let Some(barrier) = self.barrier.take() {
+            barrier.wait();
+        }
+    }
+}
+
+impl Drop for SnapshotGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Park two running turns on one PTY whose screen and registry both
+/// read idle — the actor is back in its wait, which is the wake that
+/// detaches before `Shared::shutdown`.
+fn park_idle_labelled_turns(d: &TestDaemon, mock: &MockDevin) -> (String, String, i32) {
+    d.register_devin("dv1", None);
+    d.register("pm");
+    d.wait_agent("dv1", "idle", 20);
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1",
+               "reply_to": "pm"}),
+    )
+    .unwrap();
+    let token1 = pty_token(d, "dv1", "m1");
+    // `submitted` means `run_turn` has returned. The actor is in the
+    // idle wait, not inside the paste, so the next wake can detach it.
+    d.wait_event("dv1", "submitted", 15);
+    let generation = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["agent"]["generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token2 = format!("pty-{generation}-turn-m2");
+    {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,
+                 created)
+             VALUES('m2','dv1','other',NULL,'test','running',?1,1.0)",
+            rusqlite::params![token2],
+        )
+        .unwrap();
+        conn.execute("UPDATE agents SET state='idle' WHERE alias='dv1'", [])
+            .unwrap();
+    }
+    let agent = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["agent"].clone();
+    assert_eq!(agent["state"], "idle", "{agent}");
+    assert!(agent["pid"].as_i64().is_some(), "{agent}");
+    let probe = d.rpc("agent_probe", json!({"alias": "dv1"})).unwrap();
+    assert_eq!(probe["idle"], true, "{probe}");
+    assert_eq!(probe["reason"], "idle", "{probe}");
+    assert_eq!(d.message_state("dv1", "m1"), "running");
+    assert_eq!(d.message_state("dv1", "m2"), "running");
+    let pane_pid: i32 = std::fs::read_to_string(d.pane_file(mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    (token1, token2, pane_pid)
+}
+
+fn message_ids(d: &TestDaemon, alias: &str, id: &str) -> usize {
+    d.rpc("agent_show", json!({"alias": alias})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["id"].as_str() == Some(id))
+        .count()
+}
+
+/// Stop an idle-labelled PTY only after its actor has detached, then
+/// prove both turns adopt on the same pane and tokens with no replay.
+fn restart_idle_pty_after_forced_detach(via_signal: bool) {
+    let barrier = Arc::new(Barrier::new(2));
+    let mut opts = daemon_opts();
+    opts.release_shutdown_snapshot = Some(Arc::clone(&barrier));
+    let mut d = TestDaemon::start_opts(opts);
+    let mock = d.mock_devin();
+    let (token1, token2, pane_pid) = park_idle_labelled_turns(&d, &mock);
+    let screen_before = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap();
+    let mut gate = SnapshotGate { barrier: None };
+    if via_signal {
+        unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
+    } else {
+        d.rpc("shutdown", json!({})).unwrap();
+    }
+    // Arm only after shutdown was requested, so a panic below releases
+    // `serve` instead of leaving it blocked.
+    gate.barrier = Some(barrier);
+    // Do not RPC here. `serve` may already be waiting on the barrier,
+    // so the listener will not accept another call until we release it.
+    // The agent row is the detach evidence the former snapshot used to miss.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let row = loop {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        let row: (Option<i64>, Option<String>, String) = conn
+            .query_row(
+                "SELECT pid, generation, state FROM agents WHERE alias='dv1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        if row.0.is_none() && row.1.is_none() {
+            break row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle actor did not detach before the former facts snapshot: {row:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        row.2, "offline",
+        "detach during shutdown must land offline, not a finished turn: {row:?}"
+    );
+    gate.release();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    let marker = read_marker(&state);
+    let entries = marker["entries"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        2,
+        "both turns recorded after detach: {marker}"
+    );
+    for id in ["m1", "m2"] {
+        assert!(
+            entries.iter().any(|e| e["message_id"].as_str() == Some(id)),
+            "{marker}"
+        );
+    }
+    assert!(
+        entries
+            .iter()
+            .all(|e| e["pane_pid"].as_u64() == Some(pane_pid as u64)),
+        "{marker}"
+    );
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    let agent = d.wait_agent("dv1", "idle", 25);
+    assert_eq!(d.message_state("dv1", "m1"), "running");
+    assert_eq!(d.message_state("dv1", "m2"), "running");
+    assert_eq!(message_ids(&d, "dv1", "m1"), 1);
+    assert_eq!(message_ids(&d, "dv1", "m2"), 1);
+    let pid_now: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(pid_now, pane_pid, "adopted pane changed pid");
+    assert_eq!(agent["pid"].as_i64().unwrap() as i32, pane_pid);
+    wait_event_count(&d, "dv1", "turn_adopted", 2, 15);
+    let kinds = event_kinds(&d, "dv1");
+    assert!(
+        !kinds.iter().any(|k| k == "turn_adopt_refused"),
+        "{kinds:?}"
+    );
+    let screen_after = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap();
+    assert_eq!(
+        screen_after, screen_before,
+        "restart must not replay a paste into the pane"
+    );
+    for (id, token) in [("m1", token1.as_str()), ("m2", token2.as_str())] {
+        d.rpc(
+            "message_report",
+            json!({"message": id, "token": token, "kind": "result",
+                   "text": "done"}),
+        )
+        .unwrap();
+        d.wait_message("dv1", id, &["completed"], 15);
+    }
+    let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    assert_eq!(
+        pm["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["source"] == "worker_result")
+            .count(),
+        1,
+        "m1's original token must route once: {pm}"
+    );
+}
+
+#[test]
+fn pty_shutdown_facts_before_detach_rpc() {
+    restart_idle_pty_after_forced_detach(false);
+}
+
+#[test]
+fn pty_shutdown_facts_before_detach_signal() {
+    // Process-per-test: SIGTERM is delivered to this process, and the
+    // daemon's signal hook is what requests shutdown.
+    restart_idle_pty_after_forced_detach(true);
+}
+
+#[test]
+fn pty_shutdown_facts_before_detach_unprovable() {
+    // Identity cleared before the snapshot is not inferred. Each
+    // in-flight turn is refused by name; nothing is adopted or replayed.
+    let mut d = TestDaemon::start();
+    let mock = d.mock_devin();
+    let (_token1, _token2, _pid) = park_idle_labelled_turns(&d, &mock);
+    let screen_before = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap();
+    {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE agents SET pid=NULL, generation=NULL, endpoint=NULL
+             WHERE alias='dv1'",
+            [],
+        )
+        .unwrap();
+    }
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    let marker = read_marker(&state);
+    assert!(
+        marker["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["alias"].as_str() != Some("dv1")),
+        "unprovable identity must not be recorded: {marker}"
+    );
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    d.wait_agent("dv1", "attention", 20);
+    assert_eq!(d.message_state("dv1", "m1"), "unknown");
+    assert_eq!(d.message_state("dv1", "m2"), "unknown");
+    assert_eq!(message_ids(&d, "dv1", "m1"), 1);
+    assert_eq!(message_ids(&d, "dv1", "m2"), 1);
+    assert!(
+        !event_kinds(&d, "dv1").iter().any(|k| k == "turn_adopted"),
+        "unprovable identity must not be adopted"
+    );
+    let refusals: Vec<Value> = d.rpc("agent_events", json!({"alias": "dv1"})).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"].as_str() == Some("turn_adopt_refused"))
+        .cloned()
+        .collect();
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    for id in ["m1", "m2"] {
+        let reason = refusals
+            .iter()
+            .find(|e| e["payload"]["message"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("missing refusal for {id}: {refusals:?}"));
+        let text = reason["payload"]["reason"].as_str().unwrap_or("");
+        assert!(
+            text.contains("not provable") && text.contains("do not replay"),
+            "{id}: {text}"
+        );
+    }
+    let screen_after = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap();
+    assert_eq!(
+        screen_after, screen_before,
+        "refusal must not replay a paste"
+    );
+}
+
 #[test]
 fn pty_hot_restart_token_predates_generation_fences() {
-    // The facts snapshot runs at the top of shutdown while RPC
-    // threads are still live: a resume that re-opened the pane under
-    // a newer generation leaves old tokens stale forever. Recording
+    // Facts are captured when shutdown is requested, before actors
+    // detach, while RPC threads are still live: a resume that re-opened
+    // the pane under a newer generation leaves old tokens stale forever. Recording
     // such a turn would roll the agent back to a dead generation —
     // `shutdown_entries` skips it and names the refusal instead.
     // Doctoring the row is the deterministic stand-in for that race.
@@ -2373,6 +2645,7 @@ fn daemon_opts() -> daemon::ServeOptions {
         // [host] table on the dev host must never leak into a test.
         slots: Some(cadence_agent::slots::SlotConfig::default()),
         slot_clock: None,
+        release_shutdown_snapshot: None,
     }
 }
 
