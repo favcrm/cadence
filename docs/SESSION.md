@@ -404,11 +404,14 @@ In this order:
 2. Close the issue with the merge commit in a comment.
 3. Clean up the lane: `cadence issue finish <ID> --remote` removes
    the worktree and the local+remote branches — and refuses while the
-   worktree is in use (a live message recorded against it, or a
-   process with cwd inside it), while the tree is dirty, or while the
-   branch is neither merged nor pushed, so it is safe by default. An
-   owner busy in a DIFFERENT worktree, an unknown owner, or a queued
-   message on an inbox or dead owner does not block. Deletion is
+   worktree is in use (a live message recorded against it, an
+   unreconciled `unknown` message bound to it or held by a registered
+   agent whose cwd is on it, or a process with cwd inside it), while
+   the tree is dirty, or while the branch is neither merged nor
+   pushed, so it is safe by default. A reconciled agent whose cwd is
+   still this path, an owner busy in a DIFFERENT worktree, an unknown
+   owner, or a queued message on an inbox or dead owner does not block.
+   Deletion is
    commit-bound: the local `branch -D` fires only when the branch tip
    still equals the commit the merge/push evidence covered, and
    `--remote` fetches `origin/<branch>` first and deletes only when

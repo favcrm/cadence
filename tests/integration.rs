@@ -16231,6 +16231,294 @@ fn finish_guard_per_worktree() {
     );
 }
 
+/// CAD-242: `issue finish` holds a present merged worktree while an
+/// unreconciled `unknown` still refers to it — bound to the worktree,
+/// or sitting on an agent whose cwd is that directory (a child counts;
+/// a sibling prefix does not). A reconciled lane with a stale fence
+/// error still finishes. `--force` records `unreconciled-unknown`; the
+/// sweep cannot force.
+#[test]
+fn finish_holds_unreconciled_unknown() {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    let d = TestDaemon::start_on(state);
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let cli_raw = |args: &[&str]| -> (i32, String, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let cli = |args: &[&str]| -> (bool, Value) {
+        let (code, stdout, stderr) = cli_raw(args);
+        let text = if stdout.is_empty() { stderr } else { stdout };
+        (
+            code == 0,
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s,]).0);
+    for title in ["Reconciled", "Samecwd", "Bound", "Elsewhere", "Child"] {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+    for id in ["D-1", "D-2", "D-3", "D-4", "D-5"] {
+        let (ok, out) = cli(&["issue", "start", id]);
+        assert!(ok, "{out}");
+        let (ok, _) = cli(&["issue", "set", id, "owner="]);
+        assert!(ok);
+    }
+    let (ok, _) = cli(&["issue", "set", "D-3", "owner=bound"]);
+    assert!(ok);
+    let (ok, out) = cli(&["issue", "ref", "D-3", "message", "m-bound"]);
+    assert!(ok, "{out}");
+
+    let wt = |slug: &str| repo.join(format!(".cadence/wt/{slug}"));
+    for slug in [
+        "d-1-reconciled",
+        "d-2-samecwd",
+        "d-3-bound",
+        "d-4-elsewhere",
+        "d-5-child",
+    ] {
+        std::fs::write(wt(slug).join(format!("{slug}.txt")), "x").unwrap();
+        git(&wt(slug), &["add", "-A"]);
+        git(&wt(slug), &["commit", "-qm", slug]);
+        git(&repo, &["merge", "-q", &format!("cadence/{slug}")]);
+    }
+    let child_cwd = wt("d-5-child").join("nested");
+    std::fs::create_dir_all(&child_cwd).unwrap();
+    // A sibling whose name merely extends the worktree's prefix must
+    // not count as cwd-on-worktree.
+    let sibling = repo.join(".cadence/wt/d-4-elsewhere-extra");
+    std::fs::create_dir_all(&sibling).unwrap();
+    let elsewhere = tmp.path().join("other");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let body = "secret-body-should-not-leak";
+    {
+        let store = Store::open(&d.state.join("cadence.sqlite3")).unwrap();
+        let reg = |alias: &str, cwd: &Path| {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: "inbox",
+                    role: "worker",
+                    cwd: cwd.to_str().unwrap(),
+                    sandbox: "read-only",
+                    instructions: None,
+                    params: None,
+                })
+                .unwrap();
+            store.set_enabled(alias, false).unwrap();
+        };
+        reg("settled", &wt("d-1-reconciled"));
+        reg("holder", &wt("d-2-samecwd"));
+        reg("bound", &elsewhere);
+        reg("stray", &sibling);
+        reg("child", &child_cwd);
+        let fence = |alias: &str, id: &str| {
+            store.enqueue(alias, body, None, id, "test").unwrap();
+            store.mark_running(id, &format!("turn-{id}")).unwrap();
+            let message = store.message(id).unwrap().unwrap();
+            store
+                .finish(
+                    &message,
+                    "unknown",
+                    &json!({
+                        "status": "unknown",
+                        "text": "",
+                        "error": "Uncertain provider outcome"
+                    }),
+                    Some("Uncertain provider outcome"),
+                )
+                .unwrap();
+            store
+                .set_agent_state(alias, "attention", Some("Uncertain provider outcome"))
+                .unwrap();
+        };
+        fence("settled", "m-settled");
+        fence("holder", "m-holder");
+        fence("bound", "m-bound");
+        fence("stray", "m-stray");
+        fence("child", "m-child");
+        store
+            .reconcile(
+                "m-settled",
+                "interrupted",
+                Some("outcome was a no-op"),
+                "operator",
+                None,
+            )
+            .unwrap();
+    }
+
+    let settled = d.rpc("agent_show", json!({"alias": "settled"})).unwrap();
+    assert_eq!(settled["agent"]["state"], "stopped", "{settled}");
+    assert!(
+        settled["agent"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Uncertain provider outcome"),
+        "a reconciled fence must keep its stale error: {settled}"
+    );
+    assert_eq!(settled["messages"][0]["state"], "interrupted", "{settled}");
+    let holder = d.rpc("agent_show", json!({"alias": "holder"})).unwrap();
+    assert_eq!(holder["messages"][0]["state"], "unknown", "{holder}");
+
+    let (code, stdout, _) = cli_raw(&["issue", "finish", "--merged", "--dry-run", "--json"]);
+    assert_eq!(code, 1, "{stdout}");
+    let plan: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rows = plan["rows"].as_array().unwrap();
+    let outcome = |id: &str| -> (String, String) {
+        rows.iter()
+            .find(|r| r["issue"] == id)
+            .map(|r| {
+                (
+                    r["outcome"].as_str().unwrap().to_string(),
+                    r["reason"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .unwrap_or_else(|| panic!("missing {id}: {plan}"))
+    };
+    assert_eq!(outcome("D-1").0, "would-finish", "{plan}");
+    for (id, alias, mid) in [
+        ("D-2", "holder", "m-holder"),
+        ("D-3", "bound", "m-bound"),
+        ("D-5", "child", "m-child"),
+    ] {
+        let (o, reason) = outcome(id);
+        assert_eq!(o, "refused", "{id} {plan}");
+        assert!(
+            reason.contains(alias)
+                && reason.contains(mid)
+                && reason.contains("unreconciled")
+                && !reason.contains(body),
+            "{id} reason must name the alias and the unreconciled unknown, not the body: {reason}"
+        );
+    }
+    assert_eq!(outcome("D-4").0, "would-finish", "{plan}");
+    for slug in [
+        "d-1-reconciled",
+        "d-2-samecwd",
+        "d-3-bound",
+        "d-4-elsewhere",
+        "d-5-child",
+    ] {
+        assert!(wt(slug).is_dir(), "{slug} must survive dry-run");
+    }
+
+    let (code, stdout, _) = cli_raw(&["issue", "finish", "--merged", "--json"]);
+    assert_eq!(code, 1, "{stdout}");
+    let swept: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rows = swept["rows"].as_array().unwrap();
+    let swept_outcome = |id: &str| {
+        rows.iter()
+            .find(|r| r["issue"] == id)
+            .map(|r| r["outcome"].as_str().unwrap().to_string())
+            .unwrap_or_else(|| panic!("missing {id}: {swept}"))
+    };
+    assert_eq!(swept_outcome("D-1"), "finished", "{swept}");
+    assert_eq!(swept_outcome("D-4"), "finished", "{swept}");
+    assert_eq!(swept_outcome("D-2"), "refused", "{swept}");
+    assert_eq!(swept_outcome("D-3"), "refused", "{swept}");
+    assert_eq!(swept_outcome("D-5"), "refused", "{swept}");
+    assert!(!wt("d-1-reconciled").exists());
+    assert!(!wt("d-4-elsewhere").exists());
+    assert!(wt("d-2-samecwd").is_dir() && wt("d-3-bound").is_dir() && wt("d-5-child").is_dir());
+    for id in ["D-2", "D-3", "D-5"] {
+        let issue = cli(&["issue", "show", id, "--json"]).1;
+        let open = issue["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "worktree" && r["closed"] != true);
+        assert!(open, "sweep must not close {id}'s worktree ref: {issue}");
+    }
+
+    let (ok, out) = cli(&["issue", "finish", "D-2", "--force"]);
+    assert!(ok && out["finished"] == true, "{out}");
+    assert!(
+        out["overrode"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == "unreconciled-unknown"),
+        "{out}"
+    );
+    assert!(!wt("d-2-samecwd").exists());
+
+    // The sweep still has no force flag: the remaining unknowns stay.
+    let (code, stdout, _) = cli_raw(&["issue", "finish", "--merged", "--json"]);
+    assert_eq!(code, 1, "{stdout}");
+    let again: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let rows = again["rows"].as_array().unwrap();
+    for id in ["D-3", "D-5"] {
+        let row = rows.iter().find(|r| r["issue"] == id).unwrap();
+        assert_eq!(row["outcome"], "refused", "{again}");
+        assert!(
+            row["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unreconciled"),
+            "{again}"
+        );
+    }
+    assert!(wt("d-3-bound").is_dir() && wt("d-5-child").is_dir());
+}
+
 /// CAD-93: `issue finish --merged` sweeps every open worktree ref
 /// whose branch is merged and whose guard passes — one row per
 /// worktree (finished | skipped | refused), exit 1 on any refusal,
