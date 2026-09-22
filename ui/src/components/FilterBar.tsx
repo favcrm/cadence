@@ -36,6 +36,7 @@ export default function FilterBar({ scope, issues, filters, onChange }: Props) {
     ["components", "component", tally(scope.map((t) => [t.component]))],
   ];
   const active = activeCount(filters);
+  const doneCount = scope.filter((t) => t.status === "done").length;
   // Below `sm` the facet chips fold behind one toggle so the bar never
   // pushes the board off a phone screen.
   const [open, setOpen] = useState(false);
@@ -93,6 +94,22 @@ export default function FilterBar({ scope, issues, filters, onChange }: Props) {
       })}
       </div>
       <div className="ml-auto flex items-center gap-1.5">
+        {doneCount > 0 && (
+          <button
+            aria-pressed={filters.showDone}
+            onClick={() =>
+              onChange({ ...filters, showDone: !filters.showDone })
+            }
+            className={`chip !py-[.15rem] transition-colors ${
+              filters.showDone
+                ? "bg-accent/10 text-accent"
+                : "bg-ink-800 text-ink-400 hover:text-ink-200"
+            }`}
+            title="finished issues are hidden by default — a search still matches them"
+          >
+            done {doneCount}
+          </button>
+        )}
         <button
           aria-pressed={filters.groupByEpic}
           onClick={() =>
@@ -110,7 +127,11 @@ export default function FilterBar({ scope, issues, filters, onChange }: Props) {
         {active > 0 && (
           <button
             onClick={() =>
-              onChange({ ...NO_FILTERS, groupByEpic: filters.groupByEpic })
+              onChange({
+                ...NO_FILTERS,
+                groupByEpic: filters.groupByEpic,
+                showDone: filters.showDone,
+              })
             }
             className="chip !py-[.15rem] bg-ink-800 text-ink-400 hover:text-ink-200 transition-colors"
           >

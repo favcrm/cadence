@@ -39,7 +39,17 @@ const STATUS_CHIP: Record<string, string> = {
   dropped: "bg-ink-800 text-ink-500",
 };
 
-const STATUS_ORDER = new Map(COLS.map(([key], index) => [key, index]));
+// The list's default order is attention-first — work in flight, then what
+// could start, then the pile — rather than the kanban's column order.
+const LIST_ORDER = new Map(
+  ["doing", "review", "ready", "backlog", "done", "dropped"].map(
+    (key, index) => [key, index],
+  ),
+);
+
+const byPriority = (a: IssueCard, b: IssueCard) =>
+  a.priority.localeCompare(b.priority) ||
+  a.id.localeCompare(b.id, undefined, { numeric: true });
 
 function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: string; onOpen: (id: string) => void }) {
   const [sort, setSort] = useState<{ key: "id" | "title" | "status" | "priority" | "owner"; direction: "asc" | "desc" }>({ key: "status", direction: "asc" });
@@ -48,10 +58,10 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
     direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
   }));
   const rows = issues.slice().sort((a, b) => {
-    const av = sort.key === "status" ? STATUS_ORDER.get(a.status) ?? 99 : sort.key === "priority" ? a.priority : (a[sort.key] ?? "");
-    const bv = sort.key === "status" ? STATUS_ORDER.get(b.status) ?? 99 : sort.key === "priority" ? b.priority : (b[sort.key] ?? "");
+    const av = sort.key === "status" ? LIST_ORDER.get(a.status) ?? 99 : sort.key === "priority" ? a.priority : (a[sort.key] ?? "");
+    const bv = sort.key === "status" ? LIST_ORDER.get(b.status) ?? 99 : sort.key === "priority" ? b.priority : (b[sort.key] ?? "");
     const result = typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv), undefined, { numeric: true });
-    return (sort.direction === "asc" ? result : -result) || a.id.localeCompare(b.id, undefined, { numeric: true });
+    return (sort.direction === "asc" ? result : -result) || byPriority(a, b);
   });
   const header = (key: typeof sort.key, label: string) => (
     <button className="inline-flex items-center gap-1 hover:text-ink-200" onClick={() => sortRows(key)}>
@@ -285,7 +295,13 @@ export default function Board({
           .toLowerCase()
           .includes(query.toLowerCase())),
   );
-  const visible = scope.filter((t) => matches(filters, t));
+  // Finished work stays out of the default view; typing a search looks
+  // through it anyway since a query means "find this", not "browse".
+  const visible = scope.filter(
+    (t) =>
+      matches(filters, t) &&
+      (filters.showDone || t.status !== "done" || query !== ""),
+  );
   const title =
     project === "all"
       ? "All projects"
@@ -335,7 +351,20 @@ export default function Board({
       <div className="grid grid-flow-col auto-cols-[minmax(232px,78vw)] lg:auto-cols-[minmax(0,1fr)] gap-3 overflow-x-auto lg:overflow-visible pb-2 snap-x snap-mandatory lg:snap-none">
       {COLS.map(([key, name, wip], ci) => {
         const showAdd = quickAdd && !readOnly;
-        const cards = laneCards.filter((t) => t.status === key);
+        const cards = laneCards
+          .filter((t) => t.status === key)
+          .sort(byPriority);
+        // The Done column stays mounted as a drop target even while done
+        // cards are hidden — collapsing it shows the count and a reveal.
+        const doneHidden =
+          key === "done" && !filters.showDone
+            ? scope.filter(
+                (t) =>
+                  t.status === "done" &&
+                  (lane === "" ||
+                    (lane === "none" ? !t.parent : t.parent === lane)),
+              ).length
+            : 0;
         const cell = `${lane}:${key}`;
         return (
           <section
@@ -382,7 +411,7 @@ export default function Board({
                 {name}
               </h2>
               <span className="kicker num">
-                {cards.length}
+                {doneHidden > 0 ? doneHidden : cards.length}
                 {/* The WIP limit is board-wide — a lane shows its count only. */}
                   {wip && lane === "" ? ` of ${wip} wip` : ""}
               </span>
@@ -396,7 +425,14 @@ export default function Board({
                   onError={onError}
                 />
               )}
-              {cards.length === 0 && !(key === "backlog" && showAdd) ? (
+              {doneHidden > 0 ? (
+                <button
+                  onClick={() => onFilters({ ...filters, showDone: true })}
+                  className="kicker px-1 py-2 text-left hover:text-accent transition-colors"
+                >
+                  {doneHidden} done hidden — show
+                </button>
+              ) : cards.length === 0 && !(key === "backlog" && showAdd) ? (
                 <p className="kicker px-1 py-2">empty</p>
               ) : (
                 cards.map((t) => (
