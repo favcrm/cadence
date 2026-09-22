@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../api";
 import { canonicalJson } from "../modelDefaultsCompare";
+import { modelIdProblem } from "../modelId";
 import type {
   ModelDefaultsConfig,
   ModelDefaultsSnapshot,
@@ -86,16 +87,6 @@ function configFrom(
 }
 
 
-function modelProblem(value: string): string | null {
-  const model = value.trim();
-  if (!model) return "Enter a model id.";
-  if (model.length > 200) return "Model ids are at most 200 characters.";
-  if ([...model].some((ch) => ch.charCodeAt(0) < 32)) {
-    return "Model ids cannot contain control characters.";
-  }
-  return null;
-}
-
 function statusCopy(status: number, code?: string): string {
   if (status === 503 || code === "daemon_unavailable") {
     return "The daemon is not reachable. Settings stay unchanged until it answers.";
@@ -176,13 +167,13 @@ export default function ModelDefaults() {
       const draft = drafts[provider.id];
       if (!provider.eligible || !draft?.present) continue;
       if (draft.baseline === "model") {
-        const problem = modelProblem(draft.baselineModel);
+        const problem = modelIdProblem(draft.baselineModel);
         if (problem) found.push(`${provider.label} baseline: ${problem}`);
       }
       for (const role of snapshot?.roles ?? []) {
         const row = draft.roles[role.id];
         if (row?.choice === "model") {
-          const problem = modelProblem(row.model);
+          const problem = modelIdProblem(row.model);
           if (problem) found.push(`${provider.label} ${role.label}: ${problem}`);
         }
       }

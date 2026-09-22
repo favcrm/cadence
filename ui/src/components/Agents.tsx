@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { fmtTime } from "../fmt";
+import { provenanceDetail } from "../modelProvenance";
 import { agentIsUnassigned, agentMatchesProject, issueProjectMap } from "../scope";
 import { agentsEmptyCopy } from "../uxCopy";
 import type {
@@ -78,35 +79,10 @@ function activeTasks(a: Agent): AgentTask[] {
   return (a.tasks ?? []).filter((task) => !TERMINAL_TASK_STATES.has(task.task_state));
 }
 
-function provenanceLabel(source: string | null | undefined): string | null {
-  switch (source) {
-    case "explicit":
-      return "explicit launch model";
-    case "explicit_provider_default":
-      return "explicit provider-native";
-    case "role_default":
-      return "role default";
-    case "provider_baseline":
-      return "provider baseline";
-    case "provider_default":
-      return "provider-native default";
-    case "legacy_configured":
-      return "saved before model defaults";
-    case "legacy_provider_default":
-      return "saved before model defaults";
-    default:
-      return null;
-  }
-}
-
 function profileModel(a: Agent): { value: string; note: string; mismatch?: string; provenance?: string } {
   const reported = a.model_reported ?? a.model ?? null;
   const configured = a.model_configured ?? null;
-  const provenance = provenanceLabel(a.model_selection?.source);
-  const lookup = a.model_lookup_role ?? a.model_selection?.lookup_role;
-  const provenanceText = [provenance, lookup ? `lookup ${lookup}` : null]
-    .filter(Boolean)
-    .join(" · ");
+  const provenanceText = provenanceDetail(a.model_selection, a.model_lookup_role);
   if (a.model_selection === null && (a.provider === "devin" || a.provider === "inbox")) {
     return {
       value: reported ?? "unsupported",
