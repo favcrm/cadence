@@ -79,30 +79,6 @@ async function write<T extends object | undefined>(
   return parsed as WriteResp;
 }
 
-/** Memory writes return `{ok, write, memory}` — not the issue shape. */
-async function memoryWrite(
-  path: string,
-  body?: object,
-): Promise<{ ok: boolean; memory: MemoryDetail }> {
-  const resp = await fetch(path, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-    },
-    body: body === undefined ? "{}" : JSON.stringify(body),
-  });
-  const parsed = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    throw new ApiError(
-      parsed?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  return parsed;
-}
-
 export const api = {
   health: () => get<Health>("/api/health"),
   meta: () => get<Meta>("/api/meta"),
@@ -161,16 +137,6 @@ export const api = {
     get<MemoryDetail>(
       `/api/memories/${encodeURIComponent(project)}/${encodeURIComponent(slug)}`,
     ),
-  memoryAccept: (project: string, slug: string, body?: string) =>
-    memoryWrite(
-      `/api/memories/${encodeURIComponent(project)}/${encodeURIComponent(slug)}/accept`,
-      body === undefined ? undefined : { body },
-    ),
-  memoryReject: (project: string, slug: string) =>
-    memoryWrite(
-      `/api/memories/${encodeURIComponent(project)}/${encodeURIComponent(slug)}/reject`,
-    ),
-
   create: (req: {
     project: string;
     title: string;

@@ -211,6 +211,19 @@ pub trait ProviderAdapter: Send + Sync {
             "this endpoint kind has no screen probe",
         ))
     }
+    /// Read-only proof that this adapter still owns the same native endpoint
+    /// recorded by the store. Memory identity uses this instead of treating
+    /// a live pid and metadata row as sufficient ownership.
+    fn verify_owned_endpoint(
+        &self,
+        _expected_pid: u32,
+        _expected_generation: &str,
+        _expected_native: Option<&str>,
+    ) -> Result<()> {
+        Err(crate::error::Error::rejected(
+            "endpoint kind has no native ownership proof",
+        ))
+    }
     /// `agent answer`: send one menu-choice keystroke to a pane that
     /// currently probes `approval_menu` (pty only). The adapter
     /// re-probes first and refuses anything that isn't a live menu —

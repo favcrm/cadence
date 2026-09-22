@@ -467,11 +467,13 @@ In this order:
    task with `cadence memory propose --project <key> --type
    rule|gotcha|decision|recipe --scope-… -m "<fact> … **Why:** …
    **How to apply:** …"` — a proposal, not a write to shared truth.
-   The PM (or the Memory tab) curates: `memory accept|reject|supersede`,
-   `memory verify` re-stamps `verified_at`, `memory ls --stale` finds
-   what drifted. Accepted memories ride the next `dispatch` kickoff as
-   a `Lessons:` file and project `rule`s appear in every briefing —
-   that is the loop closing.
+   An authenticated native PM endpoint curates: `memory accept|reject`,
+   `memory supersede` remains explicitly refused until crash-atomic pair
+   recovery exists, and `memory verify` opens a fresh review cycle.
+   Browser Memory-tab writes are refused because HTTP cannot prove that
+   endpoint identity; `memory ls --stale` finds what drifted. Accepted
+   memories ride the next `dispatch` kickoff as a `Lessons:` file and
+   project `rule`s appear in every briefing — that is the loop closing.
 
 ## 8. When something goes wrong
 

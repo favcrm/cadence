@@ -30,6 +30,7 @@ use crate::adapter::{
 };
 use crate::client;
 use crate::error::{Error, Result};
+use crate::memory::{self, IdentityProof, NativeIdentity};
 use crate::proto;
 use crate::slots::{SlotConfig, SlotKind, Slots};
 use crate::store::{self, Agent, Message, Store, Take};
@@ -1224,6 +1225,9 @@ impl Shared {
             "task_fail" => self.rpc_task_fail(params),
             "task_reopen" => self.rpc_task_reopen(params),
             "task_cancel" => self.rpc_task_cancel(params),
+            "memory_propose" => self.rpc_memory_propose(params, peer_pid),
+            "memory_review" => self.rpc_memory_review(params, peer_pid),
+            "memory_finalize" => self.rpc_memory_finalize(params, peer_pid),
             "monitor_register" => self.rpc_monitor_register(params),
             "monitor_list" => self.rpc_monitor_list(),
             "monitor_show" => self.rpc_monitor_show(params),
@@ -1363,6 +1367,174 @@ impl Shared {
                 ))
             })?;
         Ok((lane, chain))
+    }
+
+    /// Resolve a memory actor only from the Unix connection peer and a
+    /// currently owned native PTY endpoint. Request fields, CADENCE_ALIAS,
+    /// upstream grouping and operator defaults never participate.
+    fn memory_actor(&self, peer_pid: u32) -> Result<NativeIdentity> {
+        let chain = adapter::pty::caller_chain(peer_pid).ok_or_else(|| {
+            Error::rejected(format!(
+                "Memory caller pid {peer_pid}: /proc ancestry unreadable — \
+                 native identity underivable"
+            ))
+        })?;
+        let agents = self.store.agents()?;
+        let mut found = Vec::new();
+        for agent in agents {
+            if agent.endpoint_kind != "pty"
+                || !matches!(agent.role.as_str(), "pm" | "worker")
+                || !matches!(
+                    agent.state.as_str(),
+                    "idle" | "busy" | "running" | "waiting_input"
+                )
+            {
+                continue;
+            }
+            let Some(pid) = agent.pid.and_then(|p| u32::try_from(p).ok()) else {
+                continue;
+            };
+            let Some(generation) = agent.generation.clone() else {
+                continue;
+            };
+            if generation.is_empty() || agent.endpoint.is_none() || !chain.contains(&pid) {
+                continue;
+            }
+            let process_start = process_start_identity(pid)?;
+            found.push((agent, generation, process_start));
+        }
+        if found.len() != 1 {
+            return Err(Error::rejected(format!(
+                "Memory caller pid {peer_pid} is not owned by exactly one live native \
+                 PTY endpoint (matched {}) — external, detached or ambiguous identity \
+                 is unsupported",
+                found.len()
+            )));
+        }
+        let (agent, generation, process_start) = found.pop().expect("one memory actor");
+        let pid = agent
+            .pid
+            .and_then(|p| u32::try_from(p).ok())
+            .ok_or_else(|| Error::rejected("native endpoint pid disappeared"))?;
+        let adapter = self.adapter_for(&agent.alias)?;
+        adapter.verify_owned_endpoint(pid, &generation, agent.session_id.as_deref())?;
+        if process_start != process_start_identity(pid)? {
+            return Err(Error::rejected(
+                "native endpoint process changed while resolving memory identity",
+            ));
+        }
+        Ok(NativeIdentity {
+            proof: IdentityProof {
+                alias: agent.alias,
+                registration: agent.created.to_bits(),
+                generation,
+                process_start,
+                role: agent.role,
+            },
+        })
+    }
+
+    fn reject_memory_identity_claims(params: &Value) -> Result<()> {
+        for field in [
+            "actor",
+            "alias",
+            "by",
+            "generation",
+            "identity",
+            "pane",
+            "pid",
+            "process_start",
+            "reviewer",
+        ] {
+            if params.get(field).is_some() {
+                return Err(Error::rejected(format!(
+                    "memory identity is connection-bound; request field '{field}' is not accepted"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn rpc_memory_propose(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::reject_memory_identity_claims(params)?;
+        let actor = self.memory_actor(peer_pid)?;
+        let pm = crate::issue::Pm::open_default()?;
+        let key = required_str(params, "project")?;
+        let kind = required_str(params, "kind")?;
+        let scope = params
+            .get("scope")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| Error::rejected(format!("invalid memory scope: {e}")))?
+            .unwrap_or_default();
+        memory::propose_native(
+            &pm,
+            key,
+            kind,
+            &scope,
+            optional_str(params, "source"),
+            optional_str(params, "confidence"),
+            optional_str(params, "from"),
+            optional_str(params, "text"),
+            optional_str(params, "id"),
+            &actor,
+        )
+    }
+
+    fn rpc_memory_review(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::reject_memory_identity_claims(params)?;
+        let actor = self.memory_actor(peer_pid)?;
+        let pm = crate::issue::Pm::open_default()?;
+        let request = memory::ReviewRequest {
+            operation: required_str(params, "operation")?,
+            verdict: required_str(params, "verdict")?,
+            evidence: required_str(params, "evidence")?,
+            expected_digest: required_str(params, "digest")?,
+        };
+        memory::submit_review(
+            &pm,
+            optional_str(params, "project"),
+            required_str(params, "slug")?,
+            &request,
+            &actor,
+        )
+    }
+
+    fn rpc_memory_finalize(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::reject_memory_identity_claims(params)?;
+        if params.get("body").is_some() || params.get("edit").is_some() {
+            return Err(Error::rejected(
+                "editing memory content during finalization is refused; submit a new proposal",
+            ));
+        }
+        let actor = self.memory_actor(peer_pid)?;
+        let pm = crate::issue::Pm::open_default()?;
+        let operation = required_str(params, "operation")?;
+        match operation {
+            "reject" => memory::reject_native(
+                &pm,
+                optional_str(params, "project"),
+                required_str(params, "slug")?,
+                &actor,
+            ),
+            "supersede" => memory::supersede_native(
+                &pm,
+                optional_str(params, "project"),
+                required_str(params, "old")?,
+                required_str(params, "new")?,
+                &actor,
+            ),
+            "accept" | "verify" => memory::finalize_native(
+                &pm,
+                optional_str(params, "project"),
+                required_str(params, "slug")?,
+                operation,
+                required_str(params, "digest")?,
+                &actor,
+            ),
+            _ => Err(Error::rejected("unsupported memory finalization operation")),
+        }
     }
 
     /// The pid a slot request may bind: the socket peer itself or one
@@ -4304,6 +4476,25 @@ fn check_peer(stream: &UnixStream) -> Result<u32> {
         return Err(Error::rejected("Socket peer is not the same user"));
     }
     Ok(cred.pid as u32)
+}
+
+/// Linux process-start identity for an endpoint pid. The daemon stores the
+/// registration discriminator separately; this request-time provenance
+/// catches a stale or reused pid before issuing a receipt.
+fn process_start_identity(pid: u32) -> Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| {
+        Error::rejected(format!(
+            "Cannot read native endpoint process start for pid {pid}: {e}"
+        ))
+    })?;
+    let end = stat
+        .rfind(')')
+        .ok_or_else(|| Error::rejected(format!("Malformed /proc/{pid}/stat")))?;
+    let fields: Vec<&str> = stat[end + 1..].split_whitespace().collect();
+    fields
+        .get(19)
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| Error::rejected(format!("Missing process start for pid {pid}")))
 }
 
 /// The peer's ancestor chain (peer first, up to pid 1) — `None` when
