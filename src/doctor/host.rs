@@ -1911,6 +1911,264 @@ fn is_secret_flag(arg: &str) -> bool {
     secret_name(name) || (!arg.starts_with("--") && matches!(name, "p" | "a" | "u"))
 }
 
+/// One argv element is a shell command when it carries whitespace and
+/// is not already a single header or a secret-named assignment. Those
+/// two stay whole: splitting `Authorization: Basic …` or
+/// `--password=two words` would put the tail back on the page.
+fn shell_blob_arg(arg: &str) -> bool {
+    arg.chars().any(|c| c.is_ascii_whitespace()) && !header_unit(arg) && !sealed_assignment(arg)
+}
+
+/// `Name: value` as one element — the colon rule already redacts the
+/// rest, so a nested split must not reopen it. A colon whose left side
+/// itself contains whitespace is a command (`psql postgres://…`), not
+/// a header.
+fn header_unit(arg: &str) -> bool {
+    let colon_first = match (arg.find(':'), arg.find('=')) {
+        (Some(c), Some(e)) => c < e,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if !colon_first {
+        return false;
+    }
+    let (left, right) = arg.split_once(':').unwrap();
+    if left.chars().any(|c| c.is_ascii_whitespace()) {
+        return false;
+    }
+    secret_name(left)
+        || right
+            .split_whitespace()
+            .any(|seg| secret_value(seg.trim_matches(|c: char| matches!(c, '"' | '\''))))
+}
+
+/// `NAME=value` / `--flag=value` whose name owns the whole element.
+/// A secret name redacts every character after `=`, spaces included.
+/// A plain name with no space in the value is one token; a space means
+/// later shell words (`EDITOR=vim cmd --token …`) and must be split.
+fn sealed_assignment(arg: &str) -> bool {
+    let Some((name, value)) = arg.split_once('=') else {
+        return false;
+    };
+    if name.is_empty() || name.chars().any(|c| c.is_ascii_whitespace()) {
+        return false;
+    }
+    let flagged = name.starts_with('-');
+    let bare = name.trim_start_matches('-');
+    if bare.is_empty() || !(flagged || env_name(name)) {
+        return false;
+    }
+    if secret_name(bare) {
+        return true;
+    }
+    !value.chars().any(|c| c.is_ascii_whitespace())
+}
+
+/// `sh -c` is the outer element (depth 0). Each quoted command inside
+/// it opens one more layer, up to this depth. Past it, secret-bearing
+/// text is withheld instead of parsed further.
+const SHELL_BLOB_DEPTH: u8 = 2;
+
+struct ShellWord<'a> {
+    start: usize,
+    end: usize,
+    raw: &'a str,
+    logical: String,
+}
+
+/// Bounded word split for one command element. Single and double
+/// quotes group a word (so a value can contain spaces); a quote
+/// mid-word (`don't`) stays literal. `$`, backticks and backslashes
+/// are expansions or escapes — the split fails closed instead of
+/// guessing. Nothing here is executed.
+fn split_shell_words(s: &str) -> std::result::Result<Vec<ShellWord<'_>>, ()> {
+    let b = s.as_bytes();
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && !b[i].is_ascii_whitespace() {
+            match b[i] {
+                b'\\' | b'$' | b'`' => return Err(()),
+                b'\'' | b'"' if i == start || b[i - 1] == b'=' => {
+                    let q = b[i];
+                    i += 1;
+                    let mut closed = false;
+                    while i < b.len() {
+                        if q == b'"' && matches!(b[i], b'\\' | b'$' | b'`') {
+                            return Err(());
+                        }
+                        if b[i] == q {
+                            i += 1;
+                            closed = true;
+                            break;
+                        }
+                        i += s[i..].chars().next().map_or(1, char::len_utf8);
+                    }
+                    if !closed {
+                        return Err(());
+                    }
+                }
+                _ => i += s[i..].chars().next().map_or(1, char::len_utf8),
+            }
+        }
+        let raw = &s[start..i];
+        words.push(ShellWord {
+            start,
+            end: i,
+            logical: logical_shell_word(raw),
+            raw,
+        });
+    }
+    Ok(words)
+}
+
+fn logical_shell_word(raw: &str) -> String {
+    strip_shell_value_quotes(unwrap_shell_quotes(raw))
+}
+
+fn unwrap_shell_quotes(raw: &str) -> &str {
+    let b = raw.as_bytes();
+    if b.len() >= 2 && matches!(b[0], b'\'' | b'"') && b[b.len() - 1] == b[0] {
+        return &raw[1..b.len() - 1];
+    }
+    raw
+}
+
+/// `--token="value"` and `NAME='value'` classify as the unquoted
+/// forms the flag and env rules already know. The quotes are dropped
+/// even when more characters follow them (`TOKEN="x"extra`) so a
+/// secret name still owns the value.
+fn strip_shell_value_quotes(s: &str) -> String {
+    let b = s.as_bytes();
+    let Some(eq) = b.iter().position(|c| *c == b'=') else {
+        return s.to_string();
+    };
+    if eq + 1 >= b.len() {
+        return s.to_string();
+    }
+    let q = b[eq + 1];
+    if q != b'\'' && q != b'"' {
+        return s.to_string();
+    }
+    let rest = &s[eq + 2..];
+    let Some(rel) = rest.find(q as char) else {
+        return s.to_string();
+    };
+    let mut out = String::with_capacity(s.len() - 2);
+    out.push_str(&s[..=eq]);
+    out.push_str(&rest[..rel]);
+    out.push_str(&rest[rel + 1..]);
+    out
+}
+
+/// Tokenizer gave up. Withhold the element when a flag, assignment,
+/// header or credential shape is still visible; benign text (an
+/// unmatched quote, `echo $HOME`) stays so a failed split is not a
+/// blanket mask.
+fn blob_may_hold_secret(s: &str) -> bool {
+    if s.contains("://") && s.contains('@') {
+        return true;
+    }
+    for raw in s.split_whitespace() {
+        let tok = raw.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')' | '('));
+        if tok.is_empty() {
+            continue;
+        }
+        if looks_like_credential(tok) {
+            return true;
+        }
+        if let Some(body) = tok.strip_prefix('-') {
+            let name = body.split(['=', ':']).next().unwrap_or(body);
+            if secret_name(name) {
+                return true;
+            }
+            if !tok.starts_with("--") && matches!(name.chars().next(), Some('p' | 'a' | 'u')) {
+                return true;
+            }
+        }
+        if let Some((name, value)) = tok.split_once('=') {
+            let name = name.trim_matches(|c: char| matches!(c, '"' | '\''));
+            let value = value.trim_matches(|c: char| matches!(c, '"' | '\''));
+            if secret_name(name.trim_start_matches('-'))
+                || secret_value(value)
+                || looks_like_credential(value)
+            {
+                return true;
+            }
+        }
+        if let Some((name, value)) = tok.split_once(':') {
+            let name = name.trim_matches(|c: char| matches!(c, '"' | '\''));
+            if secret_name(name) {
+                return true;
+            }
+            let value = value.trim_matches(|c: char| matches!(c, '"' | '\''));
+            if secret_value(value) || looks_like_credential(value) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn withhold_or_keep(s: &str) -> String {
+    if blob_may_hold_secret(s) {
+        REDACTED.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Apply the flat argv rules inside one command element and splice
+/// the results back, keeping the original whitespace and quoting
+/// wherever a word did not change.
+fn redact_shell_blob(s: &str, depth: u8) -> String {
+    if depth > SHELL_BLOB_DEPTH {
+        return withhold_or_keep(s);
+    }
+    let words = match split_shell_words(s) {
+        Ok(words) => words,
+        Err(()) => return withhold_or_keep(s),
+    };
+    if words.is_empty() {
+        return s.to_string();
+    }
+    let logicals: Vec<String> = words
+        .iter()
+        .map(|w| {
+            if w.logical.chars().any(|c| c.is_ascii_whitespace())
+                && !header_unit(&w.logical)
+                && !sealed_assignment(&w.logical)
+            {
+                redact_shell_blob(&w.logical, depth + 1)
+            } else {
+                w.logical.clone()
+            }
+        })
+        .collect();
+    let redacted = redact_argv_parts(&logicals, false, true);
+    let keep = redacted.len().min(words.len());
+    let mut out = String::with_capacity(s.len());
+    let mut pos = 0;
+    for i in 0..keep {
+        out.push_str(&s[pos..words[i].start]);
+        if redacted[i] == words[i].logical {
+            out.push_str(words[i].raw);
+        } else {
+            out.push_str(&redacted[i]);
+        }
+        pos = words[i].end;
+    }
+    if keep == words.len() {
+        out.push_str(&s[pos..]);
+    }
+    out
+}
+
 /// Redact credential material from an argv, returning it joined with
 /// spaces — the one place argv becomes display text. The executable
 /// and ordinary arguments pass through; secret *values* become
@@ -1919,15 +2177,36 @@ fn is_secret_flag(arg: &str) -> bool {
 /// arguments with such a name, `Key: value` header arguments, the
 /// password half of `scheme://user:pass@host`, `-p`/`-a`/`-u`
 /// short-flag values, and any standalone argument matching a known
-/// credential shape or the 32+ char high-entropy token shape. Public
-/// because `src/session.rs` (landing with PR #63, in review) will
-/// share it once both land — argv-as-text must share one scrubber
-/// rather than re-implement.
+/// credential shape or the 32+ char high-entropy token shape.
+///
+/// An element that itself holds a command (`sh -c 'run --token …'`)
+/// is split once on unquoted whitespace and run through those same
+/// rules, so a secret inside the script is not printed. Quotes are
+/// grouping only — this is not a shell parser and it never executes
+/// the text. `$`, backticks and backslashes fail closed: the element
+/// is withheld when a secret flag, assignment, header or credential
+/// shape is still visible, and left unchanged when it is not. A
+/// secret-named `NAME=value` that occupies the whole element still
+/// redacts the entire value, trailing words included.
+/// Public because `src/session.rs` shares it — argv-as-text must
+/// share one scrubber rather than re-implement.
 pub fn redact_argv<S: AsRef<str>>(argv: &[S]) -> String {
+    redact_argv_parts(argv, true, false).join(" ")
+}
+
+/// `blobs`: a top-level element that is a command string is split.
+/// `header_tail`: inside that split, a bare `Name:` consumes the
+/// following words so the header value cannot survive beside it.
+fn redact_argv_parts<S: AsRef<str>>(argv: &[S], blobs: bool, header_tail: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(argv.len());
     let mut i = 0;
     while i < argv.len() {
         let arg = argv[i].as_ref();
+        if blobs && shell_blob_arg(arg) {
+            out.push(redact_shell_blob(arg, 0));
+            i += 1;
+            continue;
+        }
         if arg.starts_with('-') && arg.len() > 1 {
             // A flag: `--name=value`, `--name value`, `-x<value>` or a
             // bare switch.
@@ -2014,6 +2293,14 @@ pub fn redact_argv<S: AsRef<str>>(argv: &[S]) -> String {
                     })
                 {
                     out.push(format!("{left}: [REDACTED]"));
+                    // A bare `Name:` inside a command string is only
+                    // the header; the value is the words after it.
+                    // Eating them here is what keeps
+                    // `Authorization: Basic <secret>` from printing
+                    // once the colon no longer shares their element.
+                    if header_tail && right.trim().is_empty() {
+                        return out;
+                    }
                     i += 1;
                     continue;
                 }
@@ -2035,7 +2322,7 @@ pub fn redact_argv<S: AsRef<str>>(argv: &[S]) -> String {
         }
         i += 1;
     }
-    out.join(" ")
+    out
 }
 
 /// argv[0] plus a redacted, ~120-char head of the full command line —
@@ -6115,6 +6402,182 @@ mod tests {
             redact_argv(&["env", &format!("DATA={aws_secret}")]),
             "env DATA=[REDACTED]"
         );
+    }
+
+    /// CAD-141. Before the blob split, each of these scripts is one
+    /// argv element and `redact_argv` returned it unchanged — the
+    /// secret was still in the display string. Assertions check that
+    /// the secret is gone and that benign context remains; they do
+    /// not pin an incidental spelling of the mask.
+    #[test]
+    fn redact_argv_shell_blob_hides_nested_secrets() {
+        let hidden_kept: &[(&str, &[&str], &[&str])] = &[
+            (
+                "run --token s3cr3tvalue && echo ok",
+                &["s3cr3tvalue"],
+                &["run", "--token", "echo ok"],
+            ),
+            (
+                "run --token=s3cr3tvalue --verbose",
+                &["s3cr3tvalue"],
+                &["run", "--token", "--verbose"],
+            ),
+            (
+                "run --token=\"s3cr3tvalue\" --verbose",
+                &["s3cr3tvalue"],
+                &["run", "--verbose"],
+            ),
+            (
+                "run --token='s3cr3tvalue' --verbose",
+                &["s3cr3tvalue"],
+                &["run", "--verbose"],
+            ),
+            (
+                "echo \"run --token s3cr3tvalue\"",
+                &["s3cr3tvalue"],
+                &["echo"],
+            ),
+            (
+                "export TOKEN=\"s3cr3tvalue\" && echo ok",
+                &["s3cr3tvalue"],
+                &["export", "echo ok"],
+            ),
+            (
+                "env GITHUB_TOKEN=ghp_TESTTOKEN cmd",
+                &["ghp_TESTTOKEN"],
+                &["env", "cmd"],
+            ),
+            (
+                "curl -H 'Authorization: Basic YWxpY2U6c3VwZXJzZWNyZXQ=' https://api.x",
+                &["YWxpY2U6c3VwZXJzZWNyZXQ"],
+                &["curl", "https://api.x"],
+            ),
+            (
+                "curl -H \"X-Custom: sk-LIVE\" https://api.x",
+                &["sk-LIVE"],
+                &["curl", "https://api.x"],
+            ),
+            (
+                "psql postgres://admin:hunter2@db.example.com:5432/app",
+                &["hunter2"],
+                &["psql", "postgres://admin:", "db.example.com"],
+            ),
+            ("echo figd_TESTTOKEN", &["figd_TESTTOKEN"], &["echo"]),
+            ("mysql -phunter2 db", &["hunter2"], &["mysql", "db"]),
+            (
+                "echo \"say 'run --token s3cr3tvalue'\"",
+                &["s3cr3tvalue"],
+                &["echo"],
+            ),
+            (
+                "export MSG=\"run --token s3cr3tvalue\"",
+                &["s3cr3tvalue"],
+                &["export"],
+            ),
+            (
+                "EDITOR=vim cmd --token s3cr3tvalue",
+                &["s3cr3tvalue"],
+                &["EDITOR=vim", "cmd"],
+            ),
+            (
+                "curl -H Authorization: Basic s3cr3tvalue https://api.x",
+                &["s3cr3tvalue"],
+                &["curl"],
+            ),
+            (
+                "tool --password=\"hello hunter2\" --verbose",
+                &["hunter2"],
+                &["tool", "--verbose"],
+            ),
+        ];
+        for (script, hidden, kept) in hidden_kept {
+            let out = redact_argv(&["sh", "-c", script]);
+            for secret in *hidden {
+                assert!(
+                    !out.contains(secret),
+                    "leaked {secret} from {script:?} -> {out}"
+                );
+            }
+            for bit in *kept {
+                assert!(out.contains(bit), "lost {bit} from {script:?} -> {out}");
+            }
+            assert!(
+                out.contains("[REDACTED]"),
+                "no mask from {script:?} -> {out}"
+            );
+        }
+        // A secret-named assignment that fills the element still
+        // hides the value; the trailing word is withheld with it.
+        let sealed = redact_argv(&["sh", "-c", "PGPASSWORD=hunter2 psql"]);
+        assert!(!sealed.contains("hunter2"), "{sealed}");
+        assert!(sealed.contains("[REDACTED]"), "{sealed}");
+        // Same secret behind `export` keeps the following command.
+        let exported = redact_argv(&["sh", "-c", "export PGPASSWORD=hunter2 psql"]);
+        assert!(!exported.contains("hunter2"), "{exported}");
+        assert!(exported.contains("psql"), "{exported}");
+        // Direct `--password=two words` must not split the tail back out.
+        let direct = redact_argv(&["tool", "--password=hello hunter2"]);
+        assert_eq!(direct, "tool --password=[REDACTED]");
+        assert!(!direct.contains("hunter2"));
+    }
+
+    /// Benign command text, including quotes, `$`, ports, SHAs and
+    /// ordinary flags, stays byte-identical. Malformed text is
+    /// withheld only when a secret is still visible.
+    #[test]
+    fn redact_argv_shell_blob_keeps_benign_text() {
+        for script in [
+            "echo hello && ls /tmp",
+            "echo 'hello world'",
+            "echo \"hello world\"",
+            "export MSG=\"hello world\" && echo ok",
+            "echo don't stop",
+            "git checkout 4f2a9c1d8e3b5a7c9f1e2d3b4a5c6d7e8f9a0b1c",
+            "npm publish --access public",
+            "ssh -p 2222 host",
+            "t monkey=banana",
+            "echo $HOME && ls /tmp",
+            "echo \"hello",
+        ] {
+            assert_eq!(
+                redact_argv(&["sh", "-c", script]),
+                format!("sh -c {script}"),
+                "{script}"
+            );
+        }
+        // Unbalanced quote, or `$`, next to a real secret: withhold
+        // rather than print the value. No literal secret survives.
+        for script in [
+            "run --token \"s3cr3tvalue",
+            "run --token s3cr3tvalue && echo $HOME",
+        ] {
+            let out = redact_argv(&["sh", "-c", script]);
+            assert!(!out.contains("s3cr3tvalue"), "{script} -> {out}");
+            assert!(out.contains("[REDACTED]"), "{script} -> {out}");
+        }
+    }
+
+    #[test]
+    fn orphans_redact_shell_blob_argv() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let repo = scan.cwd.clone();
+        add_pid_argv(
+            &scan.proc_root,
+            43,
+            Some(&repo.join(".cadence/wt/gone")),
+            None,
+            Some(&["sh", "-c", "run --token s3cr3tvalue && echo ok"]),
+            7_200,
+            &[],
+        );
+        let c = check_orphans(&scan);
+        let blob = serde_json::to_string(&c.to_json()).unwrap();
+        for text in [&blob, &c.detail, &c.remedy] {
+            assert!(!text.contains("s3cr3tvalue"), "{text}");
+        }
+        assert!(blob.contains("[REDACTED]"), "{blob}");
+        assert!(blob.contains("echo ok"), "{blob}");
     }
 
     #[test]
