@@ -4398,6 +4398,52 @@ fn issue_start_conflicting_branch_refused_and_status_owner() {
 
 // ---- CAD-55: `cadence dispatch` + `cadence issue finish` ----
 
+#[test]
+fn issue_finish_pairs_branch_when_dir_name_differs() {
+    // CAD-166: a worktree whose dir name is not its branch name (moved,
+    // hand-recorded or adopted) must still finish its branch.
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Moved", "--project", "demo"]).0);
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let old = repo.join(".cadence/wt/d-1-moved");
+    let new = repo.join(".cadence/wt/elsewhere");
+    let moved = git(
+        &repo,
+        &[
+            "worktree",
+            "move",
+            old.to_str().unwrap(),
+            new.to_str().unwrap(),
+        ],
+    );
+    assert!(moved.0, "{}", moved.1);
+    let file = pm.join("demo/D-1/issue.md");
+    let front = std::fs::read_to_string(&file).unwrap();
+    let old_s = old.canonicalize().unwrap_or(old.clone());
+    let recorded = if front.contains(old.to_str().unwrap()) {
+        old.to_str().unwrap().to_string()
+    } else {
+        old_s.to_str().unwrap().to_string()
+    };
+    assert!(front.contains(&recorded), "{front}");
+    std::fs::write(&file, front.replace(&recorded, new.to_str().unwrap())).unwrap();
+    assert!(git(&pm, &["commit", "-qam", "D-1: hand-move worktree ref"]).0);
+
+    let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["removed_worktree"], true, "{out}");
+    assert_eq!(out["deleted_branch"], true, "branch must not leak: {out}");
+    assert!(!new.exists());
+    assert!(
+        !git(
+            &repo,
+            &["rev-parse", "--verify", "--quiet", "cadence/d-1-moved"]
+        )
+        .0
+    );
+}
+
 /// `issue finish` without a reachable daemon refuses rather than
 /// guesses; `--force` overrides and is recorded; a second finish is a
 /// no-op; an issue without refs has nothing to finish.

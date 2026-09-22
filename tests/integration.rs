@@ -19882,7 +19882,8 @@ fn doctor_host_json_reports_all_checks() {
             "temp-dirs",
             "task-targets",
             "worktrees",
-            "load"
+            "load",
+            "config"
         ]
     );
     for c in report["checks"].as_array().unwrap() {

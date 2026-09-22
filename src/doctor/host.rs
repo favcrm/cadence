@@ -123,6 +123,7 @@ fn check(
 /// `[host]` in `pm.yaml` — every field optional; unset keys keep the
 /// built-in defaults. Sizes are bytes, ages are seconds.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostOverrides {
     pub disk_warn_pct: Option<f64>,
     pub disk_warn_free_bytes: Option<u64>,
@@ -206,6 +207,10 @@ pub struct Thresholds {
     /// Warn/fail on `/proc/pressure/io` `some avg10` percent.
     pub io_stall_warn_pct: f64,
     pub io_stall_fail_pct: f64,
+    /// Why `pm.yaml [host]` could not be applied, when it could not.
+    /// Every threshold is then the default and `wal_checkpoint` is
+    /// off: the writer into other tools' stores fails closed (CAD-189).
+    pub config_error: Option<String>,
 }
 
 impl Default for Thresholds {
@@ -233,6 +238,7 @@ impl Default for Thresholds {
             load_warn_ratio: None,
             io_stall_warn_pct: 30.0,
             io_stall_fail_pct: 60.0,
+            config_error: None,
         }
     }
 }
@@ -394,15 +400,53 @@ impl Scan {
 /// `pub(crate)` — the daemon's slot service and `issue start` reuse it
 /// for the CAD-113 `[host]` keys (`build_slots` &c.).
 pub(crate) fn host_overrides(pm_dir: &Path) -> Option<HostOverrides> {
-    let text = std::fs::read_to_string(pm_dir.join("pm.yaml")).ok()?;
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
-    serde_yaml::from_value(yaml.get("host")?.clone()).ok()
+    read_host_overrides(pm_dir).ok().flatten()
+}
+
+/// `pm.yaml [host]`: `Ok(None)` when there is no file or no table,
+/// `Err` naming the problem when the table is present but unusable —
+/// a bad value or an unknown (misspelled) key.
+pub(crate) fn read_host_overrides(
+    pm_dir: &Path,
+) -> std::result::Result<Option<HostOverrides>, String> {
+    let Ok(text) = std::fs::read_to_string(pm_dir.join("pm.yaml")) else {
+        return Ok(None);
+    };
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&text).map_err(|e| format!("pm.yaml is not valid YAML: {e}"))?;
+    let Some(host) = yaml.get("host") else {
+        return Ok(None);
+    };
+    serde_yaml::from_value(host.clone()).map(Some).map_err(|e| {
+        // A type error does not say which key; retry each key alone so
+        // the message names the one to fix.
+        let culprit = host.as_mapping().and_then(|m| {
+            m.iter().find_map(|(k, v)| {
+                let mut one = serde_yaml::Mapping::new();
+                one.insert(k.clone(), v.clone());
+                serde_yaml::from_value::<HostOverrides>(serde_yaml::Value::Mapping(one))
+                    .is_err()
+                    .then(|| k.as_str().unwrap_or("?").to_string())
+            })
+        });
+        match culprit {
+            Some(key) => format!("pm.yaml [host] {key}: {e}"),
+            None => format!("pm.yaml [host]: {e}"),
+        }
+    })
 }
 
 /// Resolved `[host]` thresholds — shared by `Scan::host` and the
 /// daemon's WAL watcher so both read one config table.
 pub(crate) fn host_thresholds(pm_dir: Option<&Path>) -> Thresholds {
-    Thresholds::resolve(pm_dir.and_then(host_overrides))
+    match pm_dir.map(read_host_overrides).transpose() {
+        Ok(overrides) => Thresholds::resolve(overrides.flatten()),
+        Err(e) => Thresholds {
+            wal_checkpoint: false,
+            config_error: Some(e),
+            ..Thresholds::default()
+        },
+    }
 }
 
 /// Every host check against `scan`; the report is one JSON object
@@ -420,6 +464,7 @@ pub fn run(scan: &Scan) -> Value {
         check_task_targets(scan),
         check_worktrees(scan),
         check_load(scan),
+        check_config(scan),
     ];
     let level = checks.iter().map(|c| c.level).max().unwrap_or(Level::Ok);
     json!({
@@ -5083,6 +5128,31 @@ fn planned_load_warn_ratio(scan: &Scan, cpus: f64) -> f64 {
 /// Host pressure: load1 vs cpu count plus io stall, with the slot
 /// queue in the detail so a hot host names its cause. Everything
 /// reads `scan.proc_root`, so tests fabricate both files.
+/// `pm.yaml [host]` itself: ok when absent or applied, warn naming the
+/// error when it could not be applied (defaults in force, WAL watch off).
+fn check_config(scan: &Scan) -> Check {
+    let (level, detail, remedy) = match &scan.thresholds.config_error {
+        None => (
+            Level::Ok,
+            "host thresholds applied".to_string(),
+            String::new(),
+        ),
+        Some(e) => (
+            Level::Warn,
+            format!("{e} — every threshold is at its default and the WAL checkpoint watch is off"),
+            "fix the [host] table in pm.yaml (unknown keys and bad values are refused)".to_string(),
+        ),
+    };
+    Check {
+        name: "config",
+        level,
+        value: json!({"error": scan.thresholds.config_error}),
+        threshold: Value::Null,
+        detail,
+        remedy,
+    }
+}
+
 fn check_load(scan: &Scan) -> Check {
     let name = "load";
     let cpus = std::thread::available_parallelism()
@@ -8010,7 +8080,8 @@ mod tests {
                 "temp-dirs",
                 "task-targets",
                 "worktrees",
-                "load"
+                "load",
+                "config"
             ]
         );
         for c in report["checks"].as_array().unwrap() {
@@ -8058,6 +8129,43 @@ mod tests {
         // A pm.yaml without the table is fine too.
         std::fs::write(pm.join("pm.yaml"), "schema: 1\n").unwrap();
         assert!(host_overrides(&pm).is_none());
+        assert!(host_thresholds(Some(&pm)).config_error.is_none());
+    }
+
+    #[test]
+    fn pm_yaml_host_errors_fail_the_wal_watch_closed() {
+        let root = TempDir::new().unwrap();
+        let pm = root.path().join("pm");
+        std::fs::create_dir_all(&pm).unwrap();
+        // The explicit opt-out is honoured.
+        std::fs::write(
+            pm.join("pm.yaml"),
+            "schema: 1\nhost:\n  wal_checkpoint: false\n",
+        )
+        .unwrap();
+        let t = host_thresholds(Some(&pm));
+        assert!(!t.wal_checkpoint && t.config_error.is_none());
+        // A quoted bool or a misspelled key is refused, named, and turns
+        // the writer off instead of silently reverting to defaults.
+        for (body, needle) in [
+            (
+                "  wal_checkpoint: \"false\"\n  wal_max_bytes: 4096\n",
+                "wal_checkpoint",
+            ),
+            ("  wal_max_byte: 4096\n", "wal_max_byte"),
+        ] {
+            std::fs::write(pm.join("pm.yaml"), format!("schema: 1\nhost:\n{body}")).unwrap();
+            let t = host_thresholds(Some(&pm));
+            let err = t.config_error.clone().unwrap_or_default();
+            assert!(err.contains(needle), "{needle}: {err}");
+            assert!(!t.wal_checkpoint, "{needle}: WAL watch must be off");
+            assert_eq!(t.wal_max_bytes, GIB, "{needle}: defaults in force");
+            let mut scan = fake_scan(&root);
+            scan.thresholds = t;
+            let c = check_config(&scan);
+            assert_eq!(c.level, Level::Warn);
+            assert!(c.detail.contains(needle), "{}", c.detail);
+        }
     }
 
     // ---------- session census (CAD-198) ----------

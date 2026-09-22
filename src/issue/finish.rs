@@ -238,6 +238,17 @@ struct Target {
     cargo_target: Option<String>,
 }
 
+/// The branch a live worktree has checked out; `None` when the dir is
+/// gone, detached or not a git checkout.
+fn checked_out_branch(wt: &Path) -> Option<String> {
+    if !wt.is_dir() {
+        return None;
+    }
+    git(wt, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .filter(|name| !name.is_empty())
+}
+
 /// The three ref states an issue can be in for finishing.
 enum Resolve {
     /// No worktree/branch refs at all — `finish` errors.
@@ -279,8 +290,17 @@ fn resolve(pm: &Pm, id: &str) -> Result<Resolve> {
             })
             .and_then(|r| r.path.clone())
     };
+    // `issue start` names the dir and branch alike, so `cadence/<dir>`
+    // pairs them; a worktree whose dir and branch differ (hand-recorded
+    // or adopted) pairs by the branch it actually has checked out, when
+    // that value is recorded as an open branch ref (CAD-166).
     let branch = match &wt_name {
-        Some(n) => open_branch(Some(&format!("cadence/{n}"))).unwrap_or_default(),
+        Some(n) => open_branch(Some(&format!("cadence/{n}")))
+            .or_else(|| {
+                let head = checked_out_branch(open_wt.as_deref()?)?;
+                open_branch(Some(&head))
+            })
+            .unwrap_or_default(),
         None => open_branch(None).unwrap_or_default(),
     };
     if open_wt.is_none() && branch.is_empty() {
