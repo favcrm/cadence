@@ -414,7 +414,12 @@ fn restart_fences_unknown_inflight() {
     let d = TestDaemon::start_on(state);
     // The fenced actor lands in attention, not a silent relaunch.
     let agent = d.wait_agent("w1", "attention", 10);
-    assert!(agent["error"].as_str().unwrap().contains("Uncertain"));
+    let error = agent["error"].as_str().unwrap();
+    assert!(
+        error.contains("Runtime restarted during provider turn"),
+        "{error}"
+    );
+    assert!(error.contains("does not prove"), "{error}");
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     let m1 = &show["messages"].as_array().unwrap()[0];
     assert_eq!(m1["state"], "unknown");
@@ -551,11 +556,10 @@ fn reconcile_interrupted_clears_fence_and_preserves_history() {
     .unwrap();
     // A bare resume is rejected, naming the reconcile-first path.
     let err = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("cadence agent unfence w1 --status interrupted"),
-        "{err}"
-    );
+    let err = err.to_string();
+    assert!(err.contains("resume refused"), "{err}");
+    assert!(err.contains("--no-resume"), "{err}");
+    assert!(!err.contains("then `cadence agent resume"), "{err}");
     // The operator's verdict: interrupted, with a note and caller.
     let r = d
         .rpc(
@@ -1095,13 +1099,10 @@ fn resume_all_lists_fenced_without_attempting() {
         .iter()
         .find(|r| r["alias"] == "w1")
         .expect("w1 listed under fenced");
-    assert!(
-        w1["hint"]
-            .as_str()
-            .unwrap()
-            .contains("cadence agent unfence w1 --status interrupted"),
-        "{w1}"
-    );
+    let hint = w1["hint"].as_str().unwrap();
+    assert!(hint.contains("not resumed"), "{w1}");
+    assert!(hint.contains("--no-resume"), "{w1}");
+    assert!(!hint.contains("then `cadence agent resume"), "{w1}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("FENCED"), "{stderr}");
     // Still fenced: the message is untouched, the agent never launched.
@@ -1408,7 +1409,12 @@ fn pty_hot_restart_no_marker_fences() {
     drop_shutdown_marker(&state);
     let d = TestDaemon::start_on(state);
     let agent = d.wait_agent("dv1", "attention", 20);
-    assert!(agent["error"].as_str().unwrap_or("").contains("Uncertain"));
+    let error = agent["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("Runtime restarted during provider turn"),
+        "{error}"
+    );
+    assert!(error.contains("does not prove"), "{error}");
     assert_eq!(d.message_state("dv1", "m1"), "unknown");
     let kinds = event_kinds(&d, "dv1");
     assert!(!kinds.iter().any(|k| k == "turn_adopted"), "{kinds:?}");
@@ -1988,10 +1994,12 @@ fn resume_rejected_while_actor_stopping() {
     let agent = d.wait_agent("w1", "attention", 10);
     assert_eq!(agent["enabled"], false);
     d.wait_message("w1", "m1", &["unknown"], 10);
-    // A later resume is rejected by the fence, naming the reconcile
-    // path — it is not a relaunch and stays disabled.
+    // A later resume is rejected by the fence — it is not a relaunch
+    // and stays disabled. The rejection does not chain a second resume.
     let fenced = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap_err();
-    assert!(fenced.to_string().contains("agent unfence"), "{fenced}");
+    let fenced = fenced.to_string();
+    assert!(fenced.contains("resume refused"), "{fenced}");
+    assert!(!fenced.contains("then `cadence agent resume"), "{fenced}");
     let agent = d
         .rpc("agent_show", json!({"alias": "w1"}))
         .unwrap()
@@ -3296,20 +3304,23 @@ fn stop_on_fenced_agent_preserves_attention() {
     .unwrap();
     let fenced = d.wait_agent("w1", "attention", 10);
     let reason = fenced["error"].clone();
-    // The fence error is either the provider's own account ("Connection
-    // lost during turn…") or the generic "Uncertain provider outcome"
-    // rewrite a later relaunch-skip stamps — both name the reconcile
-    // path; which one is observed is timing.
-    assert!(reason.as_str().unwrap().contains("reconcile"), "{reason}");
+    // Actor exit must keep the provider account. The generic review
+    // sentence is only the fallback when no account was recorded.
+    let reason = reason.as_str().unwrap();
+    assert!(reason.contains("Connection lost during turn"), "{reason}");
+    assert!(reason.contains("does not prove"), "{reason}");
+    assert!(!reason.contains("then `cadence agent resume"), "{reason}");
     // Stop only disables: the fence state and its reason stay visible.
     let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     assert_eq!(stopped["state"], "attention");
     let agent = d.wait_agent("w1", "attention", 10);
     assert_eq!(agent["enabled"], false);
-    // The relaunch-skip may restate the error between reads — assert
-    // the fence is still named, not byte-equality with the snapshot.
+    // Stop must not replace the provider account with a generic fence.
     assert!(
-        agent["error"].as_str().unwrap().contains("reconcile"),
+        agent["error"]
+            .as_str()
+            .unwrap()
+            .contains("Connection lost during turn"),
         "{}",
         agent["error"]
     );
@@ -3318,15 +3329,20 @@ fn stop_on_fenced_agent_preserves_attention() {
     assert_eq!(again["state"], "attention");
     let agent = d.wait_agent("w1", "attention", 5);
     assert!(
-        agent["error"].as_str().unwrap().contains("reconcile"),
+        agent["error"]
+            .as_str()
+            .unwrap()
+            .contains("Connection lost during turn"),
         "{}",
         agent["error"]
     );
     assert_eq!(d.message_state("w1", "m1"), "unknown");
     // Resume is rejected until the operator reconciles — the fence is
-    // not masked by either verb.
+    // not masked by either verb, and the rejection does not chain a second resume.
     let fenced = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap_err();
-    assert!(fenced.to_string().contains("agent unfence"), "{fenced}");
+    let fenced = fenced.to_string();
+    assert!(fenced.contains("resume refused"), "{fenced}");
+    assert!(!fenced.contains("then `cadence agent resume"), "{fenced}");
 }
 
 #[test]
@@ -5862,8 +5878,7 @@ fn fenced_agent_resume_hint() {
     assert!(agent["endpoint"].is_null());
 
     // `devin -r <slug>` on the fenced agent must not print attach/ready
-    // steps — the useful next commands are `agent unfence` then
-    // `agent resume`.
+    // steps, and must not hand out an unfence-then-resume command chain.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
         .arg("--state-dir")
         .arg(&d.state)
@@ -5877,27 +5892,29 @@ fn fenced_agent_resume_hint() {
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["state"], "attention", "{v}");
-    assert_eq!(
-        v["next"]["unfence"].as_str().unwrap_or_default(),
-        "cadence agent unfence dv1 --status interrupted",
-        "{v}"
-    );
-    assert_eq!(
-        v["next"]["resume"].as_str().unwrap_or_default(),
-        "cadence agent resume dv1",
-        "{v}"
-    );
-    assert!(v["next"]["attach"].is_null(), "{v}");
-    // `agent show`'s error text names the same reconcile-first path.
-    let agent = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["agent"].clone();
     assert!(
-        agent["error"]
+        v["next"]["inspect"]
             .as_str()
-            .unwrap()
-            .contains("agent unfence dv1 --status interrupted"),
-        "{}",
-        agent["error"]
+            .unwrap_or_default()
+            .contains("does not prove"),
+        "{v}"
     );
+    assert!(
+        v["next"]["decision"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--no-resume"),
+        "{v}"
+    );
+    assert!(v["next"]["unfence"].is_null(), "{v}");
+    assert!(v["next"]["resume"].is_null(), "{v}");
+    assert!(v["next"]["attach"].is_null(), "{v}");
+    // `agent show` keeps the message's unknown account, not a second-resume command.
+    let agent = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["agent"].clone();
+    let error = agent["error"].as_str().unwrap();
+    assert!(error.contains("endpoint lost after submission"), "{error}");
+    assert!(error.contains("does not prove"), "{error}");
+    assert!(!error.contains("then `cadence agent resume"), "{error}");
 }
 
 /// Spawn the real `cadence` binary under a scratch HOME (skill install

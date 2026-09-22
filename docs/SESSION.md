@@ -479,7 +479,7 @@ In this order:
 
 | Symptom | Meaning | Do |
 |---|---|---|
-| Agent `attention`, message `unknown` | A delivery outcome could not be proven (fence). The pane is still alive. | `cadence agent capture <a>` to look, then `cadence agent unfence <a> --status interrupted` (resumes and reports `pane: adopted|respawned`) |
+| Agent `attention`, message `unknown` | A delivery outcome could not be proved. A pty fence detaches the pane; it is not killed unless `agent stop` ran (stop kills a surviving pane). `agent capture` needs a live actor and fails while the fence holds. | Read `agent show` for that message's error and inspect side effects. A missed render does not prove the paste was not delivered. Reconciliation is an explicit operator decision, not automatic interrupted or completed. CLI `agent unfence` resumes by default — do not resume again after it. `--no-resume` reconciles without resuming. Bare RPC unfence does not resume. Do not dispatch a new revision until continuation is safe. |
 | Queued message never delivers | The probe reads busy. | `cadence agent probe <a>` for the reason; `cadence agent capture <a>`; only then `agent ready --force` |
 | Managed Claude `waiting_input` | A brokered approval is open. | `cadence agent requests <a>`, `cadence agent respond <a> --request <h> --decision accept|decline [--reason …]` |
 | Worker "Running tools" for an hour | Usually waiting on CI or a long suite. | `agent capture`; interrupt only through the pane (`Escape Escape`), never by pasting |
