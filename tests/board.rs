@@ -7789,6 +7789,58 @@ fn project_context_api_scopes_projects_and_pins_revision() {
 }
 
 #[test]
+fn project_context_dirty_probe_failure_keeps_pinned_documents() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let head = context_repo(
+        repo.path(),
+        "dirty-probe",
+        "docs/probe.md",
+        "probe HEAD remains readable\n",
+    );
+
+    // status needs the index; immutable HEAD/tree/blob readers do not.
+    std::fs::write(repo.path().join(".git/index"), b"not a git index\n").unwrap();
+    let (status_ok, status_output) = git(
+        repo.path(),
+        &["status", "--porcelain=v1", "--untracked-files=no"],
+    );
+    assert!(
+        !status_ok,
+        "corrupted index unexpectedly passed status: {status_output}"
+    );
+    let (head_ok, observed_head) = git(repo.path(), &["rev-parse", "--verify", "HEAD"]);
+    assert!(head_ok);
+    assert_eq!(observed_head.trim(), head);
+    let (tree_ok, tree) = git(repo.path(), &["ls-tree", &head, "--", "docs/probe.md"]);
+    assert!(tree_ok);
+    assert!(tree.contains("docs/probe.md"));
+    let (blob_ok, blob) = git(repo.path(), &["cat-file", "blob", "HEAD:docs/probe.md"]);
+    assert!(blob_ok);
+    assert!(blob.contains("probe HEAD remains readable"));
+
+    assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
+    add_context_project(pm.path(), state.path(), "dirty-probe", "D", &[repo.path()]);
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let (code, body) = http(port, "GET", "/api/projects/dirty-probe/context", &host);
+    assert_eq!(code, 200, "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["snapshot"]["dirty"], Value::Null);
+    assert!(!value["snapshot"]["error"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty());
+    assert_eq!(value["snapshot"]["head_revision"], head);
+    assert_ne!(value["state"], "unavailable_repository");
+    assert!(value["documents"][0]["excerpt"]
+        .as_str()
+        .unwrap()
+        .contains("probe HEAD remains readable"));
+}
+
+#[test]
 fn project_context_rejects_invalid_paths_and_reports_repository_states() {
     let pm = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
