@@ -514,19 +514,20 @@ fn finalization_for<'a>(
     cycle: Option<u64>,
     digest: &str,
 ) -> Option<&'a FinalizationReceipt> {
-    front
+    let receipt = front
         .finalizations
         .iter()
         .filter(|receipt| {
-            receipt.operation == operation
-                && cycle.is_none_or(|expected| receipt.cycle == expected)
-                && receipt.digest == digest
-                && receipt.finalizer.role == "pm"
-                && !receipt.finalizer.alias.is_empty()
-                && !receipt.finalizer.generation.is_empty()
-                && !receipt.finalized_at.is_empty()
+            receipt.operation == operation && cycle.is_none_or(|expected| receipt.cycle == expected)
         })
-        .max_by_key(|receipt| receipt.cycle)
+        .max_by_key(|receipt| receipt.cycle)?;
+    (receipt.digest == digest
+        && receipt.finalizer.role == "pm"
+        && !receipt.finalizer.alias.is_empty()
+        && !receipt.finalizer.generation.is_empty()
+        && receipt.finalizer.process_start != 0
+        && !receipt.finalized_at.is_empty())
+    .then_some(receipt)
 }
 
 fn next_verify_cycle(front: &Front) -> u64 {
@@ -2120,6 +2121,9 @@ mod tests {
         assert!(retrieval_status(&mem).0);
         // The latest finalized verify cycle is authoritative.  Keeping an
         // older valid cycle cannot hide corruption in cycle three.
+        mem.front.finalizations[2].digest = "0".repeat(64);
+        assert!(!retrieval_status(&mem).0);
+        mem.front.finalizations[2].digest = digest.clone();
         mem.front.reviews[4].verdict = "revise".to_string();
         assert!(!retrieval_status(&mem).0);
     }
