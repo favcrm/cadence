@@ -4428,7 +4428,20 @@ fn issue_finish_pairs_branch_when_dir_name_differs() {
     };
     assert!(front.contains(&recorded), "{front}");
     std::fs::write(&file, front.replace(&recorded, new.to_str().unwrap())).unwrap();
-    assert!(git(&pm, &["commit", "-qam", "D-1: hand-move worktree ref"]).0);
+    // Explicit identity: CI runners have no global git user.
+    let committed = git(
+        &pm,
+        &[
+            "-c",
+            "user.name=hand",
+            "-c",
+            "user.email=hand@h",
+            "commit",
+            "-qam",
+            "D-1: hand-move worktree ref",
+        ],
+    );
+    assert!(committed.0, "{}", committed.1);
 
     let (ok, out) = cli(&pm, &state, &["issue", "finish", "D-1"]);
     assert!(ok, "{out}");
