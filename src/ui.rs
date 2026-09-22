@@ -30,7 +30,7 @@ use crate::adapter::registry;
 use crate::client;
 use crate::doctor::host::redact_argv;
 use crate::error::{Error, Result};
-use crate::issue::{board, history, model, project, write as issue_write, Pm};
+use crate::issue::{board, context, history, model, project, write as issue_write, Pm};
 use crate::proc::{self, BoundedError};
 
 /// The options `ui run` and `ui start` share. Every field is optional:
@@ -434,6 +434,37 @@ fn pct_decode(raw: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+fn context_query(
+    raw_query: &str,
+) -> std::result::Result<(Option<String>, Option<String>), &'static str> {
+    let mut role = None;
+    let mut expected_revision = None;
+    for raw_pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (raw_key, raw_value) = raw_pair
+            .split_once('=')
+            .ok_or("context query values must use key=value")?;
+        let key = pct_decode(raw_key).ok_or("malformed context query")?;
+        let value = pct_decode(raw_value).ok_or("malformed context query")?;
+        match key.as_str() {
+            "role" if role.is_none() => role = Some(value),
+            "expected_revision" if expected_revision.is_none() => expected_revision = Some(value),
+            "role" | "expected_revision" => return Err("duplicate context query key"),
+            _ => return Err("unknown context query key"),
+        }
+    }
+    if let Some(value) = role.as_deref() {
+        if !matches!(value, "pm" | "dev" | "qa" | "ops") {
+            return Err("bad context role");
+        }
+    }
+    if let Some(value) = expected_revision.as_deref() {
+        if !context::valid_revision(value) {
+            return Err("bad expected revision");
+        }
+    }
+    Ok((role, expected_revision))
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -2007,6 +2038,46 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
             }
         }
         _ => {
+            // A selected project's bounded, tracked-document context. The
+            // project key is resolved through the PM registry before any repo
+            // path is touched; no request value becomes a filesystem path.
+            if let Some(tail) = path.strip_prefix("/api/projects/") {
+                let mut segs = tail.split('/');
+                let key = segs.next().unwrap_or_default();
+                let sub = segs.next();
+                if sub == Some("context") && segs.next().is_none() {
+                    if !model::valid_key(key) {
+                        send(request, err_response(400, "bad project key"));
+                        return;
+                    }
+                    let (role, expected_revision) = match context_query(raw_query) {
+                        Ok(query) => query,
+                        Err(error) => {
+                            send(request, err_response(400, error));
+                            return;
+                        }
+                    };
+                    match Pm::at(pm_dir) {
+                        Ok(pm) => match project::list(&pm.dir) {
+                            Ok(projects) => match projects.iter().find(|p| p.key == key) {
+                                Some(selected) => send(
+                                    request,
+                                    json_response(context::bundle(
+                                        &pm,
+                                        selected,
+                                        role.as_deref(),
+                                        expected_revision.as_deref(),
+                                    )),
+                                ),
+                                None => send(request, err_response(404, "unknown project")),
+                            },
+                            Err(error) => send(request, err_response(503, &error.to_string())),
+                        },
+                        Err(error) => send(request, err_response(503, &error.to_string())),
+                    }
+                    return;
+                }
+            }
             // `/api/memories/<project>/<slug>` — memory detail.
             if let Some(tail) = path.strip_prefix("/api/memories/") {
                 let mut segs = tail.splitn(2, '/');

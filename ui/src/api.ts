@@ -10,6 +10,8 @@ import type {
   Meta,
   Overview,
   Project,
+  ProjectContext,
+  ContextRole,
 } from "./types";
 
 export class ApiError extends Error {
@@ -84,6 +86,13 @@ export const api = {
   meta: () => get<Meta>("/api/meta"),
   overview: () => get<Overview>("/api/overview"),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
+  projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
+    const query = new URLSearchParams({ role });
+    if (expectedRevision) query.set("expected_revision", expectedRevision);
+    return get<ProjectContext>(
+      `/api/projects/${encodeURIComponent(project)}/context?${query.toString()}`,
+    );
+  },
   issues: (project?: string) =>
     get<{ issues: IssueCard[] }>(
       project ? `/api/issues?project=${encodeURIComponent(project)}` : "/api/issues",

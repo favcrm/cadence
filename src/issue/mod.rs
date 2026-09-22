@@ -7,6 +7,7 @@
 
 pub mod board;
 pub mod cli;
+pub mod context;
 pub mod dispatch;
 pub mod doctor;
 pub mod finish;
