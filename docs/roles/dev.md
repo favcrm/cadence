@@ -22,7 +22,7 @@ This host runs several lanes at once. Cap your builds with `CARGO_BUILD_JOBS=4` 
 Until that rollout is confirmed, retain the existing `CARGO_BUILD_JOBS=4` cap and host `CADENCE_SUITE_LOCK`; merging this PR alone does not upgrade the running daemon. Once deployed, a slot admission refusal must be resolved rather than bypassed by running cargo directly.
 
 ## Rules that bite
-- Diff-based checks (`git diff`/`git show`) run through `rtk proxy` — the rtk hook rewrites the bare forms and its condensed output can print nothing for a real diff, so a filtered empty result is unproven, not clean (CAD-138).
+- Diff-based checks (`git diff`/`git show`) run through `rtk proxy` — the rtk hook rewrites the bare forms and its condensed output can print nothing for a real diff, so a filtered empty result is unproven, not clean (CAD-138). On 2026-09-20 a filtered `git diff --numstat` came back empty and a net-deletion check read clean against a head that deleted 3018 lines. `scripts/rtk-diff-guard.py`, a `PreToolUse` hook in `.claude/settings.json`, therefore denies every form rtk would rewrite (bare `git diff`/`git show`, `git -C`/`-c` spellings, `rtk git diff`, `rtk diff`) and names the fix. Escapes: `rtk proxy git diff …` (use this one), `RTK_DISABLED=1 git diff …` (presence counts, any value) or `\git diff …`.
 - `GIT_EDITOR=true` for any git command that could open an editor (rebase continue, merge, commit without `-m`).
 - Never paste another process's command line, environment or tool output with arguments into a PR, issue or note: summarise.
 - Stop background shells before you report.
