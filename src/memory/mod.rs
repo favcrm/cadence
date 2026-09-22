@@ -683,7 +683,19 @@ pub fn retrieval_status(mem: &Memory) -> (bool, String) {
             ),
         );
     }
-    if let Some(receipt) = finalization_for(&mem.front, "verify", None, &digest) {
+    if mem
+        .front
+        .finalizations
+        .iter()
+        .any(|receipt| receipt.operation == "verify")
+    {
+        let Some(receipt) = finalization_for(&mem.front, "verify", None, &digest) else {
+            return (
+                false,
+                "review blocked: latest verify finalization is invalid or has a different digest"
+                    .to_string(),
+            );
+        };
         let (verify_quorum, verify_reason) = quorum_status_for_cycle(mem, "verify", receipt.cycle);
         if !verify_quorum {
             return (

@@ -5846,33 +5846,42 @@ fn legacy_memory(
     if let Some(verified_at) = verified_at {
         yaml.push_str(&format!("verified_at: {verified_at}\n"));
     }
-    yaml.push_str("scope:\n");
-    if project {
-        yaml.push_str("  project: true\n");
-    }
-    if !components.is_empty() {
-        yaml.push_str("  components:\n");
-        for value in components {
-            yaml.push_str(&format!("    - {value}\n"));
+    if project
+        || !components.is_empty()
+        || !paths.is_empty()
+        || !providers.is_empty()
+        || !tags.is_empty()
+    {
+        yaml.push_str("scope:\n");
+        if project {
+            yaml.push_str("  project: true\n");
         }
-    }
-    if !paths.is_empty() {
-        yaml.push_str("  paths:\n");
-        for value in paths {
-            yaml.push_str(&format!("    - \"{value}\"\n"));
+        if !components.is_empty() {
+            yaml.push_str("  components:\n");
+            for value in components {
+                yaml.push_str(&format!("    - {value}\n"));
+            }
         }
-    }
-    if !providers.is_empty() {
-        yaml.push_str("  providers:\n");
-        for value in providers {
-            yaml.push_str(&format!("    - {value}\n"));
+        if !paths.is_empty() {
+            yaml.push_str("  paths:\n");
+            for value in paths {
+                yaml.push_str(&format!("    - \"{value}\"\n"));
+            }
         }
-    }
-    if !tags.is_empty() {
-        yaml.push_str("  tags:\n");
-        for value in tags {
-            yaml.push_str(&format!("    - {value}\n"));
+        if !providers.is_empty() {
+            yaml.push_str("  providers:\n");
+            for value in providers {
+                yaml.push_str(&format!("    - {value}\n"));
+            }
         }
+        if !tags.is_empty() {
+            yaml.push_str("  tags:\n");
+            for value in tags {
+                yaml.push_str(&format!("    - {value}\n"));
+            }
+        }
+    } else {
+        yaml.push_str("scope: {}\n");
     }
     std::fs::create_dir_all(pm.join("mem/memory")).unwrap();
     std::fs::write(
