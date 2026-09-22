@@ -16,7 +16,11 @@
 //! record. Agents opted into `params.auto_ready = "verified"` let the
 //! daemon mint the claim itself after a screen probe
 //! ([`TuiProfile::analyze`]) proves the pane idle; a human `agent
-//! ready` still wins whenever both exist.
+//! ready` still wins whenever both exist. A routed notice
+//! (`worker_result`, `worker_notice`, `job_event`) may also paste
+//! into an idle pane with no claim and with `auto_ready` off — the
+//! actor sets that for the duration of one `run_turn` only. A busy
+//! pane or an open approval menu still refuses.
 //!
 //! Text is delivered literally through a tmux buffer (`load-buffer` +
 //! bracketed `paste-buffer -p` + `Enter`); no shell interpolation and no
@@ -141,6 +145,10 @@ pub struct PtyAdapter {
     /// itself instead of requiring a human `agent ready` claim.
     /// Mutable — `agent set` refreshes it on the live adapter.
     auto_ready: AtomicBool,
+    /// Set by the actor for one `run_turn` when the message is routed.
+    /// With no claim and `auto_ready` off, an idle probe may still
+    /// admit the paste. Cleared when the turn returns.
+    unclaimed_ok: AtomicBool,
     /// Serialises probe→input sequences that must not interleave: the
     /// send gate's probe→paste→Enter and `agent answer`'s
     /// probe→send-keys. Without it a menu closing between the answer's
@@ -419,6 +427,7 @@ impl PtyAdapter {
                     .and_then(|v| v.as_str())
                     == Some("verified"),
             ),
+            unclaimed_ok: AtomicBool::new(false),
             paste_lock: Mutex::new(()),
             profile: Box::new(profile),
         })
@@ -522,8 +531,11 @@ impl PtyAdapter {
     /// claim eaten). Readiness last: a fresh unconsumed operator claim
     /// always wins; without one, `auto_ready=verified` agents get the
     /// probe verdict (idle pane → self-claim, recorded as a
-    /// `ready_claimed` event by `"daemon"`); anything else requeues
-    /// for a retry.
+    /// `ready_claimed` event by `"daemon"`). A routed notice with the
+    /// actor's unclaimed flag set takes the same idle-probe path when
+    /// `auto_ready` is off, recorded with `"reason": "routed"`. A
+    /// non-idle probe, an approval menu, or a user message with no
+    /// claim still requeues.
     fn check_gate(&self, message_id: &str) -> Result<()> {
         let (session, native) = self.session_and_native();
         if !self.has_session(&session) {
@@ -577,21 +589,30 @@ impl PtyAdapter {
             );
             return Ok(());
         }
-        if !self.auto_ready.load(AtomicOrdering::SeqCst) {
+        let auto = self.auto_ready.load(AtomicOrdering::SeqCst);
+        let routed = self.unclaimed_ok.load(AtomicOrdering::SeqCst);
+        // A user or task paste still needs a claim or verified
+        // auto-ready. A routed notice may proceed to the idle probe
+        // with neither. The probe itself already refused a dead pane,
+        // a tmux mode, and an open approval menu.
+        if !auto && !routed {
             return Err(Error::gate(
                 "no fresh `agent ready` claim — an operator must verify the \
                  terminal is idle with an empty input before submission",
             ));
         }
-        if probe.idle {
-            self.state.lock().unwrap().gate_probe = Some(probe.clone());
-            (self.hooks.on_event)(
-                "cadence/ready_claimed",
-                serde_json::json!({"by": "daemon", "probe": probe.to_json()}),
-            );
-            return Ok(());
+        if !probe.idle {
+            return Err(Error::gate(format!("tui not idle: {}", probe.reason)));
         }
-        Err(Error::gate(format!("tui not idle: {}", probe.reason)))
+        self.state.lock().unwrap().gate_probe = Some(probe.clone());
+        let mut payload = serde_json::json!({"by": "daemon", "probe": probe.to_json()});
+        // Distinguish a routed idle paste from verified auto-ready.
+        // When both are set, verified auto-ready is the recorded path.
+        if routed && !auto {
+            payload["reason"] = serde_json::json!("routed");
+        }
+        (self.hooks.on_event)("cadence/ready_claimed", payload);
+        Ok(())
     }
 
     /// Visible screen only (no scrollback) — what the TUI shows now.
@@ -1170,6 +1191,10 @@ impl ProviderAdapter for PtyAdapter {
             params.get("auto_ready").and_then(|v| v.as_str()) == Some("verified"),
             AtomicOrdering::SeqCst,
         );
+    }
+
+    fn set_unclaimed_ok(&self, ok: bool) {
+        self.unclaimed_ok.store(ok, AtomicOrdering::SeqCst);
     }
 }
 
