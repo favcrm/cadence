@@ -16672,7 +16672,7 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
     let busy_token = pty_token(&d, "author", "memory-busy");
     d.wait_agent("author", "busy", 10);
 
-    let body = "socket-bound memory claims native identity\n\n**Why:** the provider socket is the authority.\n\n**How to apply:** use only reviewed native memory.\n";
+    let body = "\nsocket-bound memory claims native identity\n\n**Why:** the provider socket is the authority.\n\n**How to apply:** use only reviewed native memory.\n";
     let proposal = json!({
         "project": "demo",
         "kind": "rule",
@@ -16932,6 +16932,7 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
     let pm = cadence_agent::issue::Pm::at(&pm_dir).unwrap();
     let (_, accepted) = memory::find(&pm, Some("demo"), "native-socket-rule").unwrap();
     assert!(memory::retrieval_status(&accepted).0);
+    assert_eq!(accepted.body, body);
     assert_eq!(
         accepted.front.author_proof.as_ref().unwrap().alias,
         "author"
