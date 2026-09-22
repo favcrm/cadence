@@ -5,12 +5,20 @@ on:
   push:
     branches: [main, 'feat/**']
 
-# A new commit supersedes an in-flight PR run, but protected main pushes and
-# separate PR numbers never cancel one another. Pushes from feat/** retain
-# their own non-canceling ref group, so the existing trigger remains explicit.
+# Concurrency policy (CAD-228; docs/SESSION.md "Post-merge CI on main"):
+# - pull_request: one group per PR number; a new head cancels the running
+#   and the pending run for that PR (stale PR work is never verified).
+# - push (main, feat/**): one group per ref; every pushed commit is
+#   verified, serially. A running push run is never cancelled, and
+#   `queue: max` keeps up to 100 pending runs instead of GitHub's default
+#   single pending slot, where a newer push cancelled the older pending run
+#   with zero jobs. Only a 101st waiting push is cancelled.
+# GitHub rejects `queue: max` together with `cancel-in-progress: true`, so
+# both are chosen by event and never meet in one run.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
 permissions:
   contents: read
