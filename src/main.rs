@@ -743,9 +743,11 @@ enum Commands {
     },
     /// Review a PR end-to-end: detached checkout under
     /// `.cadence/wt/review-<pr>` (the merge result when the base moved),
-    /// config-driven gates from `cadence-review.toml`, new-test stress,
-    /// one full-suite run, and an equal-conditions compare of every
-    /// failure on the gated tree and the base head. Writes a
+    /// config-driven gates from `cadence-review.toml` as committed on the
+    /// base head (a PR that changes it is flagged and never suggested
+    /// `pass`), new-test stress, one full-suite run, and an
+    /// equal-conditions compare of every failure on the gated tree and
+    /// the base head. Writes a
     /// Markdown+JSON report under the state dir — never posts a
     /// status, never merges, never pushes.
     Review {

@@ -147,7 +147,9 @@ cadence daemon stop             # shutdown + wait for the process to release
 
 cadence review <PR>             # the reviewer's mechanical routine: detached
                                 #  checkout (merge result when the base moved),
-                                #  gates from cadence-review.toml, new-test
+                                #  gates from cadence-review.toml as committed
+                                #  on the base head (a PR that changes it is
+                                #  flagged and never suggested `pass`), new-test
                                 #  stress, one full suite, equal-conditions
                                 #  compare — a Markdown+JSON report under the
                                 #  state dir (--no-full, --stress N, --keep,

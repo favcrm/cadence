@@ -8,10 +8,15 @@
 //! the reviewer. The command never posts a status, never merges,
 //! never pushes.
 //!
-//! The steps are data, not code: `<repo>/cadence-review.toml` declares
+//! The steps are data, not code: `cadence-review.toml` declares
 //! `prepare`, `gates`, `full_suite`, `test_globs`, `stress_pattern`
-//! and `test_command`. Every subprocess goes through
-//! [`crate::proc::run_bounded`]; timeouts come from `[timeouts]`.
+//! and `test_command`. It is read from the base branch head
+//! (`git show <base>:cadence-review.toml`), never from the PR tree or
+//! the reviewer's working tree, so a PR cannot weaken the gates it is
+//! judged by. A PR that changes the file is flagged in the report and
+//! its suggested verdict is never `pass`. Every subprocess goes through
+//! [`crate::proc::run_bounded`]; timeouts come from `[timeouts]`
+//! (defaults until the config is loaded).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,10 +32,13 @@ use crate::worktree;
 
 /// How many trailing lines of a failing step's output the report keeps.
 const TAIL_LINES: usize = 40;
-/// Config file `run` looks for at the main checkout root.
+/// Config file `run` reads from the base branch head (never the PR tree
+/// or the reviewer's working tree).
 pub const CONFIG_FILE: &str = "cadence-review.toml";
-/// Required keys named when the config file is absent.
-const REQUIRED_KEYS: &str = "prepare, gates, full_suite, test_globs, test_command, stress_pattern";
+/// Required and optional keys, named when the config file is absent.
+const CONFIG_KEYS: &str = "Required keys: prepare, gates, full_suite, test_globs, \
+     test_command, stress_pattern; optional: [timeouts] prepare_secs gate_secs \
+     stress_secs full_secs test_secs git_secs gh_secs";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -195,67 +203,65 @@ pub struct ReviewConfig {
 }
 
 impl ReviewConfig {
-    /// Load `<root>/cadence-review.toml`; a missing file names the
-    /// required keys so a fresh repo can write one without guessing.
+    /// Load `<root>/cadence-review.toml` from disk; a missing file names
+    /// the required keys so a fresh repo can write one without guessing.
+    /// `run` never reads the working tree — see `config_at_base`.
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(CONFIG_FILE);
         if !path.is_file() {
             return Err(Error::rejected(format!(
                 "no {CONFIG_FILE} at {} — `cadence review` reads its steps \
-                 from that file. Required keys: {REQUIRED_KEYS}; optional: \
-                 [timeouts] prepare_secs gate_secs stress_secs full_secs \
-                 test_secs git_secs gh_secs",
+                 from that file. {CONFIG_KEYS}",
                 root.display()
             )));
         }
         let text = std::fs::read_to_string(&path)?;
-        let cfg: ReviewConfig = toml::from_str(&text)
-            .map_err(|e| Error::rejected(format!("{} is not valid TOML: {e}", path.display())))?;
+        Self::parse(&text, &path.display().to_string())
+    }
+
+    /// Parse and validate config text; `origin` (a path, or
+    /// `<sha>:cadence-review.toml`) names the source in every error.
+    pub fn parse(text: &str, origin: &str) -> Result<Self> {
+        let cfg: ReviewConfig = toml::from_str(text)
+            .map_err(|e| Error::rejected(format!("{origin} is not valid TOML: {e}")))?;
         if cfg.gates.is_empty() {
             return Err(Error::rejected(format!(
-                "{}: `gates` must name at least one command",
-                path.display()
+                "{origin}: `gates` must name at least one command"
             )));
         }
         if cfg.test_globs.is_empty() {
             return Err(Error::rejected(format!(
-                "{}: `test_globs` must name at least one pattern",
-                path.display()
+                "{origin}: `test_globs` must name at least one pattern"
             )));
         }
         if !cfg.test_command.contains("{test}") {
             return Err(Error::rejected(format!(
-                "{}: `test_command` must contain a {{test}} placeholder",
-                path.display()
+                "{origin}: `test_command` must contain a {{test}} placeholder"
             )));
         }
         if cfg.runner.result_format == ResultFormat::Junit
             && !safe_rel_path(&cfg.runner.result_path)
         {
             return Err(Error::rejected(format!(
-                "{}: runner.result_path must be a safe repo-relative path",
-                path.display()
+                "{origin}: runner.result_path must be a safe repo-relative path"
             )));
         }
         if cfg.runner.backend == ReviewBackend::Nextest {
             if cfg.runner.result_format != ResultFormat::Junit {
                 return Err(Error::rejected(format!(
-                    "{}: nextest requires runner.result_format = 'junit'",
-                    path.display()
+                    "{origin}: nextest requires runner.result_format = 'junit'"
                 )));
             }
             if !command_mentions_nextest(&cfg.full_suite)
                 || !command_mentions_nextest(&cfg.test_command)
             {
                 return Err(Error::rejected(format!(
-                    "{}: nextest backend requires both full_suite and test_command to use scripts/cadence-nextest",
-                    path.display()
+                    "{origin}: nextest backend requires both full_suite and test_command to use scripts/cadence-nextest"
                 )));
             }
             if !cfg.test_command.contains("--exact") || !cfg.test_command.contains("--") {
                 return Err(Error::rejected(format!(
-                    "{}: nextest test_command must use an exact libtest filter after '--'",
-                    path.display()
+                    "{origin}: nextest test_command must use an exact libtest filter after '--'"
                 )));
             }
         }
@@ -517,6 +523,48 @@ fn git_status(repo: &Path, args: &[&str], secs: u64) -> Result<StepOut> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args(args);
     run_cmd(&mut cmd, Duration::from_secs(secs))
+}
+
+/// The blob id of `cadence-review.toml` at `sha`, or `None` when the
+/// file does not exist in that commit.
+fn config_blob(repo: &Path, sha: &str, secs: u64) -> Result<Option<String>> {
+    let spec = format!("{sha}:{CONFIG_FILE}");
+    let out = git_status(repo, &["rev-parse", "--verify", "-q", &spec], secs)?;
+    if out.timed_out {
+        return Err(Error::internal(format!(
+            "git rev-parse {spec} timed out in {}",
+            repo.display()
+        )));
+    }
+    let blob = out.stdout.trim();
+    Ok((out.status == Some(0) && !blob.is_empty()).then(|| blob.to_string()))
+}
+
+/// The review config as committed at the base head — never the PR's
+/// copy, never the reviewer's working tree, so a PR cannot weaken the
+/// gates it is judged by (risk class 7). A base without the file is
+/// refused; there is no fallback.
+fn config_at_base(repo: &Path, base_ref: &str, base_sha: &str, secs: u64) -> Result<ReviewConfig> {
+    if config_blob(repo, base_sha, secs)?.is_none() {
+        return Err(Error::rejected(format!(
+            "no {CONFIG_FILE} at the base head {base_sha} ({base_ref}) — \
+             `cadence review` reads its steps from the file committed on \
+             the base branch, never from the PR or the working tree. \
+             {CONFIG_KEYS}"
+        )));
+    }
+    let spec = format!("{base_sha}:{CONFIG_FILE}");
+    let text = git(repo, &["show", &spec], secs)?;
+    ReviewConfig::parse(&text, &spec)
+}
+
+/// Whether the PR itself changes `cadence-review.toml`: its blob at the
+/// merge-base differs from the one at the PR head (absent on one side
+/// counts). Compared against the merge-base, not the base head, so a
+/// config change that landed on the base after the branch was cut is
+/// not blamed on the PR.
+fn config_changed_by_pr(repo: &Path, merge_base: &str, head_sha: &str, secs: u64) -> Result<bool> {
+    Ok(config_blob(repo, merge_base, secs)? != config_blob(repo, head_sha, secs)?)
 }
 
 /// Every `gh` invocation goes through here so tests put a fake `gh`
@@ -1552,8 +1600,9 @@ pub fn run(opts: &Options) -> Result<i32> {
         ));
     }
     let root = worktree::main_root(&opts.cwd)?;
-    let cfg = ReviewConfig::load(&root)?;
-    let t = &cfg.timeouts;
+    // The config comes from the base head, which is only known once the
+    // PR is resolved — every call up to there runs on default timeouts.
+    let pre = Timeouts::default();
 
     // Repo slug: --repo wins, else the origin remote's `gh repo view`.
     let slug = match &opts.repo {
@@ -1568,7 +1617,7 @@ pub fn run(opts: &Options) -> Result<i32> {
                 "--jq".into(),
                 ".nameWithOwner".into(),
             ],
-            t.gh_secs,
+            pre.gh_secs,
         )?,
     };
 
@@ -1584,7 +1633,7 @@ pub fn run(opts: &Options) -> Result<i32> {
         ))
     })?;
 
-    let pr = gh_pr_view(&root, &slug, &opts.pr, t.gh_secs)?;
+    let pr = gh_pr_view(&root, &slug, &opts.pr, pre.gh_secs)?;
     if pr.head_sha.is_empty() || pr.base_ref.is_empty() {
         return Err(Error::rejected(format!(
             "gh pr view {} returned no head/base — is it an open PR?",
@@ -1593,14 +1642,18 @@ pub fn run(opts: &Options) -> Result<i32> {
     }
 
     // Fetch both ends into the main object store.
-    git(&root, &["fetch", "-q", "origin", &pr.base_ref], t.git_secs)?;
-    let base_sha = git(&root, &["rev-parse", "FETCH_HEAD"], t.git_secs)?;
+    git(
+        &root,
+        &["fetch", "-q", "origin", &pr.base_ref],
+        pre.git_secs,
+    )?;
+    let base_sha = git(&root, &["rev-parse", "FETCH_HEAD"], pre.git_secs)?;
     git(
         &root,
         &["fetch", "-q", "origin", &format!("pull/{}/head", pr.number)],
-        t.git_secs,
+        pre.git_secs,
     )?;
-    let head_sha = git(&root, &["rev-parse", "FETCH_HEAD"], t.git_secs)?;
+    let head_sha = git(&root, &["rev-parse", "FETCH_HEAD"], pre.git_secs)?;
     if head_sha != pr.head_sha {
         return Err(Error::rejected(format!(
             "PR #{} head moved while resolving: gh saw {}, fetch got {} \
@@ -1608,8 +1661,14 @@ pub fn run(opts: &Options) -> Result<i32> {
             pr.number, pr.head_sha, head_sha
         )));
     }
-    let merge_base = git(&root, &["merge-base", &base_sha, &head_sha], t.git_secs)?;
+    let merge_base = git(&root, &["merge-base", &base_sha, &head_sha], pre.git_secs)?;
     let base_moved = merge_base != base_sha;
+
+    // Gates, full_suite and test_command come from the base head; a PR
+    // that edits the file is gated by the base copy and flagged.
+    let cfg = config_at_base(&root, &pr.base_ref, &base_sha, pre.git_secs)?;
+    let t = &cfg.timeouts;
+    let config_changed = config_changed_by_pr(&root, &merge_base, &head_sha, t.git_secs)?;
 
     // The review checkout — detached, never the author's worktree.
     let wt_name = format!("review-{}", pr.number);
@@ -1683,6 +1742,8 @@ pub fn run(opts: &Options) -> Result<i32> {
                  "moved_since_merge_base": base_moved},
         "merge_base": merge_base,
         "changed_files": pr.files,
+        "config": {"source": "base", "base_sha": base_sha,
+                   "changed_by_pr": config_changed},
         "gated_tree": gated_tree,
         "merge": merge,
         "worktree": tree.dir.to_string_lossy(),
@@ -2309,6 +2370,19 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
             );
         }
     }
+    // Risk class 7: a PR that rewrites its own gates never passes on
+    // the mechanical check alone, even though the base config gated it.
+    if report["config"]["changed_by_pr"].as_bool().unwrap_or(false) {
+        push_reason(
+            &mut level,
+            &mut reasons,
+            1,
+            format!(
+                "PR changes {CONFIG_FILE} — gated with the base head's config; \
+                 risk class 7 needs operator review"
+            ),
+        );
+    }
     if report["schema_migration"].as_bool().unwrap_or(false) {
         push_reason(
             &mut level,
@@ -2417,6 +2491,19 @@ fn render_markdown(r: &Value) -> String {
         } else {
             md.push_str("- merge result: clean — gates ran on the merged tree\n");
         }
+    }
+    if r["config"].is_object() {
+        let changed = r["config"]["changed_by_pr"].as_bool().unwrap_or(false);
+        md.push_str(&format!(
+            "- config: `{CONFIG_FILE}` from the base head `{}` — changed by this PR: **{}**{}\n",
+            short_sha(r["config"]["base_sha"].as_str().unwrap_or("")),
+            if changed { "yes" } else { "no" },
+            if changed {
+                " (the PR's copy was not used; risk class 7)"
+            } else {
+                ""
+            }
+        ));
     }
     md.push_str(&format!(
         "- duration {}s · {}\n\n**suggested verdict: {}**\n\n",
@@ -2796,6 +2883,59 @@ gate_secs = 42
     }
 
     #[test]
+    fn config_parse_names_its_origin() {
+        let origin = "abc123:cadence-review.toml";
+        let err = ReviewConfig::parse(
+            "prepare = []\ngates = []\nfull_suite = \"x\"\ntest_globs = [\"t/**\"]\ntest_command = \"{test}\"\n",
+            origin,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(origin) && err.contains("`gates`"), "{err}");
+        let err = ReviewConfig::parse("gates = [", origin)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("{origin} is not valid TOML")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn config_comes_from_the_base_commit_and_pr_changes_are_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let g = |args: &[&str]| git(repo, args, 60).unwrap();
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "no config"]);
+        let bare = g(&["rev-parse", "HEAD"]);
+        let base_toml = "prepare = []\ngates = [\"false\"]\nfull_suite = \"x\"\n\
+                         test_globs = [\"t/**\"]\ntest_command = \"{test}\"\n";
+        std::fs::write(repo.join(CONFIG_FILE), base_toml).unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-q", "-m", "config"]);
+        let base = g(&["rev-parse", "HEAD"]);
+        // The working tree says otherwise — it is never read.
+        std::fs::write(repo.join(CONFIG_FILE), base_toml.replace("false", "true")).unwrap();
+
+        let err = config_at_base(repo, "main", &bare, 60)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&bare) && err.contains("base head"), "{err}");
+        let cfg = config_at_base(repo, "main", &base, 60).unwrap();
+        assert_eq!(cfg.gates, vec!["false"]);
+
+        g(&["commit", "-q", "-am", "pr weakens gates"]);
+        let pr = g(&["rev-parse", "HEAD"]);
+        assert!(config_changed_by_pr(repo, &base, &pr, 60).unwrap());
+        assert!(!config_changed_by_pr(repo, &base, &base, 60).unwrap());
+        // Added where the merge-base had none counts as a change.
+        assert!(config_changed_by_pr(repo, &bare, &base, 60).unwrap());
+    }
+
+    #[test]
     fn junit_results_name_failures_and_reject_zero_tests() {
         let xml = r#"<?xml version="1.0"?>
 <testsuites tests="2" failures="1">
@@ -3025,6 +3165,26 @@ result_path = "target/nextest/cadence/junit.xml"
         // A failed base prepare blocks too.
         r["open_pr_conflicts"] = json!([]);
         r["base_prepare"] = json!([{"outcome": "fail"}]);
+        assert_eq!(suggest(&r, false).0, "blocked");
+    }
+
+    #[test]
+    fn config_change_by_pr_is_never_a_pass() {
+        let mut r = json!({"merge": {}, "prepare": [], "gates": [], "failures": [],
+            "stress": [], "open_pr_conflicts": [],
+            "config": {"source": "base", "base_sha": "b", "changed_by_pr": false}});
+        assert_eq!(suggest(&r, false).0, "pass");
+        r["config"]["changed_by_pr"] = json!(true);
+        let (verdict, reasons) = suggest(&r, false);
+        assert_eq!(verdict, "needs-hands-on", "{reasons:?}");
+        assert!(
+            reasons
+                .iter()
+                .any(|m| m.contains("changes cadence-review.toml") && m.contains("risk class 7")),
+            "{reasons:?}"
+        );
+        // Already blocked stays blocked.
+        r["gates"] = json!([{"cmd": "g", "outcome": "fail"}]);
         assert_eq!(suggest(&r, false).0, "blocked");
     }
 
