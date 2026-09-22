@@ -194,6 +194,11 @@ fn monitor_alert_action(kind: &str, monitor_owner: &str) -> (&'static str, Strin
             "operator".to_string(),
             "operator reconciliation required",
         ),
+        "turn_unknown" => (
+            "Inspect the uncertain turn and reconcile its worker",
+            "operator".to_string(),
+            "operator reconciliation required",
+        ),
         "draft_pending" => (
             "Route the draft to an independent reviewer",
             "reviewer".to_string(),

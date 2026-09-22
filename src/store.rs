@@ -2076,6 +2076,37 @@ impl Store {
             "turn_finished",
             json!({"message": message.id, "result": result}),
         )?;
+        // Preserve the uncertain provider outcome on the work axis.  The
+        // compatibility `turn_finished` row above stays unscoped, while
+        // this explicit unknown row is scoped only when the message carries
+        // a real task whose job binding can be proved in this transaction.
+        // Unknown is evidence for inspection, never a task success edge.
+        if status == "unknown" {
+            if let Some(task_id) = message.task_id.as_deref() {
+                let job_id: Option<String> = tx
+                    .query_row(
+                        "SELECT job_id FROM tasks WHERE id=?",
+                        [task_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(job_id) = job_id {
+                    Self::event_scoped(
+                        &tx,
+                        &message.alias,
+                        "turn_unknown",
+                        json!({
+                            "message": message.id,
+                            "reason": unknown_event_reason(error, result),
+                            "owner": "operator",
+                            "next_action": unknown_event_action(&message.id),
+                        }),
+                        Some(&job_id),
+                        Some(task_id),
+                    )?;
+                }
+            }
+        }
         // `unknown` must not route a result — the outcome was never
         // learned, so a result notification would be fabricated. The
         // replier still hears that the worker fenced: a one-shot notice
@@ -3621,6 +3652,7 @@ impl Store {
         matches!(
             kind,
             "turn_stalled"
+                | "turn_unknown"
                 | "attention"
                 | "paste_not_rendered"
                 | "delivery_parked"
@@ -5077,6 +5109,55 @@ impl Store {
         conn.query_row("SELECT * FROM verdicts WHERE seq=?", [seq], row_verdict)
             .map_err(Into::into)
     }
+}
+
+const UNKNOWN_EVENT_REASON_CHARS: usize = 512;
+
+/// Keep the provider's uncertainty account useful to an operator without
+/// copying credentials, control characters, or an unbounded provider blob
+/// into the durable event stream.
+fn unknown_event_reason(error: Option<&str>, result: &Value) -> String {
+    let reason = error
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            result
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or(crate::daemon::UNKNOWN_GENERIC_REASON);
+    let flat: String = reason
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let words: Vec<&str> = flat.split_whitespace().collect();
+    if words.is_empty() {
+        return crate::daemon::UNKNOWN_GENERIC_REASON.to_string();
+    }
+    let redacted = crate::doctor::host::redact_argv(&words);
+    if redacted.chars().count() <= UNKNOWN_EVENT_REASON_CHARS {
+        return redacted;
+    }
+    let mut bounded: String = redacted
+        .chars()
+        .take(UNKNOWN_EVENT_REASON_CHARS)
+        .collect();
+    bounded.push('…');
+    bounded
+}
+
+fn unknown_event_action(message_id: &str) -> String {
+    format!(
+        "{} {} Review message {message_id} before choosing an explicit reconcile status.",
+        crate::daemon::unknown_inspect_lead(),
+        crate::daemon::unknown_recovery_note(),
+    )
 }
 
 /// Terminal task states — verdicts/acceptance/cancellation are closed
