@@ -996,6 +996,9 @@ pub fn add_comment(
     if body.trim().is_empty() {
         return Err(Error::rejected("Comment body is empty — pass -m or --file"));
     }
+    // CAD-109: a credential-shaped body is refused before anything is
+    // written; warn-only findings ride along in the result.
+    let secret_warnings = crate::secret::guard(&format!("{id}: comment"), body)?;
     let _lock = pm.lock()?;
     if let Some(conflict) = check_rev(&dir, if_rev)? {
         return Ok(conflict);
@@ -1026,10 +1029,12 @@ pub fn add_comment(
         actor,
         author_opt,
     )?;
-    Ok(
-        json!({"id": id, "comment": path.file_name().map(|n| n.to_string_lossy().to_string()),
-              "author": author, "committed": true}),
-    )
+    let mut out = json!({"id": id, "comment": path.file_name().map(|n| n.to_string_lossy().to_string()),
+              "author": author, "committed": true});
+    if !secret_warnings.is_empty() {
+        out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
+    }
+    Ok(out)
 }
 
 /// `issue attach <ID> <file>` — copy into `artifacts/` (basename only),

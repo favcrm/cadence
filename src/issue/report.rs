@@ -27,6 +27,9 @@
 //! shield the credential), URI query parameters, PEM blocks, and the
 //! per-token credential shapes. Prose has no flag convention — a
 //! bare `hunter2` after no keyword survives; do not paste secrets.
+//! Before any of that, the raw body goes through the CAD-109 secret
+//! scan (`crate::secret::guard`): a blocking finding refuses the report
+//! with the rule named and nothing is filed.
 
 use std::path::Path;
 use std::time::Duration;
@@ -708,6 +711,9 @@ pub fn file(
     if body.trim().is_empty() {
         return Err(Error::rejected("Report body is empty — pass -m or --file"));
     }
+    // CAD-109: refuse credential-shaped input outright. `scrub_body` below
+    // stays as defence in depth for the shapes the scan does not block.
+    let secret_warnings = crate::secret::guard("report", &body)?;
     // Scrub the complete body before splitting the title. Pending key/value,
     // PEM and quoted-span state must survive the title/body boundary.
     let body = scrub_body(&body);
@@ -808,11 +814,15 @@ pub fn file(
         reporter.as_deref(),
         &msg_key(&[&id]),
     );
-    Ok(json!({
+    let mut out = json!({
         "id": id, "project": project.key, "kind": kind.as_str(),
         "priority": priority, "status": "backlog",
         "path": dir, "committed": true, "notified": notified,
-    }))
+    });
+    if !secret_warnings.is_empty() {
+        out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
+    }
+    Ok(out)
 }
 
 fn first_line(body: &str) -> &str {
