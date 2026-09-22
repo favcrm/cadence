@@ -16798,7 +16798,8 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
         )
         .unwrap_err();
     assert!(
-        err.contains("not owned by exactly one live native PTY"),
+        err.to_string()
+            .contains("not owned by exactly one live native PTY"),
         "{err}"
     );
 
