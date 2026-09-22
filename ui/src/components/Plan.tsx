@@ -1,5 +1,9 @@
+import ProjectContext from "./ProjectContext";
+import type { ProjectContext as ProjectContextPayload } from "../types";
+
 const API_ROWS: [string, string, string, number][] = [
   ["GET", "/api/projects", "folders, prefixes, counts", 1],
+  ["GET", "/api/projects/:key/context", "tracked manifest, pinned HEAD documents, verified memory context", 1],
   ["GET", "/api/issues?project=", "parsed frontmatter, derived status, counts", 1],
   ["GET", "/api/issues/:id", "issue body, links both ways, refs, file list, activity", 1],
   ["GET", "/api/issues/:id/file", "raw issue.md, text/markdown", 1],
@@ -22,10 +26,31 @@ const ITERS: [string, string, string, string][] = [
   ["later", "token", "Dispatch from a card", "First feature that acts rather than views. Waits for auth."],
 ];
 
-export default function Plan() {
+interface PlanProps {
+  project: string;
+  context: ProjectContextPayload | null;
+  contextLoading: boolean;
+  contextError: string | null;
+  onRetryContext: () => void;
+}
+
+export default function Plan({
+  project,
+  context,
+  contextLoading,
+  contextError,
+  onRetryContext,
+}: PlanProps) {
   return (
     <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
-      <div className="plan-grid grid xl:grid-cols-3 gap-x-8 gap-y-10">
+      <ProjectContext
+        project={project}
+        context={context}
+        loading={contextLoading}
+        error={contextError}
+        onRetry={onRetryContext}
+      />
+      <div className="plan-grid grid xl:grid-cols-3 gap-x-8 gap-y-10 mt-10">
         <div className="xl:col-span-2 min-w-0 space-y-16 max-w-[62rem]">
           <section className="reveal">
             <div className="flex items-baseline gap-3 mb-4">
