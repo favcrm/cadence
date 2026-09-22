@@ -922,6 +922,15 @@ pub fn propose_native(
         }
         (Some(_), Some(_)) => return Err(Error::rejected("propose takes one content source")),
     };
+    // CAD-109/CAD-192: a candidate is built from verdict notes and command
+    // output, and the file is in git the moment it is written, so a
+    // credential-shaped candidate is refused here rather than quarantined.
+    let scanned = [
+        from_text.or(text).unwrap_or_default(),
+        source.unwrap_or_default(),
+    ]
+    .join("\n");
+    let secret_warnings = crate::secret::guard("memory propose", &scanned)?;
     let slug = match slug {
         Some(s) => check_slug(s)?,
         None => {
@@ -997,7 +1006,7 @@ pub fn propose_native(
         &format!("{key}/memory/{slug}: proposed"),
         &actor.proof.alias,
     )?;
-    Ok(json!({
+    let mut out = json!({
         "project": key,
         "slug": slug,
         "status": "proposed",
@@ -1005,7 +1014,11 @@ pub fn propose_native(
         "quorum": {"eligible": false, "reason": "review required"},
         "path": mem.path,
         "committed": committed
-    }))
+    });
+    if !secret_warnings.is_empty() {
+        out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
+    }
+    Ok(out)
 }
 
 /// Submit one native review receipt. All reads that decide the revision are
@@ -1972,6 +1985,48 @@ mod tests {
     fn native(alias: &str, registration: u64) -> NativeIdentity {
         NativeIdentity {
             proof: proof(alias, registration),
+        }
+    }
+
+    /// CAD-192: a credential-shaped candidate is refused at propose, since
+    /// the file is in git the moment it is written. Nothing lands on disk.
+    #[test]
+    fn propose_refuses_credential_shaped_candidate() {
+        use sha2::{Digest, Sha256};
+        let (_dir, pm) = mutation_fixture();
+        let author = native("worker-author", 1);
+        let digest: String = Sha256::digest(b"memory-fixture")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let token = ["figd", "_", &digest[..40]].concat();
+        let body =
+            format!("fact\n\n**Why:** the run printed {token}\n\n**How to apply:** use it\n");
+        for (text, source) in [
+            (body.as_str(), Some("CAD-192")),
+            ("fact", Some(token.as_str())),
+        ] {
+            let err = propose_native(
+                &pm,
+                "demo",
+                "rule",
+                &Scope {
+                    project: true,
+                    ..Scope::default()
+                },
+                source,
+                None,
+                None,
+                Some(text),
+                Some("leaky"),
+                &author,
+            )
+            .unwrap_err();
+            assert_eq!(err.code(), Some("secret_detected"));
+            let msg = err.to_string();
+            assert!(msg.contains("rule cadence-figma-token"), "{msg}");
+            assert!(!msg.contains(&digest[..40]), "{msg}");
+            assert!(!memory_dir(&pm, "demo").join("leaky.md").exists());
         }
     }
 
