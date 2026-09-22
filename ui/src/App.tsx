@@ -10,7 +10,7 @@ import Sidebar from "./components/Sidebar";
 import Toast, { type ToastMsg } from "./components/Toast";
 import { Logo } from "./components/Logo";
 import type { BoardFilters } from "./filters";
-import { responseBelongsToRequest, visibleContext } from "./projectContextGuard";
+import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./projectContextGuard";
 import {
   browserStoredProjectView,
   persistBrowserProjectView,
@@ -125,12 +125,14 @@ export default function App() {
         }
       })
       .catch((error) => {
-        if (!responseBelongsToRequest(request, projectContextRequest.current, project, project)) return;
+        if (!requestIsCurrent(request, projectContextRequest.current, project, project)) return;
         setProjectContextError(String(error?.message ?? error));
         setProjectContextErrorProject(project);
       })
       .finally(() => {
-        if (request === projectContextRequest.current) setProjectContextLoading(false);
+        if (requestIsCurrent(request, projectContextRequest.current, project, project)) {
+          setProjectContextLoading(false);
+        }
       });
   }, [project, tab, projectContextRefresh]);
 

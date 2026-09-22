@@ -5,8 +5,9 @@
 //! KB of `git log` was enough to turn every call into a timeout.
 
 use std::io::Read;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -18,6 +19,12 @@ pub enum BoundedError {
     TimedOut { stdout: Vec<u8>, stderr: Vec<u8> },
     /// Waiting on the child failed.
     Wait(std::io::Error),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutputBounds {
+    pub stdout_exceeded: bool,
+    pub stderr_exceeded: bool,
 }
 
 impl std::fmt::Display for BoundedError {
@@ -42,7 +49,8 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Ve
 fn drain_limited(
     pipe: Option<impl Read + Send + 'static>,
     limit: usize,
-) -> std::thread::JoinHandle<(Vec<u8>, bool)> {
+) -> Receiver<(Vec<u8>, bool)> {
+    let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let mut exceeded = false;
@@ -65,8 +73,63 @@ fn drain_limited(
                 }
             }
         }
-        (buf, exceeded)
-    })
+        let _ = sender.send((buf, exceeded));
+    });
+    receiver
+}
+
+/// Observe a child without reaping it. Keeping the leader unreaped preserves
+/// its process-group id if a descendant keeps a pipe open after the leader
+/// exits; the caller can then terminate the group before the final wait.
+fn child_exited(pid: libc::pid_t) -> Result<bool, std::io::Error> {
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() } == pid)
+}
+
+fn reap_child(pid: libc::pid_t) -> Result<std::process::ExitStatus, std::io::Error> {
+    let mut raw_status = 0;
+    loop {
+        let result = unsafe { libc::waitpid(pid, &mut raw_status, 0) };
+        if result == pid {
+            return Ok(std::process::ExitStatus::from_raw(raw_status));
+        }
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+}
+
+fn kill_process_group(pid: libc::pid_t) {
+    // SAFETY: the limited runner only calls this while the child is either
+    // unreaped or known to be alive via waitid(WNOWAIT), so its process-group
+    // id cannot have been reused for an unrelated process group.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+}
+
+fn receive_limited(
+    receiver: &Receiver<(Vec<u8>, bool)>,
+    deadline: Instant,
+) -> Option<(Vec<u8>, bool)> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match receiver.recv_timeout(remaining) {
+        Ok(result) => Some(result),
+        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
+    }
 }
 
 /// Run `cmd` to completion or `timeout`, whichever is first. stdin is
@@ -113,14 +176,14 @@ pub fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<Output, Bound
 }
 
 /// Like [`run_bounded`], but retain at most `limit` bytes from each output
-/// stream while still draining the child. The boolean reports whether either
-/// stream exceeded the retained bound, allowing callers that expose output to
-/// fail closed without buffering unbounded Git or helper output.
+/// stream while still draining the child. The returned bounds identify which
+/// stream exceeded its limit, allowing callers that expose output to fail
+/// closed without buffering unbounded Git or helper output.
 pub fn run_bounded_limited(
     cmd: &mut Command,
     timeout: Duration,
     limit: usize,
-) -> Result<(Output, bool), BoundedError> {
+) -> Result<(Output, OutputBounds), BoundedError> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -131,31 +194,75 @@ pub fn run_bounded_limited(
     let stdout = drain_limited(child.stdout.take(), limit);
     let stderr = drain_limited(child.stderr.take(), limit);
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(Some(status)),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            Ok(None) => break Ok(None),
-            Err(e) => break Err(e),
+    let pid = child.id() as libc::pid_t;
+    let mut exited = false;
+    let mut wait_error = None;
+    while Instant::now() < deadline {
+        match child_exited(pid) {
+            Ok(true) => {
+                exited = true;
+                break;
+            }
+            Ok(false) => std::thread::sleep(Duration::from_millis(5)),
+            Err(error) => {
+                wait_error = Some(error);
+                break;
+            }
         }
-    };
-    if !matches!(status, Ok(Some(_))) {
-        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-        let _ = child.wait();
     }
-    let (stdout, stdout_exceeded) = stdout.join().unwrap_or_default();
-    let (stderr, stderr_exceeded) = stderr.join().unwrap_or_default();
-    match status {
-        Ok(Some(status)) => Ok((
+
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    let mut timed_out = !exited && wait_error.is_none();
+    if exited {
+        // The leader is deliberately still a zombie here. If either reader
+        // misses the same deadline, terminate its group before reaping it.
+        stdout_result = receive_limited(&stdout, deadline);
+        stderr_result = receive_limited(&stderr, deadline);
+        if stdout_result.is_none() || stderr_result.is_none() {
+            kill_process_group(pid);
+            timed_out = true;
+        }
+    } else if timed_out {
+        kill_process_group(pid);
+    }
+
+    if wait_error.is_none() {
+        // The leader is either already exited (WNOWAIT) or was killed while
+        // still running. In both cases it is safe to reap now.
+        let status = reap_child(pid).map_err(BoundedError::Wait)?;
+        if timed_out {
+            if stdout_result.is_none() {
+                stdout_result = stdout.try_recv().ok();
+            }
+            if stderr_result.is_none() {
+                stderr_result = stderr.try_recv().ok();
+            }
+            let (stdout, _) = stdout_result.unwrap_or_default();
+            let (stderr, _) = stderr_result.unwrap_or_default();
+            return Err(BoundedError::TimedOut { stdout, stderr });
+        }
+        let (stdout, stdout_exceeded) = stdout_result.unwrap_or_default();
+        let (stderr, stderr_exceeded) = stderr_result.unwrap_or_default();
+        return Ok((
             Output {
                 status,
                 stdout,
                 stderr,
             },
-            stdout_exceeded || stderr_exceeded,
-        )),
-        Ok(None) => Err(BoundedError::TimedOut { stdout, stderr }),
-        Err(e) => Err(BoundedError::Wait(e)),
+            OutputBounds {
+                stdout_exceeded,
+                stderr_exceeded,
+            },
+        ));
+    }
+
+    let (stdout, _) = stdout_result.unwrap_or_default();
+    let (stderr, _) = stderr_result.unwrap_or_default();
+    if let Some(error) = wait_error {
+        Err(BoundedError::Wait(error))
+    } else {
+        Err(BoundedError::TimedOut { stdout, stderr })
     }
 }
 
@@ -243,5 +350,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, BoundedError::Spawn(_)));
+    }
+
+    #[test]
+    fn limited_output_reports_each_stream_bound() {
+        let (out, bounds) = run_bounded_limited(
+            &mut sh("head -c 64 /dev/zero; head -c 64 /dev/zero >&2"),
+            Duration::from_secs(2),
+            8,
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 8);
+        assert_eq!(out.stderr.len(), 8);
+        assert!(bounds.stdout_exceeded);
+        assert!(bounds.stderr_exceeded);
+    }
+
+    #[test]
+    fn limited_runner_bounds_a_leader_with_a_pipe_holding_descendant() {
+        let started = Instant::now();
+        let err = run_bounded_limited(&mut sh("sleep 30 & exit 0"), Duration::from_millis(300), 64)
+            .unwrap_err();
+        assert!(matches!(err, BoundedError::TimedOut { .. }));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

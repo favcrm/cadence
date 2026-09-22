@@ -166,7 +166,7 @@ export interface ProjectContext {
     head_revision?: string;
     expected_revision?: string;
     revision_state: string;
-    dirty: boolean;
+    dirty: boolean | null;
     dirty_truncated: boolean;
     repo_identity?: string;
     error?: string;

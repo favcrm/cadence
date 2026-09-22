@@ -7894,6 +7894,7 @@ fn project_context_rejects_invalid_paths_and_reports_repository_states() {
     let (code, body) = http(port, "GET", "/api/projects/bad/context", &host);
     assert_eq!(code, 200, "{body}");
     let huge: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(huge["state"], "too_large");
     assert_eq!(huge["documents"][0]["state"], "too_large");
     assert!(huge["documents"][0].get("excerpt").is_none());
 
@@ -7914,8 +7915,79 @@ fn project_context_rejects_invalid_paths_and_reports_repository_states() {
     let (code, body) = http(port, "GET", "/api/projects/bad/context", &host);
     assert_eq!(code, 200, "{body}");
     let linked: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(linked["state"], "unreadable");
     assert_eq!(linked["documents"][0]["state"], "unreadable");
     assert!(!body.contains("target bytes must not appear"));
+}
+
+#[test]
+fn project_context_manifest_conflicts_are_bounded_and_select_nothing() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let _ = context_repo(repo.path(), "conflicts", "docs/guide.md", "guide\n");
+    assert!(cli(pm.path(), state.path(), &["issue", "init"]).0);
+    add_context_project(pm.path(), state.path(), "conflicts", "C", &[repo.path()]);
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let replace_manifest = |manifest: &str, message: &str| -> Value {
+        std::fs::write(
+            repo.path().join("docs/cadence/project-context.yaml"),
+            manifest,
+        )
+        .unwrap();
+        assert!(git(repo.path(), &["add", "-A"]).0);
+        assert!(git(repo.path(), &["commit", "-qm", message]).0);
+        let (code, body) = http(port, "GET", "/api/projects/conflicts/context", &host);
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str(&body).unwrap()
+    };
+
+    let malformed = replace_manifest("schema: [", "malformed context manifest");
+    assert_eq!(malformed["state"], "conflict");
+    assert_eq!(malformed["documents"].as_array().unwrap().len(), 0);
+
+    let mismatched = replace_manifest(
+        "schema: 1\nproject: another\ndocuments:\n  - id: guide\n    kind: index\n    path: docs/guide.md\n    title: Guide\n    required: true\n",
+        "mismatched context manifest",
+    );
+    assert_eq!(mismatched["state"], "conflict");
+    assert_eq!(mismatched["documents"][0]["selected"], false);
+    assert!(mismatched["documents"][0].get("excerpt").is_none());
+
+    let duplicate = replace_manifest(
+        "schema: 1\nproject: conflicts\ndocuments:\n  - id: guide\n    kind: index\n    path: docs/guide.md\n    title: Guide\n    required: true\n  - id: guide\n    kind: index\n    path: docs/guide.md\n    title: Duplicate\n    required: false\n",
+        "duplicate context manifest",
+    );
+    assert_eq!(duplicate["state"], "conflict");
+    assert!(duplicate["manifest"]["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error.as_str().unwrap().contains("duplicate")));
+    assert!(duplicate["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|document| document["selected"] == false));
+
+    let mut oversized = String::from("schema: 1\nproject: conflicts\ndocuments:\n");
+    for index in 0..33 {
+        oversized.push_str(&format!(
+            "  - id: doc-{index}\n    kind: spec\n    path: docs/doc-{index}.md\n    title: Document {index}\n    required: false\n"
+        ));
+    }
+    let oversized = replace_manifest(&oversized, "oversized context manifest");
+    assert_eq!(oversized["state"], "conflict");
+    assert_eq!(oversized["manifest"]["entry_count"], 33);
+    assert_eq!(oversized["manifest"]["entries_omitted"], 1);
+    assert_eq!(oversized["documents"].as_array().unwrap().len(), 32);
+    assert!(oversized["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|document| document["selected"] == false));
+    assert!(!oversized.to_string().contains("doc-32.md"));
 }
 
 #[test]
@@ -8022,5 +8094,10 @@ fn project_context_memories_include_only_verified_lessons_and_bound_withheld() {
         .iter()
         .any(|item| item["id"] == "proposed"));
     assert!(value["memories"]["load_errors_total"].as_u64().unwrap() >= 1);
+    assert!(value["memories"]["load_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|error| error.as_str().unwrap().contains("broken.md")));
     assert!(value["memories"]["lessons"].as_str().unwrap().len() <= 4 * 1024);
 }

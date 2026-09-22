@@ -95,7 +95,7 @@ pub struct RepoSnapshot {
     pub head_revision: Option<String>,
     pub expected_revision: Option<String>,
     pub revision_state: String,
-    pub dirty: bool,
+    pub dirty: Option<bool>,
     pub dirty_truncated: bool,
     pub repo_identity: Option<String>,
     pub error: Option<String>,
@@ -159,14 +159,17 @@ fn bounded_git_with_limit(
     for arg in args {
         cmd.arg(arg);
     }
-    let (output, exceeded) = proc::run_bounded_limited(&mut cmd, GIT_TIMEOUT, output_limit)
-        .map_err(|e| match e {
+    let (output, bounds) =
+        proc::run_bounded_limited(&mut cmd, GIT_TIMEOUT, output_limit).map_err(|e| match e {
             BoundedError::TimedOut { .. } => "git operation timed out".to_string(),
             BoundedError::Spawn(_) => "git could not be started".to_string(),
             BoundedError::Wait(_) => "git operation could not be reaped".to_string(),
         })?;
-    if exceeded {
-        return Err("git output exceeded the bounded limit".to_string());
+    if bounds.stdout_exceeded {
+        return Err("git stdout exceeded the bounded limit".to_string());
+    }
+    if bounds.stderr_exceeded {
+        return Err("git stderr exceeded the bounded limit".to_string());
     }
     if !output.status.success() {
         return Err("git operation failed".to_string());
@@ -183,16 +186,24 @@ pub fn valid_revision(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn dirty_probe(root: &Path) -> (bool, bool, Option<String>) {
+fn dirty_probe(root: &Path) -> (Option<bool>, bool, Option<String>) {
     let args = vec![
         "status".to_string(),
         "--porcelain=v1".to_string(),
         "--untracked-files=no".to_string(),
     ];
     match bounded_git(root, &args) {
-        Ok(bytes) => (!bytes.is_empty(), false, None),
-        Err(error) if error.contains("bounded limit") => (true, true, None),
-        Err(error) => (false, false, Some(error)),
+        Ok(bytes) => (Some(!bytes.is_empty()), false, None),
+        Err(error) if error.contains("stdout exceeded") => (
+            Some(true),
+            true,
+            Some("tracked status exceeded the bounded output; dirty=true".to_string()),
+        ),
+        Err(error) => (
+            None,
+            false,
+            Some(format!("working tree state unavailable: {error}")),
+        ),
     }
 }
 
@@ -736,7 +747,7 @@ fn cap_response(mut payload: Value) -> Value {
             for document in documents.iter_mut().rev() {
                 let Some(excerpt) = document
                     .get_mut("excerpt")
-                    .and_then(Value::as_str)
+                    .and_then(|value| value.as_str())
                     .map(str::to_string)
                 else {
                     continue;
@@ -784,7 +795,7 @@ pub fn bundle(
                     head_revision: None,
                     expected_revision: expected_revision.map(str::to_string),
                     revision_state: "unknown".to_string(),
-                    dirty: false,
+                    dirty: None,
                     dirty_truncated: false,
                     repo_identity: None,
                     error: Some(reason),
@@ -795,6 +806,27 @@ pub fn bundle(
             });
         }
     };
+    if source.snapshot.dirty.is_none() {
+        let reason = source
+            .snapshot
+            .error
+            .clone()
+            .unwrap_or_else(|| "working tree state unavailable".to_string());
+        return cap_response(json!({
+            "project": selected.key,
+            "state": "unavailable_repository",
+            "manifest": {
+                "path": DEFAULT_MANIFEST_PATH,
+                "state": "unavailable_repository",
+                "revision": source.head,
+                "errors": [reason],
+            },
+            "snapshot": source.snapshot,
+            "documents": [],
+            "memories": empty_memories(),
+            "limits": limits_json(false),
+        }));
+    }
     let manifest_result = read_blob(&source.root, &source.head, DEFAULT_MANIFEST_PATH);
     let manifest_text = match manifest_result {
         Ok(Some(text)) => text,
@@ -873,8 +905,10 @@ pub fn bundle(
         } else if let Some(role) = role {
             if document.roles.is_empty() {
                 "optional-default".to_string()
-            } else {
+            } else if document.roles.iter().any(|candidate| candidate == role) {
                 format!("role:{role}")
+            } else {
+                "excluded:role-mismatch".to_string()
             }
         } else {
             "optional-default".to_string()
@@ -893,17 +927,35 @@ pub fn bundle(
         if let Some(path) = path {
             selected_paths.push(path);
         }
+        if is_selected
+            && path_error(&document.path).is_none()
+            && !selected_paths.iter().any(|path| path == &document.path)
+        {
+            // A manifest path is context even when its tracked blob is
+            // missing or unreadable; memory matching must not depend on a
+            // document happening to be available at this HEAD.
+            selected_paths.push(document.path.clone());
+        }
         documents.push(value);
     }
     let state = if !valid_manifest {
         "conflict"
     } else if required_failure {
-        if documents.iter().any(|document| {
-            document["required"].as_bool() == Some(true) && document["state"] == "missing"
-        }) {
+        let required_state = |wanted: &str| {
+            documents.iter().any(|document| {
+                document["required"].as_bool() == Some(true) && document["state"] == wanted
+            })
+        };
+        if required_state("missing") {
             "missing"
+        } else if required_state("too_large") {
+            "too_large"
+        } else if required_state("unreadable") {
+            "unreadable"
+        } else if required_state("invalid_path") {
+            "invalid_path"
         } else {
-            "conflict"
+            "blocked"
         }
     } else {
         "ready"

@@ -90,7 +90,8 @@ export default function ProjectContext({
         <div className="flex flex-wrap items-center gap-2">
           <StateChip label="bundle" state={context.state} />
           <StateChip label="revision" state={snapshot.revision_state} />
-          {snapshot.dirty && <StateChip label="worktree" state="dirty" />}
+          {snapshot.dirty === true && <StateChip label="worktree" state="dirty" />}
+          {snapshot.dirty === null && <StateChip label="worktree" state="unknown" />}
           {snapshot.dirty_truncated && <span className="chip text-warn bg-warn/10">dirty listing bounded</span>}
           <StateChip label="manifest" state={context.manifest.state} />
         </div>
