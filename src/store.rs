@@ -2077,6 +2077,35 @@ impl Store {
             "turn_finished",
             json!({"message": message.id, "result": result}),
         )?;
+        // Preserve the uncertain provider outcome on the work axis.  The
+        // compatibility `turn_finished` row above stays unscoped, while
+        // this explicit unknown row is scoped only when the message carries
+        // a real task whose job binding can be proved in this transaction.
+        // Unknown is evidence for inspection, never a task success edge.
+        if status == "unknown" {
+            if let Some(task_id) = message.task_id.as_deref() {
+                let job_id: Option<String> = tx
+                    .query_row("SELECT job_id FROM tasks WHERE id=?", [task_id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                if let Some(job_id) = job_id {
+                    Self::event_scoped(
+                        &tx,
+                        &message.alias,
+                        "turn_unknown",
+                        json!({
+                            "message": message.id,
+                            "reason": unknown_event_reason(error, result),
+                            "owner": "operator",
+                            "next_action": unknown_event_action(&message.id),
+                        }),
+                        Some(&job_id),
+                        Some(task_id),
+                    )?;
+                }
+            }
+        }
         // `unknown` must not route a result — the outcome was never
         // learned, so a result notification would be fabricated. The
         // replier still hears that the worker fenced: a one-shot notice
@@ -3622,6 +3651,7 @@ impl Store {
         matches!(
             kind,
             "turn_stalled"
+                | "turn_unknown"
                 | "attention"
                 | "paste_not_rendered"
                 | "delivery_parked"
@@ -5080,6 +5110,52 @@ impl Store {
     }
 }
 
+const UNKNOWN_EVENT_REASON_CHARS: usize = 512;
+
+/// Keep the provider's uncertainty account useful to an operator without
+/// copying credentials, control characters, or an unbounded provider blob
+/// into the durable event stream.
+fn unknown_event_reason(error: Option<&str>, result: &Value) -> String {
+    let reason = error
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            result
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or(crate::daemon::UNKNOWN_GENERIC_REASON);
+    let flat: String = reason
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let words: Vec<&str> = flat.split_whitespace().collect();
+    if words.is_empty() {
+        return crate::daemon::UNKNOWN_GENERIC_REASON.to_string();
+    }
+    let redacted = crate::doctor::host::redact_argv(&words);
+    if redacted.chars().count() <= UNKNOWN_EVENT_REASON_CHARS {
+        return redacted;
+    }
+    let mut bounded: String = redacted.chars().take(UNKNOWN_EVENT_REASON_CHARS).collect();
+    bounded.push('…');
+    bounded
+}
+
+fn unknown_event_action(message_id: &str) -> String {
+    format!(
+        "{} {} Review message {message_id} before choosing an explicit reconcile status.",
+        crate::daemon::unknown_inspect_lead(),
+        crate::daemon::unknown_recovery_note(),
+    )
+}
+
 /// Terminal task states — verdicts/acceptance/cancellation are closed
 /// to these. `verified` sits between review and done (accept pending).
 fn is_task_terminal(state: &str) -> bool {
@@ -6010,6 +6086,134 @@ mod tests {
         let t = s.task("t1").unwrap();
         assert_eq!(t.state, "review");
         assert_eq!(t.head_sha.as_deref(), Some(SHA40_A));
+    }
+
+    #[test]
+    fn unknown_event_reason_redacts_bounds_and_drops_controls() {
+        let secret = "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c";
+        let redacted = unknown_event_reason(
+            Some(&format!("provider dropped --token={secret} mid-turn")),
+            &json!({}),
+        );
+        assert!(!redacted.contains(secret), "{redacted}");
+        assert!(redacted.contains("[REDACTED]"), "{redacted}");
+        assert!(!redacted.chars().any(char::is_control), "{redacted}");
+
+        let noisy =
+            unknown_event_reason(Some(&format!("lost\u{1}connection {secret}")), &json!({}));
+        assert!(!noisy.contains('\u{1}'), "{noisy}");
+        assert!(!noisy.contains(secret), "{noisy}");
+
+        assert_eq!(
+            unknown_event_reason(Some("   "), &json!({"error": "  "})),
+            crate::daemon::UNKNOWN_GENERIC_REASON
+        );
+        assert_eq!(
+            unknown_event_reason(None, &json!({})),
+            crate::daemon::UNKNOWN_GENERIC_REASON
+        );
+        let from_result =
+            unknown_event_reason(None, &json!({"error": format!("see --token={secret}")}));
+        assert!(!from_result.contains(secret), "{from_result}");
+        assert!(from_result.contains("[REDACTED]"), "{from_result}");
+
+        let bounded = unknown_event_reason(Some(&"a".repeat(600)), &json!({}));
+        assert!(bounded.ends_with('…'), "{bounded}");
+        assert_eq!(bounded.chars().count(), UNKNOWN_EVENT_REASON_CHARS + 1);
+    }
+
+    #[test]
+    fn finish_unknown_emits_one_scoped_event_and_skips_unscoped() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        let message = run_kickoff(&s, &kickoff);
+        let secret = "9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c";
+        let reason = format!("dropped --token={secret}");
+        s.finish(
+            &message,
+            "unknown",
+            &json!({"status": "unknown", "text": "", "error": reason}),
+            Some(&reason),
+        )
+        .unwrap();
+        assert_eq!(s.task("t1").unwrap().state, "running");
+        assert!(s.task("t1").unwrap().head_sha.is_none());
+        assert_eq!(s.message(&kickoff).unwrap().unwrap().state, "unknown");
+        let unknown: Vec<_> = s
+            .job_events("j1", 0, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "turn_unknown")
+            .collect();
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert_eq!(unknown[0].job_id.as_deref(), Some("j1"));
+        assert_eq!(unknown[0].task_id.as_deref(), Some("t1"));
+        assert_eq!(unknown[0].payload["message"], kickoff);
+        assert_eq!(unknown[0].payload["owner"], "operator");
+        let stored_reason = unknown[0].payload["reason"].as_str().unwrap();
+        assert!(!stored_reason.contains(secret), "{stored_reason}");
+        assert!(stored_reason.contains("[REDACTED]"), "{stored_reason}");
+        assert!(unknown[0].payload["next_action"]
+            .as_str()
+            .unwrap()
+            .contains(&kickoff));
+        assert!(s
+            .events("w1", 0, 80)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "turn_finished"));
+
+        s.create_task("j1", "t2", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, kick2, ..) = s.dispatch_task("t2", None, None, "test").unwrap();
+        let completed = run_kickoff(&s, &kick2);
+        s.finish(
+            &completed,
+            "completed",
+            &json!({"status": "completed", "text": "done", "sha": SHA40_A}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.task("t2").unwrap().state, "review");
+        assert_eq!(
+            s.job_events("j1", 0, 80)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "turn_unknown")
+                .count(),
+            1
+        );
+
+        s.enqueue("w1", "plain", None, "plain", "user").unwrap();
+        let plain = run_kickoff(&s, "plain");
+        s.finish(
+            &plain,
+            "unknown",
+            &json!({"status": "unknown", "error": "no task"}),
+            Some("no task"),
+        )
+        .unwrap();
+        s.enqueue("w1", "dangling", None, "dangling", "user")
+            .unwrap();
+        let mut dangling = run_kickoff(&s, "dangling");
+        dangling.task_id = Some("missing-task".into());
+        s.finish(
+            &dangling,
+            "unknown",
+            &json!({"status": "unknown", "error": "missing task"}),
+            Some("missing task"),
+        )
+        .unwrap();
+        assert_eq!(
+            s.job_events("j1", 0, 80)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "turn_unknown")
+                .count(),
+            1
+        );
+        assert_eq!(s.task("t1").unwrap().state, "running");
     }
 
     #[test]

@@ -194,6 +194,11 @@ fn monitor_alert_action(kind: &str, monitor_owner: &str) -> (&'static str, Strin
             "operator".to_string(),
             "operator reconciliation required",
         ),
+        "turn_unknown" => (
+            "Inspect the uncertain turn and reconcile its worker",
+            "operator".to_string(),
+            "operator reconciliation required",
+        ),
         "draft_pending" => (
             "Route the draft to an independent reviewer",
             "reviewer".to_string(),
@@ -1518,6 +1523,46 @@ mod tests {
         assert_eq!(alert["authority"], "monitor owner may reconcile the worker");
         assert_eq!(alert["evidence"]["event_seq"], 44);
         assert_eq!(alert["evidence"]["fingerprint"], "turn-stalled:44");
+    }
+
+    #[test]
+    fn turn_unknown_overview_requires_operator_reconciliation() {
+        let monitors = vec![json!({
+            "id": "unknown-monitor",
+            "project": "cadence",
+            "owner": "operator",
+            "monitoring": "active",
+            "last_success_at": 90.0,
+            "last_check_at": 100.0,
+            "next_check_at": 160.0,
+            "error": Value::Null,
+        })];
+        let mut alerts_by_monitor = HashMap::new();
+        alerts_by_monitor.insert(
+            "unknown-monitor".to_string(),
+            vec![json!({
+                "seq": 3,
+                "monitor": "unknown-monitor",
+                "task": "unknown-task",
+                "event_seq": 9,
+                "fingerprint": "event:9",
+                "kind": "turn_unknown",
+                "payload": {"reason": "bounded"},
+                "state": "open",
+                "attempts": 0,
+                "last_error": Value::Null,
+                "created": 100.0,
+                "updated": 100.0,
+            })],
+        );
+        let view = monitoring_view(monitors, alerts_by_monitor, HashMap::new(), 130);
+        let alert = &view["alerts"][0];
+        assert_eq!(alert["kind"], "turn_unknown");
+        assert_eq!(alert["next_owner"], "operator");
+        assert_eq!(alert["authority"], "operator reconciliation required");
+        let action = alert["next_action"].as_str().unwrap();
+        assert!(action.contains("Inspect"), "{action}");
+        assert!(action.contains("reconcil"), "{action}");
     }
 
     #[test]
