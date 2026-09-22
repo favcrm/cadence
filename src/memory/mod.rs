@@ -688,6 +688,12 @@ pub fn retrieval_status(mem: &Memory) -> (bool, String) {
             "review blocked: acceptance finalization is bound to an invalid cycle".to_string(),
         );
     }
+    if mem.front.review_cycle == 0 {
+        return (
+            false,
+            "review blocked: accepted record has no current review cycle".to_string(),
+        );
+    }
     let (accept_quorum, accept_reason) =
         quorum_status_for_cycle(mem, "accept", accept_finalization.cycle);
     if !accept_quorum {
@@ -739,6 +745,17 @@ pub fn retrieval_status(mem: &Memory) -> (bool, String) {
                 "accepted with PM verify finalization cycle {}",
                 receipt.cycle
             ),
+        );
+    }
+    if mem
+        .front
+        .finalizations
+        .iter()
+        .any(|receipt| receipt.operation == "verify")
+    {
+        return (
+            false,
+            "review blocked: verify finalization exists without a current verify cycle".to_string(),
         );
     }
     (true, "accepted with PM acceptance finalization".to_string())
