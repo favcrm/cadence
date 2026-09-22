@@ -134,6 +134,71 @@ export interface Project {
   issues: number;
 }
 
+export type ContextRole = "pm" | "dev" | "qa" | "ops";
+
+export interface ProjectContextDocument {
+  id: string;
+  kind: string;
+  path: string;
+  title: string;
+  required: boolean;
+  selected: boolean;
+  selection_reason: string;
+  state: string;
+  reason?: string;
+  bytes?: number;
+  excerpt?: string;
+  truncated?: boolean;
+}
+
+export interface ProjectContext {
+  project: string;
+  state: string;
+  manifest: {
+    path: string;
+    state: string;
+    revision?: string;
+    entry_count?: number;
+    entries_omitted?: number;
+    errors: string[];
+  };
+  snapshot: {
+    head_revision?: string;
+    expected_revision?: string;
+    revision_state: string;
+    dirty: boolean;
+    dirty_truncated: boolean;
+    repo_identity?: string;
+    error?: string;
+  };
+  documents: ProjectContextDocument[];
+  memories: {
+    included: { id: string; kind: string; confidence: string; verified_at?: string }[];
+    lessons: string;
+    withheld: { id: string; status: string; reason: string }[];
+    withheld_total: number;
+    withheld_omitted: number;
+    load_errors: string[];
+    load_errors_total: number;
+    load_errors_omitted: number;
+    matched_total: number;
+  };
+  limits: {
+    max_manifest_bytes: number;
+    max_manifest_entries: number;
+    max_path_bytes: number;
+    max_title_bytes: number;
+    max_document_bytes: number;
+    max_excerpt_bytes: number;
+    max_git_output_bytes: number;
+    max_memory_entries: number;
+    max_memory_lesson_bytes: number;
+    max_response_bytes: number;
+    response_truncated: boolean;
+    response_excerpt_reductions: number;
+  };
+}
+
 /** One `needs_me` row — what is waiting on a human, with the command. */
 export interface NeedsMe {
   kind: string;

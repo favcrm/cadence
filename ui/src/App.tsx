@@ -10,6 +10,7 @@ import Sidebar from "./components/Sidebar";
 import Toast, { type ToastMsg } from "./components/Toast";
 import { Logo } from "./components/Logo";
 import type { BoardFilters } from "./filters";
+import { responseBelongsToRequest, visibleContext } from "./projectContextGuard";
 import {
   browserStoredProjectView,
   persistBrowserProjectView,
@@ -26,6 +27,7 @@ import type {
   Meta,
   Overview,
   Project,
+  ProjectContext,
 } from "./types";
 
 export default function App() {
@@ -37,6 +39,13 @@ export default function App() {
   const [tab, setTab] = useState<AppTab>(initial.tab);
   const [view, setView] = useState<ProjectView>(initial.view);
   const [project, setProject] = useState(initial.project);
+  const [projectContext, setProjectContext] = useState<ProjectContext | null>(null);
+  const [projectContextLoading, setProjectContextLoading] = useState(false);
+  const [projectContextError, setProjectContextError] = useState<string | null>(null);
+  const [projectContextErrorProject, setProjectContextErrorProject] = useState<string | null>(null);
+  const [projectContextRefresh, setProjectContextRefresh] = useState(0);
+  const projectContextRequest = useRef(0);
+  const observedContextRevisions = useRef<Record<string, string>>({});
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<BoardFilters>(initial.filters);
   const [issues, setIssues] = useState<IssueCard[]>([]);
@@ -94,6 +103,36 @@ export default function App() {
   // while the tab is on screen.
   const tabRef = useRef(tab);
   tabRef.current = tab;
+
+  useEffect(() => {
+    const request = ++projectContextRequest.current;
+    setProjectContext(null);
+    setProjectContextError(null);
+    setProjectContextErrorProject(null);
+    if (tab !== "plan" || project === "all") {
+      setProjectContextLoading(false);
+      return;
+    }
+    setProjectContextLoading(true);
+    const expectedRevision = observedContextRevisions.current[project];
+    api
+      .projectContext(project, "pm", expectedRevision)
+      .then((next) => {
+        if (!responseBelongsToRequest(request, projectContextRequest.current, project, next.project)) return;
+        setProjectContext(next);
+        if (next.snapshot.head_revision) {
+          observedContextRevisions.current[project] = next.snapshot.head_revision;
+        }
+      })
+      .catch((error) => {
+        if (!responseBelongsToRequest(request, projectContextRequest.current, project, project)) return;
+        setProjectContextError(String(error?.message ?? error));
+        setProjectContextErrorProject(project);
+      })
+      .finally(() => {
+        if (request === projectContextRequest.current) setProjectContextLoading(false);
+      });
+  }, [project, tab, projectContextRefresh]);
 
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
@@ -463,7 +502,15 @@ export default function App() {
             error={agentsError}
           />
         )}
-        {tab === "plan" && <Plan />}
+        {tab === "plan" && (
+          <Plan
+            project={project}
+            context={visibleContext(project, projectContext)}
+            contextLoading={projectContextLoading}
+            contextError={projectContextErrorProject === project ? projectContextError : null}
+            onRetryContext={() => setProjectContextRefresh((value) => value + 1)}
+          />
+        )}
         {tab === "memory" && <Memory project={project} onError={writeError} />}
       </div>
 

@@ -39,6 +39,36 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Ve
     })
 }
 
+fn drain_limited(
+    pipe: Option<impl Read + Send + 'static>,
+    limit: usize,
+) -> std::thread::JoinHandle<(Vec<u8>, bool)> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut exceeded = false;
+        if let Some(mut pipe) = pipe {
+            let mut chunk = [0u8; 8192];
+            loop {
+                let Ok(read) = pipe.read(&mut chunk) else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                let before = buf.len();
+                if before < limit {
+                    let remaining = limit - before;
+                    buf.extend_from_slice(&chunk[..read.min(remaining)]);
+                }
+                if before.saturating_add(read) > limit {
+                    exceeded = true;
+                }
+            }
+        }
+        (buf, exceeded)
+    })
+}
+
 /// Run `cmd` to completion or `timeout`, whichever is first. stdin is
 /// null, stdout and stderr are captured in full. A non-zero exit is
 /// not an error here — it is in the returned `Output::status`. The
@@ -77,6 +107,53 @@ pub fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<Output, Bound
             stdout,
             stderr,
         }),
+        Ok(None) => Err(BoundedError::TimedOut { stdout, stderr }),
+        Err(e) => Err(BoundedError::Wait(e)),
+    }
+}
+
+/// Like [`run_bounded`], but retain at most `limit` bytes from each output
+/// stream while still draining the child. The boolean reports whether either
+/// stream exceeded the retained bound, allowing callers that expose output to
+/// fail closed without buffering unbounded Git or helper output.
+pub fn run_bounded_limited(
+    cmd: &mut Command,
+    timeout: Duration,
+    limit: usize,
+) -> Result<(Output, bool), BoundedError> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(BoundedError::Spawn)?;
+    let stdout = drain_limited(child.stdout.take(), limit);
+    let stderr = drain_limited(child.stderr.take(), limit);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(Some(status)),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => break Ok(None),
+            Err(e) => break Err(e),
+        }
+    };
+    if !matches!(status, Ok(Some(_))) {
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+        let _ = child.wait();
+    }
+    let (stdout, stdout_exceeded) = stdout.join().unwrap_or_default();
+    let (stderr, stderr_exceeded) = stderr.join().unwrap_or_default();
+    match status {
+        Ok(Some(status)) => Ok((
+            Output {
+                status,
+                stdout,
+                stderr,
+            },
+            stdout_exceeded || stderr_exceeded,
+        )),
         Ok(None) => Err(BoundedError::TimedOut { stdout, stderr }),
         Err(e) => Err(BoundedError::Wait(e)),
     }
