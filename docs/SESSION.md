@@ -271,7 +271,10 @@ shared build directories and in-place rebases falsify test results),
 and when the base branch moved since the merge-base it gates the
 **merge result** instead (`git merge --no-commit` on the base head; a
 conflict is reported with its files). It then runs the ordered gates
-from `cadence-review.toml`, stresses every new test matching the
+from `cadence-review.toml` **as committed on the base head** (`git show
+<base-sha>:cadence-review.toml` — never the PR's copy, never the
+reviewer's working tree; a base without the file is refused), stresses
+every new test matching the
 "waits on daemon state" pattern `--stress` times in isolation, runs
 the full suite once, and reruns every failing test alone on the gated
 tree **and** on the base head before calling anything a regression.
@@ -289,6 +292,12 @@ can never remove a foreign one. A failure it cannot rerun — the test
 file is not locatable, the base tree would not prepare, the run timed
 out — is `unknown`, the comparison `inconclusive`, and the suggestion
 `blocked`; it never launders "could not run" into "pre-existing".
+A PR cannot weaken its own gates (risk class 7): one that changes
+`cadence-review.toml` is still gated with the base head's copy, the
+report records `config.changed_by_pr: true` (compared against the
+merge-base, so a config change that landed on the base later is not
+blamed on the PR), and the suggestion is never `pass` — at best
+`needs-hands-on`, for operator review.
 
 Two guards keep it from colliding with the fleet: one review at a time
 per repo (a lock under `<state>/reviews/`), and the host-wide suite

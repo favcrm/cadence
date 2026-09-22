@@ -19392,6 +19392,12 @@ fn review_verb_end_to_end() {
     assert_eq!(conflicts[0]["files"], json!(["shared.txt"]));
 
     assert_eq!(r["schema_migration"], false);
+    // PR 7 leaves cadence-review.toml alone; the config came from the
+    // base head.
+    assert_eq!(
+        r["config"],
+        json!({"source": "base", "base_sha": r["base"]["sha"], "changed_by_pr": false})
+    );
     assert_eq!(r["suggested_verdict"], json!("blocked"));
     assert!(r["report_md"].as_str().unwrap().ends_with(".md"));
 
@@ -19400,6 +19406,7 @@ fn review_verb_end_to_end() {
     let md = std::fs::read_to_string(&md_path).unwrap();
     assert!(md.contains("suggested verdict: blocked"), "{md}");
     assert!(md.contains("regression"), "{md}");
+    assert!(md.contains("changed by this PR: **no**"), "{md}");
 }
 
 #[test]
@@ -19562,7 +19569,8 @@ fn review_verb_refuses_to_adopt_an_existing_dir() {
 fn review_verb_base_prepare_failure_marks_inconclusive() {
     let base = TempDir::new().unwrap();
     let f = review_fixture(base.path());
-    // Prepare succeeds on the gated tree, fails on the base tree.
+    // Prepare succeeds on the gated tree, fails on the base tree. The
+    // config is read from the base head, so it lands on origin/main.
     std::fs::write(
         f.repo.join("cadence-review.toml"),
         r#"prepare = ["if [ \"$CADENCE_REVIEW_TREE\" = \"base\" ]; then echo base-prep-broke; exit 1; else echo prepared >> \"$GATE_LOG\"; fi"]
@@ -19574,6 +19582,11 @@ stress_pattern = ["wait_"]
 "#,
     )
     .unwrap();
+    review_git(
+        &f.repo,
+        &["commit", "-qam", "base config: base prepare breaks"],
+    );
+    review_git(&f.repo, &["push", "-q", "origin", "main"]);
     let out = review_cmd(&f).arg("7").output().unwrap();
     assert_eq!(
         out.status.code(),
@@ -19582,6 +19595,14 @@ stress_pattern = ["wait_"]
         String::from_utf8_lossy(&out.stderr)
     );
     let r = review_report(&f, 7);
+    // The base changed the config after PR 7 branched — that is not a
+    // change by the PR.
+    assert_eq!(
+        r["config"]["changed_by_pr"],
+        json!(false),
+        "{:?}",
+        r["config"]
+    );
     // The failed prepare is recorded as its own step.
     let bp = r["base_prepare"].as_array().unwrap();
     assert_eq!(bp.len(), 1, "{bp:?}");
@@ -19598,6 +19619,74 @@ stress_pattern = ["wait_"]
     let nf = fails.iter().find(|c| c["test"] == "new_flaky").unwrap();
     assert_eq!(nf["isolated_gated"]["outcome"], json!("fail"));
     assert_eq!(r["suggested_verdict"], json!("blocked"));
+}
+
+#[test]
+fn review_verb_gates_with_the_base_config_when_the_pr_rewrites_it() {
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    // PR 11 rewrites its own gates to a no-op. The reviewer's checkout
+    // stays on the PR branch, so the working tree holds the weakened
+    // copy too — neither may be read.
+    review_git(&f.repo, &["checkout", "-qb", "pr-11", "main"]);
+    std::fs::write(
+        f.repo.join("cadence-review.toml"),
+        r#"prepare = []
+gates = ["true"]
+full_suite = "true"
+test_globs = ["tests/**"]
+test_command = "true {test}"
+"#,
+    )
+    .unwrap();
+    review_git(&f.repo, &["commit", "-qam", "pr11 weakens the gates"]);
+    let head11 = review_git_sha(&f.repo, &["rev-parse", "HEAD"]);
+    review_git(&f.repo, &["push", "-q", "origin", "HEAD:refs/pull/11/head"]);
+    std::fs::write(
+        f.fakedir.join("pr-view-11.json"),
+        serde_json::to_string(&json!({
+            "number": 11, "title": "PR 11", "url": "https://example/11",
+            "headRefName": "pr-11", "headRefOid": head11,
+            "baseRefName": "main",
+            "files": [{"path": "cadence-review.toml"}],
+            "state": "OPEN",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = review_cmd(&f).args(["11", "--no-full"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The base head's gates ran and its failing gate still failed.
+    let log = std::fs::read_to_string(&f.gate_log).unwrap();
+    assert!(log.starts_with("prepared\ngate1\ngate2\n"), "{log}");
+    let r = review_report(&f, 11);
+    let gates = r["gates"].as_array().unwrap();
+    let cmds: Vec<&str> = gates.iter().map(|g| g["cmd"].as_str().unwrap()).collect();
+    assert_eq!(cmds.len(), 4, "{gates:?}");
+    assert_eq!(cmds[2], "sh gate_fail.sh");
+    assert_eq!(gates[2]["outcome"], json!("fail"), "{gates:?}");
+    assert_eq!(
+        r["config"],
+        json!({"source": "base", "base_sha": r["base"]["sha"], "changed_by_pr": true})
+    );
+    assert_ne!(r["suggested_verdict"], json!("pass"));
+    assert!(
+        r["verdict_reasons"].as_array().unwrap().iter().any(|s| s
+            .as_str()
+            .unwrap_or("")
+            .contains("changes cadence-review.toml")),
+        "{:?}",
+        r["verdict_reasons"]
+    );
+    let md = std::fs::read_to_string(r["report_md"].as_str().unwrap()).unwrap();
+    assert!(md.contains("changed by this PR: **yes**"), "{md}");
 }
 // ==== CAD-83: `cadence overview` — daemon-dependent rows ====
 
