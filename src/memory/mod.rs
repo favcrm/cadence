@@ -1026,6 +1026,9 @@ struct AfterInitialFindHook {
 }
 
 #[cfg(test)]
+const TEST_COORDINATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(test)]
 thread_local! {
     static AFTER_INITIAL_FIND_HOOK: std::cell::RefCell<Option<AfterInitialFindHook>> =
         const { std::cell::RefCell::new(None) };
@@ -1042,8 +1045,10 @@ fn after_initial_find_for_test(path: &Path) {
             .send(())
             .expect("writer did not reach memory lock");
         hook.proceed
-            .recv()
-            .expect("writer did not release memory lock");
+            .recv_timeout(TEST_COORDINATION_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("writer did not release memory lock within 15s: {error}")
+            });
     } else {
         AFTER_INITIAL_FIND_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
     }
@@ -2266,7 +2271,11 @@ mod tests {
         let writer_dir = pm.dir.clone();
         let writer_path = path.clone();
         let writer = std::thread::spawn(move || {
-            reached_rx.recv().unwrap();
+            reached_rx
+                .recv_timeout(TEST_COORDINATION_TIMEOUT)
+                .unwrap_or_else(|error| {
+                    panic!("review did not reach writer handoff within 15s: {error}")
+                });
             let writer_pm = Pm::at(&writer_dir).unwrap();
             let lock = writer_pm.lock().unwrap();
             let (_, mut changed) = find(&writer_pm, Some("demo"), "overlap-review").unwrap();
@@ -2305,7 +2314,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("revision changed"), "{err}");
-        let writer_bytes = bytes_rx.recv().unwrap();
+        let writer_bytes = bytes_rx
+            .recv_timeout(TEST_COORDINATION_TIMEOUT)
+            .unwrap_or_else(|error| panic!("writer bytes were not published within 15s: {error}"));
         assert_eq!(writer_bytes, std::fs::read(&path).unwrap());
         writer.join().unwrap();
         let (_, after) = find(&pm, Some("demo"), "overlap-review").unwrap();
