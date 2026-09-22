@@ -93,6 +93,11 @@ enum Commands {
         /// pm or worker.
         #[arg(long, default_value = "worker")]
         role: String,
+        /// Team role used only to look up a model default. Does not
+        /// change runtime pm/worker authorization. `ops` is stored as
+        /// `devops`.
+        #[arg(long)]
+        team_role: Option<String>,
         /// File with reusable provider instructions.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
@@ -148,6 +153,15 @@ enum Commands {
         /// model catalogue validates it when the endpoint opens.
         #[arg(long)]
         model: Option<String>,
+        /// Use the provider's native model instead of a daemon default.
+        /// This does not pass a model argument to the provider.
+        #[arg(long, conflicts_with = "model")]
+        provider_default_model: bool,
+        /// Team role used only to look up a model default. Does not
+        /// change runtime pm/worker authorization. `ops` is stored as
+        /// `devops`.
+        #[arg(long)]
+        team_role: Option<String>,
         /// Codex reasoning effort. The selected model's advertised
         /// reasoning efforts are validated at open time.
         #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max", "ultra"])]
@@ -212,6 +226,15 @@ enum Commands {
         /// Unset = the provider default from the CLI's own settings.
         #[arg(long)]
         model: Option<String>,
+        /// Use the provider's native model instead of a daemon default.
+        /// This does not pass a model argument to the provider.
+        #[arg(long, conflicts_with = "model")]
+        provider_default_model: bool,
+        /// Team role used only to look up a model default. Does not
+        /// change runtime pm/worker authorization. `ops` is stored as
+        /// `devops`.
+        #[arg(long)]
+        team_role: Option<String>,
         /// Reasoning effort passed as `--effort`. Replayed on resume;
         /// unset = the provider default.
         #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
@@ -304,6 +327,15 @@ enum Commands {
         /// Model flag passed to the CLI (`--model <model>`).
         #[arg(long)]
         model: Option<String>,
+        /// Use the provider's native model instead of a daemon default.
+        /// This does not pass a model argument to the provider.
+        #[arg(long, conflicts_with = "model")]
+        provider_default_model: bool,
+        /// Team role used only to look up a model default. Does not
+        /// change runtime pm/worker authorization. `ops` is stored as
+        /// `devops`.
+        #[arg(long)]
+        team_role: Option<String>,
         /// Cursor permission mode: auto-review or force. Persisted and
         /// replayed on every launch/resume.
         #[arg(long)]
@@ -474,6 +506,15 @@ enum Commands {
         /// sonnet, haiku, gpt-5.6-luna).
         #[arg(long)]
         model: Option<String>,
+        /// Use the provider's native model instead of a daemon default.
+        /// This does not pass a model argument to the provider.
+        #[arg(long, conflicts_with = "model")]
+        provider_default_model: bool,
+        /// Team role used only to look up a model default. Does not
+        /// change runtime pm/worker authorization. `ops` is stored as
+        /// `devops`.
+        #[arg(long)]
+        team_role: Option<String>,
         /// Reasoning effort for providers `claude` and `codex` (`--effort`).
         /// The selected Codex model's advertised efforts are validated at
         /// open time.
@@ -1253,6 +1294,16 @@ enum AgentAction {
         /// resume an existing Devin session). Repeatable.
         #[arg(long = "param")]
         params: Vec<String>,
+        /// Team role used only to look up a model default. Does not
+        /// change runtime pm/worker authorization. `ops` is stored as
+        /// `devops`.
+        #[arg(long)]
+        team_role: Option<String>,
+        /// Use the provider's native model instead of a daemon default.
+        /// Refused together with `--param model=…` and on endpoints
+        /// that cannot accept a model.
+        #[arg(long)]
+        provider_default_model: bool,
         /// Working directory for the provider session [default: current
         /// directory]. Meaningless for `--provider inbox` — a mailbox
         /// has no working directory.
@@ -3293,6 +3344,8 @@ fn run() -> Result<i32> {
                     sandbox,
                     instructions_file,
                     params,
+                    team_role,
+                    provider_default_model,
                 } => {
                     let instructions = match instructions_file {
                         Some(path) => Some(std::fs::read_to_string(path)?),
@@ -3308,6 +3361,7 @@ fn run() -> Result<i32> {
                         }
                         obj.insert(k.to_string(), Value::String(v.to_string()));
                     }
+                    let has_explicit_model = obj.contains_key("model");
                     let params_json = (!obj.is_empty()).then(|| Value::Object(obj).to_string());
                     // `--provider inbox` is the mailbox registration —
                     // the endpoint kind follows the provider, and no
@@ -3318,6 +3372,22 @@ fn run() -> Result<i32> {
                     } else {
                         endpoint
                     };
+                    if provider_default_model {
+                        if has_explicit_model {
+                            return Err(Error::invalid(
+                                "conflicting_model_policy",
+                                "an explicit model cannot be combined with --provider-default-model",
+                            ));
+                        }
+                        if !registry::supports_model(&provider, &endpoint) {
+                            return Err(Error::invalid(
+                                "unsupported_model_setting",
+                                format!(
+                                    "provider '{provider}' endpoint '{endpoint}' does not accept a model"
+                                ),
+                            ));
+                        }
+                    }
                     let cwd = match cwd {
                         Some(c) => c,
                         None => std::env::current_dir()?,
@@ -3331,6 +3401,12 @@ fn run() -> Result<i32> {
                             "role": role, "sandbox": sandbox,
                             "instructions": instructions,
                             "params": params_json,
+                            "team_role": team_role,
+                            "model_policy": if provider_default_model {
+                                Some("provider_default")
+                            } else {
+                                None::<&str>
+                            },
                         }),
                     )?
                 }
@@ -3504,6 +3580,7 @@ fn run() -> Result<i32> {
             cwd,
             alias,
             role,
+            team_role,
             instructions_file,
             worktree,
             bootstrap,
@@ -3535,6 +3612,8 @@ fn run() -> Result<i32> {
             },
             &CursorOpts::default(),
             &CodexOpts::default(),
+            team_role.as_deref(),
+            false,
         ),
         Commands::Codex {
             detach,
@@ -3542,6 +3621,8 @@ fn run() -> Result<i32> {
             alias,
             role,
             model,
+            provider_default_model,
+            team_role,
             effort,
             sandbox,
             instructions_file,
@@ -3570,6 +3651,8 @@ fn run() -> Result<i32> {
             &DevinOpts::default(),
             &CursorOpts::default(),
             &CodexOpts { model, effort },
+            team_role.as_deref(),
+            provider_default_model,
         ),
         Commands::Claude {
             tui,
@@ -3578,6 +3661,8 @@ fn run() -> Result<i32> {
             alias,
             role,
             model,
+            provider_default_model,
+            team_role,
             effort,
             permission_mode,
             allow,
@@ -3623,6 +3708,8 @@ fn run() -> Result<i32> {
             &DevinOpts::default(),
             &CursorOpts::default(),
             &CodexOpts::default(),
+            team_role.as_deref(),
+            provider_default_model,
         ),
         Commands::Cursor {
             resume,
@@ -3631,6 +3718,8 @@ fn run() -> Result<i32> {
             alias,
             role,
             model,
+            provider_default_model,
+            team_role,
             permission_mode,
             bypass,
             instructions_file,
@@ -3663,6 +3752,8 @@ fn run() -> Result<i32> {
                 bypass,
             },
             &CodexOpts::default(),
+            team_role.as_deref(),
+            provider_default_model,
         ),
         Commands::Join {
             group,
@@ -3680,6 +3771,8 @@ fn run() -> Result<i32> {
             auto_ready,
             agents_md,
             model,
+            provider_default_model,
+            team_role,
             effort,
             permission_mode,
             allow,
@@ -3730,6 +3823,8 @@ fn run() -> Result<i32> {
                 bypass,
             },
             CodexOpts { model, effort },
+            team_role,
+            provider_default_model,
         ),
         Commands::Attach { name, print } => attach_command(&state_dir, name, print),
         Commands::Resume { group, all, detach } => resume_command(&state_dir, group, all, detach),
@@ -5087,6 +5182,8 @@ fn provider_launch(
     devin: &DevinOpts,
     cursor: &CursorOpts,
     codex: &CodexOpts,
+    team_role: Option<&str>,
+    provider_default_model: bool,
 ) -> Result<i32> {
     // `--tui` selects the provider's pty endpoint where one exists;
     // otherwise the launch kind comes from the registry's default.
@@ -5269,6 +5366,20 @@ fn provider_launch(
     if agents_md {
         params_obj.insert("agents_md".to_string(), Value::Bool(true));
     }
+    if provider_default_model {
+        if params_obj.contains_key("model") {
+            return Err(Error::invalid(
+                "conflicting_model_policy",
+                "an explicit model cannot be combined with --provider-default-model",
+            ));
+        }
+        if !registry::supports_model(provider, endpoint_kind) {
+            return Err(Error::invalid(
+                "unsupported_model_setting",
+                format!("provider '{provider}' endpoint '{endpoint_kind}' does not accept a model"),
+            ));
+        }
+    }
     let params = (!params_obj.is_empty()).then(|| Value::Object(params_obj).to_string());
     // The sandbox rides the agent record; codex sends it on
     // `thread/start`. A cadence-launched codex worker is writable by
@@ -5289,9 +5400,15 @@ fn provider_launch(
         state_dir,
         "agent_register",
         json!({"alias": alias, "provider": provider,
-               "endpoint_kind": endpoint_kind, "cwd": cwd,
-               "role": role, "sandbox": sandbox,
-               "instructions": instructions, "params": params}),
+        "endpoint_kind": endpoint_kind, "cwd": cwd,
+        "role": role, "sandbox": sandbox,
+        "instructions": instructions, "params": params,
+        "team_role": team_role,
+        "model_policy": if provider_default_model {
+            Some("provider_default")
+        } else {
+            None::<&str>
+        }}),
     ) {
         Ok(_) => registered_fresh = true,
         Err(err) if err.to_string().contains("UNIQUE") => {
@@ -5421,6 +5538,8 @@ fn join_group(
     devin_opts: DevinOpts,
     cursor_opts: CursorOpts,
     codex_opts: CodexOpts,
+    team_role: Option<String>,
+    provider_default_model: bool,
 ) -> Result<i32> {
     // Validate the provider before any work — the registry names the
     // supported launch verbs in the rejection.
@@ -5469,6 +5588,8 @@ fn join_group(
         &devin_opts,
         &cursor_opts,
         &codex_opts,
+        team_role.as_deref(),
+        provider_default_model,
     )
 }
 
@@ -5965,6 +6086,21 @@ fn main() {
     };
     INTENDED_EXIT.store(code, Ordering::Relaxed);
     std::process::exit(code);
+}
+
+/// The debug Clap builder for this CLI exceeds the 2 MiB libtest worker stack.
+/// Raise it before libtest reads `RUST_MIN_STACK`, unless the operator already set one.
+#[cfg(all(test, target_os = "linux"))]
+#[used]
+#[link_section = ".init_array"]
+static CADENCE_TEST_STACK: unsafe extern "C" fn() = cadence_raise_test_stack;
+
+#[cfg(all(test, target_os = "linux"))]
+unsafe extern "C" fn cadence_raise_test_stack() {
+    let key = c"RUST_MIN_STACK".as_ptr();
+    if libc::getenv(key).is_null() {
+        libc::setenv(key, c"8388608".as_ptr(), 0);
+    }
 }
 
 #[cfg(test)]
@@ -6569,6 +6705,88 @@ mod tests {
         assert!(Cli::try_parse_from(["cadence", "resume", "pm1", "--all"]).is_err());
         // bare `resume` needs one of them.
         assert!(Cli::try_parse_from(["cadence", "resume"]).is_err());
+    }
+
+    #[test]
+    fn model_default_flags_parse_and_conflict() {
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "claude",
+            "--team-role",
+            "ops",
+            "--provider-default-model",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Claude {
+                team_role: Some(role),
+                provider_default_model: true,
+                model: None,
+                ..
+            } if role == "ops"
+        ));
+        assert!(Cli::try_parse_from([
+            "cadence",
+            "claude",
+            "--model",
+            "sonnet",
+            "--provider-default-model",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["cadence", "devin", "--provider-default-model"]).is_err());
+        let cli = Cli::try_parse_from(["cadence", "devin", "--team-role", "qa"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Devin {
+                team_role: Some(role),
+                ..
+            } if role == "qa"
+        ));
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "join",
+            "pm",
+            "codex",
+            "--team-role",
+            "dev",
+            "--provider-default-model",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Join {
+                team_role: Some(role),
+                provider_default_model: true,
+                ..
+            } if role == "dev"
+        ));
+        let cli = Cli::try_parse_from([
+            "cadence",
+            "agent",
+            "register",
+            "w1",
+            "--provider",
+            "claude",
+            "--team-role",
+            "qa",
+            "--provider-default-model",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Agent {
+                action: AgentAction::Register {
+                    team_role: Some(role),
+                    provider_default_model: true,
+                    ..
+                }
+            } if role == "qa"
+        ));
+    }
+
+    #[test]
+    fn group_stop_and_daemon_start_parse() {
         let cli = Cli::try_parse_from(["cadence", "resume", "pm1", "--detach"]).unwrap();
         assert!(matches!(cli.command, Commands::Resume { detach: true, .. }));
         let cli = Cli::try_parse_from(["cadence", "stop", "pm1"]).unwrap();

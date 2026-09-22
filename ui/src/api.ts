@@ -8,6 +8,8 @@ import type {
   MemoryCard,
   MemoryDetail,
   Meta,
+  ModelDefaultsConfig,
+  ModelDefaultsSnapshot,
   Overview,
   Project,
   ProjectContext,
@@ -18,16 +20,26 @@ export class ApiError extends Error {
   status: number;
   conflict?: string;
   check?: string;
+  code?: string;
+  revision?: number | null;
   card?: IssueCard;
   constructor(
     message: string,
     status: number,
-    opts?: { conflict?: string; check?: string; card?: IssueCard },
+    opts?: {
+      conflict?: string;
+      check?: string;
+      code?: string;
+      revision?: number | null;
+      card?: IssueCard;
+    },
   ) {
     super(message);
     this.status = status;
     this.conflict = opts?.conflict;
     this.check = opts?.check;
+    this.code = opts?.code;
+    this.revision = opts?.revision;
     this.card = opts?.card;
   }
 }
@@ -213,4 +225,31 @@ export const api = {
 
   artifactUrl: (id: string, name: string) =>
     `/api/issues/${id}/artifacts/${encodeURIComponent(name)}`,
+
+  modelDefaults: () => get<ModelDefaultsSnapshot>("/api/settings/model-defaults"),
+  saveModelDefaults: (body: { expected_revision: number; config: ModelDefaultsConfig }) =>
+    writeSettings(body),
 };
+
+async function writeSettings(body: {
+  expected_revision: number;
+  config: ModelDefaultsConfig;
+}): Promise<ModelDefaultsSnapshot> {
+  const resp = await fetch("/api/settings/model-defaults", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Cadence-Board": "1",
+    },
+    body: JSON.stringify(body),
+  });
+  const parsed = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    throw new ApiError(
+      parsed?.error ?? `${resp.status} ${resp.statusText}`,
+      resp.status,
+      parsed ?? undefined,
+    );
+  }
+  return parsed as ModelDefaultsSnapshot;
+}

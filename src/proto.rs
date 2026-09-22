@@ -20,7 +20,14 @@ pub fn ok(result: Value) -> Value {
 }
 
 pub fn err(error: &Error) -> Value {
-    json!({"ok": false, "error": {"kind": error.kind(), "message": error.to_string()}})
+    let mut body = json!({"kind": error.kind(), "message": error.to_string()});
+    if let Some(code) = error.code() {
+        body["code"] = json!(code);
+    }
+    if let Some(revision) = error.revision() {
+        body["revision"] = json!(revision);
+    }
+    json!({"ok": false, "error": body})
 }
 
 /// Extract the `result` field or convert an error frame into [`Error`].
@@ -37,6 +44,23 @@ pub fn unwrap(frame: Value) -> Result<Value> {
         .and_then(Value::as_str)
         .unwrap_or("unspecified error")
         .to_string();
+    let code = frame
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let revision = frame.pointer("/error/revision").and_then(Value::as_i64);
+    if kind == "conflict" || code.is_some() {
+        return Err(Error::Structured(crate::error::Structured {
+            kind: if kind == "conflict" {
+                "conflict"
+            } else {
+                "rejected"
+            },
+            code: code.unwrap_or_else(|| "rejected".to_string()),
+            message,
+            revision,
+        }));
+    }
     Err(match kind {
         "rejected" => Error::Rejected(message),
         "provider" => Error::Provider(message),

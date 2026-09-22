@@ -8153,3 +8153,174 @@ fn project_context_memories_include_only_verified_lessons_and_bound_withheld() {
         .any(|error| error.as_str().unwrap().contains("broken.md")));
     assert!(value["memories"]["lessons"].as_str().unwrap().len() <= 4 * 1024);
 }
+
+#[test]
+fn model_defaults_http_round_trip_guards_and_conflict() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let (code, body) = http(port, "GET", "/api/settings/model-defaults", &host);
+    assert_eq!(code, 503, "{body}");
+    let missing: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(missing["code"], "daemon_unavailable");
+
+    let d = UiDaemon::start();
+    let pm = TempDir::new().unwrap();
+    let port = start_ui(pm.path().to_path_buf(), d.state());
+    let host = format!("127.0.0.1:{port}");
+    let (code, body) = http(port, "GET", "/api/settings/model-defaults", &host);
+    assert_eq!(code, 200, "{body}");
+    let snap: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(snap["revision"], 0);
+    assert_eq!(snap["read_only"], false);
+    assert!(snap["config"]["providers"].as_object().unwrap().is_empty());
+    let devin = snap["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "devin")
+        .unwrap();
+    assert_eq!(devin["eligible"], false);
+    assert!(devin["limitation"].as_str().unwrap().contains("Devin"));
+    assert!(snap["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["id"] != "inbox" && row["id"] != "fake"));
+
+    let (code, _, _) = http_write(
+        port,
+        "DELETE",
+        "/api/settings/model-defaults",
+        &host,
+        &[],
+        b"{}",
+    );
+    assert_eq!(code, 405);
+    let (code, _, _) = http_write(
+        port,
+        "POST",
+        "/api/settings/model-defaults",
+        "evil.example",
+        WRITE_HEADERS,
+        b"{}",
+    );
+    assert_eq!(code, 421);
+    let (code, _, body) = http_write(
+        port,
+        "POST",
+        "/api/settings/model-defaults",
+        &host,
+        &["Content-Type: text/plain", "X-Cadence-Board: 1"],
+        b"{}",
+    );
+    assert_eq!(code, 403, "{body}");
+    let (code, _, body) = http_write(
+        port,
+        "POST",
+        "/api/settings/model-defaults",
+        &host,
+        &["Content-Type: application/json"],
+        b"{}",
+    );
+    assert_eq!(code, 403, "{body}");
+
+    let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"baseline-a"},"roles":{"qa":{"mode":"provider_default"}}}}}}"#;
+    let (code, _, body) = write_json(port, "POST", "/api/settings/model-defaults", &host, doc);
+    assert_eq!(code, 200, "{body}");
+    let saved: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(saved["revision"], 1);
+    assert_eq!(
+        saved["config"]["providers"]["claude"]["default"]["model"],
+        "baseline-a"
+    );
+    assert_eq!(saved["read_only"], false);
+
+    let (code, _, body) = write_json(port, "POST", "/api/settings/model-defaults", &host, doc);
+    assert_eq!(code, 409, "{body}");
+    let conflict: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(conflict["code"], "revision_conflict");
+    assert_eq!(conflict["revision"], 1);
+    let (code, body) = http(port, "GET", "/api/settings/model-defaults", &host);
+    let current: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(code, 200);
+    assert_eq!(current["revision"], 1);
+    assert_eq!(
+        current["config"]["providers"]["claude"]["default"]["model"],
+        "baseline-a"
+    );
+
+    let duplicate = r#"{"expected_revision":1,"config":{"schema":1,"providers":{}},"config":{"schema":1,"providers":{"claude":{"default":{"mode":"provider_default"},"roles":{}}}}}"#;
+    let (code, _, body) = write_json(
+        port,
+        "POST",
+        "/api/settings/model-defaults",
+        &host,
+        duplicate,
+    );
+    assert_eq!(code, 400, "{body}");
+    let rejected: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rejected["code"], "invalid_config");
+    assert_eq!(
+        serde_json::from_str::<Value>(&http(port, "GET", "/api/settings/model-defaults", &host).1)
+            .unwrap()["revision"],
+        1
+    );
+
+    let mut huge = vec![b' '; cadence_agent::model_defaults::MAX_HTTP_BODY_BYTES + 1];
+    huge[0] = b'{';
+    let (code, _, body) = write_json(
+        port,
+        "POST",
+        "/api/settings/model-defaults",
+        &host,
+        std::str::from_utf8(&huge).unwrap(),
+    );
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["code"],
+        "invalid_request"
+    );
+
+    d.rpc(
+        "agent_register",
+        json!({"alias": "box", "provider": "inbox", "endpoint_kind": "inbox", "team_role": "ops", "role": "worker"}),
+    );
+    let (code, body) = http(port, "GET", "/api/agents", &host);
+    assert_eq!(code, 200, "{body}");
+    let agents: Value = serde_json::from_str(&body).unwrap();
+    let row = agents["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["alias"] == "box")
+        .unwrap();
+    assert_eq!(row["role"], "worker");
+    assert_eq!(row["team_role"], "devops");
+    assert!(row["model_selection"].is_null());
+    assert!(row.get("model_lookup_role").is_some());
+
+    let read_only = start_ui_opts(pm.path().to_path_buf(), d.state(), |opts| {
+        opts.read_only = true;
+    });
+    let read_host = format!("127.0.0.1:{read_only}");
+    let (code, body) = http(read_only, "GET", "/api/settings/model-defaults", &read_host);
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["read_only"],
+        true
+    );
+    let (code, _, body) = write_json(
+        read_only,
+        "POST",
+        "/api/settings/model-defaults",
+        &read_host,
+        doc,
+    );
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["check"],
+        "read_only"
+    );
+}

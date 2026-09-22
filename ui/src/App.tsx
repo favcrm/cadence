@@ -4,6 +4,7 @@ import Agents from "./components/Agents";
 import Board from "./components/Board";
 import Drawer from "./components/Drawer";
 import Memory from "./components/Memory";
+import ModelDefaults from "./components/ModelDefaults";
 import OverviewView from "./components/Overview";
 import Plan from "./components/Plan";
 import Sidebar from "./components/Sidebar";
@@ -14,6 +15,7 @@ import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./pr
 import {
   browserStoredProjectView,
   persistBrowserProjectView,
+  APP_TABS,
   readAppUrlState,
   serializeAppUrlState,
   type AppTab,
@@ -393,8 +395,8 @@ export default function App() {
 
         {menuOpen && (
           <nav className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
-            <div className="grid grid-cols-5 gap-1.5">
-              {(["overview", "board", "plan", "agents", "memory"] as const).map(
+            <div className="grid grid-cols-3 gap-1.5">
+              {APP_TABS.map(
                 (t) => (
                   <button
                     key={t}
@@ -514,6 +516,7 @@ export default function App() {
           />
         )}
         {tab === "memory" && <Memory project={project} onError={writeError} />}
+        {tab === "settings" && <ModelDefaults />}
       </div>
 
       {openId && (

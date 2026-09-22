@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test:url-state": "tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-url-state.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc --target ES2022 --module commonjs --moduleResolution node --lib ES2023,DOM --skipLibCheck --outDir \"$tmp_dir\" src/urlState.ts src/urlState.test.ts src/filters.ts src/types.ts src/projectContextGuard.ts src/projectContextGuard.test.ts src/uxCopy.ts src/uxCopy.test.ts && node \"$tmp_dir/urlState.test.js\" && node \"$tmp_dir/projectContextGuard.test.js\" && node \"$tmp_dir/uxCopy.test.js\"",
+    "test:url-state": "tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-url-state.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc --target ES2022 --module commonjs --moduleResolution node --lib ES2023,DOM --skipLibCheck --outDir \"$tmp_dir\" src/urlState.ts src/urlState.test.ts src/filters.ts src/types.ts src/projectContextGuard.ts src/projectContextGuard.test.ts src/uxCopy.ts src/uxCopy.test.ts src/modelDefaultsCompare.ts src/modelDefaultsCompare.test.ts src/modelId.ts src/modelId.test.ts src/modelProvenance.ts src/modelProvenance.test.ts && node \"$tmp_dir/urlState.test.js\" && node \"$tmp_dir/projectContextGuard.test.js\" && node \"$tmp_dir/uxCopy.test.js\" && node \"$tmp_dir/modelDefaultsCompare.test.js\" && node \"$tmp_dir/modelId.test.js\" && node \"$tmp_dir/modelProvenance.test.js\"",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"
   },

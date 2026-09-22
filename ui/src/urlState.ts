@@ -1,6 +1,6 @@
 import { readFilters, writeFilters, type BoardFilters } from "./filters";
 
-export const APP_TABS = ["overview", "board", "plan", "agents", "memory"] as const;
+export const APP_TABS = ["overview", "board", "plan", "agents", "memory", "settings"] as const;
 export type AppTab = (typeof APP_TABS)[number];
 export type ProjectView = "kanban" | "list";
 
