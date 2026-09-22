@@ -85,7 +85,7 @@ pub struct ReviewReceipt {
 }
 
 /// Durable PM finalization receipt.  A review quorum is only eligible for
-/// retrieval after the PM records this receipt; worker receipts alone are
+/// retrieval after the PM records this receipt; reviewer receipts alone are
 /// never an acceptance or revalidation decision.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FinalizationReceipt {
@@ -532,8 +532,24 @@ fn finalization_for<'a>(
     (receipt.digest == digest
         && valid_identity_proof(&receipt.finalizer)
         && receipt.finalizer.role == "pm"
+        && !proposal_identity_matches(front, &receipt.finalizer)
         && !receipt.finalized_at.is_empty())
     .then_some(receipt)
+}
+
+fn same_identity_or_alias(left: &IdentityProof, right: &IdentityProof) -> bool {
+    left.stable_id() == right.stable_id() || left.alias == right.alias
+}
+
+fn proposal_identity_matches(front: &Front, identity: &IdentityProof) -> bool {
+    front
+        .author_proof
+        .as_ref()
+        .is_some_and(|author| same_identity_or_alias(author, identity))
+        || front
+            .contributors
+            .iter()
+            .any(|contributor| same_identity_or_alias(contributor, identity))
 }
 
 fn next_verify_cycle(front: &Front) -> u64 {
@@ -648,6 +664,18 @@ fn quorum_status_for_cycle(mem: &Memory, operation: &str, cycle: u64) -> (bool, 
 }
 
 pub fn quorum_status(mem: &Memory, operation: &str) -> (bool, String) {
+    let Some(author) = mem.front.author_proof.as_ref() else {
+        return (
+            false,
+            "review blocked: proposer has no authenticated native identity".to_string(),
+        );
+    };
+    if !valid_identity_proof(author) {
+        return (
+            false,
+            "review blocked: proposer identity proof is incomplete".to_string(),
+        );
+    }
     let Some(cycle) = operation_cycle(&mem.front, operation) else {
         return (
             false,
@@ -659,8 +687,8 @@ pub fn quorum_status(mem: &Memory, operation: &str) -> (bool, String) {
 
 /// Retrieval eligibility is stricter than a lifecycle status. Accepted
 /// records must retain their PM acceptance finalization; once a fresh verify
-/// cycle is opened, worker receipts do not make the lesson eligible until a
-/// PM records a matching finalization for that cycle.
+/// cycle is opened, native reviewer receipts do not make the lesson eligible
+/// until a PM records a matching finalization for that cycle.
 pub fn retrieval_status(mem: &Memory) -> (bool, String) {
     if mem.front.status != "accepted" {
         return (
@@ -777,9 +805,19 @@ fn commit_mem(pm: &Pm, slug: &str, subject: &str, actor: &str) -> Result<bool> {
 
 fn save_mem(mem: &Memory) -> Result<()> {
     let tmp = mem.path.with_extension("md.tmp");
-    std::fs::write(&tmp, parse::render(&mem.front, &mem.body)?)?;
+    std::fs::write(&tmp, render_memory(&mem.front, &mem.body)?)?;
     std::fs::rename(&tmp, &mem.path)?;
     Ok(())
+}
+
+/// Render memory files without normalizing their Markdown body. The generic
+/// issue renderer intentionally removes one leading newline for issue-file
+/// ergonomics, but memory bodies are part of the semantic digest and must
+/// round-trip byte-for-byte through a review write.
+fn render_memory(front: &impl Serialize, body: &str) -> Result<String> {
+    let yaml = serde_yaml::to_string(front)
+        .map_err(|e| Error::internal(format!("cannot serialise memory frontmatter: {e}")))?;
+    Ok(format!("---\n{yaml}---\n\n{body}"))
 }
 
 /// `**` recursion in glob_match is exponential on adversarial
@@ -1121,8 +1159,8 @@ pub fn submit_review(
     }))
 }
 
-/// PM-only finalization after two distinct worker receipts. A PM does not
-/// become a third reviewer merely by accepting the result.
+/// PM-only finalization after two distinct non-author PM/worker receipts. A
+/// PM does not become a third reviewer merely by accepting the result.
 pub fn finalize_native(
     pm: &Pm,
     flag: Option<&str>,
@@ -1149,6 +1187,11 @@ pub fn finalize_native(
         return Err(Error::rejected(format!(
             "memory revision changed — expected {expected_digest}, current {digest}"
         )));
+    }
+    if proposal_identity_matches(&mem.front, &actor.proof) {
+        return Err(Error::rejected(
+            "memory proposer or contributor cannot finalize its own acceptance or verification",
+        ));
     }
     let Some(cycle) = operation_cycle(&mem.front, operation) else {
         if mem
@@ -1897,7 +1940,8 @@ mod tests {
     #[test]
     fn native_review_finalize_consumes_cycle_and_requires_new_verify_cycle() {
         let (_dir, pm) = mutation_fixture();
-        let pm_actor = native("pm", 1);
+        let author = native("worker-author", 1);
+        let pm_actor = native("pm", 4);
         let worker_a = native("worker-a", 2);
         let worker_b = native("worker-b", 3);
         let body = "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
@@ -1914,7 +1958,7 @@ mod tests {
             None,
             Some(body),
             Some("lesson"),
-            &pm_actor,
+            &author,
         )
         .unwrap();
         let (_, mem) = find(&pm, Some("demo"), "lesson").unwrap();
@@ -2016,6 +2060,133 @@ mod tests {
     }
 
     #[test]
+    fn leading_blank_memory_body_keeps_digest_through_acceptance() {
+        let (_dir, pm) = mutation_fixture();
+        let author = native("worker-author", 1);
+        let pm_actor = native("pm", 4);
+        let worker_a = native("worker-a", 2);
+        let worker_b = native("worker-b", 3);
+        let body = "\nleading blank fact\n\n**Why:** preserve the exact body\n\n**How to apply:** retain it\n";
+        let proposed = propose_native(
+            &pm,
+            "demo",
+            "rule",
+            &Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-191"),
+            Some("high"),
+            None,
+            Some(body),
+            Some("leading-blank"),
+            &author,
+        )
+        .unwrap();
+        let digest = proposed["digest"].as_str().unwrap().to_string();
+        let (_, loaded) = find(&pm, Some("demo"), "leading-blank").unwrap();
+        assert_eq!(loaded.body, body);
+        assert_eq!(semantic_digest(&loaded), digest);
+
+        for (worker, evidence) in [
+            (&worker_a, "worker-a inspected the preserved body"),
+            (&worker_b, "worker-b inspected the preserved body"),
+        ] {
+            submit_review(
+                &pm,
+                Some("demo"),
+                "leading-blank",
+                &ReviewRequest {
+                    operation: "accept",
+                    verdict: "pass",
+                    evidence,
+                    expected_digest: &digest,
+                },
+                worker,
+            )
+            .unwrap();
+        }
+        finalize_native(
+            &pm,
+            Some("demo"),
+            "leading-blank",
+            "accept",
+            &digest,
+            &pm_actor,
+        )
+        .unwrap();
+        let (_, accepted) = find(&pm, Some("demo"), "leading-blank").unwrap();
+        assert_eq!(accepted.body, body);
+        assert_eq!(semantic_digest(&accepted), digest);
+        assert!(retrieval_status(&accepted).0);
+    }
+
+    #[test]
+    fn proposer_cannot_finalize_its_own_acceptance() {
+        let (_dir, pm) = mutation_fixture();
+        let author = native("pm-author", 1);
+        let finalizer = native("pm", 4);
+        let worker_a = native("worker-a", 2);
+        let worker_b = native("worker-b", 3);
+        let body = "fact\n\n**Why:** evidence\n\n**How to apply:** use it\n";
+        propose_native(
+            &pm,
+            "demo",
+            "rule",
+            &Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-191"),
+            Some("high"),
+            None,
+            Some(body),
+            Some("pm-authored"),
+            &author,
+        )
+        .unwrap();
+        let (_, mem) = find(&pm, Some("demo"), "pm-authored").unwrap();
+        let digest = semantic_digest(&mem);
+        for (worker, evidence) in [
+            (&worker_a, "worker-a evidence"),
+            (&worker_b, "worker-b evidence"),
+        ] {
+            submit_review(
+                &pm,
+                Some("demo"),
+                "pm-authored",
+                &ReviewRequest {
+                    operation: "accept",
+                    verdict: "pass",
+                    evidence,
+                    expected_digest: &digest,
+                },
+                worker,
+            )
+            .unwrap();
+        }
+        let path = find(&pm, Some("demo"), "pm-authored").unwrap().1.path;
+        let before = std::fs::read(&path).unwrap();
+        let err = finalize_native(&pm, Some("demo"), "pm-authored", "accept", &digest, &author)
+            .unwrap_err();
+        assert!(err.to_string().contains("proposer or contributor"));
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        assert!(!retrieval_status(&find(&pm, Some("demo"), "pm-authored").unwrap().1).0);
+
+        finalize_native(
+            &pm,
+            Some("demo"),
+            "pm-authored",
+            "accept",
+            &digest,
+            &finalizer,
+        )
+        .unwrap();
+        let (_, accepted) = find(&pm, Some("demo"), "pm-authored").unwrap();
+        assert!(retrieval_status(&accepted).0);
+    }
+
+    #[test]
     fn accepted_retrieval_requires_two_distinct_worker_aliases() {
         let mut mem = memory("accepted", 1, Some(proof("author", 1)));
         let digest = semantic_digest(&mem);
@@ -2041,6 +2212,14 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn quorum_status_reports_legacy_identity_before_cycle_state() {
+        let mem = memory("proposed", 0, None);
+        let (eligible, reason) = quorum_status(&mem, "accept");
+        assert!(!eligible);
+        assert!(reason.contains("no authenticated native identity"));
     }
 
     #[test]
@@ -2248,7 +2427,7 @@ mod tests {
         assert!(retrieval_status(&mem).0);
         // A later record corruption cannot make a finalized cycle eligible:
         // the PM receipt is durable evidence of what was finalized, not a
-        // replacement for rechecking its retained worker receipts.
+        // replacement for rechecking its retained reviewer receipts.
         mem.front.reviews[1] = receipt(&proof("worker-a", 9), "accept", 1, &digest);
         assert!(!retrieval_status(&mem).0);
     }

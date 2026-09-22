@@ -16946,6 +16946,58 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
         vec!["reviewer-a", "reviewer-b"]
     );
 
+    // Native PM rejection is an ordinary authenticated mutation too. It
+    // preserves an earlier review receipt and reports the tracker commit;
+    // an HTTP/CLI caller cannot manufacture this result.
+    let rejected_proposal = json!({
+        "project": "demo",
+        "kind": "gotcha",
+        "scope": {"project": true},
+        "source": "CAD-191",
+        "confidence": "medium",
+        "text": "native rejection keeps review history\n\n**Why:** the PM rejected it.\n\n**How to apply:** do not use it.\n",
+        "id": "native-rejected-rule"
+    });
+    let proposed_rejected = d
+        .memory_rpc(&mock, "author", "memory_propose", rejected_proposal)
+        .unwrap();
+    let rejected_digest = proposed_rejected["digest"].as_str().unwrap().to_string();
+    let review = d
+        .memory_rpc(
+            &mock,
+            "reviewer-a",
+            "memory_review",
+            json!({
+                "slug": "native-rejected-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "reviewer A recorded a retained rejection review",
+                "digest": rejected_digest,
+            }),
+        )
+        .unwrap();
+    assert_eq!(review["quorum"]["eligible"], false, "{review}");
+    let rejected = d
+        .memory_rpc(
+            &mock,
+            "pm",
+            "memory_finalize",
+            json!({
+                "slug": "native-rejected-rule",
+                "project": "demo",
+                "operation": "reject",
+            }),
+        )
+        .unwrap();
+    assert_eq!(rejected["status"], "rejected", "{rejected}");
+    assert_eq!(rejected["committed"], true, "{rejected}");
+    let (_, rejected_memory) = memory::find(&pm, Some("demo"), "native-rejected-rule").unwrap();
+    assert_eq!(rejected_memory.front.status, "rejected");
+    assert_eq!(rejected_memory.front.reviews.len(), 1);
+    assert_eq!(rejected_memory.front.reviews[0].reviewer, "reviewer-a");
+    assert!(!memory::retrieval_status(&rejected_memory).0);
+
     d.rpc(
         "message_report",
         json!({"message": "memory-busy", "token": busy_token, "kind": "result", "text": "done"}),
@@ -17585,28 +17637,43 @@ fn dispatch_degrades_on_memory_failures() {
     // and the omission is counted. fat-rule-00's hand-edited 5 KiB
     // fact alone exceeds the byte budget: under the old `break` it
     // hid every rule after it.
-    let mem_dir = pm_dir.join("demo/memory");
-    let rule = |id: &str, fact: &str| {
-        format!(
-            "---\nid: {id}\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  project: true\n---\n{fact}\n\n**Why:** w\n\n**How to apply:** h\n"
-        )
-    };
-    std::fs::write(
-        mem_dir.join("fat-rule-00.md"),
-        rule("fat-rule-00", &"z".repeat(5 * 1024)),
-    )
-    .unwrap();
-    std::fs::write(
-        mem_dir.join("fat-rule-01-tiny.md"),
-        rule("fat-rule-01-tiny", "t"),
-    )
-    .unwrap();
+    // These are reviewed fixtures too: accepted legacy text is deliberately
+    // withheld from dispatch, so the briefing-cap assertion must use the
+    // same authenticated evidence shape as the ordinary dispatch fixtures.
+    write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "fat-rule-00",
+        "rule",
+        Scope {
+            project: true,
+            ..Scope::default()
+        },
+        &"z".repeat(5 * 1024),
+    );
+    write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "fat-rule-01-tiny",
+        "rule",
+        Scope {
+            project: true,
+            ..Scope::default()
+        },
+        "t",
+    );
     for i in 2..10 {
-        std::fs::write(
-            mem_dir.join(format!("fat-rule-{i:02}.md")),
-            rule(&format!("fat-rule-{i:02}"), &"y".repeat(700)),
-        )
-        .unwrap();
+        write_reviewed_memory(
+            &pm_dir,
+            "demo",
+            &format!("fat-rule-{i:02}"),
+            "rule",
+            Scope {
+                project: true,
+                ..Scope::default()
+            },
+            &"y".repeat(700),
+        );
     }
     d.rpc(
         "agent_register",

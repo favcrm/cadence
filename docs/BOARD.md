@@ -806,8 +806,9 @@ opens a drawer with identity, params, capabilities, tasks, bound
 issues, running messages, and the event tail. A fence banner on the
 board links straight to it. The Memory tab lists every project's
 memories with status/type/component/path filters, opens a detail
-panel, and accepts or rejects proposed entries through the same
-guarded write path.
+panel. Memory curation is read-only in the browser: proposed entries show
+their native quorum/finalization state, while accept, reject, and supersede
+require an authenticated native agent endpoint.
 
 A filter bar above the columns slices the board by tag, epic, owner and
 component — chips with counts, multi-select: tags narrow (all of them),
