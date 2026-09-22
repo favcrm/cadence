@@ -7305,4 +7305,28 @@ mod tests {
         assert_eq!(fresh.unwrap_err().code(), Some("params_too_large"));
         assert!(s.agent_opt("fresh").unwrap().is_none());
     }
+
+    #[test]
+    fn model_defaults_deep_nesting_does_not_commit() {
+        let (_dir, s) = store();
+        assert_eq!(s.model_defaults().unwrap().revision, 0);
+        let mut body = String::from(r#"{"expected_revision":0,"config":"#);
+        body.push_str(&"[".repeat(9_000));
+        body.push('0');
+        body.push_str(&"]".repeat(9_000));
+        body.push('}');
+        assert!(body.len() <= crate::model_defaults::MAX_HTTP_BODY_BYTES);
+        let err = s.replace_model_defaults(&body, None).unwrap_err();
+        assert_eq!(err.code(), Some("invalid_config"));
+        assert!(err.to_string().contains("nesting exceeds"), "{err}");
+        assert_eq!(s.model_defaults().unwrap().revision, 0);
+        assert!(s
+            .events(Store::DAEMON_STREAM, 0, 50)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "model_defaults_updated"));
+        s.replace_model_defaults(&defaults_body(0, "{}"), None)
+            .unwrap();
+        assert_eq!(s.model_defaults().unwrap().revision, 1);
+    }
 }

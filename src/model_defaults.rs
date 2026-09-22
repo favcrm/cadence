@@ -1212,20 +1212,46 @@ mod tests {
 
     #[test]
     fn deep_json_nesting_is_rejected() {
-        let nest = 4_000;
+        for body in [
+            nested_settings("array", 9_000),
+            nested_settings("object", 2_000),
+        ] {
+            assert!(
+                body.len() <= MAX_HTTP_BODY_BYTES,
+                "fixture must stay under the body cap, got {}",
+                body.len()
+            );
+            let err = parse_settings_document(&body).unwrap_err();
+            assert_eq!(err.code(), Some("invalid_config"));
+            assert!(err.to_string().contains("nesting exceeds"), "{err}");
+        }
+        let still = parse_settings_document(
+            r#"{"expected_revision":0,"config":{"schema":1,"providers":{}}}"#,
+        )
+        .unwrap();
+        assert_eq!(still.expected_revision, 0);
+        assert!(still.config.providers.is_empty());
+    }
+
+    fn nested_settings(kind: &str, depth: usize) -> String {
         let mut body = String::from(r#"{"expected_revision":0,"config":"#);
-        body.push_str(&"[".repeat(nest));
-        body.push('0');
-        body.push_str(&"]".repeat(nest));
+        match kind {
+            "array" => {
+                body.push_str(&"[".repeat(depth));
+                body.push('0');
+                body.push_str(&"]".repeat(depth));
+            }
+            "object" => {
+                for _ in 0..depth {
+                    body.push_str(r#"{"a":"#);
+                }
+                body.push('0');
+                body.push_str(&"}".repeat(depth));
+            }
+            other => panic!("unknown nest {other}"),
+        }
         body.push('}');
-        assert!(
-            body.len() <= MAX_HTTP_BODY_BYTES,
-            "fixture must stay under the body cap, got {}",
-            body.len()
-        );
-        let err = parse_settings_document(&body).unwrap_err();
-        assert_eq!(err.code(), Some("invalid_config"));
-        assert!(err.to_string().contains("nesting exceeds"), "{err}");
+        body
     }
 
     #[test]
