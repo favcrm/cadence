@@ -418,7 +418,6 @@ pub const MODEL_DEFAULTS_CAPABILITY: &str = "model_defaults";
 
 /// Daemon-level features reported alongside the per-spec capability
 /// names — not properties of any one endpoint.
-
 const DAEMON_FEATURES: &[&str] = &[
     "agent_registry",
     "durable_queue",

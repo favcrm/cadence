@@ -1213,10 +1213,6 @@ fn sanitize_actor(raw: &str) -> Option<String> {
     Some(tok.to_string())
 }
 
-/// Dispatch POST/PATCH/DELETE on the write routes. Every route passes
-/// `write_guard` before reading a body or touching the PM dir, and every
-/// op goes through `issue::write` — one write path for CLI and API.
-#[allow(clippy::too_many_arguments)]
 fn coded_response(status: u16, code: &str, message: &str, revision: Option<i64>) -> HttpResp {
     let body = serde_json::to_vec_pretty(&json!({
         "error": message,
@@ -1358,6 +1354,10 @@ fn model_defaults_post(request: &mut Request, state_dir: &Path, opts: &ServeOpts
     }
 }
 
+/// Dispatch POST/PATCH/DELETE on the write routes. Every route passes
+/// `write_guard` before reading a body or touching the PM dir, and every
+/// op goes through `issue::write` — one write path for CLI and API.
+#[allow(clippy::too_many_arguments)]
 fn write_route(
     mut request: Request,
     method: &Method,
