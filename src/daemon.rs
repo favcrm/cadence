@@ -678,14 +678,12 @@ impl Shared {
         let closing = self.closing.load(Ordering::SeqCst);
         match outcome {
             Err(ref error) => {
-                // When unreconciled unknowns outlive the actor, the
-                // recorded reason names the reconcile-first recovery —
-                // resume alone is rejected while the fence stands.
+                // When unreconciled unknowns outlive the actor, keep the
+                // provider's own account. The returned error is often the
+                // generic review sentence; restamping from that alone would
+                // hide the reason the operator has to inspect.
                 let reason = if self.store.has_unknown(alias).unwrap_or(false) {
-                    format!(
-                        "{error} — reconcile: `cadence agent unfence {alias} \
-                         --status interrupted`, then `cadence agent resume {alias}`"
-                    )
+                    format_unknown_fence(&self.preserved_unknown_detail(alias, &error.to_string()))
                 } else {
                     error.to_string()
                 };
@@ -1036,24 +1034,33 @@ impl Shared {
         Ok(())
     }
 
-    /// The attention text for an unknown-outcome fence — keeps the
-    /// provider's own reason when `unknown()` already recorded it
-    /// (everything before the `— reconcile:` tail), so a re-stamp on
-    /// relaunch-skip doesn't erase the detail the operator needs.
+    /// The attention text for an unknown-outcome fence. A re-stamp on
+    /// actor exit or relaunch-skip keeps the provider account already
+    /// stored on the unknown row (or, failing that, the previous
+    /// `agent.error` detail). It does not replace that account with
+    /// only the generic review sentence.
     fn uncertain_fence_text(&self, alias: &str) -> String {
-        let detail = self
-            .store
-            .agent(alias)
-            .ok()
-            .and_then(|a| a.error)
-            .and_then(|e| e.split(" — reconcile:").next().map(str::to_string))
-            .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| "Uncertain provider outcome requires review".to_string());
-        format!(
-            "{detail} — reconcile: \
-             `cadence agent unfence {alias} --status interrupted`, then \
-             `cadence agent resume {alias}`"
-        )
+        format_unknown_fence(&self.preserved_unknown_detail(alias, ""))
+    }
+
+    fn preserved_unknown_detail(&self, alias: &str, actor_error: &str) -> String {
+        if let Some(detail) = self.store.preferred_unknown_error(alias).ok().flatten() {
+            let bounded = bound_unknown_detail(&detail);
+            if !bounded.is_empty() && bounded != UNKNOWN_GENERIC_REASON {
+                return bounded;
+            }
+        }
+        let from_actor = bound_unknown_detail(actor_error);
+        if !from_actor.is_empty() && from_actor != UNKNOWN_GENERIC_REASON {
+            return from_actor;
+        }
+        if let Some(stored) = self.store.agent(alias).ok().and_then(|agent| agent.error) {
+            let bounded = bound_unknown_detail(unknown_fence_detail(&stored));
+            if !bounded.is_empty() {
+                return bounded;
+            }
+        }
+        UNKNOWN_GENERIC_REASON.to_string()
     }
 
     /// An `OutcomeUnknown` never becomes a retry: mark the attempt and
@@ -1070,20 +1077,13 @@ impl Shared {
         // One write: the fence is visible immediately, so the cleared
         // endpoint must land with it — a reader in between must never
         // see `attention` plus a live endpoint.
-        self.store.set_state_detached(
-            alias,
-            "attention",
-            Some(&format!(
-                "{reason} — reconcile: \
-                 `cadence agent unfence {alias} --status interrupted`, then \
-                 `cadence agent resume {alias}`"
-            )),
-        )?;
+        self.store
+            .set_state_detached(alias, "attention", Some(&format_unknown_fence(reason)))?;
         let _ = self
             .store
             .event_public(alias, "attention", json!({"reason": reason}));
         self.wake();
-        Err(Error::unknown("Uncertain provider outcome requires review"))
+        Err(Error::unknown(UNKNOWN_GENERIC_REASON))
     }
 
     // ---- dispatch ----
@@ -2469,9 +2469,9 @@ impl Shared {
         if self.store.has_unknown(alias)? {
             return Err(Error::rejected(format!(
                 "Agent '{alias}' is fenced by an unreconciled unknown \
-                 message — reconcile it first: `cadence agent unfence \
-                 {alias} --status interrupted`, then `cadence agent \
-                 resume {alias}`"
+                 message — resume refused. {} {}",
+                unknown_inspect_lead(),
+                unknown_recovery_note()
             )));
         }
         // Enable only after the ownership/fence checks pass — a
@@ -2707,20 +2707,13 @@ impl Shared {
                     {
                         let assignee = task.assignee.as_deref().unwrap_or("?");
                         j["attention"] = if m.state == "unknown" {
-                            json!(format!(
-                                "kickoff {mid} went unknown — the worker is fenced. \
-                                 `cadence agent unfence {assignee} --status interrupted`, \
-                                 `cadence agent resume {assignee}`, then `cadence job \
-                                 dispatch {}` starts the next revision",
-                                task.id
-                            ))
+                            json!(unknown_kickoff_attention(mid, assignee))
                         } else {
-                            json!(format!(
-                                "kickoff {mid} ended '{}' — `cadence job dispatch {}` \
-                                 starts revision {}",
-                                m.state,
-                                task.id,
-                                task.revision + 1
+                            json!(ordinary_terminal_kickoff_attention(
+                                mid,
+                                &m.state,
+                                &task.id,
+                                task.revision + 1,
                             ))
                         };
                     }
@@ -4966,6 +4959,100 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     Ok(())
 }
 
+/// Fallback detail when an unknown fence has no provider account.
+pub const UNKNOWN_GENERIC_REASON: &str = "Uncertain provider outcome requires review";
+
+/// Separates a preserved unknown reason from the operator hint. Older
+/// rows used ` — reconcile:`; both markers are stripped on restamp.
+const UNKNOWN_FENCE_MARK: &str = " — inspect:";
+
+/// Same character cap `current_message_summary` uses for operator-facing text.
+const UNKNOWN_DETAIL_CHARS: usize = 512;
+
+/// First sentence of an unknown-outcome hint: look before reconciling.
+pub fn unknown_inspect_lead() -> &'static str {
+    "Inspect the uncertain message and its side effects before reconciling. \
+     A missed render observation does not prove the delivery did not happen."
+}
+
+/// What reconciliation is, and how CLI unfence behaves. No command chain:
+/// CLI unfence already resumes, and dispatch is not authorized here.
+pub fn unknown_recovery_note() -> &'static str {
+    "Reconciliation is an explicit operator decision, not an automatic \
+     interrupted or completed result. The CLI unfence command resumes by \
+     default; do not follow it with a second resume. Pass --no-resume to \
+     reconcile without resuming."
+}
+
+/// `job show` attention while the kickoff is still `unknown`. Dispatch is
+/// described as a later paste, not as the next command.
+pub fn unknown_kickoff_attention(message_id: &str, assignee: &str) -> String {
+    format!(
+        "kickoff {message_id} went unknown — the worker {assignee} is fenced. \
+         {} {} Dispatch is a new paste and another revision only after that \
+         reconciliation and a decision that continuation is safe.",
+        unknown_inspect_lead(),
+        unknown_recovery_note()
+    )
+}
+
+/// Attention for an ordinary interrupted or failed kickoff. Dispatch stays
+/// the named next revision; unknown kickoffs do not use this sentence.
+pub fn ordinary_terminal_kickoff_attention(
+    message_id: &str,
+    state: &str,
+    task_id: &str,
+    next_revision: i64,
+) -> String {
+    format!(
+        "kickoff {message_id} ended '{state}' — `cadence job dispatch {task_id}` \
+         starts revision {next_revision}"
+    )
+}
+
+/// Detail stored ahead of the hint. Accepts the current ` — inspect:`
+/// form and the previous ` — reconcile:` form so a restamp does not
+/// swallow the provider account into the hint.
+pub fn unknown_fence_detail(stored: &str) -> &str {
+    let head = stored.split(" — reconcile:").next().unwrap_or(stored);
+    head.split(UNKNOWN_FENCE_MARK).next().unwrap_or(head).trim()
+}
+
+/// Operator-facing fence text. The detail is bounded and passed through
+/// the argv scrubber; screen tails and raw argv are never appended.
+pub fn format_unknown_fence(detail: &str) -> String {
+    let bounded = bound_unknown_detail(detail);
+    let detail = if bounded.is_empty() {
+        UNKNOWN_GENERIC_REASON
+    } else {
+        bounded.as_str()
+    };
+    format!(
+        "{detail}{UNKNOWN_FENCE_MARK} {} {}",
+        unknown_inspect_lead(),
+        unknown_recovery_note()
+    )
+}
+
+fn bound_unknown_detail(detail: &str) -> String {
+    let flat: String = detail
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let words: Vec<String> = flat.split_whitespace().map(str::to_string).collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    let safe = crate::doctor::host::redact_argv(&words);
+    let count = safe.chars().count();
+    if count <= UNKNOWN_DETAIL_CHARS {
+        return safe;
+    }
+    let mut out: String = safe.chars().take(UNKNOWN_DETAIL_CHARS).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5568,6 +5655,98 @@ mod tests {
         assert_eq!(
             unmatched_caller(true, false, false, "answer").unwrap(),
             ("unknown".to_string(), "unknown")
+        );
+    }
+}
+
+#[cfg(test)]
+mod unknown_fence_guidance {
+    use super::{
+        format_unknown_fence, ordinary_terminal_kickoff_attention, unknown_fence_detail,
+        unknown_kickoff_attention, UNKNOWN_GENERIC_REASON,
+    };
+
+    const RENDER_MISS: &str = "submission accepted but never rendered on the endpoint";
+
+    #[test]
+    fn render_miss_reason_survives_restamp() {
+        let once = format_unknown_fence(RENDER_MISS);
+        let twice = format_unknown_fence(unknown_fence_detail(&once));
+        assert_eq!(once, twice);
+        assert!(once.starts_with(RENDER_MISS), "{once}");
+        assert!(once.contains("does not prove"), "{once}");
+        assert!(once.contains("--no-resume"), "{once}");
+        assert!(!once.contains("then `cadence agent resume"), "{once}");
+        assert!(!once.contains("job dispatch"), "{once}");
+        assert!(!once.contains("cadence agent unfence"), "{once}");
+        assert_ne!(
+            unknown_fence_detail(&once),
+            UNKNOWN_GENERIC_REASON,
+            "{once}"
+        );
+    }
+
+    #[test]
+    fn old_reconcile_marker_keeps_provider_account() {
+        let old = "Connection lost during turn; provider outcome is unknown — reconcile: \
+                   `cadence agent unfence w1 --status interrupted`, then \
+                   `cadence agent resume w1`";
+        let detail = unknown_fence_detail(old);
+        assert_eq!(
+            detail,
+            "Connection lost during turn; provider outcome is unknown"
+        );
+        let restamped = format_unknown_fence(detail);
+        assert!(
+            restamped.contains("Connection lost during turn"),
+            "{restamped}"
+        );
+        assert!(restamped.contains("does not prove"), "{restamped}");
+        assert!(
+            !restamped.contains("then `cadence agent resume"),
+            "{restamped}"
+        );
+    }
+
+    #[test]
+    fn empty_detail_stays_generic_without_a_command_chain() {
+        let text = format_unknown_fence("  \n");
+        assert!(text.starts_with(UNKNOWN_GENERIC_REASON), "{text}");
+        assert!(text.contains(" — inspect:"), "{text}");
+        assert!(!text.contains("then `cadence agent resume"), "{text}");
+    }
+
+    #[test]
+    fn detail_is_bounded_and_secret_shaped_argv_is_scrubbed() {
+        let noisy = format!(
+            "before\nsecret --api-key=supersecretvalue {}",
+            "x".repeat(600)
+        );
+        let text = format_unknown_fence(&noisy);
+        let detail = unknown_fence_detail(&text);
+        assert!(!detail.contains('\n'), "{detail}");
+        assert!(!detail.contains("supersecretvalue"), "{detail}");
+        assert!(detail.contains("[REDACTED]"), "{detail}");
+        assert!(detail.chars().count() <= 513, "{}", detail.chars().count());
+        assert!(!text.contains("before_tail"), "{text}");
+    }
+
+    #[test]
+    fn unknown_kickoff_does_not_name_dispatch_ordinary_terminal_does() {
+        let unknown = unknown_kickoff_attention("m1", "w1");
+        assert!(unknown.contains("does not prove"), "{unknown}");
+        assert!(unknown.contains("continuation is safe"), "{unknown}");
+        assert!(!unknown.contains("job dispatch"), "{unknown}");
+        assert!(!unknown.contains("cadence agent unfence"), "{unknown}");
+        let failed = ordinary_terminal_kickoff_attention("m1", "failed", "task-a", 3);
+        assert!(
+            failed.contains("`cadence job dispatch task-a` starts revision 3"),
+            "{failed}"
+        );
+        let interrupted = ordinary_terminal_kickoff_attention("m1", "interrupted", "task-a", 2);
+        assert!(
+            interrupted.contains("`cadence job dispatch task-a` starts revision 2"),
+            "{interrupted}"
         );
     }
 }

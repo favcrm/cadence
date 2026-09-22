@@ -112,9 +112,14 @@ a stop is in flight the alias stays reserved: `agent_resume` is
 `agent_stop` is `rejected` (`already stopping`) before any mutation —
 a stale stop cannot write over a new actor generation. A sequential
 stop after completion is idempotent. Resume on an unknown-fenced agent
-is `rejected`, naming `cadence agent unfence <alias> --status
-interrupted` then `cadence agent resume <alias>` — the fence is only
-lifted by an explicit operator reconcile.
+is `rejected`. The rejection says to inspect the uncertain message and
+side effects first: a missed render observation does not prove the
+delivery did not happen, and reconciliation is an explicit operator
+decision rather than an automatic interrupted or completed result.
+CLI `agent unfence` resumes by default, so the rejection does not ask
+for a second resume; `--no-resume` reconciles without resuming. The
+bare `agent_unfence` RPC stays reconcile-only unless `resume` is true.
+The fence is lifted only by an explicit operator reconcile.
 
 ## Agents
 
@@ -583,23 +588,24 @@ A pane that dies after a possible paste leaves submitted messages
 fails the message. `agent_respond` is `rejected` for pty — provider
 permission prompts are answered in the terminal, and a visible prompt
 is one of the things the ready claim asserts absent. A fence — like
-daemon shutdown — *detaches* the pane rather than killing it: the TUI
-stays alive for inspection (`agent capture` reads its screen), and
-after `agent unfence` reconciles the unknowns, `agent resume` re-adopts
-the same pane and native session. `agent_unfence` accepts
-`resume: true` to run that recovery in one call — reconcile, start the
-actor, wait (bounded ~30s) for its open — and reports `resumed` plus
-`pane`: `adopted` when the surviving pane was re-attached (same pid,
-same native session), `respawned` when a new pane was launched on the
-recorded session (new pid, same native session), `none` when the resume
-was not requested or did not land (with `error` when the start was
-rejected). The CLI's `cadence agent unfence` resumes by default
-(`--no-resume` reconciles only); the bare RPC defaults to
-reconcile-only. Adoption is attachment, not readiness — a visibly busy
-adopted pane still gates sends behind the screen probe (or `agent
-ready --force`). The kill is reserved for explicit
-verbs: `agent_stop` kills the owned pane (a live one through its actor,
-a fenced survivor directly), and `agent_remove`/`agent_gc` kill any
+daemon shutdown — *detaches* the pane rather than killing it. The TUI
+process can still be alive, but `agent capture` and `agent probe`
+require the live actor adapter and answer that the agent has no live
+endpoint while the fence holds. That is not a read-only capture of the
+detached session. `agent_unfence` accepts `resume: true` to reconcile
+and start the actor in one call — wait (bounded ~30s) for its open —
+and reports `resumed` plus `pane`: `adopted` when the surviving pane
+was re-attached (same pid, same native session), `respawned` when a
+new pane was launched on the recorded session (new pid, same native
+session), `none` when the resume was not requested or did not land
+(with `error` when the start was rejected). The CLI's `cadence agent
+unfence` resumes by default (`--no-resume` reconciles only); do not
+follow that default with a second `agent resume`. The bare RPC
+defaults to reconcile-only. Adoption is attachment, not readiness — a
+visibly busy adopted pane still gates sends behind the screen probe
+(or `agent ready --force`). The kill is reserved for explicit verbs:
+`agent_stop` kills the owned pane (a live one through its actor, a
+fenced survivor directly), and `agent_remove`/`agent_gc` kill any
 surviving pane before dropping the row — no orphan sessions on the
 private socket.
 
@@ -1283,17 +1289,23 @@ error verbatim, so the serve loop still sees the fence. Enabled agents
 relaunch *unless* fenced — state `attention` or an unreconciled
 `unknown`. A fenced agent is skipped before any actor or provider
 spawn: a `relaunch_skipped` event records the reason and the sweep
-continues with healthy agents. Recovery is `cadence agent unfence
-<alias> --status interrupted` then `cadence agent resume <alias>`; a
-reconciled agent lands `stopped` and disabled — the same condition as
-an operator stop — so the next restart leaves it stopped rather than
-relaunching it. A
-pty pane that survived the restart is re-adopted by `open` — the
+continues with healthy agents. An unknown fence keeps the provider's
+own reason on `agent.error`. A missed render observation does not prove
+the delivery did not happen. Inspect that message and side effects
+before reconciling; reconciliation is an explicit operator decision,
+not an automatic interrupted or completed result. CLI `agent unfence`
+resumes by default — do not follow it with a second resume.
+`--no-resume` reconciles without resuming. The bare RPC defaults to
+reconcile-only. A reconciled agent lands `stopped` and disabled — the
+same condition as an operator stop — so the next restart leaves it
+stopped rather than relaunching it. A pty pane that survived the
+restart is re-adopted by `open` when resume actually runs — the
 reattach path verifies the pane still owns the stored native session
 lock, so resume converges on the same Devin session rather than a fresh
-one. A pane that adopted a *different* session fails closed and the
-hint is `agent remove` + `join -r` — retrying resume mints a new
-provider session each time.
+one. `agent capture` still needs a live actor; it does not read a
+detached pane. `agent stop` kills a surviving pane. A pane that adopted
+a *different* session fails closed and the hint is `agent remove` +
+`join -r` — retrying resume mints a new provider session each time.
 
 **Hot restart.** The one exception to fence-on-start is a stop the
 next daemon can *recognize* as clean. A graceful shutdown —

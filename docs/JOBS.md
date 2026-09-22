@@ -329,14 +329,21 @@ Everything reuses the fence/unknown rules; the job layer adds visibility
 and a disciplined retry path, never a blind replay.
 
 - **Mid-job fence.** Kickoff → `unknown`, agent → `attention`: the task
-  stays `dispatched`/`running`, flagged. `job show` says:
-  `cadence agent unfence <w> --status interrupted`, then `cadence agent
-  resume <w>`, then `cadence job dispatch <task>` — unfence first, then
-  resume, matching PR #15. Once the kickoff is terminal for any reason
+  stays `dispatched`/`running`, flagged. `job show` says to inspect that
+  kickoff and its side effects before reconciling. A missed render
+  observation does not prove the delivery did not happen. Reconciliation
+  is an explicit operator decision, not an automatic interrupted or
+  completed result. CLI `agent unfence` resumes by default; do not follow
+  it with a second resume. `--no-resume` reconciles without resuming.
+  `job dispatch` is not the immediate recovery: it is a new paste and
+  starts another revision only after reconciliation and a decision that
+  continuation is safe. Once the kickoff is terminal for any reason
   other than normal completion (`interrupted`, `failed`, or a reconcile
   to either) dispatch is legal from `dispatched`/`running` and starts a
-  new revision. An operator reconcile to `completed` behaves like a
-  normal completion, including the SHA rules above.
+  new revision. An ordinary interrupted or failed kickoff still names
+  `job dispatch` as that next revision. An operator reconcile to
+  `completed` behaves like a normal completion, including the SHA rules
+  above.
 - **Retry idempotency.** Dispatch of the same revision with a live
   kickoff returns `duplicate` and never re-pastes. A new revision always
   mints a fresh id; the queue's envelope-conflict rule still rejects id

@@ -2342,6 +2342,36 @@ impl Store {
         Ok(count > 0)
     }
 
+    /// The unknown `error` a fence restamp should show. One column, one
+    /// row. A provider account outranks a restart stamp, and the
+    /// in-flight restart stamp outranks the later "turn never verified"
+    /// sweep, so a newer blanket sentence cannot hide an older reason.
+    /// Within one rank the newest `seq` wins. Restart stamps are the
+    /// literals `recover` and `orphan_running` write; message rows are
+    /// not rewritten here.
+    pub fn preferred_unknown_error(&self, alias: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT error FROM messages
+             WHERE alias=? AND state='unknown' AND error IS NOT NULL
+             ORDER BY
+               CASE error
+                 WHEN 'Uncertain provider outcome requires review' THEN 3
+                 WHEN 'agent fenced at restart; turn never verified' THEN 2
+                 WHEN 'Runtime restarted during provider turn' THEN 1
+                 ELSE 0
+               END,
+               seq DESC
+             LIMIT 1",
+            [alias],
+            |row| row.get(0),
+        ) {
+            Ok(error) => Ok(error),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Ids of the alias's `unknown` messages, oldest first — what
     /// `agent unfence` reconciles in one call.
     pub fn unknown_messages(&self, alias: &str) -> Result<Vec<String>> {

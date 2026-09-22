@@ -2893,10 +2893,10 @@ fn session_mismatch(error: &str) -> bool {
 }
 
 /// `next` hint for a fenced agent (`attention`, no endpoint). An
-/// unreconciled `unknown` must be reconciled first — `agent unfence`,
-/// then `agent resume`; a session-mismatch can never converge — remove
-/// and rejoin (each retried resume mints a fresh provider session);
-/// anything else retries `agent resume`.
+/// unreconciled `unknown` is an inspection problem: the hint does not
+/// hand out an unfence-then-resume command chain. A session-mismatch
+/// can never converge — remove and rejoin (each retried resume mints a
+/// fresh provider session); anything else retries `agent resume`.
 fn fenced_next(alias: &str, error: &str, unknown: i64) -> Value {
     if session_mismatch(error) {
         json!({
@@ -2906,8 +2906,8 @@ fn fenced_next(alias: &str, error: &str, unknown: i64) -> Value {
         })
     } else if unknown > 0 {
         json!({
-            "unfence": format!("cadence agent unfence {alias} --status interrupted"),
-            "resume": format!("cadence agent resume {alias}"),
+            "inspect": cadence_agent::daemon::unknown_inspect_lead(),
+            "decision": cadence_agent::daemon::unknown_recovery_note(),
         })
     } else {
         json!({"resume": format!("cadence agent resume {alias}")})
@@ -2951,10 +2951,12 @@ fn resume_one(state_dir: &Path, alias: &str) -> Value {
     // reports it under `fenced` with the reconcile-first commands.
     if unknown > 0 {
         return json!({"alias": alias, "resumed": false, "fenced": true,
-                      "state": agent["state"],
-                      "hint": format!("fenced by an unreconciled unknown message — \
-                                       `cadence agent unfence {alias} --status interrupted`, \
-                                       then `cadence agent resume {alias}`")});
+        "state": agent["state"],
+        "hint": format!(
+            "fenced by an unreconciled unknown message — not resumed. {} {}",
+            cadence_agent::daemon::unknown_inspect_lead(),
+            cadence_agent::daemon::unknown_recovery_note()
+        )});
     }
     // Any other `attention` fence gates resume exactly the way it gates
     // startup relaunch — the recorded cause is the operator's context;
@@ -4947,8 +4949,9 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
         if show["unknown"].as_i64().unwrap_or(0) > 0 {
             Error::rejected(format!(
                 "Agent '{alias}' is fenced by an unreconciled unknown message — \
-                 `cadence agent unfence {alias} --status interrupted`, then \
-                 `cadence agent resume {alias}`"
+                 resume refused. {} {}",
+                cadence_agent::daemon::unknown_inspect_lead(),
+                cadence_agent::daemon::unknown_recovery_note()
             ))
         } else {
             Error::rejected(format!(
