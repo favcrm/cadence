@@ -478,11 +478,12 @@ The daemon derives one live native PTY endpoint from the Unix socket
 peer, current adapter ownership, endpoint generation, registration
 incarnation and process start identity. Request aliases, `CADENCE_ALIAS`,
 operator UI labels and external/headless identities cannot create proof.
-Two distinct non-author PM/worker aliases must pass the same semantic
-SHA-256 revision (claim/body, trusted author/contributors, type, source,
-confidence, scope and supersede target); an authenticated PM endpoint
-then finalizes. Body edits, stale digests, duplicate aliases, missing
-evidence, disagreement and reused endpoint identities fail closed.
+Two distinct non-author PM/worker endpoint identities, displayed with
+unique aliases, must pass the same semantic SHA-256 revision (claim/body,
+trusted author/contributors, type, source, confidence, scope and supersede
+target); an authenticated PM endpoint then finalizes. Body edits, stale
+digests, duplicate aliases, missing evidence, disagreement and reused
+endpoint identities fail closed.
 Legacy accepted records remain visible with a review-blocked reason and
 are excluded from matching until a corrected native proposal is reviewed.
 `verify` opens a fresh receipt cycle; a timestamp alone cannot revalidate.
