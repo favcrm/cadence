@@ -22343,6 +22343,269 @@ fn monitor_persists_coverage_heartbeats_and_deduplicates_alerts() {
 }
 
 #[test]
+fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
+    let mut d = TestDaemon::start();
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    let (spec, sha) = d.spec_file("unknown-monitor-spec.md", "inspect uncertain work");
+    let project = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "unknown-job", "spec": spec,
+               "spec_sha256": sha, "repo": project}),
+    )
+    .unwrap();
+    d.rpc(
+        "task_new",
+        json!({"job": "unknown-job", "task": "unknown-task", "assignee": "w1",
+               "acceptance": "inspect uncertain work"}),
+    )
+    .unwrap();
+    d.rpc(
+        "monitor_register",
+        json!({"monitor": "unknown-monitor", "project": project,
+               "owner": "operator", "tasks": ["unknown-task"],
+               "interval_secs": 1}),
+    )
+    .unwrap();
+    wait_monitor_state(&d, "unknown-monitor", "active", 5);
+
+    // Stop before dispatch. The kickoff stays queued on the stopped worker
+    // until its body is the fake provider's DISCONNECT fixture and resume
+    // starts the actor. Opening Store here would run crash recovery against
+    // the live daemon, so the body rewrite uses a plain connection.
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    let stopped = d.wait_agent("w1", "stopped", 10);
+    assert_eq!(stopped["enabled"], false, "{stopped}");
+    assert!(stopped["endpoint"].is_null(), "{stopped}");
+    let dispatched = d
+        .rpc("task_dispatch", json!({"task": "unknown-task"}))
+        .unwrap();
+    assert_eq!(dispatched["duplicate"], false, "{dispatched}");
+    let kickoff = dispatched["message"].as_str().unwrap().to_string();
+    let queued = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["id"] == kickoff)
+        .unwrap()
+        .clone();
+    assert_eq!(queued["state"], "queued", "{queued}");
+    assert_eq!(queued["source"], "job_dispatch", "{queued}");
+    assert_eq!(queued["task_id"], "unknown-task", "{queued}");
+    let still_stopped = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
+    assert_eq!(still_stopped["state"], "stopped", "{still_stopped}");
+    assert_eq!(still_stopped["enabled"], false, "{still_stopped}");
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE messages SET body='DISCONNECT' WHERE id=?",
+        rusqlite::params![kickoff],
+    )
+    .unwrap();
+    drop(conn);
+    let armed = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["id"] == kickoff)
+        .unwrap()
+        .clone();
+    assert_eq!(armed["state"], "queued", "{armed}");
+    assert_eq!(armed["body"], "DISCONNECT", "{armed}");
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"]["state"],
+        "stopped"
+    );
+    d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+
+    let message = d.wait_message("w1", &kickoff, &["unknown"], 15);
+    assert_eq!(message["state"], "unknown", "{message}");
+    assert_eq!(message["source"], "job_dispatch", "{message}");
+    assert_eq!(
+        message["error"], "Connection lost during turn; provider outcome is unknown",
+        "{message}"
+    );
+    assert_eq!(message["result"]["status"], "unknown", "{message}");
+    assert!(
+        message["turn_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("fake-turn-"),
+        "{message}"
+    );
+    assert_eq!(d.task_state("unknown-task"), "running");
+    let task = d.rpc("task_show", json!({"task": "unknown-task"})).unwrap()["task"].clone();
+    assert_eq!(task["revision"], 1, "{task}");
+    assert!(task["head_sha"].is_null(), "{task}");
+    d.wait_agent("w1", "attention", 10);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "after", "message": "after-unknown"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(d.message_state("w1", "after-unknown"), "queued");
+    assert_eq!(d.message_state("w1", &kickoff), "unknown");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let alert = loop {
+        let page = d
+            .rpc(
+                "monitor_alerts",
+                json!({"monitor": "unknown-monitor", "open": true}),
+            )
+            .unwrap();
+        if let Some(alert) = page["alerts"].as_array().and_then(|alerts| alerts.first()) {
+            break alert.clone();
+        }
+        assert!(Instant::now() < deadline, "monitor did not alert: {page}");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(alert["kind"], "turn_unknown", "{alert}");
+    assert_eq!(alert["task"], "unknown-task", "{alert}");
+    assert_eq!(alert["state"], "open", "{alert}");
+    let evidence = &alert["payload"]["payload"];
+    assert_eq!(evidence["message"], kickoff);
+    assert_eq!(
+        evidence["reason"],
+        "Connection lost during turn; provider outcome is unknown"
+    );
+    assert_eq!(evidence["owner"], "operator");
+    assert!(evidence["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("reconcil"));
+    let events = d
+        .rpc("job_events", json!({"job": "unknown-job", "tail": true}))
+        .unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let unknown_events: Vec<_> = events
+        .iter()
+        .filter(|event| event["kind"] == "turn_unknown")
+        .collect();
+    assert_eq!(unknown_events.len(), 1, "{events:?}");
+    assert_eq!(unknown_events[0]["job_id"], "unknown-job");
+    assert_eq!(unknown_events[0]["task_id"], "unknown-task");
+    assert!(
+        event_kinds(&d, "w1")
+            .iter()
+            .any(|kind| kind == "turn_finished"),
+        "compatibility turn_finished stays on the agent stream"
+    );
+    let alert_seq = alert["seq"].clone();
+    let fingerprint = alert["fingerprint"].clone();
+
+    // The cursor and event fingerprint make repeated monitor ticks one alert.
+    thread::sleep(Duration::from_millis(2200));
+    let repeated = d
+        .rpc(
+            "monitor_alerts",
+            json!({"monitor": "unknown-monitor", "open": true}),
+        )
+        .unwrap();
+    assert_eq!(
+        repeated["alerts"].as_array().unwrap().len(),
+        1,
+        "{repeated}"
+    );
+    assert_eq!(repeated["alerts"][0]["seq"], alert_seq, "{repeated}");
+    assert_eq!(
+        repeated["alerts"][0]["fingerprint"], fingerprint,
+        "{repeated}"
+    );
+    // A same-kind event without task scope is outside this monitor's fixed
+    // coverage and must remain unmonitored. A raw insert avoids Store::open,
+    // whose recovery would rewrite the live daemon.
+    let at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
+         VALUES('w1','turn_unknown',?,NULL,NULL,?)",
+        rusqlite::params![r#"{"reason":"unscoped"}"#, at],
+    )
+    .unwrap();
+    drop(conn);
+    thread::sleep(Duration::from_millis(1200));
+    let unscoped = d
+        .rpc(
+            "monitor_alerts",
+            json!({"monitor": "unknown-monitor", "open": true}),
+        )
+        .unwrap();
+    assert_eq!(
+        unscoped["alerts"].as_array().unwrap().len(),
+        1,
+        "{unscoped}"
+    );
+    assert_eq!(
+        unscoped["alerts"][0]["fingerprint"], fingerprint,
+        "{unscoped}"
+    );
+    assert_eq!(
+        event_kinds(&d, "w1")
+            .iter()
+            .filter(|kind| kind.as_str() == "turn_unknown")
+            .count(),
+        2,
+        "scoped finish plus the unscoped insert"
+    );
+    let scoped = d
+        .rpc("job_events", json!({"job": "unknown-job", "tail": true}))
+        .unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "turn_unknown")
+        .count();
+    assert_eq!(scoped, 1);
+    assert_eq!(d.task_state("unknown-task"), "running");
+    assert_eq!(d.message_state("w1", &kickoff), "unknown");
+
+    // Restarting restores the monitor cursor and keeps the same open alert;
+    // the unknown attempt remains fenced and the task never reaches review.
+    let state = d.state.clone();
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let d2 = TestDaemon::start_on(state);
+    wait_monitor_state(&d2, "unknown-monitor", "active", 5);
+    thread::sleep(Duration::from_millis(1200));
+    let restored = d2
+        .rpc(
+            "monitor_alerts",
+            json!({"monitor": "unknown-monitor", "open": true}),
+        )
+        .unwrap();
+    assert_eq!(
+        restored["alerts"].as_array().unwrap().len(),
+        1,
+        "{restored}"
+    );
+    assert_eq!(
+        restored["alerts"][0]["fingerprint"], fingerprint,
+        "{restored}"
+    );
+    assert_eq!(restored["alerts"][0]["seq"], alert_seq, "{restored}");
+    assert_eq!(d2.message_state("w1", &kickoff), "unknown");
+    assert_eq!(d2.message_state("w1", "after-unknown"), "queued");
+    assert_eq!(d2.task_state("unknown-task"), "running");
+    let restored_task = d2
+        .rpc("task_show", json!({"task": "unknown-task"}))
+        .unwrap()["task"]
+        .clone();
+    assert_eq!(restored_task["revision"], 1, "{restored_task}");
+    assert!(restored_task["head_sha"].is_null(), "{restored_task}");
+    d2.wait_agent("w1", "attention", 5);
+    let _ = d2.rpc("monitor_stop", json!({"monitor": "unknown-monitor"}));
+}
+
+#[test]
 fn monitor_dispatch_requires_explicit_safe_eligibility() {
     let d = TestDaemon::start();
     d.register("pm");
