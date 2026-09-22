@@ -59,6 +59,14 @@ impl IdentityProof {
     }
 }
 
+fn valid_identity_proof(proof: &IdentityProof) -> bool {
+    !proof.alias.is_empty()
+        && proof.registration != 0
+        && !proof.generation.is_empty()
+        && proof.process_start != 0
+        && matches!(proof.role.as_str(), "pm" | "worker")
+}
+
 /// An immutable review receipt.  Receipts are retained in the memory file;
 /// lifecycle status and timestamps do not enter the semantic revision digest.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -522,10 +530,8 @@ fn finalization_for<'a>(
         })
         .max_by_key(|receipt| receipt.cycle)?;
     (receipt.digest == digest
+        && valid_identity_proof(&receipt.finalizer)
         && receipt.finalizer.role == "pm"
-        && !receipt.finalizer.alias.is_empty()
-        && !receipt.finalizer.generation.is_empty()
-        && receipt.finalizer.process_start != 0
         && !receipt.finalized_at.is_empty())
     .then_some(receipt)
 }
@@ -551,6 +557,12 @@ fn quorum_status_for_cycle(mem: &Memory, operation: &str, cycle: u64) -> (bool, 
             "review blocked: proposer has no authenticated native identity".to_string(),
         );
     };
+    if !valid_identity_proof(author) {
+        return (
+            false,
+            "review blocked: proposer identity proof is incomplete".to_string(),
+        );
+    }
     if cycle == 0 {
         return (
             false,
@@ -580,11 +592,16 @@ fn quorum_status_for_cycle(mem: &Memory, operation: &str, cycle: u64) -> (bool, 
             continue;
         }
         let identity_prefix = format!("{}#", receipt.reviewer);
+        let valid_registration = receipt
+            .identity
+            .strip_prefix(&identity_prefix)
+            .and_then(|registration| registration.parse::<u64>().ok())
+            .is_some_and(|registration| registration != 0);
         if receipt.digest != digest
             || receipt.evidence.trim().is_empty()
             || !matches!(receipt.role.as_str(), "pm" | "worker")
             || receipt.reviewer.is_empty()
-            || !receipt.identity.starts_with(&identity_prefix)
+            || !valid_registration
             || receipt.generation.is_empty()
             || receipt.process_start == 0
         {
@@ -596,6 +613,7 @@ fn quorum_status_for_cycle(mem: &Memory, operation: &str, cycle: u64) -> (bool, 
         }
         if receipt.verdict != "pass"
             || receipt.identity == author_id
+            || receipt.reviewer == author.alias
             || contributor_ids.contains(&receipt.identity)
             || contributor_aliases.contains(&receipt.reviewer)
         {
@@ -664,6 +682,12 @@ pub fn retrieval_status(mem: &Memory) -> (bool, String) {
                 .to_string(),
         );
     };
+    if accept_finalization.cycle != 1 {
+        return (
+            false,
+            "review blocked: acceptance finalization is bound to an invalid cycle".to_string(),
+        );
+    }
     let (accept_quorum, accept_reason) =
         quorum_status_for_cycle(mem, "accept", accept_finalization.cycle);
     if !accept_quorum {
@@ -683,12 +707,7 @@ pub fn retrieval_status(mem: &Memory) -> (bool, String) {
             ),
         );
     }
-    if mem
-        .front
-        .finalizations
-        .iter()
-        .any(|receipt| receipt.operation == "verify")
-    {
+    if mem.front.review_cycle > 1 {
         let Some(receipt) = finalization_for(&mem.front, "verify", None, &digest) else {
             return (
                 false,
@@ -696,6 +715,15 @@ pub fn retrieval_status(mem: &Memory) -> (bool, String) {
                     .to_string(),
             );
         };
+        if receipt.cycle != mem.front.review_cycle {
+            return (
+                false,
+                format!(
+                    "review blocked: latest verify finalization cycle {} does not match current cycle {}",
+                    receipt.cycle, mem.front.review_cycle
+                ),
+            );
+        }
         let (verify_quorum, verify_reason) = quorum_status_for_cycle(mem, "verify", receipt.cycle);
         if !verify_quorum {
             return (
@@ -818,11 +846,8 @@ pub fn propose_native(
     slug: Option<&str>,
     actor: &NativeIdentity,
 ) -> Result<Value> {
-    if actor.proof.alias.is_empty() || actor.proof.generation.is_empty() {
+    if !valid_identity_proof(&actor.proof) {
         return Err(Error::rejected("native proposer identity is incomplete"));
-    }
-    if actor.proof.role != "pm" && actor.proof.role != "worker" {
-        return Err(Error::rejected("native proposer role is unsupported"));
     }
     let projects = project::list(&pm.dir)?;
     let proj = projects
@@ -959,9 +984,9 @@ pub fn submit_review(
             "memory review verdict must be pass or revise",
         ));
     }
-    if !matches!(actor.proof.role.as_str(), "pm" | "worker") {
+    if !valid_identity_proof(&actor.proof) {
         return Err(Error::rejected(
-            "only an authenticated PM or worker endpoint may submit a memory review",
+            "authenticated PM or worker identity is incomplete",
         ));
     }
     let evidence = evidence.trim();
@@ -1089,7 +1114,7 @@ pub fn finalize_native(
     expected_digest: &str,
     actor: &NativeIdentity,
 ) -> Result<Value> {
-    if actor.proof.role != "pm" {
+    if !valid_identity_proof(&actor.proof) || actor.proof.role != "pm" {
         return Err(Error::rejected(
             "memory finalization is restricted to an authenticated PM endpoint",
         ));
@@ -1190,7 +1215,7 @@ pub fn reject_native(
     slug: &str,
     actor: &NativeIdentity,
 ) -> Result<Value> {
-    if actor.proof.role != "pm" {
+    if !valid_identity_proof(&actor.proof) || actor.proof.role != "pm" {
         return Err(Error::rejected(
             "memory rejection is restricted to an authenticated PM endpoint",
         ));
@@ -2230,6 +2255,22 @@ mod tests {
     }
 
     #[test]
+    fn author_alias_cannot_vote_after_reregistration() {
+        let mut mem = memory("accepted", 1, Some(proof("author", 1)));
+        let digest = semantic_digest(&mem);
+        mem.front
+            .reviews
+            .push(receipt(&proof("author", 99), "accept", 1, &digest));
+        mem.front
+            .reviews
+            .push(receipt(&proof("worker-b", 3), "accept", 1, &digest));
+        mem.front
+            .finalizations
+            .push(finalization(&proof("pm", 4), "accept", 1, &digest));
+        assert!(!retrieval_status(&mem).0);
+    }
+
+    #[test]
     fn authenticated_pm_can_be_a_non_author_reviewer() {
         let mut mem = memory("accepted", 1, Some(proof("author", 1)));
         let digest = semantic_digest(&mem);
@@ -2322,6 +2363,9 @@ mod tests {
         assert!(retrieval_status(&mem).0);
         // The latest finalized verify cycle is authoritative.  Keeping an
         // older valid cycle cannot hide corruption in cycle three.
+        let latest = mem.front.finalizations.pop().unwrap();
+        assert!(!retrieval_status(&mem).0);
+        mem.front.finalizations.push(latest);
         mem.front.finalizations[2].digest = "0".repeat(64);
         assert!(!retrieval_status(&mem).0);
         mem.front.finalizations[2].digest = digest.clone();
