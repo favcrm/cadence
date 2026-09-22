@@ -296,8 +296,15 @@ Cadence task <task-id> (job <job>, revision <n>): implement per spec at
 <spec-path>. Scope: worktree <path>, branch <branch>, base <sha>.
 Acceptance: <criteria>. Report when done:
 `cadence message result <dispatch-id> --token <turn_id> --text '<summary>' --sha "$(git rev-parse HEAD)"`.
-Do not report a SHA you have not committed.
+Do not report a SHA you have not committed. Correlation: <32-hex>.
 ```
+
+Explicit envelopes end with ` Correlation: <32-hex sha256 of the
+dispatch id>.` — the pty render probe slices the body's tail, and the
+derived suffix keeps that tail unique per dispatch id (bounded even for
+`--message` overrides). Truncated bodies keep the same ending after the
+report contract. Managed envelopes take no screen probe and carry no
+correlation.
 
 Managed endpoints get the trailer form instead:
 

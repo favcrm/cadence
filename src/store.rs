@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::adapter::registry;
@@ -5124,6 +5125,17 @@ fn last_sha_line(text: &str) -> Option<String> {
     })
 }
 
+/// The explicit-endpoint tail the pty render probe can tell apart:
+/// a bounded digest of the durable message id, appended last so the
+/// body's final characters differ across dispatches even when every
+/// other field is shared boilerplate. A fixed 32-hex digest (not the
+/// raw id) keeps the suffix bounded for `--message` override ids of
+/// arbitrary length; the same id always mints the same suffix.
+fn kickoff_correlation(message_id: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(message_id.as_bytes()));
+    format!(" Correlation: {}.", &digest[..32])
+}
+
 /// The dispatch body — one line, control-char free, ≤4000 chars (the
 /// pty constraint that already shapes bootstrap messages). Pointer-first:
 /// the spec path, scope claim and acceptance reference, then the exact
@@ -5197,12 +5209,22 @@ fn kickoff_body(
         issue,
         report
     );
+    // Explicit envelopes end with the per-message correlation: the
+    // screen probe slices the body's tail, and without it every
+    // kickoff shares the same boilerplate ending. Managed envelopes
+    // take no screen probe and stay byte-identical to before.
+    let correlation = if managed {
+        String::new()
+    } else {
+        kickoff_correlation(message_id)
+    };
     // The pty body ceiling is 4000 chars; truncate the free-form middle
-    // (acceptance) rather than the contract tail. The suffix and the
-    // report contract must fit inside the ceiling too.
-    if body.len() > 4000 {
+    // (acceptance) rather than the contract tail. The truncation note,
+    // the report contract and the correlation must all fit inside the
+    // ceiling, so the correlation's length is reserved up front.
+    if body.len() + correlation.len() > 4000 {
         let suffix = "… (truncated — full criteria in the spec file).";
-        let room = 4000usize.saturating_sub(suffix.len() + report.len());
+        let room = 4000usize.saturating_sub(suffix.len() + report.len() + correlation.len());
         // Byte budget, not char count — spec text may be multibyte.
         let mut cut = String::new();
         for c in body.chars() {
@@ -5213,9 +5235,10 @@ fn kickoff_body(
         }
         cut += suffix;
         cut += &report;
+        cut += &correlation;
         return cut;
     }
-    body
+    format!("{body}{correlation}")
 }
 
 #[cfg(test)]
@@ -6069,5 +6092,370 @@ mod tests {
         assert_eq!(vs.len(), 2);
         assert_eq!(vs[0].revision, 1);
         assert_eq!(vs[1].revision, 2);
+    }
+
+    /// A worker on an explicit-reporting pty endpoint (`devin/pty`,
+    /// `Reporting::Explicit` in `adapter::registry`) so dispatched
+    /// kickoffs carry the `message result` contract the screen probe
+    /// tails.
+    fn reg_pty(s: &Store, alias: &str, cwd: &Path) {
+        s.register_agent(&NewAgent {
+            alias,
+            provider: "devin",
+            endpoint_kind: "pty",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&json!({"upstream": "pm"}).to_string()),
+        })
+        .unwrap();
+    }
+
+    /// A pm + open job so `dispatch_task` mints real kickoff ids.
+    fn seeded_job(s: &Store, cwd: &Path) {
+        reg(s, "pm", cwd);
+        s.create_job(
+            "j1",
+            None,
+            "/s.md",
+            &"0".repeat(64),
+            "pm",
+            None,
+            None,
+            None,
+            2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    /// Dispatch `task` and return the durable message id plus the
+    /// enqueued body — the exact text a pty adapter would paste.
+    fn dispatch_body(s: &Store, task: &str, msg: Option<&str>) -> (String, String) {
+        let (_, kickoff, dup, _) = s.dispatch_task(task, None, msg, "test").unwrap();
+        assert!(!dup);
+        let body = s.message(&kickoff).unwrap().unwrap().body;
+        (kickoff, body)
+    }
+
+    /// The slice the pty render probe hashes (private helpers in
+    /// `src/adapter/pty/mod.rs`: `PROBE_SLICE` scalars off the tail,
+    /// whitespace stripped). Restated here because the store cannot
+    /// import them — the assertions below measure real dispatch bodies
+    /// against that documented window.
+    fn probe_slice(body: &str) -> String {
+        let tail: String = body
+            .chars()
+            .rev()
+            .take(64)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        tail.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// `normalize_screen` restated for the count model: the probe counts
+    /// `slice` occurrences inside the whitespace-stripped visible pane.
+    fn normalized(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The contract restated independently of `kickoff_correlation`:
+    /// ` Correlation: ` + 32 lowercase hex of SHA-256(message id) + `.`.
+    fn expected_correlation(message_id: &str) -> String {
+        let digest = format!("{:x}", Sha256::digest(message_id.as_bytes()));
+        format!(" Correlation: {}.", &digest[..32])
+    }
+
+    #[test]
+    fn explicit_kickoff_tails_differ_per_message_id() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task(
+            "j1",
+            "t1",
+            None,
+            Some("w1"),
+            None,
+            Some("green tests"),
+            Some("/w/t1"),
+            Some("b1"),
+            Some(SHA40_A),
+        )
+        .unwrap();
+        s.create_task(
+            "j1",
+            "t2",
+            None,
+            Some("w1"),
+            None,
+            Some("other work"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (k1, b1) = dispatch_body(&s, "t1", None);
+        let (k2, b2) = dispatch_body(&s, "t2", None);
+        assert_ne!(k1, k2);
+        for (k, b) in [(&k1, &b1), (&k2, &b2)] {
+            // The durable id is still the report target; the body ends
+            // in the derived correlation — trailer first, suffix last.
+            assert!(b.contains(&format!("cadence message result {k}")), "{b}");
+            assert!(b.ends_with(&expected_correlation(k)), "{b}");
+            let trailer = b.rfind("committed.").unwrap();
+            let corr = b.rfind("Correlation:").unwrap();
+            assert!(trailer < corr, "{b}");
+            // The pty paste contract: one line, control-free, ≤4000 bytes.
+            assert!(
+                !b.contains('\n') && !b.chars().any(|c| c.is_control()),
+                "{b}"
+            );
+            assert!(b.len() <= 4000);
+        }
+        // Distinct dispatches yield distinct probed tails, each holding
+        // its own digest inside the 64-scalar window. The slice is
+        // whitespace-stripped, so the needle must be stripped too.
+        let (s1, s2) = (probe_slice(&b1), probe_slice(&b2));
+        assert_ne!(s1, s2);
+        let stripped = |s: String| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        assert!(s1.contains(&stripped(expected_correlation(&k1))), "{s1}");
+        assert!(s2.contains(&stripped(expected_correlation(&k2))), "{s2}");
+        // The pre-change world: strip the suffix and both bodies share
+        // the boilerplate tail — the collision this fixes.
+        let b1_shared = b1.replace(&expected_correlation(&k1), "");
+        let b2_shared = b2.replace(&expected_correlation(&k2), "");
+        assert_eq!(probe_slice(&b1_shared), probe_slice(&b2_shared));
+        // Count model of the visible-pane rule: A's old prompt is on the
+        // grid before the paste; after it scrolls off and B renders, B's
+        // slice count rises 0 → 1 — a real increase, not a contains.
+        let before = normalized(&b1_shared);
+        assert_eq!(before.matches(&s2).count(), 0);
+        let after = normalized(&b2);
+        assert_eq!(after.matches(&s2).count(), 1);
+        // An absent tail still proves nothing: a pane that never paints
+        // B's ending contributes no occurrence of its slice.
+        assert_eq!(normalized("→ draft placeholder").matches(&s2).count(), 0);
+    }
+
+    #[test]
+    fn truncated_explicit_kickoff_keeps_report_and_correlation() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task(
+            "j1",
+            "t1",
+            None,
+            Some("w1"),
+            None,
+            Some(&"a".repeat(5000)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        s.create_task(
+            "j1",
+            "t2",
+            None,
+            Some("w1"),
+            None,
+            Some(&"b".repeat(5000)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (k1, b1) = dispatch_body(&s, "t1", None);
+        let (k2, b2) = dispatch_body(&s, "t2", None);
+        for (k, b) in [(&k1, &b1), (&k2, &b2)] {
+            assert!(b.len() <= 4000, "{} bytes", b.len());
+            assert!(
+                b.contains("(truncated — full criteria in the spec file)."),
+                "{b}"
+            );
+            // The truncated form still ends report-contract then
+            // correlation — the same tail the short form uses.
+            let tail = format!("shows the turn_id.{}", expected_correlation(k));
+            assert!(b.ends_with(&tail), "{b}");
+            assert!(b.contains(&format!("cadence message result {k}")), "{b}");
+            assert!(
+                !b.contains('\n') && !b.chars().any(|c| c.is_control()),
+                "{b}"
+            );
+        }
+        // Truncated envelopes collide today on the shared report ending;
+        // with the suffix their probed tails separate too.
+        assert_ne!(probe_slice(&b1), probe_slice(&b2));
+    }
+
+    #[test]
+    fn kickoff_body_ceiling_holds_across_the_truncation_boundary() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t1", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let job = s.job("j1").unwrap();
+        let mut task = s.task("t1").unwrap();
+        let worker = s.agent("w1").unwrap();
+        let mid = "mid-0123456789abcdef";
+        // sha256sum over the id bytes, computed outside this code — the
+        // test pins the encoding instead of re-deriving it from the
+        // function under test.
+        let correlation = " Correlation: 51bb19c5d45a3b839228091e46563550.";
+        let mut saw_normal = false;
+        let mut saw_truncated = false;
+        // Sweep the free-form field across the 4000-byte boundary: with
+        // the suffix appended, a pre-correlation body near the ceiling
+        // must still leave the whole paste inside it.
+        for len in (3400..=4000).step_by(25) {
+            task.acceptance = Some("x".repeat(len));
+            let out = kickoff_body(&job, &task, 1, mid, &worker);
+            assert!(out.len() <= 4000, "len {len}: {} bytes", out.len());
+            assert!(out.ends_with(&correlation), "len {len}: {out}");
+            assert!(out.contains(&format!("cadence message result {mid}")));
+            assert!(!out.chars().any(|c| c.is_control()), "len {len}");
+            if out.contains("(truncated — full criteria in the spec file).") {
+                saw_truncated = true;
+            } else {
+                saw_normal = true;
+                assert!(out.contains("Do not report a SHA you have not committed."));
+            }
+        }
+        assert!(saw_normal && saw_truncated, "sweep must cross the boundary");
+        // Multibyte acceptance: the byte budget cuts between scalars,
+        // never mid-codepoint, and the suffix survives the cut.
+        task.acceptance = Some("界".repeat(1400));
+        let out = kickoff_body(&job, &task, 1, mid, &worker);
+        assert!(out.len() <= 4000);
+        assert!(out.ends_with(&correlation), "{out}");
+        // Same id ⇒ same body: the tail is a pure function of the
+        // durable id, so a repaste of one message keeps one slice.
+        assert_eq!(out, kickoff_body(&job, &task, 1, mid, &worker));
+    }
+
+    #[test]
+    fn kickoff_body_strips_control_fields_and_keeps_pinned_tail() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t1", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let job = s.job("j1").unwrap();
+        let mut task = s.task("t1").unwrap();
+        let worker = s.agent("w1").unwrap();
+        // Newline, a C0 control and a C1 control in the free-form fields
+        // — `clean` maps them to spaces before assembly, so the paste
+        // stays one control-free line and still ends in the pinned
+        // digest of `mid-0123456789abcdef`.
+        task.acceptance = Some("line one\nline two\u{7}more\u{85}end".to_string());
+        task.spec_path = Some("spec\tdir/file\nname.md".to_string());
+        let out = kickoff_body(&job, &task, 1, "mid-0123456789abcdef", &worker);
+        assert!(!out.chars().any(|c| c.is_control()), "{out}");
+        assert!(!out.contains('\n'), "{out}");
+        assert!(out.len() <= 4000);
+        assert!(
+            out.ends_with(" Correlation: 51bb19c5d45a3b839228091e46563550."),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn kickoff_correlation_bounds_long_and_unicode_ids() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task("j1", "t1", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        // A 64-char `--message` override (the longest legal id) still
+        // yields the fixed-size suffix — not a 64-char tail.
+        let long_id = "z".repeat(64);
+        let (k, b) = dispatch_body(&s, "t1", Some(&long_id));
+        assert_eq!(k, long_id);
+        assert!(b.ends_with(&expected_correlation(&k)), "{b}");
+        // Beyond the legal grammar the function still stays bounded and
+        // control-free — the digest never leaks raw id bytes.
+        let job = s.job("j1").unwrap();
+        let task = s.task("t1").unwrap();
+        let worker = s.agent("w1").unwrap();
+        let weird = "κickoff-任务-✓".repeat(15);
+        let out = kickoff_body(&job, &task, 1, &weird, &worker);
+        assert!(out.ends_with(&expected_correlation(&weird)), "{out}");
+        assert!(!out.chars().any(|c| c.is_control()));
+        assert_ne!(expected_correlation(&long_id), expected_correlation(&weird));
+        // The suffix is 47 chars regardless of id length or alphabet.
+        assert_eq!(expected_correlation(&long_id).len(), 47);
+        assert_eq!(expected_correlation(&weird).len(), 47);
+    }
+
+    #[test]
+    fn managed_kickoff_envelope_is_unchanged() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        // `fake/fake` reports via TurnResult — the managed envelope.
+        s.register_agent(&NewAgent {
+            alias: "w1",
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&json!({"upstream": "pm"}).to_string()),
+        })
+        .unwrap();
+        s.create_task(
+            "j1",
+            "t1",
+            None,
+            Some("w1"),
+            None,
+            Some("green tests"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (_, b) = dispatch_body(&s, "t1", None);
+        assert!(!b.contains("Correlation"), "{b}");
+        assert!(b.contains("SHA: <40-hex>"), "{b}");
+        assert!(
+            b.ends_with("Do not report a SHA you have not committed."),
+            "{b}"
+        );
+        // The truncated managed form ends on the report contract
+        // exactly as before — no suffix reserved, no suffix appended.
+        s.create_task(
+            "j1",
+            "t2",
+            None,
+            Some("w1"),
+            None,
+            Some(&"a".repeat(5000)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (_, b2) = dispatch_body(&s, "t2", None);
+        assert!(b2.len() <= 4000);
+        assert!(!b2.contains("Correlation"), "{b2}");
+        assert!(b2.ends_with("reported revision."), "{b2}");
     }
 }
