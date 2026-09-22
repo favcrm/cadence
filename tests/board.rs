@@ -6391,7 +6391,7 @@ fn spawn_ui(pm: &Path, state: &Path) -> (u16, UiProc) {
 }
 
 #[test]
-fn memory_ui_list_detail_accept() {
+fn memory_ui_lists_detail_and_refuses_memory_write() {
     let (_t, pm, state, _repo) = mem_fx();
     legacy_memory(
         &pm,

@@ -1990,6 +1990,195 @@ mod tests {
     }
 
     #[test]
+    fn match_ranking_and_union_semantics_use_only_finalized_memories() {
+        fn eligible(
+            id: &str,
+            kind: &str,
+            confidence: &str,
+            scope: Scope,
+            verified_at: &str,
+            registration: u64,
+        ) -> Memory {
+            let author = proof(&format!("author-{id}"), registration);
+            let mut mem = memory("accepted", 1, Some(author));
+            mem.front.id = id.to_string();
+            mem.front.kind = kind.to_string();
+            mem.front.confidence = confidence.to_string();
+            mem.front.scope = scope;
+            mem.front.verified_at = Some(verified_at.to_string());
+            mem.path = PathBuf::from(format!("/tmp/{id}.md"));
+            let digest = semantic_digest(&mem);
+            mem.front.reviews.push(receipt(
+                &proof(&format!("review-a-{id}"), registration + 100),
+                "accept",
+                1,
+                &digest,
+            ));
+            mem.front.reviews.push(receipt(
+                &proof(&format!("review-b-{id}"), registration + 200),
+                "accept",
+                1,
+                &digest,
+            ));
+            mem.front.finalizations.push(finalization(
+                &proof(&format!("pm-{id}"), registration + 300),
+                "accept",
+                1,
+                &digest,
+            ));
+            mem
+        }
+
+        let memories = vec![
+            eligible(
+                "r-project",
+                "rule",
+                "high",
+                Scope {
+                    project: true,
+                    ..Scope::default()
+                },
+                "2026-01-01T00:00:00Z",
+                1000,
+            ),
+            eligible(
+                "r-comp",
+                "rule",
+                "medium",
+                Scope {
+                    components: vec!["daemon".to_string()],
+                    ..Scope::default()
+                },
+                "2026-01-01T00:00:00Z",
+                2000,
+            ),
+            eligible(
+                "r-low",
+                "rule",
+                "low",
+                Scope {
+                    project: true,
+                    ..Scope::default()
+                },
+                "2026-01-01T00:00:00Z",
+                3000,
+            ),
+            eligible(
+                "g-comp-hi",
+                "gotcha",
+                "high",
+                Scope {
+                    components: vec!["daemon".to_string()],
+                    ..Scope::default()
+                },
+                "2026-01-01T00:00:00Z",
+                4000,
+            ),
+            eligible(
+                "g-tag",
+                "gotcha",
+                "medium",
+                Scope {
+                    tags: vec!["flaky".to_string()],
+                    ..Scope::default()
+                },
+                "2026-01-01T00:00:00Z",
+                5000,
+            ),
+            eligible(
+                "g-comp-lo",
+                "gotcha",
+                "low",
+                Scope {
+                    components: vec!["daemon".to_string()],
+                    ..Scope::default()
+                },
+                "2026-01-01T00:00:00Z",
+                6000,
+            ),
+            eligible(
+                "c-path",
+                "recipe",
+                "medium",
+                Scope {
+                    paths: vec!["src/**".to_string()],
+                    ..Scope::default()
+                },
+                "2026-01-01T00:00:00Z",
+                7000,
+            ),
+            eligible(
+                "c-prov",
+                "recipe",
+                "medium",
+                Scope {
+                    providers: vec!["claude".to_string()],
+                    ..Scope::default()
+                },
+                "2026-01-01T00:00:00Z",
+                8000,
+            ),
+            eligible(
+                "d-prov",
+                "decision",
+                "high",
+                Scope {
+                    providers: vec!["claude".to_string()],
+                    ..Scope::default()
+                },
+                "2026-01-01T00:00:00Z",
+                9000,
+            ),
+            eligible(
+                "x-other",
+                "gotcha",
+                "medium",
+                Scope {
+                    components: vec!["other".to_string()],
+                    ..Scope::default()
+                },
+                "2026-01-01T00:00:00Z",
+                10000,
+            ),
+            memory("proposed", 0, Some(proof("pending-author", 11000))),
+        ];
+        let names = |ctx: MatchCtx| {
+            match_memories(&memories, &ctx)
+                .into_iter()
+                .map(|m| m.front.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            names(MatchCtx {
+                components: vec!["daemon".to_string()],
+                paths: vec!["src/adapter/x.rs".to_string()],
+                tags: vec!["flaky".to_string()],
+                providers: vec!["claude".to_string()],
+            }),
+            vec![
+                "r-project",
+                "r-comp",
+                "r-low",
+                "g-comp-hi",
+                "g-tag",
+                "g-comp-lo",
+                "c-path",
+                "c-prov",
+                "d-prov",
+            ]
+        );
+        assert_eq!(names(MatchCtx::default()), vec!["r-project", "r-low"]);
+        assert_eq!(
+            names(MatchCtx {
+                components: vec!["other".to_string()],
+                ..MatchCtx::default()
+            }),
+            vec!["r-project", "r-low", "x-other"]
+        );
+    }
+
+    #[test]
     fn alias_reuse_cannot_supply_the_second_vote() {
         let mut mem = memory("accepted", 1, Some(proof("author", 1)));
         let digest = semantic_digest(&mem);
