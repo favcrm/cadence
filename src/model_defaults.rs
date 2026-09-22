@@ -17,6 +17,10 @@ pub const MAX_MODEL_BYTES: usize = 200;
 pub const MAX_CONFIG_BYTES: usize = 16 * 1024;
 pub const MAX_HTTP_BODY_BYTES: usize = 20 * 1024;
 pub const MAX_STORED_PARAMS: usize = 4_000;
+/// Pre-serde duplicate-key scan limit. A body under 20 KiB can still
+/// nest thousands of arrays; serde's recursion guard never runs if this
+/// walk overflows the stack first.
+const MAX_JSON_DEPTH: usize = 128;
 
 /// Canonical team-role keys. `ops` is a launch-input alias of `devops`
 /// and is not itself a stored key.
@@ -145,7 +149,8 @@ where
 
 /// Walk JSON and reject duplicate object keys before serde's last-key
 /// map can hide them. The walk is also the size and integer-revision gate
-/// for a settings body.
+/// for a settings body. Nesting deeper than [`MAX_JSON_DEPTH`] is rejected
+/// so the scan cannot overflow the daemon stack.
 struct JsonScan<'a> {
     bytes: &'a [u8],
     i: usize,
@@ -323,11 +328,14 @@ impl<'a> JsonScan<'a> {
         }
     }
 
-    fn parse_value(&mut self) -> Result<()> {
+    fn parse_value(&mut self, depth: usize) -> Result<()> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(Self::fail(format!("JSON nesting exceeds {MAX_JSON_DEPTH}")));
+        }
         self.skip_ws();
         match self.peek()? {
-            b'{' => self.parse_object(None),
-            b'[' => self.parse_array(),
+            b'{' => self.parse_object(None, depth),
+            b'[' => self.parse_array(depth),
             b'"' => {
                 self.parse_string()?;
                 Ok(())
@@ -340,7 +348,7 @@ impl<'a> JsonScan<'a> {
         }
     }
 
-    fn parse_array(&mut self) -> Result<()> {
+    fn parse_array(&mut self, depth: usize) -> Result<()> {
         self.expect(b'[')?;
         self.skip_ws();
         if self.peek()? == b']' {
@@ -348,7 +356,7 @@ impl<'a> JsonScan<'a> {
             return Ok(());
         }
         loop {
-            self.parse_value()?;
+            self.parse_value(depth + 1)?;
             self.skip_ws();
             match self.peek()? {
                 b',' => self.i += 1,
@@ -361,7 +369,14 @@ impl<'a> JsonScan<'a> {
         }
     }
 
-    fn parse_object(&mut self, mut capture: Option<&mut EnvelopeCapture>) -> Result<()> {
+    fn parse_object(
+        &mut self,
+        mut capture: Option<&mut EnvelopeCapture>,
+        depth: usize,
+    ) -> Result<()> {
+        if depth >= MAX_JSON_DEPTH {
+            return Err(Self::fail(format!("JSON nesting exceeds {MAX_JSON_DEPTH}")));
+        }
         self.expect(b'{')?;
         self.skip_ws();
         if self.peek()? == b'}' {
@@ -390,7 +405,7 @@ impl<'a> JsonScan<'a> {
                     }
                 }
             }
-            self.parse_value()?;
+            self.parse_value(depth + 1)?;
             if let Some(captured) = capture.as_mut() {
                 let lexeme = std::str::from_utf8(&self.bytes[start..self.i])
                     .map_err(|_| Self::fail("settings field was not UTF-8"))?
@@ -467,7 +482,7 @@ pub fn parse_settings_document(raw: &str) -> Result<SettingsWrite> {
         revision_lexeme: None,
         config_len: None,
     };
-    scan.parse_object(Some(&mut captured))?;
+    scan.parse_object(Some(&mut captured), 0)?;
     scan.skip_ws();
     if scan.i != scan.bytes.len() {
         return Err(Error::invalid(
@@ -1193,6 +1208,24 @@ mod tests {
             parse_settings_document(&huge).unwrap_err().code(),
             Some("invalid_config")
         );
+    }
+
+    #[test]
+    fn deep_json_nesting_is_rejected() {
+        let nest = 4_000;
+        let mut body = String::from(r#"{"expected_revision":0,"config":"#);
+        body.push_str(&"[".repeat(nest));
+        body.push('0');
+        body.push_str(&"]".repeat(nest));
+        body.push('}');
+        assert!(
+            body.len() <= MAX_HTTP_BODY_BYTES,
+            "fixture must stay under the body cap, got {}",
+            body.len()
+        );
+        let err = parse_settings_document(&body).unwrap_err();
+        assert_eq!(err.code(), Some("invalid_config"));
+        assert!(err.to_string().contains("nesting exceeds"), "{err}");
     }
 
     #[test]

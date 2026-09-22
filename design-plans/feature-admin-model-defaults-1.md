@@ -194,3 +194,4 @@ Implemented on branch `cadence/admin-model-defaults`. Material adjustments:
 - Fake and internal endpoints never receive an injected model. `ops` is normalized only as launch input and is not a stored config role key.
 - HTTP writes go through daemon RPC. The raw document string is forwarded so duplicate JSON keys are still rejected.
 - The settings editor compares documents with sorted object keys. The daemon's `serde_json::Value` map is a `BTreeMap`, so a clean revision 0 and a just-saved revision otherwise stringify as unsaved (`providers` before `schema`).
+- The pre-serde duplicate-key scan rejects JSON nested deeper than 128. A body under the 20 KiB cap can otherwise nest thousands of arrays and overflow the daemon stack before serde's recursion limit applies.
