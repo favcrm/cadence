@@ -1615,10 +1615,19 @@ impl Store {
                 ));
             }
         }
-        let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
+        let mut conn = self.conn.lock().unwrap();
+        // IMMEDIATE so a concurrent register waits, then observes the
+        // committed alias, instead of resolving against a stale snapshot
+        // and returning `params_too_large`.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // A relaunch of a saved alias must keep that row. Resolving the
+        // current defaults first can reject a previously valid near-cap
+        // params blob with `params_too_large` and hide the duplicate.
+        if Self::agent_alias_exists(&tx, new.alias)? {
+            return Err(Self::duplicate_alias());
+        }
         let defaults = Self::read_model_defaults_tx(&tx)?;
-        let resolved = crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
+        let resolved = match crate::model_defaults::resolve(crate::model_defaults::ResolveRequest {
             provider: new.provider,
             endpoint_kind: new.endpoint_kind,
             runtime_role: new.role,
@@ -1627,13 +1636,28 @@ impl Store {
             params: new.params,
             config: &defaults.config,
             revision: defaults.revision,
-        })?;
+        }) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                if Self::agent_alias_exists(&tx, new.alias)? {
+                    return Err(Self::duplicate_alias());
+                }
+                return Err(err);
+            }
+        };
         let selection = resolved.model_selection.as_ref().map(Value::to_string);
         let merged_params = match resolved.params.as_deref() {
             Some(raw) => serde_json::from_str(raw)?,
             None => json!({}),
         };
-        registry::validate_launch_params(new.provider, new.endpoint_kind, &merged_params)?;
+        if let Err(err) =
+            registry::validate_launch_params(new.provider, new.endpoint_kind, &merged_params)
+        {
+            if Self::agent_alias_exists(&tx, new.alias)? {
+                return Err(Self::duplicate_alias());
+            }
+            return Err(err);
+        }
         // Inbox agents are durable mailboxes, not processes: they
         // register directly into `idle` with a stable pseudo-endpoint
         // (so `dead` reads false) and never spawn an actor.
@@ -1774,6 +1798,21 @@ impl Store {
             task_id,
         )?;
         Ok((false, "queued".to_string()))
+    }
+
+    /// Same text `INSERT` raises for `agents.alias`, including the `sqlite:`
+    /// prefix added when a rusqlite constraint error becomes [`Error`].
+    /// Launch reuses a saved agent when the message contains `UNIQUE`.
+    fn duplicate_alias() -> Error {
+        Error::Internal("sqlite: UNIQUE constraint failed: agents.alias".to_string())
+    }
+
+    fn agent_alias_exists(tx: &Connection, alias: &str) -> Result<bool> {
+        match tx.query_row("SELECT 1 FROM agents WHERE alias=?", [alias], |_| Ok(1i32)) {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn agent_in(&self, conn: &Connection, alias: &str) -> Result<Agent> {
@@ -7198,5 +7237,72 @@ mod tests {
             labeled.to_json()["model_selection"]["source"],
             "legacy_configured"
         );
+    }
+
+    #[test]
+    fn model_defaults_duplicate_near_cap_reports_unique() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let cwd_s = cwd.to_str().unwrap();
+        let pad = "n".repeat(3_889);
+        let params = format!(r#"{{"note":"{pad}"}}"#);
+        assert!(params.len() < crate::model_defaults::MAX_STORED_PARAMS);
+        s.register_agent(&NewAgent {
+            alias: "near",
+            provider: "claude",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: cwd_s,
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&params),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        let baseline = "m".repeat(200);
+        s.replace_model_defaults(
+            &defaults_body(
+                0,
+                &format!(
+                    r#"{{"claude":{{"default":{{"mode":"model","model":"{baseline}"}},"roles":{{}}}}}}"#
+                ),
+            ),
+            None,
+        )
+        .unwrap();
+        let dup = s.register_agent(&NewAgent {
+            alias: "near",
+            provider: "claude",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: cwd_s,
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&params),
+            team_role: Some("qa"),
+            model_policy: None,
+        });
+        let err = dup.unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+        assert_ne!(err.code(), Some("params_too_large"));
+        let saved = s.agent("near").unwrap();
+        assert_eq!(saved.param_str("model"), None);
+        assert_eq!(saved.params.unwrap().to_string(), params);
+        assert!(saved.team_role.is_none());
+        let fresh = s.register_agent(&NewAgent {
+            alias: "fresh",
+            provider: "claude",
+            endpoint_kind: "managed",
+            role: "worker",
+            cwd: cwd_s,
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&params),
+            team_role: None,
+            model_policy: None,
+        });
+        assert_eq!(fresh.unwrap_err().code(), Some("params_too_large"));
+        assert!(s.agent_opt("fresh").unwrap().is_none());
     }
 }

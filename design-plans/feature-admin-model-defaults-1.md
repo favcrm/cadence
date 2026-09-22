@@ -195,3 +195,4 @@ Implemented on branch `cadence/admin-model-defaults`. Material adjustments:
 - HTTP writes go through daemon RPC. The raw document string is forwarded so duplicate JSON keys are still rejected.
 - The settings editor compares documents with sorted object keys. The daemon's `serde_json::Value` map is a `BTreeMap`, so a clean revision 0 and a just-saved revision otherwise stringify as unsaved (`providers` before `schema`).
 - The pre-serde duplicate-key scan rejects JSON nested deeper than 128. A body under the 20 KiB cap can otherwise nest thousands of arrays and overflow the daemon stack before serde's recursion limit applies.
+- `register_agent` notices an existing alias before it resolves current defaults. A saved near-cap params blob stays reusable when a later baseline would make a fresh merge `params_too_large`. The duplicate signal still contains `UNIQUE`, and a lost insert race still surfaces that constraint.
