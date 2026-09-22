@@ -734,6 +734,12 @@ enum Commands {
         #[command(subcommand)]
         action: cadence_agent::memory::cli::MemoryAction,
     },
+    /// Credential scan (CAD-109): the check `issue comment`, `report`,
+    /// `memory propose` and the intake relay run before they write.
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
     /// The read-only board UI + JSON API on loopback.
     Ui {
         #[command(subcommand)]
@@ -858,6 +864,22 @@ enum Commands {
         /// `CADENCE_PERMISSION_TIMEOUT_SECS`, default 900).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Scan text for credential-shaped strings: the vendored gitleaks
+    /// rule pack plus cadence's bare-token and argv rules. Prints JSON
+    /// findings `{rule, line, column, redacted, severity, fingerprint}`,
+    /// never the value. Exit 0 when clean or warn-only, 1 on any
+    /// blocking finding. `<state dir>/secret-allowlist.toml` (operator
+    /// edited) drops allowlisted findings.
+    Scan {
+        /// Scan this file (its path also scopes path-specific rules);
+        /// else stdin.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
 }
 
@@ -4304,6 +4326,30 @@ fn run() -> Result<i32> {
             }
         },
         Commands::Memory { action } => cadence_agent::memory::cli::run(&action, &state_dir),
+        Commands::Secret {
+            action: SecretAction::Scan { file },
+        } => {
+            use cadence_agent::secret;
+            let text = match &file {
+                Some(path) => String::from_utf8_lossy(&std::fs::read(path).map_err(|e| {
+                    Error::rejected(format!("Cannot read {}: {e}", path.display()))
+                })?)
+                .into_owned(),
+                None => {
+                    if atty_stdin() {
+                        return Err(Error::rejected("Pipe text on stdin or pass --file"));
+                    }
+                    let mut bytes = Vec::new();
+                    std::io::stdin().read_to_end(&mut bytes)?;
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
+            };
+            let allow = secret::Allowlist::load(&state_dir)?;
+            let path = file.as_ref().map(|p| p.to_string_lossy().into_owned());
+            let (report, blocking) = secret::report(&text, path.as_deref(), &allow)?;
+            print_json(&report);
+            Ok(if blocking { 1 } else { 0 })
+        }
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
         Commands::Status { group, json, watch } => {
             run_status(&state_dir, group.as_deref(), json, watch)
