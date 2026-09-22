@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test:url-state": "tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-url-state.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc --target ES2022 --module commonjs --moduleResolution node --lib ES2023,DOM --skipLibCheck --outDir \"$tmp_dir\" src/urlState.ts src/urlState.test.ts src/filters.ts src/types.ts src/projectContextGuard.ts src/projectContextGuard.test.ts && node \"$tmp_dir/urlState.test.js\" && node \"$tmp_dir/projectContextGuard.test.js\"",
+    "test:url-state": "tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-url-state.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc --target ES2022 --module commonjs --moduleResolution node --lib ES2023,DOM --skipLibCheck --outDir \"$tmp_dir\" src/urlState.ts src/urlState.test.ts src/filters.ts src/types.ts src/projectContextGuard.ts src/projectContextGuard.test.ts src/uxCopy.ts src/uxCopy.test.ts && node \"$tmp_dir/urlState.test.js\" && node \"$tmp_dir/projectContextGuard.test.js\" && node \"$tmp_dir/uxCopy.test.js\"",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"
   },

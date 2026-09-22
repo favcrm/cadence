@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type WriteResp } from "../api";
 import { fmtBytes, fmtTime } from "../fmt";
+import { notesStatusSentence } from "../uxCopy";
 import Md from "./Md";
 import { noDragReason } from "./Card";
 import type {
@@ -215,6 +216,10 @@ export default function Drawer({
     for (const d of l.duplicates) linkRows.push(["dup", d, undefined]);
   }
   const lastNote = detail?.notes_chain[detail.notes_chain.length - 1];
+  const notesStatus =
+    detail && lastNote
+      ? notesStatusSentence(detail.status_source, lastNote.kind, detail.status)
+      : null;
   const statusLocked = detail ? noDragReason(detail) : null;
 
   const startEdit = () => {
@@ -851,11 +856,9 @@ export default function Drawer({
                 ) : (
                   <p className="text-secondary text-ink-500">Nothing yet.</p>
                 )}
-                {lastNote && detail.status_source === "notes" && (
+                {notesStatus && (
                   <p className="text-label text-ink-500 mt-3 leading-[1.5]">
-                    Latest tagged note is a {lastNote.kind}, so the board shows{" "}
-                    <span className="text-ink-200">{detail.status}</span>. Once
-                    M3 ships, status comes from the job state instead.
+                    {notesStatus}
                   </p>
                 )}
                 {detail.container && (
