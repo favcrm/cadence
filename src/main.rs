@@ -1770,16 +1770,19 @@ fn send_message(
             )?;
         }
     }
-    Ok((
-        client::rpc(
-            state_dir,
-            "agent_send",
-            json!({"alias": alias, "text": body,
-                   "message": message, "reply_to": reply_to,
-                   "task": task}),
-        )?,
-        false,
-    ))
+    let receipt = client::rpc(
+        state_dir,
+        "agent_send",
+        json!({"alias": alias, "text": body,
+               "message": message, "reply_to": reply_to,
+               "task": task}),
+    )?;
+    // CAD-251: a stale mailbox still accepted the message — say so on
+    // stderr so stdout stays the JSON receipt.
+    if let Some(warning) = receipt["warning"].as_str() {
+        eprintln!("warning: {warning}");
+    }
+    Ok((receipt, false))
 }
 
 /// Has the daemon released the state-dir singleton? `serve` holds an
@@ -2215,6 +2218,9 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
         .unwrap_or(0.0);
     let mut rows = Vec::new();
     let mut unread_inboxes = Vec::new();
+    // CAD-251: mailboxes past their unread threshold with no recent
+    // `inbox_read` — named with count, oldest age and owner.
+    let mut stale_inboxes = Vec::new();
     for a in &agents {
         let alias = a["alias"].as_str().unwrap_or_default().to_string();
         let provider = a["provider"].as_str().unwrap_or_default();
@@ -2225,6 +2231,16 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
         let unknown = show["unknown"].as_i64().unwrap_or(0);
         if provider == registry::INBOX && queued > 0 {
             unread_inboxes.push(alias.clone());
+        }
+        let health = &a["inbox_health"];
+        if health["stale"].as_bool().unwrap_or(false) {
+            stale_inboxes.push(json!({
+                "alias": alias,
+                "unread": health["unread"],
+                "oldest_unread_age_secs": health["oldest_unread_age_secs"],
+                "last_read_at": health["last_read_at"],
+                "owner": health["owner"],
+            }));
         }
         // The in-flight message: `running` (managed turn live) or
         // `submitted` (pty paste acknowledged, report pending). Age
@@ -2324,6 +2340,7 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
         "footer": {
             "states": states,
             "unread_inboxes": unread_inboxes,
+            "stale_inboxes": stale_inboxes,
             "slots": slots,
         },
         "tracker": tracker,
@@ -2433,6 +2450,25 @@ fn print_status_table(view: &Value) {
         .unwrap_or_default();
     if !unread.is_empty() {
         println!("unread: {}", unread.join(", "));
+    }
+    let stale = view["footer"]["stale_inboxes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !stale.is_empty() {
+        let names: Vec<String> = stale
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} {} unread, oldest {}, owner {}",
+                    s["alias"].as_str().unwrap_or_default(),
+                    s["unread"].as_u64().unwrap_or(0),
+                    fmt_age(s["oldest_unread_age_secs"].as_i64().unwrap_or(0)),
+                    s["owner"].as_str().unwrap_or("operator"),
+                )
+            })
+            .collect();
+        println!("stale inboxes (no consumer): {}", names.join("; "));
     }
     // Slot occupancy — the one-line build-queue summary.
     let slots = &view["footer"]["slots"];

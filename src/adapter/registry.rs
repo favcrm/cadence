@@ -376,7 +376,7 @@ pub static SPECS: &[EndpointSpec] = &[
         brokers_requests: false,
         resumable: false,
         resume_label: "n/a — mailbox",
-        live_settable_params: &[],
+        live_settable_params: &["inbox_warn_unread", "inbox_warn_idle_secs"],
         launch_params: &[],
         session_id_label: "none",
         respond_rejection: None,
@@ -732,9 +732,26 @@ pub fn validate_live_param(provider: &str, kind: &str, key: &str, value: &Value)
             }
             Ok(())
         }
+        // CAD-251: unconsumed-inbox warning thresholds.
+        "inbox_warn_unread" | "inbox_warn_idle_secs" => {
+            if has_actor(provider, kind) {
+                return Err(Error::rejected(format!(
+                    "'{key}' only applies to inbox endpoints — a live \
+                     endpoint consumes its own queue"
+                )));
+            }
+            if !check_stall_secs(value) {
+                return Err(Error::rejected(format!(
+                    "'{key}' must be a non-negative integer or a bare key \
+                     removal (back to the default)"
+                )));
+            }
+            Ok(())
+        }
         other => Err(Error::rejected(format!(
             "'{other}' is not live-settable — allowed keys: auto_ready \
-             (pty only), stall_secs, silent_end_secs (pty only). \
+             (pty only), stall_secs, silent_end_secs (pty only), \
+             inbox_warn_unread, inbox_warn_idle_secs (inbox only). \
              Recreate the agent to change wiring params like upstream \
              or session"
         ))),

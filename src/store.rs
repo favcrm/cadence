@@ -5455,6 +5455,41 @@ impl Store {
         conn.query_row("SELECT * FROM verdicts WHERE seq=?", [seq], row_verdict)
             .map_err(Into::into)
     }
+
+    /// CAD-251 consumer evidence for a mailbox: unread count, oldest
+    /// unread, newest arrival, and the last `inbox_read` completion —
+    /// the inputs to [`crate::inbox::health`].
+    pub fn inbox_consumer(&self, alias: &str) -> Result<Value> {
+        let conn = self.conn.lock().unwrap();
+        let (unread, oldest, newest, last_read): (i64, Option<f64>, Option<f64>, Option<f64>) =
+            conn.query_row(
+                "SELECT COALESCE(SUM(state='queued'),0),
+                        MIN(CASE WHEN state='queued' THEN created END),
+                        MAX(created),
+                        MAX(CASE WHEN state='completed'
+                                  AND result LIKE '%\"via\":\"inbox_read\"%'
+                                 THEN completed END)
+                 FROM messages WHERE alias=?",
+                [alias],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        Ok(json!({
+            "unread": unread,
+            "oldest_unread_at": oldest,
+            "last_received_at": newest,
+            "last_read_at": last_read,
+        }))
+    }
+
+    /// When `kind` last fired on `alias`'s event stream, if ever.
+    pub fn last_event_at(&self, alias: &str, kind: &str) -> Result<Option<f64>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT MAX(at) FROM events WHERE alias=? AND kind=?",
+            params![alias, kind],
+            |row| row.get(0),
+        )?)
+    }
 }
 
 const UNKNOWN_EVENT_REASON_CHARS: usize = 512;

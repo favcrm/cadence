@@ -43,7 +43,7 @@ Error kinds:
 | `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown, inbox?}` — `unknown` counts unreconciled unknowns fencing the agent; passive `inbox` evidence includes queued count, oldest age, last receipt/progress, and `semantic_completion:"external_consumer_required"`; it is never a drain or completion claim. `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_effective`, `model_source` (`configured` or `provider default`), `effort_configured`, `effort_reported`, `effort_effective` and legacy `effort` — also on every `agent_list` row. `team_role`, `model_lookup_role`, and `model_selection` (`source`, `lookup_role`, `revision`, `model`) record how a launch model was chosen. Unsupported endpoints leave `model_selection` null. Existing rows without stored provenance are labeled `legacy_configured` or `legacy_provider_default` at read time |
 | `model_defaults_get` | — | `{revision, config, providers, roles}` — daemon-wide provider baselines and team-role overrides. Suggestions are previously observed model ids, not a catalog. Does not start provider processes |
 | `model_defaults_set` | `document` (raw JSON string `{expected_revision, config}`), `attribution?` | the same snapshot as get, after an atomic revision bump. Mismatched `expected_revision` is `kind:"conflict"`, `code:"revision_conflict"`, with `revision` set to the current value and no write. Omitted attribution is transport `local` / actor `local`; a present attribution is transport `board` |
-| `agent_send` | `alias, text, message?, reply_to?, source?, task?` | `{message,state,duplicate}` — `task` attaches the delivery to a task for indexing |
+| `agent_send` | `alias, text, message?, reply_to?, source?, task?` | `{message,state,duplicate,warning?}` — `task` attaches the delivery to a task for indexing; `warning` names a stale inbox target (queued anyway — see inbox endpoints) |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after?, wait(<=30), tail?` | `{events:[Event], cursor, has_older}` — `tail:true` returns the newest page (50) in ascending order instead of paging forward from `after` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
@@ -790,6 +790,28 @@ nothing to interrupt), and `agent_remove` deletes the mailbox and its
 history outright — there is no live endpoint to refuse on. Daemon
 startup and `resume --all` skip inbox rows.
 
+Unconsumed inboxes (CAD-251). An inbox is **stale** when its unread
+count is above `inbox_warn_unread` (default 50) and no `inbox_read`
+completed within `inbox_warn_idle_secs` (default 86400; idle time runs
+from the last read, else from the oldest unread message). Both are
+endpoint params, live-settable with `cadence agent set <inbox>
+inbox_warn_unread=N inbox_warn_idle_secs=S` (a bare key restores the
+default). A stale inbox warns and never refuses: `agent_send` into it
+still queues and adds `warning` to the receipt (`cadence send` also
+prints it on stderr); routed deliveries (`reply_to`/upstream results)
+have no caller, so the daemon's sweep (on the stall-watch screen-sample
+cadence) records one `inbox_unconsumed` event on the inbox — at most
+once per idle window, and only after new arrivals. `agent_list` rows for
+an inbox carry `inbox_health` (`unread`, `oldest_unread_age_secs`,
+`last_read_at`, `idle_secs`, `threshold`, `stale`, `owner`, `warning`);
+`cadence status` lists stale inboxes in its footer and `cadence
+overview` raises an `inbox_stale` row. Retention and ownership: nothing
+is ever dropped or expired automatically — a message leaves the queue
+only through a drain, a cancel or `agent_remove`. The inbox's **owner**
+is the root of its `params.upstream` chain, or `operator` when the inbox
+is its own root; the stale-inbox warning, event and overview row name
+that owner as the one who must drain it or retire the inbox.
+
 (`cadence agent attach <alias>` prints this command; `--run` executes it
 in the current terminal. `cadence agent resume <alias>` gets the same
 post-open treatment as a provider launch: it waits for the endpoint —
@@ -948,6 +970,7 @@ result_routed, notice_routed, ready, ready_claimed, claim_used,
 gate_wait, submitted, session_minted, session_resume_failed,
 session_persist_failed,
 acknowledged, paste_not_rendered, delivery_parked, inbox_read,
+inbox_unconsumed,
 params_updated, reconciled, relaunch_skipped, attention,
 approval_menu, approval_answered, turn_silent_end,
 turn_stalled, turn_resumed, monitor_registered, monitor_alert,
