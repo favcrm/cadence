@@ -1018,6 +1018,37 @@ pub struct ReviewRequest<'a> {
     pub expected_digest: &'a str,
 }
 
+#[cfg(test)]
+struct AfterInitialFindHook {
+    path: PathBuf,
+    reached: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_INITIAL_FIND_HOOK: std::cell::RefCell<Option<AfterInitialFindHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_initial_find_for_test(path: &Path) {
+    let hook = AFTER_INITIAL_FIND_HOOK.with(|slot| slot.borrow_mut().take());
+    let Some(hook) = hook else {
+        return;
+    };
+    if hook.path == path {
+        hook.reached
+            .send(())
+            .expect("writer did not reach memory lock");
+        hook.proceed
+            .recv()
+            .expect("writer did not release memory lock");
+    } else {
+        AFTER_INITIAL_FIND_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+}
+
 pub fn submit_review(
     pm: &Pm,
     flag: Option<&str>,
@@ -1057,6 +1088,8 @@ pub fn submit_review(
         ));
     }
     let (proj, _) = find(pm, flag, slug)?;
+    #[cfg(test)]
+    after_initial_find_for_test(&memory_dir(pm, &proj.key).join(format!("{slug}.md")));
     let _lock = pm.lock()?;
     let (_, mut mem) = find(pm, Some(&proj.key), slug)?;
     let digest = semantic_digest(&mem);
@@ -2201,6 +2234,87 @@ mod tests {
         let (_, after_scope) = find(&pm, Some("demo"), "stale-review").unwrap();
         assert!(after_scope.front.reviews.is_empty());
         assert_eq!(after_scope.front.scope.paths, vec!["src/**".to_string()]);
+    }
+
+    #[test]
+    fn native_review_reloads_after_overlapping_writer_update() {
+        let (_dir, pm) = mutation_fixture();
+        let author = native("worker-author", 1);
+        let reviewer = native("worker-reviewer", 2);
+        propose_native(
+            &pm,
+            "demo",
+            "rule",
+            &Scope {
+                project: true,
+                ..Scope::default()
+            },
+            Some("CAD-191"),
+            Some("high"),
+            None,
+            Some("fact\n\n**Why:** evidence\n\n**How to apply:** use it\n"),
+            Some("overlap-review"),
+            &author,
+        )
+        .unwrap();
+        let (_, loaded) = find(&pm, Some("demo"), "overlap-review").unwrap();
+        let digest = semantic_digest(&loaded);
+        let path = loaded.path.clone();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let (bytes_tx, bytes_rx) = std::sync::mpsc::channel();
+        let writer_dir = pm.dir.clone();
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            reached_rx.recv().unwrap();
+            let writer_pm = Pm::at(&writer_dir).unwrap();
+            let lock = writer_pm.lock().unwrap();
+            let (_, mut changed) = find(&writer_pm, Some("demo"), "overlap-review").unwrap();
+            changed.front.source = Some("CAD-191-concurrent-update".to_string());
+            save_mem(&changed).unwrap();
+            writer_pm
+                .commit("concurrent memory update\n\nActor: writer\n")
+                .unwrap();
+            drop(lock);
+            bytes_tx.send(std::fs::read(writer_path).unwrap()).unwrap();
+            proceed_tx.send(()).unwrap();
+        });
+        AFTER_INITIAL_FIND_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(AfterInitialFindHook {
+                path: path.clone(),
+                reached: reached_tx,
+                proceed: proceed_rx,
+            });
+        });
+
+        // submit_review's first find has completed, but its PM lock has not
+        // yet been acquired. The writer owns that interval, commits a source
+        // change, and releases the lock; the review must reload and refuse
+        // the stale digest rather than append a receipt to the new revision.
+        let err = submit_review(
+            &pm,
+            Some("demo"),
+            "overlap-review",
+            &ReviewRequest {
+                operation: "accept",
+                verdict: "pass",
+                evidence: "stale overlapping review",
+                expected_digest: &digest,
+            },
+            &reviewer,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("revision changed"), "{err}");
+        let writer_bytes = bytes_rx.recv().unwrap();
+        assert_eq!(writer_bytes, std::fs::read(&path).unwrap());
+        writer.join().unwrap();
+        let (_, after) = find(&pm, Some("demo"), "overlap-review").unwrap();
+        assert!(after.front.reviews.is_empty());
+        assert!(after.front.active_operation.is_none());
+        assert_eq!(
+            after.front.source.as_deref(),
+            Some("CAD-191-concurrent-update")
+        );
     }
 
     #[test]
