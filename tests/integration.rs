@@ -13,6 +13,9 @@ use std::time::{Duration, Instant, SystemTime};
 use cadence_agent::adapter::ProviderEnv;
 use cadence_agent::client;
 use cadence_agent::daemon;
+use cadence_agent::memory::{
+    self, FinalizationReceipt, Front, IdentityProof, Memory, ReviewReceipt, Scope,
+};
 use cadence_agent::store::{NewAgent, Store, Take};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -4009,7 +4012,7 @@ die("unhandled tmux cmd " + cmd)
 /// submitted line and a `MOCK_REPLY` to the screen file.
 /// `$FAKE_PANE` (set by the mock tmux) points at the session state.
 const MOCK_DEVIN_PY: &str = r#"
-import fcntl, os, sys, time
+import fcntl, json, os, socket, sys, time
 
 locks = sys.argv[1]
 sid = sys.argv[sys.argv.index("-r") + 1] if "-r" in sys.argv else \
@@ -4042,12 +4045,47 @@ def aappend(path, text):
     try: cur = open(path).read()
     except OSError: cur = ""
     awrite(path, cur + text)
+def memory_rpc():
+    # Test-only bridge: the lockholding provider process opens the real
+    # daemon socket, so SO_PEERCRED and /proc ancestry see this pane rather
+    # than the integration-test process.  The request/response files are
+    # opt-in and scoped to this mock pane; production providers have no such
+    # bridge.
+    req_path = os.environ["FAKE_PANE"] + ".memory-rpc"
+    try:
+        raw = open(req_path).read()
+    except FileNotFoundError:
+        return
+    try:
+        request = json.loads(raw)
+        sock_path = os.path.join(os.environ["CADENCE_STATE_DIR"], "cadence.sock")
+        chunks = []
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(15)
+            sock.connect(sock_path)
+            sock.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"\n" in chunk:
+                    break
+        response = json.loads(b"".join(chunks).split(b"\n", 1)[0].decode())
+    except Exception as exc:
+        response = {"ok": False, "error": {"kind": "internal", "message": str(exc)}}
+    try:
+        os.unlink(req_path)
+    except FileNotFoundError:
+        pass
+    awrite(os.environ["FAKE_PANE"] + ".memory-rpc.response", json.dumps(response))
 aappend(os.environ["FAKE_PANE"] + ".screen",
         "Mock Devin TUI [%s]\n" % sid +
         # An idle input line — the same shape the real TUI shows so the
         # screen probe recognizes an empty prompt.
         "❭ Ask Devin to build features, fix bugs, or work on your code\n")
 while True:
+    memory_rpc()
     inp = os.environ["FAKE_PANE"] + ".input"
     try:
         data = open(inp).read()
@@ -4137,6 +4175,47 @@ impl TestDaemon {
             .join("tmux-state")
             .join(socket_for(&self.state))
             .join(format!("{alias}.{ext}"))
+    }
+
+    /// Ask a live mock Devin pane to issue one daemon RPC over the real
+    /// Unix socket. The Python process owns the request connection, so the
+    /// daemon sees its actual SO_PEERCRED pid and /proc ancestry.
+    fn memory_rpc(
+        &self,
+        mock: &MockDevin,
+        alias: &str,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<Value, String> {
+        let request_path = self.pane_file(mock, alias, "memory-rpc");
+        let response_path = self.pane_file(mock, alias, "memory-rpc.response");
+        let _ = std::fs::remove_file(&response_path);
+        let request = json!({"method": method, "params": params});
+        let temporary = request_path.with_extension("memory-rpc.tmp");
+        std::fs::write(&temporary, request.to_string()).map_err(|e| e.to_string())?;
+        std::fs::rename(&temporary, &request_path).map_err(|e| e.to_string())?;
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&response_path) {
+                let frame: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                if frame["ok"] == true {
+                    return Ok(frame["result"].clone());
+                }
+                let message = frame
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("memory RPC refused")
+                    .to_string();
+                return Err(message);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "memory RPC from {alias} timed out; request={request_path:?}"
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -16428,6 +16507,506 @@ fn finish_merged_sweep() {
     );
 }
 
+/// Write an accepted memory fixture with the same authenticated evidence
+/// shape produced by the native daemon path. Dispatch/match tests use this
+/// fixture so they exercise retrieval eligibility without pretending that a
+/// CLI child outside a native PTY can author or review a memory.
+fn write_reviewed_memory(
+    pm_dir: &Path,
+    project: &str,
+    slug: &str,
+    kind: &str,
+    scope: Scope,
+    fact: &str,
+) -> PathBuf {
+    let identity = |alias: &str, registration: u64, role: &str| IdentityProof {
+        alias: alias.to_string(),
+        registration,
+        generation: format!("fixture-{alias}-{registration}"),
+        process_start: 100 + registration,
+        role: role.to_string(),
+    };
+    let author = identity("fixture-author", 1, "worker");
+    let reviewer_a = identity("fixture-reviewer-a", 2, "worker");
+    let reviewer_b = identity("fixture-reviewer-b", 3, "worker");
+    let pm = identity("fixture-pm", 4, "pm");
+    let body = format!(
+        "{fact}\n\n**Why:** reviewed integration fixture.\n\n**How to apply:** apply the fixture rule.\n"
+    );
+    let mut front = Front {
+        id: slug.to_string(),
+        kind: kind.to_string(),
+        status: "accepted".to_string(),
+        scope,
+        source: Some("CAD-191".to_string()),
+        confidence: "high".to_string(),
+        created: "2026-01-01T00:00:00Z".to_string(),
+        verified_at: Some("2026-01-02T00:00:00Z".to_string()),
+        supersedes: None,
+        author: Some(author.alias.clone()),
+        author_proof: Some(author.clone()),
+        contributors: Vec::new(),
+        review_cycle: 1,
+        active_operation: None,
+        reviews: Vec::new(),
+        finalizations: Vec::new(),
+    };
+    let path = pm_dir
+        .join(project)
+        .join("memory")
+        .join(format!("{slug}.md"));
+    let mut memory = Memory {
+        project: project.to_string(),
+        front: front.clone(),
+        body,
+        path: path.clone(),
+    };
+    let digest = memory::semantic_digest(&memory);
+    let receipt_digest = digest.clone();
+    let receipt = move |reviewer: &IdentityProof, evidence: &str| ReviewReceipt {
+        reviewer: reviewer.alias.clone(),
+        identity: reviewer.stable_id(),
+        generation: reviewer.generation.clone(),
+        process_start: reviewer.process_start,
+        role: reviewer.role.clone(),
+        operation: "accept".to_string(),
+        cycle: 1,
+        digest: receipt_digest.clone(),
+        verdict: "pass".to_string(),
+        evidence: evidence.to_string(),
+        recorded_at: "2026-01-02T00:00:00Z".to_string(),
+    };
+    front.reviews = vec![
+        receipt(&reviewer_a, "fixture reviewer A evidence"),
+        receipt(&reviewer_b, "fixture reviewer B evidence"),
+    ];
+    front.finalizations.push(FinalizationReceipt {
+        operation: "accept".to_string(),
+        cycle: 1,
+        digest,
+        finalizer: pm,
+        finalized_at: "2026-01-02T00:00:00Z".to_string(),
+    });
+    memory.front = front;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        cadence_agent::issue::parse::render(&memory.front, &memory.body).unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+struct PmDirGuard(Option<std::ffi::OsString>);
+
+impl PmDirGuard {
+    fn set(path: &Path) -> Self {
+        let old = std::env::var_os("CADENCE_PM_DIR");
+        std::env::set_var("CADENCE_PM_DIR", path);
+        Self(old)
+    }
+}
+
+impl Drop for PmDirGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => std::env::set_var("CADENCE_PM_DIR", value),
+            None => std::env::remove_var("CADENCE_PM_DIR"),
+        }
+    }
+}
+
+/// The positive CAD-191 path uses four real mock Devin panes. Each bridge
+/// request is opened by the lockholding provider process itself, so the
+/// daemon must resolve the actual Unix peer pid through the pane's /proc
+/// ancestry and native flock ownership before allowing the write.
+#[test]
+fn memory_native_socket_identity_requires_distinct_reviewers() {
+    let tmp = TempDir::new().unwrap();
+    let pm_dir = tmp.path().join("pm");
+    let pm = cadence_agent::issue::Pm::init(&pm_dir).unwrap();
+    std::fs::create_dir_all(pm_dir.join("demo")).unwrap();
+    std::fs::write(
+        pm_dir.join("demo/project.yaml"),
+        "key: demo\nprefix: D\ncomponents: []\n",
+    )
+    .unwrap();
+    pm.commit("project fixture\n\nActor: test\n").unwrap();
+
+    let mock_dir = TempDir::new().unwrap();
+    let mock = install_mock_devin(mock_dir.path());
+    let _pm_env = PmDirGuard::set(&pm_dir);
+    let d = TestDaemon::start();
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    for (alias, role) in [
+        ("author", "worker"),
+        ("reviewer-a", "worker"),
+        ("reviewer-b", "worker"),
+        ("pm", "pm"),
+    ] {
+        d.rpc(
+            "agent_register",
+            json!({
+                "alias": alias,
+                "provider": "devin",
+                "endpoint_kind": "pty",
+                "cwd": cwd,
+                "role": role,
+                "params": "{\"auto_ready\":\"verified\"}"
+            }),
+        )
+        .unwrap();
+    }
+    for alias in ["author", "reviewer-a", "reviewer-b", "pm"] {
+        d.wait_agent(alias, "idle", 25);
+    }
+
+    // Keep the author in a real running turn while its provider socket
+    // performs the proposal. This proves the resolver accepts a live,
+    // owned endpoint in the ordinary worker state, not only an idle pane.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "author", "text": "hold native identity", "message": "memory-busy"}),
+    )
+    .unwrap();
+    let busy_token = pty_token(&d, "author", "memory-busy");
+    d.wait_agent("author", "busy", 10);
+
+    let body = "\nsocket-bound memory claims native identity\n\n**Why:** the provider socket is the authority.\n\n**How to apply:** use only reviewed native memory.\n";
+    let proposal = json!({
+        "project": "demo",
+        "kind": "rule",
+        "scope": {"project": true},
+        "source": "CAD-191",
+        "confidence": "high",
+        "text": body,
+        "id": "native-socket-rule"
+    });
+
+    // Request identity claims are rejected before any PM write. The
+    // author pane remains the only possible source of the later proposal.
+    let err = d
+        .memory_rpc(
+            &mock,
+            "author",
+            "memory_propose",
+            json!({"alias": "pm", "reviewer": "pm", "pane": "pm", "inner": proposal.clone()}),
+        )
+        .unwrap_err();
+    assert!(err.contains("connection-bound"), "{err}");
+    assert!(!pm_dir.join("demo/memory/native-socket-rule.md").exists());
+
+    let proposed = d
+        .memory_rpc(&mock, "author", "memory_propose", proposal)
+        .unwrap();
+    assert_eq!(proposed["status"], "proposed", "{proposed}");
+    let digest = proposed["digest"].as_str().unwrap().to_string();
+    assert_eq!(digest.len(), 64, "{proposed}");
+
+    let read_memory = || std::fs::read(pm_dir.join("demo/memory/native-socket-rule.md")).unwrap();
+    let before_author_review = read_memory();
+    let err = d
+        .memory_rpc(
+            &mock,
+            "author",
+            "memory_review",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "author cannot review",
+                "digest": digest,
+            }),
+        )
+        .unwrap_err();
+    assert!(err.contains("author cannot review"), "{err}");
+    assert_eq!(before_author_review, read_memory());
+
+    let err = d
+        .memory_rpc(
+            &mock,
+            "reviewer-a",
+            "memory_review",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "spoofed reviewer",
+                "digest": digest,
+                "reviewer": "reviewer-b",
+                "pid": 1,
+            }),
+        )
+        .unwrap_err();
+    assert!(err.contains("connection-bound"), "{err}");
+
+    let review_a = d
+        .memory_rpc(
+            &mock,
+            "reviewer-a",
+            "memory_review",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "reviewer A inspected the native socket claim",
+                "digest": digest,
+            }),
+        )
+        .unwrap();
+    assert_eq!(review_a["quorum"]["eligible"], false, "{review_a}");
+    assert!(review_a["quorum"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("1/2"));
+
+    let before_repeat = read_memory();
+    let err = d
+        .memory_rpc(
+            &mock,
+            "reviewer-a",
+            "memory_review",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "same reviewer twice",
+                "digest": digest,
+            }),
+        )
+        .unwrap_err();
+    assert!(err.contains("already reviewed"), "{err}");
+    assert_eq!(before_repeat, read_memory());
+
+    // A detached integration-test RPC has no pane ancestor and cannot
+    // borrow an alias from its params to review or finalize.
+    let err = d
+        .rpc(
+            "memory_review",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "outside all panes",
+                "digest": digest,
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not owned by exactly one live native PTY"),
+        "{err}"
+    );
+
+    let before_missing_quorum = read_memory();
+    let err = d
+        .memory_rpc(
+            &mock,
+            "pm",
+            "memory_finalize",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "digest": digest,
+            }),
+        )
+        .unwrap_err();
+    assert!(err.contains("1/2"), "{err}");
+    assert_eq!(before_missing_quorum, read_memory());
+
+    let before_missing_evidence = read_memory();
+    let err = d
+        .memory_rpc(
+            &mock,
+            "reviewer-b",
+            "memory_review",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "",
+                "digest": digest,
+            }),
+        )
+        .unwrap_err();
+    assert!(err.contains("evidence must be nonempty"), "{err}");
+    assert_eq!(before_missing_evidence, read_memory());
+
+    let before_stale = read_memory();
+    let err = d
+        .memory_rpc(
+            &mock,
+            "reviewer-b",
+            "memory_review",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "stale digest",
+                "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+            }),
+        )
+        .unwrap_err();
+    assert!(err.contains("revision changed"), "{err}");
+    assert_eq!(before_stale, read_memory());
+
+    // A live pane with a stale stored generation is still refused: the
+    // endpoint must match the adapter's current native session proof.
+    let reviewer_b_generation = d.rpc("agent_show", json!({"alias": "reviewer-b"})).unwrap()
+        ["agent"]["generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET generation=?1 WHERE alias=?2",
+        rusqlite::params!["stale-native-generation", "reviewer-b"],
+    )
+    .unwrap();
+    let before_generation_mismatch = read_memory();
+    let err = d
+        .memory_rpc(
+            &mock,
+            "reviewer-b",
+            "memory_review",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "stale endpoint generation",
+                "digest": digest,
+            }),
+        )
+        .unwrap_err();
+    assert!(err.contains("generation changed"), "{err}");
+    assert_eq!(before_generation_mismatch, read_memory());
+    conn.execute(
+        "UPDATE agents SET generation=?1 WHERE alias=?2",
+        rusqlite::params![reviewer_b_generation, "reviewer-b"],
+    )
+    .unwrap();
+
+    let review_b = d
+        .memory_rpc(
+            &mock,
+            "reviewer-b",
+            "memory_review",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "reviewer B independently inspected the native socket claim",
+                "digest": digest,
+            }),
+        )
+        .unwrap();
+    assert_eq!(review_b["quorum"]["eligible"], true, "{review_b}");
+
+    let finalized = d
+        .memory_rpc(
+            &mock,
+            "pm",
+            "memory_finalize",
+            json!({
+                "slug": "native-socket-rule",
+                "project": "demo",
+                "operation": "accept",
+                "digest": digest,
+            }),
+        )
+        .unwrap();
+    assert_eq!(finalized["status"], "accepted", "{finalized}");
+    assert_eq!(finalized["finalized"], true, "{finalized}");
+    assert_eq!(finalized["quorum"]["eligible"], true, "{finalized}");
+
+    let pm = cadence_agent::issue::Pm::at(&pm_dir).unwrap();
+    let (_, accepted) = memory::find(&pm, Some("demo"), "native-socket-rule").unwrap();
+    assert!(memory::retrieval_status(&accepted).0);
+    assert_eq!(accepted.body, body);
+    assert_eq!(
+        accepted.front.author_proof.as_ref().unwrap().alias,
+        "author"
+    );
+    assert_eq!(
+        accepted
+            .front
+            .reviews
+            .iter()
+            .map(|r| r.reviewer.as_str())
+            .collect::<Vec<_>>(),
+        vec!["reviewer-a", "reviewer-b"]
+    );
+
+    // Native PM rejection is an ordinary authenticated mutation too. It
+    // preserves an earlier review receipt and reports the tracker commit;
+    // an HTTP/CLI caller cannot manufacture this result.
+    let rejected_proposal = json!({
+        "project": "demo",
+        "kind": "gotcha",
+        "scope": {"project": true},
+        "source": "CAD-191",
+        "confidence": "medium",
+        "text": "native rejection keeps review history\n\n**Why:** the PM rejected it.\n\n**How to apply:** do not use it.\n",
+        "id": "native-rejected-rule"
+    });
+    let proposed_rejected = d
+        .memory_rpc(&mock, "author", "memory_propose", rejected_proposal)
+        .unwrap();
+    let rejected_digest = proposed_rejected["digest"].as_str().unwrap().to_string();
+    let review = d
+        .memory_rpc(
+            &mock,
+            "reviewer-a",
+            "memory_review",
+            json!({
+                "slug": "native-rejected-rule",
+                "project": "demo",
+                "operation": "accept",
+                "verdict": "pass",
+                "evidence": "reviewer A recorded a retained rejection review",
+                "digest": rejected_digest,
+            }),
+        )
+        .unwrap();
+    assert_eq!(review["quorum"]["eligible"], false, "{review}");
+    let rejected = d
+        .memory_rpc(
+            &mock,
+            "pm",
+            "memory_finalize",
+            json!({
+                "slug": "native-rejected-rule",
+                "project": "demo",
+                "operation": "reject",
+            }),
+        )
+        .unwrap();
+    assert_eq!(rejected["status"], "rejected", "{rejected}");
+    assert_eq!(rejected["committed"], true, "{rejected}");
+    let (_, rejected_memory) = memory::find(&pm, Some("demo"), "native-rejected-rule").unwrap();
+    assert_eq!(rejected_memory.front.status, "rejected");
+    assert_eq!(rejected_memory.front.reviews.len(), 1);
+    assert_eq!(rejected_memory.front.reviews[0].reviewer, "reviewer-a");
+    assert!(!memory::retrieval_status(&rejected_memory).0);
+
+    d.rpc(
+        "message_report",
+        json!({"message": "memory-busy", "token": busy_token, "kind": "result", "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("author", "memory-busy", &["completed"], 10);
+}
+
 /// `dispatch` renders matching accepted memories into
 /// `<state>/dispatch/<msg>-lessons.md`, names the file in the kickoff
 /// and the issue comment, and reports slugs in JSON. `--no-lessons`
@@ -16528,80 +17107,52 @@ fn dispatch_injects_project_memory_lessons() {
         assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
     }
 
-    // Three memories on the project: one project-wide rule (matches),
-    // one component-scoped gotcha (no component on the issue → no
-    // match), one provider-scoped rule for a different provider.
-    let body = |fact: &str| format!("{fact}\n\n**Why:** test.\n\n**How to apply:** do it.\n");
-    assert!(
-        cli(&[
-            "memory",
-            "propose",
-            "--project",
-            "demo",
-            "--type",
-            "rule",
-            "--id",
-            "always-drain",
-            "--scope-project",
-            "-m",
-            &body("always drain the pipe before send"),
-        ])
-        .0
+    // Three reviewed memories on the project: one project-wide rule
+    // (matches), one component-scoped gotcha (no component on the issue
+    // -> no match), and one provider-scoped rule for a different provider.
+    // They are written as authenticated reviewed fixtures because an
+    // ordinary CLI child is deliberately not a memory authority.
+    write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "always-drain",
+        "rule",
+        Scope {
+            project: true,
+            ..Scope::default()
+        },
+        "always drain the pipe before send",
     );
-    assert!(cli(&["memory", "accept", "always-drain", "--project", "demo"]).0);
-    assert!(
-        cli(&[
-            "memory",
-            "propose",
-            "--project",
-            "demo",
-            "--type",
-            "gotcha",
-            "--id",
-            "comp-only",
-            "--scope-component",
-            "daemon",
-            "-m",
-            &body("daemon-only gotcha"),
-        ])
-        .0
+    write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "comp-only",
+        "gotcha",
+        Scope {
+            components: vec!["daemon".to_string()],
+            ..Scope::default()
+        },
+        "daemon-only gotcha",
     );
-    assert!(cli(&["memory", "accept", "comp-only", "--project", "demo"]).0);
-    assert!(
-        cli(&[
-            "memory",
-            "propose",
-            "--project",
-            "demo",
-            "--type",
-            "rule",
-            "--id",
-            "claude-only",
-            "--scope-provider",
-            "claude",
-            "-m",
-            &body("claude provider rule"),
-        ])
-        .0
+    write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "claude-only",
+        "rule",
+        Scope {
+            providers: vec!["claude".to_string()],
+            ..Scope::default()
+        },
+        "claude provider rule",
     );
-    assert!(cli(&["memory", "accept", "claude-only", "--project", "demo"]).0);
-    // A still-proposed memory never injects.
-    assert!(
-        cli(&[
-            "memory",
-            "propose",
-            "--project",
-            "demo",
-            "--type",
-            "rule",
-            "--id",
-            "pending-one",
-            "--scope-project",
-            "-m",
-            &body("not yet accepted"),
-        ])
-        .0
-    );
+    // A still-proposed memory never injects. It intentionally has no
+    // authenticated proof, so it also documents legacy/proposed withholding.
+    let pending = pm_dir.join("demo/memory/pending-one.md");
+    std::fs::write(
+        pending,
+        "---\nid: pending-one\ntype: rule\nstatus: proposed\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nscope:\n  project: true\n---\nnot yet accepted\n\n**Why:** pending.\n\n**How to apply:** do not inject.\n",
+    )
+    .unwrap();
 
     let note = tmp.path().join("kickoff.md");
     std::fs::write(&note, "# kickoff").unwrap();
@@ -16806,18 +17357,23 @@ fn memory_match_explicit_axes_stay_in_current_project() {
         )
         .0
     );
-    let memory = |id: &str, fact: &str| {
-        format!(
-            "---\nid: {id}\ntype: rule\nstatus: accepted\nconfidence: high\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  components:\n    - daemon\n---\n{fact}\n\n**Why:** project boundary regression.\n\n**How to apply:** keep the project boundary.\n"
-        )
-    };
+    // Both records carry a real acceptance quorum; the test is about
+    // project resolution, so legacy accepted text must not be enough.
     for (project, id, fact) in [
         ("alpha", "alpha-daemon", "alpha fact"),
         ("beta", "beta-daemon", "beta fact"),
     ] {
-        let dir = pm_dir.join(project).join("memory");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{id}.md")), memory(id, fact)).unwrap();
+        write_reviewed_memory(
+            &pm_dir,
+            project,
+            id,
+            "rule",
+            Scope {
+                components: vec!["daemon".to_string()],
+                ..Scope::default()
+            },
+            fact,
+        );
     }
 
     let (ok, out) = run(
@@ -16946,25 +17502,18 @@ fn dispatch_degrades_on_memory_failures() {
     for title in ["One".to_string(), long_title, "Three".to_string()] {
         assert!(cli(&["issue", "new", &title, "--project", "demo"]).0);
     }
-    // One good accepted rule — matching works until the broken file.
-    let body = |fact: &str| format!("{fact}\n\n**Why:** test.\n\n**How to apply:** do it.\n");
-    assert!(
-        cli(&[
-            "memory",
-            "propose",
-            "--project",
-            "demo",
-            "--type",
-            "rule",
-            "--id",
-            "good-rule",
-            "--scope-project",
-            "-m",
-            &body("a good fact"),
-        ])
-        .0
+    // One good reviewed rule — matching works until the broken file.
+    write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "good-rule",
+        "rule",
+        Scope {
+            project: true,
+            ..Scope::default()
+        },
+        "a good fact",
     );
-    assert!(cli(&["memory", "accept", "good-rule", "--project", "demo"]).0);
 
     let note = tmp.path().join("kickoff.md");
     std::fs::write(&note, "# kickoff").unwrap();
@@ -17089,28 +17638,43 @@ fn dispatch_degrades_on_memory_failures() {
     // and the omission is counted. fat-rule-00's hand-edited 5 KiB
     // fact alone exceeds the byte budget: under the old `break` it
     // hid every rule after it.
-    let mem_dir = pm_dir.join("demo/memory");
-    let rule = |id: &str, fact: &str| {
-        format!(
-            "---\nid: {id}\ntype: rule\nstatus: accepted\nconfidence: medium\ncreated: 2026-01-01T00:00:00Z\nverified_at: 2026-01-01T00:00:00Z\nscope:\n  project: true\n---\n{fact}\n\n**Why:** w\n\n**How to apply:** h\n"
-        )
-    };
-    std::fs::write(
-        mem_dir.join("fat-rule-00.md"),
-        rule("fat-rule-00", &"z".repeat(5 * 1024)),
-    )
-    .unwrap();
-    std::fs::write(
-        mem_dir.join("fat-rule-01-tiny.md"),
-        rule("fat-rule-01-tiny", "t"),
-    )
-    .unwrap();
+    // These are reviewed fixtures too: accepted legacy text is deliberately
+    // withheld from dispatch, so the briefing-cap assertion must use the
+    // same authenticated evidence shape as the ordinary dispatch fixtures.
+    write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "fat-rule-00",
+        "rule",
+        Scope {
+            project: true,
+            ..Scope::default()
+        },
+        &"z".repeat(5 * 1024),
+    );
+    write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "fat-rule-01-tiny",
+        "rule",
+        Scope {
+            project: true,
+            ..Scope::default()
+        },
+        "t",
+    );
     for i in 2..10 {
-        std::fs::write(
-            mem_dir.join(format!("fat-rule-{i:02}.md")),
-            rule(&format!("fat-rule-{i:02}"), &"y".repeat(700)),
-        )
-        .unwrap();
+        write_reviewed_memory(
+            &pm_dir,
+            "demo",
+            &format!("fat-rule-{i:02}"),
+            "rule",
+            Scope {
+                project: true,
+                ..Scope::default()
+            },
+            &"y".repeat(700),
+        );
     }
     d.rpc(
         "agent_register",

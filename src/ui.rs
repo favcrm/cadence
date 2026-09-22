@@ -8,8 +8,10 @@
 //! dir or `--dist`. Writes are I2: POST/PATCH/DELETE routes must pass
 //! four cross-site guards (known write route, exact JSON/octet-stream
 //! content type, `X-Cadence-Board: 1`, same-origin Origin/Sec-Fetch-Site)
-//! before any work is done, then go through `issue::write` — the same
-//! writer the CLI uses — so CLI and API cannot disagree.
+//! before any work is done, then go through the authenticated writer the
+//! route supports. Memory curation is deliberately refused here: an HTTP
+//! server peer is not the native agent endpoint proof required by the
+//! daemon, so the browser cannot become a curator by reaching this route.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -1238,9 +1240,10 @@ fn write_route(
         return;
     }
 
-    // Memory curation: POST /api/memories/<project>/<slug>/accept|reject
-    // — same guarded write path as the CLI; the commit actor is the
-    // request-attributed one (`request_actor`), as on /api/issues.
+    // Memory curation: POST /api/memories/<project>/<slug>/accept|reject.
+    // The CSRF/write guards still run first, but HTTP cannot prove the
+    // native socket/PTY identity required by the memory daemon. Refuse
+    // explicitly instead of proxying the UI server's peer as a PM.
     if let Some(tail) = path.strip_prefix("/api/memories/") {
         let mut segs = tail.splitn(3, '/');
         let (key, slug, verb) = (
@@ -1267,56 +1270,13 @@ fn write_route(
             send(request, resp);
             return;
         }
-        let actor = request_actor(&request, opts);
-        let pm = match Pm::at(pm_dir) {
-            Ok(pm) => pm,
-            Err(e) => {
-                send(request, err_response(503, &e.to_string()));
-                return;
-            }
-        };
-        let bytes = match read_body(&mut request, JSON_CAP) {
-            Ok(b) => b,
-            Err(resp) => {
-                send(request, resp);
-                return;
-            }
-        };
-        let req: Value = if bytes.is_empty() {
-            json!({})
-        } else {
-            match parse_json(&bytes) {
-                Ok(r) => r,
-                Err(resp) => {
-                    send(request, resp);
-                    return;
-                }
-            }
-        };
-        let out = if verb == Some("accept") {
-            crate::memory::accept(
-                &pm,
-                Some(key),
-                slug,
-                req["body"].as_str(),
-                &actor,
-                state_dir,
-            )
-        } else {
-            crate::memory::reject(&pm, Some(key), slug, &actor, state_dir)
-        };
-        match out {
-            Ok(v) => {
-                let detail = crate::memory::find(&pm, Some(key), slug)
-                    .map(|(_, m)| crate::memory::detail_json(&m))
-                    .unwrap_or(Value::Null);
-                send(
-                    request,
-                    json_response(json!({"ok": true, "write": v, "memory": detail})),
-                );
-            }
-            Err(e) => send(request, write_err(&e)),
-        }
+        let _ = (key, slug, verb);
+        send(
+            request,
+            write_err(&Error::rejected(
+                "memory curation through HTTP is unsupported — use an authenticated native agent endpoint",
+            )),
+        );
         return;
     }
     let Some(rest) = path.strip_prefix("/api/issues") else {

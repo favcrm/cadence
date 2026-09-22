@@ -463,6 +463,29 @@ export interface Health {
 }
 
 /** GET /api/memories — one project-memory card. */
+export interface MemoryQuorumCheck {
+  eligible: boolean;
+  reason?: string | null;
+}
+
+export interface MemoryQuorum {
+  /** Whether this current revision is available to agents. */
+  eligible: boolean;
+  reason?: string | null;
+  /** Whether proposal receipts are ready for PM finalization. */
+  accept?: MemoryQuorumCheck | null;
+  /** Whether verification receipts are ready for PM finalization. */
+  verify?: MemoryQuorumCheck | null;
+}
+
+export interface MemoryFinalization {
+  operation: string;
+  cycle: number;
+  digest: string;
+  finalized_at: string;
+  finalizer: string;
+}
+
 export interface MemoryCard {
   project: string;
   slug: string;
@@ -481,6 +504,16 @@ export interface MemoryCard {
   created: string;
   verified_at?: string | null;
   supersedes?: string | null;
+  /** Semantic revision digest used by native review/finalization. */
+  revision_digest?: string | null;
+  review_cycle?: number | null;
+  active_operation?: string | null;
+  /** Immutable receipts retained across review cycles. */
+  review_count?: number | null;
+  finalization_count?: number | null;
+  finalized_operations?: MemoryFinalization[] | null;
+  /** Absent on older daemons; absence means verification is unavailable. */
+  quorum?: MemoryQuorum | null;
   fact: string;
   path: string;
 }

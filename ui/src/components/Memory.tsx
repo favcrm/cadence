@@ -39,6 +39,52 @@ type DetailState = {
   error?: string;
 };
 
+type QuorumView = {
+  eligible: boolean | null;
+  reason: string;
+  mode: "acceptance" | "retrieval";
+};
+
+function quorumView(m: MemoryCard): QuorumView {
+  const mode = m.status === "proposed" ? "acceptance" : "retrieval";
+  if (!m.quorum) {
+    return {
+      eligible: null,
+      reason: "verification unavailable — this server did not report quorum",
+      mode,
+    };
+  }
+
+  const check = mode === "acceptance" ? m.quorum.accept : m.quorum;
+  if (!check || typeof check.eligible !== "boolean") {
+    return {
+      eligible: null,
+      reason: "verification unavailable — this server did not report quorum",
+      mode,
+    };
+  }
+
+  return {
+    eligible: check.eligible,
+    reason: check.reason || "server did not provide a quorum reason",
+    mode,
+  };
+}
+
+function quorumTone(eligible: boolean | null): string {
+  if (eligible === true) return "bg-accent/10 text-accent";
+  if (eligible === false) return "bg-warn/10 text-warn";
+  return "bg-ink-800 text-ink-400";
+}
+
+function quorumLabel(q: QuorumView): string {
+  if (q.eligible === null) return "verification unavailable";
+  if (q.mode === "acceptance") {
+    return q.eligible ? "awaiting PM finalization" : "review blocked";
+  }
+  return q.eligible ? "available to agents" : "not available to agents";
+}
+
 export default function Memory({
   project,
   onError,
@@ -55,8 +101,6 @@ export default function Memory({
   const [kind, setKind] = useState("");
   const [open, setOpen] = useState<string | null>(null); // project/slug
   const [detail, setDetail] = useState<DetailState | null>(null);
-  const [draft, setDraft] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
   // The detail key the last openDetail asked for — a late response for
   // a previous card (or one already closed) is dropped here, never
   // rendered under the wrong row.
@@ -112,34 +156,12 @@ export default function Memory({
         wanted.current = null;
         setOpen(null);
         setDetail(null);
-        setDraft(null);
         return;
       }
       setOpen(key);
-      setDraft(null);
       loadDetail(m);
     },
     [open, loadDetail],
-  );
-
-  const review = useCallback(
-    (m: MemoryDetail, verb: "accept" | "reject") => {
-      setBusy(true);
-      const edited = verb === "accept" && draft !== null && draft !== m.body;
-      const call =
-        verb === "accept"
-          ? (p: string, s: string) => api.memoryAccept(p, s, edited ? draft! : undefined)
-          : api.memoryReject;
-      call(m.project, m.slug)
-        .then((r) => {
-          const key = `${m.project}/${m.slug}`;
-          if (wanted.current === key) setDetail({ key, data: r.memory });
-          setTick((t) => t + 1);
-        })
-        .catch((e) => onError(e as ApiError, `memory ${verb}`))
-        .finally(() => setBusy(false));
-    },
-    [onError, draft],
   );
 
   const filtered = status !== "" || kind !== "";
@@ -195,7 +217,7 @@ export default function Memory({
         <div className="card px-4 py-6 text-center text-ink-500 text-sm">
           {filtered
             ? "no memories match the current filters"
-            : "no memories yet — agents propose lessons with `cadence memory propose`; a curator accepts them before they reach a dispatch"}
+            : "no memories yet — authenticated native agents propose lessons with `cadence memory propose`; two independent reviews and PM finalization are required before dispatch"}
         </div>
       ) : null}
 
@@ -212,6 +234,8 @@ export default function Memory({
           const key = `${m.project}/${m.slug}`;
           const isOpen = open === key;
           const d = isOpen && detail?.key === key ? detail : null;
+          const q = quorumView(m);
+          const detailQuorum = d?.data ? quorumView(d.data) : null;
           return (
             <div key={key} className="card px-4 py-3">
               <button
@@ -219,20 +243,28 @@ export default function Memory({
                 onClick={() => openDetail(m)}
               >
                 <div className="flex items-center gap-2 flex-wrap">
-                  <span className="num text-[13px] text-ink-100">{m.slug}</span>
+                  <span className="num text-[13px] text-ink-100 min-w-0 break-all">
+                    {m.slug}
+                  </span>
                   <span className={`chip ${statusTone(m.status)}`}>{m.status}</span>
                   <span className="chip bg-ink-800 text-ink-300">{m.type}</span>
                   <span className="chip bg-ink-800 text-ink-500">{m.confidence}</span>
-                  <span className="num text-micro text-ink-500 ml-auto">
+                  <span className={`chip ${quorumTone(q.eligible)}`}>
+                    {quorumLabel(q)}
+                  </span>
+                  <span className="num text-micro text-ink-500 ml-auto min-w-0 break-words text-right">
                     {m.project}
-                    {m.verified_at ? ` · verified ${m.verified_at.slice(0, 10)}` : ""}
+                    {q.mode === "retrieval" && q.eligible === true && m.verified_at
+                      ? ` · verified ${m.verified_at.slice(0, 10)}`
+                      : ""}
                   </span>
                 </div>
-                <div className="text-[13px] text-ink-300">{m.fact}</div>
-                <div className="num text-micro text-ink-500 truncate">
+                <div className="text-[13px] text-ink-300 break-words">{m.fact}</div>
+                <div className="num text-micro text-ink-500 break-words">
                   {scopeLine(m)}
                   {m.supersedes ? ` · supersedes ${m.supersedes}` : ""}
                 </div>
+                <div className="text-micro text-ink-500 break-words">{q.reason}</div>
               </button>
 
               {isOpen && (
@@ -242,38 +274,42 @@ export default function Memory({
                       <div className="text-[13px] text-ink-200 [&_p]:mb-2">
                         <Md text={d.data.body} />
                       </div>
-                      <div className="num text-micro text-ink-500 mt-2">
+                      <div className="num text-micro text-ink-500 mt-2 break-words">
                         {d.data.author ? `by ${d.data.author} · ` : ""}
                         {d.data.source ? `source ${d.data.source} · ` : ""}
                         {d.data.path}
                       </div>
-                      {d.data.status === "proposed" && (
-                        <div className="mt-3">
-                          <textarea
-                            value={draft ?? d.data.body}
-                            onChange={(e) => setDraft(e.target.value)}
-                            rows={8}
-                            className="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1.5 text-[13px] text-ink-200 font-mono focus:outline-none focus:border-accent/50"
-                          />
-                        </div>
-                      )}
-                      {d.data.status === "proposed" && (
-                        <div className="flex gap-2 mt-3">
-                          <button
-                            disabled={busy}
-                            onClick={() => review(d.data!, "accept")}
-                            className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
-                          >
-                            accept
-                          </button>
-                          <button
-                            disabled={busy}
-                            onClick={() => review(d.data!, "reject")}
-                            className="chip bg-fail/10 text-fail hover:bg-fail/20 transition-colors"
-                          >
-                            reject
-                          </button>
-                        </div>
+                      {detailQuorum && (
+                        <>
+                          <div className="mt-3 flex flex-wrap items-center gap-2 text-[13px]">
+                            <span className="slabel">
+                              {detailQuorum.mode === "acceptance"
+                                ? "server review"
+                                : "server availability"}
+                            </span>
+                            <span className={`chip ${quorumTone(detailQuorum.eligible)}`}>
+                              {quorumLabel(detailQuorum)}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-[13px] text-ink-500 break-words">
+                            {detailQuorum.reason}
+                          </p>
+                          <p className="mt-3 text-[13px] text-ink-400">
+                            read-only — review and PM finalization require authenticated
+                            native agents; browser requests cannot provide that identity.
+                          </p>
+                          <div className="mt-3 text-[13px] text-ink-500">
+                            <span className="slabel mr-2">digest</span>
+                            <code className="num block mt-1 break-all text-ink-400">
+                              {d.data.revision_digest ?? "unavailable"}
+                            </code>
+                          </div>
+                          {typeof d.data.review_count === "number" && (
+                            <div className="num text-micro text-ink-500 mt-2">
+                              historical receipts {d.data.review_count}
+                            </div>
+                          )}
+                        </>
                       )}
                     </>
                   ) : d?.error ? (
