@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model_defaults;
 pub mod overview;
+pub mod peer;
 pub mod proc;
 pub mod proto;
 pub mod review;

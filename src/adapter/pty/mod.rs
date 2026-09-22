@@ -347,6 +347,19 @@ pub fn has_control_chars(text: &str) -> bool {
     text.chars().any(|c| (c as u32) < 32 || c as u32 == 127)
 }
 
+/// The registered pane a caller descends from, given its
+/// [`caller_chain`] and the live pane map (pane pid → alias): the
+/// NEAREST pane on the chain wins, so a caller's own pane beats any
+/// outer one and resolution never depends on map order. The daemon's
+/// slot identity (CAD-113) and the board's write identity (CAD-254)
+/// both resolve through here.
+pub(crate) fn nearest_pane<'a>(
+    chain: &[u32],
+    panes: &'a std::collections::HashMap<u32, String>,
+) -> Option<&'a String> {
+    chain.iter().find_map(|pid| panes.get(pid))
+}
+
 /// A pty provider's forbidden input prefixes — the profile's own list,
 /// surfaced here so the briefing can warn without constructing a
 /// profile. Unknown providers get an empty list (no hazard asserted).
