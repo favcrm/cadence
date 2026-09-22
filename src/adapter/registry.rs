@@ -29,6 +29,26 @@ pub const DEFAULT_ENDPOINT_KIND: &str = "managed";
 /// value itself.
 pub const DEVIN_PERMISSION_MODES: &[&str] = &["auto", "accept-edits", "smart", "dangerous"];
 
+/// Modes Devin Cloud accepts on `devin_mode`.
+pub const DEVIN_CLOUD_MODES: &[&str] = &["normal", "fast", "lite", "ultra", "fusion"];
+
+const DEVIN_CLOUD_PARAMS: &[&str] = &[
+    "repos",
+    "devin_mode",
+    "max_acu_limit",
+    "playbook_id",
+    "knowledge_ids",
+    "secret_ids",
+    "platform",
+    "tags",
+    "bypass_approval",
+    "attachment_urls",
+    "session",
+    "upstream",
+    "agents_md",
+    "stall_secs",
+];
+
 /// The modes `cursor --permission-mode` accepts — each maps to one
 /// `cursor-agent` flag (`--auto-review`, `--force`). `--bypass` is a
 /// launch shorthand that stores `force`; it is never a stored value
@@ -316,6 +336,45 @@ pub static SPECS: &[EndpointSpec] = &[
         probe_bins: &[("devin", &["--version"]), ("tmux", &["-V"])],
         session_disposable: false,
         launch_default: true,
+        internal: false,
+    },
+    EndpointSpec {
+        provider: "devin",
+        endpoint_kind: "cloud",
+        display: "Devin (cloud)",
+        has_actor: true,
+        attach: Attach::Headless,
+        ready_gate: false,
+        screen_probe: false,
+        reports: Reporting::TurnResult,
+        report_hint: Reporting::TurnResult,
+        brokers_requests: true,
+        resumable: true,
+        resume_label: "wake archived devin session <session>",
+        live_settable_params: &["stall_secs"],
+        launch_params: &[
+            "repos",
+            "devin_mode",
+            "max_acu_limit",
+            "playbook_id",
+            "knowledge_ids",
+            "secret_ids",
+            "platform",
+            "tags",
+            "bypass_approval",
+            "attachment_urls",
+            "session",
+            "upstream",
+            "agents_md",
+            "stall_secs",
+        ],
+        session_id_label: "Devin cloud session",
+        respond_rejection: None,
+        capabilities: &["devin_cloud"],
+        doctor_caps: &["devin_cloud"],
+        probe_bins: &[],
+        session_disposable: false,
+        launch_default: false,
         internal: false,
     },
     EndpointSpec {
@@ -975,6 +1034,164 @@ fn check_report_timeout(provider: &str, kind: &str, value: &Value) -> Result<()>
     Ok(())
 }
 
+fn owner_repo(repo: &str) -> bool {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return false;
+    };
+    !owner.is_empty()
+        && !name.is_empty()
+        && !name.contains('/')
+        && !owner.contains(char::is_whitespace)
+        && !name.contains(char::is_whitespace)
+}
+
+fn cloud_string_list(key: &str, value: &Value, repos: bool) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let items: Vec<&str> = match value {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(text) = item.as_str().filter(|text| !text.is_empty()) else {
+                    return Err(Error::rejected(format!(
+                        "'{key}' entries must be non-empty strings"
+                    )));
+                };
+                out.push(text);
+            }
+            out
+        }
+        _ => {
+            return Err(Error::rejected(format!(
+                "'{key}' must be a string or an array of strings"
+            )))
+        }
+    };
+    if items.iter().any(|text| text.is_empty()) {
+        return Err(Error::rejected(format!(
+            "'{key}' entries must be non-empty strings"
+        )));
+    }
+    if repos {
+        for repo in items {
+            if !owner_repo(repo) {
+                return Err(Error::rejected(format!(
+                    "repos entries must be owner/name, got '{repo}'"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cloud_string(key: &str, value: &Value) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    match value.as_str() {
+        Some(text) if !text.trim().is_empty() => Ok(()),
+        _ => Err(Error::rejected(format!(
+            "'{key}' must be a non-empty string, or null to clear it"
+        ))),
+    }
+}
+
+fn positive_acu(value: &Value) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    if let Some(n) = value.as_u64() {
+        return n > 0;
+    }
+    value
+        .as_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .is_some_and(|n| n > 0)
+}
+
+fn validate_devin_cloud(params: &Value) -> Result<()> {
+    let Some(obj) = params.as_object() else {
+        return Err(Error::rejected(
+            "devin cloud launch params must be a JSON object",
+        ));
+    };
+    for key in obj.keys() {
+        if !DEVIN_CLOUD_PARAMS.contains(&key.as_str()) {
+            return Err(Error::rejected(format!(
+                "unknown devin cloud launch param '{key}'"
+            )));
+        }
+    }
+    if let Some(value) = obj.get("repos") {
+        cloud_string_list("repos", value, true)?;
+    }
+    for key in ["knowledge_ids", "secret_ids", "attachment_urls", "tags"] {
+        if let Some(value) = obj.get(key) {
+            cloud_string_list(key, value, false)?;
+        }
+    }
+    if let Some(value) = obj.get("devin_mode") {
+        if !value.is_null() {
+            match value.as_str() {
+                Some(mode) if DEVIN_CLOUD_MODES.contains(&mode) => {}
+                Some(mode) => {
+                    return Err(Error::rejected(format!(
+                        "unknown devin_mode '{mode}' — expected one of: {}",
+                        DEVIN_CLOUD_MODES.join(", ")
+                    )))
+                }
+                None => {
+                    return Err(Error::rejected(format!(
+                        "devin_mode must be a string, one of: {}",
+                        DEVIN_CLOUD_MODES.join(", ")
+                    )))
+                }
+            }
+        }
+    }
+    if let Some(value) = obj.get("max_acu_limit") {
+        if !positive_acu(value) {
+            return Err(Error::rejected(
+                "'max_acu_limit' must be a positive integer, or null to clear it",
+            ));
+        }
+    }
+    for key in ["playbook_id", "platform", "upstream"] {
+        if let Some(value) = obj.get(key) {
+            cloud_string(key, value)?;
+        }
+    }
+    if let Some(value) = obj.get("session") {
+        if !value.is_null() {
+            match value.as_str() {
+                Some(id) if id.starts_with("devin-") && id.len() > "devin-".len() => {}
+                Some(id) => {
+                    return Err(Error::rejected(format!(
+                        "devin cloud session id must look like 'devin-…', got '{id}'"
+                    )))
+                }
+                None => {
+                    return Err(Error::rejected(
+                        "devin cloud session must be a string, or null to clear it",
+                    ))
+                }
+            }
+        }
+    }
+    for key in ["bypass_approval", "agents_md"] {
+        if let Some(value) = obj.get(key) {
+            if !(value.is_null() || value.is_boolean()) {
+                return Err(Error::rejected(format!(
+                    "'{key}' must be a boolean, or null to clear it"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Register-time validation for enumerated launch params. Params not
 /// named here keep their historical pass-through (claude's modes are
 /// provider-validated — its own CLI rejects bad values on spawn).
@@ -1065,6 +1282,9 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
                 }
             }
         }
+    }
+    if provider == "devin" && kind == "cloud" {
+        validate_devin_cloud(params)?;
     }
     if provider == "cursor" && kind == "pty" {
         if let Some(v) = params.get("permission_mode") {
@@ -1169,6 +1389,7 @@ mod tests {
             ("claude", "managed"),
             ("claude", "pty"),
             ("devin", "pty"),
+            ("devin", "cloud"),
             ("cursor", "pty"),
             ("tui-stub", "pty"),
             ("fake", "fake"),
@@ -1203,7 +1424,7 @@ mod tests {
         assert_eq!(
             spec("devin", "bogus").unwrap_err().to_string(),
             "Endpoint kind 'bogus' is not implemented \
-             (implemented: managed, managed-ws, pty, fake)"
+             (implemented: managed, managed-ws, pty, cloud, fake)"
         );
     }
 
@@ -1228,10 +1449,11 @@ mod tests {
             "result_routing",
             "model_defaults",
             "fake_provider_tests",
+            "devin_cloud",
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 17);
+        assert_eq!(caps.len(), 18);
     }
 
     #[test]
@@ -1271,6 +1493,16 @@ mod tests {
         assert_eq!(resume_command("fake", "fake", "", "", ""), None);
         // A dead agent with no thread has nothing to resume.
         assert_eq!(resume_command("devin", "pty", "", "", ""), None);
+        assert_eq!(
+            resume_command(
+                "devin",
+                "cloud",
+                "devin-1",
+                "devin-1",
+                "https://app.devin.ai/sessions/devin-1"
+            ),
+            Some("wake archived devin session devin-1".to_string())
+        );
     }
 
     #[test]
@@ -1484,5 +1716,79 @@ mod tests {
                 .to_string();
             assert!(msg.contains("not live-settable"), "{msg}");
         }
+    }
+
+    #[test]
+    fn devin_cloud_spec_is_headless_and_not_the_launch_default() {
+        let spec = spec("devin", "cloud").unwrap();
+        assert_eq!(spec.display, "Devin (cloud)");
+        assert!(spec.has_actor);
+        assert_eq!(spec.attach, Attach::Headless);
+        assert!(!spec.ready_gate);
+        assert!(!spec.screen_probe);
+        assert_eq!(spec.reports, Reporting::TurnResult);
+        assert_eq!(spec.report_hint, Reporting::TurnResult);
+        assert!(spec.brokers_requests);
+        assert!(spec.resumable);
+        assert!(!spec.launch_default);
+        assert!(spec.probe_bins.is_empty());
+        assert!(!spec.session_disposable);
+        assert_eq!(spec.capabilities, &["devin_cloud"]);
+        assert_eq!(default_kind("devin").unwrap(), "pty");
+        assert!(spec.launch_params.contains(&"repos"));
+        assert!(spec.launch_params.contains(&"stall_secs"));
+        let err = spec_fn_cloud();
+        assert!(err.contains("claude"), "{err}");
+        assert!(err.contains("devin"), "{err}");
+    }
+
+    fn spec_fn_cloud() -> String {
+        super::spec("claude", "cloud").unwrap_err().to_string()
+    }
+
+    #[test]
+    fn devin_cloud_launch_params_are_validated() {
+        assert!(validate_launch_params(
+            "devin",
+            "cloud",
+            &json!({
+                "repos": ["favcrm/cadence"],
+                "devin_mode": "fast",
+                "max_acu_limit": 4,
+                "session": "devin-keep",
+                "agents_md": true,
+                "stall_secs": 30,
+                "upstream": "pm",
+            })
+        )
+        .is_ok());
+        // `--param max_acu_limit=10` arrives as a digit string.
+        assert!(validate_launch_params("devin", "cloud", &json!({"max_acu_limit": "10"})).is_ok());
+        // Null clears an optional key.
+        assert!(validate_launch_params(
+            "devin",
+            "cloud",
+            &json!({"session": null, "devin_mode": null})
+        )
+        .is_ok());
+        let mode = validate_launch_params("devin", "cloud", &json!({"devin_mode": "turbo"}))
+            .unwrap_err()
+            .to_string();
+        for accepted in DEVIN_CLOUD_MODES {
+            assert!(mode.contains(accepted), "{mode}");
+        }
+        assert!(validate_launch_params("devin", "cloud", &json!({"max_acu_limit": 0})).is_err());
+        assert!(
+            validate_launch_params("devin", "cloud", &json!({"repos": ["not-a-repo"]})).is_err()
+        );
+        assert!(validate_launch_params("devin", "cloud", &json!({"session": "cookie"})).is_err());
+        let unknown =
+            validate_launch_params("devin", "cloud", &json!({"permission_mode": "smart"}))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            unknown.contains("unknown devin cloud launch param"),
+            "{unknown}"
+        );
     }
 }

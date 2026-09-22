@@ -2873,7 +2873,13 @@ impl Store {
         // slot free for the operator's later verdict (completed/failed)
         // or the interrupted notice.
         if status == "unknown" {
-            self.route_notice(tx, message, "unknown", result)?;
+            // A held cloud poll keeps the live session. Routing the
+            // usual fence notice would tell the PM the worker is fenced
+            // when the actor is still attached.
+            let held = result.get("held").and_then(Value::as_bool) == Some(true);
+            if !held {
+                self.route_notice(tx, message, "unknown", result)?;
+            }
         } else {
             self.route_result(tx, message, result)?;
         }
@@ -7699,6 +7705,21 @@ mod tests {
         let t = s.task("t1").unwrap();
         assert_eq!(t.head_sha.as_deref(), Some(SHA40_A), "{t:?}");
 
+        // A pull-request URL after the trailer must not steal the sha.
+        s.create_task("j1", "t-pr", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, kick_pr, ..) = s.dispatch_task("t-pr", None, None, "test").unwrap();
+        let m_pr = run_kickoff(&s, &kick_pr);
+        let trailed = format!("SHA: {SHA40_B}\nhttps://github.com/favcrm/cadence/pull/9");
+        s.finish(
+            &m_pr,
+            "completed",
+            &json!({"status": "completed", "text": trailed}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.task("t-pr").unwrap().head_sha.as_deref(), Some(SHA40_B));
+
         // Second task: no sha anywhere → review with NULL, task sha repairs.
         s.create_task("j1", "t2", None, Some("w1"), None, None, None, None, None)
             .unwrap();
@@ -7746,6 +7767,44 @@ mod tests {
         let t = s.task("t1").unwrap();
         assert_eq!(t.state, "review");
         assert_eq!(t.head_sha.as_deref(), Some(SHA40_A));
+    }
+
+    #[test]
+    fn held_unknown_does_not_route_a_fence_notice() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "w1", &cwd);
+        reg(&s, "pm", &cwd);
+        s.enqueue("w1", "work", Some("pm"), "m-held", "user")
+            .unwrap();
+        let held = run_kickoff(&s, "m-held");
+        s.finish(
+            &held,
+            "unknown",
+            &json!({"status": "unknown", "text": "", "error": "poll held", "held": true}),
+            Some("poll held"),
+        )
+        .unwrap();
+        assert!(s
+            .events("w1", 0, 40)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "notice_routed"));
+        s.enqueue("w1", "again", Some("pm"), "m-fence", "user")
+            .unwrap();
+        let fenced = run_kickoff(&s, "m-fence");
+        s.finish(
+            &fenced,
+            "unknown",
+            &json!({"status": "unknown", "text": "", "error": "lost"}),
+            Some("lost"),
+        )
+        .unwrap();
+        assert!(s
+            .events("w1", 0, 80)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "notice_routed"));
     }
 
     #[test]

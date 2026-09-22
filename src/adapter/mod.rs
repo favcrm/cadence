@@ -6,6 +6,7 @@
 //! review rather than replaying potentially executed work.
 
 pub mod claude;
+pub mod cloud;
 pub mod codex;
 pub mod fake;
 pub mod link;
@@ -52,6 +53,13 @@ impl ProviderEnv {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Value set on this daemon only. Does not consult the process
+    /// environment, so a blank override cannot fall through to a real
+    /// credential that happens to be exported.
+    pub fn own(&self, name: &str) -> Option<String> {
+        self.0.read().unwrap().get(name).cloned()
     }
 
     /// This daemon's value for `name`, else the environment's.
@@ -176,6 +184,12 @@ pub trait ProviderAdapter: Send + Sync {
     fn respond(&self, request_id: &Value, result: Value) -> Result<()>;
     /// Best-effort cancellation of an active turn.
     fn interrupt(&self);
+    /// What `agent stop` does before it waits. Defaults to [`interrupt`].
+    /// Devin cloud overrides this: `interrupt` terminates the remote
+    /// session, while stop must archive it via [`close`] instead.
+    fn release_for_stop(&self) {
+        self.interrupt();
+    }
     /// Transport is gone; any outstanding turn is ambiguous.
     fn disconnected(&self) -> bool;
     /// Release the provider process/connection and any owned resources.
@@ -307,6 +321,12 @@ pub fn build(
                 "No managed-ws adapter for provider '{other}' (implemented: codex)"
             ))),
         },
+        "cloud" => match agent.provider.as_str() {
+            "devin" => Ok(Box::new(cloud::DevinCloudAdapter::new(hooks, env))),
+            other => Err(crate::error::Error::rejected(format!(
+                "No cloud adapter for provider '{other}' (implemented: devin)"
+            ))),
+        },
         "pty" => match agent.provider.as_str() {
             "devin" => Ok(Box::new(pty::PtyAdapter::new(
                 hooks,
@@ -353,7 +373,7 @@ pub fn build(
         "fake" => Ok(Box::new(fake::FakeAdapter::new(hooks))),
         other => Err(crate::error::Error::rejected(format!(
             "Endpoint kind '{other}' is not implemented \
-             (implemented: managed, managed-ws, pty, fake)"
+             (implemented: managed, managed-ws, pty, cloud, fake)"
         ))),
     }
 }

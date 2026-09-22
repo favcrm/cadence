@@ -462,6 +462,7 @@ impl Shared {
     /// candidates the marker carried plus this run's instance id.
     pub fn new_hot(state_dir: &Path, opts: &ServeOptions, hot: HotStart) -> Result<Arc<Self>> {
         let HotStart { instance, marker } = hot;
+        let daemon_id = instance.clone();
         let db_path = state_dir.join("cadence.sqlite3");
         // Authorise the holder before the store opens the file
         // read-write and migrates. A direct `daemon run` whose identity
@@ -513,6 +514,10 @@ impl Shared {
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
         shared.emit_slot_events(boot_events);
+        // Cloud sessions tag themselves `cadence:<id>` so a restart can
+        // see which daemon opened them. The value is an instance id,
+        // not a credential, and it stays in this daemon's provider env.
+        shared.provider_env.set("CADENCE_DAEMON_ID", daemon_id);
         Ok(shared)
     }
 
@@ -847,6 +852,10 @@ impl Shared {
 
     fn actor_inner(self: &Arc<Self>, alias: &str, ctl: &Arc<AgentCtl>) -> Result<()> {
         let agent = self.store.agent(alias)?;
+        // A lost poll on a live Devin Cloud session is not a dead
+        // process. Finish the message unknown and keep the actor and
+        // endpoint; do not fence.
+        let hold_cloud = agent.provider == "devin" && agent.endpoint_kind == "cloud";
         let log_path = self.provider_log_dir.join(format!("{alias}.provider.log"));
         let shared = Arc::clone(self);
         let owned = alias.to_string();
@@ -1135,7 +1144,27 @@ impl Shared {
                                 .wait_if_unchanged(retry_ticket, Instant::now() + wait);
                         }
                         Err(Error::OutcomeUnknown(error)) => {
-                            return self.unknown(alias, &message, &error);
+                            if hold_cloud {
+                                self.store.finish(
+                                    &message,
+                                    "unknown",
+                                    &json!({
+                                        "status": "unknown",
+                                        "text": "",
+                                        "error": error,
+                                        "held": true,
+                                    }),
+                                    Some(&error),
+                                )?;
+                                let _ = self.store.event_public(
+                                    alias,
+                                    "cloud_hold",
+                                    json!({"reason": error, "fenced": false}),
+                                );
+                                self.wake();
+                            } else {
+                                return self.unknown(alias, &message, &error);
+                            }
                         }
                         // Deterministic pre-submission rejection: zero
                         // bytes reached the provider, so nothing is
@@ -2599,6 +2628,23 @@ impl Shared {
                         return Err(Error::rejected("Respond with an answers object"));
                     }
                     json!({"answers": answers.unwrap()})
+                }
+                "devin/user_input" => {
+                    let from_answers = answers.as_ref().and_then(|value| {
+                        value
+                            .get("message")
+                            .or_else(|| value.get("text"))
+                            .and_then(Value::as_str)
+                    });
+                    let text = from_answers
+                        .filter(|text| !text.trim().is_empty())
+                        .or_else(|| decision.filter(|text| !text.trim().is_empty()))
+                        .ok_or_else(|| {
+                            Error::rejected(
+                                "Respond with answers.message, answers.text, or --decision text for the Devin session",
+                            )
+                        })?;
+                    json!({"message": text})
                 }
                 "session/request_permission" => match decision {
                     Some("decline") if answers.is_none() => {
@@ -4334,7 +4380,7 @@ impl Shared {
     fn stop_ctls(&self, ctls: &[Arc<AgentCtl>]) {
         for ctl in ctls {
             if let Some(adapter) = ctl.adapter.lock().unwrap().clone() {
-                adapter.interrupt();
+                adapter.release_for_stop();
             }
             ctl.wake.notify_all();
         }
