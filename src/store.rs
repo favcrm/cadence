@@ -346,6 +346,16 @@ pub struct Verdict {
     pub created: f64,
 }
 
+/// The verdict that applies to `revision`: the highest `seq` among rows
+/// for that revision. A later reopen can leave higher revision numbers
+/// in the history; those are not the current verdict.
+pub fn current_verdict(revision: i64, verdicts: &[Verdict]) -> Option<&Verdict> {
+    verdicts
+        .iter()
+        .filter(|v| v.revision == revision)
+        .max_by_key(|v| v.seq)
+}
+
 /// A daemon-owned supervision registration. `state` is the monitor
 /// lifecycle (`degraded` until the first successful check, then `active`,
 /// or `off` after an explicit stop); it never describes worker health.
@@ -5348,6 +5358,33 @@ mod tests {
 
     const SHA40_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA40_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn verdict(seq: i64, revision: i64) -> Verdict {
+        Verdict {
+            seq,
+            task_id: "t1".to_string(),
+            revision,
+            sha: SHA40_A.to_string(),
+            verdict: "pass".to_string(),
+            reviewer: "rev".to_string(),
+            evidence: None,
+            message: None,
+            verify: None,
+            created: 0.0,
+        }
+    }
+
+    #[test]
+    fn current_verdict_follows_the_open_revision() {
+        let rows = vec![verdict(1, 2), verdict(3, 2), verdict(2, 1)];
+        let current = super::current_verdict(1, &rows).unwrap();
+        assert_eq!(current.seq, 2);
+        assert_eq!(current.revision, 1);
+        // Reopen left a higher revision in history. It is not current.
+        assert!(super::current_verdict(0, &rows).is_none());
+        let again = super::current_verdict(2, &rows).unwrap();
+        assert_eq!(again.seq, 3);
+    }
 
     fn store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();

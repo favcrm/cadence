@@ -241,15 +241,21 @@ fn task_rank(state: &str) -> u8 {
         "running" => 3,
         "revising" => 4,
         "review" => 5,
+        // Passed review, not yet accepted. Behind nothing that is still
+        // in flight, ahead of `review` only so a live review stays the
+        // least-advanced state.
+        "verified" => 6,
         _ => 3,
     }
 }
 
 /// Map one job's task-state multiset (`job_list` `tasks` counts) to a
 /// board outcome: the least-advanced non-terminal task decides —
-/// dispatched/running/revising → doing, review → review, blocked →
-/// flag, draft → fall through; all-terminal → done only when nothing
-/// failed or was cancelled.
+/// dispatched/running/revising → doing, review and verified → review,
+/// blocked → flag, draft → fall through. `done` is the only state that
+/// means accepted: a verified task is still waiting for `job accept`,
+/// so it must not mark the issue done. All-done → done only when
+/// nothing failed or was cancelled.
 fn job_outcome(tasks: &Value) -> Option<JobOutcome> {
     let mut least: Option<(u8, &str)> = None;
     let (mut finished, mut dead) = (false, false);
@@ -258,7 +264,7 @@ fn job_outcome(tasks: &Value) -> Option<JobOutcome> {
             continue;
         }
         match state.as_str() {
-            "done" | "verified" => finished = true,
+            "done" => finished = true,
             "failed" | "cancelled" => dead = true,
             // Draft tasks are unstarted templates — they must not drag a
             // job whose live tasks have real state back to "no outcome".
@@ -273,7 +279,7 @@ fn job_outcome(tasks: &Value) -> Option<JobOutcome> {
     }
     match least {
         Some((_, "dispatched" | "running" | "revising")) => Some(JobOutcome::Status("doing")),
-        Some((_, "review")) => Some(JobOutcome::Status("review")),
+        Some((_, "review" | "verified")) => Some(JobOutcome::Status("review")),
         Some((_, "blocked")) => Some(JobOutcome::Blocked),
         _ => {
             if least.is_none() && finished && !dead {
@@ -982,13 +988,15 @@ mod tests {
             job_outcome(&counts(&["review"])),
             Some(JobOutcome::Status("review"))
         );
-        for s in ["verified", "done"] {
-            assert_eq!(
-                job_outcome(&counts(&[s])),
-                Some(JobOutcome::Status("done")),
-                "{s}"
-            );
-        }
+        assert_eq!(
+            job_outcome(&counts(&["verified"])),
+            Some(JobOutcome::Status("review")),
+            "verified is waiting for accept, not done"
+        );
+        assert_eq!(
+            job_outcome(&counts(&["done"])),
+            Some(JobOutcome::Status("done"))
+        );
         assert_eq!(
             job_outcome(&counts(&["blocked"])),
             Some(JobOutcome::Blocked)
@@ -1025,7 +1033,12 @@ mod tests {
         assert_eq!(job_outcome(&counts(&["done", "cancelled"])), None);
         assert_eq!(
             job_outcome(&counts(&["verified", "done"])),
-            Some(JobOutcome::Status("done"))
+            Some(JobOutcome::Status("review")),
+            "one accepted task does not hide a sibling that is only verified"
+        );
+        assert_eq!(
+            job_outcome(&counts(&["running", "verified"])),
+            Some(JobOutcome::Status("doing"))
         );
     }
 
