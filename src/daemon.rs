@@ -1167,13 +1167,21 @@ impl Shared {
                     view.apply(&mut agent_json);
                 }
                 // The briefing lives under the state dir — actors read
-                // it there, never inside their cwd repository.
+                // it there, never inside their cwd repository. The path
+                // is advertised only while the file exists; a missing
+                // one is named as missing, never as a live path.
                 if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
-                    agent_json["briefing"] = json!(client::briefing_path(
+                    let file = client::briefing_path(
                         &self.state_dir,
                         agent.params.as_ref().unwrap_or(&Value::Null),
                         &agent.alias,
-                    ));
+                    );
+                    if file.is_file() {
+                        agent_json["briefing"] = json!(file);
+                    } else {
+                        agent_json["briefing"] = Value::Null;
+                        agent_json["briefing_missing"] = json!(file);
+                    }
                 }
                 Ok(json!({
                     "agent": agent_json,

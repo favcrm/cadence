@@ -202,11 +202,17 @@ other providers already run under, not a new one.
 **Briefings.** Every launch path (`devin`, `codex`, `claude`, `join`) writes
 `$CADENCE_STATE_DIR/briefings/<root>/BRIEFING-<alias>.md` — under the
 daemon's state dir, keyed by group root, never in the agent's cwd repo.
-`cadence agent show <alias>` prints the absolute path; agents are told
+`cadence agent show <alias>` prints the absolute path while the file
+exists; a missing file reads `"briefing": null` plus
+`"briefing_missing": "<path>"`, never a live path. Agents are told
 to read the path printed in their bootstrap message. The file carries
-identity (alias, native session id, upstream), a protocol quickref, and
+identity (alias, native session id, upstream), any `--instructions-file`
+content under a role-instructions section, a protocol quickref, and
 the group roster at write time — a snapshot; `cadence self`/`agent list`
-stay live truth. Briefings are written only after the endpoint reports
+stay live truth. The briefing is the only channel role instructions have
+on every provider but codex (which also takes them natively as developer
+instructions), so `--instructions-file` with `--no-bootstrap` is refused
+there before anything is registered. Briefings are written only after the endpoint reports
 open, and regenerated on resume when missing. Nothing else lands in the
 cwd repo unless the operator opts in: `--agents-md` (persisted in
 launch params, replayed on resume) adds an idempotent
