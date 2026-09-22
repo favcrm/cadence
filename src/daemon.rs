@@ -1044,7 +1044,7 @@ impl Shared {
     }
 
     fn preserved_unknown_detail(&self, alias: &str, actor_error: &str) -> String {
-        if let Some(detail) = self.latest_unknown_message_error(alias) {
+        if let Some(detail) = self.store.preferred_unknown_error(alias).ok().flatten() {
             let bounded = bound_unknown_detail(&detail);
             if !bounded.is_empty() && bounded != UNKNOWN_GENERIC_REASON {
                 return bounded;
@@ -1061,15 +1061,6 @@ impl Shared {
             }
         }
         UNKNOWN_GENERIC_REASON.to_string()
-    }
-
-    fn latest_unknown_message_error(&self, alias: &str) -> Option<String> {
-        let messages = self.store.messages(alias).ok()?;
-        messages
-            .into_iter()
-            .rev()
-            .find(|message| message.state == "unknown")
-            .and_then(|message| message.error)
     }
 
     /// An `OutcomeUnknown` never becomes a retry: mark the attempt and

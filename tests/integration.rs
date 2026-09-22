@@ -441,6 +441,85 @@ fn restart_fences_unknown_inflight() {
 }
 
 #[test]
+fn restart_keeps_original_unknown_reason_beside_later_inflight() {
+    // An older unknown already names the provider account. A later
+    // running turn is still in flight at crash. Restart must fence that
+    // later turn without letting its blanket sentence replace the
+    // original account on agent.error, and without rewriting the older
+    // row or dropping the later turn token.
+    const ORIGINAL: &str = "submission accepted but never rendered on the endpoint";
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        store
+            .register_agent(&NewAgent {
+                alias: "w1",
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+            })
+            .unwrap();
+        store.enqueue("w1", "first", None, "m1", "user").unwrap();
+        let m1 = match store.take_queued("w1").unwrap() {
+            Take::Message(message) => *message,
+            _ => panic!("expected m1"),
+        };
+        store
+            .finish(
+                &m1,
+                "unknown",
+                &json!({"status": "unknown", "text": "", "error": ORIGINAL}),
+                Some(ORIGINAL),
+            )
+            .unwrap();
+        store.enqueue("w1", "second", None, "m2", "user").unwrap();
+        let m2 = match store.take_queued("w1").unwrap() {
+            Take::Message(message) => *message,
+            _ => panic!("expected m2"),
+        };
+        store.mark_running(&m2.id, "pty-gen-m2").unwrap();
+    }
+    let d = TestDaemon::start_on(state);
+    let agent = d.wait_agent("w1", "attention", 10);
+    let error = agent["error"].as_str().unwrap();
+    assert!(error.contains(ORIGINAL), "{error}");
+    assert!(error.contains("does not prove"), "{error}");
+    assert!(
+        !error.contains("Runtime restarted during provider turn"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("agent fenced at restart; turn never verified"),
+        "{error}"
+    );
+    assert!(agent["endpoint"].is_null(), "{agent}");
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let messages = show["messages"].as_array().unwrap();
+    let m1 = messages.iter().find(|m| m["id"] == "m1").unwrap();
+    let m2 = messages.iter().find(|m| m["id"] == "m2").unwrap();
+    assert_eq!(m1["state"], "unknown");
+    assert_eq!(m1["error"], ORIGINAL);
+    assert_eq!(m2["state"], "unknown");
+    assert_eq!(m2["error"], "Runtime restarted during provider turn");
+    assert_eq!(m2["turn_id"], "pty-gen-m2");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "later", "message": "m3"}),
+    )
+    .unwrap();
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(d.message_state("w1", "m3"), "queued");
+    assert_eq!(d.message_state("w1", "m1"), "unknown");
+    assert_eq!(d.message_state("w1", "m2"), "unknown");
+}
+
+#[test]
 fn turns_are_serialized_per_agent() {
     let d = TestDaemon::start();
     d.register("w1");
