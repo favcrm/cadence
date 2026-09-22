@@ -1345,13 +1345,21 @@ impl Store {
     /// are final, while the facts come from the earlier snapshot since
     /// detach has already cleared them from the agent rows.
     ///
+    /// A pty alias missing from `facts` is named, not skipped. The
+    /// snapshot is taken before actors wake, but a row that already
+    /// had no live `pid`/`generation` cannot be adopted. Omitting it
+    /// made recovery fence every in-flight turn of that alias with no
+    /// per-turn evidence. Non-pty rows are not adoption candidates and
+    /// stay unnamed.
+    ///
     /// A `running` row whose token does not embed the snapshot
-    /// generation is skipped and named: the facts were captured at the
-    /// top of shutdown while RPC threads were still live, so a resume
-    /// racing the stop could re-open the pane under a newer generation
-    /// and leave this token stale forever. Recording it would roll the
-    /// agent row back to the old generation — instead the row is
-    /// refused now and fences on restart like any other refusal.
+    /// generation is skipped and named: the facts were captured when
+    /// shutdown was requested, while RPC threads were still live, so a
+    /// resume racing the stop could re-open the pane under a newer
+    /// generation and leave this token stale forever. Recording it
+    /// would roll the agent row back to the old generation — instead
+    /// the row is refused now and fences on restart like any other
+    /// refusal.
     pub fn shutdown_entries(
         &self,
         facts: &std::collections::HashMap<String, (String, u32, String)>,
@@ -1376,6 +1384,22 @@ impl Store {
         let mut entries = Vec::new();
         for (alias, message_id, turn_id, state) in inflight {
             let Some((generation, pane_pid, native_session)) = facts.get(&alias) else {
+                let kind: Option<String> = tx
+                    .query_row(
+                        "SELECT endpoint_kind FROM agents WHERE alias=?",
+                        [&alias],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if kind.as_deref() == Some("pty") {
+                    Self::event(
+                        &tx,
+                        &alias,
+                        "turn_adopt_refused",
+                        json!({"message": message_id, "turn_id": turn_id,
+                               "reason": "endpoint identity was not provable at shutdown; inspect the pane and do not replay"}),
+                    )?;
+                }
                 continue;
             };
             if state == "running" && !turn_id.starts_with(&format!("pty-{generation}-")) {
