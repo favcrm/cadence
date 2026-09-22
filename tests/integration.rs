@@ -5278,15 +5278,13 @@ fn pty_dead_pane_fences_submitted_and_stops_actor() {
         .unwrap();
     unsafe { libc::killpg(pid, libc::SIGKILL) };
     let agent = d.wait_agent("dv1", "attention", 20);
-    assert!(
-        agent["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("disconnected")
-            || agent["error"].as_str().unwrap_or("").contains("lock"),
-        "{}",
-        agent
-    );
+    // This kill is submitted-pane loss, not a session-lock refusal, so
+    // the fence must keep that account plus the inspect guidance. A
+    // lock substring is not an alternate success for this path.
+    let error = agent["error"].as_str().unwrap_or("");
+    assert!(error.contains("endpoint lost after submission"), "{agent}");
+    assert!(error.contains("does not prove"), "{error}");
+    assert!(!error.contains("then `cadence agent resume"), "{error}");
     d.wait_message("dv1", "m1", &["unknown"], 15);
 }
 
