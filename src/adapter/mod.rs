@@ -250,6 +250,13 @@ pub trait ProviderAdapter: Send + Sync {
     /// cache endpoint options (pty's `auto_ready`) refresh here. Stored
     /// params remain authoritative for the next `open` regardless.
     fn update_params(&self, _params: &Value) {}
+    /// The actor is about to run one turn. `ok` is true only for a
+    /// routed notice (`worker_result`, `worker_notice`, `job_event`):
+    /// the pty gate may then paste into an idle pane with no operator
+    /// claim. Cleared when the turn returns so a later user message
+    /// cannot inherit it. No-op except on the pty adapter — the flag
+    /// is not encoded in the message body.
+    fn set_unclaimed_ok(&self, _ok: bool) {}
     /// External proof of life: a brokered permission request is open
     /// and waiting on a human — the provider is silent by design, so
     /// activity-based liveness must count the wait or the turn fences

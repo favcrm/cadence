@@ -36,8 +36,14 @@ use crate::slots::{SlotConfig, SlotKind, Slots};
 use crate::store::{self, Agent, Message, Store, Take};
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
+///
+/// `notify_all` bumps a generation. A waiter that samples
+/// [`ticket`](Self::ticket) *before* its condition check, then
+/// [`wait_if_unchanged`](Self::wait_if_unchanged), does not lose a
+/// notify that lands in the gap — this condvar stores no permit on
+/// its own.
 pub struct Notify {
-    lock: Mutex<()>,
+    lock: Mutex<u64>,
     cv: Condvar,
 }
 
@@ -50,15 +56,23 @@ impl Default for Notify {
 impl Notify {
     pub fn new() -> Self {
         Self {
-            lock: Mutex::new(()),
+            lock: Mutex::new(0),
             cv: Condvar::new(),
         }
     }
     pub fn notify_all(&self) {
-        let _guard = self.lock.lock().unwrap();
+        let mut gen = self.lock.lock().unwrap();
+        *gen = gen.wrapping_add(1);
         self.cv.notify_all();
     }
+    /// Generation to sample before checking a condition that
+    /// `notify_all` is meant to republish.
+    pub fn ticket(&self) -> u64 {
+        *self.lock.lock().unwrap()
+    }
     /// Wait until `deadline`; returns false if it expired.
+    /// A notify that arrives before this call is not remembered —
+    /// sample [`ticket`](Self::ticket) first when that gap matters.
     pub fn wait_until(&self, deadline: Instant) -> bool {
         let guard = self.lock.lock().unwrap();
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -67,6 +81,26 @@ impl Notify {
         }
         let _ = self.cv.wait_timeout(guard, remaining).unwrap();
         Instant::now() < deadline
+    }
+    /// Wait until `deadline` or until `notify_all` has run since
+    /// `ticket`. Returns false if the deadline expired with the
+    /// generation unchanged.
+    pub fn wait_if_unchanged(&self, ticket: u64, deadline: Instant) -> bool {
+        let mut gen = self.lock.lock().unwrap();
+        loop {
+            if *gen != ticket {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (guard, result) = self.cv.wait_timeout(gen, remaining).unwrap();
+            gen = guard;
+            if result.timed_out() && *gen == ticket {
+                return false;
+            }
+        }
     }
 }
 
@@ -820,6 +854,11 @@ impl Shared {
             if self.closing.load(Ordering::SeqCst) {
                 return Ok(());
             }
+            // Sample before the empty check. `disconnected` probes the
+            // pane before the wait; a `notify_agent` in that gap must
+            // still wake the actor or a routed reply sits until the
+            // 5s poll.
+            let ticket = ctl.wake.ticket();
             match self.store.take_queued(alias)? {
                 Take::Stop => return Ok(()),
                 Take::Empty => {
@@ -831,7 +870,8 @@ impl Shared {
                             .orphan_running(alias, "endpoint lost after submission");
                         return Err(Error::unknown("Provider process disconnected while idle"));
                     }
-                    ctl.wake.wait_until(Instant::now() + Duration::from_secs(5));
+                    ctl.wake
+                        .wait_if_unchanged(ticket, Instant::now() + Duration::from_secs(5));
                 }
                 Take::Message(message) => {
                     // A gate refusal requeues the same message, so its
@@ -845,11 +885,16 @@ impl Shared {
                     let started_id = message.id.clone();
                     let shared = Arc::clone(self);
                     let watch = Arc::clone(ctl);
+                    // Routed mail may pass the pty claim gate while this
+                    // turn runs. Clear on return, including errors, so a
+                    // later user message cannot inherit the flag.
+                    adapter.set_unclaimed_ok(message.is_routed());
                     let outcome = adapter.run_turn(&message.body, &message.id, &move |turn| {
                         let _ = shared.store.mark_running(&started_id, turn);
                         watch.bump_activity();
                         shared.wake();
                     });
+                    adapter.set_unclaimed_ok(false);
                     match outcome {
                         Ok(result) => {
                             if let Err(error) = self.complete(&message, result) {
@@ -905,10 +950,14 @@ impl Shared {
                                        "claim_probe": claim_probe}),
                             );
                             if retry {
+                                let retry_ticket = ctl.wake.ticket();
                                 let _ = self.store.requeue(&message.id);
                                 let _ = self.store.set_agent_state_if(alias, "idle", "busy");
                                 gate_notice = None;
-                                ctl.wake.wait_until(Instant::now() + Duration::from_secs(5));
+                                ctl.wake.wait_if_unchanged(
+                                    retry_ticket,
+                                    Instant::now() + Duration::from_secs(5),
+                                );
                             } else if routed {
                                 let _ = self.store.event_public(
                                     alias,
@@ -917,14 +966,12 @@ impl Shared {
                                            "reason": reason,
                                            "attempts": unrendered}),
                                 );
-                                self.store.finish(
-                                    &message,
-                                    "failed",
-                                    &json!({"status": "failed",
+                                let parked = json!({"status": "failed",
                                             "via": "pty_render_miss",
-                                            "error": reason}),
-                                    Some(&reason),
-                                )?;
+                                            "error": reason});
+                                self.store
+                                    .finish(&message, "failed", &parked, Some(&reason))?;
+                                self.notify_routed_target(&message, &parked);
                                 let _ = self.store.set_agent_state_if(alias, "idle", "busy");
                                 unrendered = 0;
                                 unrendered_message = None;
@@ -941,6 +988,7 @@ impl Shared {
                         // safe to retry — back to the queue with a
                         // bounded backoff, never a silent drop.
                         Err(Error::GateRefused(reason)) => {
+                            let retry_ticket = ctl.wake.ticket();
                             let _ = self.store.requeue(&message.id);
                             let _ = self.store.set_agent_state_if(alias, "idle", "busy");
                             if gate_notice.as_deref() != Some(reason.as_str()) {
@@ -956,7 +1004,8 @@ impl Shared {
                             // is only the fallback for a busy pane.
                             let wait = Duration::from_secs((5u64 << gate_waits.min(3)).min(30));
                             gate_waits = gate_waits.saturating_add(1);
-                            ctl.wake.wait_until(Instant::now() + wait);
+                            ctl.wake
+                                .wait_if_unchanged(retry_ticket, Instant::now() + wait);
                         }
                         Err(Error::OutcomeUnknown(error)) => {
                             return self.unknown(alias, &message, &error);
@@ -966,25 +1015,26 @@ impl Shared {
                         // unknown — fail the message, keep the endpoint
                         // live and keep draining the queue.
                         Err(Error::PreWrite(reason)) => {
-                            self.store.finish(
-                                &message,
-                                "failed",
-                                &json!({"status": "failed", "text": "",
-                                        "error": reason}),
-                                Some(&reason),
-                            )?;
+                            let failed = json!({"status": "failed", "text": "",
+                                        "error": reason});
+                            self.store
+                                .finish(&message, "failed", &failed, Some(&reason))?;
+                            self.notify_routed_target(&message, &failed);
                             gate_notice = None;
                             self.wake();
                         }
                         // A provider/adapter error is actor-fatal: record
                         // the failed attempt, then land in `attention`.
                         Err(error) => {
+                            let failed =
+                                json!({"status": "failed", "text": "", "error": error.to_string()});
                             self.store.finish(
                                 &message,
                                 "failed",
-                                &json!({"status": "failed", "text": "", "error": error.to_string()}),
+                                &failed,
                                 Some(&error.to_string()),
                             )?;
+                            self.notify_routed_target(&message, &failed);
                             // Other submitted PTY messages are now
                             // orphaned by the dead endpoint.
                             let _ = self
@@ -1008,13 +1058,10 @@ impl Shared {
             // A routed notification's delivery IS its completion — the
             // receiving PM is not expected to report a result on it.
             if message.is_routed() {
-                self.store.finish(
-                    message,
-                    "completed",
-                    &json!({"status": "completed", "via": "pty_deliver",
-                            "turn_id": result.turn_id}),
-                    None,
-                )?;
+                let delivered = json!({"status": "completed", "via": "pty_deliver",
+                            "turn_id": result.turn_id});
+                self.store.finish(message, "completed", &delivered, None)?;
+                self.notify_routed_target(message, &delivered);
             }
             self.wake();
             return Ok(());
@@ -1027,18 +1074,16 @@ impl Shared {
                 )))
             }
         };
-        self.store.finish(
-            message,
-            &status,
-            &json!({
-                "turn_id": result.turn_id,
-                "status": status,
-                "text": result.text,
-                "stop_reason": result.stop_reason,
-                "error": result.error,
-            }),
-            result.error.as_deref(),
-        )?;
+        let stored = json!({
+            "turn_id": result.turn_id,
+            "status": status,
+            "text": result.text,
+            "stop_reason": result.stop_reason,
+            "error": result.error,
+        });
+        self.store
+            .finish(message, &status, &stored, result.error.as_deref())?;
+        self.notify_routed_target(message, &stored);
         self.wake();
         Ok(())
     }
@@ -1077,12 +1122,10 @@ impl Shared {
     /// of the uncertainty (idle window, EOF, cap exceeded, …) — the
     /// operator needs it to reconcile.
     fn unknown(&self, alias: &str, message: &Message, reason: &str) -> Result<()> {
-        self.store.finish(
-            message,
-            "unknown",
-            &json!({"status": "unknown", "text": "", "error": reason}),
-            Some(reason),
-        )?;
+        let stored = json!({"status": "unknown", "text": "", "error": reason});
+        self.store
+            .finish(message, "unknown", &stored, Some(reason))?;
+        self.notify_routed_target(message, &stored);
         // One write: the fence is visible immediately, so the cleared
         // endpoint must land with it — a reader in between must never
         // see `attention` plus a live endpoint.
@@ -2420,16 +2463,13 @@ impl Shared {
                     .map(store::check_commit_sha)
                     .transpose()?;
                 if message.state == "running" {
-                    self.store.finish(
-                        &message,
-                        "completed",
-                        &json!({
-                            "status": "completed", "text": text,
-                            "turn_id": token, "via": "pty_report",
-                            "sha": sha,
-                        }),
-                        None,
-                    )?;
+                    let stored = json!({
+                        "status": "completed", "text": text,
+                        "turn_id": token, "via": "pty_report",
+                        "sha": sha,
+                    });
+                    self.store.finish(&message, "completed", &stored, None)?;
+                    self.notify_routed_target(&message, &stored);
                 } else if message.state == "completed" {
                     // Idempotent retry vs conflicting duplicate.
                     let same = message
@@ -2474,6 +2514,9 @@ impl Shared {
         // like a worker's `--sha` — explicit, never inferred.
         let sha = optional_str(params, "sha");
         let message = self.store.reconcile(message_id, status, note, by, sha)?;
+        if let Some(result) = message.result.clone() {
+            self.notify_routed_target(&message, &result);
+        }
         self.wake();
         Ok(json!({"state": "reconciled", "message": message.to_json()}))
     }
@@ -2488,6 +2531,9 @@ impl Shared {
         let by = optional_str(params, "by").unwrap_or("operator");
         let reason = optional_str(params, "reason");
         let message = self.store.cancel(message_id, by, reason)?;
+        if let Some(result) = message.result.clone() {
+            self.notify_routed_target(&message, &result);
+        }
         self.wake();
         Ok(json!({"state": "cancelled", "message": message.to_json()}))
     }
@@ -2605,7 +2651,10 @@ impl Shared {
         }
         let mut reconciled = Vec::new();
         for id in &ids {
-            self.store.reconcile(id, status, note, by, None)?;
+            let message = self.store.reconcile(id, status, note, by, None)?;
+            if let Some(result) = message.result.clone() {
+                self.notify_routed_target(&message, &result);
+            }
             reconciled.push(id.clone());
         }
         // `resume` is opt-in over the socket — the CLI's `agent unfence`
@@ -4225,6 +4274,20 @@ impl Shared {
     fn notify_agent(&self, alias: &str) {
         if let Some(ctl) = self.lifecycle.lock().unwrap().agents.get(alias) {
             ctl.wake.notify_all();
+        }
+    }
+
+    /// Wake `reply_to` after a route of `worker_result` or
+    /// `worker_notice`. `wake()` still releases socket long-polls;
+    /// this is the actor parked in the empty-queue wait. An
+    /// `inbox_read` receipt does not route. A missing `reply_to`, or
+    /// an alias with no actor, does nothing.
+    fn notify_routed_target(&self, message: &Message, result: &Value) {
+        if result.get("via").and_then(Value::as_str) == Some("inbox_read") {
+            return;
+        }
+        if let Some(reply_to) = message.reply_to.as_deref() {
+            self.notify_agent(reply_to);
         }
     }
 
