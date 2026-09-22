@@ -1,4 +1,5 @@
 import type { MonitorAlert, Monitoring, Overview } from "../types";
+import { needGroupKey, needLabel } from "../uxCopy";
 
 const KIND_CHIP: Record<string, string> = {
   merge: "bg-ok/15 text-ok",
@@ -14,22 +15,6 @@ const KIND_CHIP: Record<string, string> = {
   silent_end: "bg-warn/10 text-warn",
   inbox_unread: "bg-warn/10 text-warn",
   tracker_behind: "bg-ink-800 text-ink-400",
-};
-
-const KIND_LABEL: Record<string, string> = {
-  merge: "merge",
-  intake: "intake",
-  approval: "approval",
-  fenced: "fenced",
-  stalled: "stalled",
-  drift: "drift",
-  pr_no_verdict: "no verdict",
-  review_no_pr: "review",
-  blocked_ready: "unblocked",
-  ci_red: "ci red",
-  silent_end: "silent end",
-  inbox_unread: "inbox",
-  tracker_behind: "behind",
 };
 
 function age(secs: number): string {
@@ -55,18 +40,15 @@ const MONITOR_STATE_CHIP: Record<string, string> = {
 };
 
 const NEED_GROUPS = [
-  { key: "decision", label: "Needs your decision", kinds: new Set(["approval"]) },
-  { key: "team", label: "Team handling", kinds: new Set(["merge", "intake", "fenced", "stalled", "review_no_pr", "blocked_ready", "pr_no_verdict", "ci_red", "silent_end"]) },
-  { key: "dependency", label: "Waiting on dependency", kinds: new Set(["drift"]) },
-  { key: "info", label: "Information", kinds: new Set(["inbox_unread", "tracker_behind"]) },
+  { key: "decision", label: "Needs your decision" },
+  { key: "team", label: "Team handling" },
+  { key: "dependency", label: "Waiting on dependency" },
+  { key: "info", label: "Information" },
 ] as const;
 
 function needGroup(kind: string): (typeof NEED_GROUPS)[number] {
-  return NEED_GROUPS.find((group) => group.kinds.has(kind)) ?? NEED_GROUPS[1];
-}
-
-function needLabel(kind: string): string {
-  return KIND_LABEL[kind] ?? "unknown / unclassified";
+  const key = needGroupKey(kind);
+  return NEED_GROUPS.find((group) => group.key === key) ?? NEED_GROUPS[1];
 }
 
 function projectMatches(value: string | null | undefined, project: string): boolean {

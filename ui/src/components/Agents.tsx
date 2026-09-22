@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { fmtTime } from "../fmt";
 import { agentIsUnassigned, agentMatchesProject, issueProjectMap } from "../scope";
+import { agentsEmptyCopy } from "../uxCopy";
 import type {
   Agent,
   AgentDetail,
@@ -624,6 +625,7 @@ export default function Agents({
   // A refresh error is an observation about the new request. It must not
   // erase the last successful rows already held in `payload`.
   const showRows = payload !== null || (!loading && !error);
+  const emptyCopy = agentsEmptyCopy(project);
 
   return (
     <main className="px-4 lg:px-8 pt-6 pb-9 max-w-[106rem] w-full">
@@ -787,7 +789,7 @@ export default function Agents({
         })}
         {agents.length === 0 && (
           <div className="card p-8 text-center text-ink-500">
-            No agents registered.
+            {emptyCopy}
           </div>
         )}
       </div>}
@@ -892,7 +894,7 @@ export default function Agents({
             {agents.length === 0 && (
               <tr>
                 <td colSpan={9} className="px-4 py-8 text-center text-ink-500">
-                  No agents registered.
+                  {emptyCopy}
                 </td>
               </tr>
             )}
