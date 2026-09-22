@@ -521,7 +521,7 @@ fn read_blob(root: &Path, head: &str, path: &str) -> Result<Option<String>, Blob
             MAX_DOCUMENT_BYTES + 1,
         )
         .map_err(|error| {
-            if error.contains("output exceeded") {
+            if error.contains("stdout exceeded") {
                 BlobError::State(
                     "too_large",
                     format!("document exceeds {MAX_DOCUMENT_BYTES} bytes"),
@@ -806,27 +806,6 @@ pub fn bundle(
             });
         }
     };
-    if source.snapshot.dirty.is_none() {
-        let reason = source
-            .snapshot
-            .error
-            .clone()
-            .unwrap_or_else(|| "working tree state unavailable".to_string());
-        return cap_response(json!({
-            "project": selected.key,
-            "state": "unavailable_repository",
-            "manifest": {
-                "path": DEFAULT_MANIFEST_PATH,
-                "state": "unavailable_repository",
-                "revision": source.head,
-                "errors": [reason],
-            },
-            "snapshot": source.snapshot,
-            "documents": [],
-            "memories": empty_memories(),
-            "limits": limits_json(false),
-        }));
-    }
     let manifest_result = read_blob(&source.root, &source.head, DEFAULT_MANIFEST_PATH);
     let manifest_text = match manifest_result {
         Ok(Some(text)) => text,

@@ -187,10 +187,17 @@ export default function ProjectContext({
           </ul>
         )}
         {context.memories.load_errors_total > 0 && (
-          <p className="text-label text-fail mt-3">
-            {context.memories.load_errors_total} project memory load errors surfaced
-            {context.memories.load_errors_omitted > 0 ? `; ${context.memories.load_errors_omitted} omitted by bound` : ""}.
-          </p>
+          <div className="mt-3">
+            <p className="text-label text-fail">
+              {context.memories.load_errors_total} project memory load errors surfaced
+              {context.memories.load_errors_omitted > 0 ? `; ${context.memories.load_errors_omitted} omitted by bound` : ""}.
+            </p>
+            {context.memories.load_errors.length > 0 && (
+              <ul className="mt-2 space-y-1 text-label text-fail max-h-32 overflow-auto">
+                {context.memories.load_errors.map((error, index) => <li key={`${index}-${error}`}>{error}</li>)}
+              </ul>
+            )}
+          </div>
         )}
       </div>
 
