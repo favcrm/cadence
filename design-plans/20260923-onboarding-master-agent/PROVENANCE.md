@@ -34,11 +34,10 @@ Preview host path: `preview.simplebuild.site/20260923-091413/cadence-onboarding/
 | 2026-09-23 | Go: commit, file tickets, start P0 with the sandbox | operator | accepted | CAD-309..333 |
 | 2026-09-23 | #1 Agents as folders `agents/<slug>/` with SOUL.md, AGENT.md, MEMORY.md; all information in Markdown | operator direction | design record proposed | AGENT-FILESYSTEM.md, CAD-338 |
 | 2026-09-23 | #2 Memory policy: logic checks + cross-vendor curator (project/role), quorum (company), external quarantine | operator | approved; ADR text pending | LEARNING-LOOP.md, CAD-347 |
-| 2026-09-23 | #3 Unblock memory: one daemon identity check for all agents; trust matrix provenance × evidence; clear the 11 stuck proposals | operator asked to improve | improved proposal, awaiting confirmation | LEARNING-LOOP.md, CAD-381, CAD-382, CAD-260 |
+| 2026-09-23 | #3 Unblock memory: one daemon identity check for all agents; trust matrix provenance × evidence; clear the 11 stuck proposals | operator | confirmed 2026-09-23 | LEARNING-LOOP.md, CAD-381, CAD-382, CAD-260 |
 
 ## Pending operator decisions
 
-- Confirm decision #3 (CAD-381, CAD-382).
 - Accept the ADR texts for #1 (CAD-338) and #2 (CAD-347) before code.
 - Phone push notifications would reverse the 2026-09-21 "UI is the alert
   destination" ruling — only if wanted.

@@ -125,7 +125,7 @@ Tickets per milestone: [ROADMAP.md](ROADMAP.md).
 |---|---|---|---|
 | 1 | Agent definitions | Filesystem, all Markdown: `agents/<slug>/SOUL.md`, `AGENT.md`, `MEMORY.md`; roles as templates; `TEAM.md` instead of `team.yaml` (CAD-338, answers CAD-116) | operator direction 2026-09-23; design record proposed |
 | 2 | Memory policy | Logic checks + cross-vendor curator for project/role scope; two-review quorum for company scope; external content quarantined (CAD-347) | approved 2026-09-23 |
-| 3 | Unblocking memory | Separate *who proposed* from *is it true*: one daemon identity check for every launched agent (CAD-381); trust matrix provenance × evidence; the 11 stuck lessons move through checks → curator → operator queue (CAD-382) | improved proposal; confirm |
+| 3 | Unblocking memory | Separate *who proposed* from *is it true*: one daemon identity check for every launched agent (CAD-381); trust matrix provenance × evidence; the 11 stuck lessons move through checks → curator → operator queue (CAD-382) | confirmed 2026-09-23 |
 | — | Organization | One master; one PM per team; dev, QA, DevOps; curator at company level | operator direction |
 | — | Autonomy | Plan freely, ask to dispatch; operator merges and presses effects | decided |
 | — | Master providers | Structured (Claude, Codex, Pi); unmodified official binaries only | decided |

@@ -2,7 +2,7 @@
 
 Date: 2026-09-23. Status: **proposed** design record. Operator direction:
 memory policy approved 2026-09-23 (decision #2); the identity and trust proposal
-(decision #3) awaits confirmation. Builds on the existing memory store
+(decision #3) confirmed 2026-09-23. Builds on the existing memory store
 (`src/memory/`), `cadence report`, `cadence issue retro` and
 [DEVELOPMENT-TEAM.md](DEVELOPMENT-TEAM.md). Evidence:
 [research record](../../design-plans/20260923-onboarding-master-agent/RESEARCH.md).
@@ -75,7 +75,7 @@ external data (web, CRM, inbox, issue text from outside the team).
 **Curator** (CAD-349): an agent of a different vendor from the proposer returns
 ADD, UPDATE (merge), INVALIDATE, NOOP or ESCALATE with a reason.
 
-**Trust matrix** (decision #2 approved; #3 proposed) — acceptance depends on
+**Trust matrix** (decisions #2 and #3 approved) — acceptance depends on
 *provenance × evidence*, not on identity ceremony alone:
 
 | Provenance ↓ / Evidence → | Mechanical (re-runnable: tests, `file:line@SHA`) | Judgement (strategy, pitfall without a mechanical check) |
