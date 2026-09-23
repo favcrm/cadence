@@ -2671,6 +2671,10 @@ fn daemon_opts() -> daemon::ServeOptions {
         release_shutdown_snapshot: None,
         // CAD-199: the agent-gc timer stays off unless a test pins it.
         agent_gc: Some(daemon::AgentGcSetting::default()),
+        // CAD-96: idle auto-stop is ON by default in production; test
+        // daemons pin it off so no test's agent is stopped mid-test.
+        auto_stop: Some(daemon::AutoStopSetting::off()),
+        auto_stop_clock: None,
     }
 }
 
@@ -4412,6 +4416,15 @@ if cmd == "kill-session":
     if pid:
         try: os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError: pass
+    sys.exit(0)
+if cmd == "list-clients":
+    # Attached terminal clients: one tty per line of `<session>.clients`
+    # (absent = none attached). An unknown session fails like tmux.
+    name = rest[rest.index("-t") + 1].lstrip("=")
+    if not sess_pid(name):
+        die("can't find session: " + name)
+    try: sys.stdout.write(open(sess_path(name, "clients")).read())
+    except OSError: pass
     sys.exit(0)
 die("unhandled tmux cmd " + cmd)
 "##;
@@ -20480,6 +20493,207 @@ fn overview_scope_flags_filter_rows_and_reject_unknown_keys() {
     }
 }
 
+/// CAD-253: `cadence overview --json` carries each needs-me row's
+/// server-resolved audience. A fenced worker whose PM is live stays
+/// team work; one whose PM is itself fenced, and a fenced root agent
+/// with no PM at all, are the operator's — and the plain render groups
+/// them the same way.
+#[test]
+fn overview_needs_me_audience_follows_owner_liveness() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let pm = TempDir::new().unwrap();
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.register_inbox("pm");
+    d.register("lead");
+    for (alias, upstream) in [("w1", "pm"), ("w2", "lead")] {
+        d.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "fake", "endpoint_kind": "fake",
+                   "cwd": cwd, "params": json!({"upstream": upstream}).to_string()}),
+        )
+        .unwrap();
+    }
+    for w in ["lead", "w1", "w2"] {
+        d.wait_agent(w, "idle", 10);
+        fence_agent(&d, w, &format!("x-{w}"));
+    }
+    let out = overview_cmd(home.path(), &d.state, pm.path(), &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let row = |alias: &str| -> (String, String) {
+        let r = view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["subject"]["id"] == alias && n["kind"] == "fenced")
+            .unwrap_or_else(|| panic!("no fenced row for {alias}: {view}"));
+        (
+            r["audience"].as_str().unwrap().to_string(),
+            r["audience_reason"].as_str().unwrap().to_string(),
+        )
+    };
+    assert_eq!(row("w1"), ("team".into(), "owner pm can act".into()));
+    assert_eq!(
+        row("w2"),
+        ("operator".into(), "owner lead is fenced".into())
+    );
+    assert_eq!(row("lead"), ("operator".into(), "no owner".into()));
+
+    // The plain render reads the same field: w2 and lead under the
+    // decision, w1 under team handling.
+    let plain = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .arg("overview")
+        .env("HOME", home.path())
+        .env("CADENCE_PM_DIR", pm.path())
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&plain.stdout);
+    let decision = text.find("needs your decision").expect("decision section");
+    let team = text.find("team handling").expect("team section");
+    assert!(decision < team, "{text}");
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {text}"))
+    };
+    for op in ["agent lead fenced", "agent w2 fenced"] {
+        assert!(
+            (decision..team).contains(&at(op)),
+            "{op} not a decision: {text}"
+        );
+    }
+    assert!(at("agent w1 fenced") > team, "w1 is team work: {text}");
+    assert!(!text.contains("nothing needs your decision"), "{text}");
+}
+
+/// CAD-253: the unhandled clock is when the issue entered its status —
+/// the tracker's last `status:` change — never the issue's age. Two
+/// issues created 30 days ago, owned by a live PM mailbox: one went to
+/// review 10 minutes ago (team), the other 74 minutes ago (operator,
+/// `unhandled 74m`).
+#[test]
+fn overview_tracker_row_clock_is_the_status_change() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let pm = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    git_at(repo.path(), &["init", "-q"]);
+    let repo_s = repo.path().to_str().unwrap().to_string();
+    d.register_inbox("pm");
+    issue_cli(home.path(), &d.state, pm.path(), &["issue", "init"]);
+    issue_cli(
+        home.path(),
+        &d.state,
+        pm.path(),
+        &[
+            "issue", "project", "add", "cadence", "--prefix", "CAD", "--repo", &repo_s,
+        ],
+    );
+    for title in ["fresh review", "stale review"] {
+        issue_cli(
+            home.path(),
+            &d.state,
+            pm.path(),
+            &["issue", "new", title, "--project", "cadence"],
+        );
+    }
+    // Back-date both issues 30 days — a commit that never touches the
+    // `status:` line.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let old = cadence_agent::issue::time::iso(now - 30 * 86_400);
+    for id in ["CAD-1", "CAD-2"] {
+        let file = pm.path().join("cadence").join(id).join("issue.md");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let text: String = text
+            .lines()
+            .map(|l| {
+                if l.starts_with("created:") {
+                    format!("created: {old}\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        std::fs::write(&file, text).unwrap();
+    }
+    git_at(
+        pm.path(),
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--no-verify",
+            "-am",
+            "backdate",
+        ],
+    );
+    // Each status change is committed `ago` seconds in the past.
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    for (id, ago) in [("CAD-1", 10 * 60), ("CAD-2", 74 * 60 + 30)] {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(["issue", "set", id, "owner=pm", "status=review"])
+            .env("HOME", home.path())
+            .env("CADENCE_PM_DIR", pm.path())
+            .env("GIT_AUTHOR_DATE", format!("@{} +0000", now - ago))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    Path::new(bin).parent().unwrap().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "issue set {id}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = overview_cmd(home.path(), &d.state, pm.path(), &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let view: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let row = |id: &str| -> Value {
+        view["needs_me"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["subject"]["id"] == id && n["kind"] == "review_no_pr")
+            .unwrap_or_else(|| panic!("no review row for {id}: {view}"))
+            .clone()
+    };
+    let (fresh, stale) = (row("CAD-1"), row("CAD-2"));
+    for r in [&fresh, &stale] {
+        assert!(r["age"].as_i64().unwrap() >= 29 * 86_400, "issue age: {r}");
+    }
+    assert_eq!(fresh["audience"], "team", "{fresh}");
+    assert_eq!(fresh["audience_reason"], "owner pm can act", "{fresh}");
+    let since = fresh["since"].as_i64().unwrap();
+    assert!((now - 10 * 60 - since).abs() <= 5, "{fresh}");
+    assert_eq!(stale["audience"], "operator", "{stale}");
+    assert_eq!(stale["audience_reason"], "unhandled 74m", "{stale}");
+}
+
 // ==== CAD-251: an inbox nobody drains warns, never refuses ====
 
 /// A mailbox with endpoint params (thresholds, upstream).
@@ -24710,14 +24924,34 @@ fn audit_flags_reviewer_equals_merger() {
         "note From: alias must not feed the flag:\n{text}"
     );
 
-    // Same GitHub identity posted qa-verdict and merged: flag.
+    // Same GitHub identity posted qa-verdict and merged, while the run
+    // shows the fleet has a separate QA identity (`qa-bot` on #1): the
+    // row deviates from the norm — flag.
     report_json["statuses"] = status("ops-1");
+    report_json["statuses"][heads[0].clone()] = json!({"statuses":[{
+        "context":"qa-verdict","state":"SUCCESS",
+        "created_at":"2026-09-20T11:59:30Z",
+        "creator":{"login":"qa-bot"}
+    }]});
     std::fs::write(&report, report_json.to_string()).unwrap();
     let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "flag must exit 1:\n{text}");
     assert!(text.contains("FLAG[reviewer==merger]"), "{text}");
     assert!(text.contains("reviewer@gh ops-1"), "{text}");
+    assert!(!text.contains("structural:"), "{text}");
+
+    // CAD-207: when ops-1 is the ONLY GitHub identity in the run, the
+    // match is structural — one summary line, no per-row flag.
+    report_json["statuses"] = status("ops-1");
+    std::fs::write(&report, report_json.to_string()).unwrap();
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("FLAG[reviewer==merger]"), "{text}");
+    assert!(
+        text.contains("structural: 1 merge(s) share GitHub identity ops-1"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -25102,6 +25336,496 @@ fn audit_post_hoc_verdict_does_not_clear_flag() {
             .any(|f| f == "no-passing-verdict"),
         "post-hoc pass must not clear the flag: {m}"
     );
+}
+
+// ---------- CAD-217: operator approval evidence ------------------------
+
+/// `mergedAt` of `audit_repo`'s PR n is 2026-09-20T12:00:0nZ.
+const AUDIT_MERGE_EPOCH: f64 = 1_789_905_600.0;
+
+/// Record an approval through the store's writer, then pin its event
+/// time — the fixture merges are in the past, so "before the merge"
+/// needs an explicit clock.
+fn seed_approval(state: &Path, id: &str, head: &str, pr: u64, at: f64) {
+    seed_approval_in(state, "x/y", id, head, pr, at);
+}
+
+/// `seed_approval` scoped to another repository.
+fn seed_approval_in(state: &Path, repo: &str, id: &str, head: &str, pr: u64, at: f64) {
+    let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+    let (new, recorded) = store
+        .record_approval(
+            &cadence_agent::store::NewApproval {
+                id: Some(id),
+                source: "operator in chat",
+                action: "merge",
+                head_sha: head,
+                repo,
+                pr,
+            },
+            "operator-connection",
+        )
+        .unwrap();
+    assert!(new);
+    assert_eq!(recorded, id);
+    drop(store);
+    set_approval_at(state, "approval_recorded", id, at);
+}
+
+fn set_approval_at(state: &Path, kind: &str, id: &str, at: f64) {
+    let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+    let n = conn
+        .execute(
+            "UPDATE events SET at=?1 WHERE alias='audit:approvals' AND kind=?2 \
+             AND json_extract(payload,'$.approval_id')=?3",
+            rusqlite::params![at, kind, id],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+/// CAD-217: a human-class merge binds to the operator approval in force
+/// at merge time for the EXACT landed head. Approved, revoked-before-
+/// merge, post-merge-only and older-head approvals each render with
+/// their provenance; a cancelled queue message carrying the approval
+/// phrase is never an approval; no readable store is `unknown`, not a
+/// flag.
+#[test]
+fn audit_binds_human_merge_to_exact_head_approval() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    for (i, h) in heads.iter().enumerate() {
+        verdict_note(
+            &notes,
+            &format!("20260920-1159{i}0-x-p{n}-verdict.md", n = i + 1),
+            h,
+            "qa-1",
+            "human",
+        );
+    }
+    // The checkout's origin scopes approvals even in fixture runs.
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["remote", "add", "origin", "https://github.com/x/y"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let before = AUDIT_MERGE_EPOCH - 600.0;
+    let after = AUDIT_MERGE_EPOCH + 3600.0;
+    // #1: approved for its landed head before the merge.
+    seed_approval(&state, "ap-1", &heads[0], 1, before);
+    // #2: an approval for an OLDER head before the merge, and one for
+    // the landed head only after it.
+    let old_head = "1111111111111111111111111111111111111111";
+    seed_approval(&state, "ap-2-old", old_head, 2, before);
+    seed_approval(&state, "ap-2-late", &heads[1], 2, after);
+    // …and one for the landed head before the merge, but scoped to
+    // another repository: out of scope, never binds.
+    seed_approval_in(&state, "other/z", "ap-2-foreign", &heads[1], 2, before);
+    // #3: approved, then explicitly revoked before the merge.
+    seed_approval(&state, "ap-3", &heads[2], 3, before);
+    let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+    assert!(store
+        .revoke_approval(
+            "ap-3",
+            "operator in chat",
+            "head moved",
+            "operator-connection"
+        )
+        .unwrap());
+    // The PR #84 shape: the approval phrase for #2's landed head sits
+    // only in a queue message that was then CANCELLED.
+    let cwd = dir.path().to_string_lossy().to_string();
+    store
+        .register_agent(&NewAgent {
+            alias: "ops-1",
+            provider: "inbox",
+            endpoint_kind: "inbox",
+            role: "worker",
+            cwd: &cwd,
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    store
+        .enqueue(
+            "ops-1",
+            &format!("OPERATOR APPROVED #2 at {}", heads[1]),
+            None,
+            "m-approval",
+            "user",
+        )
+        .unwrap();
+    store
+        .cancel("m-approval", "operator", Some("competing executor"))
+        .unwrap();
+    drop(store);
+    set_approval_at(&state, "approval_revoked", "ap-3", before + 60.0);
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--json"]);
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{j}");
+    let row = |pr: u64| {
+        j["merges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["pr"].as_u64() == Some(pr))
+            .unwrap()
+            .clone()
+    };
+    let r1 = row(1);
+    // Bound, but only an operator CLAIM until CAD-280.
+    assert_eq!(r1["approval"]["state"], "operator-claimed", "{r1}");
+    assert_eq!(r1["approval"]["verified"], false, "{r1}");
+    assert_eq!(r1["approval"]["note"], "unverified until CAD-280", "{r1}");
+    assert_eq!(r1["approval"]["required"], true, "{r1}");
+    assert_eq!(r1["approval"]["before_merge"], true, "{r1}");
+    assert_eq!(r1["approval"]["record"]["id"], "ap-1", "{r1}");
+    assert_eq!(
+        r1["approval"]["record"]["source"], "operator in chat",
+        "{r1}"
+    );
+    assert_eq!(r1["approval"]["record"]["head_sha"], heads[0], "{r1}");
+    assert_eq!(r1["approval"]["record"]["scope"]["pr"], 1, "{r1}");
+    assert_eq!(
+        r1["approval"]["record"]["recorded_via"], "operator-connection",
+        "{r1}"
+    );
+    assert_eq!(r1["flags"], json!([]), "{r1}");
+
+    let r2 = row(2);
+    assert_eq!(r2["approval"]["state"], "missing", "{r2}");
+    assert_eq!(r2["approval"]["before_merge"], false, "{r2}");
+    assert!(
+        r2["approval"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("post-merge"),
+        "{r2}"
+    );
+    assert_eq!(
+        r2["approval"]["other_heads"][0]["head_sha"], old_head,
+        "{r2}"
+    );
+    assert_eq!(r2["flags"], json!(["approval-missing"]), "{r2}");
+
+    let r3 = row(3);
+    assert_eq!(r3["approval"]["state"], "revoked", "{r3}");
+    assert_eq!(r3["approval"]["revocation"]["reason"], "head moved", "{r3}");
+    assert_eq!(r3["approval"]["revocation"]["before_merge"], true, "{r3}");
+    assert_eq!(r3["flags"], json!(["approval-revoked"]), "{r3}");
+    assert_eq!(j["summary"]["approvals"]["operator_claimed"], 1, "{j}");
+    assert_eq!(j["summary"]["approvals"]["verified"], false, "{j}");
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("approval operator-claimed · id ap-1 · source \"operator in chat\""),
+        "{text}"
+    );
+    assert!(text.contains("unverified until CAD-280"), "{text}");
+    assert!(
+        text.contains("1 approval(s) operator-claimed (unverified until CAD-280)"),
+        "{text}"
+    );
+    assert!(text.contains("(before merge)"), "{text}");
+    assert!(text.contains("FLAG[approval-revoked]"), "{text}");
+
+    // With no daemon store the approval question is unanswerable:
+    // `unknown`, reported with its reason, never flagged.
+    let bare = dir.path().join("bare-state");
+    std::fs::create_dir_all(&bare).unwrap();
+    let out = run_audit(&bare, &pm, &repo, &notes, &report, &["--json"]);
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{j}");
+    for pr in 1..=3u64 {
+        let m = j["merges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["pr"].as_u64() == Some(pr))
+            .unwrap();
+        assert_eq!(m["approval"]["state"], "unknown", "{m}");
+        assert!(
+            m["approval"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no daemon store"),
+            "{m}"
+        );
+        assert_eq!(m["flags"], json!([]), "{m}");
+    }
+}
+
+/// CAD-217: only an operator connection records or revokes approval
+/// evidence. A pane (and every process descended from it — the RPC
+/// and the `cadence audit approve` CLI alike) is refused, as is an
+/// identity-shaped request field; the operator's writes dedupe and a
+/// conflicting reuse of an id is refused.
+#[test]
+fn audit_approval_record_is_operator_only() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&d, "pane-1", pane.pid());
+    let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let params = json!({"id": "ap-7", "source": "operator in chat",
+                        "head": head, "repo": "x/y", "pr": 7});
+
+    let r = pane.rpc(&d.state, "approval_record", params.clone());
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("operator action") && msg.contains("pane-1"),
+        "{r}"
+    );
+    let (rc, out) = pane.cadence(
+        &d.state,
+        &format!("audit approve --pr 7 --head {head} --source op --repo x/y"),
+    );
+    assert_ne!(rc, 0, "{out}");
+    assert!(out.contains("operator action"), "{out}");
+
+    let mut forged = params.clone();
+    forged["by"] = json!("operator");
+    let err = d.rpc("approval_record", forged).unwrap_err();
+    assert!(err.to_string().contains("'by'"), "{err}");
+
+    let r = d.rpc("approval_record", params.clone()).unwrap();
+    assert_eq!(r["state"], "recorded", "{r}");
+    assert_eq!(r["duplicate"], false, "{r}");
+    assert_eq!(r["recorded_via"], "operator-connection", "{r}");
+    let r = d.rpc("approval_record", params.clone()).unwrap();
+    assert_eq!(r["duplicate"], true, "{r}");
+    let mut other = params.clone();
+    other["head"] = json!("0123456789012345678901234567890123456789");
+    let err = d.rpc("approval_record", other).unwrap_err();
+    assert!(err.to_string().contains("different evidence"), "{err}");
+    let mut short = params.clone();
+    short["id"] = json!("ap-short");
+    short["head"] = json!("abcdefa");
+    assert!(d.rpc("approval_record", short).is_err());
+
+    let revoke = json!({"id": "ap-7", "source": "operator", "reason": "moved"});
+    let r = pane.rpc(&d.state, "approval_revoke", revoke.clone());
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator action"),
+        "{r}"
+    );
+    let r = d.rpc("approval_revoke", revoke).unwrap();
+    assert_eq!(r["state"], "revoked", "{r}");
+    // A revoked id is never re-recorded — the operator is told why.
+    let err = d.rpc("approval_record", params.clone()).unwrap_err();
+    assert!(
+        err.to_string().contains("was revoked") && err.to_string().contains("--id"),
+        "{err}"
+    );
+
+    // Revoke → re-approve with the DEFAULT id: a fresh record under
+    // `<base>-2`, never a silent duplicate of the revoked one.
+    let auto = json!({"source": "operator in chat", "head": head,
+                      "repo": "x/y", "pr": 9});
+    let r = d.rpc("approval_record", auto.clone()).unwrap();
+    assert_eq!(r["approval_id"], "merge-pr9-abcdefabcdef", "{r}");
+    assert_eq!(r["duplicate"], false, "{r}");
+    let r = d.rpc("approval_record", auto.clone()).unwrap();
+    assert_eq!(r["duplicate"], true, "{r}");
+    let r = d
+        .rpc(
+            "approval_revoke",
+            json!({"id": "merge-pr9-abcdefabcdef", "source": "operator", "reason": "moved"}),
+        )
+        .unwrap();
+    assert_eq!(r["state"], "revoked", "{r}");
+    let r = d.rpc("approval_record", auto.clone()).unwrap();
+    assert_eq!(r["approval_id"], "merge-pr9-abcdefabcdef-2", "{r}");
+    assert_eq!(r["duplicate"], false, "{r}");
+    let r = d.rpc("approval_record", auto).unwrap();
+    assert_eq!(r["approval_id"], "merge-pr9-abcdefabcdef-2", "{r}");
+    assert_eq!(r["duplicate"], true, "{r}");
+
+    // The operator's CLI cannot be exercised as a child here: the test
+    // daemon runs in this process, so every child descends from the
+    // daemon and `operator_proof` refuses it (the CLI's argument
+    // shaping is unit-tested in main.rs). A second operator record:
+    let mut second = params.clone();
+    second["id"] = json!("ap-8");
+    second["pr"] = json!(8);
+    let r = d.rpc("approval_record", second).unwrap();
+    assert_eq!(r["duplicate"], false, "{r}");
+
+    // Exactly the operator's writes reached the approval stream.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let kinds: Vec<String> = conn
+        .prepare("SELECT kind FROM events WHERE alias='audit:approvals' ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "approval_recorded",
+            "approval_revoked",
+            "approval_recorded",
+            "approval_revoked",
+            "approval_recorded",
+            "approval_recorded"
+        ]
+    );
+}
+
+// ---------- CAD-207: the digest discriminates -------------------------
+
+/// The live CAD-207 run: 36 merges all pushed through ONE GitHub
+/// account (`cc-syntax`), 34 of them with a `qa-verdict` status that
+/// same account posted, and 2 (#43, #50) with no passing verdict on
+/// the landed head. The shared identity is reported once as a summary
+/// line; only the two real findings flag.
+#[test]
+fn audit_digest_reports_shared_identity_once() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    git_repo(&repo);
+    let mut prs = Vec::new();
+    let mut statuses = serde_json::Map::new();
+    for n in 15..=50u64 {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q"])
+            .args(["--allow-empty", "-m", &format!("work {n} (#{n})")])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let head = format!("{n:040x}");
+        prs.push(
+            json!({"number": n, "title": format!("work {n}"), "headRefOid": head,
+                        "mergedBy": {"login": "cc-syntax"},
+                        "mergedAt": "2026-09-20T12:00:00Z"}),
+        );
+        if n != 43 && n != 50 {
+            statuses.insert(
+                head,
+                json!({"statuses": [{"context": "qa-verdict", "state": "success",
+                                     "created_at": "2026-09-20T11:00:00Z",
+                                     "creator": {"login": "cc-syntax"}}]}),
+            );
+        }
+    }
+    let report = dir.path().join("report.json");
+    let write_report = |statuses: &serde_json::Map<String, Value>| {
+        std::fs::write(
+            &report,
+            json!({"prs": prs, "statuses": statuses}).to_string(),
+        )
+        .unwrap();
+    };
+    write_report(&statuses);
+    let notes = dir.path().join("notes");
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    for d in [&notes, &state, &pm] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    let flagged: Vec<&str> = text.lines().filter(|l| l.contains("FLAG[")).collect();
+    assert_eq!(
+        flagged,
+        [
+            "#50 work 50  FLAG[no-passing-verdict]",
+            "#43 work 43  FLAG[no-passing-verdict]"
+        ],
+        "{text}"
+    );
+    assert_eq!(text.matches("reviewer==merger").count(), 1, "{text}");
+    assert!(
+        text.contains("structural: 34 merge(s) share GitHub identity cc-syntax"),
+        "{text}"
+    );
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--json"]);
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(j["summary"]["flagged"], 2, "{j}");
+    let st = &j["summary"]["structural"];
+    assert_eq!(st.as_array().unwrap().len(), 1, "{j}");
+    assert_eq!(st[0]["code"], "shared-github-identity", "{j}");
+    assert_eq!(st[0]["identity"], "cc-syntax", "{j}");
+    assert_eq!(st[0]["rows"], 34, "{j}");
+    let structural_rows = j["merges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["structural"] == json!(["reviewer==merger"]))
+        .count();
+    assert_eq!(structural_rows, 34, "{j}");
+
+    // A clean run against the shared-token fleet exits 0: pass the
+    // two real findings and nothing is left to flag.
+    for n in [43u64, 50] {
+        statuses.insert(
+            format!("{n:040x}"),
+            json!({"statuses": [{"context": "qa-verdict", "state": "success",
+                                 "created_at": "2026-09-20T11:00:00Z",
+                                 "creator": {"login": "cc-syntax"}}]}),
+        );
+    }
+    write_report(&statuses);
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!text.contains("FLAG["), "{text}");
+    assert!(
+        text.contains("structural: 36 merge(s) share GitHub identity cc-syntax"),
+        "{text}"
+    );
+}
+
+/// CAD-207 review: "one shared identity" is decided over every merged
+/// PR the fetch returned, not the rendered window. The fleet has a
+/// separate QA identity (`qa-bot` posted #1's status); a `--limit 1`
+/// window holding only #3 — posted and merged by `ops-1` — must still
+/// flag the self-review instead of calling it structural.
+#[test]
+fn audit_digest_decides_identity_over_the_fleet_not_the_window() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    let mut report_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    let status = |login: &str| {
+        json!({"statuses":[{"context":"qa-verdict","state":"SUCCESS",
+                            "created_at":"2026-09-20T11:59:30Z",
+                            "creator":{"login":login}}]})
+    };
+    report_json["statuses"][heads[0].clone()] = status("qa-bot");
+    report_json["statuses"][heads[2].clone()] = status("ops-1");
+    std::fs::write(&report, report_json.to_string()).unwrap();
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--limit", "1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("#3 work 3"), "{text}");
+    assert!(text.contains("FLAG[reviewer==merger]"), "{text}");
+    assert!(!text.contains("structural:"), "{text}");
+    assert_eq!(out.status.code(), Some(1), "{text}");
 }
 
 // ---------- CAD-113: build slots ----------
@@ -29190,4 +29914,343 @@ fn holder_migrates_through_daemon_start_without_a_test_override() {
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, 12);
+}
+
+// ---- CAD-96: idle auto-stop (default ON in production, pinned here) ----
+
+/// A daemon with idle auto-stop pinned to `setting` and its clock at
+/// wall time plus the returned offset (seconds) — a test ages every
+/// agent by moving the offset, never by sleeping.
+fn auto_stop_daemon(
+    setting: daemon::AutoStopSetting,
+) -> (TestDaemon, std::sync::Arc<std::sync::atomic::AtomicI64>) {
+    let offset = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let o = std::sync::Arc::clone(&offset);
+    let d = TestDaemon::start_opts(daemon::ServeOptions {
+        auto_stop: Some(setting),
+        auto_stop_clock: Some(std::sync::Arc::new(move || {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64()
+                + o.load(std::sync::atomic::Ordering::SeqCst) as f64
+        })),
+        ..daemon_opts()
+    });
+    (d, offset)
+}
+
+fn auto_stop_status(d: &TestDaemon) -> Value {
+    d.rpc("health", json!({})).unwrap()["agent_auto_stop"].clone()
+}
+
+/// Wait for the timer to finish a sweep whose clock reading falls in
+/// `window` (clock seconds) — `last_kept` is that sweep's.
+fn wait_auto_stop_check(d: &TestDaemon, window: std::ops::Range<f64>) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = auto_stop_status(d);
+        if status["last_sweep_at"]
+            .as_f64()
+            .is_some_and(|at| window.contains(&at))
+        {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "no auto-stop check: {status}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Wait until `alias` is stopped AND its `agent_auto_stopped` record
+/// has landed — the stop path writes `stopped` first, the timer records
+/// the event once that path returns.
+fn wait_auto_stopped(d: &TestDaemon, alias: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let agent = d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"].clone();
+        if agent["state"] == "stopped" && agent["state_label"].is_string() {
+            return agent;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{alias} never auto-stopped: {agent}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The timer's status once its sweep has published a stop.
+fn wait_auto_stop_published(d: &TestDaemon) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = auto_stop_status(d);
+        if status["stopped_total"].as_u64().unwrap_or(0) > 0 {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "no stop published: {status}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wall_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+#[test]
+fn auto_stop_idle_agent_stops_with_event_label_and_resumes() {
+    let (d, offset) = auto_stop_daemon(daemon::AutoStopSetting::idle_after(3600));
+    d.register_inbox("pm");
+    register_fake_opts(&d, "w1", json!({"upstream": "pm"}));
+    d.wait_agent("w1", "idle", 20);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "hello", "message": "m1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m1", &["completed"], 20);
+    let status = auto_stop_status(&d);
+    assert_eq!(status["enabled"], true, "{status}");
+    assert_eq!(status["idle_secs"], 3600, "{status}");
+
+    // Two hours on the timer's clock: the next check stops w1.
+    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    let agent = wait_auto_stopped(&d, "w1");
+    assert_eq!(agent["enabled"], false, "{agent}");
+    assert_eq!(agent["resumable"], true, "{agent}");
+    let label = agent["state_label"].as_str().unwrap();
+    assert!(label.starts_with("stopped (auto, idle "), "{label}");
+    assert_eq!(agent["auto_stopped"]["bound_secs"], 3600, "{agent}");
+    assert_eq!(
+        agent["auto_stopped"]["resume"], "cadence agent resume w1",
+        "{agent}"
+    );
+    // Recorded on w1's own stream, after the normal stop path's own
+    // `stop_requested`.
+    let events = d
+        .rpc("agent_events", json!({"alias": "w1", "after": 0}))
+        .unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
+    let stop_at = kinds.iter().position(|k| *k == "stop_requested").unwrap();
+    let auto_at = kinds
+        .iter()
+        .position(|k| *k == "agent_auto_stopped")
+        .unwrap();
+    assert!(stop_at < auto_at, "{kinds:?}");
+    let payload = &events[auto_at]["payload"];
+    assert!(
+        payload["idle_secs"].as_f64().unwrap() >= 7000.0,
+        "{payload}"
+    );
+    assert_eq!(payload["bound_secs"], 3600, "{payload}");
+    assert_eq!(payload["bound_source"], "[host] auto_stop_idle_secs");
+    assert!(payload["reason"]
+        .as_str()
+        .unwrap()
+        .contains("no queued, running, awaiting-report or unknown message"));
+    let status = wait_auto_stop_published(&d);
+    assert_eq!(status["last_stopped"], json!(["w1"]), "{status}");
+    assert_eq!(status["stopped_total"], 1, "{status}");
+    // agent list and `cadence status` both render it distinctly.
+    let list = d.rpc("agent_list", json!({})).unwrap();
+    let row = list["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "w1")
+        .unwrap()
+        .clone();
+    assert_eq!(row["state_label"], agent["state_label"], "{row}");
+    let pm_dir = TempDir::new().unwrap();
+    let envs = [("CADENCE_PM_DIR", pm_dir.path())];
+    let view = status_json(&d.state, &[], &envs);
+    let srow = view["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "w1")
+        .unwrap()
+        .clone();
+    assert_eq!(srow["state"], "stopped", "{srow}");
+    assert_eq!(srow["state_label"], agent["state_label"], "{srow}");
+    let table = status_table(&d.state, &envs);
+    assert!(table.contains(label), "{table}");
+
+    // Resume brings it back on its saved thread; the marker is gone.
+    let out = d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
+    assert_eq!(out["state"], "starting", "{out}");
+    let agent = d.wait_agent("w1", "idle", 20);
+    assert!(agent["auto_stopped"].is_null(), "{agent}");
+    assert!(agent["state_label"].is_null(), "{agent}");
+    assert_eq!(agent["thread_id"], "fake-thread-w1", "{agent}");
+    // The resume's `ready` restarted the idle clock: a check a minute
+    // after it (the clock stepped back from +2h re-arms it) keeps w1.
+    offset.store(60, std::sync::atomic::Ordering::SeqCst);
+    let now = wall_secs();
+    let status = wait_auto_stop_check(&d, now..now + 600.0);
+    let why = status["last_kept"]["w1"].as_str().unwrap();
+    assert!(why.starts_with("idle "), "{status}");
+    assert_eq!(d.wait_agent("w1", "idle", 5)["state"], "idle");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "again", "message": "m2"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "m2", &["completed"], 20);
+}
+
+#[test]
+fn auto_stop_keeps_pm_inbox_opted_out_and_busy_agents() {
+    let (d, offset) = auto_stop_daemon(daemon::AutoStopSetting::idle_after(3600));
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": cwd, "role": "pm"}),
+    )
+    .unwrap();
+    register_inbox_with(&d, "box", json!({"upstream": "pm"}));
+    for alias in ["w-opt", "w-busy", "w-idle"] {
+        register_fake_opts(&d, alias, json!({"upstream": "pm"}));
+    }
+    for alias in ["pm", "w-opt", "w-busy", "w-idle"] {
+        d.wait_agent(alias, "idle", 20);
+    }
+    // Per-agent opt-out rides the ordinary `agent set` allowlist.
+    d.rpc(
+        "agent_set",
+        json!({"alias": "w-opt", "patch": {"auto_stop": "off"}}),
+    )
+    .unwrap();
+    let err = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "w-opt", "patch": {"auto_stop": "on"}}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("accepts \"off\""), "{err}");
+    let err = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "w-opt", "patch": {"auto_stop_idle_secs": "1h"}}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("non-negative integer"), "{err}");
+    let err = d
+        .rpc(
+            "agent_set",
+            json!({"alias": "box", "patch": {"auto_stop": "off"}}),
+        )
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("only applies to endpoints with an actor"));
+    // A turn held open: busy for the whole check.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w-busy", "text": "SLEEP:30", "message": "hold"}),
+    )
+    .unwrap();
+    d.wait_message("w-busy", "hold", &["running"], 20);
+
+    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    // The control proves a check ran with everyone past the bound.
+    wait_auto_stopped(&d, "w-idle");
+    let status = wait_auto_stop_published(&d);
+    assert_eq!(status["last_stopped"], json!(["w-idle"]), "{status}");
+    let kept = &status["last_kept"];
+    assert_eq!(kept["pm"], "group root (role pm)", "{status}");
+    assert!(kept["box"].is_null(), "an inbox has no actor: {status}");
+    assert_eq!(
+        kept["w-opt"], "auto-stop off (agent auto_stop=off)",
+        "{status}"
+    );
+    assert!(
+        kept["w-busy"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("state ") || r.starts_with("busy:")),
+        "{status}"
+    );
+    for alias in ["pm", "w-opt"] {
+        let agent = d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"].clone();
+        assert_eq!(agent["state"], "idle", "{alias}: {agent}");
+        assert!(agent["auto_stopped"].is_null(), "{alias}: {agent}");
+    }
+    assert_eq!(d.message_state("w-busy", "hold"), "running");
+    let inbox = d.rpc("agent_show", json!({"alias": "box"})).unwrap()["agent"].clone();
+    assert_eq!(inbox["state"], "idle", "{inbox}");
+    // No auto-stop event anywhere but on the control.
+    for alias in ["pm", "box", "w-opt", "w-busy"] {
+        let events = d
+            .rpc("agent_events", json!({"alias": alias, "after": 0}))
+            .unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            !events.iter().any(|e| e["kind"] == "agent_auto_stopped"),
+            "{alias}: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn auto_stop_pinned_off_in_test_daemons_and_reported() {
+    let d = TestDaemon::start();
+    let status = auto_stop_status(&d);
+    assert_eq!(status["enabled"], false, "{status}");
+    assert_eq!(status["default_secs"], 3600, "{status}");
+    assert!(status["attach_detection"]
+        .as_str()
+        .unwrap()
+        .contains("not detectable"));
+}
+
+#[test]
+fn auto_stop_keeps_pty_pane_with_attached_client_then_stops_it() {
+    let (d, offset) = auto_stop_daemon(daemon::AutoStopSetting::idle_after(3600));
+    let mock = d.mock_stub();
+    d.register_inbox("pm");
+    d.register_stub("s1", json!({"auto_ready": "verified", "upstream": "pm"}));
+    let agent = d.wait_agent("s1", "idle", 20);
+    assert!(agent["thread_id"].is_string(), "{agent}");
+    let clients = d.stub_pane_file(&mock, "s1", "clients");
+    atomic_write(clients.clone(), "/dev/pts/7\n");
+
+    offset.store(7200, std::sync::atomic::Ordering::SeqCst);
+    let now = wall_secs();
+    let status = wait_auto_stop_check(&d, now + 7000.0..now + 8000.0);
+    assert_eq!(
+        status["last_kept"]["s1"], "1 terminal client(s) attached",
+        "{status}"
+    );
+    assert_eq!(d.wait_agent("s1", "idle", 5)["state"], "idle");
+
+    // Detached: the next check (a minute later on the timer's clock)
+    // stops it through the normal pty stop path.
+    std::fs::remove_file(&clients).unwrap();
+    offset.store(7300, std::sync::atomic::Ordering::SeqCst);
+    let agent = wait_auto_stopped(&d, "s1");
+    assert!(
+        agent["state_label"]
+            .as_str()
+            .unwrap()
+            .starts_with("stopped (auto, idle "),
+        "{agent}"
+    );
+    assert_eq!(agent["resumable"], true, "{agent}");
+    let calls = std::fs::read_to_string(
+        mock.dir
+            .join("tmux-state")
+            .join(socket_for(&d.state))
+            .join("calls.log"),
+    )
+    .unwrap();
+    assert!(calls.contains("list-clients -t =s1"), "{calls}");
+    assert!(calls.contains("kill-session -t s1"), "{calls}");
 }

@@ -837,10 +837,16 @@ enum Commands {
     },
     /// Reconstruct every merge on the default branch from stored
     /// data — verdict notes, commit statuses, tracker folders, daemon
-    /// events — and flag `reviewer==merger` and merges with no passing
-    /// verdict on the exact landed head. Read-only; exits non-zero
-    /// when any row is flagged. See docs/AUDIT.md.
+    /// events, operator approval records — and flag merges with no
+    /// passing verdict on the exact landed head, human-class merges with
+    /// no operator approval for that head, and `reviewer==merger` where
+    /// the fleet's identities differ. Read-only; exits non-zero when any
+    /// row is flagged. `audit approve`/`audit revoke` record operator
+    /// approval evidence (operator connection only). See docs/AUDIT.md.
+    #[command(args_conflicts_with_subcommands = true)]
     Audit {
+        #[command(subcommand)]
+        action: Option<AuditAction>,
         /// Drop merges older than this: 24h, 7d, YYYY-MM-DD or epoch.
         #[arg(long)]
         since: Option<String>,
@@ -1255,7 +1261,10 @@ enum DaemonAction {
     },
     /// Report daemon health, including `agent_gc_timer`: whether the
     /// opt-in agent-gc timer is on (pm.yaml `[host]
-    /// agent_gc_older_than_secs`), its effective age, and its last sweep.
+    /// agent_gc_older_than_secs`), its effective age, and its last sweep;
+    /// and `agent_auto_stop`: the idle auto-stop bound (default ON, 3600s;
+    /// `[host] auto_stop_idle_secs`, `auto_stop_idle_secs_by_provider`),
+    /// what it last stopped, and why each live agent was kept.
     Status,
     /// Ask the daemon to shut down gracefully, then wait until the
     /// process has actually exited and released the state-dir lock
@@ -1596,6 +1605,13 @@ enum AgentAction {
     /// `agent set <alias> auto_ready=verified` opts a live agent into
     /// daemon-verified readiness.
     ///
+    /// `agent set <alias> auto_stop=off` opts an agent out of the
+    /// daemon's idle auto-stop (default ON: an agent with nothing queued,
+    /// running, awaiting a report or unknown for 60 minutes is stopped,
+    /// resumably); `auto_stop_idle_secs=<n>` sets this agent's own bound
+    /// (0 = off). A bare `auto_stop` / `auto_stop_idle_secs` removes the
+    /// override.
+    ///
     /// `--next-launch` stores launch params (`model`, `effort`) for the
     /// agent's next open instead — the live process is untouched; `agent
     /// stop` + `agent resume` picks them up.
@@ -1875,6 +1891,50 @@ enum MessageAction {
         /// Why — recorded on the event, result and the routed notice.
         #[arg(long)]
         reason: Option<String>,
+    },
+}
+
+/// Operator approval evidence for `cadence audit` (CAD-217). Both
+/// verbs go through the daemon, which refuses any agent connection;
+/// the records grant nothing — `cadence audit` binds them to merges.
+#[derive(Subcommand)]
+enum AuditAction {
+    /// Record that the operator approved `--action` (default merge) on
+    /// the exact full `--head` of PR `--pr`.
+    Approve {
+        /// PR number the approval covers.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head SHA the approval names — an approval never
+        /// carries over to a later head.
+        #[arg(long)]
+        head: String,
+        /// Who approved and where (e.g. "chris in chat 22:33Z"). A claim
+        /// the record carries; never `user` or `daemon`.
+        #[arg(long)]
+        source: String,
+        /// `owner/name` (default: the cwd checkout's github.com origin).
+        #[arg(long)]
+        repo: Option<String>,
+        /// The approved action.
+        #[arg(long, default_value = "merge")]
+        action: String,
+        /// Stable id for retries and a later revoke (default
+        /// `<action>-pr<N>-<head[..12]>`, then `-2`, `-3`, … once an
+        /// earlier default was revoked). A revoked id is never reused.
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// Withdraw an approval id. Cancelling a message never does this.
+    Revoke {
+        /// The approval id `audit approve` recorded.
+        id: String,
+        /// Who revoked and where.
+        #[arg(long)]
+        source: String,
+        /// Why the approval no longer holds.
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -2530,6 +2590,9 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
             "provider": provider,
             "endpoint_kind": kind,
             "state": a["state"].as_str().unwrap_or_default(),
+            // CAD-96: `stopped (auto, idle 72m)` for an idle auto-stop.
+            "state_label": a["state_label"],
+            "auto_stopped": a["auto_stopped"],
             "dead": a["dead"].as_bool().unwrap_or(false),
             "resumable": a["resumable"].as_bool().unwrap_or(false),
             "running": running,
@@ -2613,7 +2676,11 @@ fn print_status_table(view: &Value) {
                     a["provider"].as_str().unwrap_or_default(),
                     a["endpoint_kind"].as_str().unwrap_or_default()
                 ),
-                a["state"].as_str().unwrap_or_default().to_string(),
+                a["state_label"]
+                    .as_str()
+                    .or(a["state"].as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 running,
                 a["queued"].as_i64().unwrap_or(0).to_string(),
                 a["unknown"].as_i64().unwrap_or(0).to_string(),
@@ -2986,6 +3053,49 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
     }
 }
 
+/// `cadence audit approve|revoke` — the operator's approval-evidence
+/// writers (CAD-217). The daemon decides authority from the connection;
+/// nothing here names the caller.
+fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Result<i32> {
+    let result = match action {
+        AuditAction::Approve {
+            pr,
+            head,
+            source,
+            repo,
+            action,
+            id,
+        } => {
+            let head = head.trim().to_ascii_lowercase();
+            let repo = match repo {
+                Some(r) => r,
+                None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(
+                    || {
+                        Error::rejected(
+                            "no github.com origin remote in the cwd — pass --repo owner/name",
+                        )
+                    },
+                )?,
+            };
+            // No `--id`: the daemon picks the default, counting past a
+            // revoked one so a re-approval is a fresh record.
+            let mut params = json!({"source": source, "action": action,
+                                    "head": head, "repo": repo, "pr": pr});
+            if let Some(id) = id {
+                params["id"] = json!(id);
+            }
+            client::rpc(state_dir, "approval_record", params)?
+        }
+        AuditAction::Revoke { id, source, reason } => client::rpc(
+            state_dir,
+            "approval_revoke",
+            json!({"id": id, "source": source, "reason": reason}),
+        )?,
+    };
+    print_json(&result);
+    Ok(0)
+}
+
 /// `cadence overview` — the needs-me list, deploy drift and per-project
 /// summary, rendered as an aligned list (or the raw payload with
 /// `--json`). Read-only: every source degrades rather than failing the
@@ -3035,52 +3145,85 @@ fn fmt_age(secs: i64) -> String {
     }
 }
 
+/// `needs_me` sections in render order, keyed by the server-resolved
+/// `audience` (CAD-253) — the CLI never maps kinds to audiences.
+const NEED_SECTIONS: [(&str, &str); 4] = [
+    ("operator", "needs your decision"),
+    ("team", "team handling"),
+    ("dependency", "waiting on dependency"),
+    ("info", "information"),
+];
+
 /// Aligned-list rendering of the overview payload — the TTY default.
 fn print_overview(view: &Value) {
     let needs = view["needs_me"].as_array().cloned().unwrap_or_default();
     println!("NEEDS ME");
-    if needs.is_empty() {
-        println!("  nothing waiting on a human");
-    } else {
-        let mut widths = [0usize; 4];
-        let mut rows = Vec::new();
-        for n in &needs {
-            let title = n["title"].as_str().unwrap_or_default();
-            let title: String = title.chars().take(52).collect();
-            // One row per subject: every cause, most severe first.
-            let causes: Vec<&str> = n["causes"]
-                .as_array()
-                .map(|cs| cs.iter().filter_map(|c| c["cause"].as_str()).collect())
-                .unwrap_or_default();
-            let kind = if causes.is_empty() {
-                n["kind"].as_str().unwrap_or_default().to_string()
-            } else {
-                causes.join("+")
-            };
-            let row = [
-                kind,
-                fmt_age(n["age"].as_i64().unwrap_or(0)),
-                n["project"].as_str().unwrap_or_default().to_string(),
-                title,
-                n["command"].as_str().unwrap_or_default().to_string(),
-            ];
-            for (i, c) in row[..4].iter().enumerate() {
-                widths[i] = widths[i].max(c.chars().count());
-            }
-            rows.push(row);
+    let mut widths = [0usize; 5];
+    let mut rows: Vec<(String, [String; 6])> = Vec::new();
+    for n in &needs {
+        let title = n["title"].as_str().unwrap_or_default();
+        let title: String = title.chars().take(52).collect();
+        // One row per subject: every cause, most severe first.
+        let causes: Vec<&str> = n["causes"]
+            .as_array()
+            .map(|cs| cs.iter().filter_map(|c| c["cause"].as_str()).collect())
+            .unwrap_or_default();
+        let kind = if causes.is_empty() {
+            n["kind"].as_str().unwrap_or_default().to_string()
+        } else {
+            causes.join("+")
+        };
+        let row = [
+            kind,
+            fmt_age(n["age"].as_i64().unwrap_or(0)),
+            n["project"].as_str().unwrap_or_default().to_string(),
+            title,
+            n["audience_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            n["command"].as_str().unwrap_or_default().to_string(),
+        ];
+        for (i, c) in row[..5].iter().enumerate() {
+            widths[i] = widths[i].max(c.chars().count());
         }
-        for r in &rows {
+        // A row without a known `audience` (an older server) reads as
+        // team work.
+        let audience = n["audience"]
+            .as_str()
+            .filter(|a| NEED_SECTIONS.iter().any(|(k, _)| k == a))
+            .unwrap_or("team");
+        rows.push((audience.to_string(), row));
+    }
+    for (key, label) in NEED_SECTIONS {
+        let section: Vec<&[String; 6]> = rows
+            .iter()
+            .filter(|(a, _)| a == key)
+            .map(|(_, r)| r)
+            .collect();
+        // The decision section always renders — an empty one is an
+        // answer, not an omission.
+        if section.is_empty() && key != "operator" {
+            continue;
+        }
+        println!("  {label}");
+        if section.is_empty() {
+            println!("    nothing needs your decision");
+        }
+        for r in section {
             println!(
-                "  {:<w0$}  {:>w1$}  {:<w2$}  {:<w3$}  {}",
+                "    {:<w0$}  {:>w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {}",
                 r[0],
                 r[1],
                 r[2],
                 r[3],
                 r[4],
+                r[5],
                 w0 = widths[0],
                 w1 = widths[1],
                 w2 = widths[2],
                 w3 = widths[3],
+                w4 = widths[4],
             );
         }
     }
@@ -4835,6 +4978,11 @@ fn run() -> Result<i32> {
             }),
         },
         Commands::Audit {
+            action: Some(action),
+            ..
+        } => run_audit_evidence(&state_dir, action),
+        Commands::Audit {
+            action: None,
             since,
             class,
             project,
@@ -6838,6 +6986,48 @@ mod tests {
             "--permission-mode",
             "auto",
             "--bypass"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn audit_approve_and_revoke_parse() {
+        let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let cli = Cli::try_parse_from([
+            "cadence", "audit", "approve", "--pr", "84", "--head", head, "--source", "op",
+        ])
+        .unwrap();
+        let Commands::Audit {
+            action:
+                Some(AuditAction::Approve {
+                    pr,
+                    action,
+                    id,
+                    repo,
+                    ..
+                }),
+            ..
+        } = cli.command
+        else {
+            panic!("audit approve must parse to AuditAction::Approve");
+        };
+        assert_eq!((pr, action.as_str(), id, repo), (84, "merge", None, None));
+        assert!(
+            Cli::try_parse_from(["cadence", "audit", "revoke", "ap-1", "--source", "op"]).is_err()
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["cadence", "audit", "--json"])
+                .unwrap()
+                .command,
+            Commands::Audit {
+                action: None,
+                json: true,
+                ..
+            }
+        ));
+        // Report flags and evidence verbs never mix.
+        assert!(Cli::try_parse_from([
+            "cadence", "audit", "--json", "approve", "--pr", "1", "--head", head, "--source", "op",
         ])
         .is_err());
     }

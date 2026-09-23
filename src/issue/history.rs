@@ -587,6 +587,28 @@ fn subject_mentions(subject: &str, id: &str) -> bool {
     })
 }
 
+/// When the issue's `status:` line last changed (CAD-253): the author
+/// time of the newest tracker commit whose diff adds or removes a
+/// `status:` line in its `issue.md` — one bounded `git log`, no `show`
+/// walk like [`blame`]. A body line starting `status:` can only make
+/// the answer newer, never older. `None` without a git tracker, a
+/// matching commit, or within `timeout`.
+pub fn status_changed_at(
+    pm_dir: &Path,
+    project_key: &str,
+    id: &str,
+    timeout: Duration,
+) -> Option<i64> {
+    let rel = format!("{}/issue.md", issue_rel(project_key, id));
+    let out = git_bounded(
+        pm_dir,
+        &["log", "-1", "--format=%at", "-G", "^status:", "--", &rel],
+        timeout,
+    )
+    .ok()?;
+    out.trim().parse().ok()
+}
+
 /// `git log --all -n <scan>` under `dir` with a hard timeout — project
 /// repos are user paths, not ours, so a slow or locked repo must not
 /// stall a detail read. Returns the log text or a skip reason.

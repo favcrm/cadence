@@ -1,4 +1,11 @@
-import { agentsEmptyCopy, needGroupKey, needLabel, notesStatusSentence, shaCiLabel } from "./uxCopy";
+import {
+  agentsEmptyCopy,
+  NEED_SECTION_LABEL,
+  NEEDS_DECISION_EMPTY,
+  needLabel,
+  notesStatusSentence,
+  shaCiLabel,
+} from "./uxCopy";
 
 function equal(actual: unknown, expected: unknown): void {
   if (actual !== expected) {
@@ -18,14 +25,13 @@ if (agentsEmptyCopy("cadence").includes("registered")) {
 equal(needLabel("approval_menu"), "approval menu");
 equal(needLabel("not_a_kind"), "unknown / unclassified");
 equal(needLabel("approval"), "approval");
-equal(needGroupKey("approval_menu"), "team");
-equal(needGroupKey("approval"), "decision");
-equal(needGroupKey("not_a_kind"), "team");
 equal(needLabel("inbox_stale"), "stale inbox");
+// CAD-253: the audience comes from the server; the UI keeps only copy.
+equal(NEED_SECTION_LABEL.operator, "Needs your decision");
+equal(NEEDS_DECISION_EMPTY, "Nothing needs your decision");
 
 // CAD-267: main CI labels never launder a cancelled or missing SHA.
 equal(needLabel("ci_unverified"), "ci unverified");
-equal(needGroupKey("ci_unverified"), "team");
 const covered = "3".repeat(40);
 equal(shaCiLabel({ state: "passed" }), "passed");
 equal(shaCiLabel({ state: "cancelled", covered_by: covered }), "cancelled — covered by 3333333");

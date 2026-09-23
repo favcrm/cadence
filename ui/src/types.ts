@@ -211,10 +211,29 @@ export interface NeedsMe {
   /** What the row is about — rows sharing a subject are merged. */
   subject?: { kind: string; id: string };
   /** Every cause for the subject, most severe first (`kind` is the first). */
-  causes?: { cause: string; title: string; age: number; command: string }[];
+  causes?: {
+    cause: string;
+    title: string;
+    age: number;
+    command: string;
+    audience?: NeedAudience;
+    since?: number | null;
+  }[];
   /** Who must act on a stale inbox: its group root, or `operator`. */
   owner?: string;
+  /** Who the row is for, resolved server-side (CAD-253): a team row
+   *  escalates to `operator` when no live owner can act or it has waited
+   *  past 60 minutes. */
+  audience?: NeedAudience;
+  /** Why — e.g. `owner pm is dead`, `no owner`, `unhandled 74m`,
+   *  `owner pm can act`; null for dependency/info rows. */
+  audience_reason?: string | null;
+  /** Epoch secs when the row's condition began — the unhandled clock;
+   *  null when the kind has no reliable start (owner-only escalation). */
+  since?: number | null;
 }
+
+export type NeedAudience = "operator" | "team" | "dependency" | "info";
 
 /** Deploy drift — merged commits on the default branch past the
  *  running daemon's build commit. */
@@ -475,6 +494,8 @@ export interface Agent {
   silent_secs?: number;
   /** The daemon declared this running turn stalled. */
   stalled?: boolean;
+  /** CAD-96: `stopped (auto, idle 72m)` when the idle timer stopped it. */
+  state_label?: string | null;
   event_cursor?: number;
 }
 

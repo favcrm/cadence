@@ -36,7 +36,7 @@ Error kinds:
 
 | Method | Params | Result |
 |---|---|---|
-| `health` | — | `{state:"ready", protocol:1, capabilities:[...], agent_gc_timer:{enabled, older_than_secs, ...}}` |
+| `health` | — | `{state:"ready", protocol:1, capabilities:[...], agent_gc_timer:{enabled, older_than_secs, ...}, agent_auto_stop:{enabled, idle_secs, by_provider, last_stopped, last_kept, ...}}` |
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded), writes the clean-stop marker, then exits |
 | `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?, team_role?, model_policy?` | `{alias,state:"starting"|"idle",provider}`. `team_role` is model-lookup metadata (`ops` normalizes to `devops`); it does not change runtime `role`. `model_policy` is `inherit` (default) or `provider_default` |
 | `agent_list` | — | `{agents:[Agent+tasks+capabilities]}` — `tasks` names the alias's non-terminal task assignments; `capabilities` is the registry descriptor |
@@ -60,6 +60,8 @@ Error kinds:
 | `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit PTY ack/result; `sha` names the produced commit for task-attached kickoffs |
 | `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?, sha?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice. A `sha` on `completed` binds like a worker `--sha` |
 | `message_cancel` | `message, by?, reason?` | `{state:"cancelled", message}` — terminal exit from `queued`; never delivered. Refused for any other state (the error names it) and for task-bound deliveries (`task cancel` owns those) |
+| `approval_record` | `id?, source, head, repo, pr, action?` | `{state:"recorded", duplicate, approval_id, source, action, head_sha, scope:{repo,pr}, recorded_via}` — operator approval evidence for `cadence audit` (CAD-217); grants nothing. Refused from any connection that descends from a registered pane or enrolled endpoint or is not provably the operator (the `slot_reconcile` rule, `peer::operator_proof`) and when the request carries `by`/`operator`/`actor`/`alias`/`lane`/`pid`/`pane`/`recorded_via`. `head` must be the full SHA; an identical retry of a live approval answers `duplicate:true`; the same `id` naming other evidence, or a revoked `id`, is refused; with no `id` the daemon picks `<action>-pr<N>-<head[..12]>`, counting up (`-2`, …) past revoked or different records. `cadence audit approve`; see docs/AUDIT.md |
+| `approval_revoke` | `id, source, reason` | `{state:"revoked", duplicate, approval_id, source, reason, recorded_via}` — same operator rule; must name a recorded approval. Cancelling a message never revokes. `cadence audit revoke` |
 | `job_new` | `pm, spec, spec_sha256, job?, title?, issue?, repo?, base_ref?, max_revisions?, task_title?` | `{job, duplicate}` — bookkeeping only; creates the `open` job + default `<job>-t1` draft task |
 | `job_list` | `state?, all?` | `{jobs:[Job+task counts]}` |
 | `job_show` | `job` | `{job:{...,tasks:[Task+kickoff+attention+latest_verdict]}}` — lazily flags drift |
@@ -314,7 +316,42 @@ removal records one `agent_gc_removed` event on the `daemon` stream
 transaction that deletes the row. `health` (`cadence daemon status`)
 reports the effective setting as `agent_gc_timer` — `enabled`,
 `older_than_secs`, `configured_secs`, `warning`, and the last check and
-sweep. A fenced
+sweep.
+
+**Idle auto-stop (default ON, CAD-96).** The daemon stops — resumably,
+through the normal `agent stop` path, so pane-session reaping (CAD-201)
+and build-slot enrollment revocation apply — any agent whose actor has
+had nothing to do for the idle bound: default 3600s for every provider;
+`[host] auto_stop_idle_secs` (0 = off) and
+`auto_stop_idle_secs_by_provider` (`{claude: 7200, codex: 0}`) override
+it, and per agent `agent set <alias> auto_stop=off` opts out while
+`auto_stop_idle_secs=<n>` sets that agent's own bound (0 = off). A
+bound below 600s is raised to 600s with a warning. "Idle" means the
+agent is `idle` with no message in any state but completed, failed,
+interrupted or cancelled (queued, submitting, running, awaiting a
+report and `unknown` all keep it), and the newest durable activity —
+any message's created/started/completed stamp, or any event on its
+stream other than bookkeeping kinds (`quota_updated`, `params_updated`,
+`stop_requested`, `pane_tree_*`, …) — is older than the bound. Every
+endpoint open writes `ready`, so a resume or daemon restart starts the
+clock afresh. Exempt: group roots (role `pm`, no `upstream`, or named
+as another agent's upstream), inboxes, agents with no saved native
+thread (they could not resume), pty agents with a tmux client attached
+to their pane (`cadence attach`) or whose pane probe is not idle. A
+managed-ws codex TUI client is not detectable and does not exempt its
+agent. The check runs from the stall-watch tick at most once a minute,
+never on an actor loop, and re-reads the durable facts right before
+each stop. Each stop records `agent_auto_stopped` on the agent's stream
+(`idle_secs`, `idle_since`, `bound_secs`, `bound_source`, `reason`,
+`resume`); `agent_show`/`agent_list` then carry `auto_stopped` and
+`state_label` (`stopped (auto, idle 72m)`) until a manual stop or a
+resume supersedes it, and `cadence status` shows that label.
+`cadence agent resume <alias>` (or `cadence resume <group>`) brings the
+agent back. `health` reports `agent_auto_stop`: the effective bound,
+per-provider overrides, `warning`, the last check, `last_stopped`,
+`stopped_total`, and `last_kept` — why each live agent was kept.
+
+A fenced
 agent with no endpoint prints the `devin -r <session>` resume hint from
 its launch summary.
 
@@ -1498,6 +1535,12 @@ host:
   # agent-gc timer OFF. Set, it removes dead agent registry rows idle
   # longer than this (7-day floor), at most hourly. Records only:
   # frees no memory and no disk; removed agents cannot be resumed.
+  # auto_stop_idle_secs — the daemon stops (resumably) an agent idle
+  # this long with nothing queued/running/awaiting report/unknown.
+  # Unset = 3600 (ON); 0 = off; below 600 is raised to 600.
+  auto_stop_idle_secs: 3600
+  auto_stop_idle_secs_by_provider: # per provider; 0 = off for it
+    claude: 7200
 ```
 
 `cadence issue start`/`dispatch` write `<worktree>/.env` atomically
