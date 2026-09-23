@@ -44,6 +44,23 @@ const BUNDLE_DB: &str = "cadence.sqlite3";
 const BUNDLE_MANIFEST: &str = "manifest.json";
 const BUNDLE_REPO_MAP: &str = "repo-map.json";
 const BUNDLE_BRIEFINGS: &str = "briefings";
+/// Cap on any text member (manifest, repo map, one briefing), both when
+/// exporting and when reading a bundle back.
+pub const TEXT_MEMBER_MAX: u64 = 16 * 1024 * 1024;
+
+/// Free-text columns of the runtime database that can carry pasted
+/// credentials (message history, event payloads, instructions). Export
+/// scans each non-null value; columns a schema lacks are skipped.
+const DB_TEXT_COLUMNS: &[(&str, &[&str])] = &[
+    ("messages", &["body", "result", "error"]),
+    ("events", &["payload"]),
+    ("agents", &["instructions", "params", "error"]),
+    ("jobs", &["error"]),
+    ("tasks", &["acceptance", "error"]),
+    ("verdicts", &["evidence", "message"]),
+    ("monitors", &["error"]),
+    ("monitor_alerts", &["payload", "last_error"]),
+];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
@@ -88,9 +105,16 @@ pub fn backup(state_dir: &Path, dest: Option<&Path>, keep: usize) -> Result<Valu
     let manifest = copy_verified(&source, &dest, &file, now)?;
     let manifest_path = dest.join(format!("{stem}{MANIFEST_SUFFIX}"));
     write_new_file(&manifest_path, &manifest_bytes(&manifest)?)?;
-    let pruned = prune(&dest, keep)?;
+    let pruned = prune(&dest, keep, &file)?;
+    let copy = dest.join(&file);
+    if !copy.is_file() || !manifest_path.is_file() {
+        return Err(Error::internal(format!(
+            "backup {} vanished after pruning; nothing is backed up",
+            copy.display()
+        )));
+    }
     Ok(json!({
-        "backup": dest.join(&file),
+        "backup": copy,
         "manifest_path": manifest_path,
         "manifest": manifest,
         "verified": {"integrity_check": "ok", "schema_version": manifest.schema_version},
@@ -149,6 +173,9 @@ fn copy_verified(source: &Path, dir: &Path, file: &str, now: f64) -> Result<Mani
     let staged = (|| -> Result<(String, u64)> {
         conn.execute("VACUUM INTO ?1", [partial.to_string_lossy().as_ref()])?;
         drop(conn);
+        // VACUUM INTO creates the file with the process umask; a copy of
+        // the runtime database is as private as the database itself.
+        make_private(&partial)?;
         // The snapshot keeps the source's WAL flag in its header; a
         // standalone copy is a rollback-journal database.
         let copy = Connection::open(&partial)?;
@@ -234,6 +261,16 @@ fn schema_of(conn: &Connection) -> Result<Option<i64>> {
 /// Reopen `path` read-only, require `PRAGMA integrity_check` = `ok`,
 /// and return its schema version.
 pub fn verify_integrity(path: &Path) -> Result<Option<i64>> {
+    verify_integrity_inner(path).map_err(|e| match e {
+        Error::Rejected(_) => e,
+        other => Error::rejected(format!(
+            "{} failed verification ({other}); it is not a healthy SQLite database",
+            path.display()
+        )),
+    })
+}
+
+fn verify_integrity_inner(path: &Path) -> Result<Option<i64>> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -281,6 +318,12 @@ fn manifest_bytes(manifest: &Manifest) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn make_private(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| Error::internal(format!("chmod 0600 {}: {e}", path.display())))
+}
+
 fn create_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
@@ -295,6 +338,7 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .mode(0o600)
         .open(path)
         .map_err(|e| Error::rejected(format!("cannot create {}: {e}", path.display())))?;
@@ -327,22 +371,34 @@ fn plain_name(name: &str) -> bool {
     matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none()
 }
 
-/// Remove our oldest backups beyond `keep`. Returns the removed copies.
-fn prune(dir: &Path, keep: usize) -> Result<Vec<String>> {
-    let mut ours: Vec<(f64, String, Manifest)> = Vec::new();
+/// Remove our oldest backups beyond `keep`, never `current` (the copy
+/// just written: it always counts as one of the `keep`). Age comes from
+/// the UTC stamp in the file name, then the manifest's mtime — never
+/// from manifest content, which a stray or future-dated file could set.
+/// Returns the removed copies.
+fn prune(dir: &Path, keep: usize, current: &str) -> Result<Vec<String>> {
+    let mut ours: Vec<((String, std::time::SystemTime), String, Manifest)> = Vec::new();
     for entry in std::fs::read_dir(dir)?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if let Some(manifest) = our_manifest(dir, &name) {
-            ours.push((manifest.created_at_epoch, name, manifest));
+        let Some(manifest) = our_manifest(dir, &name) else {
+            continue;
+        };
+        if manifest.file == current {
+            continue;
         }
+        let stamp = manifest.file[FILE_PREFIX.len()..]
+            .chars()
+            .take(16)
+            .collect::<String>();
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        ours.push(((stamp, mtime), name, manifest));
     }
-    ours.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.1.cmp(&a.1))
-    });
+    ours.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     let mut pruned = Vec::new();
-    for (_, name, manifest) in ours.into_iter().skip(keep) {
+    for (_, name, manifest) in ours.into_iter().skip(keep.saturating_sub(1)) {
         let copy = dir.join(&manifest.file);
         let is_file = std::fs::symlink_metadata(&copy)
             .map(|m| m.is_file())
@@ -362,7 +418,12 @@ fn prune(dir: &Path, keep: usize) -> Result<Vec<String>> {
 /// copy, its manifest, `repo-map.json` and the briefings dir. Refuses
 /// before writing anything when a text member carries a blocking
 /// secret finding.
-pub fn export(state_dir: &Path, bundle: &Path, pm_dir: &Path) -> Result<Value> {
+pub fn export(
+    state_dir: &Path,
+    bundle: &Path,
+    pm_dir: &Path,
+    allow_unscanned_db: bool,
+) -> Result<Value> {
     if bundle.exists() {
         return Err(Error::rejected(format!(
             "{} already exists; export never overwrites. Pass a new --bundle path",
@@ -381,7 +442,19 @@ pub fn export(state_dir: &Path, bundle: &Path, pm_dir: &Path) -> Result<Value> {
         (BUNDLE_REPO_MAP.into(), repo_map_bytes(pm_dir)?),
     ];
     texts.extend(briefings(state_dir)?);
+    if let Some((name, bytes)) = texts.iter().find(|(_, b)| b.len() as u64 > TEXT_MEMBER_MAX) {
+        return Err(Error::rejected(format!(
+            "bundle member {name} is {} bytes, over the {TEXT_MEMBER_MAX}-byte cap for a \
+             text member; trim it, then retry the export",
+            bytes.len()
+        )));
+    }
     let allow = crate::secret::Allowlist::load(state_dir)?;
+    let db_scan = if allow_unscanned_db {
+        None
+    } else {
+        Some(scan_db(&staging.path().join(BUNDLE_DB), &allow)?)
+    };
     for (name, bytes) in &texts {
         let text = String::from_utf8_lossy(bytes);
         let block: Vec<_> = crate::secret::scan(&text, Some(name))?
@@ -418,7 +491,16 @@ pub fn export(state_dir: &Path, bundle: &Path, pm_dir: &Path) -> Result<Value> {
         let _ = std::fs::remove_file(&partial);
         return Err(e);
     }
-    std::fs::rename(&partial, bundle)?;
+    // `hard_link` refuses an existing target: a bundle that appeared
+    // since the check above is never overwritten.
+    let linked = std::fs::hard_link(&partial, bundle);
+    let _ = std::fs::remove_file(&partial);
+    linked.map_err(|e| {
+        Error::rejected(format!(
+            "cannot create {} ({e}); export never overwrites. Pass a new --bundle path",
+            bundle.display()
+        ))
+    })?;
     let members: Vec<&str> = std::iter::once(BUNDLE_DB)
         .chain(texts.iter().map(|(n, _)| n.as_str()))
         .collect();
@@ -426,12 +508,98 @@ pub fn export(state_dir: &Path, bundle: &Path, pm_dir: &Path) -> Result<Value> {
         "bundle": bundle,
         "manifest": manifest,
         "members": members,
-        "secret_scan": {"scanned": texts.len(), "blocking": 0},
+        "secret_scan": match &db_scan {
+            Some(db) => json!({
+                "scanned": texts.len() + 1,
+                "blocking": 0,
+                "db_values_scanned": db.values,
+                "db_columns": db.columns,
+                "unscanned": [],
+            }),
+            None => json!({
+                "scanned": texts.len(),
+                "blocking": 0,
+                "unscanned": [BUNDLE_DB],
+                "warning": "cadence.sqlite3 was copied as-is (--allow-unscanned-db): it may \
+                            hold credentials from message history; keep this bundle as \
+                            private as the live database",
+            }),
+        },
+        "integrity_note": "the manifest sha256 detects corruption, not tampering: \
+                           restore only bundles you trust",
         "next": format!(
             "restore on the new host with `cadence restore {} --state-dir <empty dir>`",
             bundle.display()
         ),
     }))
+}
+
+struct DbScan {
+    columns: Vec<String>,
+    values: u64,
+}
+
+/// Secret-scan the free-text columns of a database snapshot. A blocking
+/// finding refuses the export, naming the table, column and rowid but
+/// never the value.
+fn scan_db(db: &Path, allow: &crate::secret::Allowlist) -> Result<DbScan> {
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let mut columns = Vec::new();
+    let mut values = 0u64;
+    for (table, cols) in DB_TEXT_COLUMNS {
+        let present: Vec<String> = {
+            let mut stmt =
+                conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            names
+        };
+        for col in cols.iter().filter(|c| present.iter().any(|p| p == *c)) {
+            columns.push(format!("{table}.{col}"));
+            let mut stmt = conn.prepare(&format!(
+                "SELECT rowid, {col} FROM {table} WHERE {col} IS NOT NULL"
+            ))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let rowid: i64 = row.get(0)?;
+                let text = match row.get_ref(1)? {
+                    rusqlite::types::ValueRef::Text(t) | rusqlite::types::ValueRef::Blob(t) => {
+                        String::from_utf8_lossy(t).into_owned()
+                    }
+                    _ => continue,
+                };
+                values += 1;
+                let block: Vec<_> = crate::secret::scan(&text, None)?
+                    .into_iter()
+                    .filter(|f| !allow.permits(f) && f.severity == crate::secret::Severity::Block)
+                    .collect();
+                if !block.is_empty() {
+                    let list = block
+                        .iter()
+                        .map(|f| format!("rule {} ({})", f.rule, f.redacted))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(Error::invalid(
+                        "secret_detected",
+                        format!(
+                            "export refused: credential-shaped text in bundle member \
+                             {BUNDLE_DB} at {table}.{col} rowid {rowid} ({list}). Nothing was \
+                             written. The runtime database's history holds it; a false \
+                             positive is for the operator to allowlist in <state dir>/\
+                             secret-allowlist.toml. `--allow-unscanned-db` exports the \
+                             database unscanned — only for a bundle kept as private as the \
+                             live database"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(DbScan { columns, values })
 }
 
 fn sibling_partial(path: &Path) -> PathBuf {
@@ -576,6 +744,10 @@ pub fn restore(state_dir: &Path, file: &Path) -> Result<Value> {
         )));
     }
 
+    // Every briefing conflict is found before the database is installed,
+    // so a refusal never leaves a half-restored state dir.
+    let (to_write, skipped) = briefing_plan(state_dir, &staged.briefings)?;
+    make_private(&staged.db)?;
     // `hard_link` fails when the target exists: no clobber even if a
     // database appeared since the check above.
     std::fs::hard_link(&staged.db, &target).map_err(|e| {
@@ -585,16 +757,27 @@ pub fn restore(state_dir: &Path, file: &Path) -> Result<Value> {
         ))
     })?;
     let mut restored = Vec::new();
-    let mut skipped = Vec::new();
-    for (rel, bytes) in &staged.briefings {
+    for (rel, bytes) in to_write {
+        let mut dir = state_dir.to_path_buf();
+        let parts: Vec<_> = rel.components().collect();
+        for part in &parts[..parts.len() - 1] {
+            dir.push(part);
+            match std::fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return Err(Error::internal(format!(
+                        "{} changed under restore; the database is installed, briefings \
+                         are partial",
+                        dir.display()
+                    )))
+                }
+                Err(_) => {
+                    use std::os::unix::fs::DirBuilderExt;
+                    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+                }
+            }
+        }
         let dest = state_dir.join(rel);
-        if dest.exists() {
-            skipped.push(dest.display().to_string());
-            continue;
-        }
-        if let Some(parent) = dest.parent() {
-            create_private_dir(parent)?;
-        }
         write_new_file(&dest, bytes)?;
         restored.push(dest.display().to_string());
     }
@@ -619,6 +802,58 @@ pub fn restore(state_dir: &Path, file: &Path) -> Result<Value> {
         "repo_remap": remap,
         "next": next,
     }))
+}
+
+/// One briefing to create: (path relative to the state dir, bytes).
+type BriefingWrite<'a> = (&'a Path, &'a [u8]);
+
+/// Split bundled briefings into (to write, already present). Refuses —
+/// before anything is installed — a path whose existing ancestor under
+/// the state dir is a symlink or not a directory: restore never writes
+/// through a link.
+fn briefing_plan<'a>(
+    state_dir: &Path,
+    briefings: &'a [(PathBuf, Vec<u8>)],
+) -> Result<(Vec<BriefingWrite<'a>>, Vec<String>)> {
+    let mut write = Vec::new();
+    let mut skipped = Vec::new();
+    for (rel, bytes) in briefings {
+        let parts: Vec<_> = rel.components().collect();
+        let mut path = state_dir.to_path_buf();
+        let mut present = true;
+        for (i, part) in parts.iter().enumerate() {
+            path.push(part);
+            let last = i + 1 == parts.len();
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(Error::rejected(format!(
+                        "{} is a symlink; restore never writes briefings through a link. \
+                         Remove it or restore into an empty --state-dir; nothing was restored",
+                        path.display()
+                    )))
+                }
+                Ok(meta) if !last && !meta.is_dir() => {
+                    return Err(Error::rejected(format!(
+                        "{} is not a directory, so {} cannot be restored; move it aside or \
+                         restore into an empty --state-dir; nothing was restored",
+                        path.display(),
+                        rel.display()
+                    )))
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    present = false;
+                    break;
+                }
+            }
+        }
+        if present {
+            skipped.push(state_dir.join(rel).display().to_string());
+        } else {
+            write.push((rel.as_path(), bytes.as_slice()));
+        }
+    }
+    Ok((write, skipped))
 }
 
 fn stage(file: &Path, staging: &Path) -> Result<Staged> {
@@ -697,8 +932,13 @@ fn stage_bundle(file: &Path, staging: &Path) -> Result<Staged> {
             db = Some(dest);
             continue;
         }
+        if entry.header().size().unwrap_or(u64::MAX) > TEXT_MEMBER_MAX {
+            return Err(bad(format!(
+                "member {name} is over the {TEXT_MEMBER_MAX}-byte cap for a text member"
+            )));
+        }
         let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
+        (&mut entry).take(TEXT_MEMBER_MAX).read_to_end(&mut bytes)?;
         if name == BUNDLE_MANIFEST {
             manifest = Some(parse_manifest(&bytes, &path)?);
         } else if name == BUNDLE_REPO_MAP {
