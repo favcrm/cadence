@@ -15415,6 +15415,18 @@ fn pty_answer_refuses_without_a_menu() {
 
 // ---- CAD-55: `cadence dispatch` + `cadence issue finish` against a live daemon ----
 
+/// CAD-275: age every file under `dir` past `issue finish`'s
+/// 30-minute active window — the state of a lane nobody has touched
+/// since. Without it a lane written seconds ago is "in use".
+fn idle(dir: &Path) {
+    let st = std::process::Command::new("find")
+        .arg(dir)
+        .args(["-exec", "touch", "-h", "-d", "2 hours ago", "{}", "+"])
+        .status()
+        .unwrap();
+    assert!(st.success(), "backdate {}", dir.display());
+}
+
 /// One dispatch: `issue start` side effects + exactly one templated
 /// kickoff + comment + message ref. A second run reuses the worktree
 /// and refuses the duplicate while the first is live. Fenced and
@@ -15759,6 +15771,7 @@ fn dispatch_kickoff_and_finish_guards() {
     std::fs::write(wt1.join("work.txt"), "x").unwrap();
     git(&wt1, &["add", "-A"]);
     git(&wt1, &["commit", "-qm", "d-1 work"]);
+    idle(&wt1);
     let (ok, err) = cli(&["issue", "finish", "D-1"]);
     assert!(!ok, "{err}");
     let msg = err["error"].as_str().unwrap();
@@ -15806,6 +15819,7 @@ fn dispatch_kickoff_and_finish_guards() {
     std::fs::write(wt3.join("work3.txt"), "x").unwrap();
     git(&wt3, &["add", "-A"]);
     git(&wt3, &["commit", "-qm", "d-3 work"]);
+    idle(&wt3);
     let (ok, err) = cli(&["issue", "finish", "D-3"]);
     assert!(!ok, "{err}");
     assert!(
@@ -15852,6 +15866,7 @@ fn dispatch_kickoff_and_finish_guards() {
     // Unmerged+unpushed refusal once committed.
     git(&wt4, &["add", "-A"]);
     git(&wt4, &["commit", "-qm", "wip"]);
+    idle(&wt4);
     let (ok, err) = cli(&["issue", "finish", "D-4"]);
     assert!(
         !ok && err["error"].as_str().unwrap().contains("neither merged"),
@@ -16223,6 +16238,7 @@ fn finish_guard_per_worktree() {
     std::fs::write(wt_b.join("b.txt"), "x").unwrap();
     git(&wt_b, &["add", "-A"]);
     git(&wt_b, &["commit", "-qm", "b work"]);
+    idle(&wt_b);
     git(&repo, &["merge", "-q", "cadence/d-2-bwt"]);
     let (ok, out) = cli(&["issue", "finish", "D-2"]);
     assert!(
@@ -16292,6 +16308,7 @@ fn finish_guard_per_worktree() {
     std::fs::write(wt_d.join("d.txt"), "x").unwrap();
     git(&wt_d, &["add", "-A"]);
     git(&wt_d, &["commit", "-qm", "d work"]);
+    idle(&wt_d);
     git(&repo, &["merge", "-q", "cadence/d-4-dwt"]);
     let (ok, _) = cli(&["issue", "ref", "D-4", "message", "mkdead"]);
     assert!(ok);
@@ -16312,6 +16329,7 @@ fn finish_guard_per_worktree() {
     std::fs::write(wt_g.join("g.txt"), "x").unwrap();
     git(&wt_g, &["add", "-A"]);
     git(&wt_g, &["commit", "-qm", "g work"]);
+    idle(&wt_g);
     git(&repo, &["merge", "-q", "cadence/d-5-ghost"]);
     // The probe runs WITHOUT the pm lock: with the lock file held, a
     // stale-socket daemon (it was there and stopped answering) still
@@ -16406,12 +16424,15 @@ fn finish_guard_per_worktree() {
         err["error"].as_str().unwrap().contains(&msg_d6),
         "a non-owner recipient's bound message still blocks: {err}"
     );
-    // Re-start under --name: the old pair still refuses; the new
-    // pair is not bound to a message scoped to the old worktree.
-    let (ok, out) = cli(&["issue", "start", "D-6", "--name", "scd"]);
-    assert!(ok, "{out}");
-    let (ok, err) = cli(&["issue", "finish", "D-6"]);
-    assert!(!ok, "the first open pair still refuses: {err}");
+    // Re-start under a new --name while the old pair is open would
+    // fork the issue's work — refused, naming the open lane (CAD-274).
+    // Once the old pair is force-finished, the re-started pair is not
+    // bound to a message scoped to the old worktree.
+    let (ok, err) = cli(&["issue", "start", "D-6", "--name", "scd"]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("d-6-"),
+        "a second lane under --name is refused: {err}"
+    );
     let (ok, out) = cli(&["issue", "finish", "D-6", "--force"]);
     assert!(
         ok && out["overrode"]
@@ -16421,10 +16442,17 @@ fn finish_guard_per_worktree() {
             .any(|o| o == "bound-message"),
         "the bound-message block is what --force overrode: {out}"
     );
-    // The new pair's branch sits at the base tip (merged by
-    // ancestry) and the still-live message is scoped to the removed
-    // pair — the finish succeeds clean.
+    let (ok, out) = cli(&["issue", "start", "D-6", "--name", "scd"]);
+    assert!(ok, "{out}");
+    // The new pair's work is merged by ancestry and the still-live
+    // message is scoped to the removed pair — the finish succeeds
+    // clean.
     let wt_scd = repo.join(".cadence/wt/d-6-scd");
+    std::fs::write(wt_scd.join("scd.txt"), "x").unwrap();
+    git(&wt_scd, &["add", "-A"]);
+    git(&wt_scd, &["commit", "-qm", "scd work"]);
+    idle(&wt_scd);
+    git(&repo, &["merge", "-q", "cadence/d-6-scd"]);
     let (ok, out) = cli(&["issue", "finish", "D-6"]);
     assert!(
         ok && out["finished"] == true && out["overrode"] == json!([]),
@@ -16588,6 +16616,7 @@ fn finish_holds_unreconciled_unknown() {
         std::fs::write(wt(slug).join(format!("{slug}.txt")), "x").unwrap();
         git(&wt(slug), &["add", "-A"]);
         git(&wt(slug), &["commit", "-qm", slug]);
+        idle(&wt(slug));
         git(&repo, &["merge", "-q", &format!("cadence/{slug}")]);
     }
     let child_cwd = wt("d-5-child").join("nested");
@@ -16881,6 +16910,7 @@ fn finish_merged_sweep() {
         std::fs::write(wt(slug).join(format!("{slug}.txt")), "x").unwrap();
         git(&wt(slug), &["add", "-A"]);
         git(&wt(slug), &["commit", "-qm", "work"]);
+        idle(&wt(slug));
     }
     git(&repo, &["merge", "-q", "cadence/d-1-merged"]);
     git(&repo, &["merge", "-q", "cadence/d-2-inuse"]);
@@ -17112,14 +17142,17 @@ fn finish_merged_sweep() {
     std::fs::write(wt("d-6-prbound").join("pr6.txt"), "x").unwrap();
     git(&wt("d-6-prbound"), &["add", "-A"]);
     git(&wt("d-6-prbound"), &["commit", "-qm", "merged head"]);
+    idle(&wt("d-6-prbound"));
     let tip6 = sha(&repo, "cadence/d-6-prbound");
     std::fs::write(wt("d-7-prreused").join("pr7.txt"), "x").unwrap();
     git(&wt("d-7-prreused"), &["add", "-A"]);
     git(&wt("d-7-prreused"), &["commit", "-qm", "merged head"]);
+    idle(&wt("d-7-prreused"));
     let tip7a = sha(&repo, "cadence/d-7-prreused");
     std::fs::write(wt("d-7-prreused").join("extra.txt"), "x").unwrap();
     git(&wt("d-7-prreused"), &["add", "-A"]);
     git(&wt("d-7-prreused"), &["commit", "-qm", "unmerged extra"]);
+    idle(&wt("d-7-prreused"));
     let tip7b = sha(&repo, "cadence/d-7-prreused");
     // D-8: the accepted ancestor path — the branch tip is an ancestor
     // of the recorded PR head (a local branch behind the merged head).
@@ -17128,10 +17161,12 @@ fn finish_merged_sweep() {
     std::fs::write(wt("d-8-prancestor").join("pa.txt"), "x").unwrap();
     git(&wt("d-8-prancestor"), &["add", "-A"]);
     git(&wt("d-8-prancestor"), &["commit", "-qm", "work"]);
+    idle(&wt("d-8-prancestor"));
     git(&wt("d-8-prancestor"), &["checkout", "-q", "-b", "scratch8"]);
     std::fs::write(wt("d-8-prancestor").join("more.txt"), "x").unwrap();
     git(&wt("d-8-prancestor"), &["add", "-A"]);
     git(&wt("d-8-prancestor"), &["commit", "-qm", "pr head"]);
+    idle(&wt("d-8-prancestor"));
     let head8 = sha(&repo, "scratch8");
     git(
         &wt("d-8-prancestor"),
@@ -17274,6 +17309,7 @@ fn finish_merged_sweep() {
         std::fs::write(wt(slug).join(file), "x").unwrap();
         git(&wt(slug), &["add", "-A"]);
         git(&wt(slug), &["commit", "-qm", file]);
+        idle(&wt(slug));
     };
 
     // D-9 merged + remote at the merged tip → remote deleted too.
@@ -20979,6 +21015,7 @@ fn issue_start_never_touches_tracked_cargo_config() {
     std::fs::write(wt.join("work.txt"), "x").unwrap();
     s.git(&wt, &["add", "-A"]);
     s.git(&wt, &["commit", "-qm", "work"]);
+    idle(&wt);
     s.git(&s.repo, &["merge", "-q", "cadence/d-1-cfg"]);
     let (ok, out) = s.cli(&["issue", "finish", "D-1"]);
     assert!(ok && out["finished"] == true, "{out}");
@@ -21027,6 +21064,7 @@ fn issue_finish_keeps_shared_cargo_target() {
     std::fs::write(wt.join("work.txt"), "x").unwrap();
     s.git(&wt, &["add", "-A"]);
     s.git(&wt, &["commit", "-qm", "work"]);
+    idle(&wt);
     s.git(&s.repo, &["merge", "-q", "cadence/d-1-done"]);
     let (ok, out) = s.cli(&["issue", "finish", "D-1"]);
     assert!(ok && out["finished"] == true, "{out}");
@@ -21490,6 +21528,15 @@ fn seed_repo(repo: &Path) {
         ".cadence/wt/tst-7-done",
         "cadence/tst-7-done",
     ]);
+    // Real work, fast-forward merged, then left idle — a lane with no
+    // commits has not started and is never merged (CAD-275).
+    let wt = repo.join(".cadence/wt/tst-7-done");
+    let wt_s = wt.to_str().unwrap();
+    std::fs::write(wt.join("done.txt"), "done\n").unwrap();
+    git(&["-C", wt_s, "add", "-A"]);
+    git(&["-C", wt_s, "commit", "-m", "tst-7 work"]);
+    git(&["merge", "--ff-only", "cadence/tst-7-done"]);
+    idle(&wt);
     std::fs::create_dir_all(repo.join(".cadence/wt/tst-88-ghost")).unwrap();
 }
 
@@ -22071,6 +22118,7 @@ fn session_end_project_scopes_sweep() {
         std::fs::write(wt.join(file), "x").unwrap();
         git(wt, &["add", "-A"]);
         git(wt, &["commit", "-qm", "work"]);
+        idle(wt);
     }
     git(&repo_a, &["merge", "-q", "cadence/a-1-one"]);
     git(&repo_b, &["merge", "-q", "cadence/b-1-two"]);

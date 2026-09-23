@@ -354,11 +354,22 @@ the `Issue: <ID>` trailer — as JSON.
   and a `worktree` ref (absolute path), the status/owner updates and
   the CAD-42 `Issue:`/`Actor:` trailers under subject
   `<ID>: start <branch>`.
-- Idempotent: when the worktree and branch already exist *for this
-  issue* (matching refs recorded), the command returns them with
-  `created: false` and makes no commit. It refuses — naming both —
-  when the branch exists but points somewhere unrelated to a recorded
-  worktree.
+- One issue, one lane (CAD-274): when the issue already has exactly
+  one open worktree ref, `issue start` reuses that lane — with or
+  without `--name`, and even after the title (hence the default slug)
+  changed. It re-applies the cargo target config, re-attaches the
+  branch if the dir was removed, and returns `created: false`; no
+  worktree, branch or ref is minted and no commit lands unless the
+  refs needed a fix (a stale recorded `cargo_target`, a missing half
+  of the pair) — then one `<ID>: start <branch> (refs refreshed)`
+  commit. A `--name` for a different slug is refused, naming the open
+  lane's slug and path; so are two or more open worktree refs (listed
+  — close the stale ones with `issue finish <ID> --worktree <path>`).
+  A new `--name` needs every earlier lane finished first. Without an
+  open ref, a start under the same names as a finished lane re-opens
+  its closed refs rather than duplicating them. It refuses — naming
+  both — when the branch exists but points somewhere unrelated to a
+  recorded worktree.
 - `--job --pm <alias> --spec <file> [--assignee <alias>]` opens the
   M3 job through `job_new`: the job carries `--issue`, `--repo` and
   `--base-ref <base sha>`, and the `task_worktree`/`task_branch`/
@@ -407,14 +418,29 @@ message id and the worker's probe verdict so the operator knows
 whether it lands now or when the pane idles.
 
 `issue finish <ID>` is the other end — safe cleanup of the recorded
-worktree+branch pair. It refuses, naming what it found, while:
+worktree+branch pair. An issue with several open worktree refs needs
+`--worktree <path>` to name one (a bare finish refuses, listing them);
+when that directory is already gone, `--worktree` only marks its
+worktree/branch refs `closed: true` in one tracker commit — no git
+state is touched and a surviving branch is kept (`refs_only: true`,
+`branch_note` says so). It refuses, naming what it found, while:
 
 - the issue's `owner` agent has a queued/running message or a pty pane
   that probes busy (the daemon must be reachable — it refuses rather
   than guesses; an `inbox` owner is a durable mailbox, never busy),
 - the worktree has uncommitted changes — ignored paths like the
   `ui/node_modules` build symlink don't count (the refusal lists what
-  does), or
+  does),
+- any non-ignored file (tracked or untracked) in the worktree was
+  modified within the last 30 minutes (`ACTIVE_WINDOW` in
+  `src/issue/finish.rs`) — a worker cadence cannot see, such as a
+  subagent with no registered pane, still leaves fresh files; the
+  refusal names the newest file and its age. A fresh checkout counts:
+  a lane started minutes ago is in use (CAD-275),
+- the branch has not started — zero commits beyond the commit it was
+  cut from (the oldest entry of its reflog) — which is never "merged",
+  even though its tip sits on the default branch; `--force` finishes
+  an abandoned lane and reports `not_started: true` (CAD-275), or
 - the branch's work survives nowhere: not merged into the repo's
   default branch (`origin/HEAD`, else the checkout's current branch)
   and not pushed to a remote-tracking ref. "Merged" recognizes
