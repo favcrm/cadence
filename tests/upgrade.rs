@@ -215,6 +215,7 @@ fn req(target: Target, dry_run: bool) -> Request {
         target,
         dry_run,
         allow_unattested: false,
+        backup_state_dir: None,
     }
 }
 
@@ -223,6 +224,7 @@ fn req_unattested(sha: &str) -> Request {
         target: Target::Sha(sha.into()),
         dry_run: false,
         allow_unattested: true,
+        backup_state_dir: None,
     }
 }
 
@@ -1001,4 +1003,66 @@ fn cli_requires_exactly_one_target() {
         "{}",
         stderr(&both)
     );
+}
+
+// ---- CAD-314: the self-update takes a backup first ----
+
+/// A state dir holding a current-schema store, closed again.
+fn state_with_store(root: &Path) -> PathBuf {
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    drop(cadence_agent::store::Store::open(&state.join("cadence.sqlite3")).unwrap());
+    state
+}
+
+fn with_backup(state: &Path, dry_run: bool) -> Request {
+    Request {
+        backup_state_dir: Some(state.to_path_buf()),
+        ..req(Target::Sha(SHA.into()), dry_run)
+    }
+}
+
+#[test]
+fn cad314_upgrade_takes_a_verified_backup_before_moving_the_link() {
+    let e = env();
+    let root = TempDir::new().unwrap();
+    let state = state_with_store(root.path());
+    let fake = Fake::new(&e.artifact);
+
+    let report = upgrade::run(&fake, &e.layout, &with_backup(&state, false)).unwrap();
+
+    assert_eq!(link_target(&e.layout), e.layout.binary(SHA));
+    let manifest = PathBuf::from(report["backup"]["manifest"].as_str().unwrap());
+    assert_eq!(manifest.parent(), Some(state.join("backups").as_path()));
+    let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(m["reason"], "pre-update");
+    assert_eq!(m["integrity_check"], "ok");
+}
+
+#[test]
+fn cad314_upgrade_refuses_when_the_pre_update_backup_fails() {
+    let e = env();
+    let root = TempDir::new().unwrap();
+    let state = root.path().join("state");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("cadence.sqlite3"), b"not a database").unwrap();
+    let fake = Fake::new(&e.artifact);
+
+    let err = refusal(upgrade::run(&fake, &e.layout, &with_backup(&state, false)));
+
+    assert!(err.contains("pre-update backup"), "{err}");
+    assert_untouched(&e);
+}
+
+#[test]
+fn cad314_upgrade_dry_run_takes_no_backup() {
+    let e = env();
+    let root = TempDir::new().unwrap();
+    let state = state_with_store(root.path());
+    let fake = Fake::new(&e.artifact);
+
+    let report = upgrade::run(&fake, &e.layout, &with_backup(&state, true)).unwrap();
+
+    assert!(report["backup"].is_null(), "{report}");
+    assert!(!state.join("backups").exists());
 }

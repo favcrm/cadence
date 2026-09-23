@@ -520,6 +520,11 @@ pub struct Request {
     /// attestation does not verify (a hand-built release) as a rollback
     /// target. It is reported as an unattested local release.
     pub allow_unattested: bool,
+    /// The state dir whose store is backed up (CAD-314,
+    /// `backup::before_self_update`) before the link moves. A failed
+    /// backup refuses the upgrade before anything is installed. `None`
+    /// skips it (tests of the install path alone).
+    pub backup_state_dir: Option<PathBuf>,
 }
 
 /// `trust` in the report: what the installed binary is known to be.
@@ -666,6 +671,20 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
     let link_changed = from_target.as_deref() != Some(installed_path.as_path());
     let mut installed = false;
     let mut repointed = false;
+    // CAD-314: a self-update takes a verified backup of the store before
+    // anything is installed or the link moves. A failed backup refuses.
+    let mut backup = Value::Null;
+    if !req.dry_run && link_changed {
+        if let Some(state_dir) = &req.backup_state_dir {
+            backup = crate::backup::before_self_update(state_dir).map_err(|e| {
+                Error::rejected(format!(
+                    "upgrade refused before installing: the pre-update backup of {} \
+                     failed: {e}",
+                    state_dir.display()
+                ))
+            })?;
+        }
+    }
     if !req.dry_run {
         if let Some(tmp) = &staged {
             install_files(tmp.path(), &layout.release_dir(&sha))?;
@@ -702,6 +721,7 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
         "would_install": req.dry_run && source == "ci-artifact",
         "would_repoint": req.dry_run && link_changed,
         "verified": Value::Object(verified),
+        "backup": backup,
         "restarted": false,
     });
     if trust == TRUST_UNATTESTED {
