@@ -1459,6 +1459,18 @@ fn enrolled_roots_on_counts_every_root_and_only_unrevoked_vouches() {
     // but it still vouches for the endpoint's identity.
     held_json(&mut s, ENROLLMENT_TTL_SECS + 1.0);
     assert_eq!(s.enrollments[0].auth, AuthState::Expired);
+    // An expired owner is still revalidated: unchanged keeps it, even
+    // with another owner in the set.
+    assert_eq!(
+        s.enrolled_owners(),
+        vec!["wk".to_string(), "wk2".to_string()]
+    );
+    let same = HashMap::from([
+        ("wk".to_string(), Some("g1".to_string())),
+        ("wk2".to_string(), Some("g1".to_string())),
+    ]);
+    assert!(s.revalidate_owners(&same).is_empty());
+    assert_eq!(s.enrollments[0].auth, AuthState::Expired);
     assert_eq!(
         s.endpoint_enrollment(&outer)
             .map(|e| e.owner_actor.as_str()),

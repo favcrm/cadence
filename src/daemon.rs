@@ -2077,9 +2077,10 @@ impl Shared {
     ///
     /// Exactly one node on the peer's ancestry is the agent. None is
     /// [`Caller::NoAgentIdentity`] — which never takes an agent's
-    /// identity and is NOT operator proof (see that variant). Two or more (or one pid that is both a pane and
-    /// an enrolled root) is ambiguous and refused, as is any node whose
-    /// proof fails: fail closed, never fall through to another node.
+    /// identity and is NOT operator proof (see that variant). Two or
+    /// more (or one pid that is both a pane and an enrolled root) is
+    /// ambiguous and refused, as is any node whose proof fails: fail
+    /// closed, never fall through to another node.
     fn caller_identity(&self, peer_pid: u32) -> Result<Caller> {
         // Drifted or closed owners lose their enrollment before it can
         // vouch for anyone.

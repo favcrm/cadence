@@ -1780,13 +1780,17 @@ impl Slots {
         )
     }
 
-    /// Owners with an active enrollment — whose rows the daemon must
-    /// read for [`Self::revalidate_owners`].
+    /// Owners with a live (active or expired, never revoked) endpoint
+    /// enrollment — whose rows the daemon must read for
+    /// [`Self::revalidate_owners`]. An expired enrollment still vouches
+    /// for identity (CAD-381), so it is revalidated too: omitting it
+    /// would read as "owner gone" and revoke it whenever any other
+    /// owner is active.
     pub fn enrolled_owners(&self) -> Vec<String> {
         let mut owners: Vec<String> = self
             .enrollments
             .iter()
-            .filter(|e| e.auth == AuthState::Active && e.runner.is_none())
+            .filter(|e| !matches!(e.auth, AuthState::Revoked(_)) && e.runner.is_none())
             .map(|e| e.owner_actor.clone())
             .collect();
         owners.sort();
@@ -1794,7 +1798,7 @@ impl Slots {
         owners
     }
 
-    /// Revalidate each active enrollment against its owner row as the
+    /// Revalidate each unrevoked enrollment against its owner row as the
     /// daemon reads it now (`current`: owner → its generation, `None`
     /// when the row is gone or has no live endpoint). A missing or
     /// changed generation revokes — fail closed.

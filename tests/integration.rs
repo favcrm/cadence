@@ -29439,9 +29439,27 @@ fn memory_managed_identity_survives_ttl_and_refuses_ambiguity() {
         .cloned()
         .unwrap();
     assert_eq!(mine["auth_state"], "expired", "{s}");
+    // A freshly enrolled (active) endpoint alongside the expired one:
+    // revalidation must still read the expired owner's row, not treat
+    // it as gone (review round 3).
+    let mut fresh = ManagedWorker::start(&d, "fresh");
+    d.wait_agent("fresh", "idle", 25);
     let r = wk.rpc("child", "memory_propose", proposal("after-ttl"));
     assert_eq!(r["ok"], true, "expired enrollment still vouches: {r}");
     assert_eq!(r["result"]["status"], "proposed", "{r}");
+    let r = fresh.rpc("self", "memory_propose", proposal("fresh-rule"));
+    assert_eq!(r["ok"], true, "active enrollment vouches: {r}");
+
+    // Real drift of the expired owner's row still revokes it.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET generation='regenerated' WHERE alias='wk'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let r = wk.rpc("child", "memory_propose", proposal("drifted-rule"));
+    refused(&r, "is revoked", "drifted expired owner");
 
     // One pid both a registered pane and an enrolled root: ambiguous.
     plant_pane(&d, "twin-pane", twin.pid);
@@ -29455,9 +29473,9 @@ fn memory_managed_identity_survives_ttl_and_refuses_ambiguity() {
     // Two agent endpoints on one ancestry (the test process planted as
     // a pane above the provider): ambiguous, never nearest-wins.
     plant_self(&d);
-    let r = wk.rpc("self", "memory_propose", proposal("nested-rule"));
+    let r = fresh.rpc("self", "memory_propose", proposal("nested-rule"));
     refused(&r, "caller identity ambiguous", "nested endpoints");
-    for id in ["twin-rule", "nested-rule"] {
+    for id in ["drifted-rule", "twin-rule", "nested-rule"] {
         assert!(!pm_dir.join(format!("demo/memory/{id}.md")).exists());
     }
 }

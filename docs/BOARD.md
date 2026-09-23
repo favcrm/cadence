@@ -543,8 +543,8 @@ enrollment (provider pid + start time + uid + owner generation), plus the
 registration incarnation. A caller outside every agent tree has no agent
 identity and is refused — which is not operator proof: operator authority
 needs its own positive proof (CAD-276, CAD-313). Two endpoints on one
-ancestry are ambiguous and refused. Request aliases, `CADENCE_ALIAS`, operator UI
-labels and external identities cannot create proof.
+ancestry are ambiguous and refused. Request aliases, `CADENCE_ALIAS`,
+operator UI labels and external identities cannot create proof.
 Two distinct non-author PM/worker endpoint identities, displayed with
 unique aliases, must pass the same semantic SHA-256 revision (claim/body,
 trusted author/contributors, type, source, confidence, scope and supersede
