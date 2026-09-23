@@ -293,6 +293,45 @@ fn activity_token(tok: &str) -> bool {
     true
 }
 
+/// This state dir's private tmux server socket name (`tmux -L`).
+pub fn tmux_socket(state_dir: &Path) -> String {
+    format!("cadence-{}", short_hash(&state_dir.to_string_lossy()))
+}
+
+/// Kill this state dir's private tmux server and every pane on it,
+/// returning how many sessions it still held. A daemon stop keeps pty
+/// panes for a hot restart; a sandbox going `down` or `reset` never
+/// gets one (CAD-310). Best effort: no server is already the goal.
+pub(crate) fn kill_server(state_dir: &Path, env: &ProviderEnv) -> usize {
+    let tmux = env
+        .var("CADENCE_TMUX_COMMAND")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "tmux".to_string());
+    let socket = tmux_socket(state_dir);
+    let sessions = Command::new(&tmux)
+        .arg("-L")
+        .arg(&socket)
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    if sessions > 0 {
+        let _ = Command::new(&tmux)
+            .arg("-L")
+            .arg(&socket)
+            .arg("kill-server")
+            .output();
+    }
+    sessions
+}
+
 /// Kill `alias`'s session on this state dir's private tmux socket —
 /// the explicit kill path for `agent stop`/`remove`/`gc` on a pty
 /// agent whose pane may have survived a fence (fences detach now).

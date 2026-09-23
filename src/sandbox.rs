@@ -605,27 +605,64 @@ fn daemon_running(state_dir: &Path) -> bool {
     client::rpc_timeout(state_dir, "health", json!({}), Duration::from_secs(5)).is_ok()
 }
 
-/// Stop the board, then the daemon, through their own stop verbs.
+/// `agent_stop` every enabled agent that has an actor — stopped, not
+/// removed, so a later `up` can resume it. Returns how many stopped.
+fn stop_agents(state_dir: &Path) -> usize {
+    let Ok(list) = client::rpc(state_dir, "agent_list", json!({})) else {
+        return 0;
+    };
+    list["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| {
+            a["enabled"].as_bool() != Some(false)
+                && crate::adapter::registry::has_actor(
+                    a["provider"].as_str().unwrap_or_default(),
+                    a["endpoint_kind"].as_str().unwrap_or_default(),
+                )
+        })
+        .filter_map(|a| a["alias"].as_str())
+        .filter(|alias| client::rpc(state_dir, "agent_stop", json!({"alias": alias})).is_ok())
+        .count()
+}
+
+/// Stop the sandbox: its agents, the board and the daemon through their
+/// own stop verbs, then whatever its private tmux server still holds —
+/// a daemon stop keeps pty panes for a hot restart a stopped sandbox
+/// never gets, and `reset` deletes the state dir under them.
 fn down(sb: &Sandbox) -> Result<Value> {
     let exe = std::env::current_exe()?;
     let state = sb.state_dir();
+    let running = daemon_running(&state);
+    let agents_stopped = if running { stop_agents(&state) } else { 0 };
     let ui = if crate::ui::detached_pid(&state).is_some() {
         run_child(sb, &exe, &["ui", "stop"])?;
         "stopped"
     } else {
         "not_running"
     };
-    let daemon = if daemon_running(&state) {
+    let daemon = if running {
         run_child(sb, &exe, &["daemon", "stop"])?;
         "stopped"
     } else {
         "not_running"
     };
-    Ok(json!({"name": sb.name, "root": sb.root, "ui": ui, "daemon": daemon}))
+    let panes_killed =
+        crate::adapter::pty::kill_server(&state, &crate::adapter::ProviderEnv::default());
+    Ok(json!({
+        "name": sb.name,
+        "root": sb.root,
+        "ui": ui,
+        "daemon": daemon,
+        "agents_stopped": agents_stopped,
+        "panes_killed": panes_killed,
+    }))
 }
 
 /// Delete the root — only a direct child of the sandbox base (after
-/// symlinks) holding this sandbox's marker, stopped first.
+/// symlinks) holding this sandbox's marker, stopped first. The root is
+/// checked again after the stop: nothing may swap it in between.
 fn reset(sb: &Sandbox) -> Result<Value> {
     refuse_production(sb)?;
     if std::fs::symlink_metadata(&sb.root).is_err() {
@@ -635,6 +672,24 @@ fn reset(sb: &Sandbox) -> Result<Value> {
             sb.root.display()
         )));
     }
+    removable(sb)?;
+    let stopped = down(sb)?;
+    removable(sb)?;
+    std::fs::remove_dir_all(&sb.root)?;
+    Ok(json!({
+        "name": sb.name,
+        "root": sb.root,
+        "state": "removed",
+        "ui": stopped["ui"],
+        "daemon": stopped["daemon"],
+        "agents_stopped": stopped["agents_stopped"],
+        "panes_killed": stopped["panes_killed"],
+    }))
+}
+
+/// A root `reset` may delete: a real directory directly under the
+/// sandbox base once symlinks resolve, holding this sandbox's marker.
+fn removable(sb: &Sandbox) -> Result<()> {
     let inside_base = std::fs::canonicalize(&sb.root)
         .ok()
         .zip(std::fs::canonicalize(&sb.base).ok())
@@ -651,16 +706,7 @@ fn reset(sb: &Sandbox) -> Result<Value> {
             sb.base.display()
         )));
     }
-    require_marker(sb)?;
-    let stopped = down(sb)?;
-    std::fs::remove_dir_all(&sb.root)?;
-    Ok(json!({
-        "name": sb.name,
-        "root": sb.root,
-        "state": "removed",
-        "ui": stopped["ui"],
-        "daemon": stopped["daemon"],
-    }))
+    require_marker(sb).map(|_| ())
 }
 
 /// Every direct child of `base` that holds a marker file.

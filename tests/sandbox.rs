@@ -437,6 +437,13 @@ fn a_sandbox_claude_worker_keeps_the_sandbox_tracker_and_profile() {
         !env.contains("CADENCE_CLAUDE_COMMAND="),
         "override leaked: {env}"
     );
+
+    // `down` stops the live worker before the daemon, not just the daemon.
+    let down = host.run(&["sandbox", "down", "cl"], &[]);
+    assert!(down.status.success(), "{}", text(&down));
+    let down: Value = serde_json::from_slice(&down.stdout).unwrap();
+    assert_eq!(down["agents_stopped"], 1, "{down}");
+    assert_eq!(down["daemon"], "stopped", "{down}");
 }
 
 /// The state dir decides, not the caller's env: a sandbox restarted
@@ -510,4 +517,60 @@ fn a_sandbox_comes_back_up_after_a_rebuild() {
     assert_eq!(again["daemon"], "started", "{again}");
     let health = client::rpc(&state, "health", json!({})).unwrap();
     assert_eq!(health["sandbox"], "rb", "{health}");
+}
+
+/// A fake `tmux -L <socket> …`: sessions per socket are lines in
+/// `<dir>/<socket>`; every call is logged to `<dir>/calls`.
+const FAKE_TMUX_SH: &str = r#"#!/bin/sh
+dir="__DIR__"
+sock="$2"
+shift 2
+echo "$sock $*" >> "$dir/calls"
+case "$1" in
+  list-sessions) [ -f "$dir/$sock" ] && cat "$dir/$sock" || exit 1 ;;
+  kill-server) rm -f "$dir/$sock" ;;
+esac
+"#;
+
+/// A daemon stop keeps pty panes for a hot restart; `down` and
+/// `reset` must not leave them running on the sandbox's tmux server —
+/// `reset` would delete the state dir under them.
+#[test]
+fn sandbox_down_and_reset_kill_the_panes_the_daemon_left() {
+    let mut host = Host::new();
+    let fake = host.tmp.path().join("faketmux");
+    std::fs::create_dir_all(&fake).unwrap();
+    let script = fake.join("tmux");
+    std::fs::write(
+        &script,
+        FAKE_TMUX_SH.replace("__DIR__", fake.to_str().unwrap()),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let tmux = [("CADENCE_TMUX_COMMAND", script.to_str().unwrap())];
+    let v = host.up_free("pn", &tmux);
+    let state = PathBuf::from(v["state_dir"].as_str().unwrap());
+    let socket = cadence_agent::adapter::pty::tmux_socket(&state);
+    // Two panes the daemon kept alive on its private server.
+    std::fs::write(fake.join(&socket), "w1\nw2\n").unwrap();
+    let down = host.run(&["sandbox", "down", "pn"], &tmux);
+    assert!(down.status.success(), "{}", text(&down));
+    let down: Value = serde_json::from_slice(&down.stdout).unwrap();
+    assert_eq!(down["panes_killed"], 2, "{down}");
+    assert!(!fake.join(&socket).exists(), "server still up");
+    let calls = std::fs::read_to_string(fake.join("calls")).unwrap();
+    assert!(calls.contains(&format!("{socket} kill-server")), "{calls}");
+
+    // `reset` does the same before it deletes the root.
+    host.up_free("pn", &tmux);
+    std::fs::write(fake.join(&socket), "w3\n").unwrap();
+    let reset = host.run(&["sandbox", "reset", "pn"], &tmux);
+    assert!(reset.status.success(), "{}", text(&reset));
+    let reset: Value = serde_json::from_slice(&reset.stdout).unwrap();
+    assert_eq!(reset["panes_killed"], 1, "{reset}");
+    assert_eq!(reset["state"], "removed", "{reset}");
+    assert!(!fake.join(&socket).exists());
 }
