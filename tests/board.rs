@@ -6210,7 +6210,8 @@ fn ui_tailscale_start_shares_and_persists() {
     assert_eq!(out["tailnet_url"], format!("https://{TS_DNS}:9450"));
 
     // `ui tailscale status` prints the URL, the live mapping, and the
-    // identity probe resolving to `<login> (tailscale)`.
+    // identity probe: a local process posing as the proxy is ignored
+    // (CAD-336) — the probe is exactly the forgery it must refuse.
     let (ok, text) = cli_raw_env(
         pm.path(),
         state.path(),
@@ -6220,7 +6221,11 @@ fn ui_tailscale_start_shares_and_persists() {
     assert!(ok, "{text}");
     assert!(text.contains(&format!("https://{TS_DNS}:9450")), "{text}");
     assert!(text.contains("(live)"), "{text}");
-    assert!(text.contains("(tailscale)"), "{text}");
+    assert!(
+        text.contains("identity: local forged login ignored (operator (ui))"),
+        "{text}"
+    );
+    assert!(!text.contains("FORGEABLE"), "{text}");
 
     // Second start is idempotent: no new mapping, board restarted.
     let (ok, out) = cli_env(
@@ -6531,8 +6536,15 @@ fn tailnet_opts() -> impl Fn(&mut ui::ServeOpts) {
     }
 }
 
+/// CAD-336: a local process sending exactly the proxy's shape —
+/// tailnet Host, https Origin, identity headers, loopback peer — is not
+/// the `tailscale serve` proxy: its client socket is this test's uid,
+/// never tailscaled's. It writes as itself (`operator (ui)`: a peer tied
+/// to no pane), and the forged login is never recorded. (The real
+/// proxy's socket belongs to tailscaled's uid; that proof is unit-tested
+/// in `peer::tests` — a test cannot open a socket as another uid.)
 #[test]
-fn tailnet_write_is_attributed() {
+fn tailnet_shaped_local_write_is_not_the_proxy() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     seed(pm.path(), state.path());
     let port = start_ui_opts(
@@ -6543,8 +6555,6 @@ fn tailnet_write_is_attributed() {
     let ts_host = format!("{TS_DNS}:9450");
     let origin = format!("https://{TS_DNS}:9450");
 
-    // A write shaped exactly like the proxy's: tailnet Host, https
-    // Origin, identity headers — attributed to the tailnet user.
     let headers = ts_write_headers(&origin, "fable@example.com");
     let href: Vec<&str> = headers.iter().map(String::as_str).collect();
     let (code, _, _) = http_write(
@@ -6557,13 +6567,11 @@ fn tailnet_write_is_attributed() {
     );
     assert_eq!(code, 200);
     let sha = sha_of(pm.path(), "cadence/CAD-2", "status=done");
-    assert!(
-        trailers_of(pm.path(), &sha).contains("Actor: fable@example.com (tailscale)"),
-        "{}",
-        trailers_of(pm.path(), &sha)
-    );
+    let t = trailers_of(pm.path(), &sha);
+    assert!(t.contains("Actor: operator (ui)"), "{t}");
+    assert!(!t.contains("fable"), "{t}");
 
-    // /api/meta reports the same identity + tailnet URL.
+    // /api/meta agrees, and still reports the tailnet URL.
     let (code, _, body) = http_write(
         port,
         "GET",
@@ -6577,7 +6585,7 @@ fn tailnet_write_is_attributed() {
     );
     assert_eq!(code, 200);
     let meta: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(meta["actor"], "fable@example.com (tailscale)");
+    assert_eq!(meta["actor"], "operator (ui)");
     assert_eq!(meta["tailnet_url"], origin);
     assert_eq!(meta["read_only"], false);
 }

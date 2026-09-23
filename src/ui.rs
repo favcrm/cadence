@@ -1175,36 +1175,43 @@ fn write_err(e: &Error) -> HttpResp {
     }
 }
 
-/// The actor a write commits as. `Tailscale-User-Login` is trusted
-/// only when all three hold — tailscale mode armed, the TCP peer is
-/// loopback (the proxy connects locally), and the request's Host is
-/// the tailnet name. Anything else — including a direct loopback
-/// request forging the header under a different Host — writes as the
-/// plain operator and the header is never considered.
+/// The actor a request would write as, header-wise: the
+/// `Tailscale-User-Login` of a request [`tailnet_proxy`] proves came
+/// through `tailscale serve`, else the plain operator. The header is
+/// never considered otherwise — a local process forging it under the
+/// tailnet Host is not the proxy.
 fn request_actor(request: &Request, opts: &ServeOpts) -> String {
-    if !tailnet_request(request, opts) {
+    if tailnet_proxy(request, opts) != Some(Ok(())) {
         return UI_ACTOR.to_string();
     }
+    tailnet_login(request).unwrap_or_else(|| UI_ACTOR.to_string())
+}
+
+/// `<login> (tailscale)` from the proxy's `Tailscale-User-Login`.
+fn tailnet_login(request: &Request) -> Option<String> {
     header_value(request, "Tailscale-User-Login")
         .and_then(|l| sanitize_actor(&l))
         .map(|l| format!("{l} (tailscale)"))
-        .unwrap_or_else(|| UI_ACTOR.to_string())
 }
 
-/// Tailscale mode armed, the TCP peer is loopback (the proxy connects
-/// locally), and the request's Host is the tailnet name — the shape
-/// under which `Tailscale-User-Login` is considered at all.
-fn tailnet_request(request: &Request, opts: &ServeOpts) -> bool {
-    let Some((dns, _)) = &opts.tailnet else {
-        return false;
-    };
-    let peer_ok = request
-        .remote_addr()
-        .map(|a| a.ip().is_loopback())
-        .unwrap_or(false);
+/// Is this request from the `tailscale serve` proxy (CAD-336)? `None`
+/// — not tailnet-shaped at all (tailscale mode off, or the Host is not
+/// the tailnet name). `Some(Ok)` — tailnet-shaped and the peer is
+/// proven to be tailscaled ([`crate::peer::tailscale_proxy_proof`]:
+/// the connection's client socket belongs to tailscaled's uid).
+/// `Some(Err)` — tailnet-shaped but unproven: Host and loopback are
+/// caller-controlled, so the identity headers are not trusted.
+fn tailnet_proxy(request: &Request, opts: &ServeOpts) -> Option<std::result::Result<(), String>> {
+    let (dns, _) = opts.tailnet.as_ref()?;
     let host = header_value(request, "Host").unwrap_or_default();
     let name = host.split(':').next().unwrap_or_default();
-    peer_ok && name.eq_ignore_ascii_case(dns)
+    if !name.eq_ignore_ascii_case(dns) {
+        return None;
+    }
+    Some(match request.remote_addr() {
+        Some(peer) => crate::peer::tailscale_proxy_proof(opts.port, *peer),
+        None => Err("the request has no peer address".to_string()),
+    })
 }
 
 /// Who a board write commits as (CAD-254, CAD-263, CAD-335). The
@@ -1245,26 +1252,36 @@ impl WriteCaller {
 
 /// Derive the write caller:
 ///
+/// - a request proven to come through `tailscale serve`
+///   ([`tailnet_proxy`], CAD-336) writes as its `Tailscale-User-Login`
+///   — its peer is tailscaled, which no agent is; every other request,
+///   a tailnet-shaped one from any local process included, is
+///   attributed to its own peer process and its identity headers are
+///   never read;
 /// - a peer tied to a registered pane, or descending from a live
 ///   managed endpoint's provider process, is that agent — never the
 ///   operator, whatever the request's shape or headers;
 /// - a peer that cannot be attributed at all (unreadable ancestry, a
 ///   socket owner this user cannot see, several agents, a store the
-///   daemon cannot list) is refused (`403`, `check: "caller_identity"`)
-///   — unless the request is tailnet-shaped: the real tailnet proxy is
-///   another user's process this user cannot inspect;
+///   daemon cannot list) is refused (`403`, `check: "caller_identity"`);
 /// - a peer that walks cleanly and is tied to NO agent is still the
-///   operator (`operator (ui)` or its tailnet login). That is a
-///   DEFAULT, not proof: the operator's own peer (the tailnet `socat`
-///   relay, an ssh tunnel) carries no signal, and neither does a
-///   same-uid process that left every agent's ancestry (`setsid -f`
-///   with redirected stdio, an orphan of a dead managed provider).
-///   Replacing it with positive proof is CAD-335 phase 2 (ADR 0004).
+///   operator (`operator (ui)`). That is a DEFAULT, not proof: the
+///   operator's own peer (the tailnet `socat` relay, an ssh tunnel)
+///   carries no signal, and neither does a same-uid process that left
+///   every agent's ancestry (`setsid -f` with redirected stdio, an
+///   orphan of a dead managed provider). Replacing it with positive
+///   proof is CAD-335 phase 2 (ADR 0004).
 fn write_caller(
     request: &Request,
     state_dir: &Path,
     opts: &ServeOpts,
 ) -> std::result::Result<WriteCaller, HttpResp> {
+    let proxy = tailnet_proxy(request, opts);
+    if proxy == Some(Ok(())) {
+        return Ok(WriteCaller::Operator(
+            tailnet_login(request).unwrap_or_else(|| UI_ACTOR.to_string()),
+        ));
+    }
     let agent = agent_roots(state_dir).and_then(|roots| {
         if roots.is_empty() {
             return Ok(None);
@@ -1276,19 +1293,22 @@ fn write_caller(
     });
     match agent {
         Ok(Some(alias)) => Ok(WriteCaller::Agent(alias)),
-        Ok(None) => Ok(WriteCaller::Operator(request_actor(request, opts))),
-        Err(_) if tailnet_request(request, opts) => {
-            Ok(WriteCaller::Operator(request_actor(request, opts)))
+        Ok(None) => Ok(WriteCaller::Operator(UI_ACTOR.to_string())),
+        Err(why) => {
+            let proxy = match proxy {
+                Some(Err(p)) => format!(" It is not the tailscale proxy either: {p}."),
+                _ => String::new(),
+            };
+            Err(guard_fail(
+                "caller_identity",
+                &format!(
+                    "board write refused: caller identity underivable — {why}.{proxy} \
+                     Writes attribute the peer process to the registered pane \
+                     or managed endpoint it is tied to, or to the operator when \
+                     it is tied to none."
+                ),
+            ))
         }
-        Err(why) => Err(guard_fail(
-            "caller_identity",
-            &format!(
-                "board write refused: caller identity underivable — {why}. \
-                 Writes attribute the peer process to the registered pane \
-                 or managed endpoint it is tied to, or to the operator when \
-                 it is tied to none."
-            ),
-        )),
     }
 }
 
@@ -2182,7 +2202,6 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
     };
 
     let send = |req: Request, resp: HttpResp| send(req, resp, head_only);
-    let actor = request_actor(&request, opts);
 
     if is_write {
         write_route(
@@ -2200,6 +2219,7 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
         // the one deploy drift measures).
         "/api/meta" => {
             let daemon = client::rpc(state_dir, "daemon_info", json!({})).ok();
+            let actor = request_actor(&request, opts);
             send(
                 request,
                 json_response(json!({
@@ -3161,14 +3181,15 @@ fn ts_status(state_dir: &Path) -> Result<i32> {
             "writable"
         }
     );
-    // The identity probe: a request shaped like the proxy's — loopback
-    // peer, tailnet Host, a login header — must resolve to
-    // `<login> (tailscale)`.
+    // The identity probe (CAD-336): a local request shaped like the
+    // proxy's — loopback peer, tailnet Host, a login header — is NOT
+    // the proxy and must resolve to the plain operator. The real login
+    // shows only through the tailnet URL (`<url>/api/meta`).
     if read_pid(state_dir).is_some() {
         let ui_port = opts.port.unwrap_or(3010);
-        let login = std::env::var("USER").unwrap_or_else(|_| "operator".to_string());
         let host_hdr = format!("{}:{}", ts.dns_name, ts.https_port);
-        let login_hdr = format!("Tailscale-User-Login: {login}");
+        let forged = "forged-probe@cadence.invalid";
+        let login_hdr = format!("Tailscale-User-Login: {forged}");
         match http_get(
             "127.0.0.1",
             ui_port,
@@ -3181,7 +3202,17 @@ fn ts_status(state_dir: &Path) -> Result<i32> {
                     .ok()
                     .and_then(|v| v["actor"].as_str().map(str::to_string))
                     .unwrap_or_default();
-                println!("identity: {actor}  (test request)");
+                if actor.contains(forged) {
+                    println!(
+                        "identity: FORGEABLE — a local process posing as the proxy \
+                         resolved to {actor}"
+                    );
+                } else {
+                    println!(
+                        "identity: local forged login ignored ({actor}); tailnet \
+                         logins resolve only via {url}/api/meta"
+                    );
+                }
             }
             Ok((code, _)) => println!("identity: probe answered http {code}"),
             Err(e) => println!("identity: probe failed — {e}"),

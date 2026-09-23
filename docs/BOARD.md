@@ -673,15 +673,25 @@ leaves the mapping in place; `ui stop --tailscale-off` is the same
 removal without the restart semantics. `funnel` is never invoked —
 tailnet-only, no public exposure.
 
-Writers are attributed per request: when tailscale sharing is armed
-**and** the TCP peer is loopback **and** the request's `Host` is the
-tailnet name, `Tailscale-User-Login` resolves the actor to
-`<login> (tailscale)` — the tracker commit's `Actor:` trailer names the
-person who wrote. The same headers on a direct loopback request
-(non-tailnet `Host`) are ignored; the default actor stays
-`operator (ui)` — unless the peer is tied to a registered pane or
-descends from a managed endpoint's provider process, in which case the
-write is that agent's (see [Write identity](#write-identity)).
+Writers are attributed per request. `Tailscale-User-Login` resolves
+the actor to `<login> (tailscale)` — the tracker commit's `Actor:`
+trailer names the person who wrote — only for a request **proven** to
+come through `tailscale serve` (CAD-336): tailscale sharing is armed,
+the request's `Host` is the tailnet name, **and** the connection's
+client socket belongs to tailscaled's uid. Host and a loopback peer
+prove nothing — any local process can send both — so the proof is the
+socket's owner: the kernel records the uid that created every socket
+(the `uid` column of `/proc/net/tcp{,6}`, readable for another user's
+socket), and tailscaled's uid is the owner of its LocalAPI socket
+(`/run/tailscale/tailscaled.sock`, which only tailscaled's user can
+create). A local process runs as the operator's uid, never
+tailscaled's, so the same headers from it — under the tailnet `Host`
+or any other — are ignored: the write is attributed to the process
+itself, `operator (ui)` or the agent of the pane it is tied to (see
+[Write identity](#write-identity)). Fail closed: when tailscaled's
+LocalAPI socket is elsewhere, or tailscaled runs as the board's own
+uid (userspace networking under the operator's account), no request
+is ever proven and tailnet logins are not recorded.
 `GET /api/meta` reports `{read_only, actor,
 tailnet_url, version, build_commit, build_time, daemon}` so the SPA
 renders the right controls and the serving binary's build identity.
@@ -696,8 +706,9 @@ Threat model, unchanged in four lines:
    allowed Host; `https://<dns>:<port>` the only new write Origin.
    Everything else is `421`/`403` exactly as before.
 4. **Header trust rule** — `Tailscale-User-*` identity headers count
-   only on the tailnet `Host` from a loopback peer; forged headers on
-   direct loopback are ignored.
+   only on the tailnet `Host` from a peer proven to be tailscaled (its
+   socket's uid); the same headers from any other local process are
+   ignored.
 
 `--read-only` on `tailscale start` is the browse-only share: every
 write route answers `403` with `check: "read_only"` and the SPA hides
@@ -803,7 +814,7 @@ CAD-263), never from anything the request says:
 |---|---|
 | tied to exactly one registered pane, or descends from exactly one live managed endpoint's provider | that agent's alias — commit subject, `Actor:` trailer, comment author, ack `by`, settings attribution; never `operator` |
 | walks cleanly and is tied to no agent (the operator's browser, an ssh tunnel, the loopback gateway, the tailnet `socat` relay) | `operator (ui)` |
-| tailnet-shaped request (see Remote access) tied to no agent | `<login> (tailscale)` as before |
+| proven `tailscale serve` proxy (see Remote access) | `<login> (tailscale)` |
 | cannot be attributed — socket owned by another user's process, ancestry unreadable, tied to several agents, or a store exists but the daemon cannot list its agents | refused: `403`, `check: "caller_identity"`, naming why |
 
 **"Tied to no agent" is not proof of the operator.** It is the absence
