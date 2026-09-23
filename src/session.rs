@@ -720,7 +720,7 @@ fn scope(project: Option<&str>) -> Result<Scope> {
     if let Some(want) = project {
         if !all.iter().any(|p| p.key == want) {
             return Err(Error::rejected(format!(
-                "unknown project '{want}' — `cadence project ls` lists the keys"
+                "unknown project '{want}' — `cadence issue project ls` lists the keys"
             )));
         }
         projects.retain(|p| p.key == want);
@@ -907,8 +907,11 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                         "daemon behind — run `cadence daemon restart`",
                     );
                 } else {
-                    let up = itime::now_epoch() - info["started_at"].as_i64().unwrap_or(0);
-                    drow = drow.ok(format!("up {}m, {} agents", up / 60, fl.agents.len()));
+                    let up = match uptime_mins(info, itime::now_epoch()) {
+                        Some(m) => format!("up {m}m"),
+                        None => "uptime unknown".to_string(),
+                    };
+                    drow = drow.ok(format!("{up}, {} agents", fl.agents.len()));
                 }
             }
             None => {
@@ -1568,6 +1571,14 @@ struct EndActions {
     finish_notes: Vec<String>,
 }
 
+/// Daemon uptime in whole minutes from `daemon_info`. `started_at` is
+/// fractional epoch seconds, so it is read as f64; a missing or future
+/// value is unknown rather than measured from the epoch.
+fn uptime_mins(info: &Value, now: i64) -> Option<i64> {
+    let started = info["started_at"].as_f64().filter(|s| *s > 0.0)? as i64;
+    (now >= started).then(|| (now - started) / 60)
+}
+
 /// The handoff filename — timestamped so two runs the same day never
 /// overwrite each other; `n` disambiguates same-second runs.
 fn handoff_name(now: i64, n: u32) -> String {
@@ -1762,6 +1773,17 @@ fn handoff_md(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uptime_reads_fractional_started_at() {
+        // daemon_info serializes started_at as f64 epoch seconds; an
+        // integer read yields None and used to measure from 1970.
+        let info = json!({"started_at": 1_000_000.75});
+        assert_eq!(uptime_mins(&info, 1_000_000 + 125), Some(2));
+        assert_eq!(uptime_mins(&json!({}), 1_000_000), None);
+        assert_eq!(uptime_mins(&json!({"started_at": 0.0}), 1_000_000), None);
+        assert_eq!(uptime_mins(&info, 999_000), None);
+    }
 
     // These pin the session-side boundary — every display line goes
     // through `scrub_line` before it renders or serializes.

@@ -340,6 +340,13 @@ pub(crate) fn caller_chain(mut pid: u32) -> Option<Vec<u32>> {
     Some(chain)
 }
 
+/// Whether `text` holds a character the literal paste refuses: any C0
+/// control (newline included) or DEL. Shared by the adapter's pre-write
+/// check and the send/dispatch paths that refuse before enqueue.
+pub fn has_control_chars(text: &str) -> bool {
+    text.chars().any(|c| (c as u32) < 32 || c as u32 == 127)
+}
+
 /// A pty provider's forbidden input prefixes — the profile's own list,
 /// surfaced here so the briefing can warn without constructing a
 /// profile. Unknown providers get an empty list (no hazard asserted).
@@ -895,7 +902,7 @@ impl ProviderAdapter for PtyAdapter {
         if prompt.is_empty() || prompt.len() > 4000 {
             return Err(Error::pre_write("PTY messages must be 1–4000 characters"));
         }
-        if prompt.chars().any(|c| (c as u32) < 32 || c as u32 == 127) {
+        if has_control_chars(prompt) {
             return Err(Error::pre_write(
                 "PTY messages must be a single line without control characters",
             ));

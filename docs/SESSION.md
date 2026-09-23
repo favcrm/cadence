@@ -127,6 +127,11 @@ bytes. Opt out with `[host] wal_checkpoint: false`; preview with
 `pm.yaml [host]` also tunes `mem_warn_pct`/`mem_fail_pct` (15/5) and
 `swap_warn_pct`/`swap_fail_pct` (20/5) — and note `Committed_AS` over
 `CommitLimit` under heuristic overcommit is normal, not a failure.
+A `[host]` table that cannot be applied (an unknown key or a bad value,
+such as a quoted `"false"`) is never dropped silently: every threshold
+falls back to its default, the WAL watch turns **off**, and `doctor
+--host` shows a `config` warn naming the key. `project.yaml` refuses
+unknown keys the same way.
 
 Slice the backlog before you plan rather than scrolling it.
 `cadence issue ls --open` is everything still live; narrow it with

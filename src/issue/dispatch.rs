@@ -68,7 +68,7 @@ fn check_body(body: &str, provider: &str) -> Result<()> {
     if body.is_empty() || body.len() > 4000 {
         return Err(Error::rejected("Dispatch body must be 1–4000 characters"));
     }
-    if body.chars().any(|c| (c as u32) < 32 || c as u32 == 127) {
+    if pty::has_control_chars(body) {
         return Err(Error::rejected(
             "Dispatch body must be a single line without control characters",
         ));
