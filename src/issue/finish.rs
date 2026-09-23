@@ -5,20 +5,25 @@
 //! issue's `message` refs, or a job task's recorded worktree), an
 //! unreconciled `unknown` message bound the same way or held by a
 //! registered agent whose cwd is on the worktree, a pane
-//! process tree with cwd inside it, or any process standing in it —
-//! plus a dirty worktree (ignored paths don't count) and a branch
-//! whose work survives nowhere — merged into the repo's default
-//! branch by ancestry, patch-equivalent commits, a squash merge, or
-//! a merged PR, or pushed. A busy owner working ELSEWHERE is not a
-//! reason. `--force` overrides each and is recorded as a `Forced:`
-//! trailer on the finish commit. Refs are kept as history, marked
-//! `closed: true`; the issue's status is untouched — status follows
-//! the job or the PM. `issue finish --merged` sweeps every open
-//! worktree ref whose branch is merged and whose guard passes. A
-//! recorded directory that is already missing, or a branch checked
-//! out at a different live path, is skipped for reconciliation
-//! instead of finished — the sweep does not close those refs or
-//! delete those branches.
+//! process tree with cwd inside it, any process standing in it, or
+//! any non-ignored file modified within `ACTIVE_WINDOW` (CAD-275) —
+//! plus a dirty worktree (ignored paths don't count), a branch that
+//! has not started (no commits beyond where it was cut — never
+//! "merged", CAD-275) and a branch whose work survives nowhere —
+//! merged into the repo's default branch by ancestry,
+//! patch-equivalent commits, a squash merge, or a merged PR, or
+//! pushed. A busy owner working ELSEWHERE is not a reason. `--force`
+//! overrides each and is recorded as a `Forced:` trailer on the
+//! finish commit. Refs are kept as history, marked `closed: true`;
+//! the issue's status is untouched — status follows the job or the
+//! PM. An issue with several open worktree refs needs `--worktree
+//! <path>` to name one (CAD-274); a named directory already gone only
+//! closes its refs. `issue finish --merged` sweeps every open
+//! worktree ref whose branch is merged and whose guard passes; an
+//! unstarted branch is `skipped(not started)`. A recorded directory
+//! that is already missing, or a branch checked out at a different
+//! live path, is skipped for reconciliation instead of finished — the
+//! sweep does not close those refs or delete those branches.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -30,7 +35,8 @@ use tempfile::TempDir;
 use crate::adapter::pty;
 use crate::client;
 use crate::error::{Error, Result};
-use crate::issue::{board, model::Front, project, write, Pm};
+use crate::issue::model::{Front, Ref};
+use crate::issue::{board, project, start, write, Pm};
 use crate::proc::{run_bounded, BoundedError};
 
 /// Every git/gh probe in this file runs through the bounded runner —
@@ -259,20 +265,67 @@ enum Resolve {
     Target(Box<Target>),
 }
 
+/// The recorded paths of `lanes`, one per line, for refusals.
+fn lane_list(lanes: &[&Ref]) -> String {
+    lanes
+        .iter()
+        .filter_map(|r| r.path.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n  ")
+}
+
 /// Load the issue and resolve its open worktree/branch refs + repo
-/// root — shared by `run` and the `--merged` sweep. The first OPEN
-/// worktree ref pairs with the open branch ref of the SAME name — a
-/// re-start under `--name` leaves older pairs behind, and
-/// first-of-kind matching could fuse halves of different pairs. A
-/// lone open branch ref (hand-edited history) is still finishable on
-/// its own.
-fn resolve(pm: &Pm, id: &str) -> Result<Resolve> {
+/// root — shared by `run` and the `--merged` sweep. `pick` names the
+/// worktree ref to finish (`--worktree`, and each sweep row); without
+/// it the issue must have at most one open worktree ref — several
+/// refuse, listed, rather than guess (CAD-274). A pick matching only
+/// a closed ref is already finished. The chosen OPEN worktree ref
+/// pairs with the open branch ref of the SAME name — a re-start under
+/// `--name` leaves older pairs behind, and first-of-kind matching
+/// could fuse halves of different pairs. A lone open branch ref
+/// (hand-edited history) is still finishable on its own.
+fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
     let (_project, dir) = write::issue_dir(pm, id)?;
     let (front, body) = write::load_front(&dir)?;
-    let open_wt_ref = front
+    let open_wts: Vec<&Ref> = front
         .refs
         .iter()
-        .find(|r| r.kind == "worktree" && r.closed != Some(true));
+        .filter(|r| r.kind == "worktree" && r.closed != Some(true))
+        .collect();
+    let open_wt_ref = match pick {
+        Some(want) => {
+            let same = |r: &Ref| {
+                r.kind == "worktree"
+                    && r.path
+                        .as_deref()
+                        .is_some_and(|p| same_path(Path::new(p), want))
+            };
+            match open_wts.iter().copied().find(|r| same(r)) {
+                Some(r) => Some(r),
+                None if front.refs.iter().any(same) => return Ok(Resolve::Finished),
+                None => {
+                    return Err(Error::rejected(format!(
+                        "{id} records no open worktree {} — open: {}",
+                        want.display(),
+                        if open_wts.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            format!("\n  {}", lane_list(&open_wts))
+                        }
+                    )))
+                }
+            }
+        }
+        None if open_wts.len() > 1 => {
+            return Err(Error::rejected(format!(
+                "{id} has {} open worktree refs — refusing to guess which \
+                 to finish; pass --worktree <path>:\n  {}",
+                open_wts.len(),
+                lane_list(&open_wts)
+            )))
+        }
+        None => open_wts.first().copied(),
+    };
     let open_wt = open_wt_ref.and_then(|r| r.path.clone()).map(PathBuf::from);
     let cargo_target = open_wt_ref.and_then(|r| r.cargo_target.clone());
     let wt_name = open_wt
@@ -314,27 +367,22 @@ fn resolve(pm: &Pm, id: &str) -> Result<Resolve> {
         return Ok(Resolve::Nothing);
     }
     // The repo root: through the live worktree when it exists, else
-    // any recorded `<root>/.cadence/wt/<name>` path walked upward
-    // (closed refs still name the repo).
+    // the chosen `<root>/.cadence/wt/<name>` path walked upward, else
+    // the first recorded one (closed refs still name the repo).
     let wt_dir = open_wt;
+    let walk = |d: &Path| d.parent()?.parent()?.parent()?.canonicalize().ok();
     let root = wt_dir
         .as_deref()
         .filter(|d| d.is_dir())
         .and_then(|d| project::repo_identity(d).map(|(r, _)| r))
+        .or_else(|| wt_dir.as_deref().and_then(walk))
         .or_else(|| {
             front
                 .refs
                 .iter()
                 .find(|r| r.kind == "worktree")
                 .and_then(|r| r.path.as_deref())
-                .and_then(|d| {
-                    Path::new(d)
-                        .parent()?
-                        .parent()?
-                        .parent()?
-                        .canonicalize()
-                        .ok()
-                })
+                .and_then(|d| walk(Path::new(d)))
         })
         .ok_or_else(|| {
             Error::rejected(format!(
@@ -423,6 +471,59 @@ fn pids_cwd_under(dir: &Path) -> Vec<u32> {
         }
     }
     out
+}
+
+/// CAD-275: how long a worktree must sit untouched before `finish`
+/// treats it as idle. Every non-ignored file counts, so a fresh
+/// checkout is "active" for this long after `issue start`.
+pub(crate) const ACTIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// The most recently modified non-ignored file under `wt` — tracked
+/// or untracked, via `git ls-files` — with its age, when younger than
+/// `ACTIVE_WINDOW`. A file dated in the future counts as just now.
+fn recent_activity(wt: &Path) -> Result<Option<(String, Duration)>> {
+    let out = git_out(
+        wt,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+        &[],
+    )?;
+    if !out.status.success() {
+        return Err(Error::rejected(format!(
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let now = std::time::SystemTime::now();
+    let mut newest: Option<(String, Duration)> = None;
+    for rel in out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let rel = String::from_utf8_lossy(rel);
+        // A tracked file deleted in the tree is the dirty check's.
+        let Ok(modified) = std::fs::symlink_metadata(wt.join(&*rel)).and_then(|m| m.modified())
+        else {
+            continue;
+        };
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if age < ACTIVE_WINDOW && newest.as_ref().is_none_or(|(_, a)| age < *a) {
+            newest = Some((rel.into_owned(), age));
+        }
+    }
+    Ok(newest)
+}
+
+/// `45s`, `12m03s`, `30m` — refusal wording for ages and windows.
+fn fmt_age(d: Duration) -> String {
+    let secs = d.as_secs();
+    match (secs / 60, secs % 60) {
+        (0, s) => format!("{s}s"),
+        (m, 0) => format!("{m}m"),
+        (m, s) => format!("{m}m{s:02}s"),
+    }
 }
 
 /// Best-effort process name for a refusal message.
@@ -594,6 +695,12 @@ fn daemon_view(state_dir: &Path) -> DaemonView {
 enum Branch {
     /// No branch ref recorded, or the recorded ref no longer exists.
     Gone,
+    /// CAD-275: zero commits beyond the commit the branch was cut
+    /// from — the lane has not started, so nothing on it is merged
+    /// (its tip sitting on the default branch proves nothing). Never
+    /// a sweep candidate; an explicit finish needs `--force`. `tip`
+    /// is deletable: the branch holds no work.
+    NotStarted { tip: String },
     /// The ref exists but `merge_rule` does not land — the tip's
     /// commits are covered by no evidence and the branch is never
     /// deleted.
@@ -638,6 +745,38 @@ fn branch_tip(root: &Path, branch: &str) -> Option<String> {
     .ok()
 }
 
+/// Where `branch` was cut: the oldest entry of its reflog — `branch:
+/// Created from …` for every lane `issue start` mints. `None` when
+/// the reflog is gone (expired or disabled): the merge rules decide.
+fn fork_point(root: &Path, branch: &str) -> Option<String> {
+    let log = git(
+        root,
+        &[
+            "reflog",
+            "show",
+            "--format=%H",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .ok()?;
+    log.lines()
+        .last()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+/// CAD-275: zero commits beyond `git merge-base <tip> <fork point>`
+/// — the branch still sits where it was cut (or behind it). Measured
+/// against the fork point, not the default branch: a lane merged by
+/// fast-forward also has no commits beyond the default branch, yet it
+/// did start.
+fn not_started(root: &Path, branch: &str, tip: &str) -> bool {
+    let Some(fork) = fork_point(root, branch) else {
+        return false;
+    };
+    git(root, &["rev-list", "--count", &format!("{fork}..{tip}")]).is_ok_and(|n| n == "0")
+}
+
 /// The tracking tip once: `rev-parse refs/remotes/origin/<branch>`.
 fn tracking_tip(root: &Path, branch: &str) -> Option<String> {
     git(
@@ -667,6 +806,7 @@ fn evidence(t: &Target, remote: bool) -> Evidence {
         .and_then(|d| git(&t.root, &["rev-parse", "--verify", "--quiet", d]).ok());
     let state = match tip {
         None => Branch::Gone,
+        Some(tip) if not_started(&t.root, &t.branch, &tip) => Branch::NotStarted { tip },
         Some(tip) => match into
             .as_deref()
             .and_then(|d| merge_rule(&t.root, &t.branch, &tip, d))
@@ -722,6 +862,10 @@ fn survivability(
 ) -> (Option<&'static str>, Option<String>, Option<Block>) {
     match &ev.state {
         Branch::Merged { how, tip } => (Some(*how), Some(tip.clone()), None),
+        // No work on the branch — deleting it loses nothing. Whether
+        // the lane may be finished at all is `inspect`'s `not-started`
+        // block, not survivability.
+        Branch::NotStarted { tip } => (None, Some(tip.clone()), None),
         Branch::Open { tip } => {
             let pushed = ev
                 .remote_tip
@@ -761,7 +905,9 @@ fn stale_evidence_reason(root: &Path, branch: &str, ev: &Evidence) -> Option<Str
     if !branch.is_empty() {
         let tip_now = branch_tip(root, branch);
         let ev_tip = match &ev.state {
-            Branch::Merged { tip, .. } | Branch::Open { tip } => Some(tip.clone()),
+            Branch::Merged { tip, .. } | Branch::Open { tip } | Branch::NotStarted { tip } => {
+                Some(tip.clone())
+            }
             Branch::Gone => None,
         };
         if tip_now != ev_tip {
@@ -1226,6 +1372,47 @@ fn inspect(view: &DaemonView, state_dir: &Path, t: &Target, ev: &Evidence) -> Ch
             }
         }
     }
+    // CAD-275: recent activity. A worker cadence cannot see (a
+    // subagent with no registered pane, message or process cwd in the
+    // lane) still leaves fresh files behind — the newest non-ignored
+    // file, tracked or untracked, is the evidence. A tree that cannot
+    // be listed refuses too: unreadable is not idle.
+    if let Some(d) = t.wt_dir.as_deref().filter(|d| d.is_dir()) {
+        match recent_activity(d) {
+            Err(e) => blocks.push(Block {
+                tag: "activity-check-failed".to_string(),
+                reason: format!(
+                    "Cannot check {} for recent activity ({e}) — refusing \
+                     to guess; pass --force",
+                    d.display()
+                ),
+            }),
+            Ok(Some((path, age))) => blocks.push(Block {
+                tag: "recent-activity".to_string(),
+                reason: format!(
+                    "Worktree {} was modified {} ago ({path}) — it may be in \
+                     use; finish once it has been idle {}, or pass --force",
+                    d.display(),
+                    fmt_age(age),
+                    fmt_age(ACTIVE_WINDOW)
+                ),
+            }),
+            Ok(None) => {}
+        }
+    }
+    // CAD-275: a branch that has not started is never merged — finish
+    // would remove a lane someone may be about to use.
+    if matches!(ev.state, Branch::NotStarted { .. }) {
+        blocks.push(Block {
+            tag: "not-started".to_string(),
+            reason: format!(
+                "Branch '{}' has no commits beyond where it was cut — the \
+                 lane has not started, so nothing is merged. Pass --force \
+                 to finish an abandoned lane",
+                t.branch
+            ),
+        });
+    }
     // Survivability: the branch's work must survive somewhere — merged
     // into the repo's default branch or pushed.
     if let (_, _, Some(b)) = survivability(ev, t) {
@@ -1243,7 +1430,23 @@ fn inspect(view: &DaemonView, state_dir: &Path, t: &Target, ev: &Evidence) -> Ch
     Check { blocks }
 }
 
-/// `issue finish <ID> [--force] [--keep-branch] [--remote]` — JSON like
+/// What one `issue finish <ID>` does — the CLI flags, and each sweep
+/// row's (which never forces).
+pub(crate) struct FinishArgs<'a> {
+    pub force: bool,
+    pub keep_branch: bool,
+    pub remote: bool,
+    /// Finish exactly this open worktree ref — `--worktree`, and each
+    /// sweep row. Required when the issue has several.
+    pub worktree: Option<&'a Path>,
+    /// `--worktree` only (CAD-274): a recorded directory that is
+    /// already gone closes its worktree/branch refs in one tracker
+    /// commit and touches no git state — the branch, if any, is kept.
+    /// The sweep never sets it: its missing-dir rows stay open.
+    pub close_if_gone: bool,
+}
+
+/// `issue finish <ID> [--worktree P] [--force] [--keep-branch] [--remote]` — JSON like
 /// the other issue verbs. Runs in two phases so the pm lock is never
 /// held across a daemon RPC, a `fetch` or a `gh` call: the resolve +
 /// probe (daemon view, /proc scans, git and gh evidence, the remote
@@ -1253,17 +1456,15 @@ fn inspect(view: &DaemonView, state_dir: &Path, t: &Target, ev: &Evidence) -> Ch
 /// write. `shared` lets a sweep reuse one enumeration for every
 /// issue instead of re-issuing `agent_list` + `task_show`×N per row;
 /// a binding added mid-sweep still lands as a stale probe.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     pm: &Pm,
     id: &str,
-    force: bool,
-    keep_branch: bool,
-    remote: bool,
+    args: &FinishArgs,
     actor: &str,
     state_dir: &Path,
     shared: Option<&DaemonView>,
 ) -> Result<Value> {
+    let force = args.force;
     // Phase 1 — the unlocked probe. Nothing here holds the pm lock:
     // one enumeration + the merge/remote evidence (incl. the
     // `--remote` fetch and `gh`) all resolve before any lock.
@@ -1275,7 +1476,7 @@ pub(crate) fn run(
             &owned
         }
     };
-    let probe = match resolve(pm, id)? {
+    let probe = match resolve(pm, id, args.worktree)? {
         Resolve::Nothing => {
             return Err(Error::rejected(format!(
                 "{id}: no worktree/branch refs recorded — nothing to finish"
@@ -1287,6 +1488,12 @@ pub(crate) fn run(
         }
         Resolve::Target(t) => t,
     };
+    // A gone directory under `--worktree` only closes refs: nothing
+    // is removed or deleted, so no branch or remote is touched and
+    // survivability has nothing to protect.
+    let refs_only = args.close_if_gone && probe.wt_dir.as_deref().is_some_and(|d| !d.is_dir());
+    let keep_branch = args.keep_branch || refs_only;
+    let remote = args.remote && !refs_only;
     let ev = evidence(&probe, remote);
     let (merged_how, tip, _) = survivability(&ev, &probe);
     // The --remote coverage decision is probe data too — `gh` runs
@@ -1308,6 +1515,9 @@ pub(crate) fn run(
     let check = inspect(view, state_dir, &probe, &ev);
     let mut overridden = Vec::new();
     for b in check.blocks {
+        if refs_only && matches!(b.tag.as_str(), "not-started" | "unmerged-unpushed") {
+            continue;
+        }
         if force {
             overridden.push(b.tag);
         } else {
@@ -1320,7 +1530,7 @@ pub(crate) fn run(
     // input the probe's evidence depended on is unmoved — all local
     // `rev-parse`s; nothing networked runs while holding the lock.
     let _lock = pm.lock()?;
-    let mut t = match resolve(pm, id)? {
+    let mut t = match resolve(pm, id, args.worktree)? {
         // A concurrent finish closed the pair mid-probe — the same
         // idempotent answer the unlocked probe would have given.
         Resolve::Finished => {
@@ -1388,6 +1598,9 @@ pub(crate) fn run(
     }
     let mut deleted_branch = false;
     let mut branch_note = Value::Null;
+    if refs_only && branch_tip(&root, &branch).is_some() {
+        branch_note = json!("kept: the worktree dir was already gone — refs closed only");
+    }
     if !keep_branch && !branch.is_empty() {
         if keep_for_remote {
             branch_note = json!(format!(
@@ -1520,6 +1733,8 @@ pub(crate) fn run(
         "forced": force,
         "overrode": overridden,
         "merged_by": merged_by,
+        "not_started": matches!(ev.state, Branch::NotStarted { .. }),
+        "refs_only": refs_only,
         "status": t.front.status,
     });
     if let Some(target) = &cargo_target {
@@ -1642,6 +1857,114 @@ fn annotate_preview(row: &mut Value, preview: &PathPreview) {
         .unwrap_or(Value::Null);
 }
 
+/// One sweep row for `id`'s open worktree ref `lane` — `None` when
+/// the ref no longer resolves to a worktree target. The bool is true
+/// when the row is `refused`.
+#[allow(clippy::too_many_arguments)]
+fn sweep_row(
+    pm: &Pm,
+    id: &str,
+    lane: &Path,
+    remote: bool,
+    dry_run: bool,
+    actor: &str,
+    state_dir: &Path,
+    view: &DaemonView,
+) -> (Option<Value>, bool) {
+    let mut row = json!({
+        "issue": id,
+        "worktree": lane,
+        "branch": Value::Null,
+        "merged_by": Value::Null,
+        "outcome": Value::Null,
+        "reason": Value::Null,
+        "path_state": Value::Null,
+        "branch_state": Value::Null,
+        "live_path": Value::Null,
+    });
+    let t = match resolve(pm, id, Some(lane)) {
+        Ok(Resolve::Target(t)) if t.wt_dir.is_some() => t,
+        Ok(_) => return (None, false),
+        Err(e) => {
+            row["outcome"] = json!("refused");
+            row["reason"] = json!(e.to_string());
+            return (Some(row), true);
+        }
+    };
+    row["branch"] = json!(t.branch);
+    // Missing path / branch-at-another-path is not a finish
+    // candidate. Classify before the guard so a gone directory
+    // cannot read as `would-finish`, and skip `run` so a real
+    // sweep cannot close the ref or delete the branch. Explicit
+    // `issue finish <ID>` is unchanged.
+    let preview = path_preview(&t);
+    annotate_preview(&mut row, &preview);
+    // Candidates are merged branches — unmerged or unstarted work is
+    // skipped, never refused (the point of the verb). The sweep's own
+    // evidence never fetches: a real row's `run` fetches for its own
+    // gate at finish time.
+    let ev = evidence(&t, false);
+    if let Some(reason) = preview.reconcile {
+        if let Branch::Merged { how, .. } = &ev.state {
+            row["merged_by"] = json!(how);
+        }
+        row["outcome"] = json!("skipped");
+        row["reason"] = json!(reason);
+        return (Some(row), false);
+    }
+    let skipped = match &ev.state {
+        Branch::Gone if t.branch.is_empty() => Some("no branch ref"),
+        Branch::Gone => Some("branch missing"),
+        Branch::NotStarted { .. } => Some("not started"),
+        Branch::Open { .. } => Some("unmerged"),
+        Branch::Merged { .. } => None,
+    };
+    if let Some(reason) = skipped {
+        row["outcome"] = json!("skipped");
+        row["reason"] = json!(reason);
+        return (Some(row), false);
+    }
+    if let Branch::Merged { how, .. } = &ev.state {
+        row["merged_by"] = json!(how);
+    }
+    if dry_run {
+        return match inspect(view, state_dir, &t, &ev).blocks.first() {
+            Some(b) => {
+                row["outcome"] = json!("refused");
+                row["reason"] = json!(b.reason);
+                (Some(row), true)
+            }
+            None => {
+                row["outcome"] = json!("would-finish");
+                (Some(row), false)
+            }
+        };
+    }
+    let args = FinishArgs {
+        force: false,
+        keep_branch: false,
+        remote,
+        worktree: Some(lane),
+        close_if_gone: false,
+    };
+    match run(pm, id, &args, actor, state_dir, Some(view)) {
+        Ok(out) => {
+            row["outcome"] = json!("finished");
+            row["removed_worktree"] = out["removed_worktree"].clone();
+            row["deleted_branch"] = out["deleted_branch"].clone();
+            row["branch_note"] = out["branch_note"].clone();
+            row["remote_deleted"] = out["remote_deleted"].clone();
+            row["remote_note"] = out["remote_note"].clone();
+            (Some(row), false)
+        }
+        Err(e) => {
+            row["outcome"] = json!("refused");
+            row["reason"] = json!(e.to_string());
+            (Some(row), true)
+        }
+    }
+}
+
 /// `issue finish --merged [--project P] [--remote] [--dry-run]` —
 /// sweep every open worktree ref in scope whose branch is merged into
 /// the repo's default branch and whose per-worktree guard passes.
@@ -1673,99 +1996,18 @@ pub fn sweep(
     let mut rows = Vec::new();
     let mut refused = 0usize;
     for issue in issues {
-        let mut row = json!({
-            "issue": issue.front.id,
-            "worktree": issue.front.refs.iter()
-                .find(|r| r.kind == "worktree" && r.closed != Some(true))
-                .and_then(|r| r.path.clone()),
-            "branch": Value::Null,
-            "merged_by": Value::Null,
-            "outcome": Value::Null,
-            "reason": Value::Null,
-            "path_state": Value::Null,
-            "branch_state": Value::Null,
-            "live_path": Value::Null,
-        });
         let id = issue.front.id.clone();
-        // Only open WORKTREE refs are sweep candidates — a lone open
-        // branch ref is finished by name, not swept.
-        let t = match resolve(pm, &id) {
-            Ok(Resolve::Target(t)) if t.wt_dir.is_some() => t,
-            Ok(_) => continue,
-            Err(e) => {
-                row["outcome"] = json!("refused");
-                row["reason"] = json!(e.to_string());
-                refused += 1;
+        // One row per open WORKTREE ref — a lone open branch ref is
+        // finished by name, not swept; an issue with several lanes
+        // gets a row for each, every one finished by its own path.
+        for lane in start::open_worktrees(&issue.front) {
+            let (row, is_refused) =
+                sweep_row(pm, &id, &lane, remote, dry_run, actor, state_dir, &view);
+            if let Some(row) = row {
+                refused += usize::from(is_refused);
                 rows.push(row);
-                continue;
-            }
-        };
-        row["branch"] = json!(t.branch);
-        // Missing path / branch-at-another-path is not a finish
-        // candidate. Classify before the guard so a gone directory
-        // cannot read as `would-finish`, and skip `run` so a real
-        // sweep cannot close the ref or delete the branch. Explicit
-        // `issue finish <ID>` is unchanged.
-        let preview = path_preview(&t);
-        annotate_preview(&mut row, &preview);
-        // Candidates are merged branches — unmerged work is skipped,
-        // never refused (the point of the verb). The sweep's own
-        // evidence never fetches: a real row's `run` fetches for its
-        // own gate at finish time.
-        let ev = evidence(&t, false);
-        if let Some(reason) = preview.reconcile {
-            if let Branch::Merged { how, .. } = &ev.state {
-                row["merged_by"] = json!(how);
-            }
-            row["outcome"] = json!("skipped");
-            row["reason"] = json!(reason);
-            rows.push(row);
-            continue;
-        }
-        match &ev.state {
-            Branch::Gone => {
-                row["outcome"] = json!("skipped");
-                row["reason"] = json!(if t.branch.is_empty() {
-                    "no branch ref"
-                } else {
-                    "branch missing"
-                });
-            }
-            Branch::Open { .. } => {
-                row["outcome"] = json!("skipped");
-                row["reason"] = json!("unmerged");
-            }
-            Branch::Merged { ref how, .. } => {
-                row["merged_by"] = json!(how);
-                if dry_run {
-                    match inspect(&view, state_dir, &t, &ev).blocks.first() {
-                        Some(b) => {
-                            row["outcome"] = json!("refused");
-                            row["reason"] = json!(b.reason);
-                            refused += 1;
-                        }
-                        None => row["outcome"] = json!("would-finish"),
-                    }
-                } else {
-                    match run(pm, &id, false, false, remote, actor, state_dir, Some(&view)) {
-                        Ok(out) => {
-                            row["outcome"] = json!("finished");
-                            row["removed_worktree"] = out["removed_worktree"].clone();
-                            row["deleted_branch"] = out["deleted_branch"].clone();
-                            row["branch_note"] = out["branch_note"].clone();
-                            row["remote_deleted"] = out["remote_deleted"].clone();
-                            row["remote_note"] = out["remote_note"].clone();
-                        }
-                        Err(e) => {
-                            row["outcome"] = json!("refused");
-                            row["reason"] = json!(e.to_string());
-                            refused += 1;
-                        }
-                    }
-                }
             }
         }
-        rows.push(row);
     }
     Ok(json!({
         "rows": rows,
@@ -1804,6 +2046,39 @@ mod tests {
             msg_refs: HashSet::new(),
             cargo_target: None,
         }
+    }
+
+    /// CAD-275: "not started" is measured from where the branch was
+    /// cut, not from the default branch — a lane fast-forwarded into
+    /// main also has no commits beyond main, yet it did start.
+    #[test]
+    fn not_started_measures_from_the_fork_point() {
+        let tmp = repo();
+        let r = tmp.path();
+        git(r, &["branch", "lane"]).unwrap();
+        let tip = git(r, &["rev-parse", "lane"]).unwrap();
+        assert!(not_started(r, "lane", &tip), "cut and untouched");
+        git(r, &["checkout", "-q", "lane"]).unwrap();
+        std::fs::write(r.join("f"), "two").unwrap();
+        git(r, &["commit", "-qam", "two"]).unwrap();
+        git(r, &["checkout", "-q", "main"]).unwrap();
+        git(r, &["merge", "-q", "--ff-only", "lane"]).unwrap();
+        let tip = git(r, &["rev-parse", "lane"]).unwrap();
+        assert!(ancestor(r, &tip, "main"));
+        assert!(!not_started(r, "lane", &tip), "fast-forwarded work started");
+        // No reflog (expired or disabled): no fork point, and the
+        // merge rules decide — never a guess of "not started".
+        git(r, &["-c", "core.logAllRefUpdates=false", "branch", "bare"]).unwrap();
+        assert!(fork_point(r, "bare").is_none());
+        assert!(!not_started(r, "bare", &tip));
+    }
+
+    #[test]
+    fn fmt_age_reads_like_a_person() {
+        assert_eq!(fmt_age(Duration::from_secs(0)), "0s");
+        assert_eq!(fmt_age(Duration::from_secs(45)), "45s");
+        assert_eq!(fmt_age(Duration::from_secs(12 * 60 + 3)), "12m03s");
+        assert_eq!(fmt_age(ACTIVE_WINDOW), "30m");
     }
 
     #[test]

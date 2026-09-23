@@ -105,6 +105,17 @@ fn add_lane(repo: &Path, path: &Path, branch: &str, file: &str, merge: bool) {
     }
 }
 
+/// CAD-275: age every file under `dir` past `issue finish`'s
+/// 30-minute active window — a lane nobody has touched since.
+fn idle(dir: &Path) {
+    let st = Command::new("find")
+        .arg(dir)
+        .args(["-exec", "touch", "-h", "-d", "2 hours ago", "{}", "+"])
+        .status()
+        .unwrap();
+    assert!(st.success(), "backdate {}", dir.display());
+}
+
 fn row<'a>(plan: &'a Value, id: &str) -> &'a Value {
     plan["rows"]
         .as_array()
@@ -224,6 +235,8 @@ fn finish_preview_classifies_missing_worktrees_without_finishing_them() {
     std::fs::remove_dir_all(wt("p-6-stale")).unwrap();
     git(&wt("p-7-present"), &["checkout", "--detach"]);
     git(&repo, &["branch", "-D", &branch("p-7-present")]);
+    // The idle merged lane has sat untouched past the active window.
+    idle(&wt("p-8-live"));
 
     std::fs::create_dir_all(pm_dir.join("demo")).unwrap();
     std::fs::write(
