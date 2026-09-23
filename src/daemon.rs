@@ -1920,6 +1920,9 @@ impl Shared {
             "slot_runner" => self.rpc_slot_runner(params, peer_pid),
             "approval_record" => self.rpc_approval_record(params, peer_pid),
             "approval_revoke" => self.rpc_approval_revoke(params, peer_pid),
+            "plan_propose" => self.rpc_plan_propose(params, peer_pid),
+            "plan_approve" => self.rpc_plan_decide(params, peer_pid, true),
+            "plan_reject" => self.rpc_plan_decide(params, peer_pid, false),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -3000,6 +3003,115 @@ impl Shared {
             "reason": reason,
             "recorded_via": APPROVAL_RECORDED_VIA,
         }))
+    }
+
+    /// CAD-360: the plan gate for every daemon dispatch of a task —
+    /// `task_dispatch` and both monitor paths. A task whose job is bound
+    /// to a tracker issue dispatches only if [`crate::issue::plan::gate_id`]
+    /// passes. Fail closed: a task or job that cannot be read, or a
+    /// tracker dir that cannot be resolved, refuses; only a job with no
+    /// issue, or an issue no project holds, passes unchecked.
+    fn plan_gate_task(&self, task_id: &str) -> Result<()> {
+        let task = self.store.task(task_id)?;
+        let job = self.store.job(&task.job_id)?;
+        let Some(issue) = job.issue_id else {
+            return Ok(());
+        };
+        let pm_dir = self.pm_dir().map_err(|e| {
+            Error::invalid(
+                "plan_unreadable",
+                format!("tracker dir for {issue} cannot be resolved ({e}) — refused"),
+            )
+        })?;
+        crate::issue::plan::gate_id(&pm_dir, &issue)
+    }
+
+    /// CAD-359 `plan_propose` — write a plan (epic + tickets, one
+    /// tracker commit) and emit `plan_proposed` on the daemon stream for
+    /// a UI's plan card. The proposer is the connection's: a pane or
+    /// managed endpoint's lane, else the proven operator; anything
+    /// unattributable is refused, as is an identity-shaped field.
+    fn rpc_plan_propose(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        for field in [
+            "by",
+            "actor",
+            "alias",
+            "lane",
+            "pane",
+            "pid",
+            "operator",
+            "proposed_by",
+        ] {
+            if params.get(field).is_some() {
+                return Err(Error::rejected(format!(
+                    "plan propose attribution is connection-bound; request field \
+                     '{field}' is not accepted"
+                )));
+            }
+        }
+        let actor = match self.slot_identity(peer_pid)? {
+            Some(who) => who.lane().to_string(),
+            None => match self.operator_evidence(peer_pid) {
+                Ok(()) => "operator".to_string(),
+                Err(why) => {
+                    return Err(Error::rejected(format!(
+                        "plan propose needs an attributable caller — a pane agent, an \
+                         enrolled managed endpoint or the proven operator: {why}"
+                    )))
+                }
+            },
+        };
+        let project = required_str(params, "project")?;
+        let text = required_str(params, "text")?;
+        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let allow = crate::secret::Allowlist::load(&self.state_dir)?;
+        let out = crate::issue::plan::propose(&pm, project, text, &allow, &actor)?;
+        let _ = self.store.event_public(
+            DAEMON_ALIAS,
+            "plan_proposed",
+            json!({
+                "epic": out["epic"],
+                "project": out["project"],
+                "title": out["title"],
+                "tickets": out["tickets"],
+                "ticket_count": out["tickets"].as_array().map_or(0, Vec::len),
+                "proposed_by": out["proposed_by"],
+            }),
+        );
+        self.wake();
+        Ok(out)
+    }
+
+    /// CAD-360 `plan_approve` / `plan_reject` — operator only, exactly
+    /// the connection-bound rule of the approval-evidence verbs
+    /// ([`Self::approval_operator`]): an agent caller is refused, and a
+    /// caller with no agent identity must be the proven operator
+    /// (CAD-276). The decision is a tracker commit; approval moves the
+    /// plan's backlog tickets to ready.
+    fn rpc_plan_decide(&self, params: &Value, peer_pid: u32, approve: bool) -> Result<Value> {
+        let verb = if approve {
+            "plan approve"
+        } else {
+            "plan reject"
+        };
+        self.approval_operator(verb, params, peer_pid)?;
+        let epic = required_str(params, "epic")?;
+        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let out = crate::issue::write::decide_plan(
+            &pm,
+            epic,
+            approve,
+            "operator",
+            optional_str(params, "reason"),
+        )?;
+        let kind = if approve {
+            "plan_approved"
+        } else {
+            "plan_rejected"
+        };
+        let _ = self.store.event_public(DAEMON_ALIAS, kind, out.clone());
+        self.wake();
+        Ok(out)
     }
 
     fn rpc_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -4453,6 +4565,7 @@ impl Shared {
             .map(|a| self.resolve_alias(a))
             .transpose()?;
         let by = optional_str(params, "by").unwrap_or("operator");
+        self.plan_gate_task(required_str(params, "task")?)?;
         let (task, message, duplicate, behind_dead) = self.store.dispatch_task(
             required_str(params, "task")?,
             to.as_deref(),
@@ -4701,6 +4814,7 @@ impl Shared {
         automatic: bool,
     ) -> Result<Value> {
         if automatic {
+            self.plan_gate_task(task_id)?;
             // Hold the pending-request mutex across the store transaction.
             // The snapshot contains every alias, while the transaction
             // re-reads the task's current assignee before applying it, so an
@@ -4758,6 +4872,7 @@ impl Shared {
         }
         let task = self.store.task(task_id)?;
         let job = self.store.job(&task.job_id)?;
+        self.plan_gate_task(task_id)?;
         if job.state != "open" || job.repo.as_deref() != Some(monitor.project.as_str()) {
             return Err(Error::rejected(format!(
                 "Task '{task_id}' is not in monitor project '{}' with an open job",

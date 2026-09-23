@@ -811,6 +811,15 @@ enum Commands {
         #[command(subcommand)]
         action: cadence_agent::issue::cli::IssueAction,
     },
+    /// Plans (CAD-359/360): a proposed epic with its tickets. `propose`
+    /// writes it from a Markdown file; the operator `approve`s or
+    /// `reject`s it (operator connection only); until approved none of
+    /// its tickets dispatch. `show` prints state, tickets and
+    /// size-weighted progress.
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
     /// File a report: a question, feedback, idea or bug becomes a
     /// tracker issue with context — instead of dying in a terminal
     /// scrollback. Routing is by kind, not by cwd: `question`,
@@ -2133,6 +2142,75 @@ enum MessageAction {
         #[arg(long)]
         reason: Option<String>,
     },
+}
+
+/// `cadence plan` verbs. Writes go through the daemon, which
+/// attributes the proposer from the connection and refuses any agent
+/// connection for a decision.
+#[derive(Subcommand)]
+enum PlanAction {
+    /// Create an epic (the plan, `proposed`) and one backlog ticket per
+    /// `## <title>` section of `--file`, in one tracker commit.
+    Propose {
+        /// Project key the plan files into.
+        #[arg(long)]
+        project: String,
+        /// Plan Markdown: frontmatter `title`, `goal`, `non_goals`; one
+        /// `## <ticket>` section each with optional `size: S|M|L`,
+        /// `agent: <alias>`, `depends_on: 2, CAD-9` lines and a
+        /// `### Acceptance` checklist.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Approve a proposed plan: its backlog tickets move to ready and
+    /// may dispatch. Operator only.
+    Approve {
+        /// The plan's epic id.
+        epic: String,
+    },
+    /// Reject a proposed plan. Operator only.
+    Reject {
+        /// The plan's epic id.
+        epic: String,
+        /// Why — recorded on the epic.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Plan state, tickets with status, and size-weighted progress
+    /// (S=1 M=3 L=8, unsized=M). Read-only.
+    Show {
+        /// The plan's epic id.
+        epic: String,
+    },
+}
+
+fn run_plan(state_dir: &Path, action: PlanAction) -> Result<i32> {
+    let result = match action {
+        PlanAction::Propose { project, file } => {
+            let text = std::fs::read_to_string(&file).map_err(|e| {
+                Error::rejected(format!("Cannot read plan {}: {e}", file.display()))
+            })?;
+            client::rpc(
+                state_dir,
+                "plan_propose",
+                json!({"project": project, "text": text}),
+            )?
+        }
+        PlanAction::Approve { epic } => {
+            client::rpc(state_dir, "plan_approve", json!({"epic": epic}))?
+        }
+        PlanAction::Reject { epic, reason } => client::rpc(
+            state_dir,
+            "plan_reject",
+            json!({"epic": epic, "reason": reason}),
+        )?,
+        PlanAction::Show { epic } => {
+            let pm = cadence_agent::issue::Pm::open_default()?;
+            cadence_agent::issue::plan::show(&pm, &epic)?
+        }
+    };
+    print_json(&result);
+    Ok(0)
 }
 
 /// Operator approval evidence for `cadence audit` (CAD-217). Both
@@ -5386,6 +5464,7 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
+        Commands::Plan { action } => run_plan(&state_dir, action),
         Commands::Report {
             kind,
             project,

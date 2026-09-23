@@ -230,6 +230,17 @@ cadence dispatch CAD-16 --to w1 --note kick.md
                                    # one-step hand-off: issue start +
                                       # one templated kickoff + comment;
                                       # --job --spec f dispatches the job
+cadence plan propose --project cadence --file PLAN.md
+                                   # an epic (plan: proposed) + one backlog
+                                      # ticket per `## title` section, each
+                                      # with a `### Acceptance` checklist
+                                      # and optional size/agent/depends_on
+                                      # lines — one tracker commit
+cadence plan approve CAD-40        # operator only; tickets → ready. Until
+                                      # then start/dispatch/job dispatch of
+                                      # its tickets refuse (`plan reject
+                                      # CAD-40 --reason …` records a no)
+cadence plan show CAD-40           # state, tickets, size-weighted progress
 cadence ui run                     # 127.0.0.1:3010 — SPA + read/write API
 cadence secret scan [--file f]     # credential scan: JSON findings
                                    # {rule,line,column,redacted,severity,
