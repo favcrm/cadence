@@ -9123,9 +9123,9 @@ fn route_worker_result(d: &TestDaemon, worker: &str, pm: &str, id: &str, text: &
 }
 
 /// Idle pty, `auto_ready` unset, no `agent ready`: a routed
-/// `worker_result` is submitted within 2s of the route (the missing
-/// wake must not hide behind the 5s empty-queue poll). The same pane
-/// then refuses a `source=user` send.
+/// `worker_result` is dequeued within 2s of the route (the missing
+/// wake must not hide behind the 5s empty-queue poll) and then
+/// delivered. The same pane then refuses a `source=user` send.
 #[test]
 fn pty_routed_notice_delivers_idle_without_claim() {
     let d = TestDaemon::start();
@@ -9137,18 +9137,21 @@ fn pty_routed_notice_delivers_idle_without_claim() {
     let routed_id = route_worker_result(&d, "w1", "pm", "work-1", "review this pane");
     let started = Instant::now();
     let deadline = started + Duration::from_secs(2);
-    let mut submitted = false;
+    // `submitting` is written by the actor's dequeue itself — the step
+    // the wake gates. The paste and its render proof that follow are
+    // mock-tmux latency, which parallel tests on a loaded host stretch.
+    let mut dequeued = false;
     while Instant::now() < deadline {
         let state = d.message_state("pm", &routed_id);
-        if state == "running" || state == "completed" {
-            submitted = true;
+        if ["submitting", "running", "completed"].contains(&state.as_str()) {
+            dequeued = true;
             break;
         }
         assert_ne!(state, "failed", "routed notice failed before submit");
         thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        submitted,
+        dequeued,
         "routed notice still {} after {:?} — wake did not beat the empty-queue poll",
         d.message_state("pm", &routed_id),
         started.elapsed()
