@@ -20639,10 +20639,168 @@ fn review_verb_ignores_base_drift_between_pr_cut_points() {
         "{:?}",
         r["verdict_reasons"]
     );
+    // CAD-297: PR 10 (shared2.txt, a wait-test) shares no file with
+    // PR 11 (eleven.txt), so its advisory hint is empty and omitted.
+    let ten = skipped.iter().find(|c| c["pr"] == 10).unwrap();
+    assert!(ten.get("advisory_overlap").is_none(), "{ten:?}");
+    assert!(ten.get("advisory_overlap_error").is_none(), "{ten:?}");
+    assert!(
+        !r["verdict_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m.as_str().unwrap_or("").contains("advisory")),
+        "{:?}",
+        r["verdict_reasons"]
+    );
     assert_eq!(r["open_pr_conflicts_base"], json!(main_sha));
     let md = std::fs::read_to_string(r["report_md"].as_str().unwrap()).unwrap();
     assert!(md.contains("would land on base"), "{md}");
     assert!(md.contains("Not assessed"), "{md}");
+    // No conflict among the assessed PRs is not "no conflicting open
+    // PRs" while one was never assessed.
+    assert!(!md.contains("no conflicting open PRs"), "{md}");
+    assert!(
+        md.contains("none among assessed PRs — 1 not assessed, listed below"),
+        "{md}"
+    );
+    assert!(!md.contains("advisory"), "{md}");
+}
+
+/// CAD-297: a PR that does not merge into the base is not assessed, but
+/// when it changes a file the reviewed PR also changes, the report says
+/// so as an advisory hint — across a rename on either side. PR 15 moves
+/// big.txt to moved.txt and edits it; PR 14 edits big.txt in place and
+/// PR 16 moves it to elsewhere.txt, and both of those also edit a file
+/// main changed after they were cut, so neither merges into the base.
+#[test]
+fn review_verb_hints_a_not_assessed_overlap_across_a_rename() {
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    let lines: Vec<String> = (1..=10).map(|n| format!("line {n}")).collect();
+    let body = |at: usize, text: &str| {
+        let mut v = lines.clone();
+        v[at] = text.to_string();
+        v.join("\n") + "\n"
+    };
+    review_git(&f.repo, &["checkout", "-q", "main"]);
+    std::fs::write(f.repo.join("big.txt"), body(0, "line 1")).unwrap();
+    std::fs::write(f.repo.join("drift.txt"), "a").unwrap();
+    review_git(&f.repo, &["add", "-A"]);
+    review_git(&f.repo, &["commit", "-qm", "add big.txt"]);
+    review_git(&f.repo, &["push", "-q", "origin", "main"]);
+    let push_pr = |n: i64, edit: &dyn Fn()| -> String {
+        let branch = format!("pr-{n}");
+        review_git(&f.repo, &["checkout", "-qb", &branch, "main"]);
+        edit();
+        review_git(&f.repo, &["add", "-A"]);
+        review_git(&f.repo, &["commit", "-qm", &branch]);
+        let head = review_git_sha(&f.repo, &["rev-parse", "HEAD"]);
+        review_git(
+            &f.repo,
+            &["push", "-q", "origin", &format!("HEAD:refs/pull/{n}/head")],
+        );
+        review_git(&f.repo, &["checkout", "-q", "main"]);
+        head
+    };
+    let head14 = push_pr(14, &|| {
+        std::fs::write(f.repo.join("big.txt"), body(8, "line 9 by pr14")).unwrap();
+        std::fs::write(f.repo.join("drift.txt"), "pr14").unwrap();
+    });
+    let head16 = push_pr(16, &|| {
+        review_git(&f.repo, &["mv", "big.txt", "elsewhere.txt"]);
+        std::fs::write(f.repo.join("elsewhere.txt"), body(9, "line 10 by pr16")).unwrap();
+        std::fs::write(f.repo.join("drift.txt"), "pr16").unwrap();
+    });
+    // main moves on drift.txt: PR 14 and PR 16 no longer merge into it.
+    std::fs::write(f.repo.join("drift.txt"), "main").unwrap();
+    review_git(&f.repo, &["commit", "-qam", "drift"]);
+    review_git(&f.repo, &["push", "-q", "origin", "main"]);
+    let head15 = push_pr(15, &|| {
+        review_git(&f.repo, &["mv", "big.txt", "moved.txt"]);
+        std::fs::write(f.repo.join("moved.txt"), body(4, "line 5 by pr15")).unwrap();
+    });
+    std::fs::write(
+        f.fakedir.join("pr-view-15.json"),
+        json!({"number": 15, "title": "PR 15", "url": "https://example/15",
+               "headRefName": "pr-15", "headRefOid": head15,
+               "baseRefName": "main", "files": [{"path": "moved.txt"}],
+               "state": "OPEN"})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        f.fakedir.join("pr-list.json"),
+        json!([
+            {"number": 14, "title": "PR 14", "headRefOid": head14},
+            {"number": 15, "title": "PR 15", "headRefOid": head15},
+            {"number": 16, "title": "PR 16", "headRefOid": head16},
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let _ = review_cmd(&f).arg("15").output().unwrap();
+    let r = review_report(&f, 15);
+    assert!(
+        r["open_pr_conflicts"].as_array().unwrap().is_empty(),
+        "{:?}",
+        r["open_pr_conflicts"]
+    );
+    let skipped = r["open_pr_not_assessed"].as_array().unwrap();
+    let hint = |n: i64| {
+        let c = skipped
+            .iter()
+            .find(|c| c["pr"] == n)
+            .unwrap_or_else(|| panic!("PR {n} not listed as not assessed: {skipped:?}"));
+        assert!(
+            c["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("does not merge"),
+            "{c:?}"
+        );
+        c["advisory_overlap"].clone()
+    };
+    // The reviewed side renamed; PR 14 edits the old name in place.
+    assert_eq!(hint(14), json!(["big.txt"]));
+    // Both sides renamed the same file to different names.
+    assert_eq!(hint(16), json!(["big.txt"]));
+
+    let reasons: Vec<&str> = r["verdict_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    // One reason for both not-assessed PRs (CAD-295), each carrying its
+    // advisory overlap; no second, separate line per PR (CAD-297).
+    assert!(
+        reasons.contains(
+            &"overlap not assessed with \
+              #14 (advisory, not a conflict: both PRs change big.txt), \
+              #16 (advisory, not a conflict: both PRs change big.txt) \
+              — they do not merge into the current base"
+        ),
+        "{reasons:?}"
+    );
+    assert_eq!(
+        reasons.iter().filter(|m| m.contains("#14")).count(),
+        1,
+        "{reasons:?}"
+    );
+    let md = std::fs::read_to_string(r["report_md"].as_str().unwrap()).unwrap();
+    assert!(
+        md.contains("none among assessed PRs — 2 not assessed, listed below"),
+        "{md}"
+    );
+    assert!(!md.contains("no conflicting open PRs"), "{md}");
+    assert_eq!(
+        md.matches("  - advisory, not a conflict: both PRs change big.txt\n")
+            .count(),
+        2,
+        "{md}"
+    );
 }
 
 /// CAD-277 QA finding: a conflict that involves a rename must still be
