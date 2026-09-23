@@ -19758,6 +19758,79 @@ fn review_verb_end_to_end() {
     assert!(md.contains("changed by this PR: **no**"), "{md}");
 }
 
+/// CAD-261: another process fetching in the same checkout between the
+/// review's fetch and its resolve must not change what the review
+/// resolves. A `git` wrapper on PATH follows every fetch with a fetch
+/// of PR 8's head — exactly what a concurrent fetch does to the shared
+/// FETCH_HEAD — so any FETCH_HEAD read would see PR 8's commit.
+#[test]
+fn review_verb_resolves_its_own_refs_despite_a_concurrent_fetch() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    let real_git = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let wrapper = f.fakebin.join("git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n\"{real_git}\" \"$@\"\nrc=$?\n\
+             if [ -z \"$CLOBBERING\" ] && [ \"$1\" = -C ]; then\n\
+             case \" $* \" in *\" fetch \"*)\n\
+             CLOBBERING=1 \"{real_git}\" -C \"$2\" fetch -q origin refs/pull/8/head >/dev/null 2>&1 ;;\n\
+             esac\nfi\nexit $rc\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let main_sha = review_git_sha(&f.repo, &["ls-remote", "origin", "refs/heads/main"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    let out = review_cmd(&f).arg("7").output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("head moved while resolving"),
+        "a concurrent fetch was mistaken for a moved head: {stderr}"
+    );
+    let r = review_report(&f, 7);
+    assert_eq!(
+        r["head"],
+        json!(f.head7),
+        "head resolved through FETCH_HEAD"
+    );
+    assert_eq!(
+        r["base"]["sha"],
+        json!(main_sha),
+        "base resolved through FETCH_HEAD"
+    );
+    // The overlap scan still attributes each PR's own tree: only PR 8
+    // conflicts, not PR 9 and 10 read as PR 8's commit.
+    let conflicts = r["open_pr_conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    assert_eq!(conflicts[0]["pr"], 8);
+    // The run's private refs are gone afterwards.
+    let left = review_git_sha(
+        &f.repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/cadence/review/",
+        ],
+    );
+    assert!(left.is_empty(), "review refs left behind: {left}");
+}
+
 #[test]
 fn review_verb_merge_conflict_blocks() {
     let base = TempDir::new().unwrap();
