@@ -2774,6 +2774,15 @@ fn ui_stream_sse_and_guards() {
         "first frame is the keepalive: {text}"
     );
 
+    // CAD-258: each frame names the resources it invalidates, so the
+    // client refetches only those. The event name stays the source.
+    const ISSUES_FRAME: &str =
+        "event: issues\ndata: {\"resources\":[\"issues\",\"projects\",\"issue\",\"overview\"]}\n\n";
+    const AGENTS_FRAME: &str =
+        "event: agents\ndata: {\"resources\":[\"agents\",\"issue\",\"overview\"]}\n\n";
+    const JOBS_FRAME: &str =
+        "event: jobs\ndata: {\"resources\":[\"issues\",\"agents\",\"issue\",\"overview\"]}\n\n";
+
     // A tracker write moves the mtime fingerprint → `event: issues`.
     std::fs::write(pm.path().join("poke.txt"), "x").unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -2783,7 +2792,7 @@ fn ui_stream_sse_and_guards() {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 raw.extend_from_slice(&tmp[..n]);
-                if String::from_utf8_lossy(&raw).contains("event: issues") {
+                if String::from_utf8_lossy(&raw).contains(ISSUES_FRAME) {
                     got_issues = true;
                     break;
                 }
@@ -2809,7 +2818,7 @@ fn ui_stream_sse_and_guards() {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 raw.extend_from_slice(&tmp[..n]);
-                if String::from_utf8_lossy(&raw).contains("event: agents") {
+                if String::from_utf8_lossy(&raw).contains(AGENTS_FRAME) {
                     got_agents = true;
                     break;
                 }
@@ -2828,7 +2837,7 @@ fn ui_stream_sse_and_guards() {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 raw.extend_from_slice(&tmp[..n]);
-                if String::from_utf8_lossy(&raw).contains("event: jobs") {
+                if String::from_utf8_lossy(&raw).contains(JOBS_FRAME) {
                     got_jobs = true;
                     break;
                 }

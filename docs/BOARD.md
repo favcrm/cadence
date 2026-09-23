@@ -676,7 +676,7 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/memories?project=&status=&type=&component=&path=` | memory cards across projects — same filters as `memory ls`; `memory_errors` lists files that failed to load |
 | `GET /api/memories/:project/:slug` | one memory: frontmatter + body; `404` on unknown slug, `400` on grammar |
 | `GET /api/overview` | the Overview screen payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
-| `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents` on daemon state change; `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
+| `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents`/`event: monitoring` on daemon state change; each frame's data names the board resources it invalidates (`{"resources":["agents","issue","overview"]}`); `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
 
 ### API — writes
 
@@ -906,9 +906,16 @@ The original mock is `ui/design/board-mock-v4.html`. In I2 cards drag
 between columns (derived/container cards don't — the reason shows on
 hover), the drawer edits fields/body/links/refs, comments and attaches
 artifacts, and backlog has quick-add. In I3 the board is live: the SPA
-opens an `EventSource` on `/api/stream` and each `issues`/`jobs`/`agents`
-frame triggers the normal refresh — EventSource reconnects on its own
-and the 30 s/focus poll stays as the fallback. The Agents screen ranks
+opens an `EventSource` on `/api/stream` and each frame refetches only the
+resources its data names (`ui/src/resource.ts`: one store per resource,
+requests coalesced, a failed refresh keeps the last good payload as
+stale) — EventSource reconnects on its own and the 30 s/focus poll stays
+as the fallback. Issue counts in the sidebar, board header and overview
+summary all derive from `ui/src/counts.ts` over the cards, with epics,
+done and dropped named as exclusions. A project's Agents view binds an
+agent by dispatch (a job task on one of the project's issues) or by
+ownership (owner of a `doing`/`review` issue) — the `cadence status`
+ISSUES rule (`ui/src/scope.ts`). The Agents screen ranks
 fenced agents first, shows the daemon's recovery text verbatim, and
 opens a drawer with identity, params, capabilities, tasks, bound
 issues, running messages, and the event tail. A fence banner on the
