@@ -20,7 +20,7 @@ verified delivery with routine coordination handled by the system.
 | How do roles deliver work? | [Team](TEAM.md), [session workflow](SESSION.md), [role briefings](roles/pm.md). Historical aliases/model assignments are not live registry evidence. |
 | What are the task/message contracts? | [Jobs](JOBS.md), [protocol](PROTOCOL.md), [steering ADR](adr/0002-steering-contract.md). |
 | Where are projects, issues and memories? | [Board and tracker](BOARD.md), [workspaces](WORKSPACES.md), [worktree-policy ADR](adr/0003-worktree-policy.md). |
-| How is identity and role policy designed? | [Role-profiles ADR](adr/0001-role-profiles.md), [audit](AUDIT.md), [risk rules](roles/risk-classes.md). An ADR is not proof every phase shipped. |
+| How is identity and role policy designed? | [Role-profiles ADR](adr/0001-role-profiles.md), [operator-proof ADR (proposed)](adr/0005-operator-proof.md), [audit](AUDIT.md), [risk rules](roles/risk-classes.md). An ADR is not proof every phase shipped. |
 | How do reports reach the team? | [Report relay](CAD213-REPORT-RELAY.md) and the report section of [session workflow](SESSION.md). Configuration and an active consumer are separate from enqueue success. |
 | What was the original plan? | [Implementation plan](IMPLEMENTATION-PLAN.md), [dogfood retrospective](DOGFOOD.md). Read as dated context; proposed CLI examples may not match the current binary. |
 
