@@ -2957,7 +2957,7 @@ impl Store {
         status: &str,
         result: &Value,
         error: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if !matches!(status, "completed" | "failed" | "interrupted" | "unknown") {
             return Err(Error::internal(format!(
                 "Unexpected provider completion status: {status}"
@@ -3013,27 +3013,27 @@ impl Store {
         // with its own deterministic id, leaving the `cadence-result:`
         // slot free for the operator's later verdict (completed/failed)
         // or the interrupted notice.
-        if status == "unknown" {
+        let routed = if status == "unknown" {
             // A held cloud poll keeps the live session. The PM still
             // hears about it, but the notice must not say the worker
             // is fenced.
-            self.route_notice(tx, message, "unknown", result)?;
+            self.route_notice(tx, message, "unknown", result)?
         } else {
-            self.route_result(tx, message, result)?;
-        }
+            self.route_result(tx, message, result)?
+        };
         // Task edge: normal completion of a task-attached kickoff moves
         // the task to review and binds head_sha to the reported commit.
         // Any other terminal leaves the task flagged where it stands.
         if status == "completed" {
             self.task_on_completed(tx, message, result)?;
         }
-        Ok(())
+        Ok(routed)
     }
 
     /// The `reply_to` outbox: enqueue the result notification on the
     /// target in the caller's transaction. Routed deliveries get a
     /// deterministic id and no `reply_to`, so they cannot create loops.
-    fn route_result(&self, tx: &Connection, message: &Message, result: &Value) -> Result<()> {
+    fn route_result(&self, tx: &Connection, message: &Message, result: &Value) -> Result<bool> {
         // Reading a mailbox completes its row with a local receipt. That
         // receipt is durable history, not worker output: routing it through
         // reply_to would synthesize a worker_result and wake a reviewer for
@@ -3041,10 +3041,10 @@ impl Store {
         // finish(), while the original inbox row remains available to the
         // consumer with its full body and source.
         if result.get("via").and_then(Value::as_str) == Some("inbox_read") {
-            return Ok(());
+            return Ok(false);
         }
         let Some(target) = &message.reply_to else {
-            return Ok(());
+            return Ok(false);
         };
         let delivery = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
@@ -3055,7 +3055,7 @@ impl Store {
         if self.message_in(tx, &delivery)?.is_some()
             || self.handoff_unresolved_exists(tx, &delivery)?
         {
-            return Ok(());
+            return Ok(false);
         }
         let (expected, current, reason) =
             self.recipient_binding(tx, &message.alias, &message.id, &message.source, target)?;
@@ -3071,7 +3071,7 @@ impl Store {
                 expected.as_ref(),
                 current.as_ref(),
             )?;
-            return Ok(());
+            return Ok(false);
         }
         let Some(recipient) = current.as_ref() else {
             return Err(Error::internal(
@@ -3116,7 +3116,7 @@ impl Store {
                 "recipient_identity": Self::agent_identity(recipient),
             }),
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// An informational notice to `reply_to` — plainly not a result.
@@ -3132,9 +3132,9 @@ impl Store {
         message: &Message,
         kind: &str,
         result: &Value,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(target) = &message.reply_to else {
-            return Ok(());
+            return Ok(false);
         };
         let delivery = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
@@ -3145,7 +3145,7 @@ impl Store {
         if self.message_in(tx, &delivery)?.is_some()
             || self.handoff_unresolved_exists(tx, &delivery)?
         {
-            return Ok(());
+            return Ok(false);
         }
         let (expected, current, reason) =
             self.recipient_binding(tx, &message.alias, &message.id, &message.source, target)?;
@@ -3161,7 +3161,7 @@ impl Store {
                 expected.as_ref(),
                 current.as_ref(),
             )?;
-            return Ok(());
+            return Ok(false);
         }
         let Some(recipient) = current.as_ref() else {
             return Err(Error::internal(
@@ -3245,7 +3245,7 @@ impl Store {
                 "recipient_identity": Self::agent_identity(recipient),
             }),
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// Bound a routed `result` payload for a pty recipient: pty
@@ -3732,6 +3732,15 @@ impl Store {
     }
 
     pub fn set_params(&self, alias: &str, patch: &Value) -> Result<()> {
+        self.set_params_by(alias, patch, &Value::Null)
+    }
+
+    /// [`Store::set_params`] stamped with who asked (CAD-149): `audit`
+    /// (`{"by", "by_kind", …}`, the daemon's derived caller) is merged
+    /// into the `params_updated` event, which always names the target
+    /// and each changed key with its old and new stored value (`null` =
+    /// absent), written in the same transaction as the change.
+    pub fn set_params_by(&self, alias: &str, patch: &Value, audit: &Value) -> Result<()> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
@@ -3819,7 +3828,22 @@ impl Store {
                 params![stored_params, now(), alias],
             )?;
         }
-        Self::event(&tx, alias, "params_updated", json!({"patch": patch}))?;
+        let before = agent.params.clone().unwrap_or_else(|| json!({}));
+        let changes: Vec<Value> = patch
+            .keys()
+            .map(|k| {
+                json!({"key": k,
+                       "old": before.get(k).cloned().unwrap_or(Value::Null),
+                       "new": merged.get(k).cloned().unwrap_or(Value::Null)})
+            })
+            .collect();
+        let mut detail = json!({"patch": patch, "target": alias, "changes": changes});
+        if let Some(extra) = audit.as_object() {
+            for (k, v) in extra {
+                detail[k.as_str()] = v.clone();
+            }
+        }
+        Self::event(&tx, alias, "params_updated", detail)?;
         tx.commit()?;
         Ok(())
     }
@@ -4016,15 +4040,24 @@ impl Store {
     /// turn. Open work also refuses, naming it: a message not yet
     /// completed/failed/interrupted/cancelled, or a non-terminal task
     /// assigned to the alias (CAD-284). `force` overrides that check
-    /// only: queued/submitting messages are cancelled, running ones
-    /// interrupted, and one `agent_remove_forced` event on the daemon
-    /// stream names what was overridden. An `unknown` message refuses
-    /// even `force` until it is reconciled, so removal never deletes an
-    /// unknown row and never leaves one behind to fence a re-registered
-    /// alias. Callers must hold the lifecycle
+    /// only, through the normal finish paths (CAD-304 S2): a
+    /// queued/submitting message is cancelled like `message cancel`
+    /// (a `cancelled` notice to its `reply_to`), a running one finishes
+    /// `interrupted` like any interrupted turn (`turn_finished`, the
+    /// result routed to its `reply_to`). The removed alias's own stream
+    /// is then pruned with the rest of its unscoped history, so the
+    /// durable trace is the `reply_to` delivery plus one
+    /// `agent_remove_forced` event on the daemon stream naming what was
+    /// overridden and who was notified. An `unknown` message refuses
+    /// even `force` until it is reconciled (CAD-304 S1), so removal
+    /// never deletes an unknown row and never leaves one behind to fence
+    /// a re-registered alias. `by` (`{"by", "by_kind"}`, the daemon's
+    /// derived caller) stamps the `agent_removed` event every removal
+    /// records on the daemon stream. Callers must hold the lifecycle
     /// check (the daemon rejects removal of an owned alias before
-    /// reaching here).
-    pub fn remove_agent(&self, alias: &str, force: bool) -> Result<Agent> {
+    /// reaching here). Returns the `reply_to` aliases a forced finish
+    /// notified — the caller wakes them.
+    pub fn remove_agent(&self, alias: &str, force: bool, by: &Value) -> Result<Vec<String>> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
@@ -4045,13 +4078,17 @@ impl Store {
                 )));
             }
         }
-        let open_messages: Vec<(String, String)> = tx
+        let open: Vec<Message> = tx
             .prepare(
-                "SELECT id,state FROM messages WHERE alias=? AND state NOT IN
+                "SELECT * FROM messages WHERE alias=? AND state NOT IN
                  ('completed','failed','interrupted','cancelled') ORDER BY seq",
             )?
-            .query_map([alias], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([alias], row_message)?
             .collect::<rusqlite::Result<_>>()?;
+        let open_messages: Vec<(String, String)> = open
+            .iter()
+            .map(|m| (m.id.clone(), m.state.clone()))
+            .collect();
         let open_tasks: Vec<(String, String)> = tx
             .prepare(
                 "SELECT id,state FROM tasks WHERE assignee=? AND state NOT IN
@@ -4059,6 +4096,7 @@ impl Store {
             )?
             .query_map([alias], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
+        let mut notify: Vec<String> = Vec::new();
         if !open_messages.is_empty() || !open_tasks.is_empty() {
             let named = |kind: &str, rows: &[(String, String)]| {
                 rows.iter()
@@ -4077,42 +4115,121 @@ impl Store {
             // closing it would claim an outcome nobody learned, keeping
             // it would fence a re-registered alias, deleting it would
             // lose the evidence (CAD-284/CAD-304 S1). Reconcile first.
-            let unknown: Vec<&str> = open_messages
-                .iter()
-                .filter(|(_, state)| state == "unknown")
-                .map(|(id, _)| id.as_str())
-                .collect();
+            let unknown: Vec<&Message> = open.iter().filter(|m| m.state == "unknown").collect();
             if let Some(first) = unknown.first() {
+                // `agent unfence` reconciles only fencing unknowns — an
+                // unconfirmed nudge is closed by `message reconcile` alone.
+                let unfence = if unknown.iter().any(|m| m.source != "nudge") {
+                    format!(" or `cadence agent unfence {alias} --no-resume`")
+                } else {
+                    String::new()
+                };
                 return Err(Error::rejected(format!(
                     "--force cannot remove '{alias}' while message(s) {} are \
                      unknown — reconcile the outcome first: `cadence message \
-                     reconcile {first} --status interrupted|completed|failed` \
-                     or `cadence agent unfence {alias} --no-resume`",
-                    unknown.join(", ")
+                     reconcile {} --status interrupted|completed|failed`{unfence}",
+                    unknown
+                        .iter()
+                        .map(|m| m.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    first.id
                 )));
             }
             let error = format!("agent '{alias}' removed with --force");
-            tx.execute(
-                "UPDATE messages SET state='cancelled',error=?,completed=?
-                 WHERE alias=? AND state IN ('queued','submitting')",
-                params![error, now(), alias],
-            )?;
-            tx.execute(
-                "UPDATE messages SET state='interrupted',error=?,completed=?
-                 WHERE alias=? AND state='running'",
-                params![error, now(), alias],
-            )?;
+            // Non-terminal tasks are unassigned — state, revision,
+            // kickoff and history kept — so a later agent registered
+            // under this alias never inherits them (CAD-304 S4), and the
+            // job's PM hears which to reassign (review round-2 ruling).
+            let mut unassigned: Vec<String> = Vec::new();
+            for (task_id, _) in &open_tasks {
+                let task = self.task_in(&tx, task_id)?;
+                let job = self.job_in(&tx, &task.job_id)?;
+                tx.execute(
+                    "UPDATE tasks SET assignee=NULL,updated=? WHERE id=?",
+                    params![now(), task.id],
+                )?;
+                Self::event_scoped(
+                    &tx,
+                    &job.pm_alias,
+                    "task_unassigned",
+                    json!({"task": task.id, "job": job.id, "state": task.state,
+                           "revision": task.revision, "from": alias,
+                           "reason": error, "by": by["by"]}),
+                    Some(&job.id),
+                    Some(&task.id),
+                )?;
+                let told = self.route_job_event(
+                    &tx,
+                    &job,
+                    &task,
+                    &task.state,
+                    &format!("unassigned:{alias}"),
+                    &format!(
+                        "task {} ({}) is unassigned: its assignee '{alias}' was \
+                         removed with --force. Reassign it with `cadence job \
+                         dispatch {} --to <worker>`.",
+                        task.id, task.state, task.id
+                    ),
+                )?;
+                if told && !notify.contains(&job.pm_alias) {
+                    notify.push(job.pm_alias.clone());
+                }
+                unassigned.push(task.id.clone());
+            }
+            for message in &open {
+                let told = if message.state == "running" {
+                    let result = json!({"status": "interrupted", "text": "",
+                                        "error": error, "via": "agent_remove_forced",
+                                        "by": by["by"]});
+                    self.finish_in(&tx, message, "interrupted", &result, Some(&error))?
+                } else {
+                    // queued / submitting: never delivered to a live
+                    // actor (the endpoint is gone), so cancelled —
+                    // `message cancel`'s write, event and notice.
+                    let result = json!({"status": "cancelled", "via": "agent_remove_forced",
+                                        "by": by["by"], "reason": error});
+                    tx.execute(
+                        "UPDATE messages SET state='cancelled',result=?,error=?,completed=?
+                         WHERE id=?",
+                        params![result.to_string(), error, now(), message.id],
+                    )?;
+                    Self::event(
+                        &tx,
+                        alias,
+                        "cancelled",
+                        json!({"message": message.id, "by": by["by"], "reason": error}),
+                    )?;
+                    self.route_notice(&tx, message, "cancelled", &result)?
+                };
+                // Only recipients a notice actually reached — a
+                // dedupe hit or a `handoff_unresolved` is not notified.
+                if let (true, Some(reply_to)) = (told, &message.reply_to) {
+                    if !notify.contains(reply_to) {
+                        notify.push(reply_to.clone());
+                    }
+                }
+            }
             Self::event(
                 &tx,
                 Self::DAEMON_STREAM,
                 "agent_remove_forced",
-                json!({"alias": alias, "messages": open_messages, "tasks": open_tasks}),
+                json!({"alias": alias, "messages": open_messages, "tasks": open_tasks,
+                       "unassigned": unassigned, "notified": notify,
+                       "by": by["by"], "by_kind": by["by_kind"]}),
             )?;
         }
         Self::prune_agent_history(&tx, alias)?;
         tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
+        Self::event(
+            &tx,
+            Self::DAEMON_STREAM,
+            "agent_removed",
+            json!({"alias": alias, "force": force,
+                   "by": by["by"], "by_kind": by["by_kind"]}),
+        )?;
         tx.commit()?;
-        Ok(agent)
+        Ok(notify)
     }
 
     /// Drops a removed alias's message/event history except what job
@@ -4241,11 +4358,26 @@ impl Store {
         Ok(events)
     }
 
+    /// The alias's messages as `agent show` lists them — this
+    /// registration's only (CAD-304 S4). `agent remove` keeps the rows
+    /// job history still resolves under the old alias (CAD-284); a later
+    /// agent registered under the same alias must not list them as its
+    /// own. Kept rows are always terminal (removal refuses `unknown` and
+    /// finishes everything else), so a terminal row older than the
+    /// current registration is a previous agent's and is left out;
+    /// every non-terminal row is listed whatever its timestamp, so a
+    /// clock step can never hide live work. `job show`/`task show` read
+    /// the kept rows by id, unchanged.
     pub fn messages(&self, alias: &str) -> Result<Vec<Message>> {
         let conn = self.conn();
-        self.agent_in(&conn, alias)?;
-        let mut stmt = conn.prepare("SELECT * FROM messages WHERE alias=? ORDER BY seq")?;
-        let rows = stmt.query_map([alias], row_message)?;
+        let agent = self.agent_in(&conn, alias)?;
+        let mut stmt = conn.prepare(
+            "SELECT * FROM messages WHERE alias=?1
+             AND (created >= ?2 OR state NOT IN
+                  ('completed','failed','interrupted','cancelled'))
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![alias, agent.created], row_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -5908,6 +6040,21 @@ impl Store {
                  cannot verdict its own revision"
             )));
         }
+        // An unassigned task (its assignee was force-removed, CAD-304)
+        // still names its author through the kickoff that produced the
+        // revision under review.
+        if task.assignee.is_none() {
+            if let Some(kickoff) = task.dispatch_message.as_deref() {
+                if let Some(m) = self.message_in(&tx, kickoff)? {
+                    if m.alias == reviewer {
+                        return Err(Error::rejected(format!(
+                            "Reviewer '{reviewer}' ran this revision's kickoff — \
+                             a worker cannot verdict its own revision"
+                        )));
+                    }
+                }
+            }
+        }
         let evidence_json: Option<String> = evidence.map(|e| {
             serde_json::from_str::<Value>(e)
                 .map(|v| v.to_string())
@@ -6284,7 +6431,7 @@ impl Store {
         new_state: &str,
         dedupe: &str,
         note: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let delivery = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
             format!(
@@ -6298,7 +6445,7 @@ impl Store {
         if self.message_in(tx, &delivery)?.is_some()
             || self.handoff_unresolved_exists(tx, &delivery)?
         {
-            return Ok(());
+            return Ok(false);
         }
         let recipient = self.agent_opt_in(tx, &job.pm_alias)?;
         let Some(recipient) = recipient else {
@@ -6313,7 +6460,7 @@ impl Store {
                 None,
                 None,
             )?;
-            return Ok(());
+            return Ok(false);
         };
         let payload = json!({"job": job.id, "task": task.id,
                              "revision": task.revision, "state": new_state});
@@ -6335,7 +6482,7 @@ impl Store {
             Some(&job.id),
             Some(&task.id),
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// Notify a job's PM outside a state transition — the stall watch
@@ -7731,6 +7878,214 @@ mod tests {
         assert_eq!(s.messages("pm").unwrap().len(), 1);
     }
 
+    fn operator_by() -> Value {
+        json!({"by": "operator", "by_kind": "operator"})
+    }
+
+    /// CAD-304 S2: `--force` finishes open work through the normal
+    /// paths — a running kickoff ends `interrupted` with its result
+    /// routed to `reply_to`, a queued message is cancelled with a
+    /// `cancelled` notice to its `reply_to` — and names who it told.
+    #[test]
+    fn forced_remove_finishes_open_work_through_the_finish_path() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        run_kickoff(&s, &kickoff);
+        s.enqueue("w1", "later", Some("pm"), "m-queued", "user")
+            .unwrap();
+        s.set_state_detached("w1", "stopped", None).unwrap();
+
+        let notified = s
+            .remove_agent("w1", true, &json!({"by": "pm", "by_kind": "agent"}))
+            .unwrap();
+        assert_eq!(notified, vec!["pm".to_string()]);
+        let k = s.message(&kickoff).unwrap().unwrap();
+        assert_eq!(k.state, "interrupted");
+        let result = k.result.clone().unwrap();
+        assert_eq!(result["via"], "agent_remove_forced", "{result}");
+        assert_eq!(result["by"], "pm", "{result}");
+        // The unattached queued row is pruned with the rest of w1's
+        // unreferenced history; its notice already reached pm.
+        assert!(s.message("m-queued").unwrap().is_none());
+        let pm = s.messages("pm").unwrap();
+        let routed = |id: String| pm.iter().find(|m| m.id == id).cloned();
+        let result_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("cadence-result:{kickoff}").as_bytes(),
+        )
+        .simple()
+        .to_string();
+        let r = routed(result_id).expect("interrupted result routed to pm");
+        assert_eq!(r.source, "worker_result");
+        assert!(r.body.contains("interrupted"), "{}", r.body);
+        let notice_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"cadence-notice:cancelled:m-queued")
+            .simple()
+            .to_string();
+        let n = routed(notice_id).expect("cancelled notice routed to pm");
+        assert_eq!(n.source, "worker_notice");
+        let events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();
+        let forced = events
+            .iter()
+            .find(|e| e.kind == "agent_remove_forced")
+            .unwrap();
+        assert_eq!(forced.payload["notified"], json!(["pm"]));
+        assert_eq!(forced.payload["unassigned"], json!(["t1"]));
+        assert_eq!(forced.payload["by"], "pm");
+        // The task keeps its state and revision; only the assignee goes.
+        let t = s.task("t1").unwrap();
+        assert_eq!(t.assignee, None);
+        assert_eq!(t.state, "running");
+        assert_eq!(forced.payload["by_kind"], "agent");
+        let removed = events.iter().find(|e| e.kind == "agent_removed").unwrap();
+        assert_eq!(removed.payload["alias"], "w1");
+        assert_eq!(removed.payload["force"], true);
+        assert_eq!(removed.payload["by"], "pm");
+    }
+
+    /// CAD-304 S1 (qa nit): an unconfirmed nudge left `unknown` refuses
+    /// `--force` like any unknown, and the remedy names only `message
+    /// reconcile` — `agent unfence` does not reconcile a nudge.
+    #[test]
+    fn forced_remove_refuses_unknown_and_names_a_working_remedy() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "w1", &cwd);
+        s.enqueue("w1", "look", None, "m-nudge", "nudge").unwrap();
+        s.enqueue("w1", "task", None, "m-work", "user").unwrap();
+        s.set_state_detached("w1", "stopped", None).unwrap();
+        s.conn()
+            .execute("UPDATE messages SET state='unknown' WHERE id='m-nudge'", [])
+            .unwrap();
+        let err = s
+            .remove_agent("w1", true, &operator_by())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("message reconcile m-nudge"), "{err}");
+        assert!(!err.contains("agent unfence"), "{err}");
+        assert_eq!(s.message("m-nudge").unwrap().unwrap().state, "unknown");
+        assert_eq!(s.message("m-work").unwrap().unwrap().state, "queued");
+        // A fencing unknown also offers unfence.
+        s.conn()
+            .execute("UPDATE messages SET state='unknown' WHERE id='m-work'", [])
+            .unwrap();
+        let err = s
+            .remove_agent("w1", true, &operator_by())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("agent unfence w1 --no-resume"), "{err}");
+        assert!(s.agent("w1").is_ok());
+    }
+
+    /// CAD-304 S4: an alias registered again after `agent remove` does
+    /// not list, gate on or fence on the rows job history kept under
+    /// the old alias — while `message`/`job` reads still resolve them.
+    #[test]
+    fn re_registered_alias_does_not_inherit_kept_rows() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        let m = run_kickoff(&s, &kickoff);
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "text": "done", "sha": SHA40_A}),
+            None,
+        )
+        .unwrap();
+        s.set_state_detached("w1", "stopped", None).unwrap();
+        // The task is in review — open work, so the removal is forced.
+        s.remove_agent("w1", true, &operator_by()).unwrap();
+        assert_eq!(s.message(&kickoff).unwrap().unwrap().state, "completed");
+
+        s.register_agent(&NewAgent {
+            alias: "w1",
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&json!({"upstream": "pm"}).to_string()),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        assert!(s.messages("w1").unwrap().is_empty());
+        assert!(!s.has_unknown("w1").unwrap());
+        // Its task was unassigned by the forced removal (review round-2
+        // ruling): the new agent carries no task, so nothing gates on it
+        // — and the PM was told which task to reassign.
+        assert!(s.tasks_for_assignee("w1").unwrap().is_empty());
+        let t = s.task("t1").unwrap();
+        assert_eq!((t.assignee.as_deref(), t.state.as_str()), (None, "review"));
+        assert!(s
+            .messages("pm")
+            .unwrap()
+            .iter()
+            .any(|m| m.source == "job_event" && m.body.contains("is unassigned")));
+        let kinds: Vec<String> = s
+            .job_events("j1", 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.iter().any(|k| k == "task_unassigned"), "{kinds:?}");
+        // The old worker cannot verdict the revision it produced, even
+        // unassigned.
+        let err = s
+            .record_verdict("t1", SHA40_A, "pass", "w1", None, None, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ran this revision's kickoff"), "{err}");
+        assert_eq!(s.queued_count("w1").unwrap(), 0);
+        assert!(matches!(s.take_queued("w1").unwrap(), Take::Empty));
+        // The kept kickoff still resolves by id.
+        assert_eq!(s.message(&kickoff).unwrap().unwrap().alias, "w1");
+        // The new agent's own traffic lists as usual.
+        s.enqueue("w1", "fresh", None, "fresh-1", "user").unwrap();
+        let ids: Vec<String> = s
+            .messages("w1")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["fresh-1".to_string()]);
+        // Nothing old refuses a plain removal of the new agent.
+        s.set_state_detached("w1", "stopped", None).unwrap();
+        s.conn()
+            .execute(
+                "UPDATE messages SET state='completed' WHERE id='fresh-1'",
+                [],
+            )
+            .unwrap();
+        s.remove_agent("w1", false, &operator_by()).unwrap();
+    }
+
+    /// `agent_remove_forced.notified` names only recipients a notice
+    /// actually reached (review N4): a `reply_to` whose agent is gone
+    /// gets a `handoff_unresolved` instead, and is not listed.
+    #[test]
+    fn forced_remove_notified_lists_only_delivered_recipients() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "w1", &cwd);
+        reg(&s, "gone", &cwd);
+        s.enqueue("w1", "later", Some("gone"), "m-q", "user")
+            .unwrap();
+        s.set_state_detached("gone", "stopped", None).unwrap();
+        s.remove_agent("gone", false, &operator_by()).unwrap();
+        s.set_state_detached("w1", "stopped", None).unwrap();
+        let notified = s.remove_agent("w1", true, &operator_by()).unwrap();
+        assert!(notified.is_empty(), "{notified:?}");
+        let events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();
+        let forced = events
+            .iter()
+            .find(|e| e.kind == "agent_remove_forced")
+            .unwrap();
+        assert_eq!(forced.payload["notified"], json!([]));
+    }
+
     #[test]
     fn finish_survives_removed_recipient_across_restart_and_dedupes_failure() {
         let (dir, s) = store();
@@ -7739,7 +8094,12 @@ mod tests {
         let m = run_kickoff(&s, &kickoff);
 
         s.set_state_detached("pm", "stopped", None).unwrap();
-        s.remove_agent("pm", false).unwrap();
+        s.remove_agent(
+            "pm",
+            false,
+            &json!({"by": "operator", "by_kind": "operator"}),
+        )
+        .unwrap();
         let result = json!({"status": "completed", "text": "done", "sha": SHA40_A});
         s.finish(&m, "completed", &result, None).unwrap();
         // A repeated completion is an idempotent replay: it must not add a
@@ -7780,7 +8140,12 @@ mod tests {
         let m = run_kickoff(&s, &kickoff);
 
         s.set_state_detached("pm", "stopped", None).unwrap();
-        s.remove_agent("pm", false).unwrap();
+        s.remove_agent(
+            "pm",
+            false,
+            &json!({"by": "operator", "by_kind": "operator"}),
+        )
+        .unwrap();
         reg(&s, "pm", &cwd);
         s.finish(
             &m,
@@ -7873,7 +8238,12 @@ mod tests {
         let cwd = dir.path().join("w");
         let _kickoff = seeded_task(&s, &cwd);
         s.set_state_detached("pm", "stopped", None).unwrap();
-        s.remove_agent("pm", false).unwrap();
+        s.remove_agent(
+            "pm",
+            false,
+            &json!({"by": "operator", "by_kind": "operator"}),
+        )
+        .unwrap();
 
         s.job_notice("t1", "running", "stall:1", "worker is quiet")
             .unwrap();

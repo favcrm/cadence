@@ -2119,29 +2119,48 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
         // skip it and say so rather than overreach.
         gc_row = gc_row.ok(format!("gc is fleet-wide — skipped under --project {p}"));
     } else if opts.dry_run {
-        let cands: Vec<String> = fl
-            .agents
-            .iter()
-            .filter(|a| {
-                a["endpoint"].is_null()
-                    && matches!(a["state"].as_str(), Some("attention" | "stopped"))
-                    && now - a["updated"].as_f64().unwrap_or(now as f64) as i64 > 3600
-            })
-            .filter_map(|a| a["alias"].as_str().map(str::to_string))
-            .collect();
-        gc_row = gc_row.ok(format!("would sweep {} dead agent(s)", cands.len()));
-        gc_row.items = cands;
+        // The daemon's read-only plan applies the caller rule (CAD-149):
+        // what this caller may sweep, and what it may not. A daemon
+        // without the plan RPC falls back to the listing.
+        match client::rpc(
+            &opts.state_dir,
+            "agent_gc_plan",
+            json!({"older_than": 3600}),
+        ) {
+            Ok(plan) => {
+                let cands = str_list(&plan["candidates"]);
+                let refused = str_list(&plan["not_permitted"]);
+                gc_row = gc_not_permitted(
+                    gc_row,
+                    format!("would sweep {} dead agent(s)", cands.len()),
+                    &refused,
+                );
+                gc_row.items.splice(0..0, cands);
+            }
+            Err(_) => {
+                let cands: Vec<String> = fl
+                    .agents
+                    .iter()
+                    .filter(|a| {
+                        a["endpoint"].is_null()
+                            && matches!(a["state"].as_str(), Some("attention" | "stopped"))
+                            && now - a["updated"].as_f64().unwrap_or(now as f64) as i64 > 3600
+                    })
+                    .filter_map(|a| a["alias"].as_str().map(str::to_string))
+                    .collect();
+                gc_row = gc_row.ok(format!("would sweep {} dead agent(s)", cands.len()));
+                gc_row.items = cands;
+            }
+        }
     } else {
         match client::rpc(&opts.state_dir, "agent_gc", json!({"older_than": 3600})) {
             Ok(v) => {
-                done.gc_removed = v["removed"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|a| a.as_str().map(str::to_string))
-                    .collect();
-                gc_row = gc_row.ok(format!("removed {}", done.gc_removed.len()));
+                done.gc_removed = str_list(&v["removed"]);
+                gc_row = gc_not_permitted(
+                    gc_row,
+                    format!("removed {}", done.gc_removed.len()),
+                    &str_list(&v["not_permitted"]),
+                );
             }
             Err(e) => {
                 gc_row = gc_row.fail(format!("agent gc failed: {e}"), "");
@@ -2453,8 +2472,67 @@ fn handoff_md(
     md
 }
 
+/// A JSON array of strings as a `Vec` (anything else is empty).
+fn str_list(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The gc row, naming the dead agents the caller rule kept this caller
+/// from sweeping (CAD-149): a warning with the remedy, never silence.
+fn gc_not_permitted(row: Row, detail: String, refused: &[String]) -> Row {
+    if refused.is_empty() {
+        return row.ok(detail);
+    }
+    let mut row = row.warn(
+        format!(
+            "{detail}; {} dead agent(s) not permitted for this caller",
+            refused.len()
+        ),
+        "only the operator or an agent's own PM may remove it — run \
+         `cadence session end` from the operator shell",
+    );
+    row.items = refused
+        .iter()
+        .map(|a| format!("{a} (not permitted for this caller)"))
+        .collect();
+    row
+}
+
 #[cfg(test)]
 mod tests {
+    /// CAD-149: the gc row names what the caller rule kept this caller
+    /// from sweeping — a warning with the remedy, never silence.
+    #[test]
+    fn gc_row_surfaces_not_permitted() {
+        let row = gc_not_permitted(Row::new("gc"), "removed 1".into(), &[]);
+        assert!(matches!(row.sev, Sev::Ok));
+        assert_eq!(row.detail, "removed 1");
+        let refused = vec!["w6".to_string(), "w7".to_string()];
+        let row = gc_not_permitted(Row::new("gc"), "removed 1".into(), &refused);
+        assert!(matches!(row.sev, Sev::Warn));
+        assert!(
+            row.detail.contains("2 dead agent(s) not permitted"),
+            "{}",
+            row.detail
+        );
+        assert!(row.remedy.unwrap().contains("operator"));
+        assert_eq!(
+            row.items,
+            vec![
+                "w6 (not permitted for this caller)".to_string(),
+                "w7 (not permitted for this caller)".to_string()
+            ]
+        );
+        assert_eq!(str_list(&json!(["a", 1, "b"])), vec!["a", "b"]);
+        assert!(str_list(&Value::Null).is_empty());
+    }
+
     use super::*;
 
     #[test]

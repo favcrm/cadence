@@ -582,7 +582,9 @@ enum Commands {
     /// terminal attaches once the endpoint is open, same rules as
     /// `cadence devin`. `--cloud` (provider devin) opens a Devin Cloud
     /// session; `--cloud-params` is the same semicolon-separated
-    /// `key=value` list as `cadence devin --cloud-params`.
+    /// `key=value` list as `cadence devin --cloud-params`. From inside
+    /// an agent's pane only a group root (no upstream) may join, and
+    /// only into its own group (CAD-149).
     Join {
         /// Group handle — the PM agent's alias or native session id.
         group: String,
@@ -1844,6 +1846,15 @@ enum AgentAction {
     /// `--next-launch` stores launch params (`model`, `effort`) for the
     /// agent's next open instead — the live process is untouched; `agent
     /// stop` + `agent resume` picks them up.
+    ///
+    /// Caller rule (CAD-149), derived from the calling process, never
+    /// from a name: the operator and the agent's own PM may set any
+    /// allowed key; an agent may set only its own `--next-launch`
+    /// model/effort; a peer is refused. Each change is recorded as
+    /// `params_updated` with the caller and old/new values. Residual
+    /// (CAD-280): a process detached from every pane (`setsid -f env
+    /// -i …`) passes the operator check, so `by: "operator"` is not
+    /// proof the operator acted.
     Set {
         alias: String,
         /// key=value pairs; a bare `key` (no `=`) removes it.
@@ -1856,14 +1867,21 @@ enum AgentAction {
     /// event history no job references (job kickoffs, verdict messages
     /// and job-scoped events stay). Refuses while an endpoint is live
     /// (`agent stop` first), the actor still owns the alias, or the
-    /// alias has open messages or non-terminal assigned tasks.
+    /// alias has open messages or non-terminal assigned tasks. Only the
+    /// operator or the agent's own PM may remove it (CAD-304); every
+    /// removal records `agent_removed` with the caller.
     Remove {
         alias: String,
         /// Remove despite open messages/tasks: queued messages are
-        /// cancelled, running ones interrupted; recorded as an
-        /// `agent_remove_forced` event on the daemon stream. Still
-        /// refused while a message is `unknown` — reconcile it first
-        /// (`message reconcile` or `agent unfence --no-resume`).
+        /// cancelled and running ones interrupted through the normal
+        /// finish path (their `reply_to` is notified); recorded as an
+        /// `agent_remove_forced` event on the daemon stream. Never
+        /// deletes or decides an `unknown` message: refused while one
+        /// exists — reconcile it first (`message reconcile`, or `agent
+        /// unfence --no-resume` for a fencing one). Non-terminal tasks
+        /// assigned to the alias are unassigned (state and history
+        /// kept; the job's PM is told to `job dispatch <task> --to
+        /// <worker>`), so a later agent under the alias inherits none.
         #[arg(long)]
         force: bool,
     },
@@ -1874,6 +1892,9 @@ enum AgentAction {
     Bootstrap { alias: String },
     /// Sweep dead agent records: endpoint NULL and state `attention` or
     /// `stopped`. Prints what it removed. No memory or disk remedy.
+    /// Each candidate passes the `agent remove` caller rule: the operator
+    /// sweeps all, a PM only its own members (the rest are listed as
+    /// `not_permitted`).
     ///
     /// Records only: it deletes registry rows with their message and
     /// event history. It frees no disk and is no memory remedy — the one
