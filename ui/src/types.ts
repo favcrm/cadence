@@ -232,6 +232,34 @@ export interface Drift {
   held?: string;
 }
 
+/** One default-branch SHA's own `ci.yml` push-run verdict (CAD-267).
+ *  Only the SHA's own successful run is `passed`; a covered SHA keeps
+ *  its `cancelled`/`missing` label. */
+export interface ShaCi {
+  sha: string;
+  state: "passed" | "failed" | "pending" | "cancelled" | "missing";
+  /** Cancelled/missing only: nearest later SHA whose own run passed. */
+  covered_by?: string | null;
+  run_id?: number | null;
+  run_url?: string | null;
+  /** Raw run conclusion (`cancelled`, `skipped`, `timed_out`, …). */
+  conclusion?: string | null;
+  created_at?: string | null;
+}
+
+/** Default-branch CI for one repo, newest SHA first. */
+export interface MainCi {
+  slug: string;
+  project: string;
+  branch?: string;
+  workflow?: string;
+  /** `first_parent` — ordered by the local clone; `runs` — no clone, run order. */
+  order?: "first_parent" | "runs";
+  log_error?: string | null;
+  error?: string | null;
+  shas?: ShaCi[];
+}
+
 export interface OverviewProject {
   key: string;
   open_by_status: Record<string, number>;
@@ -313,6 +341,8 @@ export interface Overview {
     /** When the served PR/CI rows were fetched. */
     as_of?: number | null;
   };
+  /** Default-branch CI per repo from GitHub Actions runs (CAD-267). */
+  main_ci?: MainCi[];
   daemon: { reachable: boolean; build_commit?: string; build_time?: string; started_at?: number; info?: string };
   monitoring?: Monitoring;
   /** Sources that missed their time bound — the view narrowed. */
