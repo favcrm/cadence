@@ -726,10 +726,14 @@ CAD-263), never from anything the request says:
 2. Each peer is matched against the daemon's live registered panes
    (`agent_list`: `pty` endpoints with a pid and generation). A peer
    is that pane's agent when either **process signal** holds:
-   - the pane pid is on the peer's `/proc` ancestry;
+   - the pane pid is on the peer's `/proc` ancestry — the only
+     unforgeable signal: a process can leave a pane's ancestry but
+     never join another's;
    - one of the peer's stdio fds (0–2) is the pane's pts — a `setsid`
      or double-forked child of a pane keeps its stdio, so it stays
-     attributed after the detach.
+     attributed after the detach. This tie is **caller-choosable**:
+     any same-user process can open another pane's `/dev/pts/N` onto
+     its stdio (see the residual below).
 
    The pane's `CADENCE_ALIAS` in the peer's environment is **not** a
    board signal on its own: any process can export it, so
@@ -772,9 +776,21 @@ would to the daemon's socket:
   >/dev/null 2>&1`): no ancestry and no pane pty — `operator (ui)`,
   whatever `CADENCE_ALIAS` it still carries.
 
+- **a borrowed pane pty** (accepted residual, CAD-276): a same-user
+  process on no pane's ancestry that opens a registered pane's
+  `/dev/pts/N` onto its stdio is attributed as *that pane's* agent —
+  lateral authorship forgery between agents, with no privilege beyond
+  what the same process already had as `operator (ui)`. The pty tie is
+  kept because dropping it would send a `setsid` child of a pane back
+  to `operator (ui)`, an escalation. `tests/board.rs` pins the
+  residual so a fix flips it deliberately.
+
 Same-user is not a hostile isolation boundary; this closes the direct
 path (a pane's `curl` approving its own work as `operator`) and the
-casual detach, not every deliberate relay.
+casual detach, not every deliberate relay. The root weakness — a local
+caller tied to no pane defaults to `operator (ui)` — is tracked as a
+design note on CAD-276 (operator by positive proof, as
+`slot_reconcile` already requires).
 
 ### Security posture
 

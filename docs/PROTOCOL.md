@@ -93,8 +93,8 @@ Error kinds:
 | `agent_gc` | `older_than?` | sweeps dead agents; `{removed:[alias]}` |
 | `slot_acquire` | `kind: build|test|suite, request_id, lane?, pid?, probe?` | `{granted:true,token,kind,wait_secs}` or `{granted:false,position,wait_secs?,held,capacity}` — non-blocking; callers poll with a stable `request_id` (queue identity only — the daemon mints the `slot-*` token on grant). Caller identity is connection-derived (below): `lane` is advisory, `pid` must be the socket peer or its ancestor. A re-poll adopts a hold only on an exact `(request_id, pid, lane, kind)` match; any other caller sharing the id queues. `probe:true` answers without joining the queue (the CLI's `--wait-secs 0` path). `pid` is the holder whose death frees the slot |
 | `slot_release` | `token, lane?, pid?` | `{released:true,token,kind}` — the release must name the holding `(lane, pid)`, both derived from the connection (`lane` advisory, `pid` must be the peer or its ancestor); a foreign token is a named refusal, a never-held token a named rejection, and a token just reaped this call answers `{released:false, reason}` to its own lane (a `trap`-style cleanup never hard-fails) — foreign lanes get the same never-held rejection, so a token's existence is never probed across lanes |
-| `slot_status` | `lane?` | `{pools:{build,suite}:{capacity,held[]}, waiting[], config, enrollments[], strict:{available,reason?,reconcile_required?,state_generation}}` — also a reap pass: dead holders/waiters drop on the read. A hold's `token` shows only to the connection whose derived lane owns the hold and whose ancestry includes the hold's pid; everyone else sees identity only. Each hold names its `binding` (`legacy`/`strict`); a strict hold adds `enrollment_id, owner_generation, auth_state, liveness, accounting, reconcile_required` (see Managed endpoints below) |
-| `slot_reconcile` | `enrollment_id, token, evidence:{owner_generation,pid,starttime,uid,observed_at,process_read,command_outcome,side_effect_review}` | `{reconciled:true,token,kind,observed}` — the one operator path over a strict hold. Refused from any connection that derives a slot identity (a pane or an enrolled endpoint is an agent) and when the request carries `by`/`operator`/`actor`/`alias`/`lane`/`pid`. The evidence must name the recorded hold exactly; the daemon then reads `/proc` itself and frees only on proven death — a live or unknown holder is refused whatever the evidence says. `cadence build-slot reconcile <enrollment_id> <token> --evidence <json>` |
+| `slot_status` | `lane?` | `{pools:{build,suite}:{capacity,held[]}, waiting[], config, enrollments[], strict:{available,reason?,reconcile_required?,state_generation}}` — also a reap pass: dead holders/waiters drop on the read. A hold's `token` shows only to the connection whose derived lane owns the hold and whose ancestry includes the hold's pid; everyone else sees identity only. Each hold names its `binding` (`legacy`/`strict`); a strict hold adds `enrollment_id, owner_generation, auth_state, liveness, accounting, reconcile_required` and, when something must be done that reconcile cannot do, a `remedy` (see Managed endpoints below) |
+| `slot_reconcile` | `enrollment_id, token, evidence:{owner_generation,pid,starttime,uid,observed_at,process_read,command_outcome,side_effect_review}` | `{reconciled:true,token,kind,observed}` — the one operator path over a strict hold. Operator authority needs positive proof (CAD-276): refused from any connection that derives a slot identity (a pane or an enrolled endpoint is an agent), and from one that is not provably the operator — the peer must run as the daemon's uid with a fully readable ancestry on which no hop is a registered pane, an enrolled or tombstoned root, a descendant of the daemon, or a same-uid process carrying `CADENCE_ALIAS`, hold no pane pty, and have its session leader on that ancestry (a `setsid` + double-fork orphan does not); refused too when the request carries `by`/`operator`/`actor`/`alias`/`lane`/`pid`. The evidence must name the recorded hold exactly; the daemon then reads `/proc` itself and frees only on proven death — a live or unknown holder is refused whatever the evidence says. `cadence build-slot reconcile <enrollment_id> <token> --evidence <json>` |
 
 `alias`, `provider`, `message` ids: `^[a-z0-9][a-z0-9-]{0,63}$`.
 `text`: 1–48000 chars. `reply_to` may not equal `alias`.
@@ -1337,9 +1337,12 @@ enrolled root makes the call **strict**. A strict caller must be the
 enrolled root itself or reach it through a complete ancestry read at
 call time, every hop running as the daemon's uid (real and effective),
 no parent younger than its child (a pid recycled mid-walk fails), and
-the root exactly the recorded process (starttime). Only that verified
-peer-to-root segment may be claimed as a holder, and the holder's
-identity is recorded with the hold. The owner row is revalidated
+the root exactly the recorded process (starttime). Only the peer and
+its verified *non-root* ancestors may be claimed as a holder (CAD-276):
+the enrolled root outlives the work, so `acquire --pid <root>` from a
+tool subprocess is refused (the root may hold only as its own peer),
+while `build-slot run` binds its own pid and `acquire --pid $$` the
+invoking shell. The holder's identity is recorded with the hold. The owner row is revalidated
 before every slot call: a missing row, a closed endpoint or a changed
 owner generation revokes the enrollment. A failed strict verification
 refuses — it never falls through to an outer pane, and an alias, lane,
@@ -1351,6 +1354,24 @@ winning the nearest-identity check, so the provider and its tool tree
 are refused new work instead of falling through to a pane registered
 above them. It is pruned only once nothing holds under it and its root
 is proven dead.
+
+Several enrollments may share one root — a same-root supersession (the
+same provider process re-enrolled under a new owner generation) keeps
+the old one as a tombstone while a hold names it. A caller is matched
+against them in one deterministic order (CAD-276): live first
+(`active`, then `expired`, then revoked), then the most recently
+issued, then the enrollment id. A release runs as the root's
+enrollment whose id matches the hold, so the old holder can still give
+back a hold taken before the supersession; the exact-holder rule is
+unchanged. A shared root never makes restart reject the state file,
+but a revoked and a live enrollment on the same root must share an
+owner — across owners the pair is invalid (strict blocked, file kept
+byte-identical as evidence), and the daemon never enrolls one exact
+process for a second owner.
+
+Residual: an orphan of a dead provider re-parented under a pane — only
+possible with a subreaper below that pane — has no enrolled root left
+on its chain, so it falls to the pane's legacy binding.
 
 *Deviation from design v3:* v3 admits only the exact root/worker
 process. A managed provider's builds run in its tools' subprocesses
@@ -1372,7 +1393,15 @@ retains, `dead` (gone, or the pid recycled) frees, `unknown`
 occupying its slot. `slot_status` exposes `auth_state`, `liveness`,
 `accounting`, `owner_generation` and `reconcile_required` per hold and
 the enrollments themselves; `slot_reconcile` is the only operator
-path and cannot free a live or unknown hold.
+path and cannot free a live or unknown hold. So `reconcile_required`
+is set only where reconcile can act — a holder proven dead whose free
+has not landed while the strict writer is available — and any other
+hold that needs a hand names its `remedy` instead: `holder alive —
+release from the holder or stop it` (past `max_hold_secs`), `liveness
+unknown — restart the daemon after verifying`, or a dead holder whose
+free could not be written (restart once `slots.json` is writable).
+`cadence build-slot status` prints both inside the hold's `[strict …]`
+flags.
 
 Two pools share one queue: `build`/`test` requests draw on
 `build_slots` (default 3), `suite` requests on `suite_slots` (default
