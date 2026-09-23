@@ -435,6 +435,78 @@ fn provider_state_flags_fat_wal_and_store() {
     assert_eq!(stores.len(), 2); // absent stores skipped
 }
 
+/// CAD-316: the cadence store's own size shows in doctor, with the
+/// event bookkeeping retention acts on — rows, delivery rows already
+/// rolled into counts, and rows past the age cut still awaiting a
+/// rollup. Informational: size thresholds stay in provider-state.
+#[test]
+fn cadence_store_shows_size_and_rollup_counts() {
+    let root = TempDir::new().unwrap();
+    let scan = fake_scan(&root);
+    let c = check_cadence_store(&scan);
+    assert_eq!(c.name, "cadence-store");
+    assert_eq!(c.level, Level::Ok);
+    assert!(c.detail.contains("no cadence.sqlite3"), "{}", c.detail);
+
+    let db = scan.state_dir.join("cadence.sqlite3");
+    let store = crate::store::Store::open(&db).unwrap();
+    let now = scan
+        .now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for (kind, days) in [
+            ("submitting", 9.0),
+            ("submitted", 9.0),
+            ("submitting", 8.0),
+            ("submitted", 1.0),
+            ("turn_finished", 30.0),
+        ] {
+            conn.execute(
+                    "INSERT INTO events(alias,kind,payload,at) VALUES('a1',?1,'{\"message\":\"gone\"}',?2)",
+                    rusqlite::params![kind, now - days * 86_400.0],
+                )
+                .unwrap();
+        }
+    }
+    let c = check_cadence_store(&scan);
+    assert_eq!(c.level, Level::Ok);
+    assert!(c.value["store_bytes"].as_u64().unwrap() > 0, "{}", c.value);
+    assert_eq!(c.value["events"], 5, "{}", c.value);
+    assert_eq!(c.value["delivery_awaiting_rollup"], 3, "{}", c.value);
+    assert_eq!(c.value["delivery_rolled_up"], 0, "{}", c.value);
+    assert!(c.detail.starts_with("cadence.sqlite3 "), "{}", c.detail);
+    assert!(
+        c.detail
+            .contains(&human(c.value["store_bytes"].as_u64().unwrap())),
+        "{}",
+        c.detail
+    );
+    assert!(
+        c.detail.contains("3 older than 7d awaiting rollup"),
+        "{}",
+        c.detail
+    );
+
+    assert_eq!(
+        store
+            .roll_up_delivery_events(now - crate::store::EVENT_ROLLUP_AGE_SECS)
+            .unwrap(),
+        3
+    );
+    let c = check_cadence_store(&scan);
+    assert_eq!(c.value["events"], 3, "{}", c.value);
+    assert_eq!(c.value["delivery_awaiting_rollup"], 0, "{}", c.value);
+    assert_eq!(c.value["delivery_rolled_up"], 3, "{}", c.value);
+    assert!(
+        c.detail.contains("3 delivery events rolled up"),
+        "{}",
+        c.detail
+    );
+}
+
 // ---------- memory + census ----------
 
 /// Write a fabricated `/proc/meminfo` (values in kB, like the real
@@ -3023,6 +3095,7 @@ fn run_emits_all_checks() {
         vec![
             "disk",
             "provider-state",
+            "cadence-store",
             "pipes",
             "memory",
             "processes",

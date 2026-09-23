@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::proto::identifier;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -63,6 +63,71 @@ pub struct NewApproval<'a> {
 /// `<action>-pr<N>-<head[..12]>` — the base id an approval records
 /// under when the operator names none. A fresh approval after a revoke
 /// becomes `<base>-2`, `<base>-3`, … (see `Store::record_approval`).
+/// CAD-316: the only event kinds retention may remove — per-delivery
+/// bookkeeping whose facts the message row also records. An allowlist,
+/// never a denylist: a kind added later is kept until someone lists it
+/// here, and every deleting statement repeats this filter.
+pub const ROLLABLE_EVENT_KINDS: [&str; 2] = ["submitting", "submitted"];
+/// The one per-alias row holding the rolled-up delivery counts.
+pub const DELIVERY_ROLLUP_EVENT: &str = "delivery_rolled_up";
+/// Delivery rows younger than this stay rows.
+pub const EVENT_ROLLUP_AGE_SECS: f64 = 7.0 * 86_400.0;
+/// Most delivery rows one rollup pass folds. A pass holds the store
+/// lock in one transaction, so a long-lived store's first backlog
+/// drains in bounded chunks, oldest first, never in one long hold.
+pub const EVENT_ROLLUP_BATCH: usize = 5_000;
+
+/// `events e` rows a rollup at cutoff `?1` may fold: an allowlisted
+/// kind, older than the cut, outside any job view, and not naming a
+/// message that is still live or `unknown` (unreconciled evidence).
+fn rollable_events_where() -> String {
+    let kinds = ROLLABLE_EVENT_KINDS
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "e.kind IN ({kinds}) AND e.at < ?1 AND e.job_id IS NULL AND e.task_id IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM messages m \
+           WHERE m.id = json_extract(e.payload, '$.message') \
+           AND m.state NOT IN ('completed','failed','interrupted','cancelled'))"
+    )
+}
+
+/// What `doctor --host` shows about the events table (CAD-316).
+pub(crate) struct EventStoreStats {
+    pub events: u64,
+    pub awaiting_rollup: u64,
+    pub rolled_up: u64,
+}
+
+/// Read-only counts for doctor over an already-open connection.
+pub(crate) fn event_store_stats(
+    conn: &Connection,
+    cutoff: f64,
+) -> rusqlite::Result<EventStoreStats> {
+    let events = conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+    let awaiting_rollup = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM events e WHERE {}",
+            rollable_events_where()
+        ),
+        [cutoff],
+        |r| r.get(0),
+    )?;
+    let rolled_up = conn.query_row(
+        "SELECT COALESCE(SUM(c.value), 0) FROM events e, json_each(e.payload, '$.counts') c \
+         WHERE e.kind = ?1",
+        [DELIVERY_ROLLUP_EVENT],
+        |r| r.get(0),
+    )?;
+    Ok(EventStoreStats {
+        events,
+        awaiting_rollup,
+        rolled_up,
+    })
+}
+
 pub fn default_approval_id(action: &str, pr: u64, head: &str) -> String {
     format!("{action}-pr{pr}-{}", &head[..head.len().min(12)])
 }
@@ -202,6 +267,95 @@ impl Store {
     /// CAD-405: record the operator's approval of a project's work gate
     /// keys (`project`, `digest`, `by`, `at`, …) on [`APPROVAL_STREAM`]
     /// — never pruned, and not a mailbox anything can cancel.
+    /// CAD-316: fold delivery rows older than `cutoff` (see
+    /// [`ROLLABLE_EVENT_KINDS`]) into one [`DELIVERY_ROLLUP_EVENT`] row
+    /// per alias carrying per-kind counts and the folded time span. The
+    /// first rollup reuses the alias's oldest folded row, so the summary
+    /// keeps an old seq and never reads as new activity to a cursor or
+    /// the stall watch; later passes add into that row. One pass folds
+    /// at most `limit` rows, oldest first, so the lock hold stays
+    /// bounded; returns the number folded — `limit` means more may
+    /// remain.
+    pub fn roll_up_delivery_events(&self, cutoff: f64, limit: usize) -> Result<usize> {
+        let conn = self.write_conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let mut rows: Vec<(i64, String, String, f64)> = {
+            let mut st = tx.prepare(&format!(
+                "SELECT e.seq, e.alias, e.kind, e.at FROM events e WHERE {} \
+                 ORDER BY e.seq LIMIT ?2",
+                rollable_events_where()
+            ))?;
+            let rows = st.query_map(params![cutoff, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        // Per-alias runs, each in seq order, for the fold below.
+        rows.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        let kinds_sql = ROLLABLE_EVENT_KINDS
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for batch in rows.chunk_by(|a, b| a.1 == b.1) {
+            let alias = &batch[0].1;
+            let existing: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT seq, payload FROM events WHERE alias=?1 AND kind=?2 \
+                     ORDER BY seq LIMIT 1",
+                    params![alias, DELIVERY_ROLLUP_EVENT],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let mut summary = match &existing {
+                Some((_, payload)) => serde_json::from_str::<Value>(payload).map_err(|e| {
+                    Error::internal(format!("{DELIVERY_ROLLUP_EVENT} payload: {e}"))
+                })?,
+                None => json!({
+                    "counts": ROLLABLE_EVENT_KINDS
+                        .iter()
+                        .map(|k| (k.to_string(), json!(0)))
+                        .collect::<serde_json::Map<_, _>>(),
+                }),
+            };
+            for (_, _, kind, at) in batch {
+                let count = summary["counts"][kind.as_str()].as_u64().unwrap_or(0);
+                summary["counts"][kind.as_str()] = json!(count + 1);
+                let first = summary["first_at"].as_f64().map_or(*at, |f| f.min(*at));
+                let last = summary["last_at"].as_f64().map_or(*at, |l| l.max(*at));
+                summary["first_at"] = json!(first);
+                summary["last_at"] = json!(last);
+            }
+            let folded = match existing {
+                Some((seq, _)) => {
+                    tx.execute(
+                        "UPDATE events SET payload=?1 WHERE seq=?2 AND kind=?3",
+                        params![summary.to_string(), seq, DELIVERY_ROLLUP_EVENT],
+                    )?;
+                    batch
+                }
+                None => {
+                    tx.execute(
+                        &format!(
+                            "UPDATE events SET kind=?1, payload=?2 \
+                             WHERE seq=?3 AND kind IN ({kinds_sql})"
+                        ),
+                        params![DELIVERY_ROLLUP_EVENT, summary.to_string(), batch[0].0],
+                    )?;
+                    &batch[1..]
+                }
+            };
+            let mut delete = tx.prepare(&format!(
+                "DELETE FROM events WHERE seq=?1 AND kind IN ({kinds_sql})"
+            ))?;
+            for (seq, ..) in folded {
+                delete.execute([seq])?;
+            }
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
     pub fn record_work_approval(&self, payload: Value) -> Result<()> {
         let conn = self.write_conn()?;
         Self::event(&conn, APPROVAL_STREAM, WORK_APPROVED_EVENT, payload)

@@ -29,6 +29,7 @@
 // shared measurement machinery in util.rs.
 
 mod agent_uid;
+mod cadence_store;
 mod config;
 mod disk;
 mod load;
@@ -521,6 +522,7 @@ pub fn run(scan: &Scan) -> Value {
     let checks = [
         check_disk(scan),
         check_provider_state(scan),
+        check_cadence_store(scan),
         check_pipes(scan),
         check_memory(scan),
         check_processes(scan),
@@ -646,6 +648,8 @@ const DIR_WALK_BUDGET: usize = 200_000;
 #[allow(unused_imports)]
 use agent_uid::check_agent_uid;
 #[allow(unused_imports)]
+use cadence_store::check_cadence_store;
+#[allow(unused_imports)]
 use config::check_config;
 #[allow(unused_imports)]
 use disk::{check_disk, fs_level};
@@ -662,8 +666,6 @@ use pane_identity::check_pane_identity;
 use pipes::{check_pipes, scan_pipes, PipeStats};
 #[allow(unused_imports)]
 use processes::check_processes;
-#[allow(unused_imports)]
-pub(crate) use provider_state::wal_sibling;
 #[allow(unused_imports)]
 use provider_state::{check_provider_state, store_level};
 #[allow(unused_imports)]
@@ -684,6 +686,8 @@ pub(crate) use util::has_secret_prefix;
 #[allow(unused_imports)]
 pub(crate) use util::wal_roots;
 #[allow(unused_imports)]
+pub(crate) use util::wal_sibling;
+#[allow(unused_imports)]
 pub(crate) use util::Census;
 #[allow(unused_imports)]
 pub(crate) use util::FsFree;
@@ -695,8 +699,8 @@ pub(crate) use util::WalScan;
 pub(crate) use util::SECRET_PREFIXES;
 #[allow(unused_imports)]
 use util::{
-    census_of, comm_family, dir_size, dir_size_limited, file_locked, group_line, kill_lines,
-    kill_remedy, pid_age_secs, proc_census, proc_stat, proc_uptime, read_u64_file,
+    census_of, comm_family, dir_size, dir_size_limited, file_locked, file_size, group_line,
+    kill_lines, kill_remedy, pid_age_secs, proc_census, proc_stat, proc_uptime, read_u64_file,
     redact_argv_parts, repo_root, shell_quote, stale_worktrees, top_groups, GroupAgg, OldestProc,
     ProcStat, REDACTED,
 };

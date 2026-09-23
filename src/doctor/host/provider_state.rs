@@ -15,10 +15,6 @@ struct StoreMeasure {
     level: Level,
 }
 
-fn file_size(path: &Path) -> Option<u64> {
-    std::fs::metadata(path).ok().map(|m| m.len())
-}
-
 pub(super) fn store_level(store: u64, wal: Option<u64>, t: &Thresholds) -> Level {
     if wal.is_some_and(|w| w > t.wal_fail_bytes) {
         Level::Fail
@@ -153,10 +149,4 @@ fn eval_provider_state(stores: &[StoreMeasure], t: &Thresholds) -> Check {
         })
         .collect::<Vec<_>>();
     check(name, level, json!(value), threshold, detail, remedy)
-}
-
-/// The `<db>-wal` sibling cadence and sqlite both write next to the
-/// main file.
-pub(crate) fn wal_sibling(db: &Path) -> Option<PathBuf> {
-    Some(db.with_file_name(format!("{}-wal", db.file_name()?.to_string_lossy())))
 }
