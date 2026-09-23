@@ -7754,14 +7754,14 @@ fn briefing_body(
         let cwd = agent["cwd"].as_str()?;
         let pm = cadence_agent::issue::Pm::open_default().ok()?;
         let proj = cadence_agent::issue::project::resolve(&pm.dir, None, Path::new(cwd)).ok()?;
-        let (rules, errors) = cadence_agent::memory::project_rules(&pm, &proj.key);
+        let (matched, errors) = cadence_agent::memory::project_rules(&pm, &proj.key);
         if let Some(line) = cadence_agent::memory::load_errors_line(&errors) {
             eprintln!("{line}");
         }
-        if rules.is_empty() {
+        if matched.lessons.is_empty() && matched.withheld.is_empty() {
             return None;
         }
-        let fresh = cadence_agent::memory::Freshness::for_project(Some(&proj));
+        let rules = &matched.lessons;
         // ≤8 entries AND ≤LESSON_MAX_BYTES total — same bound the
         // dispatch lessons file carries. An over-budget rule is
         // skipped, not a stop: later smaller rules still list.
@@ -7771,7 +7771,7 @@ fn briefing_body(
             let line = format!(
                 "- `{}` ({}): {} — {}",
                 m.front.id,
-                cadence_agent::memory::evidence_label(m, &fresh),
+                matched.label(m),
                 cadence_agent::memory::fact_line(&m.body),
                 cadence_agent::memory::apply_line(&m.body)
             );
@@ -7790,8 +7790,24 @@ fn briefing_body(
         } else {
             String::new()
         };
+        if items.is_empty() {
+            items.push_str("(none applied)");
+        }
+        // A withheld rule is named with its reason — "why did I not get
+        // this?" — bounded like the dispatch lessons file's section.
+        let mut withheld = String::new();
+        for (m, reason) in matched.withheld.iter().take(8) {
+            let line = format!("- `{}`: {reason}\n", m.front.id);
+            if withheld.len() + line.len() > cadence_agent::memory::LESSON_MAX_BYTES {
+                break;
+            }
+            withheld.push_str(&line);
+        }
+        if !withheld.is_empty() {
+            withheld = format!("Withheld — stale evidence, not applied:\n\n{withheld}\n");
+        }
         Some(format!(
-            "## Project memory — accepted rules ({proj_key})\n\n{items}\n\n{more}\
+            "## Project memory — accepted rules ({proj_key})\n\n{items}\n\n{more}{withheld}\
              `cadence memory match --issue <ID>` lists everything scoped to\n\
              a task; `cadence memory propose` records a new lesson.\n\n",
             proj_key = proj.key

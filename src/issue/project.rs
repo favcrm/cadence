@@ -83,8 +83,10 @@ pub struct Project {
 #[serde(deny_unknown_fields)]
 pub struct MemoryPolicy {
     /// Days a verified lesson's evidence stays fresh. A lesson last
-    /// verified longer ago is withheld from dispatch until a new verify
-    /// cycle is finalized. Default: `memory::DEFAULT_STALE_DAYS` (30).
+    /// verified longer ago is not withheld: it decays to unverified and
+    /// is still injected, labelled "unverified (last verified <date>)",
+    /// until a new verify cycle is finalized. Only an explicit `stale:`
+    /// mark withholds. Default: `memory::DEFAULT_STALE_DAYS` (30).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_days: Option<u64>,
 }

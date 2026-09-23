@@ -123,13 +123,16 @@ pub enum MemoryAction {
         /// Only memories whose path globs match this file.
         #[arg(long)]
         path: Option<String>,
-        /// Accepted memories whose path globs match files changed
-        /// after verified_at in a project repo.
+        /// Accepted memories whose evidence is not current, read the
+        /// way retrieval reads it: marked stale (withheld), no verify
+        /// inside the window (unverified), or path globs matching files
+        /// changed since the last verify in a project repo.
         #[arg(long)]
         stale: bool,
-        /// Staleness scan window in days [default: 30].
-        #[arg(long, default_value = "30")]
-        days: u64,
+        /// Freshness window in days [default: the project's
+        /// `memory.stale_days`, else 30].
+        #[arg(long)]
+        days: Option<u64>,
         #[arg(long)]
         json: bool,
     },
@@ -340,22 +343,32 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 if *as_json {
                     crate::issue::cli::print_json(&json!({"stale": hits, "load_errors": errors}));
                 } else if hits.is_empty() {
-                    println!("no stale memories (window: {days} days)");
+                    match days {
+                        Some(days) => println!("no stale memories (window: {days} days)"),
+                        None => println!("no stale memories (window: each project's)"),
+                    }
                 } else {
                     for h in &hits {
-                        println!(
-                            "{}/{}\tverified {}\t{}",
-                            h["project"].as_str().unwrap_or_default(),
-                            h["slug"].as_str().unwrap_or_default(),
-                            h["verified_at"].as_str().unwrap_or("never"),
-                            h["changed"]
-                                .as_array()
-                                .map(|c| c
-                                    .iter()
+                        let changed = h["changed"]
+                            .as_array()
+                            .map(|c| {
+                                c.iter()
                                     .filter_map(|p| p.as_str())
                                     .collect::<Vec<_>>()
-                                    .join(", "))
-                                .unwrap_or_default(),
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        let reason = h["reason"].as_str().unwrap_or_default();
+                        println!(
+                            "{}/{}\t{}\t{}",
+                            h["project"].as_str().unwrap_or_default(),
+                            h["slug"].as_str().unwrap_or_default(),
+                            h["evidence"]["label"].as_str().unwrap_or("unverified"),
+                            if changed.is_empty() {
+                                reason.to_string()
+                            } else {
+                                format!("{reason}: {changed}")
+                            },
                         );
                     }
                 }
@@ -369,6 +382,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             };
             let filtering = component.is_some() || path.is_some();
             let (all, load_errors) = memory::load_all_report(&pm.dir);
+            let projects = crate::issue::project::list(&pm.dir).unwrap_or_default();
             if let Some(line) = memory::load_errors_line(&load_errors) {
                 eprintln!("{line}");
             }
@@ -396,7 +410,10 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             }
             if *as_json {
                 crate::issue::cli::print_json(&json!({
-                    "memories": mems.iter().map(memory::card_json).collect::<Vec<_>>(),
+                    "memories": mems
+                        .iter()
+                        .map(|m| memory::card_json(m, &memory::Freshness::among(&projects, &m.project)))
+                        .collect::<Vec<_>>(),
                     "load_errors": load_errors,
                 }));
             } else if mems.is_empty() {
@@ -422,9 +439,10 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             json: as_json,
         } => {
             let pm = open_pm()?;
-            let (_proj, m) = memory::find(&pm, project.as_deref(), slug)?;
+            let (proj, m) = memory::find(&pm, project.as_deref(), slug)?;
             if *as_json {
-                crate::issue::cli::print_json(&memory::detail_json(&m));
+                let fresh = memory::Freshness::for_project(Some(&proj));
+                crate::issue::cli::print_json(&memory::detail_json(&m, &fresh));
             } else {
                 let text = std::fs::read_to_string(&m.path)?;
                 println!("{text}");
