@@ -2,7 +2,10 @@
 //! branch to an issue: mint `.cadence/wt/<id>-<slug>` on
 //! `cadence/<id>-<slug>`, record both as refs, move `backlog|ready`
 //! to `doing`, print the CAD-42 trailer. `--job` additionally opens
-//! an M3 job whose task is already scoped to the worktree.
+//! an M3 job whose task is already scoped to the worktree. An issue
+//! with one open worktree ref reuses that lane (CAD-274): a re-start
+//! re-applies the cargo target and mints nothing; a `--name` for a
+//! different slug, or several open refs, refuses.
 
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -12,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::client;
 use crate::error::{Error, Result};
-use crate::issue::model::Ref;
+use crate::issue::model::{Front, Ref};
 use crate::issue::{git, project, write, Pm};
 use crate::{proto, worktree};
 
@@ -173,6 +176,133 @@ fn worktree_branch(dir: &Path) -> Option<String> {
     git(dir, &["symbolic-ref", "--short", "HEAD"]).ok()
 }
 
+/// The issue's open worktree refs, in recorded order.
+pub(crate) fn open_worktrees(front: &Front) -> Vec<PathBuf> {
+    front
+        .refs
+        .iter()
+        .filter(|r| r.kind == "worktree" && r.closed != Some(true))
+        .filter_map(|r| r.path.as_deref().map(PathBuf::from))
+        .collect()
+}
+
+/// The repo a recorded lane belongs to: through the checkout when it
+/// exists, else the `<root>/.cadence/wt/<name>` layout walked upward.
+/// `None` when neither answers — the caller's resolved repo stands.
+fn lane_root(lane: &Path) -> Option<PathBuf> {
+    if lane.is_dir() {
+        return worktree::main_root(lane).ok();
+    }
+    let wt = lane.parent()?;
+    let cadence = wt.parent()?;
+    if wt.file_name()? != "wt" || cadence.file_name()? != ".cadence" {
+        return None;
+    }
+    cadence.parent()?.canonicalize().ok()
+}
+
+/// CAD-274: the one open lane an issue already has — `(dir, branch)`.
+/// A `--name` naming a different slug would fork the issue's work into
+/// a second lane and is refused, naming the lane that exists; so is a
+/// lane recorded in another repo than the one resolved. The branch is
+/// the open branch ref `cadence/<dir name>`, else the branch the dir
+/// has checked out when that is recorded open (a moved lane), else
+/// `cadence/<dir name>`.
+fn reuse_lane(
+    front: &Front,
+    lane: &Path,
+    name: Option<&str>,
+    root: &Path,
+) -> Result<(PathBuf, String)> {
+    let wt_name = lane
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let prefix = format!("{}-", front.id.to_lowercase());
+    let slug = wt_name.strip_prefix(&prefix).unwrap_or(&wt_name);
+    if let Some(name) = name {
+        let (want, _) = names(&front.id, &front.title, Some(name))?;
+        if want != wt_name {
+            return Err(Error::rejected(format!(
+                "{id} already has an open worktree '{slug}' at {path} — \
+                 --name {name} would start a second lane. Re-run without \
+                 --name to reuse it, or close it first with `cadence issue \
+                 finish {id} --worktree {path}`",
+                id = front.id,
+                path = lane.display()
+            )));
+        }
+    }
+    if let Some(other) = lane_root(lane).filter(|r| r != root) {
+        return Err(Error::rejected(format!(
+            "{}'s open worktree {} belongs to repo {}, not {} — pass --repo {}",
+            front.id,
+            lane.display(),
+            other.display(),
+            root.display(),
+            other.display()
+        )));
+    }
+    let open_branch = |b: &str| {
+        front
+            .refs
+            .iter()
+            .any(|r| r.kind == "branch" && r.closed != Some(true) && r.path.as_deref() == Some(b))
+    };
+    let named = format!("cadence/{wt_name}");
+    let branch = if open_branch(&named) {
+        named
+    } else {
+        worktree_branch(lane)
+            .filter(|b| open_branch(b))
+            .unwrap_or(named)
+    };
+    Ok((lane.to_path_buf(), branch))
+}
+
+/// `front` with the lane's branch and worktree refs recorded open —
+/// an existing ref of the same value is re-opened (never duplicated),
+/// else one is added — and the worktree ref's cargo target current.
+fn with_lane_refs(
+    front: &Front,
+    branch: &str,
+    wt: &str,
+    repo_label: &str,
+    cargo_target: &Option<PathBuf>,
+) -> Front {
+    fn open_ref<'a>(refs: &'a mut Vec<Ref>, kind: &str, path: &str, label: &str) -> &'a mut Ref {
+        let same = |r: &Ref| r.kind == kind && r.path.as_deref() == Some(path);
+        let at = refs
+            .iter()
+            .position(|r| same(r) && r.closed != Some(true))
+            .or_else(|| refs.iter().rposition(same));
+        let at = at.unwrap_or_else(|| {
+            refs.push(Ref {
+                kind: kind.to_string(),
+                url: None,
+                path: Some(path.to_string()),
+                label: (!label.is_empty()).then(|| label.to_string()),
+                closed: None,
+                worktree: None,
+                cargo_target: None,
+                agent: None,
+            });
+            refs.len() - 1
+        });
+        let r = &mut refs[at];
+        if r.closed == Some(true) {
+            r.closed = None;
+        }
+        r
+    }
+    let mut out = front.clone();
+    open_ref(&mut out.refs, "branch", branch, repo_label);
+    open_ref(&mut out.refs, "worktree", wt, "").cargo_target = cargo_target
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    out
+}
+
 /// Probe the daemon, the PM alias and the assignee before anything is
 /// created — `--job` refuses up front on any failure. The assignee
 /// rule mirrors `check_group_member` (the PM itself or an agent whose
@@ -234,14 +364,42 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
 
     let _lock = pm.lock()?;
     let (mut front, body) = write::load_front(&dir)?;
-    let (wt_name, branch) = names(&front.id, &front.title, args.name.as_deref())?;
-    let wt_dir = root.join(".cadence").join("wt").join(&wt_name);
+    // CAD-274: an open worktree ref IS the issue's lane — a re-start
+    // reuses it (re-applying the cargo target) rather than minting a
+    // second lane from the title. Several open refs are ambiguous:
+    // refuse and name them instead of guessing.
+    let open = open_worktrees(&front);
+    let (wt_dir, branch) = match open.as_slice() {
+        [] => {
+            let (wt_name, branch) = names(&front.id, &front.title, args.name.as_deref())?;
+            (root.join(".cadence").join("wt").join(wt_name), branch)
+        }
+        [lane] => reuse_lane(&front, lane, args.name.as_deref(), &root)?,
+        many => {
+            return Err(Error::rejected(format!(
+                "{} has {} open worktree refs — refusing to guess which lane \
+                 to start:\n  {}\nClose the stale ones with `cadence issue \
+                 finish {} --worktree <path>`",
+                front.id,
+                many.len(),
+                many.iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n  "),
+                front.id
+            )))
+        }
+    };
+    let wt_name = wt_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
-    // Recorded refs are matched by value, not first-of-kind: a
-    // re-start under `--name` leaves the old refs in place (they are
-    // history) and must not shadow the new ones.
+    // Recorded refs are matched by value, not first-of-kind: a lane
+    // finished earlier leaves its closed refs as history, and a
+    // re-start under the same names re-opens them.
     let wt_str = wt_dir.to_string_lossy().into_owned();
-    let has_ref = |kind: &str, target: &str| {
+    let recorded = |kind: &str, target: &str| {
         front
             .refs
             .iter()
@@ -254,7 +412,6 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             .find(|r| r.kind == kind)
             .and_then(|r| r.path.clone())
     };
-    let ours_recorded = has_ref("branch", &branch) && has_ref("worktree", &wt_str);
     // Clear registrations whose dirs are gone — a deleted worktree
     // must not block its own re-creation.
     let _ = git(&root, &["worktree", "prune"]);
@@ -269,10 +426,16 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         ],
     )
     .is_ok();
+    let reuse = branch_exists
+        && (!open.is_empty() || recorded("branch", &branch) && recorded("worktree", &wt_str));
+    let repo_label = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
 
     let mut created = false;
     let cargo_target: Option<PathBuf>;
-    if ours_recorded && branch_exists {
+    if reuse {
         if !dir_exists {
             // Refs still accurate — re-attach the existing branch.
             worktree::add(&root, &wt_dir, None, &branch)?;
@@ -291,33 +454,17 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             &root,
             worktree::shared_deps_enabled(&project)?,
         )?;
-        // Idempotent: same issue, same names — no commit, unless the
-        // recorded cargo target went stale (project config flipped,
-        // an older cadence recorded a different layout). The ref is
-        // corrected with a real commit, same as any ref edit.
-        let now = cargo_target
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned());
-        let stale = front
-            .refs
-            .iter()
-            .find(|r| r.kind == "worktree" && r.path.as_deref() == Some(wt_str.as_str()))
-            .is_some_and(|r| r.cargo_target != now);
-        if stale {
-            let mut refreshed = front.clone();
-            if let Some(r) = refreshed
-                .refs
-                .iter_mut()
-                .find(|r| r.kind == "worktree" && r.path.as_deref() == Some(wt_str.as_str()))
-            {
-                r.cargo_target = cargo_target
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned());
-            }
+        // Idempotent: same lane — no commit, unless its refs need a
+        // fix: a stale recorded cargo target (project config flipped,
+        // an older cadence recorded a different layout), a closed
+        // pair re-opened, a missing half of the pair. The fix is a
+        // real commit, same as any ref edit.
+        let refreshed = with_lane_refs(&front, &branch, &wt_str, &repo_label, &cargo_target);
+        if refreshed.refs != front.refs {
             let committed = write::save_front(&dir, &refreshed, &body).and_then(|_| {
                 write::commit(
                     pm,
-                    &format!("{}: start {branch} (cargo_target refreshed)", front.id),
+                    &format!("{}: start {branch} (refs refreshed)", front.id),
                     &[front.id.as_str()],
                     actor,
                 )
@@ -365,40 +512,10 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         }
         created = true;
 
-        let repo_label = root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.display().to_string());
-        let mut new_front = front.clone();
-        // Refs are pushed only when not already recorded — a front
-        // saved-but-never-committed (crash, refused commit) must not
-        // duplicate them on retry.
-        if !has_ref("branch", &branch) {
-            new_front.refs.push(Ref {
-                kind: "branch".to_string(),
-                url: None,
-                path: Some(branch.clone()),
-                label: Some(repo_label),
-                closed: None,
-                worktree: None,
-                cargo_target: None,
-                agent: None,
-            });
-        }
-        if !has_ref("worktree", &wt_str) {
-            new_front.refs.push(Ref {
-                kind: "worktree".to_string(),
-                url: None,
-                path: Some(wt_str.clone()),
-                label: None,
-                closed: None,
-                worktree: None,
-                cargo_target: cargo_target
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned()),
-                agent: None,
-            });
-        }
+        // Refs already recorded (a front saved-but-never-committed on
+        // a crash or refused commit, or a closed pair of the same
+        // names) are re-opened, never duplicated.
+        let mut new_front = with_lane_refs(&front, &branch, &wt_str, &repo_label, &cargo_target);
         if matches!(new_front.status.as_str(), "backlog" | "ready") {
             new_front.status = "doing".to_string();
         }
