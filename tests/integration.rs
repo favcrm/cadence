@@ -26264,3 +26264,185 @@ fn body_flags_match_on_send_and_comment() {
         assert!(show.contains(want), "{want}: {show}");
     }
 }
+
+// ---------- CAD-109: pre-publish secret scan ----------
+
+/// A synthetic token: `prefix` plus `n` letters and digits drawn from a
+/// seeded SHA-256 stream. It is built at run time so this file never holds a
+/// credential-shaped literal.
+fn cad109_token(prefix: &str, seed: &str, n: usize) -> String {
+    use sha2::{Digest, Sha256};
+    const ALPHANUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = prefix.to_string();
+    let mut counter = 0u32;
+    while out.len() < prefix.len() + n {
+        for b in Sha256::digest(format!("{seed}:{counter}").as_bytes()) {
+            if out.len() < prefix.len() + n {
+                out.push(ALPHANUM[b as usize % ALPHANUM.len()] as char);
+            }
+        }
+        counter += 1;
+    }
+    out
+}
+
+/// `cadence --state-dir <state> secret scan <args>` with `stdin` piped in.
+fn cad109_scan(state: &Path, args: &[&str], stdin: &str) -> (i32, Value, String) {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state)
+        .args(["secret", "scan"])
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let v = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("not json: {stdout} / {stderr}"));
+    (
+        out.status.code().unwrap_or(-1),
+        v,
+        format!("{stdout}{stderr}"),
+    )
+}
+
+/// Exit 0 when clean or warn-only, 1 on a blocking finding. A bare token
+/// alone on its line is found with its rule, line and a redacted prefix, and
+/// the value appears nowhere in the output. The operator allowlist in the
+/// state dir drops what it names.
+#[test]
+fn secret_scan_exit_codes_and_redaction() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    let (code, v, _) = cad109_scan(&state, &[], "Ran the focused tests; all green.\n");
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["findings"], json!([]));
+
+    let warn = format!(
+        "config:\n  api_key = \"{}\"\n",
+        cad109_token("", "warn", 24)
+    );
+    let (code, v, _) = cad109_scan(&state, &[], &warn);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["findings"][0]["rule"], "generic-api-key");
+    assert_eq!(v["findings"][0]["severity"], "warn");
+
+    let ant = ["sk", "-ant-", "api03-"].concat();
+    let pat = ["github", "_pat_"].concat();
+    for (prefix, rule) in [
+        ("figd_", "cadence-figma-token"),
+        (ant.as_str(), "cadence-anthropic-key"),
+        (pat.as_str(), "cadence-github-fine-grained-pat"),
+    ] {
+        let tok = cad109_token(prefix, rule, 64);
+        let (code, v, all) = cad109_scan(&state, &[], &format!("Result\n\n{tok}\n"));
+        assert_eq!(code, 1, "{v}");
+        let f = &v["findings"][0];
+        assert_eq!(f["rule"], rule, "{v}");
+        assert_eq!(
+            (f["line"].as_u64(), f["column"].as_u64()),
+            (Some(3), Some(1))
+        );
+        assert_eq!(f["severity"], "block");
+        assert!(f["redacted"].as_str().unwrap().ends_with('…'), "{v}");
+        assert!(!all.contains(&tok[prefix.len()..]), "{all}");
+    }
+
+    let tok = cad109_token("figd_", "file", 40);
+    let file = tmp.path().join("pr-body.md");
+    std::fs::write(&file, format!("# Summary\n\ntoken {tok}\n")).unwrap();
+    let (code, v, all) = cad109_scan(&state, &["--file", file.to_str().unwrap()], "");
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["blocking"], 1);
+    assert!(!all.contains(&tok[5..]), "{all}");
+
+    std::fs::write(
+        state.join("secret-allowlist.toml"),
+        "[[allow]]\nrule = \"cadence-figma-token\"\nreason = \"test fixture\"\n",
+    )
+    .unwrap();
+    let (code, v, _) = cad109_scan(&state, &["--file", file.to_str().unwrap()], "");
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["allowlisted"], 1);
+
+    std::fs::write(state.join("secret-allowlist.toml"), "not toml [").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["secret", "scan", "--file", file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Refusing to write"));
+}
+
+/// `issue comment` refuses a credential-shaped body: the error names the
+/// rule, never the value, and no comment file or tracker commit is written.
+/// `report` is refused the same way, both as a new issue and as `--issue`.
+#[test]
+fn issue_comment_and_report_refuse_credential_shaped_text() {
+    let s = ReportFx::new();
+    let state = s.state.to_str().unwrap().to_string();
+    let env = [("CADENCE_STATE_DIR", state.as_str())];
+    let (ok, out) = s.cli(&["issue", "new", "Target", "--project", "product"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let comments = s.pm_dir.join("product").join(&id).join("comments");
+    let count = || std::fs::read_dir(&comments).map(|d| d.count()).unwrap_or(0);
+    let log_before = s.tracker_log(1);
+
+    let tok = cad109_token("figd_", "comment", 40);
+    let body = format!("Verified locally.\n{tok}\n");
+    let (ok, stderr, _) = s.cli_at_env(
+        &s.product_repo,
+        &["issue", "comment", &id, "-m", &body],
+        &env,
+    );
+    assert!(!ok, "{stderr}");
+    assert!(stderr.contains("rule cadence-figma-token"), "{stderr}");
+    assert!(
+        stderr.contains("secret_detected") || stderr.contains("refused"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(&tok[5..]), "{stderr}");
+    assert_eq!(count(), 0);
+    assert_eq!(s.tracker_log(1), log_before);
+
+    for args in [
+        vec!["report", "--kind", "bug", "-m", &body],
+        vec!["report", "--issue", &id, "--kind", "bug", "-m", &body],
+    ] {
+        let (ok, stderr, _) = s.cli_at_env(&s.product_repo, &args, &env);
+        assert!(!ok, "{args:?}: {stderr}");
+        assert!(stderr.contains("rule cadence-figma-token"), "{stderr}");
+        assert!(!stderr.contains(&tok[5..]), "{stderr}");
+    }
+    assert_eq!(count(), 0);
+    assert_eq!(s.tracker_log(1), log_before);
+
+    // Clean text still goes through, and a warn-only finding rides along.
+    let warn = format!(
+        "config:\n  api_key = \"{}\"\n",
+        cad109_token("", "warn", 24)
+    );
+    let (ok, stderr, (_, v)) = s.cli_at_env(
+        &s.product_repo,
+        &["issue", "comment", &id, "-m", &warn],
+        &env,
+    );
+    assert!(ok, "{stderr}");
+    assert_eq!(v["secret_warnings"][0]["rule"], "generic-api-key", "{v}");
+    assert_eq!(count(), 1);
+}

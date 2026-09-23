@@ -37,6 +37,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tungstenite = "0.26"
 tempfile = "3"
 toml = "0.8"
+# CAD-109 secret scan: the vendored gitleaks rule pack is RE2 syntax, which
+# the regex crate accepts as-is (no lookarounds or backreferences).
+regex = "1"
 
 [dev-dependencies]
 shlex = "2.0.1"
