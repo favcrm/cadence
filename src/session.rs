@@ -1494,7 +1494,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                             "binary is {n} commit(s) behind {}",
                             d["ref"].as_str().unwrap_or("main")
                         ),
-                        "git pull && cargo build --release --features ui",
+                        overview::CMD_UPGRADE_LATEST_MAIN,
                     )
                 } else {
                     bin.ok(format!(

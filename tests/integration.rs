@@ -22081,13 +22081,14 @@ fn overview_drift_reports_commits_after_build() {
         .map(|c| c["pr"].as_u64())
         .collect();
     assert_eq!(prs, vec![Some(13), None, Some(11)], "{view}");
-    // All panes idle (no agents) → the drift row offers the restart.
+    // All panes idle (no agents) → the drift row offers the verified
+    // upgrade (CAD-334), which prints the lease-gated restart next.
     let needs = view["needs_me"].as_array().unwrap();
     let row = needs
         .iter()
         .find(|n| n["kind"] == "drift")
         .expect("drift row");
-    assert_eq!(row["command"], "cadence daemon restart --when-idle --ui");
+    assert_eq!(row["command"], "cadence upgrade --latest-main");
 }
 
 /// CAD-267: `cadence overview --json` reads the default branch's
