@@ -665,9 +665,11 @@ builds are trusted and what is installed or replaced, so never take them
 from a message or an agent. A link that is a regular file is never
 replaced. The persisted copy is re-hashed before the link moves, and the
 link is re-hashed through afterwards and pointed back if it does not
-resolve to the verified bytes. Earlier releases stay on disk. The report is JSON:
-`from_sha`, `to_sha`, `installed_path`, `verified{…}`, `restarted`, and
-`restart_command`.
+resolve to the verified bytes. Earlier releases stay on disk. Before the
+install, a verified `pre-update` backup of the store is taken; if it
+fails, the upgrade is refused (see "Backup, export and restore"). The
+report is JSON: `from_sha`, `to_sha`, `installed_path`, `verified{…}`,
+`backup`, `restarted`, and `restart_command`.
 
 **Releases already on disk.** A release under `releases/<sha>/` is
 reused without a download only when it proves to be the CI build: its
@@ -849,3 +851,134 @@ used to list by hand:
 - `git worktree list` shows only the main tree and active lanes.
 - `cadence stop <pm>` parks the group; sessions stay resumable.
 - Write down what changed in how you work, not only what shipped.
+
+## 10. Backup, export and restore
+
+The store (`<state>/cadence.sqlite3`) is the only durable controller
+state that is not already in git. Three commands cover it (CAD-314):
+
+```bash
+cadence backup                          # verified copy + manifest into <state>/backups
+cadence backup --reason nightly         # its own retention group, keeps 7 by default
+cadence backup --dir /srv/cadence-bak --keep 14
+cadence export --out ~/cadence-bundle   # portable bundle, no credentials
+cadence restore <copy>.manifest.json    # or: cadence restore ~/cadence-bundle
+cadence restore ~/cadence-bundle --repo ~/src/cadence --repo ~/src/app
+```
+
+**Backup.** The copy is taken with SQLite's online backup API from a
+read-only connection. It is one snapshot, and a running daemon's writer
+is never blocked, so there is no need to stop anything. The copy is
+turned into a single file with no `-wal`, checked with `PRAGMA
+integrity_check`, and hashed. A manifest named `<copy>.manifest.json`
+is written next to it:
+
+- `schema_version`, read from the copy itself;
+- `sha256` and `bytes`;
+- `integrity_check`;
+- `versions`: the cadence build, the schema this binary migrates to, and SQLite;
+- `repos`: each checkout the store points into, with its `origin` remote,
+  userinfo stripped.
+
+The pair is then read back from disk and verified before the command
+reports success. The files are `0600` and the directory is `0700`.
+
+`--keep N` (default 7) prunes the oldest backups that share the same
+`--reason` in that directory. Only a copy that has a cadence manifest is
+ever pruned. Hand-made files there, such as
+`cadence-live-<ts>.sqlite3`, are never touched, and a burst of
+`pre-restore` copies cannot push out the nightly ones.
+
+**Nightly.** Nightly backups are a schedule, not a daemon feature. Add a
+cron line:
+
+```cron
+17 3 * * * $HOME/.local/bin/cadence backup --reason nightly >> $HOME/.local/state/cadence/backups/nightly.log 2>&1
+```
+
+With the default `--keep 7`, this holds a week of copies. The backup
+runs out of process, on its own read connection, so the daemon's
+single-writer mutex is never involved. A daemon timer would add a new
+failure mode to the production process, and it would need a config and
+status surface like `agent_gc_timer`. That timer is a follow-up, not
+part of this command.
+
+**Rollout receipts.** `cadence rollout backup --path` refuses a file
+inside the state dir. For a schema-crossing rollout, take the copy with
+`--dir` outside the state dir after `rollout claim`, then record that
+`.sqlite3` path.
+
+**Export.** `export --out <new dir>` writes exactly two files:
+
+- `cadence.sqlite3`
+- `manifest.json`, whose `export` block lists what is in the bundle and what is not
+
+Only the store goes in. It is changed in these ways:
+
+- `agents.generation`, the generation every turn token is bound to, is set to NULL.
+- `agents.pid` is set to NULL.
+- The file is `VACUUM`ed, so deleted rows left in freed pages do not travel.
+
+Everything else stays out by construction:
+
+- `ui.json`, `slots.json`, logs, the lock and the socket;
+- `secret-allowlist.toml` and `intake-relay.yaml`;
+- `.env` files;
+- `private/`, `sessions/`, `briefings/`, `reviews/`, `agents/`, `roles/` and `backups/`;
+- provider sign-in state, which lives in the providers' own dirs and is never read;
+- the tracker, which is a git repo with its own remote.
+
+No board session secret exists yet (CAD-313). Because only the store is
+exported, a token file in the state dir stays out. A secret column added
+to the store must join `SCRUB_COLUMNS` in `src/backup/mod.rs`.
+
+Every text cell of every table then goes through the CAD-109 secret
+scan (`cadence secret scan`'s rules). A single blocking finding refuses
+the export and removes the directory. The refusal names each
+`table.column`, rowid, rule and fingerprint, never the value. A false
+positive is for the operator to allowlist by rule and fingerprint in
+`<state>/secret-allowlist.toml`. There is no bypass flag.
+
+**Restore.** `restore` takes a backup manifest or a bundle directory and
+writes `--state-dir` (default: the usual state dir). It refuses in each
+of these cases:
+
+- **A daemon holds the state dir.** A running daemon holds
+  `cadence.lock`. Restore takes that lock itself for the whole run, so
+  no daemon can start mid-restore.
+- **The manifest's schema is newer than this binary.**
+- **The copy does not match its manifest**: a different sha256 or size,
+  a failed integrity check, or a different recorded schema.
+- **The state dir already has a store**, unless `--force` is passed.
+  `--force` first takes a verified `pre-restore` backup into
+  `<state>/backups`, then replaces the store and drops the old `-wal` and
+  `-shm`.
+
+Repo paths are rewritten by remote. The restore matches each recorded
+repo to the `--repo` checkout whose `origin` is the same remote.
+`https://…/o/r.git`, `git@host:o/r` and `ssh://git@host:22/o/r` all
+count as the same remote. The rewrite covers `agents.cwd`, `jobs.repo`,
+`jobs.spec_path`, `tasks.worktree` and `tasks.spec_path` by prefix.
+
+A recorded path that is still a checkout of the same remote is kept.
+Anything else is listed under `unmapped` and left as written. Paths
+inside JSON params and event payloads are history and are not rewritten.
+
+A restored store with an older schema is migrated by the next daemon
+start only under a rollout lease with a backup receipt. The JSON output
+says so in `note`.
+
+**Self-update.** `cadence upgrade` takes a backup first. The backup
+runs after every verification and immediately before the release is
+installed and the link moves. It goes through `backup::before_self_update`,
+the same as `cadence backup --reason pre-update`, and writes a verified
+copy into `<state>/backups`, which keeps 7 `pre-update` copies. A failed
+backup refuses the upgrade, and nothing is installed. `--dry-run` and an
+upgrade that is already current take no backup. The copy is reported
+under `backup`, and a state dir with no store yet reports `skipped`.
+This copy is inside the state dir, so it is not a rollout receipt for a
+schema crossing (see above).
+
+Never point `restore` at the production state dir to try it out. Rehearse
+in a `mktemp -d` state dir with a read-only copy of the store:
+`sqlite3 -readonly "file:<live>?mode=ro" ".backup <tmp>/cadence.sqlite3"`.
