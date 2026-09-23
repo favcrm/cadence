@@ -40,6 +40,12 @@ pub fn default_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CADENCE_PM_DIR") {
         return Ok(PathBuf::from(dir));
     }
+    home_default_dir()
+}
+
+/// The tracker `default_dir` resolves with `CADENCE_PM_DIR` unset —
+/// `~/pm`, the production default a sandbox must never reach.
+pub fn home_default_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())

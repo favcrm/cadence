@@ -29,6 +29,26 @@ pub fn cloud_secret_env_prefix() -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// The daemon's own tracker and profile. Every agent it launches must
+/// share them, so a sandbox worker's `cadence issue …` reaches the
+/// sandbox's tracker, gated (CAD-310). Provider scrubs that drop
+/// `CADENCE_*` re-inject exactly these beside the agent's alias and
+/// state dir.
+pub const DAEMON_CONTEXT_ENV: [&str; 2] = ["CADENCE_PM_DIR", "CADENCE_PROFILE"];
+
+/// [`DAEMON_CONTEXT_ENV`] as this daemon has it; empty values are
+/// skipped.
+pub fn daemon_context_env(env: &ProviderEnv) -> Vec<(String, String)> {
+    DAEMON_CONTEXT_ENV
+        .iter()
+        .filter_map(|name| {
+            env.var(name)
+                .filter(|v| !v.is_empty())
+                .map(|v| (name.to_string(), v))
+        })
+        .collect()
+}
 pub mod codex;
 pub mod fake;
 pub mod link;
@@ -473,5 +493,26 @@ mod tests {
             app.env_remove(name);
         }
         assert_child_lacks_secrets(&mut app);
+    }
+
+    /// CAD-310: the tracker and profile a launched agent gets back are
+    /// the daemon's own values; an empty one is not re-injected.
+    #[test]
+    fn daemon_context_env_is_the_daemon_tracker_and_profile() {
+        let env = ProviderEnv::default();
+        env.set("CADENCE_PM_DIR", "/sbx/pm");
+        env.set("CADENCE_PROFILE", "sandbox:x");
+        assert_eq!(
+            daemon_context_env(&env),
+            vec![
+                ("CADENCE_PM_DIR".to_string(), "/sbx/pm".to_string()),
+                ("CADENCE_PROFILE".to_string(), "sandbox:x".to_string()),
+            ]
+        );
+        env.set("CADENCE_PROFILE", "");
+        assert_eq!(
+            daemon_context_env(&env),
+            vec![("CADENCE_PM_DIR".to_string(), "/sbx/pm".to_string())]
+        );
     }
 }

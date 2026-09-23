@@ -536,22 +536,30 @@ fn proc_start_ticks(stat: &str) -> Option<String> {
 /// same rule as the managed adapter's (`EnvScrub::prefixes`), expressed
 /// as `env -u` because the pane launches through a shell command, not
 /// a Command env table. `CADENCE_ALIAS`/`CADENCE_STATE_DIR` stay: the
-/// agent and the Stop hook need them for `cadence self`.
+/// agent and the Stop hook need them for `cadence self`. So does the
+/// daemon's tracker and profile ([`crate::adapter::DAEMON_CONTEXT_ENV`],
+/// set on the pane with `-e`): a sandbox worker's `cadence issue …`
+/// must stay in the sandbox.
 fn scrubbed_env_names() -> Vec<String> {
+    scrub_names(std::env::vars().map(|(k, _)| k))
+}
+
+/// [`scrubbed_env_names`] over an explicit list of inherited names.
+fn scrub_names(inherited: impl Iterator<Item = String>) -> Vec<String> {
     const KEEP: &[&str] = &[
         "CLAUDE_CONFIG_DIR",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CADENCE_ALIAS",
         "CADENCE_STATE_DIR",
     ];
-    let mut names: Vec<String> = std::env::vars()
-        .map(|(k, _)| k)
+    let mut names: Vec<String> = inherited
         .filter(|k| {
             (k.starts_with("CLAUDE_")
                 || k.starts_with("CLAUDECODE")
                 || k.starts_with("CODEX_")
                 || k.starts_with("CADENCE_"))
                 && !KEEP.contains(&k.as_str())
+                && !crate::adapter::DAEMON_CONTEXT_ENV.contains(&k.as_str())
         })
         .collect();
     for name in crate::adapter::CLOUD_SECRET_ENV {
@@ -935,7 +943,8 @@ impl TuiProfile for ClaudeProfile {
 #[cfg(test)]
 mod tests {
     use super::{
-        analyze_claude, analyze_claude_styled, proc_start_ticks, ClaudeProfile, STATUS_LINES,
+        analyze_claude, analyze_claude_styled, proc_start_ticks, scrub_names, ClaudeProfile,
+        STATUS_LINES,
     };
     use crate::adapter::pty::profile::TuiProfile;
     use std::path::PathBuf;
@@ -1466,5 +1475,40 @@ mod tests {
         let p = analyze_claude(screen, None);
         assert!(!p.approval_menu && p.input_nonempty, "{p:?}");
         assert!(prof.approval_answer(screen, "1").is_err());
+    }
+
+    /// CAD-310: the pane scrub keeps the agent's identity and the
+    /// daemon's tracker and profile; test overrides and nested-session
+    /// variables still go.
+    #[test]
+    fn pane_scrub_keeps_the_daemon_tracker_and_profile() {
+        let names = scrub_names(
+            [
+                "CADENCE_ALIAS",
+                "CADENCE_STATE_DIR",
+                "CADENCE_PM_DIR",
+                "CADENCE_PROFILE",
+                "CADENCE_CLAUDE_COMMAND",
+                "CLAUDE_PID",
+                "PATH",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        for kept in [
+            "CADENCE_ALIAS",
+            "CADENCE_STATE_DIR",
+            "CADENCE_PM_DIR",
+            "CADENCE_PROFILE",
+            "PATH",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == kept),
+                "{kept} scrubbed: {names:?}"
+            );
+        }
+        for gone in ["CADENCE_CLAUDE_COMMAND", "CLAUDE_PID"] {
+            assert!(names.iter().any(|n| n == gone), "{gone} kept: {names:?}");
+        }
     }
 }

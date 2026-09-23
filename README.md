@@ -353,6 +353,43 @@ still selects terminal-natively; `Ctrl-b [` enters copy mode as a
 fallback. OSC52 reaches the system clipboard only on terminals that
 support it.
 
+### Sandbox
+
+A disposable Cadence beside the production one, for trying a build or
+driving a feature by hand:
+
+```bash
+cadence sandbox up smoke          # own state dir, tracker and board port
+                                  #  (3110-3199, --port to pick; 3010 refused)
+eval "$(cadence sandbox env smoke)"  # point this shell at it
+cadence sandbox ls                # every sandbox, daemon/board running?
+cadence sandbox down smoke        # stop its agents, board and daemon and
+                                  #  kill leftover panes; keep files
+cadence sandbox reset smoke       # stop, then delete its root
+```
+
+Roots live under `$CADENCE_SANDBOX_ROOT` (default
+`$XDG_STATE_HOME/cadence-sandbox/<name>`; an absolute path with no `.`
+or `..`) as `.cadence-sandbox` (the marker `reset` requires), `state/`,
+`pm/` and `sandbox.env`. `up` runs the daemon and board from the binary
+that invoked it, and refuses a root that overlaps production's state
+dir (either default), socket or `~/pm`, or the
+`CADENCE_STATE_DIR`/`CADENCE_PM_DIR` the shell exports. The state dir
+decides: any `cadence --state-dir <root>/state …` runs as that sandbox,
+whatever the shell exports, and a sandbox never needs the rollout lease
+— a rebuilt binary brings it back up. Under
+`CADENCE_PROFILE=sandbox:<name>` the daemon skips the skill sync into
+`$HOME`, `ui tailscale` and port 3010 are refused, the provider WAL
+watcher only records intent, and the Cursor `cli-config.json` merge
+(only when it would write) needs the opt-in:
+`cadence sandbox down <name>` then
+`CADENCE_SANDBOX_ALLOW_GLOBAL=1 cadence sandbox up <name>`. Every agent the sandbox launches gets
+its state dir, tracker and profile, so its own `cadence` calls stay in
+the sandbox. A sandbox is not a container, though: its daemon, board
+and agents run as you with your `$HOME`, so everything else there is
+shared with the host — provider logins, sessions and config, git and
+build caches, and whatever an agent writes itself.
+
 ## Principles
 
 - Preserve native session identity and visible terminal conversations.

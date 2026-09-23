@@ -74,8 +74,9 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(60);
 /// (config location) and `CLAUDE_CODE_OAUTH_TOKEN` (CI auth injection).
 /// `ANTHROPIC_*` auth/proxy variables are never touched. `CADENCE_*` is
 /// scrubbed then the real pair (`CADENCE_ALIAS`, `CADENCE_STATE_DIR`) is
-/// re-injected per agent — test overrides like `CADENCE_CLAUDE_COMMAND`
-/// never reach the child.
+/// re-injected per agent, with the daemon's tracker and profile
+/// ([`super::DAEMON_CONTEXT_ENV`]) — test overrides like
+/// `CADENCE_CLAUDE_COMMAND` never reach the child.
 pub(crate) fn claude_env_scrub() -> EnvScrub {
     EnvScrub::prefixes(
         &["CLAUDE_", "CLAUDECODE", "CODEX_", "CADENCE_"],
@@ -450,13 +451,14 @@ impl ProviderAdapter for ClaudeAdapter {
         let generation = Uuid::new_v4().simple().to_string()[..12].to_string();
         *self.shared.generation.lock().unwrap() = generation.clone();
         self.shared.dead.store(false, Ordering::SeqCst);
-        let env = [
+        let mut env = vec![
             ("CADENCE_ALIAS".to_string(), agent.alias.clone()),
             (
                 "CADENCE_STATE_DIR".to_string(),
                 self.state_dir.to_string_lossy().to_string(),
             ),
         ];
+        env.extend(super::daemon_context_env(&self.env));
         let params = agent.params.clone().unwrap_or(Value::Null);
         let idle_secs = params
             .get("turn_idle_secs")
