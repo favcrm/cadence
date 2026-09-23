@@ -4517,25 +4517,19 @@ impl Store {
         Ok(rows.into_iter().filter(Message::holds_turn).collect())
     }
 
-    /// CAD-375: every running message's turn token with what judges it
-    /// — `(alias, provider, endpoint_kind, generation, turn_id)`. The
-    /// daemon keeps only the tokens a `message_report` would accept
-    /// now and withholds them from every connection but the owner's.
-    /// Driven from `agents` so each probe is an index seek on
-    /// `msg_queue(alias,state,…)`, never a scan of the history.
-    #[allow(clippy::type_complexity)]
-    pub fn running_turn_tokens(
-        &self,
-    ) -> Result<Vec<(String, String, String, Option<String>, String)>> {
+    /// CAD-375: every running message's turn token and its agent —
+    /// `(alias, turn_id)`. The daemon withholds each from every
+    /// connection but the owner's, current or not. Driven from `agents`
+    /// so each probe is an index seek on `msg_queue(alias,state,…)`,
+    /// never a scan of the history.
+    pub fn running_turn_tokens(&self) -> Result<Vec<(String, String)>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT a.alias, a.provider, a.endpoint_kind, a.generation, m.turn_id
+            "SELECT a.alias, m.turn_id
              FROM agents a JOIN messages m ON m.alias = a.alias AND m.state = 'running'
              WHERE m.turn_id IS NOT NULL AND m.turn_id != ''",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 

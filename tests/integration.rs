@@ -6367,7 +6367,9 @@ fn cad162_assert_refused(d: &TestDaemon, alias: &str, id: &str, token: &str, wha
     }
     let after = cad162_message(d, alias, id);
     assert_eq!(after["state"], "running", "{what}: {after}");
-    assert_eq!(after["turn_id"], token, "{what}: {after}");
+    // The token itself is read from the store: the daemon withholds a
+    // running turn's token from every connection but its agent's (CAD-375).
+    assert_eq!(running_token(d, id), token, "{what}: {after}");
     assert_eq!(after["result"], before["result"], "{what}: {after}");
     assert!(after["result"]["ack"].is_null(), "{what}: {after}");
 }
@@ -33899,6 +33901,103 @@ fn operator_verbs_refuse_agents_whatever_they_claim() {
     assert_eq!(rec["payload"]["by"], "operator", "{rec}");
 }
 
+/// CAD-375 (review R1): the withholding is one filter over every answer,
+/// so it covers the read paths beyond `agent_show`: job and task views
+/// (the kickoff's `turn_id`), the agent's thread and its message rows
+/// (a body quoting the token), events, and a pane capture showing it —
+/// and it holds while the generation is cleared, as in a hot restart's
+/// window before adoption restores it.
+#[test]
+fn turn_tokens_are_withheld_on_every_read_path() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register("pm");
+    d.fixture_rpc(
+        "agent_register",
+        json!({"alias": "dv1", "provider": "devin", "endpoint_kind": "pty",
+               "cwd": d.dir.path().to_str().unwrap(),
+               "params": json!({"upstream": "pm"}).to_string()}),
+    )
+    .unwrap();
+    d.wait_agent("dv1", "idle", 20);
+    let (spec, sha) = d.spec_file("spec.md", "token reads");
+    d.job_new("pm", "j1", &spec, &sha);
+    d.rpc(
+        "task_new",
+        json!({"job": "j1", "task": "j1-t", "assignee": "dv1", "acceptance": "ok"}),
+    )
+    .unwrap();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    let kickoff = d.job_dispatch("j1-t", json!({})).unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token = pty_token(&d, "dv1", &kickoff);
+    // Prose quoting it: a queued chat message (row + thread entry) and the
+    // pane's screen, as if the worker printed `cadence self`.
+    d.rpc(
+        "thread_send",
+        json!({"alias": "dv1", "text": format!("report with {token}"), "message": "q1"}),
+    )
+    .unwrap();
+    let screen = d.pane_file(&mock, "dv1", "screen");
+    let shown = std::fs::read_to_string(&screen).unwrap_or_default();
+    atomic_write(
+        screen.clone(),
+        format!("{shown}\nrunning: {kickoff} {token}\n"),
+    );
+
+    let reads = [
+        ("agent_show", json!({"alias": "dv1"})),
+        ("agent_list", json!({})),
+        ("agent_events", json!({"alias": "dv1"})),
+        ("job_show", json!({"job": "j1"})),
+        ("task_show", json!({"task": "j1-t"})),
+        ("thread_read", json!({"alias": "dv1"})),
+        ("agent_capture", json!({"alias": "dv1"})),
+    ];
+    let check = |when: &str| {
+        for (method, params) in &reads {
+            let r = d.rpc(method, params.clone()).unwrap();
+            assert!(!r.to_string().contains(&token), "{when} {method}: {r}");
+        }
+    };
+    check("live");
+    let capture = d.rpc("agent_capture", json!({"alias": "dv1"})).unwrap();
+    assert!(
+        capture["capture"]
+            .as_str()
+            .unwrap()
+            .contains("[turn token withheld]"),
+        "{capture}"
+    );
+    let thread = d.rpc("thread_read", json!({"alias": "dv1"})).unwrap();
+    assert!(
+        thread
+            .to_string()
+            .contains("report with [turn token withheld]"),
+        "{thread}"
+    );
+    let task = d.rpc("task_show", json!({"task": "j1-t"})).unwrap();
+    assert!(task["task"]["kickoff"]["turn_id"].is_null(), "{task}");
+
+    // The restart window: no generation, the turn still running.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let generation: String = conn
+        .query_row("SELECT generation FROM agents WHERE alias='dv1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    conn.execute("UPDATE agents SET generation=NULL WHERE alias='dv1'", [])
+        .unwrap();
+    check("no generation");
+    conn.execute(
+        "UPDATE agents SET generation=?1 WHERE alias='dv1'",
+        [&generation],
+    )
+    .unwrap();
+}
+
 /// CAD-373: `job task reopen` is the proven operator's or the job's own
 /// PM's (the cadence skill tells PMs to run it) — decided by the
 /// connection. The task's assignee, a peer worker and another group's
@@ -34198,6 +34297,27 @@ fn turn_tokens_are_shown_only_to_the_owning_connection() {
     assert_ne!(rc, 0, "{out}");
     assert!(out.contains("shown only to that agent's own pane"), "{out}");
     assert!(!out.contains(token), "{out}");
+
+    // A hot restart's window: the generation is NULL while the turn
+    // keeps running and becomes current again on adoption (review R1).
+    // A token that is not current NOW is still withheld.
+    cad162_sql(
+        &d,
+        "UPDATE agents SET generation=NULL WHERE alias='wa'",
+        &[],
+    );
+    for (method, params) in &reads {
+        let r = peer.rpc(&d.state, method, params.clone());
+        assert!(
+            !r.to_string().contains(token),
+            "peer {method}, no generation: {r}"
+        );
+    }
+    cad162_sql(
+        &d,
+        "UPDATE agents SET generation='planted' WHERE alias='wa'",
+        &[],
+    );
 
     // The owner still reads its own token, on every path.
     for (method, params) in &reads {

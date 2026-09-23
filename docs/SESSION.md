@@ -741,8 +741,10 @@ Expected rollout effects after the restart:
 
 - A Devin PM (managed) whose turn was in flight is fenced: its provider
   process died with the old daemon, and the turn goes `unknown` with the
-  agent in `attention`. Once you have checked what it did, reconcile it
-  with `cadence agent unfence <pm> --status interrupted`. That resumes
+  agent in `attention`. Once you have checked what it did, the operator
+  reconciles it from a shell outside every pane with `cadence agent
+  unfence <pm> --status interrupted` — an agent, the rollout owner's
+  own pane included, is refused (CAD-374). That resumes
   it; add `--no-resume` to reconcile only. PTY turns that are re-adopted
   show `kept` in the table.
 - Every endpoint open writes `ready`, so the idle auto-stop clock (CAD-96,

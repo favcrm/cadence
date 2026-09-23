@@ -1826,21 +1826,20 @@ impl Shared {
     /// `turn_id` held it (and a redaction marker where prose quoted
     /// it), on every read path at once: `agent_show`/`agent_list`
     /// (`awaiting_report`, message rows), events, job and task views,
-    /// threads. Only tokens a report would accept now are withheld —
-    /// a finished or stale-generation turn's token is history, not a
-    /// credential. Fail closed: a caller whose identity cannot be
-    /// derived owns nothing.
+    /// threads, pane captures.
+    ///
+    /// EVERY running message's token is withheld, whatever its
+    /// currency: a hot restart clears the generation while adopted
+    /// turns keep running and then restores it, so a token that is not
+    /// current now can be current again in a moment (review R1). The
+    /// owner derivation reads panes and enrollments only; it can miss
+    /// the owner (a pane whose facts are not published yet) and then
+    /// withholds from the owner too — never the other way round. Fail
+    /// closed: a caller whose identity cannot be derived owns nothing,
+    /// and unreadable running turns withhold every `turn_id`.
     fn withhold_turn_tokens(&self, answer: Value, peer_pid: u32) -> Value {
-        let live: Vec<(String, String)> = match self.store.running_turn_tokens() {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|(_, provider, kind, generation, token)| {
-                    registry::turn_token_current(provider, kind, generation.as_deref(), token)
-                })
-                .map(|(alias, _, _, _, token)| (alias, token))
-                .collect(),
-            // Unreadable: withhold every string that looks like a turn
-            // token rather than answer with one.
+        let live = match self.store.running_turn_tokens() {
+            Ok(rows) => rows,
             Err(_) => return withhold_all_turn_ids(answer),
         };
         if live.is_empty() {
@@ -8168,24 +8167,44 @@ fn upstream_roots(agents: &[Agent]) -> HashSet<String> {
         .collect()
 }
 
-/// Replace every occurrence of `tokens` in `value`'s strings (CAD-375):
-/// a string that IS a token becomes `null` (a withheld `turn_id`), one
-/// that quotes it keeps its text with the token masked.
+/// A token long enough to mask inside prose without corrupting other
+/// text: every scheme a report accepts (`pty-<gen>-<nonce>`,
+/// `claude-<gen>-<nonce>`) is far longer; a short schemeless token
+/// (`fake-turn-1`, which `fake-turn-10` contains) is withheld only
+/// where it is a whole value.
+fn quotable(token: &str) -> bool {
+    token.len() >= 16
+}
+
+/// Withhold `tokens` from `value` (CAD-375): a `turn_id` field holding
+/// one becomes `null`; any string that IS or quotes a [`quotable`]
+/// token has it masked (`null` when it is the whole string). A short
+/// schemeless token (a codex `t-1`, a fake `fake-turn-1`) is withheld
+/// only as a `turn_id` value — elsewhere the same text is someone
+/// else's data (a message id, `fake-turn-10`).
 fn redact_tokens(value: &mut Value, tokens: &[&str]) {
     match value {
         Value::String(text) => {
-            if tokens.contains(&text.as_str()) {
+            if tokens.iter().any(|t| quotable(t) && t == text) {
                 *value = Value::Null;
-            } else if tokens.iter().any(|t| text.contains(t)) {
+            } else if tokens.iter().any(|t| quotable(t) && text.contains(t)) {
                 let mut masked = text.clone();
-                for token in tokens {
+                for token in tokens.iter().filter(|t| quotable(t)) {
                     masked = masked.replace(token, "[turn token withheld]");
                 }
                 *value = Value::String(masked);
             }
         }
         Value::Array(items) => items.iter_mut().for_each(|v| redact_tokens(v, tokens)),
-        Value::Object(map) => map.values_mut().for_each(|v| redact_tokens(v, tokens)),
+        Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                if key == "turn_id" && v.as_str().is_some_and(|t| tokens.contains(&t)) {
+                    *v = Value::Null;
+                } else {
+                    redact_tokens(v, tokens);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -9485,18 +9504,28 @@ mod tests {
     /// and masked where prose quotes it; other strings are untouched.
     #[test]
     fn redact_tokens_withholds_values_and_quotes() {
-        let tok = "pty-g1-abc";
+        let tok = "pty-g1-0123456789abcdef";
+        let short = "fake-turn-1";
         let mut v = json!({
             "agent": {"awaiting_report": {"turn_id": tok, "message": "m1"}},
             "events": [{"payload": {"turn_id": tok}}, {"text": format!("token {tok} here")}],
-            "other": "pty-g1-abd",
+            "other": "pty-g1-0123456789abcdeX",
+            "fake": short,
+            "later": "fake-turn-10",
         });
-        redact_tokens(&mut v, &[tok]);
+        redact_tokens(&mut v, &[tok, short]);
         assert!(v["agent"]["awaiting_report"]["turn_id"].is_null(), "{v}");
         assert_eq!(v["agent"]["awaiting_report"]["message"], "m1");
         assert!(v["events"][0]["payload"]["turn_id"].is_null(), "{v}");
         assert_eq!(v["events"][1]["text"], "token [turn token withheld] here");
-        assert_eq!(v["other"], "pty-g1-abd");
+        assert_eq!(v["other"], "pty-g1-0123456789abcdeX");
+        // A short token is withheld only as a `turn_id` value — the
+        // same text elsewhere is someone else's data.
+        assert_eq!(v["fake"], short, "{v}");
+        assert_eq!(v["later"], "fake-turn-10");
+        let mut row = json!({"id": "t-1", "turn_id": "t-1"});
+        redact_tokens(&mut row, &["t-1"]);
+        assert_eq!(row, json!({"id": "t-1", "turn_id": null}));
         let all = withhold_all_turn_ids(json!({"m": [{"turn_id": "x", "id": "m1"}]}));
         assert!(all["m"][0]["turn_id"].is_null() && all["m"][0]["id"] == "m1");
     }

@@ -680,7 +680,9 @@ impl Audience {
     /// unknown kind is team work, so it can still escalate.
     fn of_kind(kind: &str) -> Self {
         match kind {
-            "approval" => Self::Operator,
+            // A fenced agent's exit is `agent unfence` / `message
+            // reconcile`, which only the operator may run (CAD-374).
+            "approval" | "fenced" => Self::Operator,
             "drift" => Self::Dependency,
             "inbox_unread" | "tracker_behind" => Self::Info,
             _ => Self::Team,
@@ -2050,6 +2052,8 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
                 age,
                 &cmd_agent_unfence(alias),
             )
+            // Operator only (CAD-374): the PM escalates, it cannot act.
+            .owned_by(None)
             .since(fenced_since(a, probe)),
         );
     }
@@ -2993,29 +2997,21 @@ mod tests {
         resolve(agent_items(&w1, &probe, "cadence", NOW), &agents)
     }
 
+    /// CAD-374: only the operator may unfence or reconcile, so a fenced
+    /// agent's row is the operator's from the start — live PM or dead.
     #[test]
-    fn fenced_agent_with_dead_pm_escalates_to_operator() {
-        let out = fenced_rows(120, Some(pm_row(true, "idle")));
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["kind"], "fenced");
-        assert_eq!(out[0]["since"], NOW - 120, "{}", out[0]);
-        assert_eq!(out[0]["audience"], "operator", "{}", out[0]);
-        assert_eq!(out[0]["audience_reason"], "owner pm is dead");
-    }
-
-    #[test]
-    fn fenced_agent_with_live_pm_stays_team_until_the_threshold() {
-        let live = || Some(pm_row(false, "idle"));
-        // Fenced 10 minutes ago, although the agent row is days old.
-        let out = fenced_rows(10 * 60, live());
-        assert_eq!(out[0]["audience"], "team", "{}", out[0]);
-        assert_eq!(out[0]["audience_reason"], "owner pm can act");
-        let out = fenced_rows(ESCALATE_AFTER_SECS - 60, live());
-        assert_eq!(out[0]["audience"], "team", "{}", out[0]);
-        // Fenced 74 minutes ago.
-        let out = fenced_rows(ESCALATE_AFTER_SECS + 14 * 60, live());
-        assert_eq!(out[0]["audience"], "operator", "{}", out[0]);
-        assert_eq!(out[0]["audience_reason"], "unhandled 74m");
+    fn fenced_agent_goes_to_the_operator_whatever_its_pm() {
+        for (pm, ago) in [
+            (pm_row(true, "idle"), 120),
+            (pm_row(false, "idle"), 10 * 60),
+        ] {
+            let out = fenced_rows(ago, Some(pm));
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0]["kind"], "fenced");
+            assert_eq!(out[0]["since"], NOW - ago, "{}", out[0]);
+            assert_eq!(out[0]["audience"], "operator", "{}", out[0]);
+            assert_eq!(out[0]["audience_reason"], "operator decision");
+        }
     }
 
     /// The clock is when the issue entered its status, not its age: an
@@ -3104,18 +3100,28 @@ mod tests {
         };
         let out = fenced(74 * 60);
         assert_eq!(out[0]["since"], NOW - 74 * 60, "{}", out[0]);
-        assert_eq!(out[0]["audience_reason"], "unhandled 74m");
+        // The operator's from the start (CAD-374).
+        assert_eq!(out[0]["audience_reason"], "operator decision");
         // A later params write shortens the clock; it never inflates it.
-        assert_eq!(fenced(10 * 60)[0]["audience"], "team");
+        assert_eq!(fenced(10 * 60)[0]["since"], NOW - 10 * 60);
     }
 
     #[test]
     fn owner_that_cannot_act_escalates_with_the_reason() {
+        // A team row the PM owns (a fenced row is the operator's alone,
+        // CAD-374, so it cannot show the owner's reason).
         let owners_of = |pm: Option<Value>| {
-            let out = fenced_rows(60, pm);
+            let agents: Vec<Value> = pm.into_iter().collect();
+            let mut rows = vec![item(40, "stalled", "t", 60, "", None, "c").owned_by(Some("pm"))];
+            classify_needs(
+                &mut rows,
+                &Owners::new(true, &agents),
+                NOW,
+                ESCALATE_AFTER_SECS,
+            );
             (
-                out[0]["audience"].clone(),
-                out[0]["audience_reason"].clone(),
+                rows[0].json["audience"].clone(),
+                rows[0].json["audience_reason"].clone(),
             )
         };
         assert_eq!(
@@ -3137,7 +3143,7 @@ mod tests {
             (json!("operator"), json!("owner pm has no inbox consumer"))
         );
         // An unreachable daemon cannot vouch for any owner.
-        let mut rows = vec![item(30, "fenced", "t", 1, "", None, "c").owned_by(Some("pm"))];
+        let mut rows = vec![item(40, "stalled", "t", 1, "", None, "c").owned_by(Some("pm"))];
         classify_needs(
             &mut rows,
             &Owners::new(false, &[]),

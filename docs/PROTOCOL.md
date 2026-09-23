@@ -151,7 +151,7 @@ below they are refused, naming the field, and nothing is written.
 | `message_reconcile`, `agent_unfence` | the proven operator; the record says `by:"operator"` | every agent: the fenced one, a peer and its own PM ("reconciliation is an explicit operator decision"). A PM cannot unfence or reconcile its worker; it escalates to the operator |
 | `agent_respond` | the proven operator, or the requester's own PM (`params.upstream`, bound to the PM's registration as in `agent_set`) | the requesting agent itself, a peer, another group's PM |
 | `plan_approve`, `plan_reject`, `approval_record`, `approval_revoke`, `model_defaults_set`, `slot_reconcile` | the proven operator (`operator_connection`) | every agent |
-| running turn tokens (any answer) | only the connection that derives the agent owning the turn | everyone else, the operator and the board included, reads `null` for that `turn_id` (and `[turn token withheld]` where prose quotes it) |
+| running turn tokens (any answer) | only the connection that derives the agent owning the turn | everyone else, the operator and the board included, reads `null` for that `turn_id` (and `[turn token withheld]` where prose quotes it), whether or not the token is current |
 
 Refusals name the verb and the rule, e.g. `monitor stop is an
 operator action — this connection is agent 'lead'`, `job task reopen
@@ -160,10 +160,13 @@ refused: agent 'wr' cannot answer its own request … (caller rule,
 CAD-370)`, `job verdict: caller identity is connection-bound; request
 field 'reviewer' is not accepted`. Turn tokens are withheld on every
 read path at once (`agent_show`, `agent_list`, events, job and task
-views, threads): the daemon filters each answer for the tokens a
-`message_report` would accept right now and masks the ones the caller
-does not own. A finished or stale-generation token is history and
-passes. Residual (CAD-280): "operator" means only that `operator_proof`
+views, threads, `agent_capture`): the daemon filters each answer for
+the token of EVERY running message and masks the ones the caller does
+not own, current or not — a hot restart clears the generation while
+adopted turns keep running, then restores it. Only a finished turn's
+token (the message is no longer `running`) passes. The owner is derived
+from registered panes and enrollments; while those are not yet
+published (the restart window) the owner is withheld from too. Residual (CAD-280): "operator" means only that `operator_proof`
 passed, which a same-uid process that detaches from every pane and
 scrubs its env and stdio still does.
 
