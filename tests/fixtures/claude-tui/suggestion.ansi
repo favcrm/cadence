@@ -1,0 +1,39 @@
+
+  [1m2.[0m [1mStop[0m [1mduring[0m [1ma[0m [1mhold[0m [1mand[0m [1mthe[0m [1mnotice.[0m
+  - [1mStop:[0m while a turn is held, stopping the agent no longer archives the Devin session.
+  - [1mNotice:[0m the hold and escalation notices no longer advise stop then resume. They include the session URL and name the
+    commands that work: [38;5;153mcadence[39m [38;5;153mmessage[39m [38;5;153mreconcile[39m [38;5;153m<id>[39m [38;5;153m--status[39m [38;5;153m<completed|failed|interrupted>[39m (with [38;5;153m--sha[39m [38;5;153m<40-hex>[39m for
+    a completed commit), or [38;5;153mcadence[39m [38;5;153magent[39m [38;5;153munfence[39m [38;5;153m<alias>[39m [38;5;153m--status[39m [38;5;153m…[39m once the worker is fenced. I checked both against
+    [38;5;153m--help[39m.
+  - [1mReconcile[0m [1mduring[0m [1ma[0m [1mlive[0m [1mhold:[0m before this, the actor's next poll would have failed on the already-reconciled message
+    and put the agent in [38;5;153mattention[39m. Now the actor keeps the operator's result and moves to the next message. That
+    wasn't in the brief, but the new notice tells operators to reconcile, so it had to work.
+  - [1mTests:[0m one for stop (no archive or delete, message stays [38;5;153munknown[39m) and one for reconcile during a hold.
+
+  [1m3.[0m [1mStrict[0m [1mrefresh[0m [1mbefore[0m [1mevery[0m [1mpost.[0m Every post now needs a fresh read of the session and its full message log first.
+  If that fails, the result is [38;5;153mPreWrite[39m and nothing is posted, even when an older complete log exists.
+  [38;5;153mmarker_capture_miss_does_not_bind_an_older_sha[39m now expects exactly that.
+
+  [1mRebase:[0m the PR conflicted with main's CAD-268 commit in one place, the daemon's startup setup ([38;5;153mShared::new_hot[39m). I
+  kept main's rollout-lease code and added the branch's one line; the other eight commits came through unchanged. Main
+  has moved again since, with no conflict, so I left it as the brief says.
+
+  [1mValidation[0m, all admitted through build-slot on the final head:
+  - Focused tests: 175 + 4 passed.
+  - Clippy: clean.
+  - [38;5;153mcargo fmt --check[39m: clean.
+  - 68 integration restart and fence tests also passed, run before the rebase.
+
+  One single-test diagnostic run went without admission while I was fixing a failing test; every reported gate was
+  admitted. The [38;5;153mrespond()[39m reset and the 429 bursts stay in CAD-272.
+
+[38;5;246m✻[39m [38;5;246mSautéed for 24m 4s · done 5:52 AM[39m
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [2mSend qa-cad243 the round 7 review on 6d3325f[0m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m[Opus 5.5] 📁 cad-243-devin-cloud | [█████████████████████████] 126.2% (196,842)[39m
+  [38;5;220m⏵⏵ auto mode on[38;5;246m (shift+tab to cycle) · PR[39m [4m[38;5;220m]8;id=nekvze;https://github.com/favcrm/cadence/pull/136\#136[0m[38;5;246m]8;;\ · ← 3 agents[39m
+                                                                                [38;5;246mnew task? [38;5;153m/clear[38;5;246m to save [38;5;153m197.6k tokens[39m
+
+

@@ -4275,7 +4275,7 @@ fn ws_second_pending_request_keeps_waiting() {
 /// command (`bash -c`) in its own process group so pane_pid and the
 /// /proc lock-descendant checks exercise real ownership logic.
 const MOCK_TMUX_PY: &str = r##"#!/usr/bin/env python3
-import os, signal, subprocess, sys, time
+import os, re, signal, subprocess, sys, time
 
 args = sys.argv[1:]
 if args[0] == "-L":
@@ -4414,6 +4414,11 @@ if cmd == "capture-pane":
     # a dropped `-p` fails loudly here the way it does on a real pane.
     if "-p" not in rest:
         sys.exit(0)
+    # Real tmux keeps SGR attributes (and OSC 8 links) only with `-e`;
+    # a plain capture drops them. Screen files may carry a styled frame.
+    if "-e" not in rest:
+        out = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)",
+                     "", out)
     sys.stdout.write(out); sys.exit(0)
 if cmd == "load-buffer":
     open(os.path.join(state, "buffer"), "w").write(open(rest[-1]).read())
@@ -11907,6 +11912,45 @@ fn pty_claude_busy_and_approval_gate_sends() {
     assert_eq!(probe["approval_menu"], true, "{probe}");
     std::fs::remove_file(&state).unwrap();
     pty_token(&d, "cl", "m3");
+}
+
+/// CAD-294: Claude Code's prompt suggestion is dim (`ESC[2m`) ghost
+/// text in an empty input box. The probe reads the pane with
+/// `capture-pane -e`, so a live frame showing a suggestion probes idle
+/// and a readiness claim goes through — while a live frame with a
+/// typed (undimmed) draft still refuses one. The mock's cursor sits on
+/// its own prompt row, not the replayed box: the attributes alone
+/// decide.
+#[test]
+fn pty_claude_dim_prompt_suggestion_probes_idle() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    d.register_claude_pty("cl", json!({}));
+    d.wait_agent("cl", "idle", 20);
+    let fixture = |name: &str| {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/claude-tui/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    };
+    let state = d.claude_pane_file(&mock, "cl", "tui-state");
+    atomic_write(state.clone(), fixture("suggestion.ansi"));
+    let probe = d.rpc("agent_probe", json!({"alias": "cl"})).unwrap();
+    assert_eq!(probe["idle"], true, "{probe}");
+    assert_eq!(probe["input_nonempty"], false, "{probe}");
+    d.rpc("agent_ready", json!({"alias": "cl"})).unwrap();
+
+    atomic_write(state, fixture("typed.ansi"));
+    let probe = d.rpc("agent_probe", json!({"alias": "cl"})).unwrap();
+    assert_eq!(probe["idle"], false, "{probe}");
+    assert_eq!(probe["input_nonempty"], true, "{probe}");
+    assert_eq!(
+        probe["reason"], "unsubmitted text in the input line",
+        "{probe}"
+    );
+    let err = d.rpc("agent_ready", json!({"alias": "cl"})).unwrap_err();
+    assert!(err.to_string().contains("unsubmitted text"), "{err}");
 }
 
 /// `cadence claude --tui` launches the pty endpoint through the CLI —
