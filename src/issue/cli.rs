@@ -287,7 +287,7 @@ pub enum IssueAction {
     Comment {
         id: String,
         /// Inline comment text.
-        #[arg(short = 'm', conflicts_with = "file")]
+        #[arg(short = 'm', long, conflicts_with = "file")]
         text: Option<String>,
         /// Read the comment body from a file.
         #[arg(long)]
