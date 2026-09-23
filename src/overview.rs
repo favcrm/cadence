@@ -152,10 +152,13 @@ pub fn cmd_agent_answer(alias: &str) -> String {
     format!("cadence agent answer {alias} <choice>")
 }
 
-/// The ready-gated continue for a silently ended turn: the pane
-/// provably probes idle, so `--ready` claims and pastes in one step.
-pub fn cmd_send_ready(alias: &str) -> String {
-    format!("cadence send {alias} --ready --text \"continue …\"")
+/// The recovery for a silently ended turn: a nudge asking the worker to
+/// finish and report. A plain follow-up `send` would queue behind the
+/// unreported turn — the actor holds one report-owing turn at a time —
+/// while a nudge owns no turn and pastes into the idle pane (CAD-250).
+/// `cadence agent attach <alias>` is the manual alternative.
+pub fn cmd_send_nudge(alias: &str) -> String {
+    format!("cadence send {alias} --nudge --text \"finish and report …\"")
 }
 
 pub fn cmd_inbox(alias: &str) -> String {
@@ -2068,6 +2071,32 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
             &cmd_agent_answer(alias),
         ));
     }
+    // CAD-250: an unreported turn holds the actor's queue — a row only
+    // once real work waits behind it, so a healthy turn in progress is
+    // never needs-me noise. Past the bound the turn goes `unknown` and
+    // the `fenced` row takes over.
+    let awaiting = &a["awaiting_report"];
+    let behind = awaiting["queued_behind"].as_i64().unwrap_or(0);
+    if awaiting.is_object() && behind > 0 {
+        let waited = awaiting["since_secs"].as_u64().unwrap_or(0);
+        let bound = match awaiting["remaining_secs"].as_u64() {
+            Some(left) => format!("unknown in {}", inbox::fmt_age(left)),
+            None => "no report bound set".to_string(),
+        };
+        items.push(
+            row(
+                40,
+                "awaiting_report",
+                &format!(
+                    "agent {alias} awaiting report for {} — {behind} queued behind it; {bound}",
+                    inbox::fmt_age(waited)
+                ),
+                waited as i64,
+                &cmd_agent_show(alias),
+            )
+            .since(Some(now - waited as i64)),
+        );
+    }
     if a["silent_ended"].as_bool().unwrap_or(false) {
         items.push(
             row(
@@ -2075,7 +2104,7 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
                 "silent_end",
                 &format!("agent {alias} turn ended at an idle pane — never reported"),
                 a["ended_secs"].as_f64().unwrap_or(age as f64) as i64,
-                &cmd_send_ready(alias),
+                &cmd_send_nudge(alias),
             )
             .since(secs_ago("ended_secs")),
         );
@@ -2863,7 +2892,7 @@ mod tests {
             .map(|c| c["cause"].as_str().unwrap())
             .collect();
         assert_eq!(causes, ["stalled", "silent_end"]);
-        assert_eq!(w1["causes"][1]["command"], cmd_send_ready("w1"));
+        assert_eq!(w1["causes"][1]["command"], cmd_send_nudge("w1"));
         assert_eq!(w1["project"], "cadence");
         // A lone row still carries its one cause.
         assert_eq!(merged[1].json["causes"].as_array().unwrap().len(), 1);
