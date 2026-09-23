@@ -8725,6 +8725,10 @@ fn agent_set_rejects_non_allowlisted_params() {
 
 #[test]
 fn pty_unrendered_worker_result_requeues_then_parks() {
+    // CAD-185: the retry waits (5s after each miss, 5s gate back-off) were
+    // most of this test's ~41s and nothing here asserts their length — the
+    // count, flags, park and survival are the contract. 1s keeps them.
+    test_env().set("CADENCE_PTY_RETRY_SECS", "1");
     let d = TestDaemon::start();
     let mock = d.mock_devin();
     d.register_devin_opts("pm", json!({"auto_ready": "verified"}));
@@ -11171,6 +11175,10 @@ fn task_attached_send_and_self() {
 
 #[test]
 fn job_event_parks_on_unrendered_pty_pm() {
+    // CAD-185: three 5s retry waits were ~15s of this test and nothing
+    // here asserts their length; the four render misses keep the real
+    // RENDER_DEADLINE, since that timeout path is what the park proves.
+    test_env().set("CADENCE_PTY_RETRY_SECS", "1");
     let state_dir = TempDir::new().unwrap();
     let mock_dir = TempDir::new().unwrap();
     let mock = install_mock_devin(mock_dir.path());

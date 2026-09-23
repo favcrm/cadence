@@ -114,6 +114,12 @@ const STALL_TICK: Duration = Duration::from_secs(2);
 /// wrote, a one-minute tick bounds overshoot past `wal_max_bytes` to
 /// ~128 MiB.
 const WAL_TICK: Duration = Duration::from_secs(60);
+/// How long a pty actor waits before retrying a requeued delivery: a
+/// render-miss requeue waits this long, a gate refusal backs off from it
+/// (×1, ×2, ×4, capped at ×6 — 5 → 10 → 20 → 30s). Claims and inbox
+/// arrivals still wake either wait early. `CADENCE_PTY_RETRY_SECS`
+/// overrides it per daemon — tests shrink it (`Shared::pty_retry_base`).
+const PTY_RETRY_BASE: Duration = Duration::from_secs(5);
 /// Persistent monitor reconciliation cadence. Individual registrations
 /// carry their own interval; this tick only bounds how soon a due check
 /// starts after its deadline.
@@ -876,6 +882,7 @@ impl Shared {
         // never a caller's claim.
         self.enroll_endpoint(alias);
         self.wake();
+        let retry_base = self.pty_retry_base();
         let mut gate_notice: Option<String> = None;
         let mut gate_waits: u32 = 0;
         // Proven paste misses per message — a TUI that looks idle but
@@ -986,10 +993,8 @@ impl Shared {
                                 let _ = self.store.requeue(&message.id);
                                 let _ = self.store.set_agent_state_if(alias, "idle", "busy");
                                 gate_notice = None;
-                                ctl.wake.wait_if_unchanged(
-                                    retry_ticket,
-                                    Instant::now() + Duration::from_secs(5),
-                                );
+                                ctl.wake
+                                    .wait_if_unchanged(retry_ticket, Instant::now() + retry_base);
                             } else if routed {
                                 let _ = self.store.event_public(
                                     alias,
@@ -1031,10 +1036,12 @@ impl Shared {
                                 );
                                 gate_notice = Some(reason);
                             }
-                            // 5s → 10 → 20 → 30s cap: claims and inbox
-                            // arrivals wake the wait early, so the poll
-                            // is only the fallback for a busy pane.
-                            let wait = Duration::from_secs((5u64 << gate_waits.min(3)).min(30));
+                            // 5s → 10 → 20 → 30s cap (PTY_RETRY_BASE):
+                            // claims and inbox arrivals wake the wait
+                            // early, so the poll is only the fallback for
+                            // a busy pane.
+                            let wait =
+                                (retry_base * (1u32 << gate_waits.min(3))).min(retry_base * 6);
                             gate_waits = gate_waits.saturating_add(1);
                             ctl.wake
                                 .wait_if_unchanged(retry_ticket, Instant::now() + wait);
@@ -3893,6 +3900,17 @@ impl Shared {
             }
         }
         Ok(Some(root))
+    }
+
+    /// `PTY_RETRY_BASE`, unless this daemon's provider env (a test) or
+    /// the environment sets `CADENCE_PTY_RETRY_SECS` in (0, 3600].
+    fn pty_retry_base(&self) -> Duration {
+        self.provider_env
+            .var("CADENCE_PTY_RETRY_SECS")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|s| *s > 0.0 && *s <= 3600.0)
+            .map(Duration::from_secs_f64)
+            .unwrap_or(PTY_RETRY_BASE)
     }
 
     /// CAD-201: reap what is left of a stopped pane's session — off
