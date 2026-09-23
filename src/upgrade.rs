@@ -541,6 +541,38 @@ pub const TRUST_UNATTESTED: &str = "unattested local release";
 /// `--sha` rollback may still use an unattested release when `gh` is
 /// unavailable (offline) or with `allow_unattested`, and the report then
 /// says [`TRUST_UNATTESTED`], never the tested build.
+/// The pre-update backup must still be on disk and still verify when the
+/// install starts: `before_self_update` returning `Ok` is not enough (its
+/// own retention could remove what it just wrote). A skipped backup (no
+/// store yet) has nothing to check.
+fn verify_backup_pair(backup: &Value) -> Result<()> {
+    if backup.get("skipped").is_some() {
+        return Ok(());
+    }
+    let (Some(db), Some(manifest)) = (backup["db"].as_str(), backup["manifest"].as_str()) else {
+        return Err(Error::rejected(
+            "upgrade refused before installing: the pre-update backup reported no db/manifest",
+        ));
+    };
+    for path in [db, manifest] {
+        let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
+        if !regular {
+            return Err(Error::rejected(format!(
+                "upgrade refused before installing: the pre-update backup {path} is missing \
+                 right after it was taken; nothing was installed. Check `cadence backup` \
+                 retention in its directory, then retry"
+            )));
+        }
+    }
+    crate::backup::verify(Path::new(manifest)).map_err(|e| {
+        Error::rejected(format!(
+            "upgrade refused before installing: the pre-update backup {manifest} no longer \
+             verifies ({e}); nothing was installed"
+        ))
+    })?;
+    Ok(())
+}
+
 pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Value> {
     if let Target::Sha(sha) = &req.target {
         if !is_full_sha(sha) {
@@ -683,6 +715,7 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
                     state_dir.display()
                 ))
             })?;
+            verify_backup_pair(&backup)?;
         }
     }
     if !req.dry_run {
@@ -1152,4 +1185,26 @@ pub fn repoint(link: &Path, target: &Path) -> Result<bool> {
         return Err(e.into());
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod backup_pair_tests {
+    use super::*;
+
+    #[test]
+    fn cad396_a_missing_pre_update_backup_refuses_the_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("cadence-pre-update-x.sqlite3");
+        let manifest = dir.path().join("cadence-pre-update-x.manifest.json");
+        fs::write(&manifest, b"{}").unwrap();
+        let backup = json!({"backup": true, "db": db, "manifest": manifest});
+        let err = verify_backup_pair(&backup).unwrap_err().to_string();
+        assert!(err.contains("missing"), "{err}");
+        // Present but not a verified pair: refused too.
+        fs::write(&db, b"x").unwrap();
+        let err = verify_backup_pair(&backup).unwrap_err().to_string();
+        assert!(err.contains("no longer verifies"), "{err}");
+        // No store yet: nothing to check.
+        verify_backup_pair(&json!({"skipped": "no database"})).unwrap();
+    }
 }
