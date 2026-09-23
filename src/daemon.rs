@@ -3229,7 +3229,7 @@ impl Shared {
 
     /// CAD-360 `plan_approve` / `plan_reject` — operator only, exactly
     /// the connection-bound rule of the approval-evidence verbs
-    /// ([`Self::approval_operator`]): an agent caller is refused, and a
+    /// ([`Self::operator_connection`]): an agent caller is refused, and a
     /// caller with no agent identity must be the proven operator
     /// (CAD-276). The decision is a tracker commit; approval moves the
     /// plan's backlog tickets to ready.
@@ -3239,7 +3239,7 @@ impl Shared {
         } else {
             "plan reject"
         };
-        self.approval_operator(verb, params, peer_pid)?;
+        self.operator_connection(verb, params, peer_pid)?;
         let epic = required_str(params, "epic")?;
         let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
         let out = crate::issue::write::decide_plan(
