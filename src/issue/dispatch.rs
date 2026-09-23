@@ -34,6 +34,9 @@ pub struct DispatchArgs {
     pub job_spec: Option<PathBuf>,
     /// `--no-lessons` — skip project-memory injection for this send.
     pub no_lessons: bool,
+    /// `--force` — dispatch even when the worker's pty pane cwd is
+    /// outside the project's repos (CAD-202); recorded on the issue.
+    pub force: bool,
 }
 
 /// The fixed single-line kickoff body — note path, issue id, summary
@@ -84,6 +87,72 @@ fn check_body(body: &str, provider: &str) -> Result<()> {
     Ok(())
 }
 
+/// CAD-202: a pty worker's live pane cwd must be a directory that
+/// still exists and lies inside one of the issue project's repos (a
+/// linked worktree under `<repo>/.cadence/wt/` counts) — otherwise the
+/// issue's work would run nowhere, or in another project. Reads the
+/// `pane_cwd` fact `agent show` reports; a worker with no live pane
+/// (or a non-pty endpoint) is not checked here. A deleted cwd always
+/// refuses (`cwd_deleted` — delivery would refuse anyway); a foreign
+/// one refuses (`cwd_outside_project`) unless `force`, which returns
+/// the override note the caller records.
+pub(crate) fn check_lane_cwd(
+    project: &crate::issue::project::Project,
+    worker: &str,
+    agent: &Value,
+    force: bool,
+) -> Result<Option<String>> {
+    if agent["endpoint_kind"].as_str() != Some("pty") {
+        return Ok(None);
+    }
+    let Some(path) = agent["pane_cwd"]["path"].as_str() else {
+        return Ok(None);
+    };
+    if agent["pane_cwd"]["deleted"].as_bool() == Some(true) {
+        return Err(Error::invalid(
+            "cwd_deleted",
+            format!(
+                "cwd_deleted: worker '{worker}' has a deleted working directory ({path}) — its \
+                 pane cannot run this work; re-home the lane (`cadence agent stop \
+                 {worker}`, fix its cwd, resume) before dispatching"
+            ),
+        ));
+    }
+    let repos = start::declared_repos(project);
+    if repos.is_empty() {
+        return Ok(None);
+    }
+    let cwd = Path::new(path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(path));
+    if repos.iter().any(|repo| cwd.starts_with(repo)) {
+        return Ok(None);
+    }
+    let listed = repos
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !force {
+        return Err(Error::invalid(
+            "cwd_outside_project",
+            format!(
+                "cwd_outside_project: worker '{worker}' pane cwd {} is outside every repo of project \
+                 {} ({listed}) — its work would run in the wrong repo; re-home the \
+                 lane, or pass --force to dispatch anyway (recorded on the issue)",
+                cwd.display(),
+                project.key
+            ),
+        ));
+    }
+    Ok(Some(format!(
+        "Dispatch override (--force, cwd_outside_project): {worker}'s pane cwd {} \
+         is outside every repo of project {} ({listed})",
+        cwd.display(),
+        project.key
+    )))
+}
+
 /// `dispatch <ISSUE> --to <worker> --note <path> [--job --spec f]`.
 pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path) -> Result<Value> {
     let (project, dir) = write::issue_dir(pm, id)?;
@@ -114,6 +183,8 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
             agent["error"].as_str().unwrap_or("attention")
         )));
     }
+    // CAD-202: the lane's pane must still be inside this project.
+    let cwd_override = check_lane_cwd(&project, &args.to, agent, args.force)?;
     let provider = agent["provider"].as_str().unwrap_or_default().to_string();
     if args.job_spec.is_some() {
         let member = agent["alias"].as_str() == Some(reply_to.as_str())
@@ -160,6 +231,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
             pm: reply_to.clone(),
             spec: spec.clone(),
             assignee: Some(args.to.clone()),
+            force: args.force,
         }),
     };
     let started = start::run(pm, id, &start_args, actor, state_dir)?;
@@ -402,6 +474,12 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     if !lessons.is_empty() {
         comment_text.push_str(&format!("\nLessons injected: {}", lessons.join(", ")));
     }
+    // A `--job` dispatch's override is already recorded by `issue
+    // start`, which re-checks the assignee; the plain path records it
+    // here, with the dispatch it allowed.
+    if let Some(note) = cwd_override.as_ref().filter(|_| args.job_spec.is_none()) {
+        comment_text.push_str(&format!("\n{note}"));
+    }
     let comment = write::add_comment(pm, id, &comment_text, None, Some("dispatch"), None, actor)?;
 
     // The worker's current probe verdict — pty only; the operator
@@ -430,5 +508,6 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     out["job"] = started["job"].clone();
     out["task"] = started["task"].clone();
     out["probe"] = probe.unwrap_or(Value::Null);
+    out["cwd_override"] = cwd_override.map(Value::from).unwrap_or(Value::Null);
     Ok(out)
 }

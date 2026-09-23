@@ -16243,9 +16243,16 @@ fn finish_guard_per_worktree() {
     let _ = shell.wait();
 
     // A queued message blocks only on a LIVE non-inbox owner — give
-    // C to a live devin pane and bind a queued message to it.
+    // C to a live devin pane and bind a queued message to it. The
+    // pane runs in the project's main checkout, as a real lane does —
+    // `dispatch` refuses a pty worker outside the project (CAD-202).
     let _mock = d.mock_devin();
-    d.register_devin("dv", None);
+    d.rpc(
+        "agent_register",
+        json!({"alias": "dv", "provider": "devin", "endpoint_kind": "pty",
+               "cwd": repo_s}),
+    )
+    .unwrap();
     d.wait_agent("dv", "idle", 15);
     let (ok, _) = cli(&["issue", "set", "D-3", "owner=dv"]);
     assert!(ok);
@@ -27047,4 +27054,493 @@ fn session_start_scopes_to_cwd_project() {
     let text = session_text(&out);
     assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(text.contains("not inside a known project repo"), "{text}");
+}
+
+// ==== CAD-201 / CAD-202: pty lane process tree and cwd integrity ====
+
+/// `(state, sid, start_time)` from `/proc/<pid>/stat` — `None` once the
+/// pid is gone.
+fn lane_stat(pid: u32) -> Option<(char, u32, u64)> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = text.rfind(')')?;
+    let f: Vec<&str> = text[end + 1..].split_whitespace().collect();
+    Some((
+        f.first()?.chars().next()?,
+        f.get(3)?.parse().ok()?,
+        f.get(19)?.parse().ok()?,
+    ))
+}
+
+/// Live (non-zombie) pids whose session id is `sid`.
+fn lane_session_pids(sid: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|&pid| lane_stat(pid).is_some_and(|(state, s, _)| s == sid && state != 'Z'))
+        .collect()
+}
+
+/// Test-owned `sleep` children, SIGKILLed on drop if a failed assertion
+/// left them running — matched by pid + start time, never pid alone.
+struct LaneSleepers(Vec<(u32, u64)>);
+
+impl Drop for LaneSleepers {
+    fn drop(&mut self) {
+        for &(pid, start) in &self.0 {
+            if lane_stat(pid).is_some_and(|(state, _, s)| s == start && state != 'Z') {
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+fn wait_pid_file(path: &Path, secs: u64) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// CAD-201: a pty lane records its pane root (pid + start time +
+/// session id + generation) at open and `agent stop` reaps the pane's
+/// session after the pane is killed: SIGTERM, a bounded drain, a
+/// re-sample by identity and SIGKILL only for matching survivors.
+/// The pane spawns two children into their own process groups (so
+/// killing the pane's group misses them, as with real MCP servers):
+/// one exits on SIGTERM, one ignores it and needs the SIGKILL. A
+/// process outside the session is untouched.
+#[test]
+fn pty_stop_reaps_pane_session_tree() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    test_env().set("CADENCE_PTY_DRAIN_SECS", "1.5");
+    let kids = d.dir.path().join("kids");
+    std::fs::create_dir_all(&kids).unwrap();
+    // `set -m` gives each background job its own process group inside
+    // the pane's session; the spawning shell then exits, so both
+    // children are reparented — exactly the escaped-MCP-child shape.
+    let spawn = format!(
+        "bash -c 'set -m; sleep 600 & echo $! > {k}/term.pid; \
+         (trap \"\" TERM; exec sleep 601) & echo $! > {k}/kill.pid'; \
+         python3 {stub} {locks}",
+        k = kids.display(),
+        stub = mock.dir.join("mock-stub.py").display(),
+        locks = mock.locks.display(),
+    );
+    test_env().set("CADENCE_STUB_COMMAND", spawn);
+    // Unrelated process: the test's own child, outside the pane session.
+    let mut outsider = std::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .unwrap();
+    let outsider_start = lane_stat(outsider.id()).unwrap().2;
+    let mut guard = LaneSleepers(vec![(outsider.id(), outsider_start)]);
+
+    d.register_stub("st", json!({}));
+    let agent = d.wait_agent("st", "idle", 20);
+    let root = agent["pane_root"].clone();
+    assert_eq!(root["session_leader"], true, "{agent}");
+    assert_eq!(root["current"], true, "{agent}");
+    assert_eq!(root["generation"], agent["generation"], "{agent}");
+    let sid = root["sid"].as_u64().unwrap() as u32;
+    assert_eq!(root["pid"].as_u64().unwrap() as u32, sid, "{agent}");
+    assert_eq!(
+        lane_stat(sid).unwrap().2,
+        root["start_time"].as_u64().unwrap(),
+        "{agent}"
+    );
+    let term_pid = wait_pid_file(&kids.join("term.pid"), 10);
+    let kill_pid = wait_pid_file(&kids.join("kill.pid"), 10);
+    for pid in [term_pid, kill_pid] {
+        let (_, s, start) = lane_stat(pid).expect("child alive");
+        assert_eq!(s, sid, "child {pid} must be in the pane session");
+        guard.0.push((pid, start));
+    }
+    let recorded = d.wait_event("st", "pane_root", 5);
+    assert_eq!(recorded["payload"]["sid"], root["sid"], "{recorded}");
+
+    d.rpc("agent_stop", json!({"alias": "st"})).unwrap();
+    d.wait_agent("st", "stopped", 15);
+    let intent = d.wait_event("st", "pane_tree_reap_intent", 15);
+    let members: Vec<u64> = intent["payload"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["pid"].as_u64().unwrap())
+        .collect();
+    assert!(
+        members.contains(&(term_pid as u64)) && members.contains(&(kill_pid as u64)),
+        "{intent}"
+    );
+    let reaped = d.wait_event("st", "pane_tree_reaped", 20);
+    let pids = |key: &str| -> Vec<u64> {
+        reaped["payload"][key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["pid"].as_u64().unwrap())
+            .collect()
+    };
+    assert!(reaped["payload"]["refused"].is_null(), "{reaped}");
+    assert!(pids("terminated").contains(&(term_pid as u64)), "{reaped}");
+    assert!(pids("exited").contains(&(term_pid as u64)), "{reaped}");
+    // Only the SIGTERM-ignoring child needed the SIGKILL.
+    assert_eq!(pids("killed"), vec![kill_pid as u64], "{reaped}");
+    assert!(pids("residue").is_empty(), "{reaped}");
+    // Nothing from the pane's session survives the drain…
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !lane_session_pids(sid).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "session {sid} survivors: {:?}",
+            lane_session_pids(sid)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // …and the process outside it is untouched.
+    assert!(
+        lane_stat(outsider.id()).is_some_and(|(state, _, s)| s == outsider_start && state != 'Z'),
+        "the outside process must survive"
+    );
+
+    // A second stop is idempotent: the tree is already reaped.
+    d.rpc("agent_stop", json!({"alias": "st"})).unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let intents = d
+        .events("st")
+        .into_iter()
+        .filter(|e| e["kind"] == "pane_tree_reap_intent")
+        .count();
+    assert_eq!(intents, 1);
+
+    let _ = outsider.kill();
+    let _ = outsider.wait();
+    drop(guard);
+    test_env().remove("CADENCE_PTY_DRAIN_SECS");
+}
+
+/// CAD-201: an agent with no recorded pane root (opened before the
+/// identity was recorded) is never reaped — the stop records that the
+/// tree is unowned and signals nothing beyond the pane.
+#[test]
+fn pty_stop_without_pane_root_records_unowned_tree() {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        store
+            .register_agent(&NewAgent {
+                alias: "old",
+                provider: "tui-stub",
+                endpoint_kind: "pty",
+                role: "worker",
+                cwd: &cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        store.set_enabled("old", false).unwrap();
+        store.set_agent_state("old", "stopped", None).unwrap();
+    }
+    let d = TestDaemon::start_on(state);
+    let _mock = d.mock_stub();
+    d.rpc("agent_stop", json!({"alias": "old"})).unwrap();
+    let e = d.wait_event("old", "pane_tree_unowned", 10);
+    assert!(
+        e["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no pane root identity"),
+        "{e}"
+    );
+    assert!(d
+        .events("old")
+        .iter()
+        .all(|e| e["kind"] != "pane_tree_reap_intent"));
+}
+
+/// Run the cadence CLI against `d` with a hermetic tracker/home.
+fn lane_cli(d: &TestDaemon, pm_dir: &Path, home: &Path, args: &[&str]) -> (bool, Value) {
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(args)
+        .env("CADENCE_PM_DIR", pm_dir)
+        .env("HOME", home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("CADENCE_ALIAS")
+        .output()
+        .unwrap();
+    let text = if out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stderr).to_string()
+    } else {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    (
+        out.status.success(),
+        serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+    )
+}
+
+/// CAD-202: a pty pane whose cwd was deleted refuses delivery at the
+/// gate with a named reason — the message stays queued, never failed —
+/// and `agent show` and `status` surface `cwd_deleted`.
+#[test]
+fn pty_deleted_cwd_refuses_delivery_and_is_surfaced() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    let lane = d.dir.path().join("lane-wt");
+    std::fs::create_dir_all(&lane).unwrap();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "st", "provider": "tui-stub", "endpoint_kind": "pty",
+               "cwd": lane.to_str().unwrap(),
+               "params": json!({"auto_ready": "verified"}).to_string()}),
+    )
+    .unwrap();
+    let agent = d.wait_agent("st", "idle", 20);
+    assert_eq!(agent["cwd_deleted"], false, "{agent}");
+    assert_eq!(
+        agent["pane_cwd"]["path"].as_str().unwrap(),
+        lane.canonicalize().unwrap().to_str().unwrap(),
+        "{agent}"
+    );
+    // The worktree is removed under the live pane.
+    std::fs::remove_dir_all(&lane).unwrap();
+    let agent = d.rpc("agent_show", json!({"alias": "st"})).unwrap()["agent"].clone();
+    assert_eq!(agent["cwd_deleted"], true, "{agent}");
+    assert_eq!(agent["pane_cwd"]["deleted"], true, "{agent}");
+
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "work here", "message": "m1"}),
+    )
+    .unwrap();
+    let wait = d.wait_event("st", "gate_wait", 15);
+    assert!(
+        wait["payload"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("cwd_deleted:"),
+        "{wait}"
+    );
+    assert_eq!(d.message_state("st", "m1"), "queued");
+
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, home) = (tmp.path().join("pm"), tmp.path().join("home"));
+    std::fs::create_dir_all(&home).unwrap();
+    let (ok, view) = lane_cli(&d, &pm_dir, &home, &["status", "--json"]);
+    assert!(ok, "{view}");
+    let row = view["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "st")
+        .cloned()
+        .unwrap();
+    assert_eq!(row["cwd_deleted"], true, "{row}");
+    // Still queued after the status probe — refusal, not failure.
+    assert_eq!(d.message_state("st", "m1"), "queued");
+}
+
+/// CAD-202: issue dispatch to a pty lane checks the pane's cwd against
+/// the issue project's repos — outside refuses by name, `--force`
+/// dispatches and records the override on the issue, a deleted cwd
+/// always refuses, an in-repo lane dispatches as before, and `issue
+/// start --job --assignee` applies the same check.
+#[test]
+fn dispatch_checks_pty_lane_cwd_against_project_repos() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home, elsewhere, gone) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+        tmp.path().join("elsewhere"),
+        tmp.path().join("gone"),
+    );
+    for dir in [&pm_dir, &repo, &home, &elsewhere, &gone] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {}", args.join(" "));
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let cli = |args: &[&str]| lane_cli(&d, &pm_dir, &home, args);
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]).0);
+    for title in ["One", "Two", "Three", "Four"] {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+    let note = tmp.path().join("kickoff.md");
+    std::fs::write(&note, "# kickoff").unwrap();
+    let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
+    let spec = tmp.path().join("spec.md");
+    std::fs::write(&spec, "# spec").unwrap();
+    let spec_s = spec.to_str().unwrap().to_string();
+
+    d.register("pm");
+    for (alias, cwd) in [("out", &elsewhere), ("inr", &repo), ("gone", &gone)] {
+        d.rpc(
+            "agent_register",
+            json!({"alias": alias, "provider": "tui-stub", "endpoint_kind": "pty",
+                   "cwd": cwd.to_str().unwrap(),
+                   "params": json!({"upstream": "pm"}).to_string()}),
+        )
+        .unwrap();
+    }
+    for alias in ["pm", "out", "inr", "gone"] {
+        d.wait_agent(alias, "idle", 20);
+    }
+    std::fs::remove_dir_all(&gone).unwrap();
+    let dispatch = |issue: &str, to: &str, extra: &[&str]| {
+        let mut args = vec![
+            "dispatch",
+            issue,
+            "--to",
+            to,
+            "--note",
+            &note_s,
+            "--reply-to",
+            "pm",
+        ];
+        args.extend_from_slice(extra);
+        cli(&args)
+    };
+
+    // Outside every project repo: refused by name, nothing created.
+    let (ok, err) = dispatch("D-1", "out", &[]);
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("cwd_outside_project:"),
+        "{err}"
+    );
+    assert!(!repo.join(".cadence/wt/d-1-one").exists());
+    assert!(
+        d.rpc("agent_show", json!({"alias": "out"})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // `--force` dispatches and the override lands on the issue.
+    let (ok, out) = dispatch("D-1", "out", &["--force"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], true, "{out}");
+    assert!(
+        out["cwd_override"]
+            .as_str()
+            .unwrap()
+            .contains("cwd_outside_project"),
+        "{out}"
+    );
+    let issue = cli(&["issue", "show", "D-1", "--json"]).1;
+    assert!(
+        issue["comments"].as_array().unwrap().iter().any(|c| {
+            let body = c["body"].as_str().unwrap_or("");
+            body.contains("Dispatched to out") && body.contains("Dispatch override (--force")
+        }),
+        "{issue}"
+    );
+
+    // A deleted cwd refuses even with --force.
+    let (ok, err) = dispatch("D-2", "gone", &["--force"]);
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"].as_str().unwrap().starts_with("cwd_deleted:"),
+        "{err}"
+    );
+    assert!(!repo.join(".cadence/wt/d-2-two").exists());
+
+    // The normal case: a lane inside the project's repo dispatches.
+    let (ok, out) = dispatch("D-3", "inr", &[]);
+    assert!(ok, "{out}");
+    assert_eq!(out["dispatched"], true, "{out}");
+    assert!(out["cwd_override"].is_null(), "{out}");
+
+    // `issue start --job --assignee` applies the same check.
+    let start = |extra: &[&str]| {
+        let mut args = vec![
+            "issue",
+            "start",
+            "D-4",
+            "--job",
+            "--pm",
+            "pm",
+            "--spec",
+            &spec_s,
+            "--assignee",
+            "out",
+        ];
+        args.extend_from_slice(extra);
+        cli(&args)
+    };
+    let (ok, err) = start(&[]);
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("cwd_outside_project:"),
+        "{err}"
+    );
+    assert!(!repo.join(".cadence/wt/d-4-four").exists());
+    let (ok, out) = start(&["--force"]);
+    assert!(ok, "{out}");
+    assert!(out["cwd_override"].is_string(), "{out}");
+    let issue = cli(&["issue", "show", "D-4", "--json"]).1;
+    assert!(
+        issue["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["body"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Dispatch override (--force")),
+        "{issue}"
+    );
 }

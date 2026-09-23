@@ -51,6 +51,7 @@
 pub mod claude;
 pub mod cursor;
 pub mod devin;
+pub mod lane;
 pub mod profile;
 mod render;
 pub mod stub;
@@ -564,7 +565,18 @@ impl PtyAdapter {
         if self.pane_value(&session, "#{pane_dead}")? == "1" {
             return Err(Error::provider("pane process has exited"));
         }
-        self.verify_ownership(&session, &native)?;
+        let pane_pid = self.verify_ownership(&session, &native)?;
+        // CAD-202: a pane whose cwd was deleted (its worktree removed
+        // under it) runs work nowhere — refuse like any other gate, so
+        // the message stays queued, before a claim is consumed.
+        if let Some(cwd) = lane::pane_cwd(pane_pid).filter(|c| c.deleted) {
+            return Err(Error::gate(format!(
+                "cwd_deleted: the pane's working directory {} was deleted — \
+                 re-home the lane (`cadence agent stop`, fix its cwd, resume) \
+                 before delivery",
+                cwd.path
+            )));
+        }
         if self.pane_value(&session, "#{pane_in_mode}")? != "0" {
             return Err(Error::gate("pane is in a tmux mode (copy/view)"));
         }
@@ -639,6 +651,21 @@ impl PtyAdapter {
     fn capture_visible(&self) -> Result<String> {
         let session = self.session();
         self.tmux_ok(&["capture-pane", "-p", "-t", &session])
+    }
+
+    /// CAD-201: record the pane root's process identity for this
+    /// endpoint generation — the `pane_root` event `agent stop` reaps
+    /// the pane's session by. An unreadable root is recorded as such:
+    /// the tree is then unowned, never guessed at.
+    fn record_pane_root(&self, pane_pid: u32, generation: &str) {
+        match lane::PaneRoot::capture(pane_pid, generation) {
+            Some(root) => (self.hooks.on_event)("cadence/pane_root", root.to_json()),
+            None => (self.hooks.on_event)(
+                "cadence/pane_root_unrecorded",
+                serde_json::json!({"pid": pane_pid, "generation": generation,
+                                   "reason": "pane root /proc/<pid>/stat unreadable at open"}),
+            ),
+        }
     }
 
     /// The pane cursor cell `(x, y)` for the analyzer — profiles use it
@@ -833,6 +860,7 @@ impl ProviderAdapter for PtyAdapter {
             " #{session_name} ",
         ]);
 
+        self.record_pane_root(pane_pid, &generation);
         let endpoint = format!("tmux://{}/{session}", self.socket);
         {
             let mut s = self.state.lock().unwrap();
@@ -881,6 +909,7 @@ impl ProviderAdapter for PtyAdapter {
         }
         self.profile
             .verify_ownership(&adoption.native_session, pane_pid)?;
+        self.record_pane_root(pane_pid, &adoption.generation);
 
         let endpoint = format!("tmux://{}/{session}", self.socket);
         {
