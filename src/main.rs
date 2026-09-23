@@ -1037,6 +1037,16 @@ enum Commands {
         #[arg(long)]
         releases_dir: Option<PathBuf>,
     },
+    /// A disposable Cadence beside production: its own state dir,
+    /// tracker and board port under `$CADENCE_SANDBOX_ROOT` (default
+    /// `$XDG_STATE_HOME/cadence-sandbox`), run from this binary with
+    /// `CADENCE_PROFILE=sandbox:<name>` — which skips the skill sync
+    /// into `$HOME`, refuses `ui tailscale`, and keeps the provider WAL
+    /// watcher observe-only. Refuses production's dirs and port 3010.
+    Sandbox {
+        #[command(subcommand)]
+        action: cadence_agent::sandbox::SandboxAction,
+    },
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
     /// generated `--mcp-config`, never by hand.
@@ -4227,6 +4237,11 @@ fn run() -> Result<i32> {
         Some(dir) => dir,
         None => client::state_dir()?,
     };
+    // CAD-310: a sandbox's state dir decides its profile and tracker,
+    // not the caller's env. `sandbox` verbs resolve their own roots.
+    if !matches!(cli.command, Commands::Sandbox { .. }) {
+        cadence_agent::sandbox::adopt(&state_dir)?;
+    }
     match cli.command {
         Commands::Doctor {
             host,
@@ -4258,12 +4273,18 @@ fn run() -> Result<i32> {
                 // Every daemon start re-syncs the vendored skill: a
                 // rebuilt binary propagates changes. stderr lands in
                 // daemon.log for the detached child — stdout stays silent.
-                match home_dir().map(|h| cadence_agent::skill::sync(&h, false)) {
-                    Ok(Ok(report)) if report["wrote"].as_bool().unwrap_or(false) => {
-                        eprintln!("skill: refreshed {}", report["installed"])
+                // A sandbox shares $HOME with production, so it never
+                // writes the skill there.
+                if cadence_agent::sandbox::profile().is_some() {
+                    eprintln!("skill: skipped (sandbox profile)");
+                } else {
+                    match home_dir().map(|h| cadence_agent::skill::sync(&h, false)) {
+                        Ok(Ok(report)) if report["wrote"].as_bool().unwrap_or(false) => {
+                            eprintln!("skill: refreshed {}", report["installed"])
+                        }
+                        Ok(Err(e)) => eprintln!("skill: refresh failed: {e}"),
+                        _ => {}
                     }
-                    Ok(Err(e)) => eprintln!("skill: refresh failed: {e}"),
-                    _ => {}
                 }
                 cadence_agent::daemon::serve(&state_dir)?;
                 Ok(0)
@@ -5361,6 +5382,7 @@ fn run() -> Result<i32> {
             Ok(if blocking { 1 } else { 0 })
         }
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
+        Commands::Sandbox { action } => cadence_agent::sandbox::run_cli(&action),
         Commands::Status { group, json, watch } => {
             run_status(&state_dir, group.as_deref(), json, watch)
         }

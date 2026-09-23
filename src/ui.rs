@@ -305,6 +305,7 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
         tailscale: persisted.tailscale.clone(),
     };
     if let Some(https_port) = flags.tailscale {
+        crate::sandbox::refuse_global("`ui start --tailscale`")?;
         let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
         if !is_loopback_host(&host) {
             return Err(Error::rejected(format!(
@@ -332,6 +333,8 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
 fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
     let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     let port = eff.port.unwrap_or(3010);
+    // A sandbox board never takes production's port (CAD-310).
+    crate::sandbox::refuse_production_port(port)?;
     if eff.tailscale.is_some() && !is_loopback_host(&host) {
         return Err(Error::rejected(format!(
             "--tailscale shares the board through a proxy on this host, \
@@ -2988,6 +2991,8 @@ fn serve_map() -> Result<HashMap<u16, String>> {
 /// left alone (returns false), a different one on that port is a hard
 /// refusal — cadence never overwrites somebody else's serve config.
 fn ensure_mapping(port: u16, target: &str) -> Result<bool> {
+    // The tailnet is host-wide: a sandbox board never goes on it.
+    crate::sandbox::refuse_global("`tailscale serve`")?;
     match serve_map()?.get(&port) {
         Some(existing) if existing == target => Ok(false),
         Some(other) => Err(Error::rejected(format!(
@@ -3049,6 +3054,7 @@ pub(crate) fn ts_start_quiet(state_dir: &Path, https_port: u16, read_only: bool)
 }
 
 fn ts_start_inner(state_dir: &Path, https_port: u16, read_only: bool, quiet: bool) -> Result<i32> {
+    crate::sandbox::refuse_global("`ui tailscale start`")?;
     let me = ts_self()?;
     let mut opts = load_opts(state_dir);
     let ui_port = opts.port.unwrap_or(3010);

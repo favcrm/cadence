@@ -475,6 +475,15 @@ processes at suite start.
 Then do one thing the tests do not: drive the feature by hand on a
 scratch daemon (`CADENCE_STATE_DIR=/tmp/short-path`), a temp repo or a
 temp tracker. Most real findings came from this step.
+`target/debug/cadence sandbox up <name>` builds all three at once from
+the PR binary — its own state dir, tracker and board port, with the
+skill sync, tailnet and provider WAL checkpoints gated off, and agents
+that keep the sandbox's tracker — and `sandbox reset <name>` removes it,
+panes included. It refuses production's dirs and port 3010, so it never
+stands in for a rollout; see the README's Sandbox section. Put
+`CADENCE_SANDBOX_ROOT` under a short `/tmp/<x>.XXXX`: a root inside an
+agent scratchpad can push `state/cadence.sock` past the 107-byte Unix
+socket limit, which `up` refuses.
 
 Rules that were learned the hard way (now encoded in the command):
 

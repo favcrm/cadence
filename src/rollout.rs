@@ -302,6 +302,9 @@ pub fn authorize_migration(path: &Path) -> Result<MigrationPermit> {
         }
         Peek::Version(v) => v,
     };
+    if path.parent().is_some_and(sandbox_exempt) {
+        return Ok(MigrationPermit { crossing: None });
+    }
 
     let bootstrap = bootstrap_requested();
     let table = lease_table_present(path)?;
@@ -415,7 +418,17 @@ pub fn authorize_direct_run(state_dir: &Path) -> Result<()> {
     authorize_spawn_for(state_dir, process_caller()).map(|_| ())
 }
 
+/// A sandbox's own state dir (`<root>/state` beside its marker) takes
+/// no part in a rollout: it is disposable, so a rebuilt binary starts
+/// it, and migrates it, without the lease (CAD-310).
+pub fn sandbox_exempt(state_dir: &Path) -> bool {
+    matches!(crate::sandbox::owner_of(state_dir), Ok(Some(_)))
+}
+
 pub fn authorize_spawn_for(state_dir: &Path, caller: Result<Caller>) -> Result<Option<String>> {
+    if sandbox_exempt(state_dir) {
+        return Ok(caller.ok().map(|c| c.identity));
+    }
     let path = db_file(state_dir);
     if !path.exists() {
         return Ok(caller.ok().map(|c| c.identity));
@@ -2250,6 +2263,30 @@ mod tests {
         BOOTSTRAP_FORCE.with(|c| c.set(None));
         let err = err.unwrap_err();
         assert!(err.to_string().contains("backup"), "{err}");
+    }
+
+    /// CAD-310: a sandbox's own state dir starts a different build and
+    /// crosses a schema with no identity and no lease; the same dir
+    /// without its marker still refuses both.
+    #[test]
+    fn a_marked_sandbox_state_dir_needs_no_lease_for_a_new_build_or_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sbx");
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        Store::open(&db_file(&state)).unwrap();
+        let conn = connect_ensured(&db_file(&state)).unwrap();
+        upsert_daemon_build(&conn, "deadbeef", 1.0).unwrap();
+        drop(conn);
+        let nobody = || Err(Error::rejected("no rollout identity"));
+        assert!(authorize_spawn_for(&state, nobody()).is_err());
+        std::fs::write(root.join(".cadence-sandbox"), r#"{"name":"sbx"}"#).unwrap();
+        assert!(sandbox_exempt(&state));
+        assert!(authorize_spawn_for(&state, nobody()).is_ok());
+        let db = downgrade_to_v11(&state);
+        assert!(authorize_migration(&db).is_ok());
+        std::fs::remove_file(root.join(".cadence-sandbox")).unwrap();
+        assert!(authorize_migration(&db).is_err());
     }
 
     #[test]

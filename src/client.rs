@@ -18,6 +18,12 @@ pub fn state_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("CADENCE_STATE_DIR") {
         return Ok(PathBuf::from(dir));
     }
+    default_state_dir()
+}
+
+/// The state directory `state_dir` resolves with `CADENCE_STATE_DIR`
+/// unset — the production default a sandbox must never reach.
+pub fn default_state_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
         return Ok(PathBuf::from(dir).join("cadence"));
     }

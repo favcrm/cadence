@@ -690,6 +690,27 @@ impl CursorProfile {
     /// `allow` is malformed the same way. A `.bak` of the original
     /// bytes is written before every modification.
     fn ensure_cadence_allowlist(&self) -> Result<()> {
+        self.merge_cadence_allowlist(&|| self.global_write_gate())
+    }
+
+    /// A sandbox shares $HOME with production: writing the real
+    /// ~/.cursor config needs the operator's opt-in (CAD-310). A
+    /// relocated root (`CADENCE_CURSOR_CHATS`) is the caller's own.
+    fn global_write_gate(&self) -> Result<()> {
+        let real = std::env::var_os("HOME")
+            .is_some_and(|home| self.chats_dir == Path::new(&home).join(".cursor/chats"));
+        if real {
+            crate::sandbox::refuse_global_unless_allowed(
+                "the Cursor `Shell(cadence)` merge into ~/.cursor/cli-config.json",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The merge [`Self::ensure_cadence_allowlist`] runs. `gate` is
+    /// asked only when the merge is about to write: a config that
+    /// already allows `Shell(cadence)` launches with no question.
+    fn merge_cadence_allowlist(&self, gate: &dyn Fn() -> Result<()>) -> Result<()> {
         let path = self.cli_config_path();
         // A symlinked config must be written through, never replaced:
         // resolve the link so `.bak` and the temp+rename land beside
@@ -759,6 +780,7 @@ impl CursorProfile {
         {
             return Ok(());
         }
+        gate()?;
         allow.push(Value::String(CADENCE_ALLOW_ENTRY.to_string()));
         let rendered = serde_json::to_string_pretty(&doc)?;
         // The new file keeps the source's mode; a brand-new config is
@@ -1627,6 +1649,37 @@ mod tests {
             .iter()
             .map(|e| e.as_str().unwrap().to_string())
             .collect()
+    }
+
+    /// CAD-310: the sandbox gate guards the write, not the launch. An
+    /// entry already present never asks; a missing one is refused
+    /// before a byte is written or backed up.
+    #[test]
+    fn allowlist_gate_runs_only_when_the_merge_would_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = profile_in(dir.path());
+        let config = dir.path().join("cli-config.json");
+        let refuse = || -> crate::error::Result<()> {
+            Err(crate::error::Error::rejected("gate: sandbox refused"))
+        };
+        std::fs::write(
+            &config,
+            r#"{"version":1,"permissions":{"allow":["Shell(cadence)"],"deny":[]}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&config).unwrap();
+        p.merge_cadence_allowlist(&refuse).unwrap();
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        std::fs::write(
+            &config,
+            r#"{"version":1,"permissions":{"allow":[],"deny":[]}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&config).unwrap();
+        let err = p.merge_cadence_allowlist(&refuse).unwrap_err();
+        assert!(err.to_string().contains("gate: sandbox refused"), "{err}");
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        assert!(!dir.path().join("cli-config.json.bak").exists());
     }
 
     #[test]
