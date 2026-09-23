@@ -5677,15 +5677,13 @@ fn pty_routed_result_body_is_single_line() {
         "routed body is not pty-safe: {body:?}"
     );
     assert!(body.contains("j1"));
-    // Gated delivery, not a bypass: it waits queued for an operator
-    // claim, then pastes like any send (running = validation passed).
-    thread::sleep(Duration::from_millis(400));
-    let mid = d.message_state("pm", routed["id"].as_str().unwrap());
-    assert!(matches!(mid.as_str(), "queued" | "submitting"), "{mid}");
-    // A routed notification is fire-and-forget on a pty endpoint: once
-    // the paste succeeds the message completes with a delivery receipt
-    // — the receiving PM is not expected to `message result` it.
-    d.rpc("agent_ready", json!({"alias": "pm"})).unwrap();
+    // Since CAD-245 a routed notice pastes into an idle pane without an
+    // operator claim (pty_routed_notice_delivers_idle_without_claim pins
+    // the gate). Claiming here as well raced that paste: the claim's
+    // probe could see the notice's text still in the input line and
+    // refuse (CAD-266). A routed notification is fire-and-forget on a
+    // pty endpoint: once the paste succeeds the message completes with
+    // a delivery receipt — the PM is not expected to `message result` it.
     let done = d.wait_message("pm", routed["id"].as_str().unwrap(), &["completed"], 15);
     assert_eq!(
         done["result"]["via"].as_str(),
@@ -8710,13 +8708,17 @@ fn agent_set_opts_live_agent_into_auto_ready() {
     let _mock = d.mock_devin();
     d.register_devin("dv", None);
     d.wait_agent("dv", "idle", 20);
-    // Without opt-in the queue still waits on a human claim.
+    // Without opt-in the queue still waits on a human claim. Since
+    // CAD-245 the actor wakes on the send at once, so a fixed sleep can
+    // land mid-attempt (`submitting` while the gate probes). Wait for
+    // the recorded refusal; the requeued message then sits out the
+    // gate back-off (CAD-266).
     d.rpc(
         "agent_send",
         json!({"alias": "dv", "text": "gated", "message": "m1"}),
     )
     .unwrap();
-    thread::sleep(Duration::from_millis(400));
+    d.wait_event("dv", "gate_wait", 20);
     assert_eq!(d.message_state("dv", "m1"), "queued");
     // Retrofit via agent_set — the running actor reads params per send.
     d.rpc(
