@@ -5955,6 +5955,13 @@ fn provider_launch(
     let alias = alias
         .or_else(|| resume.clone())
         .unwrap_or_else(|| format!("{provider}-{}", &Uuid::new_v4().simple().to_string()[..6]));
+    // An alias keeps its provider — refuse before any worktree, register
+    // or resume rather than reopen the old agent under the new verb.
+    if let Ok(show) = client::rpc(state_dir, "agent_show", json!({"alias": alias})) {
+        if show["agent"]["alias"].as_str() == Some(alias.as_str()) {
+            refuse_provider_mismatch(&alias, &show["agent"], provider)?;
+        }
+    }
     let cwd = match cwd {
         Some(path) => path,
         None => std::env::current_dir()?,
@@ -6144,6 +6151,7 @@ fn provider_launch(
             // Already registered — reopen rather than fail. A stopped
             // agent is resumed; a live one is reused as-is.
             let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+            refuse_provider_mismatch(&alias, &show["agent"], provider)?;
             let state = show["agent"]["state"].as_str().unwrap_or_default();
             if matches!(state, "stopped" | "offline") {
                 client::rpc(state_dir, "agent_resume", json!({"alias": alias}))?;
@@ -6325,6 +6333,21 @@ fn join_group(
         team_role.as_deref(),
         provider_default_model,
     )
+}
+
+/// CAD-283: reopening a registered alias under a different provider
+/// would silently resume the old one — refuse, naming both providers and
+/// the remove-then-join path (there is no in-place provider swap).
+fn refuse_provider_mismatch(alias: &str, agent: &Value, provider: &str) -> Result<()> {
+    let registered = agent["provider"].as_str().unwrap_or_default();
+    if registered == provider {
+        return Ok(());
+    }
+    Err(Error::rejected(format!(
+        "'{alias}' is already registered as a {registered} agent, not {provider} — \
+         an alias keeps its provider. To replace it, run `cadence agent remove \
+         {alias}`, then launch or join {provider} under that alias"
+    )))
 }
 
 /// What a launch writes for the agent's ambient briefing.

@@ -12060,6 +12060,123 @@ fn cli_join_claude_tui_briefs_prefixes() {
     assert_eq!(agent["params"]["upstream"], "pm", "{agent}");
 }
 
+/// Register `alias` as a `fake` agent and stop it; returns its full
+/// `agent_show` so a refused launch can prove nothing changed.
+fn stopped_fake_agent(d: &TestDaemon, alias: &str) -> Value {
+    d.register(alias);
+    d.wait_agent(alias, "idle", 10);
+    d.rpc("agent_stop", json!({"alias": alias})).unwrap();
+    d.wait_agent(alias, "stopped", 10);
+    d.rpc("agent_show", json!({"alias": alias})).unwrap()
+}
+
+/// A launch onto an alias registered under another provider is refused,
+/// naming both providers and the remove-then-join remedy.
+fn assert_provider_refused(out: &std::process::Output, alias: &str, requested: &str) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    for want in [
+        format!("'{alias}' is already registered as a fake agent"),
+        format!("not {requested}"),
+        format!("cadence agent remove {alias}"),
+    ] {
+        assert!(stderr.contains(&want), "missing {want:?}: {stderr}");
+    }
+}
+
+/// CAD-283: `join <pm> claude --tui --alias X` onto a stopped agent of
+/// another provider refuses instead of resuming the old one — no row,
+/// param, worktree or tmux pane changes.
+#[test]
+fn cli_join_refuses_different_provider_pty() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude_tui();
+    let pm_repo = d.dir.path().join("pmrepo");
+    git_repo(&pm_repo);
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": pm_repo}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 10);
+    let before = stopped_fake_agent(&d, "wx");
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    for extra in [&[][..], &["--worktree", "feat-x"][..]] {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(["join", "pm", "claude", "--tui", "--alias", "wx", "--detach"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert_provider_refused(&out, "wx", "claude");
+    }
+    let after = d.rpc("agent_show", json!({"alias": "wx"})).unwrap();
+    assert_eq!(after, before);
+    assert!(!pm_repo.join(".cadence/wt/feat-x").exists());
+    assert!(!d.claude_pane_file(&mock, "wx", "argv").exists());
+}
+
+/// CAD-283: the managed launch paths — `join <pm> codex` and the
+/// standalone `cadence claude` — refuse the same way, stopped or live.
+#[test]
+fn cli_join_refuses_different_provider_managed() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let before = stopped_fake_agent(&d, "wx");
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["join", "pm", "codex", "--alias", "wx", "--detach"])
+        .output()
+        .unwrap();
+    assert_provider_refused(&out, "wx", "codex");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["claude", "--alias", "wx", "--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert_provider_refused(&out, "wx", "claude");
+    let after = d.rpc("agent_show", json!({"alias": "wx"})).unwrap();
+    assert_eq!(after, before);
+    // A live alias is not silently reused under the wrong provider either.
+    d.register("wl");
+    d.wait_agent("wl", "idle", 10);
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["join", "pm", "codex", "--alias", "wl", "--detach"])
+        .output()
+        .unwrap();
+    assert_provider_refused(&out, "wl", "codex");
+}
+
+/// CAD-283 guard: a same-provider join onto a stopped alias still
+/// resumes the existing agent.
+#[test]
+fn cli_join_same_provider_resumes_stopped_alias() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let before = stopped_fake_agent(&d, "wx");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["join", "pm", "fake", "--alias", "wx", "--detach"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("already registered"), "{stderr}");
+    let agent = d.wait_agent("wx", "idle", 15);
+    assert_eq!(agent["provider"], "fake");
+    assert_eq!(agent["params"], before["agent"]["params"]);
+}
+
 /// `join <pm> codex` records the worker's sandbox on the agent row and
 /// sends it on `thread/start` — `workspace-write` by default (the
 /// unattended-worker posture), `read-only` only when asked.
