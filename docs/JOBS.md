@@ -334,6 +334,27 @@ Result routing: kickoff `reply_to` = `jobs.pm_alias` explicitly. The
 routed `worker_result` gains `"task"`/`"sha"` fields so the PM's
 notification is self-describing.
 
+### Turn tokens per endpoint (CAD-162)
+
+`--token` is the running message's `turn_id` (`cadence self` prints it).
+A report is accepted only when the token equals the recorded `turn_id`
+AND is current for the agent's live endpoint generation under that
+endpoint's own scheme — one predicate,
+`adapter::registry::turn_token_current`, judges `message_report` and the
+hot-restart adoption checks alike:
+
+| Endpoint | Token minted today | Checkable? |
+|---|---|---|
+| any `pty` (claude, devin, cursor) | `pty-<generation>-<uuid>`, generation minted per pane open | yes |
+| `claude` `managed` | `claude-<generation>-<uuid>`, generation minted per process open | yes — `ack` only; the turn result completes the message |
+| `codex` `managed` / `managed-ws` | the provider's own turn id | no — every report refused |
+| `devin` `cloud` | the message id (generation is the Devin session id) | no — every report refused |
+| `fake`, `inbox` | counter / none | no — every report refused |
+
+A token from an earlier generation, or one minted by a different
+endpoint kind, is never current. An endpoint with no checkable scheme
+fails closed; it completes through its adapter's turn result instead.
+
 ---
 
 ## 5. Failure semantics (A2)

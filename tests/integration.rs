@@ -6115,6 +6115,119 @@ fn pty_stale_generation_report_rejected() {
     );
 }
 
+// ---- CAD-162: turn tokens are judged by the endpoint's own scheme ----
+
+/// A fresh 32-hex generation that no endpoint minted.
+const CAD162_OTHER_GEN: &str = "fedcba9876543210fedcba9876543210";
+
+fn cad162_sql(d: &TestDaemon, sql: &str, params: &[&str]) {
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(sql, rusqlite::params_from_iter(params.iter()))
+        .unwrap();
+}
+
+/// Point message `id`'s running turn at `token` (what a report must
+/// match first), leaving everything else as the daemon wrote it.
+fn cad162_set_turn(d: &TestDaemon, id: &str, token: &str) {
+    cad162_sql(
+        d,
+        "UPDATE messages SET turn_id=?1 WHERE id=?2",
+        &[token, id],
+    );
+}
+
+fn cad162_message(d: &TestDaemon, alias: &str, id: &str) -> Value {
+    d.rpc("agent_show", json!({"alias": alias})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("no message {id} on {alias}"))
+        .clone()
+}
+
+/// Both report kinds with `token` are refused as stale, and the message
+/// is untouched: still `running` under `token` with no ack recorded.
+fn cad162_assert_refused(d: &TestDaemon, alias: &str, id: &str, token: &str, what: &str) {
+    let before = cad162_message(d, alias, id);
+    for kind in ["ack", "result"] {
+        let err = d
+            .rpc(
+                "message_report",
+                json!({"message": id, "token": token, "kind": kind, "text": "forged"}),
+            )
+            .expect_err(&format!("{what}: {kind} with {token} accepted as current"));
+        assert!(
+            err.to_string().contains("stale endpoint generation"),
+            "{what}: {err}"
+        );
+    }
+    let after = cad162_message(d, alias, id);
+    assert_eq!(after["state"], "running", "{what}: {after}");
+    assert_eq!(after["turn_id"], token, "{what}: {after}");
+    assert_eq!(after["result"], before["result"], "{what}: {after}");
+    assert!(after["result"]["ack"].is_null(), "{what}: {after}");
+}
+
+/// CAD-162 on pty: the current `pty-<gen>-…` token is accepted; the
+/// same message's token is refused once the endpoint generation moves
+/// on, and a managed-claude-shaped token carrying the LIVE generation is
+/// refused — never accepted as current.
+#[test]
+fn pty_report_refuses_stale_generation_and_managed_token() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let gen = agent["generation"].as_str().unwrap().to_string();
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "m1");
+    assert!(token.starts_with(&format!("pty-{gen}-")), "{token}");
+
+    // The endpoint moved to a newer generation: m1's token is stale.
+    cad162_sql(
+        &d,
+        "UPDATE agents SET generation=?1 WHERE alias='dv1'",
+        &[CAD162_OTHER_GEN],
+    );
+    cad162_assert_refused(&d, "dv1", "m1", &token, "earlier generation");
+    cad162_sql(
+        &d,
+        "UPDATE agents SET generation=?1 WHERE alias='dv1'",
+        &[&gen],
+    );
+
+    // Another endpoint kind's token under the live generation.
+    let managed = format!("claude-{gen}-{}", "c".repeat(32));
+    cad162_set_turn(&d, "m1", &managed);
+    cad162_assert_refused(&d, "dv1", "m1", &managed, "managed token on pty");
+
+    // The genuine token still reports — the refusals were the token's.
+    cad162_set_turn(&d, "m1", &token);
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "ack", "text": "seen"}),
+    )
+    .unwrap();
+    let m = cad162_message(&d, "dv1", "m1");
+    assert_eq!(m["state"], "running", "{m}");
+    assert_eq!(
+        m["result"]["status"], "submitted",
+        "pty ack keeps the marker: {m}"
+    );
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result", "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "m1", &["completed"], 10);
+}
+
 #[test]
 fn pty_locked_session_refuses_takeover() {
     let d = TestDaemon::start();
@@ -10132,6 +10245,11 @@ for line in sys.stdin:
           "session_id": sid})
     if mode_now == "await-interrupt":
         continue  # the SIGINT handler emits the result
+    if mode_now == "hold":
+        # The turn stays open until the test drops `<pidfile>.release`,
+        # then completes like "ok" (CAD-162: ack mid-turn).
+        while not os.path.exists(pidfile + ".release"):
+            time.sleep(0.05)
     if mode_now == "silent":
         while True:
             time.sleep(5)  # alive but eventless — the idle fence path
@@ -10250,6 +10368,172 @@ impl Drop for MockClaude {
     fn drop(&mut self) {
         test_env().remove("CADENCE_CLAUDE_COMMAND");
         test_env().remove("CADENCE_MCP_PERMISSION_COMMAND");
+    }
+}
+
+/// CAD-162 acceptance 2/4 on managed Claude: `kind: "ack"` with the
+/// adapter-minted `claude-<gen>-…` token is accepted mid-turn and keeps
+/// the message running (never `awaiting_report` — a managed turn owes no
+/// report); a reported `result` is refused because the adapter's turn
+/// result is the one writer of the outcome; that later turn result
+/// completes the message.
+#[test]
+fn claude_managed_ack_keeps_running_until_the_turn_result() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude("hold", None);
+    d.register_claude("w1", Value::Null);
+    let agent = d.wait_agent("w1", "idle", 15);
+    let gen = agent["generation"].as_str().unwrap().to_string();
+    assert!(!gen.is_empty(), "{agent}");
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "long task", "message": "m1"}),
+    )
+    .unwrap();
+    let m = d.wait_message("w1", "m1", &["running"], 20);
+    let token = m["turn_id"].as_str().unwrap().to_string();
+    assert!(token.starts_with(&format!("claude-{gen}-")), "{token}");
+
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "ack", "text": "understood"}),
+    )
+    .unwrap();
+    let m = cad162_message(&d, "w1", "m1");
+    assert_eq!(m["state"], "running", "{m}");
+    assert_eq!(m["result"]["ack"]["text"], "understood", "{m}");
+    assert_eq!(m["result"]["status"], "acknowledged", "{m}");
+    assert!(
+        m["awaiting_report"].is_null(),
+        "managed ack owes no report: {m}"
+    );
+    assert!(
+        event_kinds(&d, "w1").iter().any(|k| k == "acknowledged"),
+        "ack must be recorded"
+    );
+
+    let err = d
+        .rpc(
+            "message_report",
+            json!({"message": "m1", "token": token, "kind": "result", "text": "done?"}),
+        )
+        .expect_err("a reported result must not race the managed turn result");
+    assert!(err.to_string().contains("report `ack` only"), "{err}");
+    assert_eq!(d.message_state("w1", "m1"), "running");
+
+    std::fs::write(mock.pidfile.with_extension("pid.release"), "").unwrap();
+    let m = d.wait_message("w1", "m1", &["completed"], 20);
+    assert_eq!(m["result"]["text"], "MOCK_OK:long task", "{m}");
+    assert_eq!(m["result"]["turn_id"], token, "{m}");
+}
+
+/// CAD-162 acceptance 2/3 on managed Claude: the token is refused once
+/// the endpoint generation moves on, and a pty-shaped token carrying the
+/// LIVE generation is refused — never accepted as current.
+#[test]
+fn claude_managed_report_refuses_stale_generation_and_pty_token() {
+    let d = TestDaemon::start();
+    let mock = d.mock_claude("hold", None);
+    d.register_claude("w1", Value::Null);
+    let agent = d.wait_agent("w1", "idle", 15);
+    let gen = agent["generation"].as_str().unwrap().to_string();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "task", "message": "m1"}),
+    )
+    .unwrap();
+    let m = d.wait_message("w1", "m1", &["running"], 20);
+    let token = m["turn_id"].as_str().unwrap().to_string();
+
+    cad162_sql(
+        &d,
+        "UPDATE agents SET generation=?1 WHERE alias='w1'",
+        &[CAD162_OTHER_GEN],
+    );
+    cad162_assert_refused(&d, "w1", "m1", &token, "earlier generation");
+    cad162_sql(
+        &d,
+        "UPDATE agents SET generation=?1 WHERE alias='w1'",
+        &[&gen],
+    );
+
+    let pty = format!("pty-{gen}-{}", "c".repeat(32));
+    cad162_set_turn(&d, "m1", &pty);
+    cad162_assert_refused(&d, "w1", "m1", &pty, "pty token on managed claude");
+
+    cad162_set_turn(&d, "m1", &token);
+    std::fs::write(mock.pidfile.with_extension("pid.release"), "").unwrap();
+    d.wait_message("w1", "m1", &["completed"], 20);
+}
+
+/// CAD-162 fail closed: endpoint kinds whose tokens carry no generation
+/// cadence can check refuse every report — managed and managed-ws Codex
+/// (provider turn ids, no generation), the fake test double and the
+/// mailbox. Each is tried with its real/natural token AND with pty- and
+/// claude-shaped tokens forged under a generation planted on the row.
+#[test]
+fn report_refused_on_endpoint_kinds_without_a_token_scheme() {
+    let d = TestDaemon::start();
+    let _codex = d.mock_codex("silent");
+    let _ws = d.mock_codex_ws("silent");
+    d.register_codex("cx1");
+    d.register_codex_ws("cw1");
+    register_fake_opts(&d, "fk1", json!({}));
+    d.register_inbox("ib1");
+    for alias in ["cx1", "cw1", "fk1"] {
+        d.wait_agent(alias, "idle", 20);
+    }
+    // Codex holds a real provider turn ("t-1") open.
+    for alias in ["cx1", "cw1"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": alias, "text": "hold", "message": format!("m-{alias}")}),
+        )
+        .unwrap();
+        let m = d.wait_message(alias, &format!("m-{alias}"), &["running"], 20);
+        let real = m["turn_id"].as_str().unwrap().to_string();
+        cad162_assert_refused(
+            &d,
+            alias,
+            &format!("m-{alias}"),
+            &real,
+            "codex's own turn id",
+        );
+    }
+    // The fake and the mailbox get a planted running row.
+    let now = format!(
+        "{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    );
+    for alias in ["fk1", "ib1"] {
+        let id = format!("m-{alias}");
+        cad162_sql(
+            &d,
+            "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,created)
+             VALUES(?1,?2,'task',NULL,'test','running','fake-turn-1',CAST(?3 AS REAL))",
+            &[&id, alias, &now],
+        );
+        cad162_assert_refused(&d, alias, &id, "fake-turn-1", "natural token");
+    }
+    for alias in ["cx1", "cw1", "fk1", "ib1"] {
+        let id = format!("m-{alias}");
+        cad162_sql(
+            &d,
+            "UPDATE agents SET generation=?1 WHERE alias=?2",
+            &[CAD162_OTHER_GEN, alias],
+        );
+        for token in [
+            format!("pty-{CAD162_OTHER_GEN}-n"),
+            format!("claude-{CAD162_OTHER_GEN}-n"),
+            format!("codex-{CAD162_OTHER_GEN}-n"),
+            id.clone(),
+        ] {
+            cad162_set_turn(&d, &id, &token);
+            cad162_assert_refused(&d, alias, &id, &token, &format!("{alias} forged"));
+        }
     }
 }
 
