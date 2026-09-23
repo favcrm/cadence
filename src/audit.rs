@@ -1,14 +1,22 @@
 //! `cadence audit` — reconstruct every merge on the default branch
-//! from data Cadence already stores, and flag the two patterns the PM
-//! must never have to hunt for by hand:
+//! from data Cadence already stores, and flag the patterns the PM must
+//! never have to hunt for by hand:
 //!
 //! - `reviewer==merger` — the same *GitHub* identity reviewed and
 //!   merged (`qa-verdict` status `creator.login` vs `mergedBy.login`;
 //!   note `From:` is an agent alias — a different namespace, rendered
-//!   but never compared).
+//!   but never compared). When every GitHub identity in the run is ONE
+//!   account (a shared token), the match is structural, not a finding:
+//!   it is reported once in the summary and never flags a row (CAD-207).
 //! - `no-passing-verdict` — no `pass` verdict bound to the exact head
 //!   that landed (`qa-verdict` status plus the verdict note must agree
 //!   on the squash-merged `headRefOid`).
+//! - `approval-missing` / `approval-revoked` — a human-class merge with
+//!   no operator approval record for the exact landed head that was in
+//!   force at merge time (CAD-217). Records come from the daemon's
+//!   approval stream (`cadence audit approve`); queue messages are
+//!   never read as approvals or revocations. A bound record reports as
+//!   `operator-claimed`, never verified, until CAD-280.
 //!
 //! Sources are read-only: merge commits on the default branch, `gh` PR
 //! metadata and commit statuses, verdict/ops notes under the notes
@@ -139,6 +147,12 @@ struct Row {
     is_root: bool,
     /// Flag codes that fired on this row.
     flags: Vec<String>,
+    /// Matches that hold on this row but cannot discriminate in this
+    /// run (CAD-207) — e.g. `reviewer==merger` under one shared GitHub
+    /// identity. Reported once in the summary, never flagged.
+    structural: Vec<String>,
+    /// Operator approval evidence bound to the landed head (CAD-217).
+    approval: ApprovalView,
     /// `(field, reason)` pairs for every `unknown` rendered.
     unknowns: Vec<(String, String)>,
 }
@@ -235,20 +249,46 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
 
     // Pass 2 — the rows that render get their per-head evidence:
     // qa-verdict status (one `gh api` call each), merge-content check,
-    // post-merge outcomes, then flags.
+    // post-merge outcomes, the approval binding, then flags.
+    // The repo an approval must be scoped to — gh's slug, or the
+    // checkout's own origin in fixture runs.
+    let approval_slug = gh.slug.clone().or_else(|| origin_slug(&repo));
     for row in &mut rows {
         enrich_status(gh.slug.as_deref(), &gh, row);
         contains_head(&repo, row);
         post_merge(&branch_log, &store, row);
+        enrich_approval(&store, approval_slug.as_deref(), row);
         finalize_unknowns(row);
         flag_row(row);
     }
+    // Fleet-level pass (CAD-207): a match every row shares is a fact
+    // about the fleet, reported once — not a per-row finding. Decided
+    // over every merged PR gh returned, not just the rendered window.
+    let structural = apply_structural(&mut rows, &fleet_logins(&gh));
 
     let flagged = rows.iter().filter(|r| !r.flags.is_empty()).count();
     if opts.json {
-        print_json(&repo, &default_ref, &rows, flagged, opts, since);
+        print_json(
+            &repo,
+            &default_ref,
+            &rows,
+            flagged,
+            structural.as_ref(),
+            opts,
+            since,
+        );
     } else {
-        print_text(&repo, &default_ref, &rows, flagged, opts);
+        print!(
+            "{}",
+            render_text(
+                &repo,
+                &default_ref,
+                &rows,
+                flagged,
+                structural.as_ref(),
+                opts
+            )
+        );
     }
     Ok(if flagged > 0 { 1 } else { 0 })
 }
@@ -404,14 +444,16 @@ struct Gh {
     fixture: bool,
 }
 
-fn slug(repo: &Path) -> Option<String> {
+/// `owner/name` of the checkout's github.com `origin` — the scope an
+/// approval record binds to (also used by `cadence audit approve`).
+pub fn origin_slug(repo: &Path) -> Option<String> {
     let url = git(repo, &["remote".into(), "get-url".into(), "origin".into()]).ok()?;
     let norm = project::normalize_remote(url.trim());
     norm.strip_prefix("github.com/").map(str::to_string)
 }
 
 fn github(repo: &Path) -> Result<Gh> {
-    let Some(slug) = slug(repo) else {
+    let Some(slug) = origin_slug(repo) else {
         return Ok(Gh {
             error: Some("no github.com origin remote".into()),
             ..Default::default()
@@ -1225,16 +1267,79 @@ struct StoreEvidence {
     /// `(kind, at)` events.
     events: Vec<(String, f64)>,
     opened: bool,
+    /// `approval_recorded` events on the approval stream, oldest first.
+    approvals: Vec<ApprovalRec>,
+    /// The first `approval_revoked` event per approval id.
+    revocations: HashMap<String, Revocation>,
+    /// Why the approval stream could not be read — approval state is
+    /// then `unknown`, never `missing`. `None` when it answered.
+    approvals_gap: Option<String>,
 }
+
+/// One operator approval record (CAD-217) — `store::NewApproval` as
+/// persisted, plus the event time.
+#[derive(Debug, Clone, Default)]
+struct ApprovalRec {
+    id: String,
+    source: String,
+    action: String,
+    head_sha: String,
+    repo: String,
+    pr: u64,
+    recorded_via: Option<String>,
+    at: f64,
+}
+
+/// One operator revocation of an approval id.
+#[derive(Debug, Clone, Default)]
+struct Revocation {
+    source: String,
+    reason: String,
+    at: f64,
+}
+
+/// A row's approval binding: `operator-claimed` (a record for the exact
+/// landed head, recorded before the merge and not revoked before it —
+/// a claim, not proof, until CAD-280: see [`APPROVAL_UNVERIFIED`]),
+/// `revoked` (every such record was revoked before the merge),
+/// `missing` (the store answered and no record was in force at merge
+/// time), `unknown` (the evidence could not be read), or `not-required`
+/// (a non-human class with no record).
+#[derive(Debug, Default)]
+struct ApprovalView {
+    state: String,
+    reason: Option<String>,
+    /// The record the state rests on (for `missing`: a post-merge one).
+    record: Option<ApprovalRec>,
+    revocation: Option<Revocation>,
+    /// Records for this PR that name a different head — shown, never
+    /// counted: an approval does not carry over to a later head.
+    other_heads: Vec<ApprovalRec>,
+}
+
+/// Why no approval record is authoritative yet (CAD-217 review): the
+/// operator gate inherits CAD-276's residual — a same-uid process that
+/// detaches from every pane (`setsid -f`, scrubbed env and stdio) passes
+/// it — and any same-uid process can write rows into the store file
+/// directly. Until operator-by-positive-proof lands, a bound approval is
+/// reported as `operator-claimed`, never as a verified approval.
+const APPROVAL_UNVERIFIED: &str = "unverified until CAD-280";
 
 fn store_evidence(path: &Path) -> StoreEvidence {
     let mut ev = StoreEvidence::default();
     if !path.exists() {
         // A host that never ran the daemon has no store — the table
-        // is empty, not unreadable. No evidence gap.
+        // is empty, not unreadable. No evidence gap for verdicts; but
+        // approval records live nowhere else, so this host cannot say
+        // whether one exists.
+        ev.approvals_gap = Some(format!(
+            "no daemon store at {} — approval records live there",
+            path.display()
+        ));
         return ev;
     }
     let Ok(conn) = crate::store::open_read_only(path) else {
+        ev.approvals_gap = Some(format!("store {} unreadable", path.display()));
         return ev;
     };
     ev.opened = true;
@@ -1257,7 +1362,65 @@ fn store_evidence(path: &Path) -> StoreEvidence {
             .map(|rows| rows.flatten().collect())
             .unwrap_or_default();
     }
+    read_approvals(&conn, &mut ev);
     ev
+}
+
+/// The approval stream, read-only. Malformed payloads are skipped —
+/// only the store's validated writer puts rows on this stream, so a
+/// row that does not parse proves nothing either way.
+fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence) {
+    use crate::store::{APPROVAL_RECORDED_EVENT, APPROVAL_REVOKED_EVENT, APPROVAL_STREAM};
+    let rows: rusqlite::Result<Vec<(String, String, f64)>> = conn
+        .prepare("SELECT kind, payload, at FROM events WHERE alias=? ORDER BY seq LIMIT 100000")
+        .and_then(|mut st| {
+            st.query_map([APPROVAL_STREAM], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect()
+        });
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            ev.approvals_gap = Some(format!("approval stream unreadable: {e}"));
+            return;
+        }
+    };
+    for (kind, raw, at) in rows {
+        let Ok(p) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let text = |k: &str| p[k].as_str().map(str::to_string);
+        let Some(id) = text("approval_id") else {
+            continue;
+        };
+        if kind == APPROVAL_RECORDED_EVENT {
+            let (Some(source), Some(action), Some(head_sha), Some(repo), Some(pr)) = (
+                text("source"),
+                text("action"),
+                text("head_sha"),
+                p["scope"]["repo"].as_str().map(str::to_string),
+                p["scope"]["pr"].as_u64(),
+            ) else {
+                continue;
+            };
+            ev.approvals.push(ApprovalRec {
+                id,
+                source,
+                action,
+                head_sha,
+                repo,
+                pr,
+                recorded_via: text("recorded_via"),
+                at,
+            });
+        } else if kind == APPROVAL_REVOKED_EVENT {
+            let (Some(source), Some(reason)) = (text("source"), text("reason")) else {
+                continue;
+            };
+            ev.revocations
+                .entry(id)
+                .or_insert(Revocation { source, reason, at });
+        }
+    }
 }
 
 fn enrich_store(ev: &StoreEvidence, path: &Path, row: &mut Row) {
@@ -1277,6 +1440,127 @@ fn enrich_store(ev: &StoreEvidence, path: &Path, row: &mut Row) {
             row.reviewer = row.reviewer.clone().or(Some(reviewer.clone()));
         }
     }
+}
+
+// ---------- operator approval (CAD-217) -----------------------------
+
+/// Bind the row to the operator approval in force at merge time for
+/// the exact landed head, then decide what the row's class makes of it.
+/// Only human-class rows can flag; other rows show a bound record for
+/// context and are otherwise `not-required` (or `unknown` without a
+/// risk class).
+fn enrich_approval(ev: &StoreEvidence, slug: Option<&str>, row: &mut Row) {
+    let view = bind_approval(ev, slug, row);
+    row.approval = match row.class.as_deref() {
+        Some("human") => {
+            if view.state == "unknown" {
+                row.unknowns
+                    .push(("approval".into(), view.reason.clone().unwrap_or_default()));
+            }
+            view
+        }
+        _ if view.record.is_some() && view.state != "missing" => view,
+        Some(_) => ApprovalView {
+            state: "not-required".into(),
+            other_heads: view.other_heads,
+            ..Default::default()
+        },
+        None => ApprovalView {
+            state: "unknown".into(),
+            reason: Some(
+                view.reason
+                    .filter(|_| view.state == "unknown")
+                    .unwrap_or_else(|| {
+                        "no risk class recorded — whether the human gate applied is unknown".into()
+                    }),
+            ),
+            other_heads: view.other_heads,
+            ..Default::default()
+        },
+    };
+}
+
+fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalView {
+    let unknown = |reason: String| ApprovalView {
+        state: "unknown".into(),
+        reason: Some(reason),
+        ..Default::default()
+    };
+    if let Some(gap) = &ev.approvals_gap {
+        return unknown(gap.clone());
+    }
+    let (Some(landed), Some(merged_at)) = (row.landed_head.as_deref(), row.merged_at) else {
+        return unknown("no landed head to bind an approval to".into());
+    };
+    // Scope: a merge approval for this PR in this repo (the repo is
+    // checked whenever the audit knows its own: gh's slug, or the
+    // checkout's origin in fixture runs).
+    let in_scope = |a: &&ApprovalRec| {
+        a.action == "merge"
+            && row.pr == Some(a.pr)
+            && slug.is_none_or(|s| s.eq_ignore_ascii_case(&a.repo))
+    };
+    let (bound, other_heads): (Vec<&ApprovalRec>, Vec<&ApprovalRec>) = ev
+        .approvals
+        .iter()
+        .filter(in_scope)
+        .partition(|a| a.head_sha.eq_ignore_ascii_case(landed));
+    let other_heads: Vec<ApprovalRec> = other_heads.into_iter().cloned().collect();
+    let revoked = |a: &ApprovalRec| ev.revocations.get(&a.id).cloned();
+    let before = |a: &&&ApprovalRec| a.at <= merged_at;
+    let view = |state: &str, a: &ApprovalRec, reason: Option<String>| ApprovalView {
+        state: state.into(),
+        reason,
+        record: Some(a.clone()),
+        revocation: revoked(a),
+        other_heads: other_heads.clone(),
+    };
+    if let Some(a) = bound
+        .iter()
+        .filter(before)
+        .find(|a| revoked(a).is_none_or(|r| r.at > merged_at))
+    {
+        // In force at merge time. A later revocation is shown, but the
+        // question is what held when the merge happened.
+        let reason = revoked(a).map(|r| format!("revoked after the merge ({})", iso(r.at)));
+        return view("operator-claimed", a, reason);
+    }
+    if let Some(a) = bound.iter().find(before) {
+        let reason = format!("approval {} was revoked before the merge", a.id);
+        return view("revoked", a, Some(reason));
+    }
+    if let Some(a) = bound.first() {
+        let reason = format!(
+            "only a post-merge record names the landed head (approval {} recorded {})",
+            a.id,
+            iso(a.at)
+        );
+        return view("missing", a, Some(reason));
+    }
+    let reason = match other_heads.first() {
+        Some(o) => format!(
+            "no approval names landed head {} — approval {} names head {}, and an \
+             approval never carries over to another head",
+            short(landed),
+            o.id,
+            short(&o.head_sha)
+        ),
+        None => format!("no approval record names landed head {}", short(landed)),
+    };
+    ApprovalView {
+        state: "missing".into(),
+        reason: Some(reason),
+        other_heads,
+        ..Default::default()
+    }
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..9.min(sha.len())]
+}
+
+fn iso(at: f64) -> String {
+    crate::issue::time::iso(at as i64)
 }
 
 // ---------- tracker --------------------------------------------------
@@ -1516,9 +1800,174 @@ fn flag_row(row: &mut Row) {
     if !(verdict_pass && heads_agree) && !status_ok && !row.is_root && !gaps {
         row.flags.push("no-passing-verdict".into());
     }
+    // The human-class gate (CAD-217): an operator approval for the
+    // exact landed head must have been in force at merge time. An
+    // unreadable store is `unknown` — reported, never flagged.
+    if row.class.as_deref() == Some("human") {
+        match row.approval.state.as_str() {
+            "missing" => row.flags.push("approval-missing".into()),
+            "revoked" => row.flags.push("approval-revoked".into()),
+            _ => {}
+        }
+    }
+}
+
+/// The fleet-level fact behind a structural match (CAD-207).
+#[derive(Debug)]
+struct Structural {
+    /// The one GitHub login every merge and every qa-verdict status in
+    /// the run was made with.
+    identity: String,
+    /// Rows whose `reviewer==merger` match it explains.
+    rows: usize,
+}
+
+const SHARED_IDENTITY_EXPLANATION: &str = "the qa-verdict status and the merge were made \
+     by the same GitHub account on every row that has both — the whole fleet pushes \
+     through one token, so reviewer==merger cannot tell rows apart here; reported \
+     once, not flagged (docs/AUDIT.md)";
+
+/// Every GitHub login the whole fetch names, beyond the rendered
+/// window: `mergedBy` of every merged PR `gh pr list` returned, and the
+/// creator of every `qa-verdict` status already in hand (a fixture has
+/// them all; a live run fetches statuses only for rendered rows, so
+/// there the rows add their own creators).
+fn fleet_logins(gh: &Gh) -> Vec<String> {
+    let mergers = gh
+        .prs
+        .values()
+        .filter_map(|p| p["mergedBy"]["login"].as_str().map(str::to_string));
+    let creators = gh.statuses.values().filter_map(|s| qa_verdict_state(s)?.1);
+    mergers.chain(creators).collect()
+}
+
+/// When every GitHub identity the fleet names (`fleet`, plus the rows'
+/// own mergers and qa-verdict creators) is ONE account,
+/// `reviewer==merger` holds by construction on every row that has both
+/// — a property of the fleet's token, not of any merge. Those matches
+/// move from `flags` to `structural` and are summarized once. When the
+/// fleet shows more than one identity, a row whose status creator is
+/// its merger deviates and keeps its flag — however narrow the window.
+fn apply_structural(rows: &mut [Row], fleet: &[String]) -> Option<Structural> {
+    let mut logins: Vec<&str> = rows
+        .iter()
+        .flat_map(|r| [r.merger.as_deref(), r.qa_verdict_creator.as_deref()])
+        .flatten()
+        .chain(fleet.iter().map(String::as_str))
+        .filter(|s| !s.is_empty())
+        .collect();
+    logins.sort_by_key(|s| s.to_ascii_lowercase());
+    logins.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    let [identity] = logins.as_slice() else {
+        return None;
+    };
+    let identity = identity.to_string();
+    let mut matched = 0;
+    for row in rows.iter_mut() {
+        if let Some(i) = row.flags.iter().position(|f| f == "reviewer==merger") {
+            row.flags.remove(i);
+            row.structural.push("reviewer==merger".into());
+            matched += 1;
+        }
+    }
+    (matched > 0).then_some(Structural {
+        identity,
+        rows: matched,
+    })
 }
 
 // ---------- rendering -------------------------------------------------
+
+fn approval_rec_json(a: &ApprovalRec) -> Value {
+    json!({
+        "id": a.id, "source": a.source, "action": a.action,
+        "head_sha": a.head_sha,
+        "scope": {"repo": a.repo, "pr": a.pr},
+        "recorded_via": a.recorded_via, "recorded_at": a.at,
+    })
+}
+
+fn approval_json(row: &Row) -> Value {
+    let v = &row.approval;
+    let mut j = json!({
+        "required": match row.class.as_deref() {
+            Some(c) => json!(c == "human"),
+            None => Value::Null,
+        },
+        "state": v.state,
+        "reason": v.reason,
+        "record": v.record.as_ref().map(approval_rec_json),
+        "before_merge": v.record.as_ref().zip(row.merged_at).map(|(a, m)| a.at <= m),
+        "revocation": v.revocation.as_ref().map(|r| json!({
+            "source": r.source, "reason": r.reason, "revoked_at": r.at,
+            "before_merge": row.merged_at.map(|m| r.at <= m),
+        })),
+        "other_heads": v.other_heads.iter().map(approval_rec_json).collect::<Vec<_>>(),
+        // No record is verified until CAD-280 (see APPROVAL_UNVERIFIED).
+        "verified": v.record.as_ref().map(|_| false),
+        "note": v.record.as_ref().map(|_| APPROVAL_UNVERIFIED),
+    });
+    if v.state.is_empty() {
+        j["state"] = json!("unknown");
+    }
+    j
+}
+
+fn claimed_count(rows: &[Row]) -> usize {
+    rows.iter()
+        .filter(|r| r.approval.state == "operator-claimed")
+        .count()
+}
+
+/// The summary's approval clause: present whenever the run has a human
+/// row or a claimed approval, so the digest never reads a bound record
+/// as proof.
+fn approvals_clause(rows: &[Row]) -> String {
+    let claimed = claimed_count(rows);
+    if claimed == 0 && !rows.iter().any(|r| r.class.as_deref() == Some("human")) {
+        return String::new();
+    }
+    format!(", {claimed} approval(s) operator-claimed ({APPROVAL_UNVERIFIED})")
+}
+
+/// The text row's approval line — for human-class rows, and for any
+/// row an approval record binds to.
+fn approval_line(row: &Row) -> Option<String> {
+    let v = &row.approval;
+    if row.class.as_deref() != Some("human") && v.record.is_none() {
+        return None;
+    }
+    let mut line = format!("approval {}", v.state);
+    if let Some(a) = &v.record {
+        let when = match row.merged_at {
+            Some(m) if a.at <= m => "before merge",
+            Some(_) => "after merge",
+            None => "merge time unknown",
+        };
+        line.push_str(&format!(
+            " · id {} · source \"{}\" · head {} · recorded {} ({when})",
+            a.id,
+            a.source,
+            short(&a.head_sha),
+            iso(a.at)
+        ));
+    }
+    if let Some(r) = &v.revocation {
+        line.push_str(&format!(
+            " · revoked {} by \"{}\": {}",
+            iso(r.at),
+            r.source,
+            r.reason
+        ));
+    }
+    if let Some(reason) = &v.reason {
+        line.push_str(&format!(" — {reason}"));
+    }
+    if v.record.is_some() {
+        line.push_str(&format!(" · {APPROVAL_UNVERIFIED}"));
+    }
+    Some(line)
+}
 
 fn row_json(row: &Row) -> Value {
     let unknowns: Vec<Value> = row
@@ -1560,6 +2009,8 @@ fn row_json(row: &Row) -> Value {
             "revert": row.revert,
         },
         "flags": row.flags,
+        "structural": row.structural,
+        "approval": approval_json(row),
         "evidence_unavailable": if row.evidence_gaps.is_empty() {
             Value::Null
         } else {
@@ -1574,9 +2025,22 @@ fn print_json(
     default_ref: &str,
     rows: &[Row],
     flagged: usize,
+    structural: Option<&Structural>,
     opts: &AuditOptions,
     since: f64,
 ) {
+    let structural: Vec<Value> = structural
+        .map(|st| {
+            json!({
+                "code": "shared-github-identity",
+                "match": "reviewer==merger",
+                "identity": st.identity,
+                "rows": st.rows,
+                "explanation": SHARED_IDENTITY_EXPLANATION,
+            })
+        })
+        .into_iter()
+        .collect();
     let merges: Vec<Value> = rows.iter().map(row_json).collect();
     let mut by_class = json!({});
     for r in rows {
@@ -1597,6 +2061,12 @@ fn print_json(
                 "rows": rows.len(),
                 "flagged": flagged,
                 "flags": rows.iter().flat_map(|r| r.flags.clone()).collect::<Vec<_>>(),
+                "structural": structural,
+                "approvals": {
+                    "operator_claimed": claimed_count(rows),
+                    "verified": false,
+                    "note": APPROVAL_UNVERIFIED,
+                },
                 "by_class": by_class,
             },
         }))
@@ -1604,9 +2074,19 @@ fn print_json(
     );
 }
 
-fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts: &AuditOptions) {
+fn render_text(
+    repo: &Path,
+    default_ref: &str,
+    rows: &[Row],
+    flagged: usize,
+    structural: Option<&Structural>,
+    opts: &AuditOptions,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
     let or = |o: &Option<String>| o.clone().unwrap_or_else(|| "unknown".into());
-    println!(
+    let _ = writeln!(
+        out,
         "AUDIT {} ({} merges on {}){}",
         repo.display(),
         rows.len(),
@@ -1617,7 +2097,7 @@ fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts
             .unwrap_or_default()
     );
     if rows.is_empty() {
-        println!("  no merges in range");
+        let _ = writeln!(out, "  no merges in range");
     }
     for row in rows {
         let flag = if row.flags.is_empty() {
@@ -1629,14 +2109,16 @@ fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts
             .pr
             .map(|n| format!("#{n}"))
             .unwrap_or_else(|| "?".into());
-        println!("{pr} {}{}", row.title, flag);
+        let _ = writeln!(out, "{pr} {}{}", row.title, flag);
         if !row.evidence_gaps.is_empty() {
-            println!(
+            let _ = writeln!(
+                out,
                 "    unknown — evidence unavailable: {}",
                 row.evidence_gaps.join("; ")
             );
         }
-        println!(
+        let _ = writeln!(
+            out,
             "    merge {} · merged_at {} · merger {}",
             &row.merge_sha[..9.min(row.merge_sha.len())],
             row.merged_at
@@ -1644,7 +2126,8 @@ fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts
                 .unwrap_or_else(|| "unknown".into()),
             or(&row.merger),
         );
-        println!(
+        let _ = writeln!(
+            out,
             "    reviewed_head {} · landed_head {} · contains_head {}",
             row.reviewed_head
                 .as_deref()
@@ -1656,7 +2139,8 @@ fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts
                 .unwrap_or("unknown"),
             row.contains_head,
         );
-        println!(
+        let _ = writeln!(
+            out,
             "    verdict {}{} · qa-verdict {}{} · reviewer {} · reviewer@gh {}",
             or(&row.verdict),
             if row.verdict_post_hoc {
@@ -1673,15 +2157,17 @@ fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts
             or(&row.reviewer),
             or(&row.qa_verdict_creator),
         );
-        println!(
+        let _ = writeln!(
+            out,
             "    class {} · trigger {}",
             or(&row.class),
             or(&row.trigger),
         );
         if row.gates.is_empty() {
-            println!("    gates unknown (no gate summary in verdict note)");
+            let _ = writeln!(out, "    gates unknown (no gate summary in verdict note)");
         } else {
-            println!(
+            let _ = writeln!(
+                out,
                 "    gates suite={} stress={} flakes={}",
                 row.gate_suite.as_deref().unwrap_or("none recorded"),
                 row.gate_stress.as_deref().unwrap_or("none recorded"),
@@ -1689,25 +2175,38 @@ fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts
             );
         }
         if let Some(a) = &row.auditor_check {
-            println!("    auditor_check {a}");
+            let _ = writeln!(out, "    auditor_check {a}");
         } else {
-            println!("    auditor_check unknown (none recorded)");
+            let _ = writeln!(out, "    auditor_check unknown (none recorded)");
         }
         if !row.residue.is_empty() {
-            println!("    residue {}", row.residue.join(" "));
+            let _ = writeln!(out, "    residue {}", row.residue.join(" "));
         }
-        println!(
+        let _ = writeln!(
+            out,
             "    outcome tree_match={} smoke={} daemon_restart={} revert={}",
             row.tree_match, row.smoke, row.daemon_restart, row.revert,
         );
+        if let Some(line) = approval_line(row) {
+            let _ = writeln!(out, "    {line}");
+        }
         for (field, reason) in &row.unknowns {
-            println!("    unknown[{field}] {reason}");
+            let _ = writeln!(out, "    unknown[{field}] {reason}");
         }
     }
-    println!(
-        "summary: {} row(s), {} flagged{}{}",
+    if let Some(st) = structural {
+        let _ = writeln!(
+            out,
+            "structural: {} merge(s) share GitHub identity {} — {}",
+            st.rows, st.identity, SHARED_IDENTITY_EXPLANATION
+        );
+    }
+    let _ = writeln!(
+        out,
+        "summary: {} row(s), {} flagged{}{}{}",
         rows.len(),
         flagged,
+        approvals_clause(rows),
         if flagged > 0 { " — " } else { "" },
         if flagged > 0 {
             rows.iter()
@@ -1718,6 +2217,7 @@ fn print_text(repo: &Path, default_ref: &str, rows: &[Row], flagged: usize, opts
             String::new()
         },
     );
+    out
 }
 
 // ---------- time ------------------------------------------------------
@@ -1958,6 +2458,299 @@ mod tests {
         r.status_post_hoc = true;
         flag_row(&mut r);
         assert!(r.flags.iter().any(|f| f == "no-passing-verdict"));
+    }
+
+    fn opts() -> AuditOptions {
+        AuditOptions {
+            since: None,
+            class: None,
+            project: None,
+            json: false,
+            limit: None,
+            repo: None,
+            notes_dir: None,
+            merge_report: None,
+            cwd: PathBuf::from("/"),
+            state_dir: PathBuf::from("/"),
+        }
+    }
+
+    /// A merged row with a qa-verdict status by `creator` (or none).
+    fn fleet_row(pr: u64, merger: &str, creator: Option<&str>) -> Row {
+        let mut r = flagged_row();
+        r.pr = Some(pr);
+        r.title = format!("work {pr}");
+        r.merger = Some(merger.into());
+        if let Some(c) = creator {
+            r.qa_verdict_status = Some("SUCCESS".into());
+            r.qa_verdict_creator = Some(c.into());
+        }
+        r
+    }
+
+    #[test]
+    fn digest_reports_shared_identity_once_and_flags_only_real_findings() {
+        // CAD-207's live run: 34 merges whose status and merge share the
+        // fleet's one GitHub account, 2 with no passing verdict.
+        let mut rows: Vec<Row> = (15..=50)
+            .map(|n| {
+                let creator = (n != 43 && n != 50).then_some("cc-syntax");
+                fleet_row(n, "cc-syntax", creator)
+            })
+            .collect();
+        for r in &mut rows {
+            flag_row(r);
+        }
+        let st = apply_structural(&mut rows, &[]).expect("one shared identity");
+        assert_eq!((st.identity.as_str(), st.rows), ("cc-syntax", 34));
+        let flagged: Vec<(u64, Vec<String>)> = rows
+            .iter()
+            .filter(|r| !r.flags.is_empty())
+            .map(|r| (r.pr.unwrap(), r.flags.clone()))
+            .collect();
+        assert_eq!(
+            flagged,
+            vec![
+                (43, vec!["no-passing-verdict".to_string()]),
+                (50, vec!["no-passing-verdict".to_string()])
+            ]
+        );
+        let text = render_text(Path::new("/r"), "origin/main", &rows, 2, Some(&st), &opts());
+        assert_eq!(text.matches("FLAG[").count(), 2, "{text}");
+        assert_eq!(text.matches("structural:").count(), 1, "{text}");
+        assert_eq!(text.matches("reviewer==merger").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn digest_keeps_reviewer_eq_merger_when_identities_differ() {
+        // The fleet has a separate QA identity: the row whose status was
+        // posted by its own merger deviates and keeps its flag.
+        let mut rows = vec![
+            fleet_row(1, "ops-bot", Some("qa-bot")),
+            fleet_row(2, "ops-bot", Some("ops-bot")),
+        ];
+        for r in &mut rows {
+            flag_row(r);
+        }
+        assert!(apply_structural(&mut rows, &[]).is_none());
+        assert!(rows[0].flags.is_empty(), "{:?}", rows[0].flags);
+        assert_eq!(rows[1].flags, vec!["reviewer==merger".to_string()]);
+        assert!(rows[1].structural.is_empty());
+        // Login case does not split one identity in two.
+        let mut rows = vec![
+            fleet_row(1, "CC-Syntax", Some("cc-syntax")),
+            fleet_row(2, "cc-syntax", None),
+        ];
+        for r in &mut rows {
+            flag_row(r);
+        }
+        assert_eq!(apply_structural(&mut rows, &[]).map(|s| s.rows), Some(1));
+        assert!(rows[0].flags.is_empty(), "{:?}", rows[0].flags);
+        // #2 has no status at all — its real finding still flags.
+        assert_eq!(rows[1].flags, vec!["no-passing-verdict".to_string()]);
+    }
+
+    #[test]
+    fn digest_decides_identity_over_the_fleet_not_the_window() {
+        // A narrow window (`--limit 1`) holds one self-merge; outside it
+        // the fleet shows a separate QA identity. The window alone looks
+        // like one shared account — the fleet says otherwise: flag.
+        let mut rows = vec![fleet_row(3, "ops-1", Some("ops-1"))];
+        flag_row(&mut rows[0]);
+        let gh = Gh {
+            prs: HashMap::from([
+                (1, json!({"mergedBy": {"login": "ops-1"}})),
+                (3, json!({"mergedBy": {"login": "ops-1"}})),
+            ]),
+            statuses: HashMap::from([(
+                "h1".to_string(),
+                json!({"statuses": [{"context": "qa-verdict", "state": "success",
+                                     "creator": {"login": "qa-bot"}}]}),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(fleet_logins(&gh).len(), 3);
+        assert!(apply_structural(&mut rows, &fleet_logins(&gh)).is_none());
+        assert_eq!(rows[0].flags, vec!["reviewer==merger".to_string()]);
+        // Without the outside identity it is structural, as before.
+        let mut rows = vec![fleet_row(3, "ops-1", Some("ops-1"))];
+        flag_row(&mut rows[0]);
+        let fleet = vec!["ops-1".to_string()];
+        assert_eq!(apply_structural(&mut rows, &fleet).map(|s| s.rows), Some(1));
+        assert!(rows[0].flags.is_empty());
+    }
+
+    const HEAD: &str = "7896dd2735035c0c67e246039cb495231702941c";
+    const OLD_HEAD: &str = "1111111111111111111111111111111111111111";
+    const MERGED: f64 = 1_000_000.0;
+
+    fn rec(id: &str, head: &str, at: f64) -> ApprovalRec {
+        ApprovalRec {
+            id: id.into(),
+            source: "operator in chat".into(),
+            action: "merge".into(),
+            head_sha: head.into(),
+            repo: "x/y".into(),
+            pr: 1,
+            recorded_via: Some("operator-connection".into()),
+            at,
+        }
+    }
+
+    fn revoke(at: f64) -> Revocation {
+        Revocation {
+            source: "operator".into(),
+            reason: "head moved".into(),
+            at,
+        }
+    }
+
+    /// A human-class row's approval state and flags under `ev`.
+    fn human(ev: &StoreEvidence, slug: Option<&str>) -> Row {
+        let mut r = flagged_row();
+        r.landed_head = Some(HEAD.into());
+        r.merged_at = Some(MERGED);
+        r.class = Some("human".into());
+        r.qa_verdict_status = Some("SUCCESS".into());
+        enrich_approval(ev, slug, &mut r);
+        flag_row(&mut r);
+        r
+    }
+
+    fn ev(approvals: Vec<ApprovalRec>, revocations: &[(&str, Revocation)]) -> StoreEvidence {
+        StoreEvidence {
+            approvals,
+            revocations: revocations
+                .iter()
+                .map(|(id, r)| (id.to_string(), r.clone()))
+                .collect(),
+            opened: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn approval_binds_exact_landed_head_in_force_at_merge() {
+        // Approved before the merge for the exact landed head.
+        let r = human(&ev(vec![rec("a", HEAD, MERGED - 60.0)], &[]), Some("x/y"));
+        assert_eq!(r.approval.state, "operator-claimed");
+        assert_eq!(r.approval.record.as_ref().unwrap().id, "a");
+        assert!(r.flags.is_empty(), "{:?}", r.flags);
+        let line = approval_line(&r).unwrap();
+        assert!(line.contains("(before merge)"), "{line}");
+        assert!(line.contains("unverified until CAD-280"), "{line}");
+        let j = approval_json(&r);
+        assert_eq!(j["verified"], false, "{j}");
+        assert_eq!(j["note"], "unverified until CAD-280", "{j}");
+
+        // Revoked AFTER the merge: it was in force when the merge ran.
+        let e = ev(
+            vec![rec("a", HEAD, MERGED - 60.0)],
+            &[("a", revoke(MERGED + 60.0))],
+        );
+        let r = human(&e, None);
+        assert_eq!(r.approval.state, "operator-claimed");
+        assert!(r
+            .approval
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("after the merge"));
+        assert!(r.flags.is_empty());
+
+        // Revoked BEFORE the merge: revoked, flagged.
+        let e = ev(
+            vec![rec("a", HEAD, MERGED - 60.0)],
+            &[("a", revoke(MERGED - 30.0))],
+        );
+        let r = human(&e, None);
+        assert_eq!(r.approval.state, "revoked");
+        assert_eq!(r.flags, vec!["approval-revoked".to_string()]);
+
+        // One revoked, another still in force: operator-claimed.
+        let e = ev(
+            vec![rec("a", HEAD, MERGED - 60.0), rec("b", HEAD, MERGED - 10.0)],
+            &[("a", revoke(MERGED - 30.0))],
+        );
+        assert_eq!(human(&e, None).approval.state, "operator-claimed");
+
+        // Only recorded after the merge: missing, the record shown.
+        let r = human(&ev(vec![rec("a", HEAD, MERGED + 60.0)], &[]), None);
+        assert_eq!(r.approval.state, "missing");
+        assert!(r.approval.record.is_some());
+        assert_eq!(r.flags, vec!["approval-missing".to_string()]);
+
+        // An approval for an older head never counts for the landed one.
+        let r = human(&ev(vec![rec("a", OLD_HEAD, MERGED - 60.0)], &[]), None);
+        assert_eq!(r.approval.state, "missing");
+        assert_eq!(r.approval.other_heads.len(), 1);
+        assert!(r
+            .approval
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("never carries"));
+        assert_eq!(r.flags, vec!["approval-missing".to_string()]);
+
+        // Another PR, another repo, or another action: out of scope.
+        let mut other_pr = rec("a", HEAD, MERGED - 60.0);
+        other_pr.pr = 2;
+        let mut other_action = rec("b", HEAD, MERGED - 60.0);
+        other_action.action = "deploy".into();
+        let e = ev(vec![other_pr, other_action], &[]);
+        assert_eq!(human(&e, None).approval.state, "missing");
+        let e = ev(vec![rec("a", HEAD, MERGED - 60.0)], &[]);
+        assert_eq!(human(&e, Some("other/repo")).approval.state, "missing");
+        // The fixture/no-slug path still binds on head + PR.
+        assert_eq!(human(&e, None).approval.state, "operator-claimed");
+    }
+
+    #[test]
+    fn approval_unknown_evidence_is_reported_not_flagged() {
+        let gap = StoreEvidence {
+            approvals_gap: Some("store /s unreadable".into()),
+            ..Default::default()
+        };
+        let r = human(&gap, None);
+        assert_eq!(r.approval.state, "unknown");
+        assert!(r.flags.is_empty(), "{:?}", r.flags);
+        assert!(r.unknowns.iter().any(|(f, _)| f == "approval"));
+
+        // No landed head to bind: unknown too.
+        let mut r = flagged_row();
+        r.landed_head = None;
+        r.class = Some("human".into());
+        r.qa_verdict_status = Some("SUCCESS".into());
+        enrich_approval(&ev(vec![], &[]), None, &mut r);
+        flag_row(&mut r);
+        assert_eq!(r.approval.state, "unknown");
+        assert!(!r.flags.iter().any(|f| f.starts_with("approval")));
+
+        // Non-human classes never flag: not-required without a record,
+        // the record shown when one binds; an unknown class is unknown.
+        let e = ev(vec![rec("a", HEAD, MERGED - 60.0)], &[]);
+        for (class, want) in [
+            (Some("auto"), "operator-claimed"),
+            (None, "operator-claimed"),
+        ] {
+            let mut r = flagged_row();
+            r.landed_head = Some(HEAD.into());
+            r.merged_at = Some(MERGED);
+            r.class = class.map(str::to_string);
+            enrich_approval(&e, None, &mut r);
+            assert_eq!(r.approval.state, want);
+        }
+        let empty = ev(vec![], &[]);
+        for (class, want) in [(Some("notify"), "not-required"), (None, "unknown")] {
+            let mut r = flagged_row();
+            r.merged_at = Some(MERGED);
+            r.class = class.map(str::to_string);
+            enrich_approval(&empty, None, &mut r);
+            flag_row(&mut r);
+            assert_eq!(r.approval.state, want);
+            assert!(!r.flags.iter().any(|f| f.starts_with("approval")));
+            assert!(approval_line(&r).is_none());
+        }
     }
 
     #[test]
