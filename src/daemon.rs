@@ -532,6 +532,12 @@ pub struct Shared {
     /// CAD-445: serialises `<state>/master-wakes.json` (blocker epochs,
     /// tickets a plan-approved wake already named).
     wake_lock: Mutex<()>,
+    /// CAD-152: `agent recover-submit` runs one at a time, from its
+    /// message checks through the recorded outcome — a racing second
+    /// recovery (a PM and the operator on the same stuck draft) sees
+    /// the first one's `submit_recovered` and refuses, never a second
+    /// Enter.
+    recover_lock: Mutex<()>,
 }
 
 impl Shared {
@@ -606,6 +612,7 @@ impl Shared {
             wake_lock: Mutex::new(()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
             idle_poll: opts.idle_poll.unwrap_or(IDLE_POLL),
+            recover_lock: Mutex::new(()),
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -2132,6 +2139,7 @@ impl Shared {
             "agent_capture" => self.rpc_capture(params),
             "agent_probe" => self.rpc_probe(params),
             "agent_answer" => self.rpc_answer(params, peer_pid),
+            "agent_recover_submit" => self.rpc_recover_submit(params, peer_pid),
             "agent_set" => self.rpc_set(params, peer_pid),
             "agent_inbox" => self.rpc_inbox(params),
             "message_report" => self.rpc_message_report(params),
@@ -5069,6 +5077,254 @@ impl Shared {
         // sit out the gate backoff.
         self.notify_agent(&alias);
         Ok(json!({"alias": alias, "state": "answered", "choice": choice}))
+    }
+
+    /// `agent recover-submit` (CAD-152): a task message that was pasted
+    /// into a pty pane but never submitted — `running` under its turn
+    /// token, the draft still sitting in the input line (the AOS-11
+    /// lost submit) — is submitted with exactly one Enter, never a
+    /// re-paste, so its turn token and report path stay the ones minted
+    /// at paste.
+    ///
+    /// Caller rule (CAD-149): only the operator or the target's own PM
+    /// ([`crate::peer::may_mutate_agent`], `Controlled`) — a pane must
+    /// never submit its own input, and a peer never another's.
+    ///
+    /// Every precondition holds at action time or nothing is sent:
+    /// the message checks ([`Self::recover_message_check`]) run first
+    /// and again inside the adapter's critical section just before the
+    /// Enter; the adapter checks the live generation, the pane, the
+    /// probe and the draft ([`ProviderAdapter::recover_submit`]). Each
+    /// refusal names its check. Recoveries are serialised daemon-wide
+    /// and recorded durably — `submit_recovered` for a sent Enter
+    /// (confirmed or not), `submit_recover_refused` for an authorized
+    /// caller's refusal — with the caller, alias, generation, message
+    /// id, before/after probe and result. Neither event carries the
+    /// message body or the draft.
+    fn rpc_recover_submit(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        const VERB: &str = "agent recover-submit";
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        let id = required_str(params, "message")?.to_string();
+        let inspected = optional_str(params, "generation").map(str::to_string);
+        let agent = self.store.agent(&alias)?;
+        let caller = self.authorize_agent_mutation(
+            params,
+            peer_pid,
+            VERB,
+            &agent,
+            AgentMutation::Controlled,
+        )?;
+        let _serial = self.recover_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Re-read after the wait: a recovery that ran first may have
+        // changed what this one sees.
+        let agent = self.store.agent(&alias)?;
+        let generation = agent.generation.clone().unwrap_or_default();
+        let mut audit = caller_audit(&caller);
+        audit["caller_pid"] = json!(peer_pid);
+        audit["alias"] = json!(alias);
+        audit["message"] = json!(id);
+        audit["generation"] = json!(generation);
+        let refuse = |check: &str, reason: &str, probe: Option<&Probe>| -> Result<Value> {
+            let mut detail = audit.clone();
+            detail["check"] = json!(check);
+            detail["reason"] = json!(reason);
+            detail["before"] = probe.map_or(Value::Null, Probe::to_json);
+            detail["after"] = Value::Null;
+            detail["result"] = json!("refused");
+            let _ = self
+                .store
+                .event_public(&alias, "submit_recover_refused", detail);
+            Err(Error::rejected(format!(
+                "{VERB} refused ({check}): {reason}"
+            )))
+        };
+        if agent.endpoint_kind != "pty" {
+            return refuse(
+                "unsupported_endpoint",
+                &format!(
+                    "agent '{alias}' is a {} endpoint — only a pty pane has a staged \
+                     draft to submit",
+                    agent.endpoint_kind
+                ),
+                None,
+            );
+        }
+        let check = || self.recover_message_check(&agent, &id, inspected.as_deref());
+        let message = match check() {
+            Ok(message) => message,
+            Err((c, reason)) => return refuse(&c, &reason, None),
+        };
+        let adapter = match self.adapter_for(&alias) {
+            Ok(adapter) => adapter,
+            Err(e) => return refuse("endpoint", &e.to_string(), None),
+        };
+        let outcome = adapter.recover_submit(&generation, &message.body, &|| check().map(|_| ()));
+        let (before, after, confirmed, send_error) = match outcome {
+            Ok(adapter::RecoverSubmit::Sent {
+                before,
+                after,
+                confirmed,
+                send_error,
+            }) => (before, after, confirmed, send_error),
+            Ok(adapter::RecoverSubmit::Refused {
+                check,
+                reason,
+                probe,
+            }) => return refuse(&check, &reason, probe.as_ref()),
+            // Nothing was sent: every failure before the Enter is a
+            // refusal of this action, recorded like one.
+            Err(e) => return refuse("endpoint", &format!("pane read failed: {e}"), None),
+        };
+        let result = if confirmed {
+            "submitted"
+        } else {
+            "unconfirmed"
+        };
+        let mut detail = audit;
+        detail["before"] = before.to_json();
+        detail["after"] = after.to_json();
+        detail["result"] = json!(result);
+        if let Some(e) = &send_error {
+            detail["send_error"] = json!(e);
+        }
+        // The durable marker a second recovery refuses on — written
+        // before the lock drops. An Enter already went out, so a failed
+        // write is an uncertain outcome, never a silent success.
+        self.store
+            .event_public(&alias, "submit_recovered", detail)
+            .map_err(|e| {
+                Error::unknown(format!(
+                    "{VERB}: the Enter was sent but its audit event could not be \
+                     recorded ({e}) — inspect with `cadence agent capture {alias}`"
+                ))
+            })?;
+        // The turn really starts now: the stall watch's clock and the
+        // delivery loop should see it.
+        self.bump_activity(&alias);
+        self.notify_agent(&alias);
+        self.wake();
+        let mut out = json!({
+            "alias": alias,
+            "message": id,
+            "state": result,
+            "generation": generation,
+            "before": before.to_json(),
+            "after": after.to_json(),
+        });
+        if !confirmed {
+            out["note"] = json!(
+                "one Enter was sent but the draft did not leave the input line within \
+                 the bound — the outcome is unconfirmed and is never retried; inspect \
+                 with `cadence agent capture`"
+            );
+        }
+        Ok(out)
+    }
+
+    /// The message-side preconditions of `agent recover-submit` —
+    /// `Err((check, reason))` names the first that fails, and no reason
+    /// quotes the body. Run before the adapter is touched and again
+    /// inside its critical section, just before the Enter.
+    fn recover_message_check(
+        &self,
+        agent: &Agent,
+        id: &str,
+        inspected: Option<&str>,
+    ) -> std::result::Result<Message, (String, String)> {
+        let fail = |check: &str, reason: String| Err((check.to_string(), reason));
+        let alias = agent.alias.as_str();
+        let message = match self.store.message(id) {
+            Ok(Some(m)) if m.alias == alias => m,
+            Ok(_) => return fail("message", format!("agent '{alias}' has no message '{id}'")),
+            Err(e) => return fail("message", format!("message lookup failed: {e}")),
+        };
+        match self.store.submit_recovered(alias, id) {
+            Ok(None) => {}
+            Ok(Some(prior)) => {
+                return fail(
+                    "already_submitted",
+                    format!(
+                        "recover-submit already sent its Enter for message {id} (result: {}, \
+                         by {}) — it is never sent twice",
+                        prior["result"].as_str().unwrap_or("unknown"),
+                        prior["by"].as_str().unwrap_or("unknown"),
+                    ),
+                )
+            }
+            Err(e) => return fail("message", format!("recovery record lookup failed: {e}")),
+        }
+        let held = match self.store.held_turns(alias) {
+            Ok(held) => held,
+            Err(e) => return fail("message", format!("held-turn lookup failed: {e}")),
+        };
+        if let Some(other) = held.iter().find(|m| m.id != id) {
+            return fail(
+                "other_message_pending",
+                format!(
+                    "message {id} is {} — the pasted message agent '{alias}' holds is {}",
+                    message.state, other.id
+                ),
+            );
+        }
+        if message.state != "running" {
+            return fail(
+                "not_running",
+                format!(
+                    "message {id} is {} — only a pasted, unreported turn (running) can \
+                     be recovered",
+                    message.state
+                ),
+            );
+        }
+        if !message.holds_turn() {
+            return fail(
+                "not_a_turn",
+                format!(
+                    "message {id} is a routed notice or nudge — it completes at paste, \
+                     there is no turn to recover"
+                ),
+            );
+        }
+        let acked = message
+            .result
+            .as_ref()
+            .is_some_and(|r| r.get("ack").is_some_and(|a| !a.is_null()));
+        if acked {
+            return fail(
+                "acknowledged",
+                format!("agent '{alias}' already acknowledged message {id} — it was submitted"),
+            );
+        }
+        let Some(generation) = agent.generation.as_deref() else {
+            return fail(
+                "stale_generation",
+                format!("agent '{alias}' has no live endpoint generation"),
+            );
+        };
+        if inspected.is_some_and(|g| g != generation) {
+            return fail(
+                "stale_generation",
+                "the endpoint generation changed since it was inspected".to_string(),
+            );
+        }
+        let current = message.turn_id.as_deref().is_some_and(|token| {
+            registry::turn_token_current(
+                &agent.provider,
+                &agent.endpoint_kind,
+                Some(generation),
+                token,
+            )
+        });
+        if !current {
+            return fail(
+                "stale_generation",
+                format!(
+                    "message {id} was pasted under an earlier endpoint generation — its \
+                     turn token is not the live endpoint's"
+                ),
+            );
+        }
+        Ok(message)
     }
 
     /// Merge key=value pairs into an agent's stored params — how an

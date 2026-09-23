@@ -241,6 +241,29 @@ impl TuiProfile for StubProfile {
         analyze_stub(screen)
     }
 
+    /// The stub's draft: the last `»` row plus the wrapped rows under
+    /// it, up to the first blank row.
+    fn draft_rows(&self, styled: &str) -> std::result::Result<Vec<String>, String> {
+        let screen = super::sgr::strip(styled);
+        let lines: Vec<&str> = screen.lines().collect();
+        let start = lines
+            .iter()
+            .rposition(|l| l.trim_start().starts_with(stub_screen::PROMPT))
+            .ok_or("no stub input line on screen")?;
+        let mut rows = vec![lines[start]
+            .trim_start()
+            .trim_start_matches(stub_screen::PROMPT)
+            .trim()
+            .to_string()];
+        rows.extend(
+            lines[start + 1..]
+                .iter()
+                .take_while(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string()),
+        );
+        Ok(rows)
+    }
+
     fn respond_rejection(&self) -> &'static str {
         "pty endpoints have no approval channel — answer stub \
          permission prompts in the terminal itself"

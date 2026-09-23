@@ -18076,6 +18076,434 @@ fn pty_answer_refuses_without_a_menu() {
     );
 }
 
+// ---- CAD-152: `agent recover-submit` — one Enter for a pasted, unsubmitted draft ----
+
+/// The kickoff whose submit is lost. Distinctive, so an audit event
+/// quoting it is caught; single-line, no stub command prefix.
+const RECOVER_BODY: &str = "CAD152-KICKOFF read the brief at docs/brief.md and report \
+                            with your turn token when you start";
+
+/// The AOS-11 shape on a stub pane: task message `id` was pasted and is
+/// `running` under its turn token, unreported, and its draft sits in the
+/// input line again as if the submit keystroke had been lost — no busy
+/// marker, no menu. The delivery's own paste and Enter are the only
+/// keys the pane has seen. Answers the turn token.
+fn stuck_draft(d: &TestDaemon, mock: &MockStub, alias: &str, id: &str) -> String {
+    d.rpc(
+        "agent_send",
+        json!({"alias": alias, "text": RECOVER_BODY, "message": id}),
+    )
+    .unwrap();
+    let token = pty_token(d, alias, id);
+    atomic_write(d.stub_pane_file(mock, alias, "input"), RECOVER_BODY);
+    let probe = d.rpc("agent_probe", json!({"alias": alias})).unwrap();
+    assert_eq!(probe["input_nonempty"], true, "{probe}");
+    assert_eq!(probe["busy_marker"], false, "{probe}");
+    token
+}
+
+/// The mock tmux's call log for the test's socket.
+fn tmux_log(d: &TestDaemon, mock: &MockStub) -> String {
+    std::fs::read_to_string(d.stub_pane_file(mock, "calls", "log")).unwrap_or_default()
+}
+
+/// `(pastes, enters)` the mock tmux delivered to `alias`'s pane.
+fn pane_keys(d: &TestDaemon, mock: &MockStub, alias: &str) -> (usize, usize) {
+    let log = tmux_log(d, mock);
+    let target = format!("-t {alias}");
+    let pastes = log
+        .lines()
+        .filter(|l| l.starts_with("paste-buffer") && l.ends_with(&target))
+        .count();
+    let enters = log
+        .lines()
+        .filter(|l| *l == format!("send-keys -t {alias} Enter"))
+        .count();
+    (pastes, enters)
+}
+
+fn recover_events(d: &TestDaemon, alias: &str, kind: &str) -> Vec<Value> {
+    d.events(alias)
+        .into_iter()
+        .filter(|e| e["kind"] == kind)
+        .map(|e| e["payload"].clone())
+        .collect()
+}
+
+/// A refusal names its check, sends nothing — the delivery's one paste
+/// and one Enter stay the only keys, the draft stays staged and the
+/// message stays `running` — and records `submit_recover_refused` with
+/// the caller, alias, generation, message id, before state and result,
+/// never the body.
+fn assert_recover_refused(
+    d: &TestDaemon,
+    mock: &MockStub,
+    alias: &str,
+    id: &str,
+    err: cadence_agent::Error,
+    check: &str,
+) {
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!("agent recover-submit refused ({check})")),
+        "{text}"
+    );
+    assert!(!text.contains("CAD152-KICKOFF"), "{text}");
+    assert_eq!(pane_keys(d, mock, alias), (1, 1), "{}", tmux_log(d, mock));
+    assert!(recover_events(d, alias, "submit_recovered").is_empty());
+    let refused = recover_events(d, alias, "submit_recover_refused");
+    let event = refused
+        .iter()
+        .find(|e| e["check"] == check)
+        .unwrap_or_else(|| panic!("no {check} refusal recorded: {refused:?}"));
+    let agent = d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"].clone();
+    assert_eq!(event["by"], "operator", "{event}");
+    assert_eq!(event["by_kind"], "operator", "{event}");
+    assert_eq!(event["alias"], alias, "{event}");
+    assert_eq!(event["message"], id, "{event}");
+    assert_eq!(event["generation"], agent["generation"], "{event}");
+    assert_eq!(event["result"], "refused", "{event}");
+    assert!(event["after"].is_null(), "{event}");
+    assert!(!event.to_string().contains("CAD152-KICKOFF"), "{event}");
+}
+
+fn recover(d: &TestDaemon, alias: &str, id: &str) -> cadence_agent::Result<Value> {
+    d.operator_rpc(
+        "agent_recover_submit",
+        json!({"alias": alias, "message": id}),
+    )
+}
+
+/// A recoverable stub agent with one stuck kickoff `m1`.
+fn recover_fixture(params: Value) -> (TestDaemon, MockStub, String) {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    d.register_stub("st", params);
+    d.wait_agent("st", "idle", 20);
+    let token = stuck_draft(&d, &mock, "st", "m1");
+    (d, mock, token)
+}
+
+/// CAD-152 acceptance 1, 3, 5: the operator recovers a lost submit
+/// through the CLI — the draft may be wrapped across rows — with
+/// exactly one Enter and no second paste. The message keeps its turn
+/// token and completes through the normal report; a second recovery of
+/// the same message refuses as already submitted. The audit event
+/// carries caller, alias, generation, message id, before/after state
+/// and result — never the body.
+#[test]
+fn recover_submit_sends_one_enter_and_keeps_correlation() {
+    let (d, mock, token) = recover_fixture(json!({"auto_ready": "verified"}));
+    // The TUI wraps a long draft: the row break falls on a space.
+    let (head, tail) = RECOVER_BODY.split_at(RECOVER_BODY.find(" docs/").unwrap());
+    atomic_write(
+        d.stub_pane_file(&mock, "st", "input"),
+        format!("{head}\n{}", tail.trim_start()),
+    );
+    let generation = d.rpc("agent_show", json!({"alias": "st"})).unwrap()["agent"]["generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (ok, out, err) = d.operator_cadence(&[
+        "agent",
+        "recover-submit",
+        "st",
+        "--message",
+        "m1",
+        "--generation",
+        &generation,
+    ]);
+    assert!(ok, "{out}\n{err}");
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(out["state"], "submitted", "{out}");
+    assert_eq!(out["before"]["input_nonempty"], true, "{out}");
+    assert_eq!(out["after"]["input_nonempty"], false, "{out}");
+    // One Enter on top of the delivery's; no re-paste.
+    assert_eq!(
+        pane_keys(&d, &mock, "st"),
+        (1, 2),
+        "{}",
+        tmux_log(&d, &mock)
+    );
+    // The TUI took the staged draft as the turn.
+    let screen = std::fs::read_to_string(d.stub_pane_file(&mock, "st", "screen")).unwrap();
+    assert_eq!(
+        screen.matches("STUB_REPLY: CAD152-KICKOFF").count(),
+        2,
+        "{screen}"
+    );
+    // Normal correlation: still running under the token minted at
+    // paste; the report completes it.
+    let m = d.wait_message("st", "m1", &["running"], 5);
+    assert_eq!(m["turn_id"], token.as_str(), "{m}");
+    // A second recovery of the same message — racing, or later —
+    // refuses and sends nothing.
+    atomic_write(d.stub_pane_file(&mock, "st", "input"), RECOVER_BODY);
+    let e = recover(&d, "st", "m1").unwrap_err().to_string();
+    assert!(
+        e.contains("agent recover-submit refused (already_submitted)"),
+        "{e}"
+    );
+    assert_eq!(pane_keys(&d, &mock, "st"), (1, 2));
+    atomic_write(d.stub_pane_file(&mock, "st", "input"), "");
+    d.rpc(
+        "message_report",
+        json!({"message": "m1", "token": token, "kind": "result", "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("st", "m1", &["completed"], 10);
+    let e = recover(&d, "st", "m1").unwrap_err().to_string();
+    assert!(e.contains("(already_submitted)"), "{e}");
+    // The audit record.
+    let sent = recover_events(&d, "st", "submit_recovered");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let ev = &sent[0];
+    assert_eq!(ev["by"], "operator", "{ev}");
+    assert_eq!(ev["by_kind"], "operator", "{ev}");
+    assert_eq!(ev["alias"], "st", "{ev}");
+    assert_eq!(ev["message"], "m1", "{ev}");
+    assert_eq!(ev["generation"], generation.as_str(), "{ev}");
+    assert_eq!(ev["result"], "submitted", "{ev}");
+    assert_eq!(ev["before"]["input_nonempty"], true, "{ev}");
+    assert_eq!(ev["after"]["input_nonempty"], false, "{ev}");
+    for e in d
+        .events("st")
+        .iter()
+        .filter(|e| e["kind"] == "submit_recovered" || e["kind"] == "submit_recover_refused")
+    {
+        assert!(!e.to_string().contains("CAD152-KICKOFF"), "{e}");
+    }
+    let refused = recover_events(&d, "st", "submit_recover_refused");
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert!(refused.iter().all(|e| e["check"] == "already_submitted"));
+}
+
+/// CAD-152: a generation the operator inspected that is no longer the
+/// live one, and a message whose turn token was minted under an earlier
+/// endpoint generation, both refuse as `stale_generation`.
+#[test]
+fn recover_submit_refuses_stale_generation() {
+    let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    let err = d
+        .operator_rpc(
+            "agent_recover_submit",
+            json!({"alias": "st", "message": "m1", "generation": "an-earlier-life"}),
+        )
+        .unwrap_err();
+    assert_recover_refused(&d, &mock, "st", "m1", err, "stale_generation");
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE messages SET turn_id=?1 WHERE id='m1'",
+        [format!("pty-earlier-{}", uuid::Uuid::new_v4())],
+    )
+    .unwrap();
+    let err = recover(&d, "st", "m1").unwrap_err();
+    assert!(
+        err.to_string().contains("earlier endpoint generation"),
+        "{err}"
+    );
+    assert_recover_refused(&d, &mock, "st", "m1", err, "stale_generation");
+}
+
+/// CAD-152: the id of a message that was never pasted — queued behind
+/// the stuck one — refuses and names the pending pasted message.
+#[test]
+fn recover_submit_refuses_other_message_pending() {
+    let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    d.rpc(
+        "agent_send",
+        json!({"alias": "st", "text": "a follow-up", "message": "m2"}),
+    )
+    .unwrap();
+    assert_eq!(d.message_state("st", "m2"), "queued");
+    let err = recover(&d, "st", "m2").unwrap_err();
+    assert!(err.to_string().contains("holds is m1"), "{err}");
+    assert_recover_refused(&d, &mock, "st", "m2", err, "other_message_pending");
+}
+
+/// CAD-152: nothing staged in the input line — nothing to submit.
+#[test]
+fn recover_submit_refuses_empty_input() {
+    let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    atomic_write(d.stub_pane_file(&mock, "st", "input"), "");
+    let err = recover(&d, "st", "m1").unwrap_err();
+    assert_recover_refused(&d, &mock, "st", "m1", err, "empty_input");
+}
+
+/// CAD-152: a busy TUI (an active worker) refuses even with the exact
+/// draft staged.
+#[test]
+fn recover_submit_refuses_busy_pane() {
+    let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    atomic_write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n");
+    let err = recover(&d, "st", "m1").unwrap_err();
+    assert_recover_refused(&d, &mock, "st", "m1", err, "busy");
+}
+
+/// CAD-152: an open approval menu refuses — an Enter would answer it.
+#[test]
+fn recover_submit_refuses_open_approval_menu() {
+    let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    atomic_write(
+        d.stub_pane_file(&mock, "st", "tui-state"),
+        "stub approval: run tests?\n",
+    );
+    let err = recover(&d, "st", "m1").unwrap_err();
+    assert!(err.to_string().contains("cadence agent answer"), "{err}");
+    assert_recover_refused(&d, &mock, "st", "m1", err, "approval_menu");
+}
+
+/// CAD-152: a draft that is not the message body — edited by a user,
+/// or other text — refuses without quoting it.
+#[test]
+fn recover_submit_refuses_edited_draft() {
+    let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    let edited = RECOVER_BODY.replace("docs/brief.md", "docs/other.md");
+    atomic_write(d.stub_pane_file(&mock, "st", "input"), &edited);
+    let err = recover(&d, "st", "m1").unwrap_err();
+    assert_recover_refused(&d, &mock, "st", "m1", err, "draft_mismatch");
+    atomic_write(
+        d.stub_pane_file(&mock, "st", "input"),
+        "operator note: hold on",
+    );
+    let err = recover(&d, "st", "m1").unwrap_err();
+    assert_recover_refused(&d, &mock, "st", "m1", err, "draft_mismatch");
+}
+
+/// CAD-152: only part of the body visible (a scrolled or clipped input
+/// line), or a whitespace difference a wrap could hide, is ambiguous —
+/// never a blind submit.
+#[test]
+fn recover_submit_refuses_ambiguous_wrap() {
+    let (d, mock, _token) = recover_fixture(json!({"auto_ready": "verified"}));
+    atomic_write(
+        d.stub_pane_file(&mock, "st", "input"),
+        &RECOVER_BODY[RECOVER_BODY.len() - 40..],
+    );
+    let err = recover(&d, "st", "m1").unwrap_err();
+    assert_recover_refused(&d, &mock, "st", "m1", err, "ambiguous_wrap");
+    atomic_write(
+        d.stub_pane_file(&mock, "st", "input"),
+        RECOVER_BODY.replacen(" the brief", "thebrief", 1),
+    );
+    let err = recover(&d, "st", "m1").unwrap_err();
+    assert_recover_refused(&d, &mock, "st", "m1", err, "ambiguous_wrap");
+}
+
+/// CAD-152: a non-pty endpoint has no draft to submit — refused before
+/// any message lookup, naming the endpoint.
+#[test]
+fn recover_submit_refuses_non_pty_endpoint() {
+    let d = TestDaemon::start();
+    d.register("fx");
+    d.wait_agent("fx", "idle", 10);
+    let err = recover(&d, "fx", "m1").unwrap_err().to_string();
+    assert!(
+        err.contains("agent recover-submit refused (unsupported_endpoint)"),
+        "{err}"
+    );
+}
+
+/// CAD-152 acceptance 4: only the operator or the agent's own PM may
+/// recover-submit — derived from the connection (CAD-149). A peer
+/// worker, another group's PM, the agent on itself, a caller that is
+/// not provably the operator and a claimed identity are all refused
+/// with the rule named, and send nothing; the PM's recovery goes
+/// through and is attributed to the PM.
+#[test]
+fn recover_submit_caller_rule_per_caller_kind() {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    let mut p = guard_panes(&d);
+    d.register_stub("st", json!({"upstream": "pm", "auto_ready": "verified"}));
+    d.wait_agent("st", "idle", 20);
+    stuck_draft(&d, &mock, "st", "m1");
+    let req = json!({"alias": "st", "message": "m1"});
+    let r = p.w1.rpc(&d.state, "agent_recover_submit", req.clone());
+    let e = frame_err(&r);
+    assert!(
+        e.contains("agent 'w1' cannot change another agent") && e.contains("its PM 'pm'"),
+        "{r}"
+    );
+    let r = p.pm2.rpc(&d.state, "agent_recover_submit", req.clone());
+    assert!(
+        frame_err(&r).contains("agent 'pm2' cannot change another agent"),
+        "{r}"
+    );
+    let r = unprovable_rpc(&d, "agent_recover_submit", req.clone());
+    assert!(frame_err(&r).contains("not provably the operator"), "{r}");
+    let r = p.w1.rpc(
+        &d.state,
+        "agent_recover_submit",
+        json!({"alias": "w1", "message": "m1"}),
+    );
+    assert!(
+        frame_err(&r).contains("agent 'w1' cannot make this change to itself"),
+        "{r}"
+    );
+    let mut forged = req.clone();
+    forged["by"] = json!("operator");
+    let r = p.w1.rpc(&d.state, "agent_recover_submit", forged);
+    assert!(frame_err(&r).contains("'by' is not accepted"), "{r}");
+    // Nothing sent, nothing recorded for the refused callers.
+    assert_eq!(
+        pane_keys(&d, &mock, "st"),
+        (1, 1),
+        "{}",
+        tmux_log(&d, &mock)
+    );
+    assert!(recover_events(&d, "st", "submit_recovered").is_empty());
+    assert!(recover_events(&d, "st", "submit_recover_refused").is_empty());
+    // The target's own PM.
+    let r = p.pm.rpc(&d.state, "agent_recover_submit", req);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["state"], "submitted", "{r}");
+    assert_eq!(pane_keys(&d, &mock, "st"), (1, 2));
+    let sent = recover_events(&d, "st", "submit_recovered");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["by"], "pm", "{sent:?}");
+    assert_eq!(sent[0]["by_kind"], "agent", "{sent:?}");
+}
+
+/// CAD-152: the AOS-11 reproduction on the Devin profile it was seen
+/// on — a Devin pane whose kickoff sits unsubmitted in the input box,
+/// between the box rule and the model bar — recovered entirely through
+/// cadence; the turn then reports under its original token.
+#[test]
+fn recover_submit_devin_lost_submit() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    // The live box's bottom rule and model bar under the input row.
+    atomic_write(
+        d.pane_file(&mock, "dv1", "tui-state"),
+        format!("{}\nSWE-2 Max\n", "─".repeat(60)),
+    );
+    d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": RECOVER_BODY, "message": "k1"}),
+    )
+    .unwrap();
+    let token = pty_token(&d, "dv1", "k1");
+    atomic_write(d.pane_file(&mock, "dv1", "input"), RECOVER_BODY);
+    let r = recover(&d, "dv1", "k1").unwrap();
+    assert_eq!(r["state"], "submitted", "{r}");
+    let screen = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap();
+    assert_eq!(
+        screen.matches("MOCK_REPLY: CAD152-KICKOFF").count(),
+        2,
+        "{screen}"
+    );
+    d.rpc(
+        "message_report",
+        json!({"message": "k1", "token": token, "kind": "result", "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("dv1", "k1", &["completed"], 10);
+}
+
 // ---- CAD-55: `cadence dispatch` + `cadence issue finish` against a live daemon ----
 
 /// CAD-275: age every file under `dir` past `issue finish`'s

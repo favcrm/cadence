@@ -120,6 +120,22 @@ pub trait TuiProfile: Send + Sync {
         &["C-c"]
     }
 
+    /// `agent recover-submit` (CAD-152): the staged draft's visible
+    /// rows, top to bottom, with this TUI's chrome (prompt glyph, box
+    /// rules, indentation) removed — the text the generic matcher
+    /// compares against the message body. Called only after the probe
+    /// saw a non-empty input line. `Err` names why the draft cannot be
+    /// delimited on this screen, and the recovery refuses: the default
+    /// refuses for every TUI whose input area has no proven shape, so a
+    /// new profile fails closed until it opts in.
+    fn draft_rows(&self, _styled: &str) -> std::result::Result<Vec<String>, String> {
+        Err(format!(
+            "{} drafts cannot be read reliably from the screen — recover it in \
+             the terminal (`cadence agent attach`)",
+            self.name()
+        ))
+    }
+
     /// First non-space characters that must never be pasted verbatim.
     /// Terminal UIs commonly treat a leading `/` or `!` as a command or
     /// mode switch, so a literal paste of such a body is an injection

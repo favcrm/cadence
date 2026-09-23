@@ -77,7 +77,9 @@ use crate::adapter::registry;
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
-use super::{AdapterHooks, Identity, Probe, ProviderAdapter, ProviderEnv, TurnResult};
+use super::{
+    AdapterHooks, Identity, Probe, ProviderAdapter, ProviderEnv, RecoverSubmit, TurnResult,
+};
 use render::{RenderDecision, RenderObservation, RenderOutcome};
 
 /// How long an operator readiness claim stays valid for one send.
@@ -208,6 +210,68 @@ fn normalize_screen(text: &str) -> String {
         .filter(|c| !c.is_whitespace() && !MARKDOWN_MARKERS.contains(c))
         .collect()
 }
+
+/// How a visible draft compares with a message body — the
+/// `agent recover-submit` draft check (CAD-152).
+#[derive(Debug, PartialEq, Eq)]
+enum DraftMatch {
+    /// Every row is the next piece of the body, in order, each row
+    /// break a wrap point, and nothing of the body is left over.
+    Exact,
+    /// The rows are part of the body, or equal it only once all
+    /// whitespace is dropped: a clipped or scrolled input box, or a
+    /// whitespace difference a wrap could hide. Not provably the body.
+    Ambiguous,
+    /// Other text: an edited draft, operator text, another message.
+    Differs,
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Compare the draft `rows` (chrome already removed by the profile)
+/// with `body`. Pty bodies are single-line (`run_turn` rejects control
+/// characters), so every row break on screen is a wrap: it may have
+/// consumed one space of the body or fallen mid-word — rows are
+/// trimmed, so exactly one reading applies at each break. Runs of
+/// whitespace compare as one space on both sides.
+fn match_draft(rows: &[String], body: &str) -> DraftMatch {
+    let body = collapse_whitespace(body);
+    let rows: Vec<String> = rows
+        .iter()
+        .map(|r| collapse_whitespace(r))
+        .filter(|r| !r.is_empty())
+        .collect();
+    if rows.is_empty() {
+        return DraftMatch::Differs;
+    }
+    let mut rest = body.as_str();
+    let mut walked = true;
+    for (i, row) in rows.iter().enumerate() {
+        let Some(after) = rest.strip_prefix(row.as_str()) else {
+            walked = false;
+            break;
+        };
+        rest = after;
+        if i + 1 < rows.len() {
+            rest = rest.strip_prefix(' ').unwrap_or(rest);
+        }
+    }
+    if walked && rest.is_empty() {
+        return DraftMatch::Exact;
+    }
+    let squash = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    if squash(&body).contains(&squash(&rows.concat())) {
+        DraftMatch::Ambiguous
+    } else {
+        DraftMatch::Differs
+    }
+}
+
+/// How long `agent recover-submit` watches for the draft to leave the
+/// input line after its one Enter.
+const RECOVER_DEADLINE: Duration = RENDER_DEADLINE;
 
 /// The last `n` characters of `text` (by char, not byte).
 fn tail_chars(text: &str, n: usize) -> String {
@@ -1409,6 +1473,161 @@ impl ProviderAdapter for PtyAdapter {
         Ok(probe)
     }
 
+    /// `agent recover-submit`: see [`ProviderAdapter::recover_submit`].
+    /// Held under the paste lock end to end — the checks, the one
+    /// Enter and the watch after it — so no paste, answer or second
+    /// recovery can land keys in between.
+    fn recover_submit(
+        &self,
+        generation: &str,
+        body: &str,
+        confirm: &dyn Fn() -> std::result::Result<(), (String, String)>,
+    ) -> Result<RecoverSubmit> {
+        let refused = |check: &str, reason: String, probe: Option<Probe>| {
+            Ok(RecoverSubmit::Refused {
+                check: check.to_string(),
+                reason,
+                probe,
+            })
+        };
+        let _paste_guard = self.paste_lock.lock().unwrap();
+        let (session, native, live) = {
+            let s = self.state.lock().unwrap();
+            (
+                s.session.clone(),
+                s.native_session.clone(),
+                s.generation.clone(),
+            )
+        };
+        if live != generation {
+            return refused(
+                "stale_generation",
+                "the endpoint was relaunched since this message was pasted — its \
+                 generation is no longer the live one"
+                    .to_string(),
+                None,
+            );
+        }
+        let dead = !self.has_session(&session)
+            || self
+                .pane_value(&session, "#{pane_dead}")
+                .map_or(true, |v| v == "1");
+        if dead {
+            return refused(
+                "endpoint",
+                "the pane is gone or its process exited".to_string(),
+                None,
+            );
+        }
+        if let Err(e) = self.verify_ownership(&session, &native) {
+            return refused(
+                "endpoint",
+                format!("the pane no longer proves ownership of its native session: {e}"),
+                None,
+            );
+        }
+        if self.pane_value(&session, "#{pane_in_mode}").ok().as_deref() != Some("0") {
+            return refused(
+                "pane_mode",
+                "the pane is in a tmux mode (copy/view) — an Enter would not reach the TUI"
+                    .to_string(),
+                None,
+            );
+        }
+        let styled = self.capture_visible_styled()?;
+        let before = self
+            .profile
+            .analyze_styled(&styled, self.cursor_pos(&session));
+        if before.approval_menu {
+            return refused(
+                "approval_menu",
+                format!(
+                    "an approval menu is open ({}) — answer it with `cadence agent answer`",
+                    before.reason
+                ),
+                Some(before),
+            );
+        }
+        if before.busy_marker {
+            return refused(
+                "busy",
+                format!("the TUI is busy ({})", before.reason),
+                Some(before),
+            );
+        }
+        if !before.input_nonempty {
+            return refused(
+                "empty_input",
+                "the input line is empty — no draft is staged to submit".to_string(),
+                Some(before),
+            );
+        }
+        let rows = match self.profile.draft_rows(&styled) {
+            Ok(rows) if rows.iter().any(|r| !r.trim().is_empty()) => rows,
+            Ok(_) => {
+                return refused(
+                    "draft_unreadable",
+                    "the input line reads non-empty but no draft text could be read".to_string(),
+                    Some(before),
+                )
+            }
+            Err(why) => return refused("draft_unreadable", why, Some(before)),
+        };
+        // Neither reason quotes the draft: it may be operator text.
+        match match_draft(&rows, body) {
+            DraftMatch::Exact => {}
+            DraftMatch::Ambiguous => {
+                return refused(
+                    "ambiguous_wrap",
+                    "the visible draft is only part of the message body, or differs from \
+                     it only in whitespace a wrap could hide — it cannot be proven to be \
+                     the whole message"
+                        .to_string(),
+                    Some(before),
+                )
+            }
+            DraftMatch::Differs => {
+                return refused(
+                    "draft_mismatch",
+                    "the staged draft is not this message's body (edited, or other text)"
+                        .to_string(),
+                    Some(before),
+                )
+            }
+        }
+        if let Err((check, reason)) = confirm() {
+            return refused(&check, reason, Some(before));
+        }
+        // Exactly one Enter — never a re-paste. A failed send may still
+        // have landed, so it is watched like a sent one.
+        let send_error = self
+            .tmux_ok(&["send-keys", "-t", &session, "Enter"])
+            .err()
+            .map(|e| e.to_string());
+        let started = Instant::now();
+        let mut after = before.clone();
+        loop {
+            if let Ok(styled) = self.capture_visible_styled() {
+                after = self
+                    .profile
+                    .analyze_styled(&styled, self.cursor_pos(&session));
+                if !after.input_nonempty {
+                    break;
+                }
+            }
+            if started.elapsed() >= RECOVER_DEADLINE {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        Ok(RecoverSubmit::Sent {
+            confirmed: !after.input_nonempty,
+            before,
+            after,
+            send_error,
+        })
+    }
+
     fn sample_screen(&self) -> Result<(String, Probe)> {
         let session = self.session();
         let styled = self.capture_visible_styled()?;
@@ -1432,7 +1651,70 @@ impl ProviderAdapter for PtyAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_screen, pane_env, tail_chars};
+    use super::{match_draft, normalize_screen, pane_env, tail_chars, DraftMatch};
+
+    fn rows(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    /// CAD-152: a draft matches its body when every row is the next
+    /// piece of it and every row break is a wrap — at a space or
+    /// mid-word; runs of whitespace compare as one.
+    #[test]
+    fn draft_match_accepts_the_body_however_it_wraps() {
+        let body = "Kickoff AOS-11: read the brief  and report with your token.";
+        for draft in [
+            rows(&["Kickoff AOS-11: read the brief and report with your token."]),
+            rows(&[
+                "Kickoff AOS-11: read the",
+                "brief and report with your token.",
+            ]),
+            rows(&[
+                "Kickoff AOS-11: read the bri",
+                "ef and report with",
+                "your token.",
+            ]),
+            rows(&[
+                "Kickoff AOS-11:   read the brief",
+                "",
+                "and report with your token.",
+            ]),
+        ] {
+            assert_eq!(match_draft(&draft, body), DraftMatch::Exact, "{draft:?}");
+        }
+    }
+
+    /// Part of the body (a clipped or horizontally scrolled box), or a
+    /// whitespace-only difference a wrap could hide, is not provably the
+    /// whole message: ambiguous. Anything else differs.
+    #[test]
+    fn draft_match_refuses_partial_whitespace_and_other_text() {
+        let body = "Kickoff AOS-11: read the brief and report with your token.";
+        for draft in [
+            rows(&["and report with your token."]),
+            rows(&["Kickoff AOS-11: read the brief"]),
+            rows(&["Kickoff AOS-11: read thebrief and report with your token."]),
+            rows(&[
+                "Kickoff AOS-11: read the brief and",
+                "rep ort with your token.",
+            ]),
+        ] {
+            assert_eq!(
+                match_draft(&draft, body),
+                DraftMatch::Ambiguous,
+                "{draft:?}"
+            );
+        }
+        for draft in [
+            rows(&["Kickoff AOS-11: read the brief and report with your token. also do X"]),
+            rows(&["Kickoff AOS-12: read the brief and report with your token."]),
+            rows(&["operator note"]),
+            rows(&[""]),
+            Vec::new(),
+        ] {
+            assert_eq!(match_draft(&draft, body), DraftMatch::Differs, "{draft:?}");
+        }
+    }
 
     #[test]
     fn normalize_and_tail_helpers() {

@@ -509,6 +509,30 @@ impl TuiProfile for DevinProfile {
         analyze_devin(screen)
     }
 
+    /// The draft is the input box's interior: the last `❭` input row
+    /// and any wrapped rows under it, down to the box's bottom rule.
+    /// No rule below the input row means the box is cut off — the
+    /// draft cannot be delimited, so the recovery refuses.
+    fn draft_rows(&self, styled: &str) -> std::result::Result<Vec<String>, String> {
+        let screen = super::sgr::strip(styled);
+        let lines: Vec<&str> = screen.trim_end().lines().collect();
+        let start = (0..lines.len())
+            .rev()
+            .find(|&i| input_row(&lines, i))
+            .ok_or("no Devin input row on screen")?;
+        let rule = |l: &str| l.chars().filter(|c| matches!(c, '─' | '═')).count() >= 8;
+        let end = (start + 1..lines.len()).find(|&i| rule(lines[i])).ok_or(
+            "the Devin input box has no bottom rule on screen — the draft cannot be delimited",
+        )?;
+        let mut rows = vec![lines[start]
+            .trim_start()
+            .trim_start_matches(devin_screen::PROMPT)
+            .trim()
+            .to_string()];
+        rows.extend(lines[start + 1..end].iter().map(|l| l.trim().to_string()));
+        Ok(rows)
+    }
+
     fn respond_rejection(&self) -> &'static str {
         "pty endpoints have no approval channel — answer Devin \
          permission prompts in the terminal itself"
@@ -789,6 +813,34 @@ Allow this tool call?
 · 9 I
 · 10 No
 ↑↓ select · ↵ confirm · esc cancel";
+
+    /// CAD-152: the draft is the input box's interior — the `❭` row
+    /// and its wrapped rows down to the bottom rule; without that rule
+    /// the box cannot be delimited and the read refuses.
+    #[test]
+    fn draft_rows_read_the_input_box_interior() {
+        let prof = profile(None);
+        let one = IDLE.replacen(
+            "Ask Devin to build features, fix bugs, or work on your code",
+            "Kickoff AOS-11: read the brief",
+            1,
+        );
+        assert_eq!(
+            prof.draft_rows(&one).unwrap(),
+            vec!["Kickoff AOS-11: read the brief"]
+        );
+        let wrapped = format!(
+            "transcript tail\n{RULE}\n❭ Kickoff AOS-11: read the\n  brief and report\n{RULE}\nSWE-2 Max"
+        );
+        assert_eq!(
+            prof.draft_rows(&wrapped).unwrap(),
+            vec!["Kickoff AOS-11: read the", "brief and report"]
+        );
+        let cut = "transcript tail\n❭ Kickoff AOS-11: read the brief";
+        let err = prof.draft_rows(cut).unwrap_err();
+        assert!(err.contains("no bottom rule"), "{err}");
+        assert!(prof.draft_rows("no prompt at all").is_err());
+    }
 
     #[test]
     fn multi_digit_answer_navigates_instead_of_typing() {

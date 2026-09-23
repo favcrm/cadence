@@ -2107,6 +2107,22 @@ impl Store {
         Ok(out)
     }
 
+    /// CAD-152: the `submit_recovered` record of an earlier `agent
+    /// recover-submit` for message `id` on `alias`, if one exists — the
+    /// durable marker that makes a second recovery refuse.
+    pub fn submit_recovered(&self, alias: &str, id: &str) -> Result<Option<Value>> {
+        let conn = self.conn();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT payload FROM events WHERE alias=?1 AND kind='submit_recovered' \
+                 AND json_extract(payload,'$.message')=?2 ORDER BY seq LIMIT 1",
+                params![alias, id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw.map(|r| serde_json::from_str(&r).unwrap_or(Value::Null)))
+    }
+
     /// Standalone event insert for runtime/daemon bookkeeping.
     pub fn event_public(&self, alias: &str, kind: &str, payload: Value) -> Result<()> {
         let conn = self.conn();
