@@ -457,8 +457,9 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 ctx.paths.extend(path.clone());
                 ctx.tags.extend(tag.clone());
                 let (pool, errors) = memory::load_project_report(&pm.dir, &issue_obj.project);
+                let fresh = memory::Freshness::for_project(Some(&proj));
                 (
-                    memory::match_memories(&pool, &ctx),
+                    memory::match_memories(&pool, &ctx, &fresh),
                     ctx,
                     errors,
                     issue_obj.project,
@@ -473,20 +474,32 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                     tags: tag.clone(),
                 };
                 let (pool, errors) = memory::load_project_report(&pm.dir, &proj.key);
-                (memory::match_memories(&pool, &ctx), ctx, errors, proj.key)
+                let fresh = memory::Freshness::for_project(Some(&proj));
+                (
+                    memory::match_memories(&pool, &ctx, &fresh),
+                    ctx,
+                    errors,
+                    proj.key,
+                )
             };
             if let Some(line) = memory::load_errors_line(&load_errors) {
                 eprintln!("{line}");
             }
             if *as_json {
                 crate::issue::cli::print_json(&json!({
-                    "matched": mems.iter().map(|m| json!({
+                    "matched": mems.lessons.iter().map(|m| json!({
                         "project": m.project,
                         "slug": m.front.id,
                         "type": m.front.kind,
                         "confidence": m.front.confidence,
-                        "verified_at": m.front.verified_at,
+                        "verified_at": memory::last_verified(m),
+                        "evidence": mems.label(m),
                         "fact": memory::fact_line(&m.body),
+                    })).collect::<Vec<_>>(),
+                    "withheld": mems.withheld.iter().map(|(m, reason)| json!({
+                        "project": m.project,
+                        "slug": m.front.id,
+                        "reason": reason,
                     })).collect::<Vec<_>>(),
                     "context": {
                         "project": project_key,
@@ -498,14 +511,18 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                     "load_errors": load_errors,
                 }));
             } else {
-                for m in &mems {
+                for m in &mems.lessons {
                     println!(
-                        "{}/{}\t{}\t{}",
+                        "{}/{}\t{}\t{}\t{}",
                         m.project,
                         m.front.id,
                         m.front.kind,
+                        mems.label(m),
                         memory::fact_line(&m.body),
                     );
+                }
+                for (m, reason) in &mems.withheld {
+                    println!("{}/{}\twithheld\t{reason}", m.project, m.front.id);
                 }
             }
             Ok(0)

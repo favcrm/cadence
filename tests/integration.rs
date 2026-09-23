@@ -19543,6 +19543,7 @@ fn write_reviewed_memory(
         confidence: "high".to_string(),
         created: "2026-01-01T00:00:00Z".to_string(),
         verified_at: Some("2026-01-02T00:00:00Z".to_string()),
+        stale: None,
         supersedes: None,
         author: Some(author.alias.clone()),
         author_proof: Some(author.clone()),
@@ -19596,6 +19597,38 @@ fn write_reviewed_memory(
     )
     .unwrap();
     path
+}
+
+/// Give a `write_reviewed_memory` fixture a PM-finalized verify cycle 2
+/// at `verified_at`, reviewed by the same two fixture reviewers.
+fn mark_memory_verified(path: &Path, verified_at: &str) {
+    let text = std::fs::read_to_string(path).unwrap();
+    let (mut front, body) = memory::parse_memory(&text).unwrap();
+    let verify: Vec<ReviewReceipt> = front
+        .reviews
+        .iter()
+        .map(|r| ReviewReceipt {
+            operation: "verify".to_string(),
+            cycle: 2,
+            recorded_at: verified_at.to_string(),
+            ..r.clone()
+        })
+        .collect();
+    front.reviews.extend(verify);
+    let accept = front.finalizations[0].clone();
+    front.finalizations.push(FinalizationReceipt {
+        operation: "verify".to_string(),
+        cycle: 2,
+        finalized_at: verified_at.to_string(),
+        ..accept
+    });
+    front.review_cycle = 2;
+    front.verified_at = Some(verified_at.to_string());
+    std::fs::write(
+        path,
+        cadence_agent::issue::parse::render(&front, &body).unwrap(),
+    )
+    .unwrap();
 }
 
 /// The positive CAD-191 path uses four real mock Devin panes. Each bridge
@@ -20128,6 +20161,41 @@ fn dispatch_injects_project_memory_lessons() {
         },
         "claude provider rule",
     );
+    // CAD-203: a project-wide rule whose last verify is years old decays
+    // to unverified — still injected, labelled — while one explicitly
+    // marked stale is withheld from the lessons and the briefing, with
+    // its reason.
+    let aged = write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "aged-rule",
+        "rule",
+        Scope {
+            project: true,
+            ..Scope::default()
+        },
+        "aged rule nobody re-checked",
+    );
+    mark_memory_verified(&aged, "2020-01-01T00:00:00Z");
+    let marked = write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "marked-rule",
+        "rule",
+        Scope {
+            project: true,
+            ..Scope::default()
+        },
+        "rule whose cited fix was reverted",
+    );
+    let text = std::fs::read_to_string(&marked).unwrap();
+    let (mut front, body) = memory::parse_memory(&text).unwrap();
+    front.stale = Some("D-9 reverted the cited fix".to_string());
+    std::fs::write(
+        &marked,
+        cadence_agent::issue::parse::render(&front, &body).unwrap(),
+    )
+    .unwrap();
     // A still-proposed memory never injects. It intentionally has no
     // authenticated proof, so it also documents legacy/proposed withholding.
     let pending = pm_dir.join("demo/memory/pending-one.md");
@@ -20153,7 +20221,16 @@ fn dispatch_injects_project_memory_lessons() {
         "pm",
     ]);
     assert!(ok && out["dispatched"] == true, "{out}");
-    assert_eq!(out["lessons"], json!(["always-drain"]), "{out}");
+    assert_eq!(
+        out["lessons"],
+        json!(["aged-rule", "always-drain"]),
+        "{out}"
+    );
+    assert_eq!(
+        out["lessons_withheld"],
+        json!([{"slug": "marked-rule", "reason": "evidence marked stale: D-9 reverted the cited fix"}]),
+        "{out}"
+    );
     let lessons_path = PathBuf::from(out["lessons_file"].as_str().unwrap());
     let msg_id = out["message"].as_str().unwrap().to_string();
     assert_eq!(
@@ -20164,7 +20241,25 @@ fn dispatch_injects_project_memory_lessons() {
     );
     let text = std::fs::read_to_string(&lessons_path).unwrap();
     assert!(text.contains("always drain the pipe before send"), "{text}");
+    assert!(
+        text.contains("- `always-drain` (rule, unverified):"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "- `aged-rule` (rule, unverified (last verified 2020-01-01)): aged rule nobody re-checked"
+        ),
+        "{text}"
+    );
     assert!(!text.contains("daemon-only gotcha"), "{text}");
+    assert!(
+        !text.contains("rule whose cited fix was reverted"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- `marked-rule`: evidence marked stale: D-9 reverted the cited fix"),
+        "{text}"
+    );
     assert!(text.len() <= 4096);
     // The kickoff names the file; the comment records the injection.
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
@@ -20181,7 +20276,15 @@ fn dispatch_injects_project_memory_lessons() {
             c["body"]
                 .as_str()
                 .unwrap()
-                .contains("Lessons injected: always-drain")
+                .contains("Lessons injected: aged-rule, always-drain")
+        }),
+        "{issue}"
+    );
+    assert!(
+        issue["comments"].as_array().unwrap().iter().any(|c| {
+            c["body"].as_str().unwrap().contains(
+                "Lessons withheld: marked-rule (evidence marked stale: D-9 reverted the cited fix)",
+            )
         }),
         "{issue}"
     );
@@ -20237,8 +20340,14 @@ fn dispatch_injects_project_memory_lessons() {
         "{text}"
     );
     assert!(text.contains("always-drain"), "{text}");
+    assert!(text.contains("`always-drain` (unverified)"), "{text}");
     assert!(!text.contains("pending-one"), "{text}");
     assert!(!text.contains("claude-only"), "{text}");
+    assert!(
+        text.contains("`aged-rule` (unverified (last verified 2020-01-01))"),
+        "{text}"
+    );
+    assert!(!text.contains("marked-rule"), "{text}");
 }
 
 /// Explicit-axis matching resolves the current project from cwd and never
