@@ -1806,6 +1806,205 @@ fn pty_hot_restart_adopts_multiple_running_turns() {
     }
 }
 
+/// CAD-250 `send --nudge`: steering pasted into the live pane while a
+/// turn is held. The nudge passes the one-turn hold, never becomes
+/// `running`, owes no report and completes at its confirmed paste; the
+/// held turn stays the one running row and queued tasks stay queued.
+#[test]
+fn pty_nudge_steers_without_owning_a_turn() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register("pm");
+    d.register_stub("w1", json!({"auto_ready": "verified"}));
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 20);
+    for id in ["t1", "t2", "t3"] {
+        d.rpc(
+            "agent_send",
+            json!({"alias": "w1", "text": format!("task {id}"),
+                   "message": id, "reply_to": "pm"}),
+        )
+        .unwrap();
+    }
+    let token = pty_token(&d, "w1", "t1");
+    let (ok, sent) = cadence_cli(
+        &d.state,
+        &[
+            "message",
+            "send",
+            "w1",
+            "--nudge",
+            "--text",
+            "steer: prefer the smaller fix",
+        ],
+        &[],
+    );
+    assert!(ok, "{sent}");
+    let nid = sent["message"].as_str().unwrap().to_string();
+    let n = d.wait_message("w1", &nid, &["completed"], 20);
+    assert_eq!(n["source"], "nudge", "{n}");
+    assert_eq!(n["nudge"], true, "{n}");
+    assert_eq!(n["result"]["via"], "pty_nudge", "{n}");
+    assert!(n["reply_to"].is_null(), "a nudge owes no report: {n}");
+    assert!(n.get("awaiting_report").is_none(), "{n}");
+    // It never became a turn: no `turn_started` for the nudge.
+    assert!(d
+        .events("w1")
+        .iter()
+        .all(|e| { !(e["kind"] == "turn_started" && e["payload"]["message"] == nid.as_str()) }));
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let running: Vec<&str> = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["state"] == "running")
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(running, ["t1"], "{show}");
+    assert_eq!(show["agent"]["awaiting_report"]["message"], "t1", "{show}");
+    assert_eq!(d.message_state("w1", "t2"), "queued");
+    assert_eq!(d.message_state("w1", "t3"), "queued");
+    // No notice or result reached the PM for the nudge.
+    let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    assert!(
+        pm["messages"].as_array().unwrap().iter().all(|m| {
+            !m["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(nid.as_str())
+        }),
+        "{pm}"
+    );
+    // The held turn is unchanged and reports normally.
+    d.rpc(
+        "message_report",
+        json!({"message": "t1", "token": token, "kind": "result", "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "t1", &["completed"], 10);
+    pty_token(&d, "w1", "t2");
+}
+
+/// CAD-250: `--nudge` is pty-only and caller-rule neutral — refused on a
+/// managed endpoint and a mailbox (naming the provider kind), with a
+/// `reply_to`, and together with `--ready`.
+#[test]
+fn nudge_refused_off_pty_and_with_ready() {
+    let d = TestDaemon::start();
+    d.register("mgd");
+    d.register_inbox("box");
+    d.wait_agent("mgd", "idle", 10);
+    for (alias, kind) in [("mgd", "fake/fake"), ("box", "inbox/inbox")] {
+        let err = d
+            .rpc(
+                "agent_send",
+                json!({"alias": alias, "text": "steer", "nudge": true}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pty") && err.contains(kind), "{alias}: {err}");
+        // The forged-source path takes the same check.
+        let err = d
+            .rpc(
+                "agent_send",
+                json!({"alias": alias, "text": "steer", "source": "nudge"}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(kind), "{alias}: {err}");
+    }
+    let err = d
+        .rpc(
+            "agent_send",
+            json!({"alias": "mgd", "text": "steer", "nudge": true, "reply_to": "box"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("reply_to") || err.contains("pty"), "{err}");
+    // A clap conflict: refused before any RPC, error names both flags.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["send", "mgd", "--nudge", "--ready", "--text", "steer"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "--nudge with --ready must be refused"
+    );
+    assert!(
+        stderr.contains("--nudge") && stderr.contains("--ready"),
+        "{stderr}"
+    );
+    // Nothing was enqueued by any refusal.
+    for alias in ["mgd", "box"] {
+        let show = d.rpc("agent_show", json!({"alias": alias})).unwrap();
+        assert!(
+            show["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["body"] != "steer"),
+            "{show}"
+        );
+    }
+}
+
+/// CAD-250: a nudge is steering for its moment — one still queued when
+/// the daemon stops is cancelled at the next start with a
+/// `nudge_cancelled` event, never pasted into the later pane.
+#[test]
+fn pty_nudge_queued_at_restart_is_cancelled_not_replayed() {
+    let mut d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    // An open approval menu holds every paste at the gate.
+    atomic_write(d.pane_file(&mock, "dv1", "tui-state"), DEVIN_MENU);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "late steer", "message": "n1", "nudge": true}),
+    )
+    .unwrap();
+    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "n1", 20);
+    assert_eq!(d.message_state("dv1", "n1"), "queued");
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    std::mem::forget(d);
+    std::fs::remove_file(d_pane(&mock, &state, "dv1", "tui-state")).unwrap();
+    let d = TestDaemon::start_on(state);
+    let m = d.wait_message("dv1", "n1", &["cancelled", "unknown"], 20);
+    assert_eq!(m["state"], "cancelled", "{m}");
+    assert_eq!(m["result"]["via"], "restart_cancelled", "{m}");
+    let ev = d.wait_event_where(
+        "dv1",
+        "nudge_cancelled",
+        |e| e["payload"]["message"] == "n1",
+        10,
+    );
+    assert_eq!(ev["payload"]["was"], "queued", "{ev}");
+    // The pane never received it, and it does not fence the agent.
+    d.wait_agent("dv1", "idle", 25);
+    let input =
+        std::fs::read_to_string(d_pane(&mock, &d.state, "dv1", "input")).unwrap_or_default();
+    assert!(!input.contains("late steer"), "nudge replayed: {input}");
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["unknown"],
+        0
+    );
+}
+
+/// The mock pane file for `alias` under `state` — for a restarted daemon
+/// whose `TestDaemon` was re-created on the same state dir.
+fn d_pane(mock: &MockDevin, state: &Path, alias: &str, ext: &str) -> PathBuf {
+    mock.dir
+        .join("tmux-state")
+        .join(socket_for(state))
+        .join(format!("{alias}.{ext}"))
+}
+
 /// CAD-250 reconcile path for rows that accumulated before one turn per
 /// actor (the live aos-pm shape: delivered `user` turns, no `reply_to`,
 /// days old, never reported). A hot restart adopts them like any proven
@@ -15208,9 +15407,10 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
 /// by the sampled probe: `turn_silent_end` fires once per message
 /// carrying the age and the admitting probe, the views flag it
 /// (`silent_ended`, `ended_secs`, `ended?:` in status, an overview
-/// needs-me row naming `agent attach`). The message itself is never
-/// auto-resolved — and since CAD-250 a follow-up send queues behind the
-/// unreported turn until it is reported.
+/// needs-me row naming the `send --nudge` remedy). The message itself is
+/// never auto-resolved. Since CAD-250 the nudge pastes without owning a
+/// turn, while a plain follow-up send queues behind the unreported turn
+/// until it is reported.
 #[test]
 fn pty_silent_end_fires_once_and_recovers() {
     let d = TestDaemon::start();
@@ -15268,15 +15468,31 @@ fn pty_silent_end_fires_once_and_recovers() {
         .iter()
         .find(|n| n["kind"] == "silent_end")
         .expect("silent_end row");
-    // CAD-250: a follow-up send would queue behind the unreported turn,
-    // so the remedy is the pane itself.
-    assert_eq!(ended["command"], "cadence agent attach w1");
+    // CAD-250: the remedy is a nudge — it owns no turn, so it pastes
+    // past the unreported one instead of queueing behind it.
+    assert_eq!(
+        ended["command"],
+        "cadence send w1 --nudge --text \"finish and report …\""
+    );
     assert!(ended["title"].as_str().unwrap().contains("w1"));
 
-    // The message is flagged, never auto-resolved. A `--ready` follow-up
-    // is accepted but held `queued` behind the unreported turn (not
-    // pasted, not refused); the report releases it.
+    // The remedy verbatim: the nudge completes at its confirmed paste
+    // with no report, and ms9 is still the one running turn.
+    let (ok, nudged) = cadence_cli(
+        &d.state,
+        &["send", "w1", "--nudge", "--text", "finish and report …"],
+        &[],
+    );
+    assert!(ok, "{nudged}");
+    let nudge_id = nudged["message"].as_str().unwrap().to_string();
+    let n = d.wait_message("w1", &nudge_id, &["completed"], 20);
+    assert_eq!(n["result"]["via"], "pty_nudge", "{n}");
+    assert_eq!(n["nudge"], true, "{n}");
     assert_eq!(d.message_state("w1", "ms9"), "running");
+
+    // A plain `--ready` follow-up is accepted but held `queued` behind
+    // the unreported turn (not pasted, not refused); the report
+    // releases it.
     let (ok, sent) = cadence_cli(
         &d.state,
         &["send", "w1", "--ready", "--text", "continue"],

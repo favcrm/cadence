@@ -93,6 +93,7 @@ cadence join <your-alias> devin --worktree feat-a   # isolated checkout
                                                     #  (.cadence/wt/feat-a)
 cadence agent ready <worker>                        # gate one paste
 cadence send <worker> --ready --text "task"         # claim + send fused
+cadence send <worker> --nudge --text "steer"        # mid-turn steering (pty)
 cadence agent probe <worker>                        # is the pane idle? (pty)
 cadence agent set <worker> auto_ready=verified      # daemon verifies idle
                                                     #  itself before pasting

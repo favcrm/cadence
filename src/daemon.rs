@@ -966,16 +966,47 @@ impl Shared {
                     let started_id = message.id.clone();
                     let shared = Arc::clone(self);
                     let watch = Arc::clone(ctl);
-                    // Routed mail may pass the pty claim gate while this
-                    // turn runs. Clear on return, including errors, so a
-                    // later user message cannot inherit the flag.
-                    adapter.set_unclaimed_ok(message.is_routed());
+                    // Routed mail and nudges may pass the pty claim gate
+                    // while a turn runs. Clear on return, including errors,
+                    // so a later user message cannot inherit the flag.
+                    let nudge = message.is_nudge();
+                    adapter.set_unclaimed_ok(message.is_routed() || nudge);
                     let outcome = adapter.run_turn(&message.body, &message.id, &move |turn| {
-                        let _ = shared.store.mark_running(&started_id, turn);
-                        watch.bump_activity();
+                        // CAD-250: a nudge owns no turn — it never becomes
+                        // `running`, and its paste is not the held turn's
+                        // proof of life.
+                        if !nudge {
+                            let _ = shared.store.mark_running(&started_id, turn);
+                            watch.bump_activity();
+                        }
                         shared.wake();
                     });
                     adapter.set_unclaimed_ok(false);
+                    // CAD-250: an unconfirmed nudge paste ends `unknown`,
+                    // but a nudge belongs to no turn — it never fences the
+                    // agent, never retries, never touches the held turn.
+                    let outcome = match outcome {
+                        Err(Error::NotRendered(miss)) if nudge => {
+                            let _ = self.store.event_public(
+                                alias,
+                                "paste_not_rendered",
+                                json!({"message": message.id,
+                                       "reason": miss.reason,
+                                       "attempt": 1,
+                                       "retry": false,
+                                       "before": miss.before_tail,
+                                       "after": miss.after_tail,
+                                       "claim_probe": miss.claim_probe}),
+                            );
+                            self.nudge_unconfirmed(&message, &miss.reason)?;
+                            continue;
+                        }
+                        Err(Error::OutcomeUnknown(reason)) if nudge => {
+                            self.nudge_unconfirmed(&message, &reason)?;
+                            continue;
+                        }
+                        other => other,
+                    };
                     match outcome {
                         Ok(result) => {
                             if let Err(error) = self.complete(&message, result) {
@@ -1129,7 +1160,44 @@ impl Shared {
         }
     }
 
+    /// CAD-250: a nudge whose paste could not be confirmed — `unknown`,
+    /// recorded with a `nudge_unconfirmed` event, and nothing else: no
+    /// fence, no retry, no notice (a nudge has no `reply_to`).
+    fn nudge_unconfirmed(&self, message: &Message, reason: &str) -> Result<()> {
+        let stored = json!({"status": "unknown", "text": "", "error": reason,
+                            "via": "pty_nudge"});
+        self.store
+            .finish(message, "unknown", &stored, Some(reason))?;
+        let _ = self.store.event_public(
+            &message.alias,
+            "nudge_unconfirmed",
+            json!({"message": message.id, "reason": reason}),
+        );
+        // `finish` idles the agent; a turn still held keeps it busy.
+        if !self.store.awaiting_reports(&message.alias)?.is_empty() {
+            let _ = self
+                .store
+                .set_agent_state_if(&message.alias, "busy", "idle");
+        }
+        self.wake();
+        Ok(())
+    }
+
     fn complete(&self, message: &Message, result: TurnResult) -> Result<()> {
+        // CAD-250: a nudge completes at its confirmed paste — no report
+        // is owed, and the held turn (if any) is untouched.
+        if message.is_nudge() {
+            let delivered = json!({"status": "completed", "via": "pty_nudge",
+                        "turn_id": result.turn_id});
+            self.store.finish(message, "completed", &delivered, None)?;
+            if !self.store.awaiting_reports(&message.alias)?.is_empty() {
+                let _ = self
+                    .store
+                    .set_agent_state_if(&message.alias, "busy", "idle");
+            }
+            self.wake();
+            return Ok(());
+        }
         // PTY endpoints report "submitted": the paste reached the
         // terminal, but only an explicit ack/result report may finish
         // the message — it stays `running` meanwhile.
@@ -2281,13 +2349,33 @@ impl Shared {
     fn rpc_send(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
+        let target = self.store.agent_opt(&alias)?;
         // A pty endpoint pastes literally and fails a body with control
         // characters at delivery; refuse it here so `send` never answers
         // `queued` for a message that cannot be delivered (CAD-218).
-        let pty = self
-            .store
-            .agent_opt(&alias)?
-            .is_some_and(|a| a.endpoint_kind == "pty");
+        let pty = target.as_ref().is_some_and(|a| a.endpoint_kind == "pty");
+        // CAD-250: `--nudge` — turnless steering for a live pty pane. The
+        // flag is the only way in: a caller-supplied `source: "nudge"`
+        // takes the same checks rather than bypassing them.
+        let nudge = params
+            .get("nudge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || optional_str(params, "source") == Some(store::NUDGE_SOURCE);
+        if nudge {
+            if let Some(agent) = target.as_ref().filter(|a| a.endpoint_kind != "pty") {
+                return Err(Error::rejected(format!(
+                    "--nudge only applies to pty endpoints — '{alias}' is {}/{}; \
+                     send it a normal message instead",
+                    agent.provider, agent.endpoint_kind
+                )));
+            }
+            if optional_str(params, "reply_to").is_some() {
+                return Err(Error::rejected(
+                    "--nudge owes no report, so it takes no reply_to",
+                ));
+            }
+        }
         if pty && crate::adapter::pty::has_control_chars(text) {
             return Err(Error::rejected(
                 "PTY messages must be a single line without control characters \
@@ -2297,9 +2385,10 @@ impl Shared {
         // An explicit reply_to always wins; absent one, a worker joined
         // to a group (params.upstream) reports results to its PM by
         // default. `enqueue` still validates the target.
+        // A nudge owes no report: no upstream default either.
         let reply_to = optional_str(params, "reply_to")
             .map(str::to_string)
-            .or_else(|| self.upstream_of(&alias));
+            .or_else(|| (!nudge).then(|| self.upstream_of(&alias)).flatten());
         let message = optional_str(params, "message")
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
@@ -2307,7 +2396,11 @@ impl Shared {
         // Identifier-charset only — internal sources like
         // `worker_result` contain characters this rejects, so the
         // internal routing contract cannot be forged through agent_send.
-        let source = optional_str(params, "source").unwrap_or("user");
+        let source = if nudge {
+            store::NUDGE_SOURCE
+        } else {
+            optional_str(params, "source").unwrap_or("user")
+        };
         proto::identifier(source, "Message source")?;
         // `send --task` attaches the delivery to a task — ad-hoc
         // PM↔worker follow-up inside a job's delivery record.

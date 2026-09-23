@@ -831,6 +831,15 @@ impl Message {
         )
     }
 
+    /// CAD-250: an operator/PM `send --nudge` — steering pasted into a
+    /// live pty pane without owning a turn. Fire-and-forget like a routed
+    /// notification: it passes the one-turn hold, never becomes `running`
+    /// or `awaiting_report`, owes no report, and its `unknown` (an
+    /// unconfirmed paste) never fences the agent.
+    pub fn is_nudge(&self) -> bool {
+        self.source == NUDGE_SOURCE
+    }
+
     /// CAD-250: a report-owing turn whose paste was delivered and that
     /// has no result report yet — `running` with the pty `submitted`
     /// marker (an ack keeps the marker). Derived, never stored: routed
@@ -888,6 +897,9 @@ impl Message {
         if self.awaiting_report() {
             j["awaiting_report"] = json!(true);
         }
+        if self.is_nudge() {
+            j["nudge"] = json!(true);
+        }
         j
     }
 }
@@ -908,9 +920,16 @@ pub fn report_timeout_secs(params: Option<&Value>) -> u64 {
         .unwrap_or(DEFAULT_REPORT_TIMEOUT_SECS)
 }
 
-/// The routed sources as an SQL list — must name exactly what
-/// [`Message::is_routed`] matches.
-const ROUTED_SOURCES_SQL: &str = "('worker_result','worker_notice','job_event')";
+/// The `source` of a `send --nudge` delivery ([`Message::is_nudge`]).
+pub const NUDGE_SOURCE: &str = "nudge";
+
+/// Sources that never own a turn — [`Message::is_routed`] plus
+/// [`Message::is_nudge`]; they pass the one-turn hold and never hold it.
+const TURNLESS_SOURCES_SQL: &str = "('worker_result','worker_notice','job_event','nudge')";
+
+/// The `unknown` rows that fence an agent: every one except a nudge's,
+/// whose unconfirmed paste belongs to no turn (CAD-250).
+const FENCING_UNKNOWN_SQL: &str = "state='unknown' AND source != 'nudge'";
 
 impl Event {
     pub fn to_json(&self) -> Value {
@@ -1485,6 +1504,46 @@ impl Store {
                     .push((*e).clone());
             }
         }
+        // CAD-250: a nudge is steering for the moment it was sent — it is
+        // never replayed into a later daemon's pane. One still `queued`
+        // is cancelled with a `nudge_cancelled` event; one caught
+        // mid-paste (`submitting`) may have landed, so it goes `unknown`
+        // with the same event — an unknown that fences nothing.
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id, alias, state FROM messages
+                 WHERE source='nudge' AND state IN ('queued','submitting')",
+            )?;
+            let stale = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            for (id, alias, state) in stale {
+                let (to, via) = if state == "queued" {
+                    ("cancelled", "restart_cancelled")
+                } else {
+                    ("unknown", "restart_unconfirmed")
+                };
+                let result = json!({"status": to, "via": via,
+                                    "reason": "daemon restarted — a nudge is never replayed"});
+                tx.execute(
+                    "UPDATE messages SET state=?,result=?,completed=? WHERE id=?",
+                    params![to, result.to_string(), now(), id],
+                )?;
+                Self::event(
+                    &tx,
+                    &alias,
+                    "nudge_cancelled",
+                    json!({"message": id, "was": state, "state": to}),
+                )?;
+            }
+        }
         // Dynamic NOT IN for the protected message ids — one UPDATE
         // either way, never string-interpolated values.
         let kept_ids: Vec<String> = kept.iter().map(|e| e.message_id.clone()).collect();
@@ -1574,8 +1633,10 @@ impl Store {
             Some(_) => {
                 let unknown: i64 = tx
                     .query_row(
-                        "SELECT COUNT(*) FROM messages
-                         WHERE alias=? AND state='unknown'",
+                        &format!(
+                            "SELECT COUNT(*) FROM messages
+                             WHERE alias=? AND {FENCING_UNKNOWN_SQL}"
+                        ),
                         [&e.alias],
                         |r| r.get(0),
                     )
@@ -1657,7 +1718,7 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         let mut stmt = tx.prepare(
             "SELECT alias, id, turn_id, state FROM messages
-             WHERE state IN ('running','submitting')",
+             WHERE state IN ('running','submitting') AND source != 'nudge'",
         )?;
         let inflight = stmt
             .query_map([], |r| {
@@ -2458,14 +2519,14 @@ impl Store {
         }
         // CAD-250: the actor serializes report-owing turns. While one is
         // `running` (delivered, its report still owed), only routed
-        // notifications — fire-and-forget, complete at paste — may be
-        // claimed; every other delivery stays `queued`, never refused,
+        // notifications and nudges — fire-and-forget, complete at paste —
+        // may be claimed; every other delivery stays `queued`, never refused,
         // until that turn is reported, reconciled or bounded to
         // `unknown`.
         let holding: bool = tx.query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM messages WHERE alias=?
-                 AND state='running' AND source NOT IN {ROUTED_SOURCES_SQL})"
+                 AND state='running' AND source NOT IN {TURNLESS_SOURCES_SQL})"
             ),
             [alias],
             |r| r.get(0),
@@ -2473,7 +2534,7 @@ impl Store {
         let next_sql = if holding {
             format!(
                 "SELECT * FROM messages WHERE alias=? AND state='queued'
-                 AND source IN {ROUTED_SOURCES_SQL} ORDER BY seq LIMIT 1"
+                 AND source IN {TURNLESS_SOURCES_SQL} ORDER BY seq LIMIT 1"
             )
         } else {
             "SELECT * FROM messages WHERE alias=? AND state='queued'
@@ -2987,7 +3048,7 @@ impl Store {
     pub fn has_unknown(&self, alias: &str) -> Result<bool> {
         let conn = self.conn();
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE alias=? AND state='unknown'",
+            &format!("SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL}"),
             [alias],
             |r| r.get(0),
         )?;
@@ -3004,8 +3065,9 @@ impl Store {
     pub fn preferred_unknown_error(&self, alias: &str) -> Result<Option<String>> {
         let conn = self.conn();
         match conn.query_row(
-            "SELECT error FROM messages
-             WHERE alias=? AND state='unknown' AND error IS NOT NULL
+            &format!(
+                "SELECT error FROM messages
+             WHERE alias=? AND {FENCING_UNKNOWN_SQL} AND error IS NOT NULL
              ORDER BY
                CASE error
                  WHEN 'Uncertain provider outcome requires review' THEN 3
@@ -3014,7 +3076,8 @@ impl Store {
                  ELSE 0
                END,
                seq DESC
-             LIMIT 1",
+             LIMIT 1"
+            ),
             [alias],
             |row| row.get(0),
         ) {
@@ -3024,12 +3087,14 @@ impl Store {
         }
     }
 
-    /// Ids of the alias's `unknown` messages, oldest first — what
-    /// `agent unfence` reconciles in one call.
+    /// Ids of the alias's fencing `unknown` messages, oldest first — what
+    /// `agent unfence` reconciles in one call. An unconfirmed nudge is
+    /// `unknown` too but fences nothing, so it is not listed (CAD-250).
     pub fn unknown_messages(&self, alias: &str) -> Result<Vec<String>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT id FROM messages WHERE alias=? AND state='unknown' ORDER BY seq")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL} ORDER BY seq"
+        ))?;
         let ids = stmt
             .query_map([alias], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -3120,11 +3185,12 @@ impl Store {
         // operator stop: a restart must not relaunch a worker the
         // operator never resumed. `agent resume` is the next move.
         let remaining: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM messages WHERE alias=? AND state='unknown'",
+            &format!("SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL}"),
             [&message.alias],
             |r| r.get(0),
         )?;
-        if remaining == 0 {
+        // A nudge's unknown never fenced, so reconciling it lifts nothing.
+        if remaining == 0 && !message.is_nudge() {
             tx.execute(
                 "UPDATE agents SET state='stopped',enabled=0,updated=? \
                  WHERE alias=? AND state='attention'",
@@ -3934,7 +4000,7 @@ impl Store {
         Ok(conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'
-                 AND source NOT IN {ROUTED_SOURCES_SQL}"
+                 AND source NOT IN {TURNLESS_SOURCES_SQL}"
             ),
             [alias],
             |r| r.get(0),
@@ -6699,6 +6765,56 @@ mod tests {
             .unwrap());
         assert!(!s.expire_awaiting_report("m2", None, "late").unwrap());
         assert_eq!(s.message("m2").unwrap().unwrap().state, "completed");
+    }
+
+    /// CAD-250 nudges: claimed past a held turn, never holding it; an
+    /// unconfirmed nudge's `unknown` fences nothing; a nudge still queued
+    /// at restart is cancelled with an event, never replayed.
+    #[test]
+    fn nudge_passes_the_hold_never_fences_and_never_replays() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "task", None, "t1", "user").unwrap();
+        s.enqueue("w1", "next", None, "t2", "user").unwrap();
+        s.enqueue("w1", "steer", None, "n1", NUDGE_SOURCE).unwrap();
+        s.enqueue("w1", "steer again", None, "n2", NUDGE_SOURCE)
+            .unwrap();
+        let Take::Message(t1) = s.take_queued("w1").unwrap() else {
+            panic!("t1 must be claimed");
+        };
+        s.mark_running(&t1.id, "pty-g-t1").unwrap();
+        let Take::Message(n1) = s.take_queued("w1").unwrap() else {
+            panic!("the nudge must pass the held turn");
+        };
+        assert_eq!(n1.id, "n1");
+        assert!(n1.is_nudge() && n1.to_json()["nudge"] == true);
+        // An unconfirmed nudge: unknown, yet no fence and no unfence item.
+        s.finish(
+            &n1,
+            "unknown",
+            &json!({"status": "unknown"}),
+            Some("unconfirmed"),
+        )
+        .unwrap();
+        assert!(!s.has_unknown("w1").unwrap());
+        assert!(s.unknown_messages("w1").unwrap().is_empty());
+        assert_eq!(s.message("t2").unwrap().unwrap().state, "queued");
+        // Restart: n2 (still queued) is cancelled with an event; t2 stays.
+        drop(s);
+        let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        let n2 = s.message("n2").unwrap().unwrap();
+        assert_eq!(n2.state, "cancelled");
+        assert_eq!(n2.result.as_ref().unwrap()["via"], "restart_cancelled");
+        assert_eq!(s.message("t2").unwrap().unwrap().state, "queued");
+        assert!(s
+            .events("w1", 0, 500)
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "nudge_cancelled" && e.payload["message"] == "n2"));
+        // The crash path fences the held turn — and only it: the
+        // unconfirmed nudge is still no unfence item.
+        assert_eq!(s.unknown_messages("w1").unwrap(), ["t1"]);
     }
 
     #[test]

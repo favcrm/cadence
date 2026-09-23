@@ -885,7 +885,7 @@ payload at read time — nothing is stored; `cadence overview [--json]
 | 20 | `approval_menu` — a sampled pty approval menu | team | the agent's PM (`params.upstream`) | `cadence agent answer <a> <choice>` |
 | 30 | `fenced` — agent in `attention` | team | the agent's PM | `cadence agent unfence <a>` |
 | 40 | `stalled` — turn silent past the fence threshold | team | the agent's PM | `cadence agent show <a>` |
-| 40 | `silent_end` — turn ended at an idle pane, never reported | team | the agent's PM | `cadence agent attach <a>` (a follow-up send queues behind the unreported turn — CAD-250) |
+| 40 | `silent_end` — turn ended at an idle pane, never reported | team | the agent's PM | `cadence send <a> --nudge --text "finish and report …"` (a nudge owns no turn, so it pastes past the unreported one; `cadence agent attach <a>` is the manual alternative — CAD-250) |
 | 40 | `awaiting_report` — a delivered pty turn still owes its report while other turns queue behind it (CAD-250) | team | the agent's PM | `cadence agent show <a>` |
 | 50 | `drift` — merged commits not running while every pane is idle | dependency | — | `cadence daemon restart --when-idle --ui` |
 | 60 | `pr_no_verdict` — open PR with no `qa-verdict` status | team | the issue owner | `gh pr view <n> --repo <slug>` |

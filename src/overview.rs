@@ -152,12 +152,13 @@ pub fn cmd_agent_answer(alias: &str) -> String {
     format!("cadence agent answer {alias} <choice>")
 }
 
-/// The recovery for a silently ended turn: attach to the pane and ask
-/// the worker to report. A follow-up `send` would queue behind the
-/// unreported turn — the actor holds one report-owing turn at a time
-/// (CAD-250) — so the nudge goes through the terminal itself.
-pub fn cmd_agent_attach(alias: &str) -> String {
-    format!("cadence agent attach {alias}")
+/// The recovery for a silently ended turn: a nudge asking the worker to
+/// finish and report. A plain follow-up `send` would queue behind the
+/// unreported turn — the actor holds one report-owing turn at a time —
+/// while a nudge owns no turn and pastes into the idle pane (CAD-250).
+/// `cadence agent attach <alias>` is the manual alternative.
+pub fn cmd_send_nudge(alias: &str) -> String {
+    format!("cadence send {alias} --nudge --text \"finish and report …\"")
 }
 
 pub fn cmd_inbox(alias: &str) -> String {
@@ -2103,7 +2104,7 @@ fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<It
                 "silent_end",
                 &format!("agent {alias} turn ended at an idle pane — never reported"),
                 a["ended_secs"].as_f64().unwrap_or(age as f64) as i64,
-                &cmd_agent_attach(alias),
+                &cmd_send_nudge(alias),
             )
             .since(secs_ago("ended_secs")),
         );
@@ -2891,7 +2892,7 @@ mod tests {
             .map(|c| c["cause"].as_str().unwrap())
             .collect();
         assert_eq!(causes, ["stalled", "silent_end"]);
-        assert_eq!(w1["causes"][1]["command"], cmd_agent_attach("w1"));
+        assert_eq!(w1["causes"][1]["command"], cmd_send_nudge("w1"));
         assert_eq!(w1["project"], "cadence");
         // A lone row still carries its one cause.
         assert_eq!(merged[1].json["causes"].as_array().unwrap().len(), 1);

@@ -436,6 +436,12 @@ enum Commands {
         /// Force the ready claim past a busy probe verdict.
         #[arg(long, requires = "ready")]
         force: bool,
+        /// Mid-turn steering (pty only): paste into the live pane without
+        /// owning a turn — passes the one-running-turn hold, owes no
+        /// report, completes when the paste is confirmed, never replayed
+        /// after a daemon restart. Takes no `--reply-to`.
+        #[arg(long, conflicts_with_all = ["ready", "reply_to"])]
+        nudge: bool,
     },
     /// One-step issue dispatch: `issue start` (idempotent, owner =
     /// the worker) then exactly one templated kickoff message, a
@@ -1801,6 +1807,12 @@ enum MessageAction {
         /// Force the ready claim past a busy probe verdict.
         #[arg(long, requires = "ready")]
         force: bool,
+        /// Mid-turn steering (pty only): paste into the live pane without
+        /// owning a turn — passes the one-running-turn hold, owes no
+        /// report, completes when the paste is confirmed, never replayed
+        /// after a daemon restart. Takes no `--reply-to`.
+        #[arg(long, conflicts_with_all = ["ready", "reply_to"])]
+        nudge: bool,
     },
     /// Send and wait for the turn's terminal state.
     Ask {
@@ -2012,6 +2024,7 @@ fn send_message(
     ready: bool,
     force: bool,
     task: Option<String>,
+    nudge: bool,
 ) -> Result<(Value, bool)> {
     let body = read_body(text, file)?;
     // --ready IS the operator's explicit claim — and the claim probes
@@ -2038,7 +2051,7 @@ fn send_message(
         "agent_send",
         json!({"alias": alias, "text": body,
                "message": message, "reply_to": reply_to,
-               "task": task}),
+               "task": task, "nudge": nudge}),
     )?;
     // CAD-251: a stale mailbox still accepted the message — say so on
     // stderr so stdout stays the JSON receipt.
@@ -4499,11 +4512,12 @@ fn run() -> Result<i32> {
             task,
             ready,
             force,
+            nudge,
         } => {
             // Identical path to `message send` — the verb form is sugar,
             // not a second implementation.
             let (result, _) = send_message(
-                &state_dir, &alias, text, file, message, reply_to, ready, force, task,
+                &state_dir, &alias, text, file, message, reply_to, ready, force, task, nudge,
             )?;
             print_json(&result);
             Ok(0)
@@ -4594,8 +4608,9 @@ fn run() -> Result<i32> {
                     task,
                     ready,
                     force,
+                    nudge,
                 } => send_message(
-                    &state_dir, &alias, text, file, message, reply_to, ready, force, task,
+                    &state_dir, &alias, text, file, message, reply_to, ready, force, task, nudge,
                 )?,
                 MessageAction::Ack {
                     message,

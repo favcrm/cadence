@@ -43,7 +43,7 @@ Error kinds:
 | `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown, inbox?}` — `unknown` counts unreconciled unknowns fencing the agent; `agent.awaiting_report` (also on `agent_list` rows) is `{message, turn_id, task_id, since_secs, acked, report_timeout_secs, remaining_secs, count, queued_behind}` while a delivered pty turn awaits its report (null otherwise; `remaining_secs` null when the bound is disabled), and that message's row carries `awaiting_report: true`; passive `inbox` evidence includes queued count, oldest age, last receipt/progress, and `semantic_completion:"external_consumer_required"`; it is never a drain or completion claim. `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_effective`, `model_source` (`configured` or `provider default`), `effort_configured`, `effort_reported`, `effort_effective` and legacy `effort` — also on every `agent_list` row. `team_role`, `model_lookup_role`, and `model_selection` (`source`, `lookup_role`, `revision`, `model`) record how a launch model was chosen. Unsupported endpoints leave `model_selection` null. Existing rows without stored provenance are labeled `legacy_configured` or `legacy_provider_default` at read time |
 | `model_defaults_get` | — | `{revision, config, providers, roles}` — daemon-wide provider baselines and team-role overrides. Suggestions are previously observed model ids, not a catalog. Does not start provider processes |
 | `model_defaults_set` | `document` (raw JSON string `{expected_revision, config}`), `attribution?` | the same snapshot as get, after an atomic revision bump. Mismatched `expected_revision` is `kind:"conflict"`, `code:"revision_conflict"`, with `revision` set to the current value and no write. Omitted attribution is transport `local` / actor `local`; a present attribution is transport `board` |
-| `agent_send` | `alias, text, message?, reply_to?, source?, task?` | `{message,state,duplicate,warning?}` — `task` attaches the delivery to a task for indexing; `warning` names a stale inbox target (queued anyway — see inbox endpoints) |
+| `agent_send` | `alias, text, message?, reply_to?, source?, task?, nudge?` | `{message,state,duplicate,warning?}` — `task` attaches the delivery to a task for indexing; `nudge: true` (CLI `send --nudge` / `message send --nudge`, pty only, no `reply_to`, not with `--ready`) records a turnless `source: "nudge"` delivery — see the CAD-250 section; `warning` names a stale inbox target (queued anyway — see inbox endpoints) |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after?, wait(<=30), tail?` | `{events:[Event], cursor, has_older}` — `tail:true` returns the newest page (50) in ascending order instead of paging forward from `after` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
@@ -736,10 +736,33 @@ turns, and the store says so: while an agent holds a `running` message
 that is not a routed notification, its actor claims only routed
 notifications (`worker_result`, `worker_notice`, `job_event` —
 fire-and-forget, complete at paste). Every other delivery — a second
-task, a `--task` follow-up, a `send --ready` nudge — is accepted
+task, a `--task` follow-up, a `send --ready` message — is accepted
 `queued` and stays there, never refused and never pasted, until the
 held turn is reported, reconciled or bounded to `unknown`; a `message
-result` wakes the actor so the next one is claimed at once. The held
+result` wakes the actor so the next one is claimed at once.
+
+**Nudges — mid-turn steering.** `cadence send <alias> --nudge --text
+…` (or `message send --nudge`, RPC `agent_send nudge: true`) is the
+one way to reach a pane that holds a turn. A nudge is a durable
+message with `source: "nudge"` (`nudge: true` on its row) that owns no
+turn: like a routed notification it passes the hold and needs no
+ready claim, but it still waits for the screen probe to read the pane
+idle and menu-free. It never becomes `running` or `awaiting_report`,
+owes no report, takes no `reply_to` (and no upstream default), and
+completes at its confirmed paste (`result.via: "pty_nudge"`). An
+unconfirmed paste ends `unknown` with a `nudge_unconfirmed` event —
+never retried, and an unknown nudge fences nothing (it is excluded
+from the agent's `unknown` count and from `agent unfence`; reconcile
+it with `message reconcile` if you want it closed). Delivered at most
+once and never replayed: a nudge still `queued` when the daemon stops
+is `cancelled` at the next start (`result.via: "restart_cancelled"`),
+one caught mid-paste goes non-fencing `unknown`, each with a
+`nudge_cancelled` event; nudges are never recorded for hot-restart
+adoption. pty endpoints only — a managed, inbox or cloud agent refuses
+`--nudge` naming its provider/kind; `--nudge` with `--ready` is a CLI
+error; the body follows the pty rules (one line, no control
+characters, no forbidden leading character). A nudge caller needs no
+authority a plain `send` lacks. The held
 turn is **`awaiting_report`** — derived, never stored: `running` with
 the `submitted` marker (an ack keeps it). `agent_show`/`agent_list`
 carry the `awaiting_report` block (wait, bound, remaining, queued
@@ -1037,7 +1060,9 @@ provider outcome needs human review; the actor will not relaunch itself.
 ## Messages
 
 States: `queued → submitting → running → completed | failed | interrupted
-| unknown | cancelled`. `awaiting_report` is a derived phase of
+| unknown | cancelled`. A `source: "nudge"` delivery skips `running`:
+`queued → submitting → completed | unknown | failed | cancelled`, and
+its `unknown` fences nothing (CAD-250). `awaiting_report` is a derived phase of
 `running` — a delivered pty turn whose result report is still owed —
 visible in the views and bounded by `report_timeout_secs` (see the pty
 section); it is never a stored state. `unknown` is durable and fences its actor. Any ambiguous
@@ -1244,10 +1269,12 @@ fences, cancels, or replays anything it observes.
   `silent_ended` + `ended_secs` (the idle streak's age), `status`
   renders `ended?: <age>` beside an idle pane on a running message,
   and the overview needs-me row (`kind: silent_end`) gives the remedy
-  `cadence agent attach <alias>` — ask the worker in its own pane to
-  report. A follow-up `send` would queue behind the unreported turn
-  (one report-owing turn per actor, CAD-250); left alone, the turn goes
-  `unknown` when `report_timeout_secs` runs out.
+  `cadence send <alias> --nudge --text "finish and report …"` — a
+  turnless nudge that pastes past the unreported turn (a plain
+  follow-up `send` would queue behind it, one report-owing turn per
+  actor, CAD-250); `cadence agent attach <alias>` is the manual
+  alternative. Left alone, the turn goes `unknown` when
+  `report_timeout_secs` runs out.
 - **Budget resolution.** `jobs.stall_secs` (set at `job new
   --stall-secs`) wins for task-attached deliveries; otherwise the
   agent's `params.stall_secs` (launch param or live `agent set alias
