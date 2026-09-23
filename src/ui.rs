@@ -547,16 +547,24 @@ enum StaticAnswer {
 
 /// Whether a path is a client-side route (ui/src/lib/router.ts: `/`,
 /// `/projects/:slug`, `/agents/:alias`, `/setup`, `/settings`, …) that the
-/// SPA shell answers so deep links and refreshes work. A path that names a
-/// file — anything under `/assets/`, or a last segment with a dot (project
-/// keys and aliases have none) — is not: a missing file must be a 404, not
-/// HTML the browser would try to run as a script or stylesheet. `/api` is
-/// never a route; its 404 is JSON (answered before the static branch).
+/// SPA shell answers so deep links and refreshes work. The two routes with
+/// a parameter always are — agent aliases may contain dots (`valid_alias`
+/// in ui/threads.rs allows `[A-Za-z0-9._-]`), project keys never do. Any
+/// other path that names a file — under `/assets/`, or a last segment with
+/// a dot — is not: a missing file must be a 404, not HTML the browser would
+/// try to run as a script or stylesheet. `/api` is never a route; its 404
+/// is JSON (answered before the static branch).
 fn is_client_route(path: &str) -> bool {
     if path == "/api" || path.starts_with("/api/") || path.starts_with("/assets/") {
         return false;
     }
-    !path.rsplit('/').next().unwrap_or_default().contains('.')
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let param_route = match parts.as_slice() {
+        ["agents", alias] => !alias.is_empty(),
+        ["projects", slug] | ["projects", slug, "context"] => !slug.is_empty(),
+        _ => false,
+    };
+    param_route || !path.rsplit('/').next().unwrap_or_default().contains('.')
 }
 
 /// A build file when one matches; else the SPA shell for a client route.
@@ -3448,6 +3456,7 @@ mod tests {
             "/settings",
             "/settings/memory",
             "/unknown-page",
+            "/agents/cc.worker-1",
         ] {
             match answer(route) {
                 StaticAnswer::File(name, bytes) => {
@@ -3469,7 +3478,13 @@ mod tests {
             StaticAnswer::File(_, bytes) => assert_eq!(bytes, b"<svg/>"),
             _ => panic!("favicon not served"),
         }
-        for missing in ["/assets/gone.js", "/assets/chunk", "/gone.css", "/projects/x/logo.png"] {
+        for missing in [
+            "/assets/gone.js",
+            "/assets/chunk",
+            "/gone.css",
+            "/projects/x/logo.png",
+            "/agents/a/b.js",
+        ] {
             assert!(matches!(answer(missing), StaticAnswer::Missing), "{missing}");
         }
         // /api never falls through to the shell, even with a file of that name.
