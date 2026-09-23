@@ -1401,7 +1401,7 @@ issued, then the enrollment id. A release runs as the root's
 enrollment whose id matches the hold, so the old holder can still give
 back a hold taken before the supersession; the exact-holder rule is
 unchanged. A shared root never makes restart reject the state file,
-but a revoked and a live enrollment on the same root must share an
+but every enrollment on the same root must share an
 owner — across owners the pair is invalid (strict blocked, file kept
 byte-identical as evidence), and the daemon never enrolls one exact
 process for a second owner.
