@@ -543,6 +543,50 @@ fn fetch_ref(repo: &Path, src: &str, dst: &str, secs: u64) -> Result<String> {
     )
 }
 
+/// `head` as it would land on `base`: a commit object (no ref) whose tree
+/// is the clean merge of the two, or `None` when they conflict. Comparing
+/// two PRs as landed puts the current base on both sides, so what the
+/// base changed between their cut points cannot read as an overlap, and
+/// git's own rename detection sees a moved file on both sides (CAD-277).
+fn landed(repo: &Path, base: &str, head: &str, secs: u64) -> Result<Option<String>> {
+    let mt = git_status(repo, &["merge-tree", "--write-tree", base, head], secs)?;
+    match mt.status {
+        Some(0) => {}
+        Some(1) if !mt.timed_out => return Ok(None),
+        _ => {
+            return Err(Error::internal(format!(
+                "merge-tree {base} {head}: {}",
+                if mt.timed_out {
+                    "timed out".to_string()
+                } else {
+                    format!("exited {:?}: {}", mt.status, mt.stderr.trim())
+                }
+            )))
+        }
+    }
+    let tree = mt.stdout.lines().next().unwrap_or("").trim().to_string();
+    // Explicit identity: a review host or CI runner may have none.
+    let commit = git(
+        repo,
+        &[
+            "-c",
+            "user.name=cadence-review",
+            "-c",
+            "user.email=cadence-review@localhost",
+            "commit-tree",
+            &tree,
+            "-p",
+            base,
+            "-p",
+            head,
+            "-m",
+            "cadence review: as landed",
+        ],
+        secs,
+    )?;
+    Ok(Some(commit))
+}
+
 /// The review's private ref namespace, `refs/cadence/review/<pr>/`,
 /// deleted when the run ends however it ends.
 struct ReviewRefs {
@@ -2134,8 +2178,17 @@ pub fn run(opts: &Options) -> Result<i32> {
         .map(Step::to_json)
         .collect::<Vec<_>>());
 
-    // Pairwise conflicts with the other open PRs (files only).
+    // Pairwise conflicts with the other open PRs (files only), compared
+    // as both would land on the current base: each PR is merged onto the
+    // base first, then the two results are merged with the base as their
+    // merge-base. A head-vs-head merge-tree instead "conflicted" on what
+    // the base changed between two PRs' cut points (CAD-277). A PR that
+    // does not merge into the base cannot be compared that way; it is
+    // listed as not assessed, never counted as a conflict or dropped.
     let mut pr_conflicts = Vec::new();
+    let mut not_assessed = Vec::new();
+    report["open_pr_conflicts_base"] = json!(base_sha);
+    let mine = landed(&root, &base_sha, &head_sha, t.git_secs);
     let open = gh(
         &root,
         &[
@@ -2175,14 +2228,42 @@ pub fn run(opts: &Options) -> Result<i32> {
                         "error": "could not fetch head"}));
                     continue;
                 };
+                let pair = mine.as_ref().map_err(|e| e.to_string()).and_then(|m| {
+                    landed(&root, &base_sha, &theirs, t.git_secs)
+                        .map(|t| (m.clone(), t))
+                        .map_err(|e| e.to_string())
+                });
+                let (mine_landed, theirs_landed) = match pair {
+                    Ok((Some(m), Some(t))) => (m, t),
+                    Ok((None, _)) => {
+                        // This PR itself does not merge into the base —
+                        // already a blocking reason; no pair can be judged.
+                        not_assessed.push(json!({"pr": num, "title": other["title"],
+                            "reason": "this PR does not merge into the current base"}));
+                        continue;
+                    }
+                    Ok((_, None)) => {
+                        not_assessed.push(json!({"pr": num, "title": other["title"],
+                            "reason": "it does not merge into the current base"}));
+                        continue;
+                    }
+                    Err(e) => {
+                        pr_conflicts.push(json!({"pr": num,
+                            "title": other["title"],
+                            "error": format!("as-landed scan failed: {e}")}));
+                        continue;
+                    }
+                };
+                let merge_base = format!("--merge-base={base_sha}");
                 let mt = git_status(
                     &root,
                     &[
                         "merge-tree",
                         "--write-tree",
                         "--name-only",
-                        &head_sha,
-                        &theirs,
+                        &merge_base,
+                        &mine_landed,
+                        &theirs_landed,
                     ],
                     t.git_secs,
                 )?;
@@ -2220,6 +2301,7 @@ pub fn run(opts: &Options) -> Result<i32> {
         }
     }
     report["open_pr_conflicts"] = json!(pr_conflicts);
+    report["open_pr_not_assessed"] = json!(not_assessed);
 
     // Suggested verdict — the reviewer still does the hands-on check;
     // `pass` only means the mechanical part found nothing.
@@ -2731,6 +2813,12 @@ fn render_markdown(r: &Value) -> String {
         .cloned()
         .unwrap_or_default();
     md.push_str("## Other open PRs\n\n");
+    if let Some(base) = r["open_pr_conflicts_base"].as_str() {
+        md.push_str(&format!(
+            "Compared as both PRs would land on base `{}`.\n\n",
+            &base[..base.len().min(12)]
+        ));
+    }
     if let Some(err) = r["open_pr_conflicts_error"].as_str() {
         md.push_str(&format!("scan failed: {err}\n\n"));
     } else if conflicts.is_empty() {
@@ -2756,6 +2844,22 @@ fn render_markdown(r: &Value) -> String {
                     c["error"].as_str().unwrap_or("no data")
                 ));
             }
+        }
+        md.push('\n');
+    }
+    let skipped = r["open_pr_not_assessed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !skipped.is_empty() {
+        md.push_str("Not assessed (no clean as-landed tree to compare):\n\n");
+        for c in &skipped {
+            md.push_str(&format!(
+                "- #{} {} — {}\n",
+                c["pr"].as_i64().unwrap_or(0),
+                c["title"].as_str().unwrap_or(""),
+                c["reason"].as_str().unwrap_or("")
+            ));
         }
         md.push('\n');
     }

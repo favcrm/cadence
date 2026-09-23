@@ -19834,6 +19834,139 @@ fn review_verb_resolves_its_own_refs_despite_a_concurrent_fetch() {
     assert!(left.is_empty(), "review refs left behind: {left}");
 }
 
+/// CAD-277: two PRs cut from different base commits must not "overlap"
+/// on a file only the base changed between the cuts. PR 10 was cut from
+/// base A and changes shared2.txt; main then rewrote shared2.txt (B). A
+/// PR 11 cut from B that changes an unrelated file carries B's
+/// shared2.txt, so a head-vs-head merge-tree conflicts there — but
+/// neither PR 11 nor that line of history is PR 11's change.
+#[test]
+fn review_verb_ignores_base_drift_between_pr_cut_points() {
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    review_git(&f.repo, &["checkout", "-qb", "pr-11", "main"]);
+    std::fs::write(f.repo.join("eleven.txt"), "eleven").unwrap();
+    review_git(&f.repo, &["add", "-A"]);
+    review_git(&f.repo, &["commit", "-qm", "pr11"]);
+    let head11 = review_git_sha(&f.repo, &["rev-parse", "HEAD"]);
+    review_git(&f.repo, &["push", "-q", "origin", "HEAD:refs/pull/11/head"]);
+    review_git(&f.repo, &["checkout", "-q", "main"]);
+    std::fs::write(
+        f.fakedir.join("pr-view-11.json"),
+        json!({"number": 11, "title": "PR 11", "url": "https://example/11",
+               "headRefName": "pr-11", "headRefOid": head11,
+               "baseRefName": "main", "files": [{"path": "eleven.txt"}],
+               "state": "OPEN"})
+        .to_string(),
+    )
+    .unwrap();
+    let list: Value =
+        serde_json::from_str(&std::fs::read_to_string(f.fakedir.join("pr-list.json")).unwrap())
+            .unwrap();
+    let mut list = list.as_array().unwrap().clone();
+    list.push(json!({"number": 11, "title": "PR 11", "headRefOid": head11}));
+    std::fs::write(f.fakedir.join("pr-list.json"), json!(list).to_string()).unwrap();
+    let main_sha = review_git_sha(&f.repo, &["rev-parse", "main"]);
+
+    let _ = review_cmd(&f).arg("11").output().unwrap();
+    let r = review_report(&f, 11);
+    let conflicts = r["open_pr_conflicts"].as_array().unwrap();
+    assert!(
+        !conflicts.iter().any(|c| c["pr"] == 10),
+        "base drift reported as an overlap with PR 10: {conflicts:?}"
+    );
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    // PR 10 itself does not merge into the moved base, so there is no
+    // as-landed tree to compare: listed, never dropped or counted.
+    let skipped = r["open_pr_not_assessed"].as_array().unwrap();
+    assert!(
+        skipped.iter().any(|c| c["pr"] == 10
+            && c["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("does not merge")),
+        "{skipped:?}"
+    );
+    assert_eq!(r["open_pr_conflicts_base"], json!(main_sha));
+    let md = std::fs::read_to_string(r["report_md"].as_str().unwrap()).unwrap();
+    assert!(md.contains("would land on base"), "{md}");
+    assert!(md.contains("Not assessed"), "{md}");
+}
+
+/// CAD-277 QA finding: a conflict that involves a rename must still be
+/// reported. PR 12 moves big.txt to moved.txt and edits line 5; PR 13
+/// edits line 5 of big.txt. Comparing both as landed on the base lets
+/// git's rename detection pair the two edits.
+#[test]
+fn review_verb_reports_a_rename_overlap() {
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    let lines: Vec<String> = (1..=10).map(|n| format!("line {n}")).collect();
+    let body = |five: &str| {
+        let mut v = lines.clone();
+        v[4] = five.to_string();
+        v.join("\n") + "\n"
+    };
+    // The file lives on the current base, so both PRs are cut after it.
+    review_git(&f.repo, &["checkout", "-q", "main"]);
+    std::fs::write(f.repo.join("big.txt"), body("line 5")).unwrap();
+    review_git(&f.repo, &["add", "-A"]);
+    review_git(&f.repo, &["commit", "-qm", "add big.txt"]);
+    review_git(&f.repo, &["push", "-q", "origin", "main"]);
+    let push_pr = |n: i64, branch: &str, edit: &dyn Fn()| -> String {
+        review_git(&f.repo, &["checkout", "-qb", branch, "main"]);
+        edit();
+        review_git(&f.repo, &["add", "-A"]);
+        review_git(&f.repo, &["commit", "-qm", branch]);
+        let head = review_git_sha(&f.repo, &["rev-parse", "HEAD"]);
+        review_git(
+            &f.repo,
+            &["push", "-q", "origin", &format!("HEAD:refs/pull/{n}/head")],
+        );
+        review_git(&f.repo, &["checkout", "-q", "main"]);
+        head
+    };
+    let head12 = push_pr(12, "pr-12", &|| {
+        review_git(&f.repo, &["mv", "big.txt", "moved.txt"]);
+        std::fs::write(f.repo.join("moved.txt"), body("line 5 by pr12")).unwrap();
+    });
+    let head13 = push_pr(13, "pr-13", &|| {
+        std::fs::write(f.repo.join("big.txt"), body("line 5 by pr13")).unwrap();
+    });
+    std::fs::write(
+        f.fakedir.join("pr-view-13.json"),
+        json!({"number": 13, "title": "PR 13", "url": "https://example/13",
+               "headRefName": "pr-13", "headRefOid": head13,
+               "baseRefName": "main", "files": [{"path": "big.txt"}],
+               "state": "OPEN"})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        f.fakedir.join("pr-list.json"),
+        json!([
+            {"number": 12, "title": "PR 12", "headRefOid": head12},
+            {"number": 13, "title": "PR 13", "headRefOid": head13},
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let _ = review_cmd(&f).arg("13").output().unwrap();
+    let r = review_report(&f, 13);
+    let conflicts = r["open_pr_conflicts"].as_array().unwrap();
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "rename overlap was dropped: {conflicts:?}"
+    );
+    assert_eq!(conflicts[0]["pr"], 12);
+    assert!(
+        !conflicts[0]["files"].as_array().unwrap().is_empty(),
+        "{conflicts:?}"
+    );
+}
+
 #[test]
 fn review_verb_merge_conflict_blocks() {
     let base = TempDir::new().unwrap();
