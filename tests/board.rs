@@ -6584,7 +6584,8 @@ fn ui_tailscale_start_shares_and_persists() {
     assert_eq!(out["tailnet_url"], format!("https://{TS_DNS}:9450"));
 
     // `ui tailscale status` prints the URL, the live mapping, and the
-    // identity probe resolving to `<login> (tailscale)`.
+    // identity probe: a local process posing as the proxy is ignored
+    // (CAD-336) — the probe is exactly the forgery it must refuse.
     let (ok, text) = cli_raw_env(
         pm.path(),
         state.path(),
@@ -6594,7 +6595,11 @@ fn ui_tailscale_start_shares_and_persists() {
     assert!(ok, "{text}");
     assert!(text.contains(&format!("https://{TS_DNS}:9450")), "{text}");
     assert!(text.contains("(live)"), "{text}");
-    assert!(text.contains("(tailscale)"), "{text}");
+    assert!(
+        text.contains("identity: local forged login ignored (operator (ui); refused by check"),
+        "{text}"
+    );
+    assert!(!text.contains("FORGEABLE"), "{text}");
 
     // Second start is idempotent: no new mapping, board restarted.
     let (ok, out) = cli_env(
@@ -6897,28 +6902,146 @@ fn ts_write_headers(origin: &str, login: &str) -> Vec<String> {
     ]
 }
 
-fn tailnet_opts() -> impl Fn(&mut ui::ServeOpts) {
-    |o| {
+/// Tailscale sharing armed, with the tailnet proof reading tailscaled's
+/// LocalAPI at `socket` (a [`fake_localapi`], or a path with nothing).
+fn tailnet_opts(socket: &Path) -> impl Fn(&mut ui::ServeOpts) + Send + Sync + 'static {
+    let socket = socket.to_path_buf();
+    move |o| {
         o.tailnet = Some((TS_DNS.to_string(), 9450));
         o.allow_hosts = vec![TS_DNS.to_string(), format!("{TS_DNS}:9450")];
         o.allow_origins = vec![format!("https://{TS_DNS}:9450")];
+        o.tailscaled_socket = Some(socket.clone());
     }
 }
 
+/// A fake tailscaled LocalAPI (CAD-336): a unix socket, owned by this
+/// test's uid, answering `/localapi/v0/status` with `status.json`,
+/// `/localapi/v0/prefs` with `prefs.json` and `/localapi/v0/serve-config`
+/// with `serve.json` from its directory, read per request — a missing
+/// file answers `500`. It starts with no operator user, so a board's
+/// startup read ([`ui::serve`]'s operator latch) finds none. Under `/tmp`: a
+/// long TMPDIR would overflow `sun_path`.
+fn fake_localapi() -> (TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("ts")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let sock = dir.path().join("ts.sock");
+    localapi_operator(dir.path(), "");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let root = dir.path().to_path_buf();
+    thread::spawn(move || {
+        for mut conn in listener.incoming().flatten() {
+            // Read through the end of the request head.
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 512];
+            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                match conn.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => raw.extend_from_slice(&buf[..n]),
+                }
+            }
+            let req = String::from_utf8_lossy(&raw).to_string();
+            let path = req.split_whitespace().nth(1).unwrap_or_default();
+            let file = if path.starts_with("/localapi/v0/status") {
+                Some("status.json")
+            } else if path == "/localapi/v0/prefs" {
+                Some("prefs.json")
+            } else if path == "/localapi/v0/serve-config" {
+                Some("serve.json")
+            } else {
+                None
+            };
+            let resp = match file.and_then(|f| std::fs::read(root.join(f)).ok()) {
+                Some(body) => [
+                    b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n".as_slice(),
+                    &body,
+                ]
+                .concat(),
+                None => b"HTTP/1.0 500 Internal Server Error\r\n\r\n".to_vec(),
+            };
+            let _ = conn.write_all(&resp);
+        }
+    });
+    (dir, sock)
+}
+
+/// Write the fake LocalAPI's answers: `TUN` (None omits the field), no
+/// operator user, and the serve config.
+fn localapi_says(dir: &Path, tun: Option<bool>, serve: Value) {
+    let status = match tun {
+        Some(t) => json!({"TUN": t, "BackendState": "Running"}),
+        None => json!({"BackendState": "Running"}),
+    };
+    std::fs::write(dir.join("status.json"), status.to_string()).unwrap();
+    localapi_operator(dir, "");
+    std::fs::write(dir.join("serve.json"), serve.to_string()).unwrap();
+}
+
+/// The fake LocalAPI's `prefs.OperatorUser` (`""` is none).
+fn localapi_operator(dir: &Path, user: &str) {
+    let prefs = json!({"OperatorUser": user, "WantRunning": true});
+    std::fs::write(dir.join("prefs.json"), prefs.to_string()).unwrap();
+}
+
+/// This test process's user name — the board's user in board tests.
+fn own_user_name() -> String {
+    let out = Command::new("id").arg("-un").output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// The serve config `ui tailscale start` makes: https:9450 proxied to
+/// the board, plus an unrelated TCP forwarder (ssh).
+fn serve_https_only(board_port: u16) -> Value {
+    json!({
+        "TCP": {"9450": {"HTTPS": true}, "2222": {"TCPForward": "127.0.0.1:22"}},
+        "Web": {format!("{TS_DNS}:9450"): {"Handlers": {"/": {"Proxy": format!("http://127.0.0.1:{board_port}")}}}}
+    })
+}
+
+/// `/api/meta` for a tailnet-shaped request carrying a forged login:
+/// `(actor, tailnet_proof)`.
+fn tailnet_meta(port: u16) -> (String, Value) {
+    let (code, _, body) = http_write(
+        port,
+        "GET",
+        "/api/meta",
+        &format!("{TS_DNS}:9450"),
+        &["Tailscale-User-Login: mallory@evil.example"],
+        b"",
+    );
+    assert_eq!(code, 200, "{body}");
+    let meta: Value = serde_json::from_str(&body).unwrap();
+    (
+        meta["actor"].as_str().unwrap_or_default().to_string(),
+        meta["tailnet_proof"].clone(),
+    )
+}
+
+/// CAD-336: a local process sending exactly the proxy's shape —
+/// tailnet Host, https Origin, identity headers, loopback peer — against
+/// a tailscaled that passes every config check (kernel networking, no
+/// TCP forwarder to the board) is still not the proxy: here the fake
+/// tailscaled is this test's own uid, so the last check, `foreign_uid`,
+/// refuses (on a real host the local caller fails `socket_owner`, which
+/// `tailnet_proof`'s unit tests cover — a test cannot open a socket as
+/// another uid). It writes as itself, `operator (ui)`, and the forged
+/// login is never recorded.
 #[test]
-fn tailnet_write_is_attributed() {
+fn tailnet_shaped_local_write_is_not_the_proxy() {
     let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     seed(pm.path(), state.path());
+    let (ts_dir, sock) = fake_localapi();
     let port = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
-        tailnet_opts(),
+        tailnet_opts(&sock),
     );
+    localapi_says(ts_dir.path(), Some(true), serve_https_only(port));
     let ts_host = format!("{TS_DNS}:9450");
     let origin = format!("https://{TS_DNS}:9450");
 
-    // A write shaped exactly like the proxy's: tailnet Host, https
-    // Origin, identity headers — attributed to the tailnet user.
     let headers = ts_write_headers(&origin, "fable@example.com");
     let href: Vec<&str> = headers.iter().map(String::as_str).collect();
     let (code, _, _) = http_write(
@@ -6931,29 +7054,189 @@ fn tailnet_write_is_attributed() {
     );
     assert_eq!(code, 200);
     let sha = sha_of(pm.path(), "cadence/CAD-2", "status=done");
-    assert!(
-        trailers_of(pm.path(), &sha).contains("Actor: fable@example.com (tailscale)"),
-        "{}",
-        trailers_of(pm.path(), &sha)
-    );
+    let t = trailers_of(pm.path(), &sha);
+    assert!(t.contains("Actor: operator (ui)"), "{t}");
+    assert!(!t.contains("fable"), "{t}");
 
-    // /api/meta reports the same identity + tailnet URL.
-    let (code, _, body) = http_write(
+    // /api/meta agrees, names the refusing check, and still reports
+    // the tailnet URL.
+    let (actor, proof) = tailnet_meta(port);
+    assert_eq!(actor, "operator (ui)");
+    assert_eq!(proof["proven"], false, "{proof}");
+    assert_eq!(proof["check"], "foreign_uid", "{proof}");
+    let (_, _, body) = http_write(port, "GET", "/api/meta", &ts_host, &[], b"");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["tailnet_url"],
+        origin
+    );
+}
+
+/// CAD-336: each fail-closed check of the tailnet proof refuses on its
+/// own condition and `/api/meta` names it — so a refusal can never pass
+/// for a different reason (on a host without tailscaled every request
+/// would otherwise fail at `tailscaled_socket`). One board per case: the
+/// LocalAPI facts are cached per socket.
+#[test]
+fn tailnet_proof_refusals_name_their_check() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    type Setup = fn(&Path, u16);
+    let cases: [(&str, Setup); 8] = [
+        ("localapi", |d, p| {
+            // No TUN field: the status cannot be read as either mode.
+            localapi_says(d, None, serve_https_only(p))
+        }),
+        ("localapi", |d, _| {
+            // The serve config does not answer.
+            localapi_says(d, Some(true), json!({}));
+            std::fs::remove_file(d.join("serve.json")).unwrap();
+        }),
+        ("localapi", |d, p| {
+            // The prefs do not answer: the operator user is unknown.
+            localapi_says(d, Some(true), serve_https_only(p));
+            std::fs::remove_file(d.join("prefs.json")).unwrap();
+        }),
+        ("kernel_networking", |d, p| {
+            localapi_says(d, Some(false), serve_https_only(p))
+        }),
+        ("not_operator_user", |d, p| {
+            // The board's user is tailscaled's operator: it could make
+            // tailscaled dial the board at will (qa-1 round 2).
+            localapi_says(d, Some(true), serve_https_only(p));
+            localapi_operator(d, &own_user_name());
+        }),
+        ("not_operator_user", |d, p| {
+            // An operator name that resolves to no user: fail closed.
+            localapi_says(d, Some(true), serve_https_only(p));
+            localapi_operator(d, "no-such-user-cad336");
+        }),
+        ("no_tcp_forwarder", |d, p| {
+            // qa-1's attack: `tailscale serve --tcp=N tcp://127.0.0.1:<board>`
+            // in a foreground session — raw TCP passes forged headers.
+            let mut serve = serve_https_only(p);
+            serve["Foreground"] = json!({"sess1": {"TCP": {"7777": {
+                "TCPForward": format!("127.0.0.1:{p}")
+            }}}});
+            localapi_says(d, Some(true), serve)
+        }),
+        ("foreign_uid", |d, p| {
+            // Another user (root) is the operator: every config check
+            // passes, and the fake tailscaled's own uid refuses last.
+            localapi_says(d, Some(true), serve_https_only(p));
+            localapi_operator(d, "root");
+        }),
+    ];
+    for (want, setup) in cases {
+        let (ts_dir, sock) = fake_localapi();
+        let port = start_ui_opts(
+            pm.path().to_path_buf(),
+            state.path().to_path_buf(),
+            tailnet_opts(&sock),
+        );
+        setup(ts_dir.path(), port);
+        let (actor, proof) = tailnet_meta(port);
+        assert_eq!(actor, "operator (ui)", "{want}");
+        assert_eq!(proof["proven"], false, "{want}: {proof}");
+        assert_eq!(proof["check"], want, "{proof}");
+    }
+
+    // No LocalAPI socket at all: tailscaled's uid is unknown.
+    let nowhere = TempDir::new().unwrap().path().join("absent.sock");
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(&nowhere),
+    );
+    let (actor, proof) = tailnet_meta(port);
+    assert_eq!(actor, "operator (ui)");
+    assert_eq!(proof["check"], "tailscaled_socket", "{proof}");
+}
+
+/// CAD-336 r4 (qa-1 round 3): the operator check latches for the
+/// board process's life. A board whose user was tailscaled's operator
+/// at startup stays refused after the operator is cleared — a
+/// connection set up through a since-removed forwarder would outlive
+/// the clear — and so does a board whose startup read failed.
+#[test]
+fn tailnet_operator_latch_outlives_a_clear() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+
+    // The board's user is the operator at startup, then clears itself.
+    let (ts_dir, sock) = fake_localapi();
+    localapi_operator(ts_dir.path(), &own_user_name());
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(&sock),
+    );
+    localapi_says(ts_dir.path(), Some(true), serve_https_only(port));
+    let (actor, proof) = tailnet_meta(port);
+    assert_eq!(actor, "operator (ui)");
+    assert_eq!(proof["check"], "operator_latched", "{proof}");
+
+    // The startup read fails (no prefs), then the LocalAPI recovers.
+    let (ts_dir, sock) = fake_localapi();
+    std::fs::remove_file(ts_dir.path().join("prefs.json")).unwrap();
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(&sock),
+    );
+    localapi_says(ts_dir.path(), Some(true), serve_https_only(port));
+    let (actor, proof) = tailnet_meta(port);
+    assert_eq!(actor, "operator (ui)");
+    assert_eq!(proof["check"], "operator_latched", "{proof}");
+
+    // Sighted as operator AFTER startup: latched from then on too.
+    let (ts_dir, sock) = fake_localapi();
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(&sock),
+    );
+    localapi_says(ts_dir.path(), Some(true), serve_https_only(port));
+    localapi_operator(ts_dir.path(), &own_user_name());
+    assert_eq!(tailnet_meta(port).1["check"], "not_operator_user");
+    localapi_operator(ts_dir.path(), "");
+    // Past the LocalAPI cache: the fresh read shows no operator.
+    thread::sleep(Duration::from_millis(2100));
+    assert_eq!(tailnet_meta(port).1["check"], "operator_latched");
+}
+
+/// The TCP-forwarder attack end to end: a tailnet-shaped write through
+/// a board whose serve config forwards raw TCP to it commits as the
+/// local caller, never the forged login.
+#[test]
+fn tailnet_write_with_a_tcp_forwarder_is_not_attributed() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+    let (ts_dir, sock) = fake_localapi();
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(&sock),
+    );
+    let mut serve = serve_https_only(port);
+    serve["TCP"]["7777"] = json!({"TCPForward": format!("127.0.0.1:{port}")});
+    localapi_says(ts_dir.path(), Some(true), serve);
+    let origin = format!("https://{TS_DNS}:9450");
+    let headers = ts_write_headers(&origin, "mallory@evil.example");
+    let href: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let (code, _, _) = http_write(
         port,
-        "GET",
-        "/api/meta",
-        &ts_host,
-        &[
-            "Tailscale-User-Login: fable@example.com",
-            "Tailscale-User-Name: Some User",
-        ],
-        b"",
+        "PATCH",
+        "/api/issues/CAD-2",
+        &format!("{TS_DNS}:9450"),
+        &href,
+        br#"{"status":"done"}"#,
     );
     assert_eq!(code, 200);
-    let meta: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(meta["actor"], "fable@example.com (tailscale)");
-    assert_eq!(meta["tailnet_url"], origin);
-    assert_eq!(meta["read_only"], false);
+    let sha = sha_of(pm.path(), "cadence/CAD-2", "status=done");
+    let t = trailers_of(pm.path(), &sha);
+    assert!(t.contains("Actor: operator (ui)"), "{t}");
+    assert!(!t.contains("mallory"), "{t}");
+    assert_eq!(tailnet_meta(port).1["check"], "no_tcp_forwarder");
 }
 
 #[test]
@@ -6963,7 +7246,7 @@ fn forged_tailscale_headers_not_attributed() {
     let port = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
-        tailnet_opts(),
+        tailnet_opts(Path::new("/nonexistent/tailscaled.sock")),
     );
     let host = format!("127.0.0.1:{port}");
 
@@ -6996,10 +7279,10 @@ fn forged_tailscale_headers_not_attributed() {
         b"",
     );
     assert_eq!(code, 200);
-    assert_eq!(
-        serde_json::from_str::<Value>(&body).unwrap()["actor"],
-        "operator (ui)"
-    );
+    let meta = serde_json::from_str::<Value>(&body).unwrap();
+    assert_eq!(meta["actor"], "operator (ui)");
+    // Not tailnet-shaped at all: no proof was even attempted.
+    assert_eq!(meta["tailnet_proof"], Value::Null);
 }
 
 #[test]
@@ -7009,7 +7292,7 @@ fn tailnet_write_wrong_origin_refused() {
     let port = start_ui_opts(
         pm.path().to_path_buf(),
         state.path().to_path_buf(),
-        tailnet_opts(),
+        tailnet_opts(Path::new("/nonexistent/tailscaled.sock")),
     );
     // Tailnet Host but a foreign Origin — still refused.
     let headers = ts_write_headers("https://evil.example", "fable@example.com");

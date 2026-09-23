@@ -49,7 +49,10 @@
 //!
 //! Only processes this user can inspect are visible: a socket held by
 //! another user's process (a root proxy) cannot be attributed, and the
-//! caller decides what that means — the board refuses the write.
+//! caller decides what that means — the board refuses the write. The
+//! one foreign peer the board accepts is the `tailscale serve` proxy,
+//! proven by [`crate::tailnet_proof`] from the owner uid
+//! [`client_socket`] reads, which `/proc/net/tcp` shows for any user.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -339,7 +342,7 @@ pub(crate) fn operator_proof(
 }
 
 /// Real and effective uid from `/proc/<pid>/status`.
-fn proc_uids(pid: u32) -> Result<(u32, u32), String> {
+pub(crate) fn proc_uids(pid: u32) -> Result<(u32, u32), String> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|e| format!("/proc/{pid}/status: {e}"))?;
     status
@@ -400,7 +403,7 @@ pub(crate) fn tcp_peer_agent(
     roots: &AgentRoots,
 ) -> Result<Option<String>, String> {
     let peer = canonical(peer);
-    let Some(inode) = client_socket_inode(server_port, peer)? else {
+    let Some((inode, _)) = client_socket(server_port, peer)? else {
         if !peer.ip().is_loopback() {
             return Ok(None);
         }
@@ -448,7 +451,7 @@ pub(crate) fn tcp_peer_agent(
 
 /// A v4-mapped v6 address (`::ffff:127.0.0.1`, what a dual-stack
 /// listener reports) compares as the v4 address the kernel lists.
-fn canonical(addr: SocketAddr) -> SocketAddr {
+pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
     match addr.ip() {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
@@ -458,19 +461,24 @@ fn canonical(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-/// The inode of the socket whose local end is `peer` and whose remote
-/// end is our `server_port` — the client's half of the connection, not
-/// the accepted half this server holds. `Ok(None)` when no table lists
-/// it; `Err` only when neither table could be read.
-fn client_socket_inode(server_port: u16, peer: SocketAddr) -> Result<Option<u64>, String> {
+/// The client's half of the connection — the socket whose local end is
+/// `peer` and whose remote end is our `server_port`, not the accepted
+/// half this server holds: its inode and its owner uid (the uid column
+/// the kernel prints for every socket, readable for another user's
+/// socket too). `Ok(None)` when no table lists it; `Err` only when
+/// neither table could be read.
+pub(crate) fn client_socket(
+    server_port: u16,
+    peer: SocketAddr,
+) -> Result<Option<(u64, u32)>, String> {
     let mut read_any = false;
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let Ok(text) = std::fs::read_to_string(table) else {
             continue;
         };
         read_any = true;
-        if let Some(inode) = find_client_inode(&text, server_port, peer) {
-            return Ok(Some(inode));
+        if let Some(found) = find_client_socket(&text, server_port, peer) {
+            return Ok(Some(found));
         }
     }
     if !read_any {
@@ -481,13 +489,14 @@ fn client_socket_inode(server_port: u16, peer: SocketAddr) -> Result<Option<u64>
 
 /// Scan one `/proc/net/tcp{,6}` table: `sl local rem st … uid timeout
 /// inode`. Inode 0 (a TIME_WAIT remnant) is owned by nobody — skipped.
-fn find_client_inode(table: &str, server_port: u16, peer: SocketAddr) -> Option<u64> {
+fn find_client_socket(table: &str, server_port: u16, peer: SocketAddr) -> Option<(u64, u32)> {
     table.lines().skip(1).find_map(|line| {
         let cols: Vec<&str> = line.split_whitespace().collect();
         let local = canonical(parse_addr(cols.get(1)?)?);
         let remote = canonical(parse_addr(cols.get(2)?)?);
+        let uid: u32 = cols.get(7)?.parse().ok()?;
         let inode: u64 = cols.get(9)?.parse().ok()?;
-        (local == peer && remote.port() == server_port && inode != 0).then_some(inode)
+        (local == peer && remote.port() == server_port && inode != 0).then_some((inode, uid))
     })
 }
 
@@ -638,5 +647,18 @@ mod tests {
             managed: HashMap::from([(parent, "wk".to_string())]),
         };
         assert!(tcp_peer_agent(port, peer, &both).is_err());
+    }
+
+    /// The client socket's uid column is read, and it is ours for a
+    /// connection this process opened.
+    #[test]
+    fn a_loopback_client_socket_carries_its_owner_uid() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_accepted, peer) = listener.accept().unwrap();
+        let (_, own) = proc_uids(std::process::id()).unwrap();
+        let (_, uid) = client_socket(port, peer).unwrap().unwrap();
+        assert_eq!(uid, own);
     }
 }
