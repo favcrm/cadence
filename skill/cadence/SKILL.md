@@ -159,6 +159,12 @@ Before dispatch or resuming changed scope:
   one writer per area, reviewer/result route and proportionate validation.
   Include rollout/recovery and cleanup ownership when they are in scope. Link
   existing plans instead of copying them; revise the brief when scope changes.
+- **Kickoff:** state the known state (base as `origin/main` at dispatch, main
+  CI status, known flaky tests, PRs about to land) and require a fetch right
+  before push. Give each rule's intent, not only its mechanics, so edge cases
+  resolve without guessing. For each acceptance item name the component that
+  produces the output, mark every number measured or aspirational, and list
+  the existing tests and neighbouring verbs that consume the changed output.
 
 During implementation and handoff:
 
@@ -190,22 +196,27 @@ checklist report for every trivial edit or spend model turns on empty retros.
 
 ## Improve memory and this skill
 
-1. Propose one scoped, reusable claim with `cadence memory propose`, linking
+1. Route each lesson to the strongest place that can hold it: a check in code
+   or CI when a machine can enforce it (file the ticket), scoped memory when a
+   reader must know it and cannot be checked, this skill when it is how to
+   work across projects, and nowhere when it is a one-off incident or
+   transient state. A memory must not paper over a fixable defect.
+2. Propose one scoped, reusable claim with `cadence memory propose`, linking
    source issue/commit/test, rationale, applicability, limits and invalidation
    conditions. Remove secrets and transient queue/quota state. An incident
    description alone is not a verified general rule.
-2. Two distinct accountable PM/worker reviewers, neither the author nor a
+3. Two distinct accountable PM/worker reviewers, neither the author nor a
    contributor, check the same revision's original evidence and counterexamples
    before an authenticated PM finalizes it. Native endpoint identity is the
    proof of independence; the CLI's permission checks, a confidence label or a
    refreshed timestamp are not. Record reviewer receipts and evidence in the
    memory when supported, otherwise retain them in the task/artifact. An
    external alias or operator claim cannot substitute for native identity.
-3. Retrieve relevant accepted lessons at task start/resume and material scope
+4. Retrieve relevant accepted lessons at task start/resume and material scope
    changes. Report which lesson helped, was irrelevant or was contradicted,
    with evidence. Withhold contradicted guidance from the current task and
    route it for revalidation; retain history rather than silently rewriting it.
-4. Promote a lesson into a skill change only when it improves a recurring,
+5. Promote a lesson into a skill change only when it improves a recurring,
    broadly applicable decision. Keep project-specific design choices in scoped
    memory/ADRs. Change the smallest instruction, give it a realistic behavioral
    check and independent review, and retain source/revision and supersession
