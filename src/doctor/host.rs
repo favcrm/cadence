@@ -495,8 +495,14 @@ pub fn render(report: &Value) -> String {
             ));
             if level != "ok" {
                 let remedy = c["remedy"].as_str().unwrap_or("");
-                if !remedy.is_empty() {
-                    out.push_str(&format!("       remedy: {remedy}\n"));
+                // A kill remedy is one line per pid — continuation
+                // lines indent under the first.
+                for (i, line) in remedy.lines().enumerate() {
+                    if i == 0 {
+                        out.push_str(&format!("       remedy: {line}\n"));
+                    } else {
+                        out.push_str(&format!("               {line}\n"));
+                    }
                 }
             }
         }
@@ -1126,19 +1132,11 @@ fn check_pipes(scan: &Scan) -> Check {
             stats.denied, stats.vanished
         ));
     }
-    let remedy = if stats.top.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "kill {}  # the biggest FIFO holders release the user's pipe pages",
-            stats
-                .top
-                .iter()
-                .map(|(pid, _)| pid.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    };
+    let remedy = kill_remedy(
+        &scan.proc_root,
+        &stats.top.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
+        "the biggest FIFO holders — stopping them releases the user's pipe pages",
+    );
     let value = json!({
         "pipe_fds": stats.fds,
         "unique_pipes": stats.pipes,
@@ -1754,6 +1752,60 @@ fn pid_age_secs(pid_dir: &Path, uptime: Option<f64>) -> Option<u64> {
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
     let started = start_jiffies / hz;
     Some((uptime? as u64).saturating_sub(started))
+}
+
+/// `17h`, `3d`, `42m`, `9s` — the largest whole unit.
+fn age_label(secs: u64) -> String {
+    match secs {
+        s if s >= 86_400 => format!("{}d", s / 86_400),
+        s if s >= 3_600 => format!("{}h", s / 3_600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// One `kill <pid>  # <comm>  cwd=<cwd>  age=<age>` line per pid, read
+/// from `<proc_root>/<pid>` at report time — an operator sees what each
+/// pid is before signalling it (CAD-257). `comm` is the kernel's short
+/// executable name, never argv. A pid that vanished is omitted; an
+/// unreadable cwd or age prints `?`.
+fn kill_lines(proc_root: &Path, pids: &[u32]) -> Vec<String> {
+    let uptime = proc_uptime(proc_root);
+    pids.iter()
+        .filter_map(|&pid| {
+            let dir = proc_root.join(pid.to_string());
+            if !dir.is_dir() {
+                return None;
+            }
+            let comm = std::fs::read_to_string(dir.join("comm"))
+                .ok()
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .or_else(|| {
+                    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
+                    let (_, rest) = stat.split_once('(')?;
+                    Some(rest.rsplit_once(')')?.0.to_string())
+                })
+                .unwrap_or_else(|| "?".to_string());
+            let cwd = std::fs::read_link(dir.join("cwd"))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "?".to_string());
+            let age = pid_age_secs(&dir, uptime)
+                .map(age_label)
+                .unwrap_or_else(|| "?".to_string());
+            Some(format!("kill {pid}  # {comm}  cwd={cwd}  age={age}"))
+        })
+        .collect()
+}
+
+/// A kill remedy: the reason line, then one named `kill` line per pid
+/// still present. Empty when every pid has exited.
+fn kill_remedy(proc_root: &Path, pids: &[u32], why: &str) -> String {
+    let lines = kill_lines(proc_root, pids);
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("{why}:\n{}", lines.join("\n"))
 }
 
 /// The only text a secret value is ever replaced by.
@@ -2542,19 +2594,11 @@ fn check_orphans(scan: &Scan) -> Check {
             denied, vanished
         ));
     }
-    let remedy = if orphans.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "kill {}  # orphaned; their worktrees are gone — the watchdog never signals them itself",
-            orphans
-                .iter()
-                .take(10)
-                .map(|o| o.pid.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    };
+    let remedy = kill_remedy(
+        &scan.proc_root,
+        &orphans.iter().take(10).map(|o| o.pid).collect::<Vec<_>>(),
+        "orphaned; their worktrees are gone — the watchdog never signals them itself",
+    );
     let value = json!({
         "count": orphans.len(),
         "pids": orphans.iter().map(|o| json!({
@@ -6220,7 +6264,28 @@ mod tests {
             .collect();
         // Sorted by pid regardless of read_dir order.
         assert_eq!(pids, vec![20, 22, 23]);
-        assert!(c.remedy.contains("kill 20 22 23"));
+        // One named kill line per pid (CAD-257): comm from stat,
+        // cwd from the link, age from starttime.
+        let kills: Vec<&str> = c
+            .remedy
+            .lines()
+            .filter(|l| l.starts_with("kill "))
+            .collect();
+        assert_eq!(
+            kills,
+            vec![
+                format!(
+                    "kill 20  # t  cwd={}  age=1m",
+                    repo.join(".cadence/wt/gone").display()
+                )
+                .as_str(),
+                // No cwd link → `?`, never a guess.
+                "kill 22  # t  cwd=?  age=3h",
+                "kill 23  # t  cwd=?  age=2h",
+            ],
+            "{}",
+            c.remedy
+        );
         assert!(c.detail.contains("pid 20"));
     }
 
@@ -9191,5 +9256,51 @@ mod tests {
         let c = check_load(&scan);
         assert_eq!(c.level, Level::Ok);
         assert!(c.value["skipped"].as_bool().unwrap_or(false));
+    }
+
+    /// CAD-257: a kill remedy names each pid's comm, cwd and age, read
+    /// from the real `/proc` — a live child `sleep` is the witness; a
+    /// pid that has exited is omitted rather than printed bare.
+    #[test]
+    fn kill_lines_name_comm_cwd_and_age_from_proc() {
+        let dir = TempDir::new().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(dir.path())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // `spawn` can return before exec renames the task: the vfork
+        // hand-back (mm_release) precedes `__set_task_comm` in the
+        // kernel, so comm may still read as this test binary for a
+        // moment. Wait, bounded, for the exec to finish.
+        let comm = format!("/proc/{pid}/comm");
+        for _ in 0..500 {
+            if std::fs::read_to_string(&comm).is_ok_and(|c| c.trim() == "sleep") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lines = kill_lines(Path::new("/proc"), &[pid]);
+        let remedy = kill_remedy(Path::new("/proc"), &[pid], "why");
+        let _ = child.kill();
+        let _ = child.wait();
+        let cwd = dir.path().canonicalize().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.starts_with(&format!("kill {pid}  # sleep  cwd={}  age=", cwd.display())),
+            "{line}"
+        );
+        // Just spawned: seconds old, never an unknown `?`.
+        let age = line.rsplit_once("age=").unwrap().1;
+        assert!(
+            age.ends_with('s') && age[..age.len() - 1].parse::<u64>().is_ok(),
+            "{line}"
+        );
+        assert_eq!(remedy, format!("why:\n{line}"));
+        // Reaped → gone from /proc → omitted; nothing left → no remedy.
+        assert!(kill_lines(Path::new("/proc"), &[pid]).is_empty());
+        assert_eq!(kill_remedy(Path::new("/proc"), &[pid], "why"), "");
     }
 }

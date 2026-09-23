@@ -734,6 +734,12 @@ enum Commands {
         #[command(subcommand)]
         action: cadence_agent::memory::cli::MemoryAction,
     },
+    /// Credential scan (CAD-109): the check `issue comment`, `report`,
+    /// `memory propose` and the intake relay run before they write.
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
     /// The read-only board UI + JSON API on loopback.
     Ui {
         #[command(subcommand)]
@@ -868,6 +874,22 @@ enum Commands {
         /// `CADENCE_PERMISSION_TIMEOUT_SECS`, default 900).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         timeout_secs: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Scan text for credential-shaped strings: the vendored gitleaks
+    /// rule pack plus cadence's bare-token and argv rules. Prints JSON
+    /// findings `{rule, line, column, redacted, severity, fingerprint}`,
+    /// never the value. Exit 0 when clean or warn-only, 1 on any
+    /// blocking finding. `<state dir>/secret-allowlist.toml` (operator
+    /// edited) drops allowlisted findings.
+    Scan {
+        /// Scan this file (its path also scopes path-specific rules);
+        /// else stdin.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
 }
 
@@ -1504,11 +1526,16 @@ enum SkillAction {
 enum SessionAction {
     /// Start-of-session gate: host, binary-vs-main, daemon, board,
     /// reconcile, inbox — one screen, exit 0 ok / 1 warnings /
-    /// 2 failures. Read-only by default.
+    /// 2 failures. Judges the cwd repo's project by default; other
+    /// projects collapse to one summary line that never fails the
+    /// gate. Read-only by default.
     Start {
-        /// Scope tracker reads and repo scans to one project key.
-        #[arg(long)]
+        /// Judge this project instead of the cwd repo's.
+        #[arg(long, conflicts_with = "all")]
         project: Option<String>,
+        /// Judge every project — the fleet-wide gate.
+        #[arg(long)]
+        all: bool,
         /// Emit the check report as JSON.
         #[arg(long)]
         json: bool,
@@ -1549,6 +1576,28 @@ enum SessionAction {
         /// scanning — tests/debug; the run is labelled fixture-backed.
         #[arg(long, hide = true)]
         host_report: Option<PathBuf>,
+    },
+    /// Acknowledge a known `session start` item by the key it prints
+    /// in [brackets]: until the ack expires the item warns instead of
+    /// failing, and still prints with the reason. `--list` shows every
+    /// ack, expired ones included.
+    Ack {
+        /// The item key, e.g. `reconcile:<message-id>`, `host:disk`.
+        #[arg(required_unless_present = "list")]
+        key: Option<String>,
+        /// Why the item is known and parked.
+        #[arg(long, required_unless_present = "list")]
+        reason: Option<String>,
+        /// A duration (90m, 12h, 3d) or YYYY-MM-DDTHH:MM:SSZ — at most
+        /// 14 days out.
+        #[arg(long, required_unless_present = "list")]
+        expires: Option<String>,
+        /// List every acknowledgement, expired ones marked expired.
+        #[arg(long, conflicts_with_all = ["key", "reason", "expires"])]
+        list: bool,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4380,6 +4429,30 @@ fn run() -> Result<i32> {
             }
         },
         Commands::Memory { action } => cadence_agent::memory::cli::run(&action, &state_dir),
+        Commands::Secret {
+            action: SecretAction::Scan { file },
+        } => {
+            use cadence_agent::secret;
+            let text = match &file {
+                Some(path) => String::from_utf8_lossy(&std::fs::read(path).map_err(|e| {
+                    Error::rejected(format!("Cannot read {}: {e}", path.display()))
+                })?)
+                .into_owned(),
+                None => {
+                    if atty_stdin() {
+                        return Err(Error::rejected("Pipe text on stdin or pass --file"));
+                    }
+                    let mut bytes = Vec::new();
+                    std::io::stdin().read_to_end(&mut bytes)?;
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
+            };
+            let allow = secret::Allowlist::load(&state_dir)?;
+            let path = file.as_ref().map(|p| p.to_string_lossy().into_owned());
+            let (report, blocking) = secret::report(&text, path.as_deref(), &allow)?;
+            print_json(&report);
+            Ok(if blocking { 1 } else { 0 })
+        }
         Commands::Ui { action } => cadence_agent::ui::run_cli(&state_dir, &action),
         Commands::Status { group, json, watch } => {
             run_status(&state_dir, group.as_deref(), json, watch)
@@ -4408,11 +4481,13 @@ fn run() -> Result<i32> {
         Commands::Session { action } => match action {
             SessionAction::Start {
                 project,
+                all,
                 json,
                 fix,
                 host_report,
             } => cadence_agent::session::run_start(&cadence_agent::session::StartOptions {
                 project,
+                all,
                 json,
                 fix,
                 host_report,
@@ -4434,6 +4509,20 @@ fn run() -> Result<i32> {
                 idle_secs,
                 host_report,
                 cwd: std::env::current_dir()?,
+                state_dir,
+            }),
+            SessionAction::Ack {
+                key,
+                reason,
+                expires,
+                list,
+                json,
+            } => cadence_agent::session::run_ack(&cadence_agent::session::AckOptions {
+                key,
+                reason,
+                expires,
+                list,
+                json,
                 state_dir,
             }),
         },

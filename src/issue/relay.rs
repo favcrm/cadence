@@ -1020,12 +1020,6 @@ fn publish_local_reports<T: GithubApi>(
         if r.state == "published" || (r.state == "retrying" && !retry_due(r)) {
             continue;
         }
-        // The receipt is persisted by `sync_once` after this bounded pass.
-        // If the process dies after GitHub creates the issue, the next run
-        // reconciles the stable marker before attempting another create.
-        r.state = "publishing".to_string();
-        r.reason = Some("publishing a sanitized summary".to_string());
-        r.updated_at = iso_now();
         let (title, summary) = report_summary(issue);
         let body = format!(
             "{}\n\nSource: local report `{}`\n\n{}",
@@ -1033,7 +1027,32 @@ fn publish_local_reports<T: GithubApi>(
             id,
             summary
         );
-        match api.create_issue(&config.repo, &format!("[Cadence report] {title}"), &body) {
+        let title = format!("[Cadence report] {title}");
+        // CAD-109: the sanitized summary still passes the secret scan
+        // before it can cross the GitHub boundary. A blocked report stays
+        // local and is re-checked on every pass, so an edit that removes
+        // the value publishes it.
+        if let Err(refused) = crate::secret::guard(
+            &format!("intake relay of {id}"),
+            &format!("{title}\n{body}"),
+        ) {
+            let reason = refused.to_string();
+            if r.state != "blocked" || r.reason.as_deref() != Some(reason.as_str()) {
+                errors.push(reason.clone());
+                r.state = "blocked".to_string();
+                r.reason = Some(reason);
+                r.next_retry_at = None;
+                r.updated_at = iso_now();
+            }
+            continue;
+        }
+        // The receipt is persisted by `sync_once` after this bounded pass.
+        // If the process dies after GitHub creates the issue, the next run
+        // reconciles the stable marker before attempting another create.
+        r.state = "publishing".to_string();
+        r.reason = Some("publishing a sanitized summary".to_string());
+        r.updated_at = iso_now();
+        match api.create_issue(&config.repo, &title, &body) {
             Ok(remote_issue) => {
                 mark_published(r, &remote_issue, source_rev);
                 published += 1;
@@ -1523,6 +1542,57 @@ mod tests {
             reopened.projects["cadence"].reports["CAD-1"].state,
             "pending"
         );
+    }
+
+    /// CAD-109: a credential shape the summary scrubber lets through (a
+    /// GitLab token is too short for its entropy test) is refused by the
+    /// secret scan. Nothing reaches GitHub, the receipt names the rule and
+    /// not the value, and an edit that removes the value publishes.
+    #[test]
+    fn credential_shaped_report_is_blocked_not_published() {
+        use sha2::{Digest, Sha256};
+        let pm_temp = tempfile::tempdir().unwrap();
+        let pm = intake_pm(&pm_temp);
+        let config = RelayProjectConfig {
+            enabled: true,
+            repo: "fake/repo".to_string(),
+            poll_seconds: 300,
+            dispatch: false,
+            pm_alias: None,
+            actor: None,
+        };
+        let digest: String = Sha256::digest(b"relay-fixture")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let token = ["gl", "pat-", &digest[..20]].concat();
+        let path = pm_temp.path().join("cadence/CAD-1/issue.md");
+        let clean = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("{clean}\nDeploy with\n{token}\n")).unwrap();
+
+        let mut api = MockApi::default();
+        let mut state = RelayProjectState::default();
+        let (published, pending, errors) =
+            publish_local_reports(&pm.dir, "cadence", &config, &mut state, &mut api);
+        assert_eq!((published, pending, api.create_calls), (0, 0, 0));
+        let r = &state.reports["CAD-1"];
+        assert_eq!(r.state, "blocked");
+        let reason = r.reason.clone().unwrap();
+        assert!(reason.contains("rule cadence-gitlab-pat"), "{reason}");
+        assert!(!reason.contains(&token[6..]), "{reason}");
+        assert_eq!(errors, vec![reason]);
+
+        // A later pass re-checks without repeating the error.
+        let (_, _, errors) =
+            publish_local_reports(&pm.dir, "cadence", &config, &mut state, &mut api);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(api.create_calls, 0);
+
+        fs::write(&path, clean).unwrap();
+        let (published, _, errors) =
+            publish_local_reports(&pm.dir, "cadence", &config, &mut state, &mut api);
+        assert_eq!(published, 1, "{errors:?}");
+        assert_eq!(state.reports["CAD-1"].state, "published");
     }
 
     #[test]

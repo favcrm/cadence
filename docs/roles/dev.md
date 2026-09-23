@@ -25,6 +25,7 @@ Until that rollout is confirmed, retain the existing `CARGO_BUILD_JOBS=4` cap an
 - Diff-based checks (`git diff`/`git show`) run through `rtk proxy` — the rtk hook rewrites the bare forms and its condensed output can print nothing for a real diff, so a filtered empty result is unproven, not clean (CAD-138). On 2026-09-20 a filtered `git diff --numstat` came back empty and a net-deletion check read clean against a head that deleted 3018 lines. `scripts/rtk-diff-guard.py`, a `PreToolUse` hook in `.claude/settings.json`, therefore denies every form rtk would rewrite (bare `git diff`/`git show`, `git -C`/`-c` spellings, `rtk git diff`, `rtk diff`) and names the fix. Escapes: `rtk proxy git diff …` (use this one), `RTK_DISABLED=1 git diff …` (presence counts, any value) or `\git diff …`.
 - `GIT_EDITOR=true` for any git command that could open an editor (rebase continue, merge, commit without `-m`).
 - Never paste another process's command line, environment or tool output with arguments into a PR, issue or note: summarise.
+- Run `cadence secret scan --file <body>` on a PR body or note before you publish it; it must exit 0. `issue comment`, `report`, `memory propose` and the intake relay run the same scan and refuse credential-shaped text. There is no bypass flag: a false positive goes to the operator's allowlist.
 - Stop background shells before you report.
 - One issue per turn; if the kickoff is wrong or blocked, say so in your report instead of widening scope.
 

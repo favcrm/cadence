@@ -26537,3 +26537,453 @@ fn body_flags_match_on_send_and_comment() {
         assert!(show.contains(want), "{want}: {show}");
     }
 }
+
+// ---------- CAD-109: pre-publish secret scan ----------
+
+/// A synthetic token: `prefix` plus `n` letters and digits drawn from a
+/// seeded SHA-256 stream. It is built at run time so this file never holds a
+/// credential-shaped literal.
+fn cad109_token(prefix: &str, seed: &str, n: usize) -> String {
+    use sha2::{Digest, Sha256};
+    const ALPHANUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = prefix.to_string();
+    let mut counter = 0u32;
+    while out.len() < prefix.len() + n {
+        for b in Sha256::digest(format!("{seed}:{counter}").as_bytes()) {
+            if out.len() < prefix.len() + n {
+                out.push(ALPHANUM[b as usize % ALPHANUM.len()] as char);
+            }
+        }
+        counter += 1;
+    }
+    out
+}
+
+/// `cadence --state-dir <state> secret scan <args>` with `stdin` piped in.
+fn cad109_scan(state: &Path, args: &[&str], stdin: &str) -> (i32, Value, String) {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state)
+        .args(["secret", "scan"])
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let v = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("not json: {stdout} / {stderr}"));
+    (
+        out.status.code().unwrap_or(-1),
+        v,
+        format!("{stdout}{stderr}"),
+    )
+}
+
+/// Exit 0 when clean or warn-only, 1 on a blocking finding. A bare token
+/// alone on its line is found with its rule, line and a redacted prefix, and
+/// the value appears nowhere in the output. The operator allowlist in the
+/// state dir drops what it names.
+#[test]
+fn secret_scan_exit_codes_and_redaction() {
+    let tmp = TempDir::new().unwrap();
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    let (code, v, _) = cad109_scan(&state, &[], "Ran the focused tests; all green.\n");
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["findings"], json!([]));
+
+    let warn = format!(
+        "config:\n  api_key = \"{}\"\n",
+        cad109_token("", "warn", 24)
+    );
+    let (code, v, _) = cad109_scan(&state, &[], &warn);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["findings"][0]["rule"], "generic-api-key");
+    assert_eq!(v["findings"][0]["severity"], "warn");
+
+    let ant = ["sk", "-ant-", "api03-"].concat();
+    let pat = ["github", "_pat_"].concat();
+    for (prefix, rule) in [
+        ("figd_", "cadence-figma-token"),
+        (ant.as_str(), "cadence-anthropic-key"),
+        (pat.as_str(), "cadence-github-fine-grained-pat"),
+    ] {
+        let tok = cad109_token(prefix, rule, 64);
+        let (code, v, all) = cad109_scan(&state, &[], &format!("Result\n\n{tok}\n"));
+        assert_eq!(code, 1, "{v}");
+        let f = &v["findings"][0];
+        assert_eq!(f["rule"], rule, "{v}");
+        assert_eq!(
+            (f["line"].as_u64(), f["column"].as_u64()),
+            (Some(3), Some(1))
+        );
+        assert_eq!(f["severity"], "block");
+        assert!(f["redacted"].as_str().unwrap().ends_with('…'), "{v}");
+        assert!(!all.contains(&tok[prefix.len()..]), "{all}");
+    }
+
+    let tok = cad109_token("figd_", "file", 40);
+    let file = tmp.path().join("pr-body.md");
+    std::fs::write(&file, format!("# Summary\n\ntoken {tok}\n")).unwrap();
+    let (code, v, all) = cad109_scan(&state, &["--file", file.to_str().unwrap()], "");
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["blocking"], 1);
+    assert!(!all.contains(&tok[5..]), "{all}");
+
+    std::fs::write(
+        state.join("secret-allowlist.toml"),
+        "[[allow]]\nrule = \"cadence-figma-token\"\nreason = \"test fixture\"\n",
+    )
+    .unwrap();
+    let (code, v, _) = cad109_scan(&state, &["--file", file.to_str().unwrap()], "");
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["allowlisted"], 1);
+
+    std::fs::write(state.join("secret-allowlist.toml"), "not toml [").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["secret", "scan", "--file", file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Refusing to write"));
+}
+
+/// `issue comment` refuses a credential-shaped body: the error names the
+/// rule, never the value, and no comment file or tracker commit is written.
+/// `report` is refused the same way, both as a new issue and as `--issue`.
+#[test]
+fn issue_comment_and_report_refuse_credential_shaped_text() {
+    let s = ReportFx::new();
+    let state = s.state.to_str().unwrap().to_string();
+    let env = [("CADENCE_STATE_DIR", state.as_str())];
+    let (ok, out) = s.cli(&["issue", "new", "Target", "--project", "product"]);
+    assert!(ok, "{out}");
+    let id = out["id"].as_str().unwrap().to_string();
+    let comments = s.pm_dir.join("product").join(&id).join("comments");
+    let count = || std::fs::read_dir(&comments).map(|d| d.count()).unwrap_or(0);
+    let log_before = s.tracker_log(1);
+
+    let tok = cad109_token("figd_", "comment", 40);
+    let body = format!("Verified locally.\n{tok}\n");
+    let (ok, stderr, _) = s.cli_at_env(
+        &s.product_repo,
+        &["issue", "comment", &id, "-m", &body],
+        &env,
+    );
+    assert!(!ok, "{stderr}");
+    assert!(stderr.contains("rule cadence-figma-token"), "{stderr}");
+    assert!(
+        stderr.contains("secret_detected") || stderr.contains("refused"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(&tok[5..]), "{stderr}");
+    assert_eq!(count(), 0);
+    assert_eq!(s.tracker_log(1), log_before);
+
+    for args in [
+        vec!["report", "--kind", "bug", "-m", &body],
+        vec!["report", "--issue", &id, "--kind", "bug", "-m", &body],
+    ] {
+        let (ok, stderr, _) = s.cli_at_env(&s.product_repo, &args, &env);
+        assert!(!ok, "{args:?}: {stderr}");
+        assert!(stderr.contains("rule cadence-figma-token"), "{stderr}");
+        assert!(!stderr.contains(&tok[5..]), "{stderr}");
+    }
+    assert_eq!(count(), 0);
+    assert_eq!(s.tracker_log(1), log_before);
+
+    // Clean text still goes through, and a warn-only finding rides along.
+    let warn = format!(
+        "config:\n  api_key = \"{}\"\n",
+        cad109_token("", "warn", 24)
+    );
+    let (ok, stderr, (_, v)) = s.cli_at_env(
+        &s.product_repo,
+        &["issue", "comment", &id, "-m", &warn],
+        &env,
+    );
+    assert!(ok, "{stderr}");
+    assert_eq!(v["secret_warnings"][0]["rule"], "generic-api-key", "{v}");
+    assert_eq!(count(), 1);
+}
+
+// ---- CAD-257: session gate scope, expiring acks ----
+
+/// `cadence session start` stdout+stderr and exit code.
+fn session_text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// An idle agent holding one `unknown` message — a reconcile `fail`
+/// keyed `reconcile:<id>`.
+fn unknown_msg_agent(alias: &str, id: &str) -> StubAgent {
+    stub_agent(
+        alias,
+        "fake",
+        "fake",
+        "idle",
+        60,
+        (
+            vec![json!({"id": id, "state": "unknown", "body": "lost turn"})],
+            0,
+            1,
+        ),
+    )
+}
+
+/// An acknowledged item warns until its expiry and fails after it —
+/// the expired record is written straight into the store (no sleeps),
+/// and `ack --list` keeps it, marked expired.
+#[test]
+fn session_start_ack_downgrades_until_expiry() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+    );
+    seed_pm(&pm, &repo, &tmp.path().join("notes"));
+    seed_repo(&repo);
+    let _sd = stub_daemon(
+        &state,
+        cadence_agent::overview::BUILD_COMMIT,
+        vec![unknown_msg_agent("w1", "m-unk")],
+    );
+    let host = clean_host(tmp.path());
+    let start = || run_session_host(&state, &pm, &repo, &["session", "start"], &host, &[]);
+
+    let out = start();
+    let text = session_text(&out);
+    assert_eq!(out.status.code(), Some(2), "unacked fails:\n{text}");
+    assert!(text.contains("[reconcile:m-unk]"), "key printed:\n{text}");
+    assert!(text.contains("cadence session ack <key>"), "hint:\n{text}");
+
+    // A credential-shaped reason is refused by CAD-109's scan before
+    // the store is written. The synthetic token is assembled at run
+    // time so no credential-shaped literal is committed.
+    let token = ["gh", "p_", "0123456789abcdefghij", "ABCDEFGHIJ012345"].concat();
+    let reason = format!("token {token}");
+    let out = run_session(
+        &state,
+        &pm,
+        &repo,
+        &[
+            "session",
+            "ack",
+            "reconcile:m-unk",
+            "--reason",
+            &reason,
+            "--expires",
+            "1d",
+        ],
+    );
+    let text = session_text(&out);
+    assert!(!out.status.success(), "secret reason accepted:\n{text}");
+    assert!(
+        text.contains("credential-shaped") && !text.contains(&token),
+        "{text}"
+    );
+
+    // Refusals: past the 14-day cap, in the past, no reason.
+    for args in [
+        vec![
+            "session",
+            "ack",
+            "reconcile:m-unk",
+            "--reason",
+            "x",
+            "--expires",
+            "15d",
+        ],
+        vec![
+            "session",
+            "ack",
+            "reconcile:m-unk",
+            "--reason",
+            "x",
+            "--expires",
+            "2020-01-01T00:00:00Z",
+        ],
+        vec![
+            "session",
+            "ack",
+            "reconcile:m-unk",
+            "--reason",
+            " ",
+            "--expires",
+            "1d",
+        ],
+    ] {
+        let out = run_session(&state, &pm, &repo, &args);
+        assert!(
+            !out.status.success(),
+            "{args:?} accepted:\n{}",
+            session_text(&out)
+        );
+    }
+    assert!(
+        !state.join("sessions/acks.json").exists(),
+        "a refusal wrote the store"
+    );
+
+    let out = run_session(
+        &state,
+        &pm,
+        &repo,
+        &[
+            "session",
+            "ack",
+            "reconcile:m-unk",
+            "--reason",
+            "known lost turn",
+            "--expires",
+            "2d",
+        ],
+    );
+    assert!(out.status.success(), "{}", session_text(&out));
+    let out = start();
+    let text = session_text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "acked fail downgrades to warn:\n{text}"
+    );
+    assert!(
+        text.contains("[reconcile:m-unk]"),
+        "an ack never hides the item:\n{text}"
+    );
+    assert!(
+        text.contains("(acknowledged until") && text.contains("known lost turn"),
+        "ack reason shown:\n{text}"
+    );
+
+    // Expired: the same record with an expiry already past.
+    let store = state.join("sessions/acks.json");
+    let mut acks: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+    assert_eq!(acks["acks"][0]["key"], "reconcile:m-unk");
+    assert!(acks["acks"][0]["actor"]
+        .as_str()
+        .is_some_and(|a| !a.is_empty()));
+    acks["acks"][0]["expires"] = json!("2026-01-01T00:00:00Z");
+    std::fs::write(&store, acks.to_string()).unwrap();
+    let out = start();
+    let text = session_text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expired ack fails again:\n{text}"
+    );
+    assert!(
+        text.contains("(acknowledgement expired 2026-01-01T00:00:00Z"),
+        "{text}"
+    );
+
+    let out = run_session(&state, &pm, &repo, &["session", "ack", "--list", "--json"]);
+    let list: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list["acks"].as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list["acks"][0]["state"], "expired", "{list}");
+}
+
+/// Default scope is the cwd repo's project: another project's failing
+/// item collapses to the `others` summary and cannot no-go the gate;
+/// `--all` judges it again, and a cwd outside every project repo
+/// behaves as `--all` and says so.
+#[test]
+fn session_start_scopes_to_cwd_project() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, other) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("other-repo"),
+    );
+    seed_pm(&pm, &repo, &tmp.path().join("notes"));
+    seed_repo(&repo);
+    std::fs::create_dir_all(pm.join("oth")).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        pm.join("oth/project.yaml"),
+        format!(
+            "key: oth\nprefix: OTH\nrepos:\n- path: {}\n",
+            other.display()
+        ),
+    )
+    .unwrap();
+    let _sd = stub_daemon(
+        &state,
+        cadence_agent::overview::BUILD_COMMIT,
+        vec![unknown_msg_agent("ow", "m-oth").with_cwd(&other)],
+    );
+    let host = clean_host(tmp.path());
+
+    let out = run_session_host(&state, &pm, &repo, &["session", "start"], &host, &[]);
+    let text = session_text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "other project's fail capped at warn:\n{text}"
+    );
+    assert!(text.contains("scope: project tst"), "{text}");
+    assert!(text.contains("others"), "summary row:\n{text}");
+    assert!(
+        text.contains("oth 1 (worst fail)"),
+        "per-project count:\n{text}"
+    );
+    assert!(
+        !text.contains("[reconcile:m-oth]"),
+        "collapsed, not listed:\n{text}"
+    );
+    // The cwd project's own findings are still judged and listed.
+    assert!(text.contains("tst-88-ghost"), "{text}");
+
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--all"],
+        &host,
+        &[],
+    );
+    let text = session_text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--all judges every project:\n{text}"
+    );
+    assert!(text.contains("[reconcile:m-oth]"), "{text}");
+
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--project", "oth", "--json"],
+        &host,
+        &[],
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{v}");
+    assert_eq!(v["scope"]["project"], "oth");
+
+    // Outside any project repo: fleet-wide, with the reason printed.
+    let out = run_session_host(&state, &pm, tmp.path(), &["session", "start"], &host, &[]);
+    let text = session_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("not inside a known project repo"), "{text}");
+}
