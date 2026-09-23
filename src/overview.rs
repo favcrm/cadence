@@ -873,10 +873,25 @@ fn compute_drift(repo: &Path, build_commit: &str) -> Value {
     })
 }
 
-/// `gh pr list` + the default-branch commit status for one repo slug.
-/// Both calls inside one cache entry so a partial failure refreshes
-/// together.
+/// `gh pr list` plus the default branch's `ci.yml` push runs for one
+/// repo slug, fetched concurrently into one cache entry (CAD-267). The
+/// legacy commit-status API is not read here: Actions reports check
+/// runs, so `commits/HEAD/status` stays `pending, total_count: 0` on a
+/// red main. `qa-verdict` still rides the PR rollup. A failing runs
+/// fetch never costs the PR rows — it lands as `main_ci.error`.
 fn gh_repo(slug: &str) -> Result<Value, String> {
+    let (prs, main_ci) = std::thread::scope(|s| {
+        let ci = s.spawn(|| gh_main_ci(slug));
+        let prs = gh_prs(slug);
+        let main_ci = ci
+            .join()
+            .unwrap_or_else(|_| json!({"error": "ci runs fetch panicked"}));
+        (prs, main_ci)
+    });
+    Ok(json!({"prs": prs?, "main_ci": main_ci}))
+}
+
+fn gh_prs(slug: &str) -> Result<Value, String> {
     let prs = gh_text(&[
         "pr".into(),
         "list".into(),
@@ -889,13 +904,395 @@ fn gh_repo(slug: &str) -> Result<Value, String> {
         "--json".into(),
         "number,title,url,headRefOid,headRefName,updatedAt,statusCheckRollup".into(),
     ])?;
-    let ci = gh_text(&["api".into(), format!("repos/{slug}/commits/HEAD/status")])?;
-    Ok(json!({
-        "prs": serde_json::from_str::<Value>(&prs)
-            .map_err(|e| format!("gh pr list: unreadable ({e})"))?,
-        "ci": serde_json::from_str::<Value>(&ci)
-            .map_err(|e| format!("gh status: unreadable ({e})"))?,
-    }))
+    serde_json::from_str::<Value>(&prs).map_err(|e| format!("gh pr list: unreadable ({e})"))
+}
+
+/// The run fields [`classify_main_ci`] and the rows read — the rest of
+/// the API object is dropped before it reaches the cache.
+const RUN_FIELDS: [&str; 9] = [
+    "id",
+    "head_sha",
+    "status",
+    "conclusion",
+    "event",
+    "path",
+    "head_branch",
+    "html_url",
+    "created_at",
+];
+
+/// `{branch, runs}` for the repo's default branch: the newest
+/// [`CI_RUNS_PAGE`] `ci.yml` push runs. A repo without a `ci.yml`
+/// workflow is `{absent: true}` — no CI to read, not an error; any
+/// other failure is `{error}`.
+fn gh_main_ci(slug: &str) -> Value {
+    let branch = match gh_text(&["api".into(), format!("repos/{slug}")])
+        .and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("unreadable ({e})")))
+    {
+        Ok(repo) => match repo["default_branch"].as_str() {
+            Some(b) if is_plain_ref(b) => b.to_string(),
+            _ => return json!({"error": format!("repos/{slug}: no readable default_branch")}),
+        },
+        Err(e) => return json!({"error": e}),
+    };
+    let path = format!(
+        "repos/{slug}/actions/workflows/{CI_WORKFLOW}/runs?branch={branch}&event=push&per_page={CI_RUNS_PAGE}"
+    );
+    let body = match gh_text(&["api".into(), path]) {
+        Ok(t) => t,
+        Err(e) if e.contains("HTTP 404") => return json!({"branch": branch, "absent": true}),
+        Err(e) => return json!({"branch": branch, "error": e}),
+    };
+    let parsed: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => return json!({"branch": branch, "error": format!("ci runs: unreadable ({e})")}),
+    };
+    let Some(runs) = parsed["workflow_runs"].as_array() else {
+        return json!({"branch": branch, "error": "ci runs: no workflow_runs array"});
+    };
+    let runs: Vec<Value> = runs
+        .iter()
+        .map(|r| {
+            RUN_FIELDS
+                .iter()
+                .map(|f| (f.to_string(), r[*f].clone()))
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        })
+        .collect();
+    json!({"branch": branch, "runs": runs})
+}
+
+/// A branch name safe to put in a query string and a git revision
+/// unquoted.
+fn is_plain_ref(b: &str) -> bool {
+    !b.is_empty()
+        && !b.starts_with('-')
+        && b.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+}
+
+// ---------- default-branch CI (CAD-267) ----------
+
+/// The workflow whose push runs are the default branch's CI verdict.
+/// Runs of any other workflow (Handover, …) never count.
+const CI_WORKFLOW: &str = "ci.yml";
+/// Push runs fetched per refresh — one per pushed SHA under the
+/// `queue: max` policy, so a page covers more SHAs than we classify.
+const CI_RUNS_PAGE: usize = 30;
+/// First-parent SHAs of the default branch the overview classifies.
+const MAIN_CI_SHAS: usize = 20;
+/// First-parent SHAs read from the local clone to place each run.
+const MAIN_CI_LOG: usize = 60;
+
+/// One default-branch SHA's own `ci.yml` verdict. Only a SHA's own
+/// successful push run makes it `Passed` — never absence, another
+/// workflow, or a later SHA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CiState {
+    Passed,
+    /// `failure`, `timed_out`, `startup_failure`.
+    Failed,
+    /// The run exists and has not completed.
+    Pending,
+    /// The run completed without a verdict: `cancelled`, or `skipped`,
+    /// `neutral`, `stale`, `action_required` (see `conclusion`).
+    Cancelled,
+    /// No `ci.yml` push run for this SHA at all.
+    Missing,
+}
+
+impl CiState {
+    fn as_str(self) -> &'static str {
+        match self {
+            CiState::Passed => "passed",
+            CiState::Failed => "failed",
+            CiState::Pending => "pending",
+            CiState::Cancelled => "cancelled",
+            CiState::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShaCi {
+    pub sha: String,
+    pub state: CiState,
+    /// Cancelled/missing only: the nearest later SHA whose own run
+    /// passed. The SHA itself stays unverified — covered, not passed.
+    pub covered_by: Option<String>,
+    /// The run that decided `state` — `None` when missing.
+    pub run_id: Option<u64>,
+    pub run_url: Option<String>,
+    pub conclusion: Option<String>,
+    pub created_at: Option<String>,
+}
+
+impl ShaCi {
+    fn to_json(&self) -> Value {
+        json!({
+            "sha": self.sha,
+            "state": self.state.as_str(),
+            "covered_by": self.covered_by,
+            "run_id": self.run_id,
+            "run_url": self.run_url,
+            "conclusion": self.conclusion,
+            "created_at": self.created_at,
+        })
+    }
+}
+
+fn is_ci_run(r: &Value) -> bool {
+    let path = r["path"].as_str().unwrap_or_default();
+    let file = path.split('@').next().unwrap_or_default();
+    r["event"].as_str() == Some("push")
+        && (file == CI_WORKFLOW || file.ends_with(&format!("/{CI_WORKFLOW}")))
+}
+
+fn run_state(r: &Value) -> CiState {
+    if r["status"].as_str() != Some("completed") {
+        return CiState::Pending;
+    }
+    match r["conclusion"].as_str() {
+        Some("success") => CiState::Passed,
+        Some("failure" | "timed_out" | "startup_failure") => CiState::Failed,
+        _ => CiState::Cancelled,
+    }
+}
+
+/// Classify the default branch's recent SHAs by their own `ci.yml`
+/// push run (CAD-267). Pure — fixtures test it.
+///
+/// `first_parent` is `git log --first-parent` of the default branch,
+/// newest first. A run SHA it does not contain but whose run is newer
+/// than every listed SHA's run was pushed after the clone's last fetch:
+/// it leads the list, newest run first (with no clone at all, the runs
+/// alone give the order). Older unlisted run SHAs are not on the
+/// branch's first-parent history and are ignored. Per SHA the newest
+/// run (highest id) decides; returns at most [`MAIN_CI_SHAS`], newest
+/// first.
+pub(crate) fn classify_main_ci(runs: &[Value], first_parent: &[String]) -> Vec<ShaCi> {
+    let mut own: HashMap<&str, &Value> = HashMap::new();
+    for r in runs.iter().filter(|r| is_ci_run(r)) {
+        let Some(sha) = r["head_sha"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let id = r["id"].as_u64().unwrap_or(0);
+        if own
+            .get(sha)
+            .is_none_or(|prev| prev["id"].as_u64().unwrap_or(0) < id)
+        {
+            own.insert(sha, r);
+        }
+    }
+    let created = |sha: &str| {
+        own.get(sha)
+            .and_then(|r| r["created_at"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let listed: std::collections::HashSet<&str> = first_parent.iter().map(String::as_str).collect();
+    let newest_listed = first_parent
+        .iter()
+        .map(|s| created(s))
+        .max()
+        .unwrap_or_default();
+    let mut ahead: Vec<&str> = own
+        .keys()
+        .copied()
+        .filter(|s| !listed.contains(s) && created(s) > newest_listed)
+        .collect();
+    ahead.sort_by_key(|s| std::cmp::Reverse((created(s), own[s]["id"].as_u64().unwrap_or(0))));
+    let mut out: Vec<ShaCi> = ahead
+        .into_iter()
+        .chain(first_parent.iter().map(String::as_str))
+        .map(|sha| {
+            let run = own.get(sha);
+            ShaCi {
+                sha: sha.to_string(),
+                state: run.map_or(CiState::Missing, |r| run_state(r)),
+                covered_by: None,
+                run_id: run.and_then(|r| r["id"].as_u64()),
+                run_url: run.and_then(|r| r["html_url"].as_str().map(str::to_string)),
+                conclusion: run.and_then(|r| r["conclusion"].as_str().map(str::to_string)),
+                created_at: run.and_then(|r| r["created_at"].as_str().map(str::to_string)),
+            }
+        })
+        .collect();
+    // Newest first: the last pass seen before index i is the nearest
+    // later SHA whose own run passed.
+    let mut nearest_pass: Option<String> = None;
+    for s in &mut out {
+        if matches!(s.state, CiState::Cancelled | CiState::Missing) {
+            s.covered_by = nearest_pass.clone();
+        }
+        if s.state == CiState::Passed {
+            nearest_pass = Some(s.sha.clone());
+        }
+    }
+    out.truncate(MAIN_CI_SHAS);
+    out
+}
+
+/// What the classification alerts on. `red`: the newest SHA with a
+/// verdict (passed or failed) failed — pending and cancelled SHAs
+/// carry no verdict, so they neither raise nor clear it.
+/// `unverified`: cancelled/missing SHAs with no covering later pass,
+/// newest first — they clear the moment a later SHA passes, while the
+/// SHAs keep their own label.
+pub(crate) struct MainCiAlerts<'a> {
+    pub red: Option<&'a ShaCi>,
+    pub unverified: Vec<&'a ShaCi>,
+}
+
+pub(crate) fn main_ci_alerts(shas: &[ShaCi]) -> MainCiAlerts<'_> {
+    let red = shas
+        .iter()
+        .find(|s| matches!(s.state, CiState::Passed | CiState::Failed))
+        .filter(|s| s.state == CiState::Failed);
+    let unverified = shas
+        .iter()
+        .filter(|s| matches!(s.state, CiState::Cancelled | CiState::Missing))
+        .filter(|s| s.covered_by.is_none())
+        .collect();
+    MainCiAlerts { red, unverified }
+}
+
+fn short(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+/// `git log --first-parent` of `branch` in the local clone, newest
+/// first — `origin/<branch>` when the clone tracks it, else the local
+/// branch. Local refs only, never a fetch.
+fn first_parent_log(repo: &Path, branch: &str) -> Result<Vec<String>, String> {
+    let rev = [format!("origin/{branch}"), branch.to_string()]
+        .into_iter()
+        .find(|r| {
+            git_text(
+                repo,
+                &[
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "-q".into(),
+                    r.clone(),
+                ],
+            )
+            .is_ok()
+        })
+        .ok_or_else(|| format!("no {branch} ref in {}", repo.display()))?;
+    let text = git_text(
+        repo,
+        &[
+            "log".into(),
+            "--first-parent".into(),
+            format!("-{MAIN_CI_LOG}"),
+            "--format=%H".into(),
+            rev,
+        ],
+    )?;
+    Ok(text.lines().map(str::to_string).collect())
+}
+
+/// The `main_ci` block for one slug plus its needs-me rows.
+fn main_ci_view(
+    slug: &str,
+    project: &str,
+    data: &Value,
+    clone: Option<&Path>,
+    now: i64,
+) -> (Value, Vec<Item>) {
+    let block = &data["main_ci"];
+    // A cache body written before CAD-267 has no block — nothing to say.
+    if block.is_null() {
+        return (Value::Null, Vec::new());
+    }
+    let Some(branch) = block["branch"].as_str() else {
+        return (
+            json!({"slug": slug, "project": project, "error": block["error"]}),
+            Vec::new(),
+        );
+    };
+    if block["absent"].as_bool() == Some(true) {
+        return (Value::Null, Vec::new());
+    }
+    let Some(runs) = block["runs"].as_array() else {
+        return (
+            json!({"slug": slug, "project": project, "branch": branch, "error": block["error"]}),
+            Vec::new(),
+        );
+    };
+    let (first_parent, log_error) = match clone.map(|c| first_parent_log(c, branch)) {
+        Some(Ok(log)) => (log, None),
+        Some(Err(e)) => (Vec::new(), Some(e)),
+        None => (Vec::new(), Some("no local clone declared".to_string())),
+    };
+    let shas = classify_main_ci(runs, &first_parent);
+    let alerts = main_ci_alerts(&shas);
+    let subject = format!("{slug}@{branch}");
+    let run_age = |s: &ShaCi| {
+        s.created_at
+            .as_deref()
+            .and_then(parse_iso)
+            .map(|t| now - t)
+            .unwrap_or(0)
+    };
+    let mut rows = Vec::new();
+    if let Some(s) = alerts.red {
+        let command = match s.run_id {
+            Some(id) => format!("gh run view {id} --repo {slug}"),
+            None => format!("gh run list --repo {slug} --workflow {CI_WORKFLOW} --branch {branch}"),
+        };
+        rows.push(
+            item(
+                90,
+                "ci_red",
+                &format!("{branch} CI failed at {} — {slug}", short(&s.sha)),
+                run_age(s),
+                project,
+                s.run_url.as_deref(),
+                &command,
+            )
+            .about("ci", &subject),
+        );
+    }
+    if let Some(newest) = alerts.unverified.first() {
+        let n = alerts.unverified.len();
+        let what = format!("{} {}", short(&newest.sha), newest.state.as_str());
+        let desc = if n == 1 {
+            what
+        } else {
+            format!("{n} SHAs, newest {what}")
+        };
+        // Re-running the newest cancelled run covers every older one
+        // once it passes; a missing run has nothing to re-run.
+        let command = match (newest.state, newest.run_id) {
+            (CiState::Cancelled, Some(id)) => format!("gh run rerun {id} --repo {slug}"),
+            _ => format!("gh run list --repo {slug} --workflow {CI_WORKFLOW} --branch {branch}"),
+        };
+        rows.push(
+            item(
+                92,
+                "ci_unverified",
+                &format!("{branch} CI unverified: {desc}, no later SHA passed yet — {slug}"),
+                run_age(newest),
+                project,
+                newest.run_url.as_deref(),
+                &command,
+            )
+            .about("ci", &subject),
+        );
+    }
+    let view = json!({
+        "slug": slug,
+        "project": project,
+        "branch": branch,
+        "workflow": CI_WORKFLOW,
+        "order": if first_parent.is_empty() { "runs" } else { "first_parent" },
+        "log_error": log_error,
+        "shas": shas.iter().map(ShaCi::to_json).collect::<Vec<_>>(),
+    });
+    (view, rows)
 }
 
 fn cache_file(state_dir: &Path) -> PathBuf {
@@ -1569,18 +1966,28 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
     let mut slugs = Vec::new();
     let mut slug_project: HashMap<String, String> = HashMap::new();
     let mut repo_paths: Vec<(PathBuf, String)> = Vec::new();
+    // Slug → the declared local clone its first-parent log comes from.
+    let mut slug_clone: HashMap<String, PathBuf> = HashMap::new();
     for p in &projects {
         for r in &p.repos {
+            let path = r.path.as_deref().map(|path| {
+                let path = project::expand_home(path);
+                path.canonicalize().unwrap_or(path)
+            });
             if let Some(remote) = &r.remote {
                 let norm = project::normalize_remote(remote);
                 if let Some(slug) = norm.strip_prefix("github.com/") {
                     slug_project.insert(slug.to_string(), p.key.clone());
                     slugs.push(slug.to_string());
+                    if let Some(path) = &path {
+                        slug_clone
+                            .entry(slug.to_string())
+                            .or_insert_with(|| path.clone());
+                    }
                 }
             }
-            if let Some(path) = &r.path {
-                let path = project::expand_home(path);
-                repo_paths.push((path.canonicalize().unwrap_or(path), p.key.clone()));
+            if let Some(path) = path {
+                repo_paths.push((path, p.key.clone()));
             }
         }
     }
@@ -1827,7 +2234,8 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
         }
     }
 
-    // ---- GitHub rows: merge-ready, verdict-less, red CI ----
+    // ---- GitHub rows: merge-ready, verdict-less, main CI ----
+    let mut main_ci: Vec<Value> = Vec::new();
     for (slug, data) in &gh_repos {
         let project = slug_project.get(slug).cloned().unwrap_or_default();
         for pr in data["prs"].as_array().cloned().unwrap_or_default() {
@@ -1888,21 +2296,17 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                 ),
             }
         }
-        if matches!(data["ci"]["state"].as_str(), Some("failure" | "error")) {
-            needs.push(
-                item(
-                    90,
-                    "ci_red",
-                    &format!("default branch CI failing on {slug}"),
-                    0,
-                    &project,
-                    None,
-                    &format!("gh run list --repo {slug}"),
-                )
-                .about("repo", slug),
-            );
+        let clone = slug_clone.get(slug).map(PathBuf::as_path);
+        let (view, rows) = main_ci_view(slug, &project, data, clone, now);
+        if let Some(e) = view["error"].as_str() {
+            degraded_notes.push(degraded("github_ci", slug, e));
         }
+        if !view.is_null() && opts.scope.project.as_deref().is_none_or(|k| k == project) {
+            main_ci.push(view);
+        }
+        needs.extend(rows);
     }
+    main_ci.sort_by(|a, b| a["slug"].as_str().cmp(&b["slug"].as_str()));
 
     // ---- deploy drift: is what we merged actually running ----
     let info = daemon.info.clone();
@@ -1983,6 +2387,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
         "drift": drift,
         "projects": projects_out,
         "github": gh_state,
+        "main_ci": main_ci,
         "daemon": daemon_json,
         "monitoring": monitoring_view,
         "degraded": degraded_notes,
@@ -2206,6 +2611,259 @@ mod tests {
         assert_eq!(agent_project(&a, &repos), "inner");
         assert_eq!(agent_project(&json!({"cwd": "/elsewhere"}), &repos), "");
         assert_eq!(agent_project(&json!({}), &repos), "");
+    }
+
+    // ---- CAD-267: default-branch CI from Actions runs ----
+
+    /// A fake 40-hex SHA from a digit — built at runtime, never a
+    /// credential-shaped literal.
+    fn sha(n: u8) -> String {
+        format!("{n}").repeat(40)
+    }
+
+    /// One workflow run the way the runs API lists it. `created` orders
+    /// runs; `id` rises with it.
+    fn run(workflow: &str, sha_n: u8, id: u64, status: &str, conclusion: Option<&str>) -> Value {
+        json!({
+            "id": id, "head_sha": sha(sha_n), "status": status,
+            "conclusion": conclusion, "event": "push",
+            "path": format!(".github/workflows/{workflow}"), "head_branch": "main",
+            "html_url": format!("https://github.com/o/r/actions/runs/{id}"),
+            "created_at": format!("2026-09-23T01:{:02}:00Z", id % 60),
+        })
+    }
+
+    fn ci(sha_n: u8, id: u64, status: &str, conclusion: Option<&str>) -> Value {
+        run("ci.yml", sha_n, id, status, conclusion)
+    }
+
+    fn states(shas: &[ShaCi]) -> Vec<(&str, CiState, Option<&str>)> {
+        shas.iter()
+            .map(|s| {
+                (
+                    &s.sha[..1],
+                    s.state,
+                    s.covered_by.as_deref().map(|c| &c[..1]),
+                )
+            })
+            .collect()
+    }
+
+    /// First-parent log for SHAs 1 (oldest) … n (newest), newest first.
+    fn log(n: u8) -> Vec<String> {
+        (1..=n).rev().map(sha).collect()
+    }
+
+    /// Three rapid pushes: 1 passed, 2's run cancelled, 3 still pending.
+    /// 2 has no covering descendant yet → ci_unverified; pending never
+    /// alerts and nothing is red.
+    #[test]
+    fn main_ci_middle_cancelled_newest_pending_is_unverified() {
+        let runs = [
+            ci(3, 30, "in_progress", None),
+            ci(2, 20, "completed", Some("cancelled")),
+            ci(1, 10, "completed", Some("success")),
+        ];
+        let shas = classify_main_ci(&runs, &log(3));
+        use CiState::*;
+        assert_eq!(
+            states(&shas),
+            [
+                ("3", Pending, None),
+                ("2", Cancelled, None),
+                ("1", Passed, None)
+            ]
+        );
+        let a = main_ci_alerts(&shas);
+        assert!(a.red.is_none(), "pending never alerts");
+        assert_eq!(a.unverified.len(), 1);
+        assert_eq!(a.unverified[0].sha, sha(2));
+    }
+
+    /// Newest failed: ci_red on it, and the cancelled middle stays
+    /// uncovered — a failed descendant covers nothing.
+    #[test]
+    fn main_ci_newest_failed_is_red_and_middle_uncovered() {
+        use CiState::*;
+        for bad in ["failure", "timed_out", "startup_failure"] {
+            let runs = [
+                ci(3, 30, "completed", Some(bad)),
+                ci(2, 20, "completed", Some("cancelled")),
+                ci(1, 10, "completed", Some("success")),
+            ];
+            let shas = classify_main_ci(&runs, &log(3));
+            assert_eq!(
+                states(&shas),
+                [
+                    ("3", Failed, None),
+                    ("2", Cancelled, None),
+                    ("1", Passed, None)
+                ],
+                "{bad}"
+            );
+            let a = main_ci_alerts(&shas);
+            assert_eq!(a.red.map(|s| s.sha.clone()), Some(sha(3)), "{bad}");
+            assert_eq!(a.unverified.len(), 1, "{bad}");
+            assert_eq!(a.unverified[0].sha, sha(2));
+        }
+    }
+
+    /// Newest passed: the cancelled middle is covered by it — and still
+    /// labelled cancelled, never passed. No alert.
+    #[test]
+    fn main_ci_newest_passed_covers_middle_without_passing_it() {
+        let runs = [
+            ci(3, 30, "completed", Some("success")),
+            ci(2, 20, "completed", Some("cancelled")),
+            ci(1, 10, "completed", Some("success")),
+        ];
+        let shas = classify_main_ci(&runs, &log(3));
+        use CiState::*;
+        assert_eq!(
+            states(&shas),
+            [
+                ("3", Passed, None),
+                ("2", Cancelled, Some("3")),
+                ("1", Passed, None)
+            ]
+        );
+        assert_ne!(shas[1].state, Passed);
+        let a = main_ci_alerts(&shas);
+        assert!(a.red.is_none());
+        assert!(a.unverified.is_empty(), "covered clears the alert");
+    }
+
+    /// A SHA whose only runs are another workflow's (Handover) — even a
+    /// passing one — is missing, never passed; a non-push ci run does
+    /// not count either.
+    #[test]
+    fn main_ci_handover_only_sha_is_missing_not_passed() {
+        let mut dispatch = ci(2, 21, "completed", Some("success"));
+        dispatch["event"] = json!("workflow_dispatch");
+        let runs = [
+            run("handover.yml", 2, 22, "completed", Some("success")),
+            dispatch,
+            ci(1, 10, "completed", Some("success")),
+        ];
+        let shas = classify_main_ci(&runs, &log(2));
+        use CiState::*;
+        assert_eq!(states(&shas), [("2", Missing, None), ("1", Passed, None)]);
+        assert!(shas[0].run_id.is_none());
+        let a = main_ci_alerts(&shas);
+        assert_eq!(a.unverified.len(), 1);
+        assert_eq!(a.unverified[0].state, Missing);
+        // A later passing SHA covers the missing one; it stays missing.
+        let runs = [ci(3, 30, "completed", Some("success")), runs[0].clone()];
+        let shas = classify_main_ci(&runs, &log(3));
+        assert_eq!(shas[1].state, Missing);
+        assert_eq!(shas[1].covered_by, Some(sha(3)));
+    }
+
+    /// Run SHAs newer than the clone's last fetch lead the list; an
+    /// unlisted SHA older than every listed run is not first-parent
+    /// history and is dropped. With no clone, runs alone give the order.
+    #[test]
+    fn main_ci_places_runs_the_clone_has_not_fetched() {
+        let runs = [
+            ci(4, 40, "completed", Some("success")),
+            ci(2, 20, "completed", Some("cancelled")),
+            ci(1, 10, "completed", Some("success")),
+            // Off first-parent history (older than every listed run).
+            ci(9, 5, "completed", Some("success")),
+        ];
+        use CiState::*;
+        // The clone knows 1..2 only; 4 was pushed after its fetch.
+        let shas = classify_main_ci(&runs, &log(2));
+        assert_eq!(
+            states(&shas),
+            [
+                ("4", Passed, None),
+                ("2", Cancelled, Some("4")),
+                ("1", Passed, None)
+            ]
+        );
+        // No clone: every run SHA, newest run first.
+        let shas = classify_main_ci(&runs, &[]);
+        assert_eq!(
+            shas.iter().map(|s| &s.sha[..1]).collect::<Vec<_>>(),
+            ["4", "2", "1", "9"]
+        );
+        // Per SHA the newest run decides (a re-push of the same SHA).
+        let runs = [
+            ci(1, 11, "completed", Some("failure")),
+            ci(1, 10, "completed", Some("success")),
+        ];
+        assert_eq!(classify_main_ci(&runs, &log(1))[0].state, Failed);
+    }
+
+    /// The needs-me rows: ci_red and ci_unverified share the branch's
+    /// subject (one row, two causes); titles end in the slug, which
+    /// `session`'s ack key reads.
+    #[test]
+    fn main_ci_rows_share_the_branch_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.email", "t@t"]);
+        git(repo, &["config", "user.name", "t"]);
+        let mut shas = Vec::new();
+        for i in 0..3 {
+            std::fs::write(repo.join("f"), format!("{i}")).unwrap();
+            git(repo, &["add", "f"]);
+            git(repo, &["commit", "-qm", &format!("c{i}")]);
+            shas.push(
+                git_text(repo, &["rev-parse".into(), "HEAD".into()])
+                    .unwrap()
+                    .trim()
+                    .to_string(),
+            );
+        }
+        let with_sha = |mut r: Value, i: usize| {
+            r["head_sha"] = json!(shas[i]);
+            r
+        };
+        let data = json!({"main_ci": {"branch": "main", "runs": [
+            with_sha(ci(0, 30, "completed", Some("failure")), 2),
+            with_sha(ci(0, 20, "completed", Some("cancelled")), 1),
+            with_sha(ci(0, 10, "completed", Some("success")), 0),
+        ]}});
+        let (view, rows) = main_ci_view("o/r", "cadence", &data, Some(repo), 0);
+        assert_eq!(view["order"], "first_parent", "{view}");
+        let got: Vec<&str> = view["shas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, ["failed", "cancelled", "passed"], "{view}");
+        let merged = merge_by_subject(rows);
+        assert_eq!(merged.len(), 1);
+        let row = &merged[0].json;
+        assert_eq!(row["subject"], json!({"kind": "ci", "id": "o/r@main"}));
+        assert_eq!(row["kind"], "ci_red");
+        assert_eq!(row["command"], "gh run view 30 --repo o/r");
+        let causes: Vec<&str> = row["causes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["cause"].as_str().unwrap())
+            .collect();
+        assert_eq!(causes, ["ci_red", "ci_unverified"]);
+        assert_eq!(row["causes"][1]["command"], "gh run rerun 20 --repo o/r");
+        assert!(row["title"].as_str().unwrap().ends_with(" o/r"), "{row}");
+        assert!(row["causes"][1]["title"]
+            .as_str()
+            .unwrap()
+            .contains(&shas[1][..7]));
+        // No ci.yml workflow: nothing to show, nothing to alert.
+        let absent = json!({"main_ci": {"branch": "main", "absent": true}});
+        let (view, rows) = main_ci_view("o/r", "cadence", &absent, Some(repo), 0);
+        assert!(view.is_null() && rows.is_empty());
+        // A failed fetch surfaces its error, never a verdict.
+        let failed = json!({"main_ci": {"branch": "main", "error": "gh: boom"}});
+        let (view, rows) = main_ci_view("o/r", "cadence", &failed, Some(repo), 0);
+        assert_eq!(view["error"], "gh: boom");
+        assert!(rows.is_empty());
     }
 
     fn slow_gh(_slug: &str) -> Result<Value, String> {

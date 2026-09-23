@@ -1331,7 +1331,8 @@ fn need_key(n: &Value) -> (String, Option<String>) {
                 return (format!("{kind}:{slug}#{num}"), None);
             }
         }
-        "ci_red" => {
+        // Titles end in the slug: `main CI failed at <sha> — <slug>`.
+        "ci_red" | "ci_unverified" => {
             if let Some(slug) = words.last() {
                 return (format!("{kind}:{slug}"), None);
             }
@@ -2825,8 +2826,16 @@ mod tests {
             ("intake:CAD-3".into(), None)
         );
         assert_eq!(
-            row("ci_red", "default branch CI failing on o/r", "x"),
+            row("ci_red", "main CI failed at 1234567 — o/r", "x"),
             ("ci_red:o/r".into(), None)
+        );
+        assert_eq!(
+            row(
+                "ci_unverified",
+                "main CI unverified: 1234567 cancelled, no later SHA passed yet — o/r",
+                "x"
+            ),
+            ("ci_unverified:o/r".into(), None)
         );
         assert_eq!(
             row("drift", "3 merged commit(s) not running", "x").0,

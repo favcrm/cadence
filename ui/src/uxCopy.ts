@@ -10,11 +10,41 @@ const KIND_LABEL: Record<string, string> = {
   review_no_pr: "review",
   blocked_ready: "unblocked",
   ci_red: "ci red",
+  ci_unverified: "ci unverified",
   silent_end: "silent end",
   inbox_unread: "inbox",
   inbox_stale: "stale inbox",
   tracker_behind: "behind",
 };
+
+/**
+ * One default-branch SHA's CI label. Only the SHA's own successful run
+ * reads "passed"; a cancelled or missing SHA covered by a later pass
+ * says so and never borrows the pass.
+ */
+export function shaCiLabel(s: {
+  state: string;
+  covered_by?: string | null;
+  conclusion?: string | null;
+}): string {
+  const cover = s.covered_by
+    ? `covered by ${s.covered_by.slice(0, 7)}`
+    : "not yet covered";
+  switch (s.state) {
+    case "passed":
+      return "passed";
+    case "failed":
+      return s.conclusion && s.conclusion !== "failure" ? `failed (${s.conclusion})` : "failed";
+    case "pending":
+      return "pending";
+    case "cancelled":
+      return `${s.conclusion && s.conclusion !== "cancelled" ? s.conclusion : "cancelled"} — ${cover}`;
+    case "missing":
+      return `no ci run — ${cover}`;
+    default:
+      return "unknown";
+  }
+}
 
 /** Empty Agents list. `all` means the fleet itself is empty. */
 export function agentsEmptyCopy(project: string): string {
@@ -37,6 +67,7 @@ const NEED_GROUP: Record<string, "decision" | "team" | "dependency" | "info"> = 
   blocked_ready: "team",
   pr_no_verdict: "team",
   ci_red: "team",
+  ci_unverified: "team",
   silent_end: "team",
   // A sampled menu is not an operator approval.
   approval_menu: "team",
