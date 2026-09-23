@@ -1,7 +1,7 @@
 import type { IssueCard } from "./types";
 
 /** The board's slice — chips in the filter bar, mirrored in the URL
- *  (`?tag=ui,api&epic=CAD-38&owner=ann&component=core&group=epic`) so a
+ *  (`?tag=ui,api&epic=CAD-38&owner=ann&component=core&group=epic&done=1`) so a
  *  filtered view is a link. Tags narrow (all of them); epic, owner and
  *  component widen within themselves (any of them). */
 export interface BoardFilters {
@@ -11,6 +11,8 @@ export interface BoardFilters {
   components: string[];
   /** Render one swimlane per epic. */
   groupByEpic: boolean;
+  /** Include finished (`done`) issues — hidden by default so active work leads. */
+  showDone: boolean;
 }
 
 export type Facet = "tags" | "epics" | "owners" | "components";
@@ -21,6 +23,7 @@ export const NO_FILTERS: BoardFilters = {
   owners: [],
   components: [],
   groupByEpic: false,
+  showDone: false,
 };
 
 const PARAMS: [Facet, string][] = [
@@ -36,7 +39,11 @@ export function readFilters(q: URLSearchParams): BoardFilters {
       .getAll(key)
       .flatMap((v) => v.split(","))
       .filter(Boolean);
-  const out = { ...NO_FILTERS, groupByEpic: q.get("group") === "epic" };
+  const out = {
+    ...NO_FILTERS,
+    groupByEpic: q.get("group") === "epic",
+    showDone: q.get("done") === "1",
+  };
   for (const [facet, key] of PARAMS) out[facet] = list(key);
   return out;
 }
@@ -51,6 +58,8 @@ export function writeFilters(q: URLSearchParams, f: BoardFilters) {
   }
   q.delete("group");
   if (f.groupByEpic) q.set("group", "epic");
+  q.delete("done");
+  if (f.showDone) q.set("done", "1");
 }
 
 export function toggle(f: BoardFilters, facet: Facet, value: string): BoardFilters {
