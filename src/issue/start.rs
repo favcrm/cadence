@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::client;
 use crate::error::{Error, Result};
-use crate::issue::model::{Front, Ref};
+use crate::issue::model::{self, Front, Ref};
 use crate::issue::{git, parse, project, write, Pm};
 use crate::{proto, worktree};
 
@@ -390,6 +390,10 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
             )))
         }
     };
+    // A reused lane's values come from the tracker and the checkout —
+    // never re-record one git would read as an option (CAD-144).
+    model::check_ref_value(&branch)?;
+    model::check_ref_value(&wt_dir.to_string_lossy())?;
     let wt_name = wt_dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
