@@ -28683,6 +28683,7 @@ fn daemon_start_refuses_a_different_build_without_a_lease() {
     )
     .unwrap();
     drop(conn);
+    let before = sqlite_family(state.path());
     let refused = cadence_at(
         home.path(),
         state.path(),
@@ -28691,6 +28692,11 @@ fn daemon_start_refuses_a_different_build_without_a_lease() {
     let err = String::from_utf8_lossy(&refused.stderr);
     assert!(!refused.status.success(), "{err}");
     assert!(err.contains("deadbeefdead"), "{err}");
+    assert_eq!(
+        sqlite_family(state.path()),
+        before,
+        "a refused start must not rewrite the database or its sidecars"
+    );
     hold_rollout_lease(home.path(), state.path());
     let start = cadence_at(
         home.path(),
@@ -28988,4 +28994,200 @@ fn restart_and_rollout_help_say_same_build_restart_is_lease_free() {
             "help for {args:?} should say same-build restart is lease-free:\n{text}"
         );
     }
+}
+
+/// A hand-run `daemon run` of a different build by a non-holder must
+/// refuse before `hot_restart_begin` deletes the shutdown marker and
+/// before `recover` writes. The marker and the sqlite family stay.
+#[test]
+fn direct_daemon_run_by_a_non_holder_keeps_the_hot_restart_marker() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let marker = state.path().join("shutdown.json");
+    let marker_before = std::fs::read(&marker).expect("clean stop writes shutdown.json");
+    let db = state.path().join("cadence.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE daemon_build SET commit_sha='deadbeefdead' WHERE id=1",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+    }
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+            "{}{suffix}",
+            db.display()
+        )));
+    }
+    let before = sqlite_family(state.path());
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state.path())
+        .args(["daemon", "run", "--rollout-as", "operator:intruder"])
+        .env("HOME", home.path())
+        .env_remove("CADENCE_ALIAS")
+        .env_remove("CADENCE_ROLLOUT_AS")
+        .envs(test_env().vars())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut timed_out = false;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break,
+            None if std::time::Instant::now() > deadline => {
+                timed_out = true;
+                let _ = child.kill();
+                break;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    let out = child.wait_with_output().unwrap();
+    let err = format!(
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !timed_out,
+        "direct daemon run did not exit; killed it. output: {err}"
+    );
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("deadbeefdead"), "{err}");
+    assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+    assert_eq!(sqlite_family(state.path()), before);
+}
+
+/// The holder claims, records a backup, and migrates through
+/// `daemon start --as`. No `MIGRATION_HOLDER` override: the child learns
+/// the holder from `--rollout-as`.
+#[test]
+fn holder_migrates_through_daemon_start_without_a_test_override() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let db = state.path().join("cadence.sqlite3");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS rollout_leases;
+         DROP TABLE IF EXISTS daemon_build;
+         UPDATE schema_version SET version=11;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .unwrap();
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+            "{}{suffix}",
+            db.display()
+        )));
+    }
+    let version: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 11);
+    let claim = cadence_at(
+        home.path(),
+        state.path(),
+        &[
+            "rollout",
+            "claim",
+            "--reason",
+            "crossing",
+            "--as",
+            "operator:test",
+            "--ttl",
+            "2h",
+        ],
+    );
+    assert!(
+        claim.status.success(),
+        "{}",
+        String::from_utf8_lossy(&claim.stderr)
+    );
+    let backup = home.path().join("backup.sqlite3");
+    std::fs::copy(&db, &backup).unwrap();
+    let recorded = cadence_at(
+        home.path(),
+        state.path(),
+        &[
+            "rollout",
+            "backup",
+            "--path",
+            backup.to_str().unwrap(),
+            "--as",
+            "operator:test",
+        ],
+    );
+    assert!(
+        recorded.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&recorded.stdout),
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    drop(conn);
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+            "{}{suffix}",
+            db.display()
+        )));
+    }
+    let start = cadence_at(
+        home.path(),
+        state.path(),
+        &["daemon", "start", "--as", "operator:test"],
+    );
+    let started = start.status.success();
+    if started {
+        let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+        assert!(
+            stop.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stop.stderr)
+        );
+    }
+    assert!(
+        started,
+        "holder migration failed: {} {}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let version: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 12);
 }

@@ -5662,6 +5662,11 @@ pub fn serve(state_dir: &Path) -> Result<()> {
 /// their mock commands here instead of through the shared environment.
 pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
+    // Before the marker is consumed and before recover() writes. A
+    // direct `daemon run` of a different build by a non-holder must
+    // leave shutdown.json and the database byte-identical. `daemon
+    // start` already refuses before spawn; this is the hand-run path.
+    crate::rollout::authorize_direct_run(state_dir)?;
     let _singleton = acquire_singleton(state_dir)?;
     // Consume the shutdown marker and record this run's instance BEFORE
     // the store opens — recover() protects the candidate entries as it

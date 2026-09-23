@@ -1315,18 +1315,24 @@ enum RolloutAction {
     /// Show the active lease, or report that none is held.
     Status,
     /// Drop the lease. The holder only, unless `--force` with an
-    /// operator identity and a reason.
+    /// operator identity and a reason. `--force` on a live, unexpired
+    /// lease also requires `--holder` naming that holder.
     Release {
         /// Identity outside a cadence pane.
         #[arg(long = "as")]
         as_identity: Option<String>,
         /// Release a lease whose holder is gone. Requires `--reason`
         /// and an operator `--as` that is not a registered agent alias.
+        /// A lease that has not expired also requires `--holder`.
         #[arg(long)]
         force: bool,
         /// Why the holder is being ousted. Required with `--force`.
         #[arg(long)]
         reason: Option<String>,
+        /// Holder being ousted. Required with `--force` while the lease
+        /// is still unexpired, and it must match the lease holder.
+        #[arg(long)]
+        holder: Option<String>,
     },
     /// Pass the lease to another identity. The holder only. The backup
     /// receipt stays with the lease.
@@ -3789,16 +3795,22 @@ fn run() -> Result<i32> {
                     as_identity,
                     force,
                     reason,
+                    holder,
                 } => {
                     let caller = caller(&as_identity)?;
                     if force {
                         let reason = reason.ok_or_else(|| {
                             Error::rejected("rollout release --force requires --reason \"<why>\"")
                         })?;
-                        cadence_agent::rollout::release_forced(&state_dir, &caller, &reason)?
-                    } else if reason.is_some() {
+                        cadence_agent::rollout::release_forced(
+                            &state_dir,
+                            &caller,
+                            &reason,
+                            holder.as_deref(),
+                        )?
+                    } else if reason.is_some() || holder.is_some() {
                         return Err(Error::rejected(
-                            "--reason is only used with `rollout release --force`",
+                            "--reason and --holder are only used with `rollout release --force`",
                         ));
                     } else {
                         cadence_agent::rollout::release(&state_dir, &caller)?
