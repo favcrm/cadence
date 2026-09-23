@@ -492,7 +492,10 @@ fn cadence_store_shows_size_and_rollup_counts() {
 
     assert_eq!(
         store
-            .roll_up_delivery_events(now - crate::store::EVENT_ROLLUP_AGE_SECS)
+            .roll_up_delivery_events(
+                now - crate::store::EVENT_ROLLUP_AGE_SECS,
+                crate::store::EVENT_ROLLUP_BATCH,
+            )
             .unwrap(),
         3
     );

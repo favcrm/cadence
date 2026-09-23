@@ -260,13 +260,20 @@ impl Shared {
                 inbox_swept = Some(Instant::now());
             }
             // CAD-316: delivery bookkeeping past a week folds into
-            // per-alias counts — hourly, allowlisted kinds only.
+            // per-alias counts — hourly, allowlisted kinds only. A full
+            // batch means backlog remains: the next tick takes the next
+            // chunk, so the store lock is released between chunks.
             if events_rolled.is_none_or(|at| at.elapsed() >= EVENT_ROLLUP_EVERY) {
                 let cutoff = epoch_secs() - crate::store::EVENT_ROLLUP_AGE_SECS;
-                if let Err(e) = self.store.roll_up_delivery_events(cutoff) {
-                    eprintln!("event rollup: {e}");
-                }
-                events_rolled = Some(Instant::now());
+                let batch = crate::store::EVENT_ROLLUP_BATCH;
+                events_rolled = match self.store.roll_up_delivery_events(cutoff, batch) {
+                    Ok(folded) if folded >= batch => None,
+                    Ok(_) => Some(Instant::now()),
+                    Err(e) => {
+                        eprintln!("event rollup: {e}");
+                        Some(Instant::now())
+                    }
+                };
             }
             // CAD-199: off unless configured; sweeps at most hourly.
             self.agent_gc_tick();
