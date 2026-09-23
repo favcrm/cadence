@@ -582,7 +582,9 @@ pub struct Store {
     conn: Mutex<Connection>,
     /// Adoption candidates that survived `recover()`'s store-level
     /// checks, keyed by alias — an agent may hold more than one
-    /// in-flight turn, so every qualifying entry is kept; each list is
+    /// in-flight turn (routed notifications beside its one report-owing
+    /// turn, or rows that accumulated before CAD-250, which the report
+    /// bound then retires), so every qualifying entry is kept; each list is
     /// consumed exactly once by the agent's actor at open
     /// (`take_adoption`).
     adoptions: Mutex<std::collections::HashMap<String, Vec<AdoptEntry>>>,
@@ -829,8 +831,50 @@ impl Message {
         )
     }
 
+    /// CAD-250: a report-owing turn whose paste was delivered and that
+    /// has no result report yet — `running` with the pty `submitted`
+    /// marker (an ack keeps the marker). Derived, never stored: routed
+    /// notifications complete at paste, and managed turns never carry
+    /// the marker, so only a pty turn waiting on `message result` is
+    /// ever `awaiting_report`.
+    pub fn awaiting_report(&self) -> bool {
+        self.state == "running"
+            && !self.is_routed()
+            && self
+                .result
+                .as_ref()
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str)
+                == Some("submitted")
+    }
+
+    /// When the report bound's clock started for an `awaiting_report`
+    /// turn: the delivery (`started`, else `created`), restarted by the
+    /// latest valid ack — an ack is the worker's own report that it holds
+    /// the turn. `None` for any other row.
+    pub fn report_clock(&self) -> Option<f64> {
+        if !self.awaiting_report() {
+            return None;
+        }
+        let delivered = self.started.unwrap_or(self.created);
+        let acked = self
+            .result
+            .as_ref()
+            .and_then(|r| r.pointer("/ack/at"))
+            .and_then(Value::as_f64);
+        Some(acked.map_or(delivered, |at| at.max(delivered)))
+    }
+
+    /// The report bound has run out at `now` — `bound == 0` disables it.
+    pub fn report_overdue(&self, bound: u64, now: f64) -> bool {
+        bound > 0
+            && self
+                .report_clock()
+                .is_some_and(|clock| now - clock >= bound as f64)
+    }
+
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut j = json!({
             "seq": self.seq, "id": self.id, "alias": self.alias,
             "body": self.body, "reply_to": self.reply_to, "source": self.source,
             "state": self.state, "turn_id": self.turn_id,
@@ -838,9 +882,35 @@ impl Message {
             "task_id": self.task_id,
             "created": self.created, "started": self.started,
             "completed": self.completed,
-        })
+        });
+        // Derived and additive: present only on a delivered, unreported
+        // pty turn, so every existing reader of `state` is unchanged.
+        if self.awaiting_report() {
+            j["awaiting_report"] = json!(true);
+        }
+        j
     }
 }
+
+/// CAD-250: how long a delivered pty turn may wait on its report before
+/// it goes `unknown` (agent param `report_timeout_secs`; `0` disables).
+pub const DEFAULT_REPORT_TIMEOUT_SECS: u64 = 7200;
+
+/// The agent's report bound: `params.report_timeout_secs` (an integer or
+/// a digit string, as `agent set` stores it), else the default.
+pub fn report_timeout_secs(params: Option<&Value>) -> u64 {
+    params
+        .and_then(|p| p.get("report_timeout_secs"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(DEFAULT_REPORT_TIMEOUT_SECS)
+}
+
+/// The routed sources as an SQL list — must name exactly what
+/// [`Message::is_routed`] matches.
+const ROUTED_SOURCES_SQL: &str = "('worker_result','worker_notice','job_event')";
 
 impl Event {
     pub fn to_json(&self) -> Value {
@@ -2386,15 +2456,32 @@ impl Store {
         if !agent.enabled {
             return Ok(Take::Stop);
         }
+        // CAD-250: the actor serializes report-owing turns. While one is
+        // `running` (delivered, its report still owed), only routed
+        // notifications — fire-and-forget, complete at paste — may be
+        // claimed; every other delivery stays `queued`, never refused,
+        // until that turn is reported, reconciled or bounded to
+        // `unknown`.
+        let holding: bool = tx.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE alias=?
+                 AND state='running' AND source NOT IN {ROUTED_SOURCES_SQL})"
+            ),
+            [alias],
+            |r| r.get(0),
+        )?;
+        let next_sql = if holding {
+            format!(
+                "SELECT * FROM messages WHERE alias=? AND state='queued'
+                 AND source IN {ROUTED_SOURCES_SQL} ORDER BY seq LIMIT 1"
+            )
+        } else {
+            "SELECT * FROM messages WHERE alias=? AND state='queued'
+             ORDER BY seq LIMIT 1"
+                .to_string()
+        };
         loop {
-            let next = tx
-                .query_row(
-                    "SELECT * FROM messages WHERE alias=? AND state='queued'
-                     ORDER BY seq LIMIT 1",
-                    [alias],
-                    row_message,
-                )
-                .ok();
+            let next = tx.query_row(&next_sql, [alias], row_message).ok();
             let Some(message) = next else {
                 // A prior routed row in this same transaction may have
                 // been failed as unresolved before the queue became empty.
@@ -2545,13 +2632,60 @@ impl Store {
         result: &Value,
         error: Option<&str>,
     ) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        self.finish_in(&tx, message, status, result, error)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// CAD-250: move a delivered, unreported pty turn to `unknown` —
+    /// the report bound ran out, or a sibling's did and the actor fences.
+    /// Guarded in one transaction: a report or ack that landed after the
+    /// caller's read wins (`Ok(false)`, nothing written). `bound` is
+    /// `Some((secs, now))` when the row itself must still be overdue.
+    /// Otherwise the `unknown` finish is [`Store::finish`]'s:
+    /// `turn_finished`, the scoped `turn_unknown`, and exactly one
+    /// `worker_notice` to `reply_to` under its deterministic id —
+    /// never a result, never a replay.
+    pub fn expire_awaiting_report(
+        &self,
+        message_id: &str,
+        bound: Option<(u64, f64)>,
+        reason: &str,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let Some(current) = self.message_in(&tx, message_id)? else {
+            return Ok(false);
+        };
+        let due = match bound {
+            Some((secs, now)) => current.report_overdue(secs, now),
+            None => current.awaiting_report(),
+        };
+        if !due {
+            return Ok(false);
+        }
+        let stored = json!({"status": "unknown", "text": "", "error": reason,
+                            "via": "report_timeout", "turn_id": current.turn_id});
+        self.finish_in(&tx, &current, "unknown", &stored, Some(reason))?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn finish_in(
+        &self,
+        tx: &Connection,
+        message: &Message,
+        status: &str,
+        result: &Value,
+        error: Option<&str>,
+    ) -> Result<()> {
         if !matches!(status, "completed" | "failed" | "interrupted" | "unknown") {
             return Err(Error::internal(format!(
                 "Unexpected provider completion status: {status}"
             )));
         }
-        let conn = self.conn();
-        let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE messages SET state=?,result=?,error=?,completed=? WHERE id=?",
             params![status, result.to_string(), error, now(), message.id],
@@ -2561,7 +2695,7 @@ impl Store {
             params![now(), message.alias],
         )?;
         Self::event(
-            &tx,
+            tx,
             &message.alias,
             "turn_finished",
             json!({"message": message.id, "result": result}),
@@ -2580,7 +2714,7 @@ impl Store {
                     .optional()?;
                 if let Some(job_id) = job_id {
                     Self::event_scoped(
-                        &tx,
+                        tx,
                         &message.alias,
                         "turn_unknown",
                         json!({
@@ -2602,17 +2736,16 @@ impl Store {
         // slot free for the operator's later verdict (completed/failed)
         // or the interrupted notice.
         if status == "unknown" {
-            self.route_notice(&tx, message, "unknown", result)?;
+            self.route_notice(tx, message, "unknown", result)?;
         } else {
-            self.route_result(&tx, message, result)?;
+            self.route_result(tx, message, result)?;
         }
         // Task edge: normal completion of a task-attached kickoff moves
         // the task to review and binds head_sha to the reported commit.
         // Any other terminal leaves the task flagged where it stands.
         if status == "completed" {
-            self.task_on_completed(&tx, message, result)?;
+            self.task_on_completed(tx, message, result)?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -3762,9 +3895,11 @@ impl Store {
         self.message_in(&conn, id)
     }
 
-    /// The agent's in-flight turn, if any — at most one message per
-    /// alias is `running` at a time (the actor loop is serial). The
-    /// stall watch and the view surfaces both read this.
+    /// The agent's in-flight turn, if any — the actor loop is serial and
+    /// holds one report-owing turn at a time (CAD-250); a routed
+    /// notification is `running` only for its paste. The newest row wins
+    /// when legacy rows overlap. The stall watch and the view surfaces
+    /// both read this.
     pub fn running_message(&self, alias: &str) -> Result<Option<Message>> {
         let conn = self.conn();
         match conn.query_row(
@@ -3779,17 +3914,66 @@ impl Store {
         }
     }
 
-    /// Providers with at least one in-flight turn — the WAL watcher
-    /// refuses to checkpoint a store whose provider is mid-turn.
-    pub fn busy_providers(&self) -> Result<std::collections::HashSet<String>> {
+    /// CAD-250: the agent's delivered, unreported pty turns, oldest
+    /// first. One at most once `take_queued` holds the line; more only
+    /// for rows that accumulated before it did (adopted on a hot
+    /// restart), which the report bound then retires.
+    pub fn awaiting_reports(&self, alias: &str) -> Result<Vec<Message>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT * FROM messages WHERE alias=? AND state='running' ORDER BY seq")?;
+        let rows = stmt.query_map([alias], row_message)?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter(Message::awaiting_report).collect())
+    }
+
+    /// Queued deliveries that are turns of their own — what an
+    /// unreported turn holds back (routed notifications still pass).
+    pub fn queued_turns(&self, alias: &str) -> Result<i64> {
+        let conn = self.conn();
+        Ok(conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'
+                 AND source NOT IN {ROUTED_SOURCES_SQL}"
+            ),
+            [alias],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Providers with at least one *live* in-flight turn — the WAL
+    /// watcher refuses to checkpoint a store whose provider is mid-turn.
+    /// Live (CAD-250) means the alias has an actor (`live`, the daemon's
+    /// owned set) and, for a delivered pty turn awaiting its report, the
+    /// report bound has not run out at `now`: a stale row on a dead actor
+    /// or an overdue one never defers a checkpoint.
+    pub fn busy_providers(&self, live: &HashSet<String>, now: f64) -> Result<HashSet<String>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT a.provider FROM agents a
-             JOIN messages m ON m.alias = a.alias
+            "SELECT a.provider AS agent_provider, a.params AS agent_params, m.*
+             FROM agents a JOIN messages m ON m.alias = a.alias
              WHERE m.state IN ('submitting','running')",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let rows = stmt.query_map([], |r| {
+            let params: Option<String> = r.get("agent_params")?;
+            Ok((
+                r.get::<_, String>("agent_provider")?,
+                params.and_then(|p| serde_json::from_str::<Value>(&p).ok()),
+                row_message(r)?,
+            ))
+        })?;
+        let mut busy = HashSet::new();
+        for row in rows {
+            let (provider, params, message) = row?;
+            if !live.contains(&message.alias) {
+                continue;
+            }
+            if message.report_overdue(report_timeout_secs(params.as_ref()), now) {
+                continue;
+            }
+            busy.insert(provider);
+        }
+        Ok(busy)
     }
 
     /// Bound a non-agent event stream to its newest `keep` rows — the
@@ -6396,6 +6580,125 @@ mod tests {
             _ => panic!("expected a message"),
         }
         assert!(matches!(s.take_queued("a1").unwrap(), Take::Empty));
+    }
+
+    /// CAD-250: while a delivered turn awaits its report, the actor's
+    /// next claim is held — the second turn stays `queued` (never
+    /// refused) while routed notifications still pass. The bound moves
+    /// the overdue turn to `unknown` exactly once, with one notice to
+    /// its `reply_to`; an ack restarts the clock; a report that already
+    /// landed wins over the expiry.
+    #[test]
+    fn unreported_turn_holds_the_queue_until_bounded() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "pm", &cwd);
+        reg(&s, "w2", &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "one", Some("pm"), "m1", "user").unwrap();
+        s.enqueue("w1", "two", Some("pm"), "m2", "user").unwrap();
+        let Take::Message(m1) = s.take_queued("w1").unwrap() else {
+            panic!("m1 must be claimed");
+        };
+        s.mark_running(&m1.id, "pty-g-m1").unwrap();
+        let m1 = s.message("m1").unwrap().unwrap();
+        // Between turn start and the submitted marker the row is
+        // `running` but not yet `awaiting_report` — it still holds.
+        assert!(!m1.awaiting_report());
+        assert!(matches!(s.take_queued("w1").unwrap(), Take::Empty));
+        s.mark_submitted(&m1).unwrap();
+        let m1 = s.message("m1").unwrap().unwrap();
+        assert!(m1.awaiting_report());
+        assert_eq!(m1.to_json()["awaiting_report"], true);
+        assert!(matches!(s.take_queued("w1").unwrap(), Take::Empty));
+        assert_eq!(s.message("m2").unwrap().unwrap().state, "queued");
+        assert_eq!(s.queued_turns("w1").unwrap(), 1);
+        assert_eq!(
+            s.awaiting_reports("w1")
+                .unwrap()
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1"]
+        );
+
+        // A routed notification overtakes the held turn.
+        s.enqueue("w2", "side", Some("w1"), "x1", "user").unwrap();
+        let Take::Message(x1) = s.take_queued("w2").unwrap() else {
+            panic!("x1 must be claimed");
+        };
+        s.finish(
+            &x1,
+            "completed",
+            &json!({"status": "completed", "text": "ok"}),
+            None,
+        )
+        .unwrap();
+        let Take::Message(routed) = s.take_queued("w1").unwrap() else {
+            panic!("the routed result must pass the hold");
+        };
+        assert_eq!(routed.source, "worker_result");
+        assert_eq!(s.message("m2").unwrap().unwrap().state, "queued");
+
+        // An ack restarts the clock; the bound counts from it.
+        let delivered = m1.report_clock().unwrap();
+        s.mark_ack(&m1, Some("on it")).unwrap();
+        let m1 = s.message("m1").unwrap().unwrap();
+        let acked = m1.report_clock().unwrap();
+        assert!(acked >= delivered);
+        assert!(m1.awaiting_report(), "an ack does not finish the turn");
+        assert!(!m1.report_overdue(0, acked + 1e9), "0 disables the bound");
+        assert!(!s
+            .expire_awaiting_report("m1", Some((10, acked + 5.0)), "r")
+            .unwrap());
+        assert_eq!(s.message("m1").unwrap().unwrap().state, "running");
+
+        // Past the bound: unknown, one notice, never a result.
+        assert!(s
+            .expire_awaiting_report("m1", Some((10, acked + 11.0)), "bound ran out")
+            .unwrap());
+        let m1 = s.message("m1").unwrap().unwrap();
+        assert_eq!(m1.state, "unknown");
+        assert_eq!(m1.result.as_ref().unwrap()["via"], "report_timeout");
+        assert!(!s
+            .expire_awaiting_report("m1", Some((10, acked + 99.0)), "again")
+            .unwrap());
+        let notices: Vec<Message> = s
+            .messages("pm")
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.source == "worker_notice" && m.body.contains("\"m1\""))
+            .collect();
+        assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+        assert!(!s
+            .messages("pm")
+            .unwrap()
+            .iter()
+            .any(|m| m.source == "worker_result" && m.body.contains("\"m1\"")));
+
+        // The hold lifts once the owed turn is resolved.
+        let Take::Message(next) = s.take_queued("w1").unwrap() else {
+            panic!("m2 must be claimed once m1 resolved");
+        };
+        assert_eq!(next.id, "m2");
+
+        // A report that lands before the expiry wins.
+        s.mark_running("m2", "pty-g-m2").unwrap();
+        let m2 = s.message("m2").unwrap().unwrap();
+        s.mark_submitted(&m2).unwrap();
+        let m2 = s.message("m2").unwrap().unwrap();
+        s.finish(
+            &m2,
+            "completed",
+            &json!({"status": "completed", "text": "done"}),
+            None,
+        )
+        .unwrap();
+        assert!(!s
+            .expire_awaiting_report("m2", Some((1, m2.report_clock().unwrap() + 9.0)), "late")
+            .unwrap());
+        assert!(!s.expire_awaiting_report("m2", None, "late").unwrap());
+        assert_eq!(s.message("m2").unwrap().unwrap().state, "completed");
     }
 
     #[test]

@@ -924,6 +924,17 @@ impl Shared {
             if self.closing.load(Ordering::SeqCst) {
                 return Ok(());
             }
+            // CAD-250: a delivered turn whose report never came is
+            // bounded here, on the actor that owns the endpoint — it goes
+            // `unknown` and fences exactly like any other uncertain
+            // outcome. Checked every pass: the queue wait below is
+            // bounded (5s idle, 30s gate backoff), so the bound fires
+            // within seconds of running out.
+            if let Some(awaiting) = self.report_overdue(alias) {
+                if self.report_timeout(alias, awaiting)? {
+                    return Err(Error::unknown(UNKNOWN_GENERIC_REASON));
+                }
+            }
             // Sample before the empty check. `disconnected` probes the
             // pane before the wait; a `notify_agent` in that gap must
             // still wake the actor or a routed reply sits until the
@@ -1157,6 +1168,119 @@ impl Shared {
         Ok(())
     }
 
+    /// CAD-250: the agent's delivered-unreported turns and their bound
+    /// when at least one has run out — `None` while every one is within
+    /// it (or the bound is `0`, disabled).
+    fn report_overdue(&self, alias: &str) -> Option<(Vec<Message>, u64)> {
+        let awaiting = self.store.awaiting_reports(alias).ok()?;
+        if awaiting.is_empty() {
+            return None;
+        }
+        let bound = store::report_timeout_secs(self.store.agent(alias).ok()?.params.as_ref());
+        let now = epoch_secs();
+        awaiting
+            .iter()
+            .any(|m| m.report_overdue(bound, now))
+            .then_some((awaiting, bound))
+    }
+
+    /// CAD-250: retire overdue unreported turns to `unknown` and fence
+    /// the actor — the standard uncertain-outcome path, never a
+    /// completion and never a replay. Each overdue row gets one
+    /// `report_timeout` event and, through the `unknown` finish, exactly
+    /// one `worker_notice` to its `reply_to` (a job kickoff's is the PM;
+    /// `send` defaults it to the upstream). Siblings still within the
+    /// bound — only rows that accumulated before one-turn-per-actor —
+    /// go `unknown` with it, since the endpoint they ran on is being
+    /// detached. Every write is guarded: a report that lands first wins.
+    /// `Ok(true)` when anything went `unknown` (the caller exits fenced).
+    fn report_timeout(&self, alias: &str, (awaiting, bound): (Vec<Message>, u64)) -> Result<bool> {
+        let now = epoch_secs();
+        let (overdue, siblings): (Vec<&Message>, Vec<&Message>) =
+            awaiting.iter().partition(|m| m.report_overdue(bound, now));
+        let mut expired: Vec<String> = Vec::new();
+        for m in overdue {
+            let waited = m.report_clock().map_or(0, |c| (now - c).max(0.0) as u64);
+            let reason = format!(
+                "no report within report_timeout_secs={bound} ({}) of delivery \
+                 — outcome unknown; not completed, not replayed",
+                fmt_duration(bound)
+            );
+            if self
+                .store
+                .expire_awaiting_report(&m.id, Some((bound, now)), &reason)?
+            {
+                let (job_id, task_id) = self.message_scope(m);
+                let _ = self.store.event_public_scoped(
+                    alias,
+                    "report_timeout",
+                    json!({"message": m.id, "turn_id": m.turn_id,
+                           "waited_secs": waited, "report_timeout_secs": bound}),
+                    job_id.as_deref(),
+                    task_id,
+                );
+                self.notify_routed_target(m, &Value::Null);
+                expired.push(m.id.clone());
+            }
+        }
+        let Some(first) = expired.first().cloned() else {
+            return Ok(false);
+        };
+        for m in siblings {
+            let reason = format!(
+                "fenced with {first}, whose report bound ran out — outcome \
+                 unknown; not completed, not replayed"
+            );
+            if self.store.expire_awaiting_report(&m.id, None, &reason)? {
+                self.notify_routed_target(m, &Value::Null);
+                expired.push(m.id.clone());
+            }
+        }
+        let reason = format!(
+            "no report within report_timeout_secs={bound} ({}) — {} turn(s) went unknown: {}",
+            fmt_duration(bound),
+            expired.len(),
+            expired.join(", ")
+        );
+        // One write, as in `unknown`: the fence lands with the cleared
+        // endpoint.
+        self.store
+            .set_state_detached(alias, "attention", Some(&format_unknown_fence(&reason)))?;
+        let _ = self
+            .store
+            .event_public(alias, "attention", json!({"reason": reason}));
+        self.wake();
+        Ok(true)
+    }
+
+    /// CAD-250: the agent's `awaiting_report` view — the oldest
+    /// delivered-unreported turn, how long it has waited, the bound and
+    /// what is queued behind it. `None` when no turn awaits a report.
+    fn awaiting_report_view(&self, agent: &Agent) -> Option<Value> {
+        let awaiting = self.store.awaiting_reports(&agent.alias).ok()?;
+        let head = awaiting.first()?;
+        let bound = store::report_timeout_secs(agent.params.as_ref());
+        let waited = head
+            .report_clock()
+            .map_or(0, |c| (epoch_secs() - c).max(0.0) as u64);
+        let acked = head
+            .result
+            .as_ref()
+            .is_some_and(|r| r.get("ack").is_some_and(|a| !a.is_null()));
+        Some(json!({
+            "message": head.id,
+            "turn_id": head.turn_id,
+            "task_id": head.task_id,
+            "since_secs": waited,
+            "acked": acked,
+            "report_timeout_secs": bound,
+            // `null` when the bound is disabled (`0`).
+            "remaining_secs": (bound > 0).then(|| bound.saturating_sub(waited)),
+            "count": awaiting.len(),
+            "queued_behind": self.store.queued_turns(&agent.alias).unwrap_or(0),
+        }))
+    }
+
     /// The attention text for an unknown-outcome fence. A re-stamp on
     /// actor exit or relaunch-skip keeps the provider account already
     /// stored on the unknown row (or, failing that, the previous
@@ -1271,6 +1395,9 @@ impl Shared {
                         view.apply(&mut j);
                     }
                     apply_auto_stop_view(&mut j, &agent, markers.get(&agent.alias));
+                    if let Some(awaiting) = self.awaiting_report_view(&agent) {
+                        j["awaiting_report"] = awaiting;
+                    }
                     agents.push(j);
                 }
                 Ok(json!({"agents": agents}))
@@ -1290,6 +1417,9 @@ impl Shared {
                 }
                 let marker = self.store.last_event_of(&alias, AUTO_STOP_MARKER_KINDS)?;
                 apply_auto_stop_view(&mut agent_json, &agent, marker.as_ref());
+                if let Some(awaiting) = self.awaiting_report_view(&agent) {
+                    agent_json["awaiting_report"] = awaiting;
+                }
                 if agent.endpoint_kind == "pty" {
                     self.pty_lane_facts(&agent, &mut agent_json);
                 }
@@ -2857,6 +2987,10 @@ impl Shared {
                     });
                     self.store.finish(&message, "completed", &stored, None)?;
                     self.notify_routed_target(&message, &stored);
+                    // CAD-250: the report frees the actor's one turn —
+                    // wake it so the next queued delivery is claimed now,
+                    // not on the idle poll.
+                    self.notify_agent(&message.alias);
                 } else if message.state == "completed" {
                     // Idempotent retry vs conflicting duplicate.
                     let same = message
@@ -4318,7 +4452,17 @@ impl Shared {
         if !t.wal_checkpoint {
             return;
         }
-        let Ok(busy) = self.store.busy_providers() else {
+        // CAD-250: only live turns defer — an alias with an actor, and
+        // a delivered pty turn still inside its report bound.
+        let live: HashSet<String> = self
+            .lifecycle
+            .lock()
+            .unwrap()
+            .agents
+            .keys()
+            .cloned()
+            .collect();
+        let Ok(busy) = self.store.busy_providers(&live, epoch_secs()) else {
             return;
         };
         wal_pass(
@@ -6938,7 +7082,9 @@ mod tests {
             panic!("queued message must be taken");
         };
         shared.store.mark_running(&msg.id, "pty-1-wal").unwrap();
-        let busy = shared.store.busy_providers().unwrap();
+        // The alias has an actor — the daemon's owned set (CAD-250).
+        let live: HashSet<String> = ["op1".to_string()].into();
+        let busy = shared.store.busy_providers(&live, epoch_secs()).unwrap();
         assert!(busy.contains("codex"), "{busy:?}");
 
         let root = dir.path().join("codex");
@@ -6964,10 +7110,79 @@ mod tests {
             .store
             .finish(&msg, "completed", &json!({"status": "completed"}), None)
             .unwrap();
-        let busy = shared.store.busy_providers().unwrap();
+        let busy = shared.store.busy_providers(&live, epoch_secs()).unwrap();
         assert!(!busy.contains("codex"), "{busy:?}");
         pass(&roots, &busy, 1, &shared, &mut watch);
         assert_eq!(wal_size(&db), 0);
+    }
+
+    /// CAD-250: only a *live* turn defers a checkpoint. A delivered pty
+    /// turn awaiting its report is busy while its actor lives and the
+    /// report bound has not run out; the same row on an alias with no
+    /// actor, or past its bound, is stale — the pass checkpoints anyway.
+    #[test]
+    fn wal_pass_ignores_stale_awaiting_report_rows() {
+        let (dir, shared) = shared();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "dv1",
+                provider: "devin",
+                endpoint_kind: "pty",
+                role: "worker",
+                cwd: dir.path().to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: Some(r#"{"report_timeout_secs": 3600}"#),
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .enqueue("dv1", "do work", None, "m-stale-1", "test")
+            .unwrap();
+        let Take::Message(msg) = shared.store.take_queued("dv1").unwrap() else {
+            panic!("queued message must be taken");
+        };
+        shared.store.mark_running(&msg.id, "pty-1-stale").unwrap();
+        let msg = shared.store.message(&msg.id).unwrap().unwrap();
+        shared.store.mark_submitted(&msg).unwrap();
+        let msg = shared.store.message(&msg.id).unwrap().unwrap();
+        assert!(msg.awaiting_report(), "{msg:?}");
+        let delivered = msg.started.unwrap();
+
+        let live: HashSet<String> = ["dv1".to_string()].into();
+        let none = HashSet::new();
+        let within = delivered + 60.0;
+        let past = delivered + 3601.0;
+        // Live actor, inside the bound: busy.
+        let busy = shared.store.busy_providers(&live, within).unwrap();
+        assert!(busy.contains("devin"), "{busy:?}");
+        // No actor owns the alias: the row is stale, not busy.
+        let busy = shared.store.busy_providers(&none, within).unwrap();
+        assert!(!busy.contains("devin"), "{busy:?}");
+        // Past the report bound: stale even with an actor.
+        let busy = shared.store.busy_providers(&live, past).unwrap();
+        assert!(!busy.contains("devin"), "{busy:?}");
+
+        // And the checkpoint decision follows: a stale row never defers.
+        let root = dir.path().join("devin");
+        std::fs::create_dir_all(&root).unwrap();
+        let (db, _writer) = wal_db(&root, "sessions.db");
+        assert!(wal_size(&db) > 0);
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "devin",
+            label: "devin sessions",
+            root,
+        }];
+        let mut watch = WalWatch::default();
+        let live_busy = shared.store.busy_providers(&live, within).unwrap();
+        pass(&roots, &live_busy, 1, &shared, &mut watch);
+        assert!(wal_size(&db) > 0, "a live turn defers the checkpoint");
+        let stale_busy = shared.store.busy_providers(&live, past).unwrap();
+        pass(&roots, &stale_busy, 1, &shared, &mut watch);
+        assert_eq!(wal_size(&db), 0, "an overdue row does not defer it");
     }
 
     /// A reader mid-snapshot makes TRUNCATE return busy — the pass

@@ -1733,9 +1733,10 @@ fn pty_hot_restart_report_before_adoption_rejected_stale() {
 
 #[test]
 fn pty_hot_restart_adopts_multiple_running_turns() {
-    // Pasted pty messages stay `running` until reported and
-    // `take_queued` has no one-running-per-alias guard, so an agent
-    // can hold more than one in-flight turn. Every qualifying turn is
+    // Pasted pty messages stay `running` until reported. Since CAD-250
+    // `take_queued` holds one report-owing turn per actor, but rows that
+    // accumulated before that rule can still hold more than one
+    // in-flight turn on an alias. Every qualifying turn is
     // adopted — same pane proof covers them all — not just the last
     // one the marker listed. The mock pane reads busy through m1's
     // turn, so the second `running` row is crafted the way the real
@@ -1791,6 +1792,68 @@ fn pty_hot_restart_adopts_multiple_running_turns() {
         .unwrap();
         d.wait_message("dv1", id, &["completed"], 15);
     }
+}
+
+/// CAD-250 reconcile path for rows that accumulated before one turn per
+/// actor (the live aos-pm shape: delivered `user` turns, no `reply_to`,
+/// days old, never reported). A hot restart adopts them like any proven
+/// turn; they read `awaiting_report`, and the actor's first pass retires
+/// every overdue one to `unknown` through the report bound — one
+/// `report_timeout` event each, agent fenced — nothing completed,
+/// deleted or replayed, and a queued send behind them stays queued.
+#[test]
+fn pty_hot_restart_retires_stale_awaiting_report_rows() {
+    let mut d = TestDaemon::start();
+    let _mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    let agent = d.wait_agent("dv1", "idle", 20);
+    let generation = agent["generation"].as_str().unwrap().to_string();
+    let old = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+        - 3.0 * 86_400.0;
+    {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        for id in ["old1", "old2"] {
+            conn.execute(
+                "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,
+                     result,created,started)
+                 VALUES(?1,'dv1','nudge',NULL,'user','running',?2,
+                     '{\"status\":\"submitted\",\"ack\":null}',?3,?3)",
+                rusqlite::params![id, format!("pty-{generation}-turn-{id}"), old],
+            )
+            .unwrap();
+        }
+    }
+    d.rpc("shutdown", json!({})).unwrap();
+    d.handle.take().unwrap().join().unwrap().unwrap();
+    let state = d.state.clone();
+    assert_eq!(
+        read_marker(&state)["entries"].as_array().unwrap().len(),
+        2,
+        "both stale rows are recorded like any running turn"
+    );
+    std::mem::forget(d);
+    let d = TestDaemon::start_on(state);
+    wait_event_count(&d, "dv1", "turn_adopted", 2, 25);
+    for id in ["old1", "old2"] {
+        let m = d.wait_message("dv1", id, &["unknown"], 20);
+        assert_eq!(m["result"]["via"], "report_timeout", "{m}");
+    }
+    d.wait_agent("dv1", "attention", 20);
+    let timeouts = wait_event_count(&d, "dv1", "report_timeout", 2, 5);
+    assert_eq!(timeouts.len(), 2);
+    // Fenced, so a later send is held, never delivered to the pane.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "after", "message": "new1"}),
+    )
+    .unwrap();
+    assert_eq!(d.message_state("dv1", "new1"), "queued");
+    let show = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap();
+    assert_eq!(show["unknown"], 2, "{show}");
+    assert!(show["agent"]["awaiting_report"].is_null(), "{show}");
 }
 
 /// Releases the CAD-241 snapshot barrier once, including when the test
@@ -5223,6 +5286,19 @@ fn pty_token(d: &TestDaemon, alias: &str, id: &str) -> String {
     m["turn_id"].as_str().unwrap().to_string()
 }
 
+/// Report a pty turn's result and wait for it to complete. Since CAD-250
+/// an actor holds one report-owing turn at a time, so a test that sends
+/// a second task reports the first before the next can be claimed.
+fn pty_report_done(d: &TestDaemon, alias: &str, id: &str) {
+    let token = pty_token(d, alias, id);
+    d.rpc(
+        "message_report",
+        json!({"message": id, "token": token, "kind": "result", "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message(alias, id, &["completed"], 10);
+}
+
 #[test]
 fn pty_send_pastes_literal_and_completes_via_report() {
     let d = TestDaemon::start();
@@ -5266,6 +5342,9 @@ fn pty_send_pastes_literal_and_completes_via_report() {
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
     let token1 = pty_token(&d, "dv1", "m1");
     assert!(token1.starts_with(&format!("pty-{gen}-")), "{token1}");
+
+    // CAD-250: m1 owes its report before the actor claims the next turn.
+    pty_report_done(&d, "dv1", "m1");
 
     // Literal text with shell metacharacters is pasted verbatim into
     // the pane input — one paste per claim, so m2 needs a new one.
@@ -5333,7 +5412,9 @@ fn pty_claim_is_single_use_and_expires() {
         json!({"alias": "dv1", "text": "one", "message": "m1"}),
     )
     .unwrap();
-    pty_token(&d, "dv1", "m1");
+    // CAD-250: m1 reports so m2 is held by the spent claim, not by the
+    // actor's one report-owing turn.
+    pty_report_done(&d, "dv1", "m1");
     // The claim was consumed: a second send queues, it does not paste.
     // Wait for m2's own recorded refusal, not a fixed sleep: the actor
     // takes the send at once and the gate may still be probing (CAD-286).
@@ -8179,6 +8260,8 @@ fn pty_ready_claims_stack_fifo_with_claimer() {
         .unwrap();
     }
     d.wait_message("dv", "m1", &["running"], 15);
+    // CAD-250: m2 is claimed once m1 has reported; bob's claim waits.
+    pty_report_done(&d, "dv", "m1");
     d.wait_message("dv", "m2", &["running"], 15);
     let used: Vec<Value> = d
         .events("dv")
@@ -8342,7 +8425,7 @@ fn pty_unfence_resume_reports_adopted_pane() {
         json!({"alias": "dv1", "text": "task", "message": "m1"}),
     )
     .unwrap();
-    pty_token(&d, "dv1", "m1");
+    pty_report_done(&d, "dv1", "m1");
     let pane_pid: i32 = std::fs::read_to_string(d.pane_file(&mock, "dv1", "pid"))
         .unwrap()
         .trim()
@@ -8657,6 +8740,7 @@ fn pty_render_check_is_differential_not_contains() {
     )
     .unwrap();
     d.wait_message("dv", "m1", &["running"], 20);
+    pty_report_done(&d, "dv", "m1");
     // Now the pane drops the paste: the body is already on screen, so a
     // `contains` check would pass — the differential check must not.
     atomic_write(d.pane_file(&mock, "dv", "swallow"), "1");
@@ -11441,7 +11525,7 @@ fn pty_stub_profile_busy_marker_blocks_paste() {
                "message": "m1"}),
     )
     .unwrap();
-    pty_token(&d, "st", "m1");
+    pty_report_done(&d, "st", "m1");
     // The stub's own marker must block.
     atomic_write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n");
     d.rpc(
@@ -11484,7 +11568,7 @@ fn pty_stub_profile_consumes_one_claim_per_send() {
         json!({"alias": "st", "text": "first", "message": "m1"}),
     )
     .unwrap();
-    pty_token(&d, "st", "m1");
+    pty_report_done(&d, "st", "m1");
     // The claim is spent: a second send waits at the gate.
     d.rpc(
         "agent_send",
@@ -11856,7 +11940,7 @@ fn pty_claude_busy_and_approval_gate_sends() {
         json!({"alias": "cl", "text": "stub marker is inert", "message": "m1"}),
     )
     .unwrap();
-    pty_token(&d, "cl", "m1");
+    pty_report_done(&d, "cl", "m1");
     // The claude spinner's own phrase holds the gate.
     std::fs::write(&state, "✻ Churning… (esc to interrupt · 4s)\n").unwrap();
     d.rpc(
@@ -11875,7 +11959,7 @@ fn pty_claude_busy_and_approval_gate_sends() {
     let probe = d.rpc("agent_probe", json!({"alias": "cl"})).unwrap();
     assert_eq!(probe["busy_marker"], true, "{probe}");
     std::fs::remove_file(&state).unwrap();
-    pty_token(&d, "cl", "m2");
+    pty_report_done(&d, "cl", "m2");
     // A permission select holds the next send; the pane answers it.
     std::fs::write(
         &state,
@@ -12701,7 +12785,7 @@ fn pty_cursor_busy_and_approval_gate_sends() {
         json!({"alias": "cu", "text": "stub marker is inert", "message": "m1"}),
     )
     .unwrap();
-    pty_token(&d, "cu", "m1");
+    pty_report_done(&d, "cu", "m1");
     // The cursor spinner's own shape holds the gate — status row
     // above the input line plus the interrupt hint on it. (The
     // model/cwd bar renders below the input row on real frames.)
@@ -12726,7 +12810,7 @@ fn pty_cursor_busy_and_approval_gate_sends() {
     let probe = d.rpc("agent_probe", json!({"alias": "cu"})).unwrap();
     assert_eq!(probe["busy_marker"], true, "{probe}");
     std::fs::remove_file(&state).unwrap();
-    pty_token(&d, "cu", "m2");
+    pty_report_done(&d, "cu", "m2");
     // A permission select holds the next send; the pane answers it.
     std::fs::write(
         &state,
@@ -15000,7 +15084,7 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
         json!({"alias": "dv", "text": "do work", "message": "m1"}),
     )
     .unwrap();
-    let token1 = pty_token(&d, "dv", "m1");
+    pty_token(&d, "dv", "m1");
 
     // The menu appears mid-turn.
     atomic_write(d.pane_file(&mock, "dv", "tui-state"), DEVIN_MENU);
@@ -15015,6 +15099,8 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
     // The views carry the menu line while the turn runs.
     let show = d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"].clone();
     assert_eq!(show["pane_menu"], "$ printenv FOO", "{show}");
+    // CAD-250: m1 reports so the actor may claim m2 at all.
+    pty_report_done(&d, "dv", "m1");
 
     // A paste under the menu is refused: m2 queues behind a gate_wait
     // naming the menu, and no claim is eaten by the refusal.
@@ -15079,16 +15165,7 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
         .rpc("agent_answer", json!({"alias": "dv", "choice": "8"}))
         .is_err());
     d.wait_message("dv", "m2", &["running"], 20);
-    let token2 = pty_token(&d, "dv", "m2");
-    for (id, token) in [("m1", &token1), ("m2", &token2)] {
-        d.rpc(
-            "message_report",
-            json!({"message": id, "token": token, "kind": "result",
-                   "text": "done"}),
-        )
-        .unwrap();
-        d.wait_message("dv", id, &["completed"], 10);
-    }
+    pty_report_done(&d, "dv", "m2");
     stall_sample(0);
 }
 
@@ -15096,8 +15173,9 @@ fn pty_approval_menu_blocks_pastes_and_answers() {
 /// by the sampled probe: `turn_silent_end` fires once per message
 /// carrying the age and the admitting probe, the views flag it
 /// (`silent_ended`, `ended_secs`, `ended?:` in status, an overview
-/// needs-me row), and a `--ready` send is the one-command recovery.
-/// The message itself is never auto-resolved.
+/// needs-me row naming `agent attach`). The message itself is never
+/// auto-resolved — and since CAD-250 a follow-up send queues behind the
+/// unreported turn until it is reported.
 #[test]
 fn pty_silent_end_fires_once_and_recovers() {
     let d = TestDaemon::start();
@@ -15155,15 +15233,14 @@ fn pty_silent_end_fires_once_and_recovers() {
         .iter()
         .find(|n| n["kind"] == "silent_end")
         .expect("silent_end row");
-    assert_eq!(
-        ended["command"],
-        "cadence send w1 --ready --text \"continue …\""
-    );
+    // CAD-250: a follow-up send would queue behind the unreported turn,
+    // so the remedy is the pane itself.
+    assert_eq!(ended["command"], "cadence agent attach w1");
     assert!(ended["title"].as_str().unwrap().contains("w1"));
 
-    // The message is flagged, never auto-resolved — and the remedy is
-    // the documented ready-gated follow-up verbatim: the idle pane
-    // passes the claim probe and the new turn proceeds normally.
+    // The message is flagged, never auto-resolved. A `--ready` follow-up
+    // is accepted but held `queued` behind the unreported turn (not
+    // pasted, not refused); the report releases it.
     assert_eq!(d.message_state("w1", "ms9"), "running");
     let (ok, sent) = cadence_cli(
         &d.state,
@@ -15172,17 +15249,165 @@ fn pty_silent_end_fires_once_and_recovers() {
     );
     assert!(ok, "{sent}");
     let ms10 = sent["message"].as_str().unwrap().to_string();
+    assert_eq!(sent["state"], "queued", "{sent}");
+    assert_eq!(d.message_state("w1", &ms10), "queued");
+    d.rpc(
+        "message_report",
+        json!({"message": "ms9", "token": token, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "ms9", &["completed"], 10);
     let token2 = pty_token(&d, "w1", &ms10);
-    for (id, t) in [("ms9", &token), (ms10.as_str(), &token2)] {
+    d.rpc(
+        "message_report",
+        json!({"message": ms10, "token": token2, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("w1", &ms10, &["completed"], 10);
+    stall_sample(0);
+}
+
+/// CAD-250 — the aos-pm accumulation shape: a pty worker that is sent
+/// several tasks and never reports holds exactly ONE `running` turn;
+/// the rest stay `queued` (accepted, never refused, never pasted) while
+/// routed notifications still pass. The unreported turn is visible as
+/// `awaiting_report` in `agent show`, `status` and the overview. A result
+/// report releases the next turn; past `report_timeout_secs` (set live
+/// through `agent set`) the unreported turn goes `unknown` with exactly
+/// one notice to its `reply_to` and the agent fences — nothing is
+/// completed, and nothing queued behind it is replayed or delivered.
+#[test]
+fn pty_unreported_turn_holds_queue_and_bounds_to_unknown() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register("pm");
+    d.register("helper");
+    d.register_stub("w1", json!({"auto_ready": "verified"}));
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("helper", "idle", 10);
+    d.wait_agent("w1", "idle", 20);
+    for i in 1..=5 {
         d.rpc(
-            "message_report",
-            json!({"message": id, "token": t, "kind": "result",
-                   "text": "done"}),
+            "agent_send",
+            json!({"alias": "w1", "text": format!("task {i}"),
+                   "message": format!("acc{i}"), "reply_to": "pm"}),
         )
         .unwrap();
-        d.wait_message("w1", id, &["completed"], 10);
     }
-    stall_sample(0);
+    let token1 = pty_token(&d, "w1", "acc1");
+    // Proof the actor kept claiming past the held turn: a routed
+    // notification to w1 is delivered (complete at paste) while acc2..5
+    // stay put.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "helper", "text": "ping", "message": "h1",
+               "reply_to": "w1"}),
+    )
+    .unwrap();
+    d.wait_message("helper", "h1", &["completed"], 15);
+    let routed = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["source"] == "worker_result")
+        .expect("routed result queued on w1")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let delivered = d.wait_message("w1", &routed, &["completed"], 20);
+    assert_eq!(delivered["result"]["via"], "pty_deliver", "{delivered}");
+
+    let running_ids = |d: &TestDaemon| -> Vec<String> {
+        d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["state"] == "running")
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(running_ids(&d), ["acc1"]);
+    for i in 2..=5 {
+        assert_eq!(d.message_state("w1", &format!("acc{i}")), "queued");
+    }
+
+    // Visible: agent show, status and the overview name the state.
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    let awaiting = &show["agent"]["awaiting_report"];
+    assert_eq!(awaiting["message"], "acc1", "{awaiting}");
+    assert_eq!(awaiting["queued_behind"], 4, "{awaiting}");
+    assert_eq!(awaiting["report_timeout_secs"], 7200, "{awaiting}");
+    assert!(
+        awaiting["remaining_secs"].as_u64().unwrap() > 7000,
+        "{awaiting}"
+    );
+    let acc1 = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "acc1")
+        .unwrap();
+    assert_eq!(acc1["awaiting_report"], true, "{acc1}");
+    let table = status_table(&d.state, &[]);
+    assert!(table.contains("awaiting_report"), "{table}");
+    let home = TempDir::new().unwrap();
+    let view = overview_at(home.path(), &d.state, None, &[]);
+    let row = view["needs_me"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "awaiting_report")
+        .cloned()
+        .expect("awaiting_report needs-me row");
+    assert_eq!(row["command"], "cadence agent show w1", "{row}");
+    assert_eq!(row["subject"]["id"], "w1", "{row}");
+    assert!(row["title"].as_str().unwrap().contains("4 queued"), "{row}");
+
+    // A result report releases exactly the next turn.
+    d.rpc(
+        "message_report",
+        json!({"message": "acc1", "token": token1, "kind": "result",
+               "text": "done"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "acc1", &["completed"], 10);
+    pty_token(&d, "w1", "acc2");
+    assert_eq!(running_ids(&d), ["acc2"]);
+
+    // The bound, lowered live: acc2 goes `unknown`, never completed.
+    d.rpc(
+        "agent_set",
+        json!({"alias": "w1", "patch": {"report_timeout_secs": "1"}}),
+    )
+    .unwrap();
+    let acc2 = d.wait_message("w1", "acc2", &["unknown"], 20);
+    assert_eq!(acc2["result"]["via"], "report_timeout", "{acc2}");
+    d.wait_agent("w1", "attention", 20);
+    let timeouts = wait_event_count(&d, "w1", "report_timeout", 1, 5);
+    assert_eq!(timeouts.len(), 1);
+    assert_eq!(timeouts[0]["payload"]["message"], "acc2");
+    // Exactly one notice to reply_to, and no fabricated result.
+    let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap();
+    let about_acc2 = |source: &str| {
+        pm["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["source"] == source && m["body"].as_str().unwrap_or_default().contains("acc2")
+            })
+            .count()
+    };
+    assert_eq!(about_acc2("worker_notice"), 1, "{pm}");
+    assert_eq!(about_acc2("worker_result"), 0, "{pm}");
+    // Nothing behind it was replayed or delivered; nothing else ran.
+    assert!(running_ids(&d).is_empty());
+    for i in 3..=5 {
+        assert_eq!(d.message_state("w1", &format!("acc{i}")), "queued");
+    }
+    assert_eq!(d.message_state("w1", "acc1"), "completed");
 }
 
 /// A menu that opens BEFORE any turn starts — the pane sits blocked

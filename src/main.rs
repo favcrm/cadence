@@ -2549,8 +2549,11 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
                     .chars()
                     .take(50)
                     .collect::<String>();
+                // CAD-250: a delivered pty turn still owed its report is
+                // named as such, not as an ordinary running turn.
                 json!({"id": m["id"], "age_secs": (now - started).max(0.0) as u64,
-                       "text": head})
+                       "text": head,
+                       "awaiting_report": m["awaiting_report"].as_bool().unwrap_or(false)})
             });
         // One probe per pty agent per invocation — and only for an
         // agent that actually has a pane (a live endpoint); a stopped
@@ -2596,6 +2599,9 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
             "dead": a["dead"].as_bool().unwrap_or(false),
             "resumable": a["resumable"].as_bool().unwrap_or(false),
             "running": running,
+            // CAD-250: the daemon's `awaiting_report` view (wait, bound,
+            // queued behind it) — null when no turn awaits a report.
+            "awaiting_report": a["awaiting_report"].clone(),
             "queued": queued,
             "unknown": unknown,
             "pane": pane,
@@ -2658,6 +2664,9 @@ fn print_status_table(view: &Value) {
             }
             if a["cwd_deleted"].as_bool().unwrap_or(false) {
                 flags.push("cwd_deleted");
+            }
+            if a["awaiting_report"].is_object() {
+                flags.push("awaiting_report");
             }
             let pane = a["pane"]["verdict"].as_str().unwrap_or("-").to_string();
             let issues = a["issues"]
