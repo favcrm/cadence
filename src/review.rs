@@ -543,6 +543,23 @@ fn fetch_ref(repo: &Path, src: &str, dst: &str, secs: u64) -> Result<String> {
     )
 }
 
+/// Files `head` changes itself: `merge-base(base, head)..head`, so what
+/// the base changed after the PR was cut is not attributed to it.
+fn own_changes(
+    repo: &Path,
+    base: &str,
+    head: &str,
+    secs: u64,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mb = git(repo, &["merge-base", base, head], secs)?;
+    let names = git(repo, &["diff", "--name-only", &mb, head], secs)?;
+    Ok(names
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// The review's private ref namespace, `refs/cadence/review/<pr>/`,
 /// deleted when the run ends however it ends.
 struct ReviewRefs {
@@ -2134,8 +2151,14 @@ pub fn run(opts: &Options) -> Result<i32> {
         .map(Step::to_json)
         .collect::<Vec<_>>());
 
-    // Pairwise conflicts with the other open PRs (files only).
+    // Pairwise conflicts with the other open PRs (files only). A file
+    // only counts when both PRs change it themselves, each measured from
+    // its own merge-base with the current base: two PRs cut from
+    // different base commits otherwise "conflict" on whatever the base
+    // changed in between, which neither PR touched (CAD-277).
     let mut pr_conflicts = Vec::new();
+    report["open_pr_conflicts_base"] = json!(base_sha);
+    let mine = own_changes(&root, &base_sha, &head_sha, t.git_secs);
     let open = gh(
         &root,
         &[
@@ -2201,8 +2224,29 @@ pub fn run(opts: &Options) -> Result<i32> {
                     .map(|s| s.to_string())
                     .collect();
                 if mt.status == Some(1) && !files.is_empty() {
-                    pr_conflicts.push(json!({"pr": num, "title": other["title"],
-                        "files": files}));
+                    let scanned = mine.as_ref().map_err(|e| e.to_string()).and_then(|mine| {
+                        own_changes(&root, &base_sha, &theirs, t.git_secs)
+                            .map(|theirs_own| (mine, theirs_own))
+                            .map_err(|e| e.to_string())
+                    });
+                    let shared = match scanned {
+                        Ok((mine, theirs_own)) => files
+                            .into_iter()
+                            .filter(|f| mine.contains(f) && theirs_own.contains(f))
+                            .collect::<Vec<_>>(),
+                        Err(e) => {
+                            pr_conflicts.push(json!({"pr": num,
+                                "title": other["title"],
+                                "error": format!("changed-file scan failed: {e}")}));
+                            continue;
+                        }
+                    };
+                    // Conflicts only on files neither PR changed come from
+                    // base drift between the two cut points — not an overlap.
+                    if !shared.is_empty() {
+                        pr_conflicts.push(json!({"pr": num, "title": other["title"],
+                            "files": shared}));
+                    }
                 } else {
                     let why = if mt.timed_out {
                         "merge-tree timed out".to_string()
@@ -2731,6 +2775,12 @@ fn render_markdown(r: &Value) -> String {
         .cloned()
         .unwrap_or_default();
     md.push_str("## Other open PRs\n\n");
+    if let Some(base) = r["open_pr_conflicts_base"].as_str() {
+        md.push_str(&format!(
+            "Compared against base `{}`; only files both PRs change themselves count.\n\n",
+            &base[..base.len().min(12)]
+        ));
+    }
     if let Some(err) = r["open_pr_conflicts_error"].as_str() {
         md.push_str(&format!("scan failed: {err}\n\n"));
     } else if conflicts.is_empty() {
