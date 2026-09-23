@@ -977,12 +977,16 @@ impl Step {
 /// Variables that hand git an identity (or a config file that may hold
 /// one) ahead of `HOME`. GitHub CI sets none of them, so every step
 /// command runs with them removed; `HOME` then decides alone.
+/// `GIT_CONFIG_PARAMETERS` is what `git -c k=v <alias>` passes to its
+/// children; it goes whole (CAD-307) rather than filtered like the
+/// `GIT_CONFIG_KEY_<n>` entries, since its quoting is git-internal.
 const GATE_ENV_UNSET: &[&str] = &[
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
     "GIT_COMMITTER_EMAIL",
     "EMAIL",
+    "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
     "XDG_CONFIG_HOME",
@@ -1008,16 +1012,18 @@ const IDENTITY_KEYS: &[&str] = &[
 /// would otherwise lend it a global `~/.gitconfig` or git's own
 /// user@hostname guess, and the review would pass what CI then fails.
 ///
-/// - `HOME` is `home`, a fresh empty directory the review removes when
-///   it ends: no `~/.gitconfig`, no `~/.config/git/config`
-///   ([`GATE_ENV_UNSET`] clears the variables that would point past it).
+/// - `HOME` is `home`, a fresh empty mode-0700 directory
+///   ([`scratch_home`]) the review removes when it ends: no
+///   `~/.gitconfig`, no `~/.config/git/config` ([`GATE_ENV_UNSET`]
+///   clears the variables that would point past it).
 /// - `GIT_CONFIG_NOSYSTEM=1`: no `/etc/gitconfig`.
 /// - `user.useConfigOnly=true`, appended through `GIT_CONFIG_COUNT`:
 ///   git stops guessing an identity, so only an explicit one works — as
 ///   on CI. A caller's own `GIT_CONFIG_*` entries are kept (renumbered)
 ///   except identity keys.
 /// - `CARGO_HOME`, `RUSTUP_HOME` and `XDG_DATA_HOME` stay at the
-///   caller's real locations (derived from the real `HOME` when unset):
+///   caller's real locations (derived from the real home when unset —
+///   `HOME`, else the passwd entry, as cargo and rustup resolve it):
 ///   cargo's registry, rustup's toolchains and the pinned nextest under
 ///   `$XDG_DATA_HOME/cadence/tools` (`scripts/cadence-nextest`) still
 ///   resolve.
@@ -1059,6 +1065,21 @@ fn gate_env(home: &Path, caller: impl Fn(&str) -> Option<String>) -> Vec<(String
         env.push((format!("GIT_CONFIG_VALUE_{i}"), value));
     }
     env
+}
+
+/// The scratch `HOME` for [`gate_env`], removed when dropped. Mode 0700
+/// whatever the umask (CAD-307): created 0700 (the umask can only
+/// narrow that) and then set to exactly 0700, so no other local user
+/// can plant a `.gitconfig` or tool config the gates would read.
+fn scratch_home() -> std::io::Result<tempfile::TempDir> {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::Builder::new()
+        .prefix("cadence-review-home-")
+        .permissions(Permissions::from_mode(0o700))
+        .tempdir()?;
+    std::fs::set_permissions(home.path(), Permissions::from_mode(0o700))?;
+    Ok(home)
 }
 
 /// Run `sh -c <cmd>` in `cwd` with the review's env, timing it.
@@ -1878,10 +1899,13 @@ pub fn run(opts: &Options) -> Result<i32> {
     // Env every step command sees: the review's own variables plus
     // CI's identity-less git (`gate_env`) under a scratch HOME that
     // lives exactly as long as this run.
-    let gate_home = tempfile::Builder::new()
-        .prefix("cadence-review-home-")
-        .tempdir()?;
-    let gate_env = gate_env(gate_home.path(), |k| std::env::var(k).ok());
+    let gate_home = scratch_home()?;
+    // With no HOME, the tool homes derive from the passwd entry, where
+    // the caller's own cargo and rustup would look.
+    let gate_env = gate_env(gate_home.path(), |k| match k {
+        "HOME" => std::env::home_dir().map(|h| h.to_string_lossy().into_owned()),
+        _ => std::env::var(k).ok(),
+    });
     let env = |tree_kind: &str| -> Vec<(String, String)> {
         let mut env = vec![
             ("CADENCE_REVIEW_PR".into(), pr.number.to_string()),
@@ -3538,6 +3562,51 @@ result_path = "target/nextest/cadence/junit.xml"
         let env = gate_env(Path::new("/s"), env_of(&[("GIT_CONFIG_COUNT", "x")]));
         assert_eq!(lookup(&env, "GIT_CONFIG_COUNT"), Some("1"));
         assert_eq!(lookup(&env, "CARGO_HOME"), None);
+    }
+
+    /// CAD-307: another local user must not be able to plant a
+    /// `.gitconfig` (or any tool config) in the scratch HOME, whatever
+    /// the caller's umask. The umask is process-wide and this binary
+    /// runs tests on many threads, so the umask 0002 half runs in a
+    /// child: this same test binary, re-exec'd with only this test under
+    /// `sh -c 'umask 0002; exec …'`. The parent never touches its own
+    /// umask.
+    #[test]
+    fn scratch_home_is_0700_under_umask_0002() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| {
+            format!(
+                "{:o}",
+                std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+            )
+        };
+        const CHILD: &str = "CADENCE_TEST_SCRATCH_HOME_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Control: a plain mkdir shows umask 0002 is in effect.
+            let control = tempfile::tempdir().unwrap();
+            let plain = control.path().join("plain");
+            std::fs::create_dir(&plain).unwrap();
+            assert_eq!(mode(&plain), "775", "child is not under umask 0002");
+            let home = scratch_home().unwrap();
+            assert_eq!(mode(home.path()), "700");
+            return;
+        }
+        let home = scratch_home().unwrap();
+        assert_eq!(mode(home.path()), "700");
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg("umask 0002 && exec \"$0\" --exact \"$1\" --test-threads=1")
+            .arg(std::env::current_exe().unwrap())
+            .arg("review::tests::scratch_home_is_0700_under_umask_0002")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "stdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

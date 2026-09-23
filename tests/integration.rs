@@ -21030,8 +21030,9 @@ test_command = "true {test}"
 /// without `-c user.name/-c user.email` fails there with "Author
 /// identity unknown". The review must fail it too, however the caller's
 /// host supplies an identity: a global `~/.gitconfig`, `GIT_CONFIG_*`
-/// entries, `EMAIL` / `GIT_AUTHOR_*` / `GIT_COMMITTER_*`, or git's own
-/// user@hostname guess.
+/// entries, `GIT_CONFIG_PARAMETERS` (what `git -c user.name=… <alias>`
+/// hands its children, CAD-307), `EMAIL` / `GIT_AUTHOR_*` /
+/// `GIT_COMMITTER_*`, or git's own user@hostname guess.
 #[test]
 fn review_verb_gates_run_without_a_git_identity() {
     let base = TempDir::new().unwrap();
@@ -21086,6 +21087,10 @@ stress_pattern = ["wait_"]
         .env("GIT_CONFIG_VALUE_0", "cfg@example.com")
         .env("GIT_CONFIG_KEY_1", "cadence.probe")
         .env("GIT_CONFIG_VALUE_1", "kept")
+        .env(
+            "GIT_CONFIG_PARAMETERS",
+            "'user.name'='param' 'user.email'='param@example.com'",
+        )
         .env("EMAIL", "env@example.com")
         .env("GIT_AUTHOR_NAME", "a")
         .env("GIT_AUTHOR_EMAIL", "a@example.com")
