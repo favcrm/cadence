@@ -30586,7 +30586,19 @@ fn dispatch_warns_on_empty_acceptance() {
         assert!(text.contains("## Acceptance"), "{text}");
         std::fs::write(&path, format!("{text}- [ ]\n- [x]   \n")).unwrap();
     }
-    git(&pm_dir, &["commit", "-qam", "stub acceptance"]);
+    // An explicit identity: CI runners have no global git config.
+    git(
+        &pm_dir,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qam",
+            "stub acceptance",
+        ],
+    );
     let criteria = tmp.path().join("acceptance.md");
     std::fs::write(&criteria, "- [ ] first criterion\n- [x] second is done\n").unwrap();
     let criteria_s = criteria.to_str().unwrap();
