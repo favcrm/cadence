@@ -54,9 +54,6 @@ const MESSAGES_PAGE_GUARD: usize = 500;
 struct SessionLog {
     cursor: Option<String>,
     known: HashSet<String>,
-    /// First-seen order, so a restart can split the log at the pre-post id.
-    order: Vec<String>,
-    last_id: Option<String>,
     complete: bool,
 }
 
@@ -65,22 +62,11 @@ struct SessionLog {
 /// that was not in that baseline, across polls, in read order.
 struct TurnState {
     baseline: HashSet<String>,
-    baseline_last: Option<String>,
     devin_msgs: Vec<(String, String)>,
     devin_ids: HashSet<String>,
     posted: bool,
     post_status: String,
     post_detail: String,
-}
-
-/// A held turn's marker, restored after a daemon restart. The baseline
-/// is the pre-post event id, not the whole set.
-#[derive(Clone)]
-struct Rebuild {
-    last_event_id: String,
-    post_status: String,
-    post_detail: String,
-    sha: Option<String>,
 }
 
 #[derive(Default)]
@@ -97,7 +83,6 @@ struct Session {
     pr_urls: Vec<String>,
     log: SessionLog,
     turn: Option<TurnState>,
-    rebuild: Option<Rebuild>,
 }
 
 enum CallErr {
@@ -623,25 +608,12 @@ impl DevinCloudAdapter {
 
     fn absorb_page(&self, page: &[Value], cursor: Option<String>, more: bool) {
         let mut st = self.session.lock().unwrap();
-        if let Some(rebuild) = st.rebuild.clone() {
-            if rebuild.last_event_id.is_empty() && st.turn.is_none() {
-                install_rebuild(&mut st, &rebuild);
-            }
-        }
         for item in page {
             let Some(id) = item.get("event_id").and_then(Value::as_str) else {
                 continue;
             };
             let id = id.to_string();
-            if st.log.known.insert(id.clone()) {
-                st.log.order.push(id.clone());
-            }
-            st.log.last_id = Some(id.clone());
-            if let Some(rebuild) = st.rebuild.clone() {
-                if st.turn.is_none() && rebuild.last_event_id == id {
-                    install_rebuild(&mut st, &rebuild);
-                }
-            }
+            st.log.known.insert(id.clone());
             if let Some(turn) = st.turn.as_mut() {
                 if turn.posted && !turn.baseline.contains(&id) && is_devin(item) {
                     if let Some(text) = message_text(item) {
@@ -663,10 +635,8 @@ impl DevinCloudAdapter {
         st.status = status.clone();
         st.detail = detail.clone();
         let baseline = st.log.known.clone();
-        let baseline_last = st.log.last_id.clone();
         st.turn = Some(TurnState {
             baseline,
-            baseline_last,
             devin_msgs: Vec::new(),
             devin_ids: HashSet::new(),
             posted: false,
@@ -675,38 +645,31 @@ impl DevinCloudAdapter {
         });
     }
 
-    /// Page until the log is complete, then snapshot that set as the
-    /// turn baseline. A failed walk that never reached the end is
-    /// [`Error::PreWrite`]: nothing is posted. A log that is already
-    /// complete keeps that baseline when a refresh fails.
+    /// Refresh the session and page the log until `has_next_page` is
+    /// false, then snapshot that set as the turn baseline. Every post
+    /// needs this refresh to succeed right before it, retried within
+    /// the poll budget. A log that was complete at an earlier read is
+    /// not enough: a Devin message written since would count as fresh.
+    /// Any failure is [`Error::PreWrite`] and nothing is posted.
     fn prepare_baseline(&self, org: &str, id: &str) -> Result<()> {
         let deadline = Instant::now() + self.budget;
         let mut backoff = self.interval;
         loop {
             let path = self.org_path(org, &format!("/{}", encode(id)));
-            let session = self.call("GET", &path, None);
-            let synced = self.sync_messages(org, id, true);
-            let complete = self.session.lock().unwrap().log.complete;
-            if complete {
-                let (status, detail) = match session {
-                    Ok(body) => status_of(&body),
-                    Err(_) => {
-                        let st = self.session.lock().unwrap();
-                        (
-                            st.status.to_ascii_lowercase(),
-                            st.detail.to_ascii_lowercase(),
-                        )
-                    }
-                };
-                self.snapshot_baseline(status, detail);
-                return Ok(());
-            }
-            let err = match (session, synced) {
-                (Err(err), _) => err,
-                (_, Err(err)) => err,
-                (Ok(_), Ok(())) => CallErr::Transport(
+            let refreshed = self.call("GET", &path, None).and_then(|body| {
+                self.sync_messages(org, id, true)?;
+                Ok(body)
+            });
+            let err = match refreshed {
+                Ok(body) if self.session.lock().unwrap().log.complete => {
+                    let (status, detail) = status_of(&body);
+                    self.snapshot_baseline(status, detail);
+                    return Ok(());
+                }
+                Ok(_) => CallErr::Transport(
                     "devin messages walk stopped before has_next_page was false".into(),
                 ),
+                Err(err) => err,
             };
             if self.released() {
                 return Err(Error::rejected("devin cloud post interrupted"));
@@ -778,7 +741,6 @@ impl DevinCloudAdapter {
         if let Err(err) = self.sync_messages(&org, &id, false) {
             return self.hold_poll(err);
         }
-        self.finish_rebuild();
         let (status, detail) = status_of(&body);
         let (posted, complete, fresh_text, stale, failure) = {
             let mut st = self.session.lock().unwrap();
@@ -813,8 +775,8 @@ impl DevinCloudAdapter {
             let failure = failure_terminal(&status, &detail);
             (posted, complete, fresh_text, stale, failure)
         };
-        // No baseline (a restart that could not rebuild one) never
-        // settles, so an old Devin message cannot complete the turn.
+        // A turn that was never posted has no baseline and never
+        // settles, so an old Devin message cannot complete it.
         // An incomplete walk also waits, unless the session has already
         // failed and there is nothing new to read for.
         if !posted || (!complete && !failure) {
@@ -828,77 +790,6 @@ impl DevinCloudAdapter {
             self.emit_wait(&fresh_text);
         }
         Ok(phase)
-    }
-
-    fn finish_rebuild(&self) {
-        let mut st = self.session.lock().unwrap();
-        if !st.log.complete {
-            return;
-        }
-        let Some(rebuild) = st.rebuild.clone() else {
-            return;
-        };
-        if let Some(turn) = st.turn.as_mut() {
-            if let Some(sha) = rebuild.sha.clone() {
-                let have = turn.devin_msgs.iter().any(|(_, text)| text.contains(&sha));
-                if !have {
-                    turn.devin_msgs
-                        .push(("restored-sha".into(), format!("SHA: {sha}")));
-                }
-            }
-        }
-        st.rebuild = None;
-    }
-
-    fn export_turn_marker(&self) -> Option<Value> {
-        let st = self.session.lock().unwrap();
-        let turn = st.turn.as_ref()?;
-        if !turn.posted {
-            return None;
-        }
-        let sha = turn
-            .devin_msgs
-            .iter()
-            .rev()
-            .find_map(|(_, text)| sha_hex(text));
-        Some(json!({
-            "last_event_id": turn.baseline_last,
-            "count": turn.baseline.len(),
-            "cursor": st.log.cursor,
-            "post_status": turn.post_status,
-            "post_detail": turn.post_detail,
-            "sha": sha,
-        }))
-    }
-
-    fn import_turn_marker(&self, marker: &Value) {
-        let sha = marker
-            .get("sha")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string);
-        let rebuild = Rebuild {
-            last_event_id: marker
-                .get("last_event_id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            post_status: marker
-                .get("post_status")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            post_detail: marker
-                .get("post_detail")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            sha,
-        };
-        let mut st = self.session.lock().unwrap();
-        st.log = SessionLog::default();
-        st.turn = None;
-        st.rebuild = Some(rebuild);
     }
 
     fn hold_poll(&self, err: CallErr) -> Result<Phase> {
@@ -1158,14 +1049,6 @@ impl ProviderAdapter for DevinCloudAdapter {
 
     fn recover_budget(&self) -> Duration {
         self.recover_budget
-    }
-
-    fn cloud_turn_marker(&self) -> Option<Value> {
-        self.export_turn_marker()
-    }
-
-    fn restore_cloud_marker(&self, marker: &Value) {
-        self.import_turn_marker(marker);
     }
 
     fn poll_settled(&self) -> Result<SettledPoll> {
@@ -1647,28 +1530,6 @@ fn message_text(message: &Value) -> Option<&str> {
         .filter(|text| !text.is_empty())
 }
 
-fn install_rebuild(st: &mut Session, rebuild: &Rebuild) {
-    let baseline = if rebuild.last_event_id.is_empty() {
-        HashSet::new()
-    } else {
-        st.log.order.iter().cloned().collect()
-    };
-    let baseline_last = if rebuild.last_event_id.is_empty() {
-        None
-    } else {
-        Some(rebuild.last_event_id.clone())
-    };
-    st.turn = Some(TurnState {
-        baseline,
-        baseline_last,
-        devin_msgs: Vec::new(),
-        devin_ids: HashSet::new(),
-        posted: true,
-        post_status: rebuild.post_status.clone(),
-        post_detail: rebuild.post_detail.clone(),
-    });
-}
-
 fn pull_request_urls(session: &Value) -> Vec<String> {
     session
         .get("pull_requests")
@@ -1685,18 +1546,6 @@ fn pull_request_urls(session: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn sha_hex(text: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let rest = line
-            .trim()
-            .strip_prefix("SHA:")
-            .or_else(|| line.trim().strip_prefix("sha:"))?;
-        let hex = rest.trim();
-        (hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .then(|| hex.to_string())
-    })
 }
 
 #[cfg(test)]
@@ -2068,8 +1917,9 @@ mod tests {
             .filter(|hit| hit.method == "GET" && hit.path.contains("/messages"))
             .count();
         let posts = message_posts(hits);
-        // Turn 2's capture is the third messages GET, before its POST.
-        if posts == 1 && n == 3 {
+        // Turn 2's refresh starts at the third messages GET, before its
+        // POST, and keeps failing for the whole budget.
+        if posts == 1 && n >= 3 {
             return (429, json!({"error": KEY}).to_string());
         }
         if posts == 0 {
@@ -2737,22 +2587,15 @@ mod tests {
             .unwrap();
         let first = adapter.run_turn("revision one", "turn-1", &|_| {}).unwrap();
         assert!(first.text.contains(SHA), "{}", first.text);
-        let second = adapter.run_turn("revision two", "turn-2", &|_| {});
-        match second {
-            Ok(turn) => panic!(
-                "turn 2 completed with revision 1's SHA (status {}): {}",
-                turn.status, turn.text
-            ),
-            Err(err) => assert!(!err.to_string().contains(SHA), "{err}"),
-        }
-        let posts = mock
-            .hits
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|hit| hit.method == "POST" && hit.path.contains("/messages"))
-            .count();
-        assert_eq!(posts, 2, "a known marker must still allow the post");
+        // The log was complete after turn 1, but turn 2's own refresh
+        // failed. That older baseline is not enough to post on.
+        let Err(err) = adapter.run_turn("revision two", "turn-2", &|_| {}) else {
+            panic!("turn 2 posted on a stale baseline");
+        };
+        assert!(matches!(err, crate::error::Error::PreWrite(_)), "{err}");
+        assert!(!err.to_string().contains(SHA), "{err}");
+        let posts = message_posts(&mock.hits.lock().unwrap());
+        assert_eq!(posts, 1, "turn 2 posted without a fresh complete log");
     }
 
     #[test]

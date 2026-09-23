@@ -3072,42 +3072,55 @@ impl Store {
             "message": message.id, "notice": kind,
             "result": routed, "worker": message.alias,
         });
-        let prompt =
-            if kind == "unknown" && result.get("held").and_then(Value::as_bool) == Some(true) {
+        let held = kind == "unknown" && result.get("held").and_then(Value::as_bool) == Some(true);
+        let prompt = if held || kind == "cloud_recover_escalated" {
+            let session: Option<String> = tx
+                .query_row(
+                    "SELECT endpoint FROM agents WHERE alias=?",
+                    [&message.alias],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let session = session
+                .filter(|url| !url.is_empty())
+                .unwrap_or_else(|| format!("shown by `cadence agent show {}`", message.alias));
+            let exit = cloud_hold_exit(&message.id, &message.alias, &session);
+            if held {
                 format!(
-                    "A Devin cloud worker's turn is held — the poll outcome was not learned and \
-                 the session is still working. The worker is not fenced. A later poll can \
-                 still capture the result. This is an informational notice, not a result; \
-                 do not treat it as worker output. {payload}"
+                    "A Devin cloud worker's turn is held: the poll outcome was not learned and \
+                     the session may still be working. The worker is not fenced yet: it keeps \
+                     polling, and a later poll can still settle the turn. {exit} This is an \
+                     informational notice, not a result; do not treat it as worker output. \
+                     {payload}"
                 )
             } else {
-                match kind {
-                    "cloud_recover_escalated" => format!(
-                        "A Devin cloud worker stopped polling a held turn after repeated \
-                         failures. The worker is not fenced and the queued work was not \
-                         replayed. Stop the agent and resume it to poll again: \
-                         `cadence agent stop {alias}` then `cadence agent resume {alias}`. \
-                         This is an informational notice, not a result; do not treat it as \
-                         worker output. {payload}",
-                        alias = message.alias
-                    ),
-                    "interrupted" => format!(
-                "An operator closed a managed worker's turn as interrupted — the outcome was \
+                format!(
+                    "A Devin cloud worker stopped polling a held turn after repeated failures. \
+                     The worker is not fenced and the held message was not replayed. {exit} \
+                     This is an informational notice, not a result; do not treat it as worker \
+                     output. {payload}"
+                )
+            }
+        } else {
+            match kind {
+                "interrupted" => format!(
+                    "An operator closed a managed worker's turn as interrupted — the outcome was \
                  never learned. This is an informational notice, not a result; do not treat it \
                  as worker output. {payload}"
-            ),
-                    "cancelled" => format!(
-                "A managed worker's queued message was cancelled before delivery — nothing \
+                ),
+                "cancelled" => format!(
+                    "A managed worker's queued message was cancelled before delivery — nothing \
                  ran. This is an informational notice, not a result; do not treat it as \
                  worker output. {payload}"
-            ),
-                    _ => format!(
-                        "A managed worker's turn outcome is unknown — the worker is fenced and an \
+                ),
+                _ => format!(
+                    "A managed worker's turn outcome is unknown — the worker is fenced and an \
                  operator reconcile is pending. This is an informational notice, not a result; \
                  do not treat it as worker output. {payload}"
-                    ),
-                }
-            } + &pointer;
+                ),
+            }
+        } + &pointer;
         tx.execute(
             "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
              VALUES(?,?,?,NULL,'worker_notice',?,?)",
@@ -3236,25 +3249,6 @@ impl Store {
             .query_map([alias], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
-    }
-
-    /// The oldest held cloud turn for this alias, if the actor died
-    /// while a Devin session was still in flight.
-    pub fn held_unknown(&self, alias: &str) -> Result<Option<Message>> {
-        for id in self.unknown_messages(alias)? {
-            if let Some(message) = self.message(&id)? {
-                let held = message
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.get("held"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if held {
-                    return Ok(Some(message));
-                }
-            }
-        }
-        Ok(None)
     }
 
     /// Operator reconcile — the only exit from `unknown` that keeps the
@@ -6563,6 +6557,23 @@ that line as the reported revision. Do not report a SHA you have not committed."
 
 /// Cloud sessions cannot read the host spec path or run `cadence self`.
 /// The spec text is inlined and the `SHA:` trailer stays the report contract.
+/// The operator exit for a held Devin cloud turn. The held message
+/// stays `unknown`: a daemon restart or `agent stop` during the hold
+/// fences the worker (resume is refused), and a stop does not archive
+/// the session.
+fn cloud_hold_exit(message: &str, alias: &str, session: &str) -> String {
+    format!(
+        "The held message `{message}` stays unknown. If the daemon restarts or the agent \
+         is stopped before a poll settles it, that message fences the worker until it is \
+         reconciled; the session is not archived and nothing is replayed. To settle it by \
+         hand, inspect the Devin session ({session}), then run `cadence message reconcile {message} \
+         --status <completed|failed|interrupted>` (add `--sha <40-hex>` for a completed \
+         commit) or, after a restart or stop has fenced the worker, `cadence agent unfence \
+         {alias} --status <completed|failed|interrupted>`, choosing the status from what the session shows. \
+         `cadence agent resume {alias}` is refused while the message is unknown."
+    )
+}
+
 fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> String {
     let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
     let raw = std::fs::read_to_string(spec)
@@ -8346,9 +8357,15 @@ mod tests {
             .collect();
         assert_eq!(notices.len(), 2);
         assert!(notices.iter().all(|message| {
-            message.body.contains("cadence agent stop w1")
-                && message.body.contains("cadence agent resume w1")
+            message.body.contains("`cadence message reconcile ")
+                && message
+                    .body
+                    .contains(" --status <completed|failed|interrupted>` (add `--sha <40-hex>`")
+                && message
+                    .body
+                    .contains("`cadence agent unfence w1 --status <completed|failed|interrupted>`")
                 && message.body.contains("not fenced")
+                && !message.body.contains("cadence agent stop")
         }));
     }
 

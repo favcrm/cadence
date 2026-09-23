@@ -245,6 +245,11 @@ struct AgentCtl {
     /// Stall-watch state for the in-flight turn — updated by provider
     /// events, the turn-start hook and the watch's own sampling.
     stall: Mutex<StallWatch>,
+    /// A Devin cloud turn is held: its message is `unknown` while the
+    /// session may still be working. Any exit then detaches instead of
+    /// closing, so a stop does not archive the session the operator's
+    /// reconcile has to inspect.
+    cloud_held: AtomicBool,
 }
 
 /// What the stall watch knows about the agent's in-flight turn.
@@ -581,6 +586,7 @@ impl Shared {
             wake: Notify::new(),
             thread: Mutex::new(None),
             stall: Mutex::new(StallWatch::default()),
+            cloud_held: AtomicBool::new(false),
         });
         let shared = Arc::clone(self);
         let owned = alias.to_string();
@@ -772,11 +778,15 @@ impl Shared {
         // error exit (a fence): owned endpoints like a tmux pane
         // outlive the controller so the operator can inspect the screen
         // a failure left behind and `agent resume` re-adopt it. Explicit
-        // stops keep `close()`. `detach` defaults to `close` for
-        // adapters that own their provider process, so managed
-        // endpoints are still reaped on every exit.
+        // stops keep `close()`, except while a Devin cloud turn is held.
+        // `detach` defaults to `close` for adapters that own their
+        // provider process, so managed endpoints are still reaped on
+        // every exit.
         if let Some(adapter) = ctl.adapter.lock().unwrap().take() {
-            if self.closing.load(Ordering::SeqCst) || outcome.is_err() {
+            if self.closing.load(Ordering::SeqCst)
+                || outcome.is_err()
+                || ctl.cloud_held.load(Ordering::SeqCst)
+            {
                 adapter.detach();
             } else {
                 adapter.close();
@@ -951,23 +961,10 @@ impl Shared {
         let mut recover_started: Option<Instant> = None;
         let mut recover_escalated = false;
         let mut recover_failures: u32 = 0;
-        // A restart drops the in-memory turn. The held row carries a
-        // small pre-post marker so recovery can rebuild the baseline
-        // instead of treating every old Devin message as fresh.
-        if hold_cloud {
-            if let Some(pending) = self.store.held_unknown(alias)? {
-                if let Some(marker) = pending
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.get("cloud_marker"))
-                {
-                    adapter.restore_cloud_marker(marker);
-                }
-                recover_delay = adapter.poll_interval().max(Duration::from_millis(1));
-                recover_started = Some(Instant::now());
-                cloud_held = Some(Box::new(pending));
-            }
-        }
+        // A hold lives only in this actor. A daemon restart or a stop
+        // during a hold leaves the message `unknown`, and start, resume
+        // and relaunch fence the agent on it: the operator inspects the
+        // Devin session and reconciles. Nothing rebuilds the turn.
         loop {
             if self.closing.load(Ordering::SeqCst) {
                 return Ok(());
@@ -987,6 +984,20 @@ impl Shared {
                 if !self.store.agent(alias)?.enabled {
                     return Ok(());
                 }
+                // An operator reconcile settled the held message: stop
+                // polling and take the next queued message.
+                if self
+                    .store
+                    .message(&pending.id)?
+                    .is_none_or(|message| message.state != "unknown")
+                {
+                    cloud_held = None;
+                    ctl.cloud_held.store(false, Ordering::SeqCst);
+                    recover_started = None;
+                    recover_escalated = false;
+                    recover_failures = 0;
+                    continue;
+                }
                 // After the budget, one escalation and no further polls.
                 // The agent stays enabled and the held message is not replayed.
                 if recover_escalated {
@@ -997,6 +1008,15 @@ impl Shared {
                     continue;
                 }
                 let transient = match adapter.poll_settled() {
+                    // A stop or shutdown released the adapter, which then
+                    // reports interrupted. That is not the session's
+                    // outcome: leave the message for the reconcile.
+                    Ok(SettledPoll::Ready(_))
+                        if self.closing.load(Ordering::SeqCst)
+                            || !self.store.agent(alias)?.enabled =>
+                    {
+                        return Ok(());
+                    }
                     Ok(SettledPoll::Ready(turn)) => {
                         let status = match turn.status.as_str() {
                             "failed" => "failed",
@@ -1008,9 +1028,21 @@ impl Shared {
                         } else {
                             Some(turn.text.as_str())
                         };
-                        self.store
-                            .reconcile(&pending.id, status, note, "cloud_poll", None)?;
+                        if let Err(error) =
+                            self.store
+                                .reconcile(&pending.id, status, note, "cloud_poll", None)
+                        {
+                            // The operator reconciled it first; theirs stands.
+                            let settled = self
+                                .store
+                                .message(&pending.id)?
+                                .is_none_or(|message| message.state != "unknown");
+                            if !settled {
+                                return Err(error);
+                            }
+                        }
                         cloud_held = None;
+                        ctl.cloud_held.store(false, Ordering::SeqCst);
                         recover_started = None;
                         recover_escalated = false;
                         recover_failures = 0;
@@ -1233,15 +1265,13 @@ impl Shared {
                         }
                         Err(Error::OutcomeUnknown(error)) => {
                             if hold_cloud {
-                                let mut held = json!({
+                                let held = json!({
                                     "status": "unknown",
                                     "text": "",
                                     "error": error,
                                     "held": true,
                                 });
-                                if let Some(marker) = adapter.cloud_turn_marker() {
-                                    held["cloud_marker"] = marker;
-                                }
+                                ctl.cloud_held.store(true, Ordering::SeqCst);
                                 self.store
                                     .finish(&message, "unknown", &held, Some(&error))?;
                                 let _ = self.store.event_public(
@@ -3334,6 +3364,8 @@ impl Shared {
         if let Some(result) = message.result.clone() {
             self.notify_routed_target(&message, &result);
         }
+        // A live actor holding this cloud turn stops polling it now.
+        self.notify_agent(&message.alias);
         self.wake();
         Ok(json!({"state": "reconciled", "message": message.to_json()}))
     }
@@ -3474,6 +3506,7 @@ impl Shared {
             }
             reconciled.push(id.clone());
         }
+        self.notify_agent(&alias);
         // `resume` is opt-in over the socket — the CLI's `agent unfence`
         // passes it unless `--no-resume`, keeping the bare-RPC call a
         // reconcile-only operation.
@@ -4491,10 +4524,13 @@ impl Shared {
                     // die: owned endpoints (a pty pane) outlive the
                     // controller and are revalidated on the next open —
                     // killing one here orphans the session the restart
-                    // is meant to re-adopt. `detach` defaults to
-                    // `close` for adapters that own their provider
-                    // process, so managed endpoints are still reaped.
-                    if self.closing.load(Ordering::SeqCst) {
+                    // is meant to re-adopt. A held Devin cloud turn
+                    // detaches too, so its session is not archived.
+                    // `detach` defaults to `close` for adapters that
+                    // own their provider process, so managed endpoints
+                    // are still reaped.
+                    if self.closing.load(Ordering::SeqCst) || ctl.cloud_held.load(Ordering::SeqCst)
+                    {
                         adapter.detach();
                     } else {
                         adapter.close();
@@ -6816,35 +6852,9 @@ fn write_shutdown_marker(state_dir: &Path, instance: &str, entries: Vec<store::A
     }
 }
 
-/// Run the daemon in the foreground until `shutdown` or a signal.
-pub fn serve(state_dir: &Path) -> Result<()> {
-    serve_with(state_dir, ServeOptions::default())
-}
-
-/// `serve` with per-instance options — in-process test daemons pass
-/// their mock commands here instead of through the shared environment.
-pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    // Before the marker is consumed and before recover() writes. A
-    // direct `daemon run` of a different build by a non-holder must
-    // leave shutdown.json and the database byte-identical. `daemon
-    // start` already refuses before spawn; this is the hand-run path.
-    crate::rollout::authorize_direct_run(state_dir)?;
-    let _singleton = acquire_singleton(state_dir)?;
-    // Consume the shutdown marker and record this run's instance BEFORE
-    // the store opens — recover() protects the candidate entries as it
-    // sweeps, and a crash between here and open simply leaves nothing
-    // to adopt.
-    let hot = hot_restart_begin(state_dir);
-    let shared = Shared::new_hot(state_dir, &opts, hot)?;
-    let socket_path = state_dir.join("cadence.sock");
-    if socket_path.exists() {
-        // Safe while the singleton is held: no live owner can exist.
-        std::fs::remove_file(&socket_path)?;
-    }
-    let listener = UnixListener::bind(&socket_path)?;
-    listener.set_nonblocking(true)?;
-    // Relaunch enabled actors; fenced ones land in `attention` instead.
+/// Relaunch enabled actors at daemon start; fenced ones land in
+/// `attention` instead.
+fn relaunch_agents(shared: &Arc<Shared>) -> Result<()> {
     // Inbox rows are durable mailboxes — enabled or not, they own no
     // actor and keep their pseudo-endpoint across restarts.
     for agent in shared.store.agents()? {
@@ -6906,6 +6916,38 @@ pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
         }
         shared.launch_actor(&agent.alias)?;
     }
+    Ok(())
+}
+
+/// Run the daemon in the foreground until `shutdown` or a signal.
+pub fn serve(state_dir: &Path) -> Result<()> {
+    serve_with(state_dir, ServeOptions::default())
+}
+
+/// `serve` with per-instance options — in-process test daemons pass
+/// their mock commands here instead of through the shared environment.
+pub fn serve_with(state_dir: &Path, opts: ServeOptions) -> Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    // Before the marker is consumed and before recover() writes. A
+    // direct `daemon run` of a different build by a non-holder must
+    // leave shutdown.json and the database byte-identical. `daemon
+    // start` already refuses before spawn; this is the hand-run path.
+    crate::rollout::authorize_direct_run(state_dir)?;
+    let _singleton = acquire_singleton(state_dir)?;
+    // Consume the shutdown marker and record this run's instance BEFORE
+    // the store opens — recover() protects the candidate entries as it
+    // sweeps, and a crash between here and open simply leaves nothing
+    // to adopt.
+    let hot = hot_restart_begin(state_dir);
+    let shared = Shared::new_hot(state_dir, &opts, hot)?;
+    let socket_path = state_dir.join("cadence.sock");
+    if socket_path.exists() {
+        // Safe while the singleton is held: no live owner can exist.
+        std::fs::remove_file(&socket_path)?;
+    }
+    let listener = UnixListener::bind(&socket_path)?;
+    listener.set_nonblocking(true)?;
+    relaunch_agents(&shared)?;
     // Signal-driven shutdown: set the same flag as the rpc.
     {
         let shared = Arc::clone(&shared);
@@ -7587,19 +7629,25 @@ mod tests {
         stop_cloud(&shared, &stop, thread);
     }
 
-    #[test]
-    fn cloud_restart_recovery_does_not_bind_a_pre_post_sha() {
-        use std::sync::atomic::AtomicUsize;
+    /// Calls a held-turn mock records. `healthy` ends the lost polls.
+    #[derive(Default)]
+    struct HoldCalls {
+        posts: std::sync::atomic::AtomicUsize,
+        archives: std::sync::atomic::AtomicUsize,
+        deletes: std::sync::atomic::AtomicUsize,
+        healthy: AtomicBool,
+        stop: AtomicBool,
+    }
 
-        const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let posts = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
+    /// A Devin mock whose session GET fails with 503 after the first
+    /// message post, so that turn is held until `healthy` is set.
+    fn cloud_hold_server() -> (String, Arc<HoldCalls>, thread::JoinHandle<()>) {
+        let calls = Arc::new(HoldCalls::default());
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap();
-        let posts_t = Arc::clone(&posts);
-        let stop_t = Arc::clone(&stop);
+        let seen = Arc::clone(&calls);
         let thread = thread::spawn(move || {
-            while !stop_t.load(Ordering::SeqCst) {
+            while !seen.stop.load(Ordering::SeqCst) {
                 let mut req = match server.recv_timeout(Duration::from_millis(50)) {
                     Ok(Some(req)) => req,
                     _ => continue,
@@ -7608,6 +7656,17 @@ mod tests {
                 let method = req.method().as_str().to_string();
                 let mut body = String::new();
                 let _ = req.as_reader().read_to_string(&mut body);
+                let posts = seen.posts.load(Ordering::SeqCst);
+                let session = |detail: &str| {
+                    json!({
+                        "session_id": "devin-created",
+                        "status": "running",
+                        "status_detail": detail,
+                        "url": "https://app.devin.ai/sessions/devin-created",
+                        "pull_requests": [],
+                    })
+                    .to_string()
+                };
                 let (status, payload): (u16, String) = if path.contains("/repositories") {
                     (
                         200,
@@ -7615,43 +7674,38 @@ mod tests {
                             .to_string(),
                     )
                 } else if method == "POST" && path.ends_with("/sessions") {
-                    (
-                        200,
-                        json!({
-                            "session_id": "devin-created",
-                            "status": "running",
-                            "status_detail": "working",
-                            "url": "https://app.devin.ai/sessions/devin-created"
-                        })
-                        .to_string(),
-                    )
+                    (200, session("working"))
+                } else if method == "POST" && path.ends_with("/archive") {
+                    seen.archives.fetch_add(1, Ordering::SeqCst);
+                    (200, json!({"ok": true}).to_string())
+                } else if method == "DELETE" {
+                    seen.deletes.fetch_add(1, Ordering::SeqCst);
+                    (200, json!({"ok": true}).to_string())
                 } else if method == "POST" && path.contains("/messages") {
-                    posts_t.fetch_add(1, Ordering::SeqCst);
+                    seen.posts.fetch_add(1, Ordering::SeqCst);
                     (200, json!({"ok": true}).to_string())
                 } else if method == "GET" && path.contains("/messages") {
-                    let items = json!([{
-                        "event_id": "evt-old",
-                        "source": "devin",
-                        "message": format!("SHA: {OLD}"),
-                        "created_at": 1
-                    }]);
-                    (
-                        200,
-                        json!({"items": items, "has_next_page": false, "end_cursor": null, "total": 1})
-                            .to_string(),
-                    )
-                } else if method == "GET" && path.contains("/sessions/") {
-                    (
-                        200,
-                        json!({
-                            "session_id": "devin-created",
-                            "status": "running",
-                            "status_detail": "finished",
-                            "url": "https://app.devin.ai/sessions/devin-created",
-                            "pull_requests": [],
+                    let items: Vec<Value> = (2..=posts)
+                        .map(|n| {
+                            json!({"event_id": format!("evt-{n}"), "source": "devin",
+                                   "message": format!("reply {n}"), "created_at": n})
                         })
+                        .collect();
+                    let total = items.len();
+                    (
+                        200,
+                        json!({"items": items, "has_next_page": false,
+                               "end_cursor": null, "total": total})
                         .to_string(),
                     )
+                } else if method == "GET" && path.contains("/sessions/") {
+                    if posts == 0 {
+                        (200, session("working"))
+                    } else if seen.healthy.load(Ordering::SeqCst) {
+                        (200, session("finished"))
+                    } else {
+                        (503, json!({"error": "unavailable"}).to_string())
+                    }
                 } else {
                     (200, json!({"ok": true}).to_string())
                 };
@@ -7659,9 +7713,11 @@ mod tests {
                     req.respond(tiny_http::Response::from_string(payload).with_status_code(status));
             }
         });
-        let (dir, shared) = shared();
-        let base = format!("http://{addr}");
-        shared.provider_env.set("CADENCE_DEVIN_API_BASE", &base);
+        (format!("http://{addr}"), calls, thread)
+    }
+
+    fn devin_env(shared: &Shared, base: &str) {
+        shared.provider_env.set("CADENCE_DEVIN_API_BASE", base);
         shared
             .provider_env
             .set("CADENCE_DEVIN_API_KEY", "cog_test_secret_value");
@@ -7671,8 +7727,13 @@ mod tests {
             .set("CADENCE_DEVIN_POLL_INTERVAL_MS", "20");
         shared
             .provider_env
-            .set("CADENCE_DEVIN_RECOVER_BUDGET_MS", "400");
-        let cwd = dir.path().to_str().unwrap();
+            .set("CADENCE_DEVIN_POLL_BUDGET_MS", "150");
+    }
+
+    /// Register `cloud-1`, send it one message and wait until the actor
+    /// holds that turn.
+    fn hold_cloud_turn(shared: &Arc<Shared>, dir: &Path, base: &str, id: &str) {
+        devin_env(shared, base);
         shared
             .store
             .register_agent(&NewAgent {
@@ -7680,7 +7741,7 @@ mod tests {
                 provider: "devin",
                 endpoint_kind: "cloud",
                 role: "worker",
-                cwd,
+                cwd: dir.to_str().unwrap(),
                 sandbox: "read-only",
                 instructions: None,
                 params: Some(r#"{"repos":["favcrm/cadence"]}"#),
@@ -7690,56 +7751,153 @@ mod tests {
             .unwrap();
         shared
             .store
-            .enqueue("cloud-1", "do the task", None, "held-1", "user")
-            .unwrap();
-        let pending = shared.store.message("held-1").unwrap().unwrap();
-        shared
-            .store
-            .finish(
-                &pending,
-                "unknown",
-                &json!({
-                    "status": "unknown",
-                    "text": "",
-                    "error": "held",
-                    "held": true,
-                    "cloud_marker": {
-                        "last_event_id": "evt-old",
-                        "post_status": "running",
-                        "post_detail": "working"
-                    }
-                }),
-                Some("held"),
-            )
+            .enqueue("cloud-1", "do the task", None, id, "user")
             .unwrap();
         shared.launch_actor("cloud-1").unwrap();
         let started = Instant::now();
         loop {
-            if started.elapsed() > Duration::from_secs(4) {
-                break;
+            let held = shared
+                .lifecycle
+                .lock()
+                .unwrap()
+                .agents
+                .get("cloud-1")
+                .is_some_and(|ctl| ctl.cloud_held.load(Ordering::SeqCst));
+            if held && shared.store.message(id).unwrap().unwrap().state == "unknown" {
+                return;
             }
-            let state = shared.store.message("held-1").unwrap().unwrap().state;
-            if state == "completed" || state == "failed" || state == "interrupted" {
-                break;
+            if started.elapsed() > Duration::from_secs(8) {
+                panic!(
+                    "turn was not held: {:?} {:?}",
+                    shared.store.message(id).ok(),
+                    shared.store.events("cloud-1", 0, 40).ok()
+                );
             }
             thread::sleep(Duration::from_millis(20));
         }
-        let message = shared.store.message("held-1").unwrap().unwrap();
-        let blob = format!(
-            "{} {}",
-            message.result.clone().unwrap_or(json!({})),
-            message.error.clone().unwrap_or_default()
-        );
+    }
+
+    fn join_actor(shared: &Shared, alias: &str) {
+        let handle = {
+            let lc = shared.lifecycle.lock().unwrap();
+            lc.agents
+                .get(alias)
+                .and_then(|ctl| ctl.thread.lock().unwrap().take())
+        };
+        if let Some(ctl) = shared.lifecycle.lock().unwrap().agents.get(alias) {
+            ctl.wake.notify_all();
+        }
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+
+    /// A daemon restart during a hold does not resume the turn: the
+    /// held message stays unknown and fences the agent for an operator
+    /// reconcile. No actor starts, nothing is posted or archived.
+    #[test]
+    fn cloud_restart_during_a_hold_fences_for_reconcile() {
+        let (base, calls, server) = cloud_hold_server();
+        let (dir, shared) = shared();
+        hold_cloud_turn(&shared, dir.path(), &base, "held-1");
+        assert_eq!(calls.posts.load(Ordering::SeqCst), 1);
+        // Shutdown: the actor detaches and the agent stays enabled.
+        shared.begin_closing();
+        join_actor(&shared, "cloud-1");
+        drop(shared);
+
+        let restarted = Shared::new(dir.path(), &ServeOptions::default()).unwrap();
+        devin_env(&restarted, &base);
+        relaunch_agents(&restarted).unwrap();
+        thread::sleep(Duration::from_millis(300));
+
+        let agent = restarted.store.agent("cloud-1").unwrap();
+        assert_eq!(agent.state, "attention", "{:?}", agent.error);
+        assert!(agent.enabled);
         assert!(
-            !blob.contains(OLD),
-            "restart recovery bound a pre-post SHA: {blob}"
+            !restarted.lifecycle.lock().unwrap().owned("cloud-1"),
+            "an actor started for a fenced agent"
         );
         assert_eq!(
-            posts.load(Ordering::SeqCst),
-            0,
-            "recovery posted a new turn"
+            restarted.store.message("held-1").unwrap().unwrap().state,
+            "unknown"
         );
-        stop_cloud(&shared, &stop, thread);
+        assert!(restarted
+            .store
+            .events("cloud-1", 0, 80)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "relaunch_skipped"));
+        assert_eq!(calls.posts.load(Ordering::SeqCst), 1, "restart posted");
+        assert_eq!(calls.archives.load(Ordering::SeqCst), 0, "archived");
+        assert_eq!(calls.deletes.load(Ordering::SeqCst), 0, "deleted");
+        calls.stop.store(true, Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    /// `agent stop` during a hold leaves the session for the reconcile:
+    /// no archive, no delete, and the message stays unknown.
+    #[test]
+    fn cloud_stop_during_a_hold_does_not_archive_the_session() {
+        let (base, calls, server) = cloud_hold_server();
+        let (dir, shared) = shared();
+        hold_cloud_turn(&shared, dir.path(), &base, "held-1");
+        shared.rpc_stop(&json!({"alias": "cloud-1"})).unwrap();
+
+        assert_eq!(calls.archives.load(Ordering::SeqCst), 0, "archived");
+        assert_eq!(calls.deletes.load(Ordering::SeqCst), 0, "deleted");
+        assert_eq!(calls.posts.load(Ordering::SeqCst), 1);
+        let message = shared.store.message("held-1").unwrap().unwrap();
+        assert_eq!(message.state, "unknown", "{:?}", message.result);
+        assert_eq!(shared.store.agent("cloud-1").unwrap().state, "stopped");
+        calls.stop.store(true, Ordering::SeqCst);
+        let _ = server.join();
+    }
+
+    /// The notice's live exit works: a reconcile while the actor holds
+    /// the turn ends the hold and the next message runs.
+    #[test]
+    fn cloud_reconcile_during_a_hold_releases_the_actor() {
+        let (base, calls, server) = cloud_hold_server();
+        let (dir, shared) = shared();
+        hold_cloud_turn(&shared, dir.path(), &base, "held-1");
+        shared
+            .rpc_reconcile(&json!({"message": "held-1", "status": "interrupted"}))
+            .unwrap();
+        calls.healthy.store(true, Ordering::SeqCst);
+        shared
+            .store
+            .enqueue("cloud-1", "next task", None, "next-1", "user")
+            .unwrap();
+        shared.notify_agent("cloud-1");
+        let started = Instant::now();
+        loop {
+            let state = shared.store.message("next-1").unwrap().unwrap().state;
+            if state == "completed" {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(8) {
+                panic!(
+                    "next message stayed {state}: {:?}",
+                    shared.store.events("cloud-1", 0, 80).ok()
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let held = shared.store.message("held-1").unwrap().unwrap();
+        assert_eq!(held.state, "interrupted");
+        assert_eq!(
+            held.result.unwrap()["via"],
+            json!("operator_reconcile"),
+            "the actor overwrote the operator's reconcile"
+        );
+        assert_eq!(calls.posts.load(Ordering::SeqCst), 2);
+        assert_ne!(shared.store.agent("cloud-1").unwrap().state, "attention");
+        shared.store.set_enabled("cloud-1", false).unwrap();
+        shared.begin_closing();
+        join_actor(&shared, "cloud-1");
+        calls.stop.store(true, Ordering::SeqCst);
+        let _ = server.join();
     }
 
     #[test]
@@ -7933,6 +8091,13 @@ mod tests {
         assert_eq!(notices.len(), 1, "expected one escalation notice");
         assert!(notices[0].body.contains("not fenced"));
         assert!(notices[0].body.contains("not replayed"));
+        assert!(notices[0].body.contains(
+            "`cadence message reconcile turn-1 --status <completed|failed|interrupted>`"
+        ));
+        assert!(notices[0]
+            .body
+            .contains("https://app.devin.ai/sessions/devin-created"));
+        assert!(!notices[0].body.contains("cadence agent stop"));
         let agent = shared.store.agent("cloud-1").unwrap();
         assert_ne!(agent.state, "attention");
         assert!(agent.enabled);
