@@ -6544,7 +6544,8 @@ fn tailnet_opts(socket: &Path) -> impl Fn(&mut ui::ServeOpts) + Send + Sync + 's
 /// test's uid, answering `/localapi/v0/status` with `status.json`,
 /// `/localapi/v0/prefs` with `prefs.json` and `/localapi/v0/serve-config`
 /// with `serve.json` from its directory, read per request — a missing
-/// file answers `500`. Under `/tmp`: a
+/// file answers `500`. It starts with no operator user, so a board's
+/// startup read ([`ui::serve`]'s operator latch) finds none. Under `/tmp`: a
 /// long TMPDIR would overflow `sun_path`.
 fn fake_localapi() -> (TempDir, PathBuf) {
     let dir = tempfile::Builder::new()
@@ -6552,6 +6553,7 @@ fn fake_localapi() -> (TempDir, PathBuf) {
         .tempdir_in("/tmp")
         .unwrap();
     let sock = dir.path().join("ts.sock");
+    localapi_operator(dir.path(), "");
     let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     let root = dir.path().to_path_buf();
     thread::spawn(move || {
@@ -6774,6 +6776,58 @@ fn tailnet_proof_refusals_name_their_check() {
     let (actor, proof) = tailnet_meta(port);
     assert_eq!(actor, "operator (ui)");
     assert_eq!(proof["check"], "tailscaled_socket", "{proof}");
+}
+
+/// CAD-336 r4 (qa-1 round 3): the operator check latches for the
+/// board process's life. A board whose user was tailscaled's operator
+/// at startup stays refused after the operator is cleared — a
+/// connection set up through a since-removed forwarder would outlive
+/// the clear — and so does a board whose startup read failed.
+#[test]
+fn tailnet_operator_latch_outlives_a_clear() {
+    let (pm, state) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    seed(pm.path(), state.path());
+
+    // The board's user is the operator at startup, then clears itself.
+    let (ts_dir, sock) = fake_localapi();
+    localapi_operator(ts_dir.path(), &own_user_name());
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(&sock),
+    );
+    localapi_says(ts_dir.path(), Some(true), serve_https_only(port));
+    let (actor, proof) = tailnet_meta(port);
+    assert_eq!(actor, "operator (ui)");
+    assert_eq!(proof["check"], "operator_latched", "{proof}");
+
+    // The startup read fails (no prefs), then the LocalAPI recovers.
+    let (ts_dir, sock) = fake_localapi();
+    std::fs::remove_file(ts_dir.path().join("prefs.json")).unwrap();
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(&sock),
+    );
+    localapi_says(ts_dir.path(), Some(true), serve_https_only(port));
+    let (actor, proof) = tailnet_meta(port);
+    assert_eq!(actor, "operator (ui)");
+    assert_eq!(proof["check"], "operator_latched", "{proof}");
+
+    // Sighted as operator AFTER startup: latched from then on too.
+    let (ts_dir, sock) = fake_localapi();
+    let port = start_ui_opts(
+        pm.path().to_path_buf(),
+        state.path().to_path_buf(),
+        tailnet_opts(&sock),
+    );
+    localapi_says(ts_dir.path(), Some(true), serve_https_only(port));
+    localapi_operator(ts_dir.path(), &own_user_name());
+    assert_eq!(tailnet_meta(port).1["check"], "not_operator_user");
+    localapi_operator(ts_dir.path(), "");
+    // Past the LocalAPI cache: the fresh read shows no operator.
+    thread::sleep(Duration::from_millis(2100));
+    assert_eq!(tailnet_meta(port).1["check"], "operator_latched");
 }
 
 /// The TCP-forwarder attack end to end: a tailnet-shaped write through

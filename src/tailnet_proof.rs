@@ -23,19 +23,26 @@
 //!    request later — no config read can see that. While the board runs
 //!    as that user, every process of it (agents included) could mint any
 //!    identity, so none is trusted;
-//! 6. `no_tcp_forwarder` — no serve `TCPForward` handler (`serve
+//! 6. `operator_latched` — the board's uid was never tailscaled's
+//!    operator user during this board process's life ([`OperatorLatch`]):
+//!    read at startup and at every later read. A connection set up while
+//!    it was — through a forwarder since removed — outlives the operator
+//!    clearing itself, so one sighting (or a failed startup read)
+//!    refuses tailnet identity until the board restarts;
+//! 7. `no_tcp_forwarder` — no serve `TCPForward` handler (`serve
 //!    --tcp`, `tcp://`) anywhere in the serve config targets the
 //!    board's port: a raw forwarder passes the client's headers through
 //!    untouched, where the HTTPS proxy replaces them. This catches a
-//!    standing or accidental forwarder; a deliberate one is check 5's;
-//! 7. `client_socket` — the connection's client socket is listed in
+//!    standing or accidental forwarder; a deliberate one is checks 5-6's;
+//! 8. `client_socket` — the connection's client socket is listed in
 //!    `/proc/net/tcp{,6}`;
-//! 8. `socket_owner` — that socket was created by tailscaled's uid (the
+//! 9. `socket_owner` — that socket was created by tailscaled's uid (the
 //!    table's uid column, readable for another user's socket);
-//! 9. `foreign_uid` — tailscaled's uid is not the board's: otherwise any
-//!    same-uid process could pose as it.
+//! 10. `foreign_uid` — tailscaled's uid is not the board's: otherwise any
+//!     same-uid process could pose as it.
 //!
-//! What stays unproven, and is documented in `docs/BOARD.md`: root, and
+//! What stays unproven, and is documented in `docs/BOARD.md`: root — and
+//! so a board user that can gain root, e.g. by passwordless sudo — and
 //! anyone who is tailscaled's operator user while the board is not (they
 //! can still make tailscaled dial the board). A request the proxy sends
 //! without a login — Funnel from the internet, a tagged node — is proven
@@ -48,7 +55,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -76,6 +83,7 @@ pub enum Check {
     Localapi,
     KernelNetworking,
     NotOperatorUser,
+    OperatorLatched,
     NoTcpForwarder,
     ClientSocket,
     SocketOwner,
@@ -90,6 +98,7 @@ impl Check {
             Check::Localapi => "localapi",
             Check::KernelNetworking => "kernel_networking",
             Check::NotOperatorUser => "not_operator_user",
+            Check::OperatorLatched => "operator_latched",
             Check::NoTcpForwarder => "no_tcp_forwarder",
             Check::ClientSocket => "client_socket",
             Check::SocketOwner => "socket_owner",
@@ -132,10 +141,83 @@ struct Facts {
     tcp_forwards: Vec<String>,
 }
 
+/// A board process's memory of tailscaled's operator user (check 6):
+/// once the board's uid has been the operator — or the startup read
+/// failed — tailnet identity stays refused until the process restarts.
+/// A non-operator, non-root user cannot become the operator, so a board
+/// that starts unlatched never meets a connection its user set up
+/// through tailscaled; one that saw its user as operator may, even after
+/// the operator is cleared.
+///
+/// `Default` is latched: only [`OperatorLatch::at_startup`], a real read,
+/// yields an unlatched latch. Clones share the state.
+#[derive(Clone, Debug)]
+pub struct OperatorLatch(Arc<Mutex<Option<String>>>);
+
+impl Default for OperatorLatch {
+    fn default() -> Self {
+        Self::latched("the board never read tailscaled's operator user at startup")
+    }
+}
+
+impl OperatorLatch {
+    fn latched(why: impl Into<String>) -> Self {
+        Self(Arc::new(Mutex::new(Some(why.into()))))
+    }
+
+    /// Read tailscaled's operator user now, at board startup, through
+    /// `socket` (`None`: [`DEFAULT_SOCKETS`]). Latched when the read
+    /// fails, the name resolves to no user, or it is the board's uid.
+    pub fn at_startup(socket: Option<&Path>) -> Self {
+        let read = anchor(socket)
+            .map_err(|r| r.why)
+            .and_then(|(path, _)| operator_uid(&path))
+            .and_then(|operator| {
+                let (_, own) = proc_uids(std::process::id())?;
+                Ok((operator, own))
+            });
+        let latch = Self(Arc::new(Mutex::new(None)));
+        match read {
+            Ok((operator, own)) => latch.observe(&operator, own),
+            Err(why) => latch.observe(&Err(why), 0),
+        }
+        latch
+    }
+
+    /// Latch on a sighting of the board's uid as operator, or on an
+    /// operator that could not be resolved. Never unlatches.
+    fn observe(&self, operator: &Result<Option<u32>, String>, own_uid: u32) {
+        let why = match operator {
+            Ok(Some(uid)) if *uid == own_uid => format!(
+                "the board's uid {own_uid} was tailscaled's operator user during this \
+                 board's life — a connection set up then may outlive the operator \
+                 clearing itself; restart the board"
+            ),
+            Err(e) => format!(
+                "tailscaled's operator user could not be read during this board's life \
+                 ({e}); restart the board"
+            ),
+            Ok(_) => return,
+        };
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.get_or_insert(why);
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
 /// Is the TCP peer `peer` of a connection to the board's `board_port`
 /// the `tailscale serve` HTTPS proxy? `socket` is tailscaled's LocalAPI
 /// socket — `None` looks in [`DEFAULT_SOCKETS`]; tests inject a fixture.
-pub fn prove(socket: Option<&Path>, board_port: u16, peer: SocketAddr) -> Result<(), Refusal> {
+/// `latch` is this board process's [`OperatorLatch`].
+pub fn prove(
+    socket: Option<&Path>,
+    latch: &OperatorLatch,
+    board_port: u16,
+    peer: SocketAddr,
+) -> Result<(), Refusal> {
     let peer = canonical(peer);
     if !peer.ip().is_loopback() {
         return Err(refuse(
@@ -144,7 +226,9 @@ pub fn prove(socket: Option<&Path>, board_port: u16, peer: SocketAddr) -> Result
         ));
     }
     let (path, tailscaled_uid) = anchor(socket)?;
+    let (_, own_uid) = proc_uids(std::process::id()).map_err(|e| refuse(Check::ForeignUid, e))?;
     let facts = facts(&path).map_err(|e| refuse(Check::Localapi, e))?;
+    latch.observe(&facts.operator_uid, own_uid);
     let socket_uid = match client_socket(board_port, peer) {
         Ok(Some((_, uid))) => uid,
         Ok(None) => {
@@ -155,13 +239,21 @@ pub fn prove(socket: Option<&Path>, board_port: u16, peer: SocketAddr) -> Result
         }
         Err(e) => return Err(refuse(Check::ClientSocket, e)),
     };
-    let (_, own_uid) = proc_uids(std::process::id()).map_err(|e| refuse(Check::ForeignUid, e))?;
-    decide(&facts, board_port, tailscaled_uid, socket_uid, own_uid)
+    decide(
+        &facts,
+        latch.reason(),
+        board_port,
+        tailscaled_uid,
+        socket_uid,
+        own_uid,
+    )
 }
 
-/// Checks 4, 5, 6, 8 and 9 once everything is read.
+/// Checks 4-7, 9 and 10 once everything is read; `latched` is the
+/// [`OperatorLatch`]'s reason, if any.
 fn decide(
     facts: &Facts,
+    latched: Option<String>,
     board_port: u16,
     tailscaled_uid: u32,
     socket_uid: u32,
@@ -187,6 +279,9 @@ fn decide(
             ));
         }
         Ok(_) => {}
+    }
+    if let Some(why) = latched {
+        return Err(refuse(Check::OperatorLatched, why));
     }
     if let Some(target) = facts
         .tcp_forwards
@@ -287,14 +382,7 @@ fn read_facts(socket: &Path) -> Result<Facts, String> {
     let tun = status["TUN"]
         .as_bool()
         .ok_or_else(|| "LocalAPI status carries no TUN field".to_string())?;
-    let prefs = localapi_get(socket, "/localapi/v0/prefs")?;
-    let operator = prefs["OperatorUser"]
-        .as_str()
-        .ok_or_else(|| "LocalAPI prefs carry no OperatorUser field".to_string())?;
-    let operator_uid = match operator {
-        "" => Ok(None),
-        name => uid_of(name).map(Some),
-    };
+    let operator_uid = operator_uid(socket)?;
     let serve = localapi_get(socket, "/localapi/v0/serve-config")?;
     let mut tcp_forwards = Vec::new();
     collect_tcp_forwards(&serve, &mut tcp_forwards);
@@ -302,6 +390,19 @@ fn read_facts(socket: &Path) -> Result<Facts, String> {
         tun,
         operator_uid,
         tcp_forwards,
+    })
+}
+
+/// `prefs.OperatorUser` resolved to a uid. The outer `Err` is an
+/// unreadable LocalAPI; the inner one a name that resolves to no user.
+fn operator_uid(socket: &Path) -> Result<Result<Option<u32>, String>, String> {
+    let prefs = localapi_get(socket, "/localapi/v0/prefs")?;
+    let operator = prefs["OperatorUser"]
+        .as_str()
+        .ok_or_else(|| "LocalAPI prefs carry no OperatorUser field".to_string())?;
+    Ok(match operator {
+        "" => Ok(None),
+        name => uid_of(name).map(Some),
     })
 }
 
@@ -417,26 +518,26 @@ mod tests {
     /// check refuses on its own condition and names itself.
     #[test]
     fn decide_names_the_failed_check() {
-        assert_eq!(decide(&good(), 3010, 0, 0, 1000), Ok(()));
+        assert_eq!(decide(&good(), None, 3010, 0, 0, 1000), Ok(()));
         let userspace = Facts {
             tun: false,
             ..good()
         };
         assert_eq!(
-            check(decide(&userspace, 3010, 0, 0, 1000)),
+            check(decide(&userspace, None, 3010, 0, 0, 1000)),
             Some(Check::KernelNetworking)
         );
         let no_operator = Facts {
             operator_uid: Ok(None),
             ..good()
         };
-        assert_eq!(decide(&no_operator, 3010, 0, 0, 1000), Ok(()));
+        assert_eq!(decide(&no_operator, None, 3010, 0, 0, 1000), Ok(()));
         let board_is_operator = Facts {
             operator_uid: Ok(Some(1000)),
             ..good()
         };
         assert_eq!(
-            check(decide(&board_is_operator, 3010, 0, 0, 1000)),
+            check(decide(&board_is_operator, None, 3010, 0, 0, 1000)),
             Some(Check::NotOperatorUser)
         );
         let unknown_operator = Facts {
@@ -444,7 +545,7 @@ mod tests {
             ..good()
         };
         assert_eq!(
-            check(decide(&unknown_operator, 3010, 0, 0, 1000)),
+            check(decide(&unknown_operator, None, 3010, 0, 0, 1000)),
             Some(Check::NotOperatorUser)
         );
         for target in ["127.0.0.1:3010", "localhost:3010", "[::1]:3010", "garbage"] {
@@ -453,22 +554,52 @@ mod tests {
                 ..good()
             };
             assert_eq!(
-                check(decide(&fwd, 3010, 0, 0, 1000)),
+                check(decide(&fwd, None, 3010, 0, 0, 1000)),
                 Some(Check::NoTcpForwarder),
                 "{target}"
             );
         }
         assert_eq!(
-            check(decide(&good(), 3010, 0, 1000, 1000)),
+            check(decide(&good(), None, 3010, 0, 1000, 1000)),
             Some(Check::SocketOwner)
         );
         assert_eq!(
-            check(decide(&good(), 3010, 0, 1001, 1000)),
+            check(decide(&good(), None, 3010, 0, 1001, 1000)),
             Some(Check::SocketOwner)
         );
         assert_eq!(
-            check(decide(&good(), 3010, 1000, 1000, 1000)),
+            check(decide(&good(), None, 3010, 1000, 1000, 1000)),
             Some(Check::ForeignUid)
+        );
+    }
+
+    /// A latch never read at startup is latched; a sighting of the
+    /// board's uid as operator, or an unresolvable operator, latches for
+    /// good — a later "no operator" read never clears it.
+    #[test]
+    fn the_operator_latch_only_ever_closes() {
+        assert!(OperatorLatch::default().reason().is_some());
+        let open = OperatorLatch(Arc::new(Mutex::new(None)));
+        open.observe(&Ok(None), 1000);
+        open.observe(&Ok(Some(1001)), 1000);
+        assert_eq!(open.reason(), None);
+        open.observe(&Ok(Some(1000)), 1000);
+        open.observe(&Ok(None), 1000);
+        assert!(open
+            .reason()
+            .is_some_and(|r| r.contains("was tailscaled's operator")));
+        let unresolved = OperatorLatch(Arc::new(Mutex::new(None)));
+        unresolved.observe(&Err("no such user".into()), 1000);
+        assert!(unresolved.reason().is_some());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            OperatorLatch::at_startup(Some(&dir.path().join("none.sock")))
+                .reason()
+                .is_some()
+        );
+        assert_eq!(
+            check(decide(&good(), Some("latched".into()), 3010, 0, 0, 1000)),
+            Some(Check::OperatorLatched)
         );
     }
 
@@ -515,18 +646,21 @@ mod tests {
         let (_accepted, peer) = listener.accept().unwrap();
 
         let remote: SocketAddr = "192.0.2.7:40000".parse().unwrap();
-        assert_eq!(check(prove(None, port, remote)), Some(Check::Loopback));
+        assert_eq!(
+            check(prove(None, &OperatorLatch::default(), port, remote)),
+            Some(Check::Loopback)
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("none.sock");
         assert_eq!(
-            check(prove(Some(&missing), port, peer)),
+            check(prove(Some(&missing), &OperatorLatch::default(), port, peer)),
             Some(Check::TailscaledSocket)
         );
         let file = dir.path().join("file.sock");
         std::fs::write(&file, b"").unwrap();
         assert_eq!(
-            check(prove(Some(&file), port, peer)),
+            check(prove(Some(&file), &OperatorLatch::default(), port, peer)),
             Some(Check::TailscaledSocket)
         );
         // A socket that answers nothing useful: the LocalAPI refusal.
@@ -537,6 +671,9 @@ mod tests {
                 drop(s);
             }
         });
-        assert_eq!(check(prove(Some(&sock), port, peer)), Some(Check::Localapi));
+        assert_eq!(
+            check(prove(Some(&sock), &OperatorLatch::default(), port, peer)),
+            Some(Check::Localapi)
+        );
     }
 }

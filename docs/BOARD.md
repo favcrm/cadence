@@ -690,6 +690,7 @@ on the first that cannot be read or does not hold:
 | `localapi` | the LocalAPI answers `status`, `prefs` and `serve-config` (read-only, over that socket; cached 2 s) |
 | `kernel_networking` | `status.TUN` is true. Under userspace networking tailscaled itself dials `127.0.0.1:<port>` for any tailnet peer the ACL lets reach the port — tagged nodes too — so its sockets carry that peer's bytes |
 | `not_operator_user` | the board's uid is not tailscaled's `OperatorUser` (`prefs`, the name resolved to a uid; a name that resolves to no user refuses) |
+| `operator_latched` | the board's uid was never the operator during this board process's life: read at board startup and at every later read. One sighting, or a failed startup read, refuses tailnet identity until the board restarts |
 | `no_tcp_forwarder` | no `TCPForward` handler (`tailscale serve --tcp=N tcp://…`) anywhere in the serve config — background, foreground sessions, services — targets the board's port. A raw forwarder passes the client's headers through untouched |
 | `client_socket` | the connection's client socket is listed in `/proc/net/tcp{,6}` |
 | `socket_owner` | that socket was created by tailscaled's uid — the table's `uid` column, readable for another user's socket |
@@ -717,19 +718,35 @@ it, agents included — can make tailscaled dial the board at any time:
 add a TCP forwarder, open a connection through it, remove the
 forwarder, and send forged headers later. No read of the serve config
 can see a connection that is already open, so `no_tcp_forwarder` only
-catches a standing or accidental forwarder; `not_operator_user` is
-what shuts the deliberate case out.
+catches a standing or accidental forwarder; `not_operator_user` and
+`operator_latched` shut the deliberate case out. The latch matters
+because the operator can clear itself (`tailscale set --operator=`
+needs no root) after opening such a connection: a board that ever saw
+its user as operator never trusts a tailnet login again. **After
+clearing the operator, restart the board** (`cadence ui stop` then
+`cadence ui start`, or `ui tailscale start`, which restarts it) — that
+also drops every connection the old process held.
 
 **What is proven**, when every check holds: the connection was opened
 by tailscaled (its uid, not the board's), which runs in kernel
 networking mode, whose operator user is not the board's user, and whose
 serve config — as read at most 2 s earlier — forwards no raw TCP to the
-board. A process at the board's uid can neither open such a connection
-nor make tailscaled open one.
+board, and the board's user was not the operator at any point in this
+board process's life. Then a process at the board's uid can neither
+open such a connection nor make tailscaled open one — **unless it can
+become root** (next list).
 
 **What is not proven:**
 
-- **root**, which can do anything here anyway;
+- **root — including a board user that can gain root.** Where the
+  board's user has passwordless sudo (`NOPASSWD`, or membership in a
+  group sudo lets run without a password), any same-user process — an
+  agent included — can run `sudo tailscale serve --tcp …` and make
+  tailscaled connect as root. On such a host tailnet logins are
+  **never** trustworthy against same-user processes, whatever the
+  checks say. **This host is such a host:** the board user `ubuntu` is
+  in the `sudo` group and `sudo -n true` succeeds. Trusting tailnet
+  logins needs a board user without passwordless sudo;
 - **tailscaled's operator user, if it is another account.** It can
   still make tailscaled dial the board as above; set no operator, or
   one you trust as much as root;
@@ -750,8 +767,10 @@ without sudo has made the board's user tailscaled's operator
 refused at `not_operator_user`: no login is recorded, and a tailnet
 write falls to the peer-process rule — `403` wherever the daemon's
 agent store exists, because tailscaled's socket belongs to another
-user (reads still work). To keep tailnet attribution, clear the operator:
-`sudo tailscale set --operator=`. Serve edits then need root:
+user (reads still work). To keep tailnet attribution, clear the operator
+with `sudo tailscale set --operator=` and **restart the board**
+(`operator_latched` refuses until then), on a board user without
+passwordless sudo (above). Serve edits then need root:
 `sudo tailscale serve --bg --https=<port> http://127.0.0.1:<ui port>`
 before `ui tailscale start` (which reuses an identical mapping), and
 `sudo tailscale serve --https=<port> off` in place of the removal

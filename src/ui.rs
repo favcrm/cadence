@@ -217,6 +217,9 @@ pub struct ServeOpts {
     /// ([`crate::tailnet_proof`]); `None` is tailscaled's default path.
     /// Never set from the command line — tests inject a fixture.
     pub tailscaled_socket: Option<PathBuf>,
+    /// This board process's operator-user latch. [`serve`] always
+    /// replaces it with a fresh startup read; the default is latched.
+    pub tailnet_latch: crate::tailnet_proof::OperatorLatch,
 }
 
 fn opts_file(state_dir: &Path) -> PathBuf {
@@ -367,6 +370,7 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         read_only: eff.read_only,
         tailnet,
         tailscaled_socket: None,
+        tailnet_latch: Default::default(),
     })
 }
 
@@ -1243,9 +1247,12 @@ fn tailnet_proxy(
         return None;
     }
     Some(match request.remote_addr() {
-        Some(peer) => {
-            crate::tailnet_proof::prove(opts.tailscaled_socket.as_deref(), opts.port, *peer)
-        }
+        Some(peer) => crate::tailnet_proof::prove(
+            opts.tailscaled_socket.as_deref(),
+            &opts.tailnet_latch,
+            opts.port,
+            *peer,
+        ),
         None => Err(crate::tailnet_proof::Refusal {
             check: crate::tailnet_proof::Check::ClientSocket,
             why: "the request has no peer address".to_string(),
@@ -2647,6 +2654,15 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
+    // The tailnet proof's operator latch starts with this process: read
+    // tailscaled's operator user now, never trust a caller-made latch.
+    let mut opts = opts.clone();
+    opts.tailnet_latch = if opts.tailnet.is_some() {
+        crate::tailnet_proof::OperatorLatch::at_startup(opts.tailscaled_socket.as_deref())
+    } else {
+        Default::default()
+    };
+    let opts = &opts;
     let server = Server::http(format!("{}:{}", opts.host, opts.port))
         .map_err(|e| Error::internal(format!("ui bind {}:{}: {e}", opts.host, opts.port)))?;
     eprintln!("cadence ui listening on http://{}:{}", opts.host, opts.port);
