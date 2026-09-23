@@ -6919,15 +6919,18 @@ fn memory_malformed_timestamp_is_safe() {
 }
 // ==== CAD-83: `cadence overview` + /api/meta + /api/overview ====
 
-/// A fake `gh` binary dir: `pr` calls answer $FAKE_GH_PRS, `api` calls
-/// answer $FAKE_GH_CI, FAKE_GH_FAIL=1 makes every call exit 1. The call
-/// log records argv lines.
+/// A fake `gh` binary dir: `pr` calls answer $FAKE_GH_PRS, the
+/// `ci.yml` runs listing answers $FAKE_GH_RUNS (default: no runs), the
+/// repo read answers default branch `main`; FAKE_GH_FAIL=1 makes every
+/// call exit 1. The call log records argv lines.
 const FAKE_GH: &str = r#"#!/bin/sh
 echo "$*" >> "$FAKE_GH_LOG"
 if [ "$FAKE_GH_FAIL" = "1" ]; then echo "gh: simulated outage" >&2; exit 1; fi
-case "$1" in
-  pr) printf '%s' "$FAKE_GH_PRS" ;;
-  api) printf '%s' "$FAKE_GH_CI" ;;
+no_runs='{"total_count": 0, "workflow_runs": []}'
+case "$1 $2" in
+  pr\ *) printf '%s' "$FAKE_GH_PRS" ;;
+  "api repos/"*/actions/workflows/*) printf '%s' "${FAKE_GH_RUNS:-$no_runs}" ;;
+  "api repos/"*) printf '%s' '{"default_branch": "main"}' ;;
   *) exit 1 ;;
 esac
 "#;
@@ -7076,7 +7079,6 @@ fn overview_merge_ready_pr_first_with_exact_command() {
             ("PATH", path.as_str()),
             ("FAKE_GH_LOG", log.as_str()),
             ("FAKE_GH_PRS", prs.as_str()),
-            ("FAKE_GH_CI", r#"{"state":"success","statuses":[]}"#),
         ],
     );
     assert!(ok, "{v}");
@@ -7096,9 +7098,16 @@ fn overview_merge_ready_pr_first_with_exact_command() {
     assert_eq!(needs[1]["command"], "gh pr view 9 --repo acme/widgets");
     assert!(needs[1]["age"].as_i64().unwrap_or(0) >= 10000);
     assert_eq!(v["github"]["state"], "ok");
-    // gh was asked exactly once per repo for each of the two queries.
+    // gh was asked exactly once per repo for each of the three queries
+    // (PRs, default branch, ci.yml runs) — never the legacy status API.
     let calls = std::fs::read_to_string(&gh.log).unwrap();
-    assert_eq!(calls.lines().count(), 2, "{calls}");
+    assert_eq!(calls.lines().count(), 3, "{calls}");
+    assert!(
+        calls.lines().any(|c| c
+            == "api repos/acme/widgets/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=30"),
+        "{calls}"
+    );
+    assert!(!calls.contains("/status"), "{calls}");
 }
 
 #[test]
@@ -7145,7 +7154,6 @@ fn overview_github_failure_degrades_not_fails() {
             ("FAKE_GH_LOG", log.as_str()),
             ("FAKE_GH_FAIL", "1"),
             ("FAKE_GH_PRS", "[]"),
-            ("FAKE_GH_CI", "{}"),
         ],
     );
     assert!(ok, "{v}");
@@ -7443,7 +7451,6 @@ fn overview_review_suppressed_by_branch_match() {
             ("PATH", path.as_str()),
             ("FAKE_GH_LOG", log.as_str()),
             ("FAKE_GH_PRS", prs.as_str()),
-            ("FAKE_GH_CI", r#"{"state":"success","statuses":[]}"#),
         ],
     );
     assert!(ok, "{v}");
@@ -7488,7 +7495,6 @@ fn overview_empty_slug_set_keeps_cached_rows() {
             ("PATH", path.as_str()),
             ("FAKE_GH_LOG", log.as_str()),
             ("FAKE_GH_PRS", prs.as_str()),
-            ("FAKE_GH_CI", r#"{"state":"success","statuses":[]}"#),
         ],
     );
     assert!(ok, "{v}");
