@@ -24,6 +24,13 @@ use crate::adapter::{pty, registry};
 use crate::error::{Error, Result};
 use crate::proto::identifier;
 
+mod threads;
+pub use threads::{
+    tool_summary, NewEntry, Sender, Thread, ThreadEntry, KIND_ASSISTANT_TEXT, KIND_MESSAGE,
+    KIND_TOOL_CALL, KIND_TOOL_RESULT, KIND_TURN_RESULT, PAGE_MAX as THREAD_PAGE_MAX, ROLE_AGENT,
+    ROLE_OPERATOR, ROLE_SYSTEM,
+};
+
 /// How long a connection waits on another process's lock before
 /// SQLITE_BUSY (CAD-256). The daemon's writer and every out-of-process
 /// reader (`audit`, `issue retro`, `doctor host`) share one WAL store.
@@ -1419,6 +1426,16 @@ impl Store {
             // or the one-time CADENCE_ROLLOUT_BOOTSTRAP introduction).
             let tx = conn.unchecked_transaction()?;
             crate::rollout::ensure_lease_tables(&tx)?;
+            tx.execute("UPDATE schema_version SET version=12", [])?;
+            tx.commit()?;
+        }
+        if version < 13 {
+            // v13: durable conversation threads (CAD-319) — a thread per
+            // agent alias and its ordered entries, outliving provider
+            // sessions. New objects only, `IF NOT EXISTS`, one
+            // transaction: a half-applied v13 converges on reopen.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(threads::SCHEMA_V13)?;
             tx.execute(
                 "UPDATE schema_version SET version=?1",
                 [crate::rollout::SCHEMA_VERSION],
@@ -2236,9 +2253,34 @@ impl Store {
         source: &str,
         task_id: Option<&str>,
     ) -> Result<(bool, String)> {
+        self.enqueue_sent(
+            alias,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            &Sender::Unattributed,
+        )
+    }
+
+    /// `enqueue_task` with the daemon's attribution of who queued it —
+    /// the role of the entry a threaded agent's chat records
+    /// (CAD-319). Only the daemon derives `sender`, from the connection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_sent(
+        &self,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        sender: &Sender,
+    ) -> Result<(bool, String)> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        let out = self.enqueue_tx(&tx, alias, body, reply_to, id, source, task_id)?;
+        let out = self.enqueue_tx(&tx, alias, body, reply_to, id, source, task_id, sender)?;
         tx.commit()?;
         Ok(out)
     }
@@ -2255,6 +2297,7 @@ impl Store {
         id: &str,
         source: &str,
         task_id: Option<&str>,
+        sender: &Sender,
     ) -> Result<(bool, String)> {
         if body.is_empty() || body.len() > 48_000 {
             return Err(Error::rejected("Prompt must contain 1-48000 characters"));
@@ -2308,6 +2351,7 @@ impl Store {
             None,
             task_id,
         )?;
+        Self::thread_note_enqueued(tx, alias, sender, source, body, id)?;
         Ok((false, "queued".to_string()))
     }
 
@@ -2933,6 +2977,7 @@ impl Store {
             "turn_finished",
             json!({"message": message.id, "result": result}),
         )?;
+        Self::thread_note_finished(tx, message, status, result, error)?;
         // Preserve the uncertain provider outcome on the work axis.  The
         // compatibility `turn_finished` row above stays unscoped, while
         // this explicit unknown row is scoped only when the message carries
@@ -4816,6 +4861,7 @@ impl Store {
             &kickoff,
             "job_dispatch",
             Some(task_id),
+            &Sender::Unattributed,
         )?;
         if duplicate {
             tx.commit()?;
@@ -5763,6 +5809,7 @@ impl Store {
             &kickoff,
             "job_dispatch",
             Some(task_id),
+            &Sender::Unattributed,
         )?;
         if duplicate {
             return Ok((task, kickoff, true, false));

@@ -29,9 +29,10 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::store::{self, Store};
 
-/// Schema version that introduces `rollout_leases` and `daemon_build`.
-/// The v12 migration in `store` hardcodes this same number.
-pub const SCHEMA_VERSION: i64 = 12;
+/// Current store schema. v12 introduced `rollout_leases` and
+/// `daemon_build`; v13 adds conversation threads (CAD-319).
+/// The newest migration in `store` writes this number.
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -340,8 +341,9 @@ pub fn authorize_migration(path: &Path) -> Result<MigrationPermit> {
 fn migration_refusal(version: i64, lease_table: bool) -> String {
     let bootstrap = if version == PRE_LEASE_SCHEMA && !lease_table {
         " This database has no rollout_leases table, so the previous binary \
-         cannot run `cadence rollout`. For this single schema 11 to 12 \
-         introduction, start the daemon once with CADENCE_ROLLOUT_BOOTSTRAP=1. \
+         cannot run `cadence rollout`. For this single introduction of the \
+         lease table (schema 11 upward), start the daemon once with \
+         CADENCE_ROLLOUT_BOOTSTRAP=1. \
          That opt-in does not authorize any later schema change."
     } else {
         ""
@@ -2379,7 +2381,7 @@ mod tests {
     }
 
     #[test]
-    fn open_store_reaches_schema_12() {
+    fn open_store_reaches_the_current_schema() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.sqlite3");
         Store::open(&db).unwrap();
@@ -2388,7 +2390,7 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 12);
+        assert_eq!(SCHEMA_VERSION, 13);
     }
 
     struct MigrationHolder;

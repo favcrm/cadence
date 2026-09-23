@@ -351,3 +351,19 @@ fn re2_literal_braces_are_escaped() {
     assert_eq!(re2_braces(r"[[:alnum:]{]{4}"), r"[[:alnum:]{]{4}");
     assert_eq!(re2_braces(r"\{\{[ \t]*}}"), r"\{\{[ \t]*\}\}");
 }
+
+/// CAD-319: `redact_text` replaces each span in place and keeps the
+/// surrounding text, multi-byte characters included; clean text is
+/// returned unchanged.
+#[test]
+fn redact_text_replaces_only_the_secret_spans() {
+    let a = token(&["gh", "p_"].concat(), "redact-a", 36);
+    let b = token(&["sk-", "ant-"].concat(), "redact-b", 40);
+    let text = format!("héllo {a} — ünd {b} ✓");
+    let out = redact_text(&text).unwrap();
+    assert!(!out.contains(&a) && !out.contains(&b), "{out}");
+    assert!(out.starts_with("héllo [redacted:"), "{out}");
+    assert!(out.contains(" — ünd [redacted:"), "{out}");
+    assert!(out.ends_with(" ✓"), "{out}");
+    assert_eq!(redact_text("nothing here ✓").unwrap(), "nothing here ✓");
+}

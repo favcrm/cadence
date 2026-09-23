@@ -606,6 +606,59 @@ fn line_col(text: &[u8], at: usize) -> (usize, usize) {
 /// one per secret span; where rules overlap, a blocking finding wins.
 /// The operator allowlist is not applied here — see [`Allowlist`].
 pub fn scan(text: &str, path: Option<&str>) -> Result<Vec<Finding>> {
+    Ok(scan_spans(text, path)?
+        .into_iter()
+        .map(|(_, _, f)| f)
+        .collect())
+}
+
+/// Replace every credential-shaped span in `text` (blocking and
+/// warn-only alike) with `[redacted:<rule>]`. For text cadence stores
+/// on its own initiative — thread entries, tool-call summaries — where
+/// refusing is not an option but the value must never land. The
+/// operator allowlist is deliberately not applied: redacting a false
+/// positive costs a few characters, storing a real one is a leak.
+pub fn redact_text(text: &str) -> Result<String> {
+    let spans = scan_spans(text, None)?;
+    if spans.is_empty() {
+        return Ok(text.to_string());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end, finding) in spans {
+        // Spans are byte offsets from a UTF-8 `&str` scanned as bytes;
+        // widen to char boundaries so slicing never panics.
+        let start = floor_char_boundary(text, start.max(at));
+        let end = ceil_char_boundary(text, end);
+        if start < at || end <= start {
+            continue;
+        }
+        out.push_str(&text[at..start]);
+        out.push_str(&format!("[redacted:{}]", finding.rule));
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    Ok(out)
+}
+
+fn floor_char_boundary(text: &str, mut i: usize) -> usize {
+    i = i.min(text.len());
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(text: &str, mut i: usize) -> usize {
+    i = i.min(text.len());
+    while !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// [`scan`] with each finding's byte span in `text`.
+fn scan_spans(text: &str, path: Option<&str>) -> Result<Vec<(usize, usize, Finding)>> {
     let pack = pack()?;
     let bytes = text.as_bytes();
     let lower = text.to_ascii_lowercase();
@@ -681,7 +734,7 @@ pub fn scan(text: &str, path: Option<&str>) -> Result<Vec<Finding>> {
             _ => out.push(hit),
         }
     }
-    Ok(out.into_iter().map(|(_, _, f)| f).collect())
+    Ok(out)
 }
 
 // ---------- operator allowlist ----------

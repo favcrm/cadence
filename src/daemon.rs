@@ -655,6 +655,7 @@ impl Shared {
         // provider lifecycle traffic and the explicit `cadence/*`
         // channel (ack, tool_use, message_report) alike.
         self.bump_activity(alias);
+        self.thread_on_provider_event(alias, method, &params);
         if method == "cadence/codex_quota" {
             let thread_id = params.get("thread_id").and_then(Value::as_str);
             if let Some(thread_id) = thread_id {
@@ -753,6 +754,146 @@ impl Shared {
             self.resolve_external(alias, &params);
         }
         self.wake();
+    }
+
+    /// Payload events into a threaded agent's chat (CAD-319): Codex
+    /// `agentMessage` items as they persist, managed Claude tool uses
+    /// (name + redacted summary). The turn result lands with the
+    /// message's finish, in the store. A lost append is logged, never
+    /// fatal to the turn — the provider transcript still has it.
+    fn thread_on_provider_event(&self, alias: &str, method: &str, params: &Value) {
+        let (kind, text, payload) = match method {
+            "item/completed" => {
+                let item = &params["item"];
+                if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+                    return;
+                }
+                let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                (
+                    store::KIND_ASSISTANT_TEXT,
+                    text.to_string(),
+                    json!({"provider_item": item.get("id"), "phase": item.get("phase")}),
+                )
+            }
+            "cadence/tool_use" => {
+                let tool = params.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                // The adapter already summarized and redacted; the store
+                // redacts again. A summary-less event records the name.
+                let summary = params
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| tool.to_string());
+                (
+                    store::KIND_TOOL_CALL,
+                    summary,
+                    json!({"tool": tool, "tool_use_id": params.get("tool_use_id")}),
+                )
+            }
+            _ => return,
+        };
+        if let Err(e) =
+            self.store
+                .thread_append_running(alias, store::ROLE_AGENT, kind, &text, Some(payload))
+        {
+            eprintln!("thread append for '{alias}' failed: {e}");
+        }
+    }
+
+    /// `thread_read` — a page of an agent's thread after `after`,
+    /// optionally long-polling up to `wait` seconds (≤ 30) for the next
+    /// entry, the way `agent_events` does. Read-only.
+    fn rpc_thread_read(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        let raw = required_str(params, "alias")?;
+        // A thread outlives its agent row: a removed alias still reads.
+        let alias = match self.resolve_alias(raw) {
+            Ok(alias) => alias,
+            Err(e) => match self.store.thread(raw)? {
+                Some(_) => raw.to_string(),
+                None => return Err(e),
+            },
+        };
+        let after = optional_i64(params, "after").unwrap_or(0);
+        if after < 0 {
+            return Err(Error::rejected("Thread cursor must be nonnegative"));
+        }
+        let limit = optional_i64(params, "limit").unwrap_or(100);
+        if !(1..=store::THREAD_PAGE_MAX).contains(&limit) {
+            return Err(Error::rejected(format!(
+                "Thread page limit must be 1-{}",
+                store::THREAD_PAGE_MAX
+            )));
+        }
+        let wait = optional_u64(params, "wait").unwrap_or(0).min(30);
+        let deadline = Instant::now() + Duration::from_secs(wait);
+        loop {
+            let thread = self.store.thread(&alias)?;
+            let entries = self.store.thread_entries(&alias, after, limit)?;
+            if !entries.is_empty()
+                || Instant::now() >= deadline
+                || self.closing.load(Ordering::SeqCst)
+            {
+                let cursor = entries.last().map(|e| e.seq).unwrap_or(after);
+                return Ok(json!({
+                    "alias": alias,
+                    "thread": thread.as_ref().map(store::Thread::to_json),
+                    "entries": entries.iter().map(store::ThreadEntry::to_json).collect::<Vec<_>>(),
+                    "cursor": cursor,
+                }));
+            }
+            let step = deadline.min(Instant::now() + Duration::from_secs(1));
+            self.changed.wait_until(step);
+        }
+    }
+
+    /// `thread_send` — the operator's chat message to an agent: starts
+    /// the alias's thread on first use and queues the text exactly like
+    /// `agent_send`, recorded as an `operator` entry.
+    ///
+    /// It instructs an agent, so an agent must never reach it: a
+    /// connection the daemon attributes to a pane or managed endpoint is
+    /// refused, and so is one whose identity cannot be derived (fail
+    /// closed). Tied to no agent is accepted as the operator — a default,
+    /// not positive proof: the board relays browser writes from its own
+    /// process, so the browser's identity is the board's to establish
+    /// (CAD-313). Identity-shaped and routing fields are refused rather
+    /// than read.
+    fn rpc_thread_send(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        if let Some(obj) = params.as_object() {
+            if let Some(field) = obj
+                .keys()
+                .find(|k| !matches!(k.as_str(), "alias" | "text" | "message"))
+            {
+                return Err(Error::rejected(format!(
+                    "thread send takes alias, text and message only; field '{field}' \
+                     is not accepted"
+                )));
+            }
+        }
+        match self.caller_identity(peer_pid) {
+            Ok(Caller::NoAgentIdentity) => {}
+            Ok(Caller::Agent(v)) => {
+                return Err(Error::rejected(format!(
+                    "thread send is the operator's chat — this connection is agent \
+                     '{}'; agents message each other with `cadence send`",
+                    v.agent.alias
+                )))
+            }
+            Err(e) => {
+                return Err(Error::rejected(format!(
+                    "thread send refused: caller identity underivable — {e}"
+                )))
+            }
+        }
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        required_str(params, "text")?;
+        let thread = self.store.ensure_thread(&alias)?;
+        let mut send = params.clone();
+        send["alias"] = json!(alias);
+        send["source"] = json!("operator");
+        let mut receipt = self.send_as(&send, &|_| store::Sender::Operator)?;
+        receipt["thread"] = thread.to_json();
+        Ok(receipt)
     }
 
     /// The provider resolved a request outside Cadence — e.g. an
@@ -1773,8 +1914,10 @@ impl Shared {
                     "unknown": self.store.unknown_messages(&alias)?.len(),
                 }))
             }
-            "agent_send" => self.rpc_send(params),
-            "agent_ask" => self.rpc_ask(params),
+            "agent_send" => self.rpc_send_from(params, peer_pid),
+            "agent_ask" => self.rpc_ask(params, peer_pid),
+            "thread_read" => self.rpc_thread_read(params),
+            "thread_send" => self.rpc_thread_send(params, peer_pid),
             "agent_events" => self.rpc_events(params),
             "agent_requests" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -3218,7 +3361,40 @@ impl Shared {
         ))
     }
 
+    /// `agent_send` without a connection to attribute (unit tests):
+    /// a threaded agent records the message as unattributed.
+    #[cfg(test)]
     fn rpc_send(self: &Arc<Self>, params: &Value) -> Result<Value> {
+        self.send_as(params, &|_| store::Sender::Unattributed)
+    }
+
+    /// `agent_send` over the socket: a threaded agent's chat records
+    /// who queued it, derived from the connection (CAD-319).
+    fn rpc_send_from(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.send_as(params, &|alias| self.thread_sender(alias, peer_pid))
+    }
+
+    /// Who queued a message for `alias`'s thread. Only computed for an
+    /// alias that has one — the identity walk is not free. An agent
+    /// connection is that agent; no agent is the operator by default
+    /// (not proof — CAD-313); an underivable caller is unattributed.
+    fn thread_sender(&self, alias: &str, peer_pid: u32) -> store::Sender {
+        match self.store.thread(alias) {
+            Ok(Some(_)) => {}
+            _ => return store::Sender::Unattributed,
+        }
+        match self.caller_identity(peer_pid) {
+            Ok(Caller::Agent(v)) => store::Sender::Agent(v.agent.alias.clone()),
+            Ok(Caller::NoAgentIdentity) => store::Sender::Operator,
+            Err(_) => store::Sender::Unattributed,
+        }
+    }
+
+    fn send_as(
+        self: &Arc<Self>,
+        params: &Value,
+        sender_of: &dyn Fn(&str) -> store::Sender,
+    ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
         let target = self.store.agent_opt(&alias)?;
@@ -3314,9 +3490,16 @@ impl Shared {
             optional_str(params, "source").unwrap_or("user")
         };
         proto::identifier(source, "Message source")?;
-        let (duplicate, state) =
-            self.store
-                .enqueue_task(&alias, text, reply_to.as_deref(), &message, source, task)?;
+        let sender = sender_of(&alias);
+        let (duplicate, state) = self.store.enqueue_sent(
+            &alias,
+            text,
+            reply_to.as_deref(),
+            &message,
+            source,
+            task,
+            &sender,
+        )?;
         self.notify_agent(&alias);
         self.wake();
         let mut receipt = json!({"message": message, "state": state, "duplicate": duplicate});
@@ -3328,9 +3511,9 @@ impl Shared {
     }
 
     /// Send and wait for the message's terminal state, bounded by `wait`.
-    fn rpc_ask(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    fn rpc_ask(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let wait = optional_u64(params, "wait").unwrap_or(120).min(600);
-        let result = self.rpc_send(params)?;
+        let result = self.rpc_send_from(params, peer_pid)?;
         let message = result["message"].as_str().unwrap_or_default().to_string();
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {

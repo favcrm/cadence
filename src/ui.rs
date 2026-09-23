@@ -33,6 +33,8 @@ use crate::error::{Error, Result};
 use crate::issue::{board, context, history, model, project, write as issue_write, Pm};
 use crate::proc::{self, BoundedError};
 
+mod threads;
+
 /// The options `ui run` and `ui start` share. Every field is optional:
 /// a given flag overrides the persisted `ui.json`, an absent one
 /// inherits it, and `--reset` on `start` forgets the file first.
@@ -1614,6 +1616,17 @@ fn write_route(
         );
         return;
     }
+    // The operator's chat message to an agent (CAD-319) — guarded and
+    // caller-attributed inside `threads::post_message`.
+    if let Some((alias, sub)) = threads::route(path) {
+        if *method != Method::Post || sub != Some("messages") {
+            send(request, err_response(404, "no such thread write route"));
+            return;
+        }
+        let resp = threads::post_message(&mut request, state_dir, opts, alias);
+        send(request, resp);
+        return;
+    }
     let Some(rest) = path.strip_prefix("/api/issues") else {
         send(request, err_response(404, "no such write route"));
         return;
@@ -2429,6 +2442,18 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
                 match Pm::at(pm_dir).and_then(|pm| crate::memory::find(&pm, Some(key), slug)) {
                     Ok((_, m)) => send(request, json_response(crate::memory::detail_json(&m))),
                     Err(e) => send(request, err_response(404, &e.to_string())),
+                }
+                return;
+            }
+            // `/api/threads/<alias>[/stream]` — an agent's chat (CAD-319).
+            if let Some((alias, sub)) = threads::route(&path) {
+                match sub {
+                    None => send(request, threads::read(state_dir, alias, &query)),
+                    Some("stream") if head_only => {
+                        send(request, err_response(405, "stream is GET only"))
+                    }
+                    Some("stream") => threads::stream(request, state_dir, alias, &query),
+                    Some(_) => send(request, err_response(404, "no such thread route")),
                 }
                 return;
             }

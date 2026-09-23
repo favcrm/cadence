@@ -35019,7 +35019,7 @@ fn holder_migrates_through_daemon_start_without_a_test_override() {
         .unwrap()
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 // ---- CAD-96: idle auto-stop (default ON in production, pinned here) ----
