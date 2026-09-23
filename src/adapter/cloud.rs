@@ -50,15 +50,17 @@ struct Session {
     limit: Option<f64>,
     wait_sent: bool,
     terminated: bool,
-    /// Assistant messages already present before the current post.
-    seen: usize,
-    message_mark: usize,
+    /// `event_id`s from the messages endpoint at post time, plus the
+    /// page `total` when the API sent one. A Devin message whose
+    /// `event_id` is already here is not part of this turn.
+    marker_ids: Vec<String>,
+    marker_total: Option<i64>,
     /// Snapshot taken at post time. A terminal or waiting state that
     /// still matches this snapshot is leftover from before the post.
     post_marked: bool,
     post_status: String,
     post_detail: String,
-    /// Assistant text that arrived after `message_mark`.
+    /// Devin text whose `event_id` arrived after `marker_ids`.
     turn_text: String,
 }
 
@@ -411,7 +413,7 @@ impl DevinCloudAdapter {
                         .and_then(Value::as_array)
                         .map(|tags| tags.iter().any(|t| t.as_str() == Some(tag.as_str())))
                         .unwrap_or(false);
-                    if tagged && id.starts_with("devin-") {
+                    if tagged && valid_session_id(id) {
                         return Ok(Some(id.to_string()));
                     }
                 }
@@ -431,15 +433,13 @@ impl DevinCloudAdapter {
         let id = reply
             .get("session_id")
             .and_then(Value::as_str)
-            .filter(|s| s.starts_with("devin-"))
+            .filter(|s| valid_session_id(s))
             .ok_or_else(|| {
-                Error::unknown(
-                    "devin cloud create outcome unknown: response had no devin- session id",
-                )
+                Error::unknown("devin cloud create outcome unknown: response had no session id")
             })?
             .to_string();
         let url = session_url(reply, &id);
-        self.remember(reply, Some(id.clone()), Some(url.clone()));
+        self.remember(reply, &[], Some(id.clone()), Some(url.clone()));
         (self.hooks.on_event)(
             "cadence/cloud_session",
             json!({"session_id": id, "endpoint": url, "status": reply.get("status")}),
@@ -460,7 +460,7 @@ impl DevinCloudAdapter {
                     return Err(mismatch(id, got));
                 }
                 let url = session_url(&reply, id);
-                self.remember(&reply, Some(id.to_string()), Some(url.clone()));
+                self.remember(&reply, &[], Some(id.to_string()), Some(url.clone()));
                 (self.hooks.on_event)(
                     "cadence/cloud_session",
                     json!({"session_id": id, "endpoint": url, "adopted": true}),
@@ -491,7 +491,7 @@ impl DevinCloudAdapter {
         }
     }
 
-    fn remember(&self, body: &Value, id: Option<String>, url: Option<String>) {
+    fn remember(&self, body: &Value, messages: &[Value], id: Option<String>, url: Option<String>) {
         let mut st = self.session.lock().unwrap();
         if let Some(id) = id {
             st.id = Some(id);
@@ -511,12 +511,54 @@ impl DevinCloudAdapter {
         if let Some(n) = body.get("max_acu_limit").and_then(Value::as_f64) {
             st.limit = Some(n);
         }
-        st.seen = assistant_count(body);
-        st.turn_text = transcript_after(body, st.message_mark);
+        st.turn_text = transcript_after(messages, &st.marker_ids, body);
+    }
+
+    /// Follow `has_next_page` / `end_cursor` on the messages list.
+    /// `source == "devin"` is the assistant; the session GET has no
+    /// messages field.
+    fn fetch_messages(&self, org: &str, id: &str) -> std::result::Result<MessageList, CallErr> {
+        let mut items = Vec::new();
+        let mut after: Option<String> = None;
+        let mut total = None;
+        for _ in 0..20 {
+            let mut rest = format!("/{}/messages?first=100", encode(id));
+            if let Some(cursor) = &after {
+                rest.push_str("&after=");
+                rest.push_str(&encode(cursor));
+            }
+            let body = self.call("GET", &self.org_path(org, &rest), None)?;
+            if let Some(page) = body.get("items").and_then(Value::as_array) {
+                items.extend(page.iter().cloned());
+            }
+            if total.is_none() {
+                total = body.get("total").and_then(Value::as_i64);
+            }
+            let more = body
+                .get("has_next_page")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let cursor = body
+                .get("end_cursor")
+                .and_then(Value::as_str)
+                .filter(|cursor| !cursor.is_empty())
+                .map(str::to_string);
+            if !more {
+                break;
+            }
+            let Some(cursor) = cursor else { break };
+            if after.as_ref() == Some(&cursor) {
+                break;
+            }
+            after = Some(cursor);
+        }
+        Ok(MessageList { items, total })
     }
 
     /// Freeze the session as it stands at post time, so a message or a
     /// terminal state that already exists is not this turn's result.
+    /// The marker is the messages endpoint's `event_id`s and `total`,
+    /// not a count on the session body.
     fn capture_post_marker(&self) {
         let (org, id) = {
             let st = self.session.lock().unwrap();
@@ -526,25 +568,30 @@ impl DevinCloudAdapter {
             (st.org.clone(), id)
         };
         let path = self.org_path(&org, &format!("/{}", encode(&id)));
-        if let Ok(body) = self.call("GET", &path, None) {
-            let (status, detail) = status_of(&body);
-            let count = assistant_count(&body);
-            let mut st = self.session.lock().unwrap();
-            st.status = status.clone();
-            st.detail = detail.clone();
-            st.seen = count;
-            st.message_mark = count;
-            st.post_status = status;
-            st.post_detail = detail;
-            st.post_marked = true;
-            st.turn_text.clear();
-        } else {
-            let mut st = self.session.lock().unwrap();
-            st.message_mark = st.seen;
-            st.post_status = st.status.to_ascii_lowercase();
-            st.post_detail = st.detail.to_ascii_lowercase();
-            st.post_marked = true;
-            st.turn_text.clear();
+        match (
+            self.call("GET", &path, None),
+            self.fetch_messages(&org, &id),
+        ) {
+            (Ok(body), Ok(list)) => {
+                let (status, detail) = status_of(&body);
+                let ids = event_ids(&list.items);
+                let mut st = self.session.lock().unwrap();
+                st.status = status.clone();
+                st.detail = detail.clone();
+                st.marker_ids = ids;
+                st.marker_total = list.total;
+                st.post_status = status;
+                st.post_detail = detail;
+                st.post_marked = true;
+                st.turn_text.clear();
+            }
+            _ => {
+                let mut st = self.session.lock().unwrap();
+                st.post_status = st.status.to_ascii_lowercase();
+                st.post_detail = st.detail.to_ascii_lowercase();
+                st.post_marked = true;
+                st.turn_text.clear();
+            }
         }
     }
 
@@ -588,50 +635,61 @@ impl DevinCloudAdapter {
             (st.org.clone(), id)
         };
         let path = self.org_path(&org, &format!("/{}", encode(&id)));
-        match self.call("GET", &path, None) {
-            Ok(body) => {
-                let stale = {
-                    let st = self.session.lock().unwrap();
-                    let (status, detail) = status_of(&body);
-                    st.post_marked
-                        && assistant_count(&body) <= st.message_mark
-                        && status == st.post_status
-                        && detail == st.post_detail
-                };
-                self.remember(&body, None, None);
-                let phase = phase_of(&body, stale);
-                if !matches!(phase, Phase::Wait) {
-                    self.session.lock().unwrap().wait_sent = false;
-                }
-                if matches!(phase, Phase::Wait) {
-                    self.emit_wait(&body);
-                }
-                Ok(phase)
-            }
-            Err(err) => {
-                if self.released() {
-                    return Ok(Phase::Interrupted);
-                }
-                let msg = call_text(&err);
-                self.note(&msg);
-                *self.hold_detail.lock().unwrap() = msg.clone();
-                let held = self.last_state();
-                match err {
-                    CallErr::Status(429, _) | CallErr::Transport(_) => Err(Error::unknown(
-                        format!("devin cloud poll held last state ({held}): {msg}"),
-                    )),
-                    CallErr::Status(code, _) if code >= 500 => Err(Error::unknown(format!(
-                        "devin cloud poll held last state ({held}): {msg}"
-                    ))),
-                    CallErr::Status(code, _) => Err(Error::provider(format!(
-                        "devin cloud poll failed: HTTP {code} {msg}"
-                    ))),
-                }
-            }
+        let body = match self.call("GET", &path, None) {
+            Ok(body) => body,
+            Err(err) => return self.hold_poll(err),
+        };
+        let list = match self.fetch_messages(&org, &id) {
+            Ok(list) => list,
+            Err(err) => return self.hold_poll(err),
+        };
+        let fresh = fresh_devin(&list.items, &self.session.lock().unwrap().marker_ids);
+        let fresh_text = fresh
+            .iter()
+            .filter_map(|message| message_text(message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stale = {
+            let st = self.session.lock().unwrap();
+            let (status, detail) = status_of(&body);
+            st.post_marked
+                && fresh.is_empty()
+                && status == st.post_status
+                && detail == st.post_detail
+        };
+        self.remember(&body, &list.items, None, None);
+        let phase = phase_of(&body, stale, &fresh_text);
+        if !matches!(phase, Phase::Wait) {
+            self.session.lock().unwrap().wait_sent = false;
+        }
+        if matches!(phase, Phase::Wait) {
+            self.emit_wait(&fresh_text);
+        }
+        Ok(phase)
+    }
+
+    fn hold_poll(&self, err: CallErr) -> Result<Phase> {
+        if self.released() {
+            return Ok(Phase::Interrupted);
+        }
+        let msg = call_text(&err);
+        self.note(&msg);
+        *self.hold_detail.lock().unwrap() = msg.clone();
+        let held = self.last_state();
+        match err {
+            CallErr::Status(429, _) | CallErr::Transport(_) => Err(Error::unknown(format!(
+                "devin cloud poll held last state ({held}): {msg}"
+            ))),
+            CallErr::Status(code, _) if code >= 500 => Err(Error::unknown(format!(
+                "devin cloud poll held last state ({held}): {msg}"
+            ))),
+            CallErr::Status(code, _) => Err(Error::provider(format!(
+                "devin cloud poll failed: HTTP {code} {msg}"
+            ))),
         }
     }
 
-    fn emit_wait(&self, body: &Value) {
+    fn emit_wait(&self, text: &str) {
         let id = {
             let mut st = self.session.lock().unwrap();
             if st.wait_sent {
@@ -645,7 +703,7 @@ impl DevinCloudAdapter {
             method: "devin/user_input".into(),
             params: json!({
                 "session_id": id,
-                "text": latest_assistant(body),
+                "text": text,
             }),
         });
     }
@@ -1084,12 +1142,19 @@ fn repo_enabled(body: &Value, owner: &str, name: &str) -> bool {
     })
 }
 
+/// Docs show a `devin-` path id. A live list on 2026-09-23 returned a
+/// 32-hex `session_id` with no prefix, and GET accepted that value.
+fn valid_session_id(id: &str) -> bool {
+    (id.starts_with("devin-") && id.len() > "devin-".len())
+        || (id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 fn require_session_id(id: &str) -> Result<()> {
-    if id.starts_with("devin-") && id.len() > "devin-".len() {
+    if valid_session_id(id) {
         Ok(())
     } else {
         Err(Error::rejected(format!(
-            "devin cloud session id must look like 'devin-…', got '{id}'"
+            "devin cloud session id must look like 'devin-…' or 32 hex, got '{id}'"
         )))
     }
 }
@@ -1215,42 +1280,99 @@ fn status_of(body: &Value) -> (String, String) {
     (status, detail)
 }
 
+/// Devin API v3 `SessionResponse` status enum, from
+/// <https://docs.devin.ai/api-reference/v3/sessions/get-organizations-session>:
+/// `new`, `claimed`, `running`, `exit`, `error`, `suspended`, `resuming`.
+///
+/// `status_detail` while `running`: `working`, `waiting_for_user`,
+/// `waiting_for_approval`, `finished`. While `suspended`: `inactivity`,
+/// `user_request`, `usage_limit_exceeded`, `out_of_credits`, `out_of_quota`,
+/// `no_quota_allocation`, `payment_declined`, `org_usage_limit_exceeded`,
+/// `user_usage_limit_exceeded`, `total_session_limit_exceeded`,
+/// `contract_expired`, `error`.
+///
+/// A finished turn is `status_detail == finished` or `status == exit`.
+/// `error` fails the turn. Suspended quota, credit, or usage details fail
+/// it. `suspended` with `user_request` or `inactivity` interrupts it.
+/// `blocked` is not in this enum (the older API used it for a user wait),
+/// so it waits instead of failing.
+///
+/// N2: a done Devin often sits in `running` / `waiting_for_user`. A fresh
+/// `source=devin` message that contains a `SHA:` line settles as completed.
+/// The same state without that line raises one user-input request. A
+/// waiting state already present at post time does not.
 fn success_terminal(status: &str, detail: &str) -> bool {
-    detail == "finished" || status == "finished" || status == "completed"
+    detail == "finished" || status == "exit" || status == "finished" || status == "completed"
+}
+
+fn quota_suspension(detail: &str) -> bool {
+    matches!(
+        detail,
+        "usage_limit_exceeded"
+            | "out_of_credits"
+            | "out_of_quota"
+            | "no_quota_allocation"
+            | "payment_declined"
+            | "org_usage_limit_exceeded"
+            | "user_usage_limit_exceeded"
+            | "total_session_limit_exceeded"
+            | "contract_expired"
+    )
 }
 
 fn failure_terminal(status: &str, detail: &str) -> bool {
-    matches!(
-        detail,
-        "error" | "failed" | "expired" | "blocked" | "acu_exhausted" | "out_of_acu"
-    ) || detail.contains("acu")
-        || matches!(status, "error" | "failed" | "expired" | "blocked")
+    status == "error" || detail == "error" || (status == "suspended" && quota_suspension(detail))
+}
+
+fn user_suspension(status: &str, detail: &str) -> bool {
+    status == "suspended" && matches!(detail, "user_request" | "inactivity")
 }
 
 fn waiting_detail(detail: &str) -> bool {
-    detail == "waiting_for_user" || detail == "waiting_for_approval"
+    detail == "waiting_for_user" || detail == "waiting_for_approval" || detail == "blocked"
 }
 
-/// `stale` means this status, detail, and assistant count were already
-/// present when we posted. A new error, expiry, block, or ACU exhaustion
-/// settles even when the session wrote no new assistant message.
-fn phase_of(body: &Value, stale: bool) -> Phase {
+fn has_sha_line(text: &str) -> bool {
+    text.lines().any(|line| {
+        let rest = line
+            .trim()
+            .strip_prefix("SHA:")
+            .or_else(|| line.trim().strip_prefix("sha:"));
+        rest.is_some_and(|hex| {
+            let hex = hex.trim();
+            hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    })
+}
+
+/// `stale` means this status, detail, and Devin `event_id` set were already
+/// present when we posted. A new error or quota suspension settles even
+/// when the session wrote no new Devin message.
+fn phase_of(body: &Value, stale: bool, fresh_text: &str) -> Phase {
     let (status, detail) = status_of(body);
-    let terminal = success_terminal(&status, &detail)
+    let settled = success_terminal(&status, &detail)
         || failure_terminal(&status, &detail)
+        || user_suspension(&status, &detail)
+        || waiting_detail(&detail)
+        || status == "blocked"
         || detail == "interrupted"
         || status == "interrupted";
-    if stale && (terminal || waiting_detail(&detail)) {
+    if stale && settled {
         return Phase::Running;
     }
     if success_terminal(&status, &detail) {
         Phase::Done
     } else if failure_terminal(&status, &detail) {
         Phase::Failed
-    } else if waiting_detail(&detail) {
-        Phase::Wait
-    } else if detail == "interrupted" || status == "interrupted" {
+    } else if user_suspension(&status, &detail)
+        || detail == "interrupted"
+        || status == "interrupted"
+    {
         Phase::Interrupted
+    } else if detail == "waiting_for_user" && has_sha_line(fresh_text) {
+        Phase::Done
+    } else if waiting_detail(&detail) || status == "blocked" {
+        Phase::Wait
     } else {
         Phase::Running
     }
@@ -1266,64 +1388,60 @@ fn create_claim(alias: &str) -> String {
     format!("cadence-agent:{alias}:{tick:x}-{n:x}")
 }
 
-fn latest_assistant(body: &Value) -> String {
-    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-        return String::new();
-    };
-    messages
+struct MessageList {
+    items: Vec<Value>,
+    total: Option<i64>,
+}
+
+fn is_devin(message: &Value) -> bool {
+    message.get("source").and_then(Value::as_str) == Some("devin")
+}
+
+fn message_text(message: &Value) -> Option<&str> {
+    message
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+fn event_ids(items: &[Value]) -> Vec<String> {
+    items
         .iter()
-        .rev()
-        .filter(|m| {
-            matches!(
-                m.get("role").and_then(Value::as_str),
-                Some("assistant") | Some("devin") | None
-            )
-        })
-        .find_map(|m| {
-            m.get("message")
-                .or_else(|| m.get("text"))
-                .or_else(|| m.get("content"))
+        .filter_map(|message| {
+            message
+                .get("event_id")
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
-        .unwrap_or_default()
+        .collect()
 }
 
-fn is_assistant(message: &Value) -> bool {
-    matches!(
-        message.get("role").and_then(Value::as_str),
-        Some("assistant") | Some("devin") | None
-    )
+fn fresh_devin<'a>(items: &'a [Value], marker: &[String]) -> Vec<&'a Value> {
+    items
+        .iter()
+        .filter(|message| {
+            is_devin(message)
+                && message
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !marker.iter().any(|seen| seen == id))
+        })
+        .collect()
 }
 
-fn assistant_count(body: &Value) -> usize {
-    body.get("messages")
-        .and_then(Value::as_array)
-        .map(|messages| messages.iter().filter(|m| is_assistant(m)).count())
-        .unwrap_or(0)
-}
-
-fn transcript_after(body: &Value, mark: usize) -> String {
+fn transcript_after(messages: &[Value], marker: &[String], session: &Value) -> String {
     let mut lines = Vec::new();
-    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
-        for message in messages.iter().filter(|m| is_assistant(m)).skip(mark) {
-            if let Some(text) = message
-                .get("message")
-                .or_else(|| message.get("text"))
-                .or_else(|| message.get("content"))
-                .and_then(Value::as_str)
-            {
-                if !text.is_empty() {
-                    lines.push(text.to_string());
-                }
-            }
+    for message in fresh_devin(messages, marker) {
+        if let Some(text) = message_text(message) {
+            lines.push(text.to_string());
         }
     }
-    if let Some(prs) = body.get("pull_requests").and_then(Value::as_array) {
+    if let Some(prs) = session.get("pull_requests").and_then(Value::as_array) {
         for pr in prs {
             if let Some(url) = pr
-                .get("url")
+                .get("pr_url")
                 .and_then(Value::as_str)
+                .or_else(|| pr.get("url").and_then(Value::as_str))
                 .or_else(|| pr.as_str())
             {
                 lines.push(url.to_string());
@@ -1390,6 +1508,8 @@ mod tests {
         StaleSha,
         ErrorQuiet,
         StaleWait,
+        ShaWait,
+        Paged,
     }
 
     struct Hit {
@@ -1414,18 +1534,234 @@ mod tests {
         }
     }
 
-    fn session_body(id: &str, detail: &str, text: &str) -> String {
-        json!({
+    fn session_body(id: &str, detail: &str, _text: &str) -> String {
+        let (status, detail) = match detail {
+            "error" => ("error", "error"),
+            "interrupted" => ("suspended", "user_request"),
+            "finished" => ("running", "finished"),
+            "waiting_for_user" => ("running", "waiting_for_user"),
+            other => ("running", other),
+        };
+        session_state(id, status, detail, false)
+    }
+
+    /// Session GET shape from the live v3 API: no `messages` field.
+    fn session_state(id: &str, status: &str, detail: &str, with_pr: bool) -> String {
+        let prs = if with_pr {
+            json!([{"pr_url": "https://github.com/favcrm/cadence/pull/9", "pr_state": "open"}])
+        } else {
+            json!([])
+        };
+        let body = json!({
             "session_id": id,
-            "status": "running",
+            "status": status,
             "status_detail": detail,
             "url": format!("https://app.devin.ai/sessions/{id}"),
-            "messages": [{"role": "assistant", "message": text}],
-            "pull_requests": [{"url": "https://github.com/favcrm/cadence/pull/9"}],
+            "tags": [],
+            "org_id": ORG,
             "acus_consumed": 1.25,
-            "max_acu_limit": 10,
+            "pull_requests": prs,
+        });
+        assert!(body.get("messages").is_none());
+        body.to_string()
+    }
+
+    fn devin_msg(event_id: &str, text: &str) -> Value {
+        json!({
+            "event_id": event_id,
+            "source": "devin",
+            "message": text,
+            "created_at": 1,
+            "origin": "api",
+            "user_id": null,
+            "username": null,
+        })
+    }
+
+    fn message_page(items: &[Value], has_next: bool, cursor: Option<&str>, total: i64) -> String {
+        json!({
+            "items": items,
+            "has_next_page": has_next,
+            "end_cursor": cursor,
+            "total": total,
         })
         .to_string()
+    }
+
+    struct Scene {
+        id: &'static str,
+        status: &'static str,
+        detail: &'static str,
+        items: Vec<Value>,
+        with_pr: bool,
+        split: Option<usize>,
+    }
+
+    fn working(id: &'static str) -> Scene {
+        Scene {
+            id,
+            status: "running",
+            detail: "working",
+            items: Vec::new(),
+            with_pr: false,
+            split: None,
+        }
+    }
+
+    fn scene(script: Script, hits: &[Hit]) -> Scene {
+        let posts = message_posts(hits);
+        let sha = format!("SHA: {SHA}");
+        match script {
+            Script::AdoptMismatch => working("devin-other"),
+            Script::AdoptOk => working("devin-keep"),
+            Script::Wait => {
+                if posts == 0 {
+                    working("devin-created")
+                } else if posts == 1 {
+                    Scene {
+                        id: "devin-created",
+                        status: "running",
+                        detail: "waiting_for_user",
+                        items: vec![devin_msg("evt-q", "which approach?")],
+                        with_pr: false,
+                        split: None,
+                    }
+                } else {
+                    Scene {
+                        id: "devin-created",
+                        status: "running",
+                        detail: "finished",
+                        items: vec![
+                            devin_msg("evt-q", "which approach?"),
+                            devin_msg("evt-sha", &sha),
+                        ],
+                        with_pr: false,
+                        split: None,
+                    }
+                }
+            }
+            Script::ErrorDetail => {
+                if posts == 0 {
+                    working("devin-created")
+                } else {
+                    Scene {
+                        id: "devin-created",
+                        status: "error",
+                        detail: "error",
+                        items: vec![devin_msg("evt-boom", "boom")],
+                        with_pr: false,
+                        split: None,
+                    }
+                }
+            }
+            Script::ErrorQuiet => {
+                if posts == 0 {
+                    working("devin-created")
+                } else {
+                    Scene {
+                        id: "devin-created",
+                        status: "error",
+                        detail: "error",
+                        items: Vec::new(),
+                        with_pr: false,
+                        split: None,
+                    }
+                }
+            }
+            Script::StaleWait => Scene {
+                id: "devin-created",
+                status: "running",
+                detail: "waiting_for_user",
+                items: vec![devin_msg("evt-old", "previous question")],
+                with_pr: false,
+                split: None,
+            },
+            Script::ShaWait => {
+                if posts == 0 {
+                    working("devin-created")
+                } else {
+                    Scene {
+                        id: "devin-created",
+                        status: "running",
+                        detail: "waiting_for_user",
+                        items: vec![devin_msg("evt-sha", &sha)],
+                        with_pr: false,
+                        split: None,
+                    }
+                }
+            }
+            Script::Interrupted => {
+                if posts == 0 {
+                    working("devin-created")
+                } else {
+                    Scene {
+                        id: "devin-created",
+                        status: "suspended",
+                        detail: "user_request",
+                        items: Vec::new(),
+                        with_pr: false,
+                        split: None,
+                    }
+                }
+            }
+            Script::StaleSha => {
+                if posts == 0 {
+                    working("devin-created")
+                } else if posts == 1 {
+                    Scene {
+                        id: "devin-created",
+                        status: "running",
+                        detail: "finished",
+                        items: vec![devin_msg("evt-1", &sha)],
+                        with_pr: false,
+                        split: None,
+                    }
+                } else {
+                    Scene {
+                        id: "devin-created",
+                        status: "running",
+                        detail: "finished",
+                        items: vec![
+                            devin_msg("evt-1", &sha),
+                            devin_msg("evt-2", "revision two has no trailer"),
+                        ],
+                        with_pr: false,
+                        split: None,
+                    }
+                }
+            }
+            Script::Paged => {
+                if posts == 0 {
+                    working("devin-created")
+                } else {
+                    Scene {
+                        id: "devin-created",
+                        status: "running",
+                        detail: "finished",
+                        items: vec![
+                            devin_msg("evt-1", "still working"),
+                            devin_msg("evt-2", &sha),
+                        ],
+                        with_pr: true,
+                        split: Some(1),
+                    }
+                }
+            }
+            _ => {
+                if posts == 0 {
+                    working("devin-created")
+                } else {
+                    Scene {
+                        id: "devin-created",
+                        status: "running",
+                        detail: "finished",
+                        items: vec![devin_msg("evt-sha", &sha)],
+                        with_pr: true,
+                        split: None,
+                    }
+                }
+            }
+        }
     }
 
     fn created_body(id: &str) -> String {
@@ -1434,23 +1770,6 @@ mod tests {
             "status": "running",
             "status_detail": "working",
             "url": format!("https://app.devin.ai/sessions/{id}"),
-        })
-        .to_string()
-    }
-
-    fn session_messages(id: &str, detail: &str, texts: &[&str]) -> String {
-        let messages: Vec<Value> = texts
-            .iter()
-            .map(|text| json!({"role": "assistant", "message": text}))
-            .collect();
-        json!({
-            "session_id": id,
-            "status": "running",
-            "status_detail": detail,
-            "url": format!("https://app.devin.ai/sessions/{id}"),
-            "messages": messages,
-            "acus_consumed": 1.25,
-            "max_acu_limit": 10,
         })
         .to_string()
     }
@@ -1506,98 +1825,37 @@ mod tests {
             return Some((200, json!({"ok": true}).to_string()));
         }
         if method == "GET" && path.contains("/sessions/") {
-            return Some(match script {
-                Script::RateLimit => (429, json!({"error": KEY}).to_string()),
-                Script::Poll500 => (500, json!({"error": KEY}).to_string()),
-                Script::Adopt404 => (404, json!({"error": "not found"}).to_string()),
-                Script::AdoptMismatch => (200, session_body("devin-other", "working", "")),
-                Script::AdoptOk => (200, session_body("devin-keep", "working", "")),
-                Script::Wait => {
-                    let posts = message_posts(hits);
-                    if posts == 0 {
-                        (200, created_body("devin-created"))
-                    } else if posts == 1 {
-                        (
-                            200,
-                            session_body("devin-created", "waiting_for_user", "which approach?"),
-                        )
-                    } else {
-                        (
-                            200,
-                            session_messages(
-                                "devin-created",
-                                "finished",
-                                &["which approach?", &format!("SHA: {SHA}")],
-                            ),
-                        )
-                    }
+            if matches!(script, Script::RateLimit) {
+                return Some((429, json!({"error": KEY}).to_string()));
+            }
+            if matches!(script, Script::Poll500) {
+                return Some((500, json!({"error": KEY}).to_string()));
+            }
+            if matches!(script, Script::Adopt404) {
+                return Some((404, json!({"error": "not found"}).to_string()));
+            }
+            let view = scene(script, hits);
+            if path.contains("/messages") {
+                let total = view.items.len() as i64;
+                if path.contains("after=") {
+                    let rest = view
+                        .split
+                        .map(|index| view.items[index..].to_vec())
+                        .unwrap_or_default();
+                    return Some((200, message_page(&rest, false, None, total)));
                 }
-                Script::ErrorDetail => {
-                    if message_posts(hits) == 0 {
-                        (200, created_body("devin-created"))
-                    } else {
-                        (200, session_body("devin-created", "error", "boom"))
-                    }
+                if let Some(index) = view.split {
+                    return Some((
+                        200,
+                        message_page(&view.items[..index], true, Some("page2"), total),
+                    ));
                 }
-                Script::ErrorQuiet => {
-                    if message_posts(hits) == 0 {
-                        (200, created_body("devin-created"))
-                    } else {
-                        (
-                            200,
-                            json!({
-                                "session_id": "devin-created",
-                                "status": "error",
-                                "status_detail": "error",
-                                "url": "https://app.devin.ai/sessions/devin-created",
-                                "messages": [],
-                            })
-                            .to_string(),
-                        )
-                    }
-                }
-                Script::StaleWait => (
-                    200,
-                    session_body("devin-created", "waiting_for_user", "previous question"),
-                ),
-                Script::Interrupted => {
-                    if message_posts(hits) == 0 {
-                        (200, created_body("devin-created"))
-                    } else {
-                        (200, session_body("devin-created", "interrupted", ""))
-                    }
-                }
-                Script::StaleSha => {
-                    let posts = message_posts(hits);
-                    if posts == 0 {
-                        (200, created_body("devin-created"))
-                    } else if posts == 1 {
-                        (
-                            200,
-                            session_body("devin-created", "finished", &format!("SHA: {SHA}")),
-                        )
-                    } else {
-                        (
-                            200,
-                            session_messages(
-                                "devin-created",
-                                "finished",
-                                &[&format!("SHA: {SHA}"), "revision two has no trailer"],
-                            ),
-                        )
-                    }
-                }
-                _ => {
-                    if message_posts(hits) == 0 {
-                        (200, created_body("devin-created"))
-                    } else {
-                        (
-                            200,
-                            session_body("devin-created", "finished", &format!("SHA: {SHA}")),
-                        )
-                    }
-                }
-            });
+                return Some((200, message_page(&view.items, false, None, total)));
+            }
+            return Some((
+                200,
+                session_state(view.id, view.status, view.detail, view.with_pr),
+            ));
         }
         Some((500, json!({"error": "unexpected"}).to_string()))
     }
@@ -1921,31 +2179,86 @@ mod tests {
     fn stale_terminal_state_does_not_settle_but_a_new_one_does() {
         for (status, detail) in [
             ("error", "error"),
-            ("expired", "expired"),
-            ("running", "blocked"),
-            ("running", "acu_exhausted"),
+            ("suspended", "out_of_quota"),
+            ("suspended", "usage_limit_exceeded"),
         ] {
-            let body = json!({
-                "status": status,
-                "status_detail": detail,
-                "messages": [],
-            });
+            let body = json!({"status": status, "status_detail": detail});
             assert!(
-                matches!(phase_of(&body, false), Phase::Failed),
-                "{status}/{detail} should settle"
+                matches!(phase_of(&body, false, ""), Phase::Failed),
+                "{status}/{detail} should fail"
             );
             assert!(
-                matches!(phase_of(&body, true), Phase::Running),
+                matches!(phase_of(&body, true, ""), Phase::Running),
                 "{status}/{detail} leftover should not settle"
             );
         }
-        let waiting = json!({
-            "status": "running",
-            "status_detail": "waiting_for_user",
-            "messages": [{"role": "assistant", "message": "previous question"}],
-        });
-        assert!(matches!(phase_of(&waiting, true), Phase::Running));
-        assert!(matches!(phase_of(&waiting, false), Phase::Wait));
+        let suspended = json!({"status": "suspended", "status_detail": "user_request"});
+        assert!(matches!(
+            phase_of(&suspended, false, ""),
+            Phase::Interrupted
+        ));
+        let finished = json!({"status": "exit", "status_detail": "finished"});
+        assert!(matches!(phase_of(&finished, false, ""), Phase::Done));
+        let blocked = json!({"status": "running", "status_detail": "blocked"});
+        assert!(
+            matches!(phase_of(&blocked, false, ""), Phase::Wait),
+            "blocked is a wait, not a failure"
+        );
+        let waiting = json!({"status": "running", "status_detail": "waiting_for_user"});
+        assert!(matches!(
+            phase_of(&waiting, true, "previous question"),
+            Phase::Running
+        ));
+        assert!(matches!(
+            phase_of(&waiting, false, "previous question"),
+            Phase::Wait
+        ));
+        let sha = format!("done\nSHA: {SHA}");
+        assert!(matches!(phase_of(&waiting, false, &sha), Phase::Done));
+    }
+
+    #[test]
+    fn waiting_for_user_with_a_sha_line_completes() {
+        let Harness {
+            adapter,
+            requests,
+            mock: _mock,
+            ..
+        } = adapter_for(Script::ShaWait);
+        adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        let turn = adapter.run_turn("do the task", "turn-1", &|_| {}).unwrap();
+        assert_eq!(turn.status, "completed");
+        assert!(turn.text.contains(&format!("SHA: {SHA}")), "{}", turn.text);
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn messages_follow_the_cursor_and_the_session_has_no_messages_field() {
+        let raw = session_state("devin-created", "running", "finished", true);
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        assert!(parsed.get("messages").is_none(), "{raw}");
+        assert!(parsed.get("pull_requests").is_some());
+        let Harness { adapter, mock, .. } = adapter_for(Script::Paged);
+        adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        let turn = adapter.run_turn("do the task", "turn-1", &|_| {}).unwrap();
+        assert_eq!(turn.status, "completed");
+        assert!(turn.text.contains(&format!("SHA: {SHA}")), "{}", turn.text);
+        assert!(turn
+            .text
+            .contains("https://github.com/favcrm/cadence/pull/9"));
+        let hits = hits_of(&mock);
+        assert!(hits.iter().any(|hit| {
+            hit.method == "GET" && hit.path.contains("/messages") && hit.path.contains("after=")
+        }));
+        assert!(hits.iter().any(|hit| {
+            hit.method == "GET"
+                && hit.path.contains("/sessions/")
+                && !hit.path.contains("/messages")
+        }));
     }
 
     #[test]

@@ -7211,6 +7211,22 @@ mod tests {
                         early_t.store(true, Ordering::SeqCst);
                     }
                     (200, json!({"ok": true}).to_string())
+                } else if method == "GET" && path.contains("/messages") {
+                    let items = if posts_t.load(Ordering::SeqCst) == 0 {
+                        json!([])
+                    } else if posts_t.load(Ordering::SeqCst) >= 2 {
+                        json!([
+                            {"event_id": "evt-1", "source": "devin", "message": format!("done\nSHA: {SHA}"), "created_at": 1},
+                            {"event_id": "evt-2", "source": "devin", "message": "follow-up done", "created_at": 2}
+                        ])
+                    } else {
+                        json!([{"event_id": "evt-1", "source": "devin", "message": format!("done\nSHA: {SHA}"), "created_at": 1}])
+                    };
+                    (
+                        200,
+                        json!({"items": items, "has_next_page": false, "end_cursor": null, "total": 1})
+                            .to_string(),
+                    )
                 } else if method == "GET" && path.contains("/sessions/") {
                     if posts_t.load(Ordering::SeqCst) == 0 {
                         (
@@ -7220,7 +7236,7 @@ mod tests {
                                 "status": "running",
                                 "status_detail": "working",
                                 "url": "https://app.devin.ai/sessions/devin-created",
-                                "messages": [],
+                                "pull_requests": [],
                             })
                             .to_string(),
                         )
@@ -7230,14 +7246,6 @@ mod tests {
                             (500, json!({"error": "transient"}).to_string())
                         } else {
                             finished_t.store(true, Ordering::SeqCst);
-                            let messages = if posts_t.load(Ordering::SeqCst) >= 2 {
-                                json!([
-                                    {"role": "assistant", "message": format!("done\nSHA: {SHA}")},
-                                    {"role": "assistant", "message": "follow-up done"}
-                                ])
-                            } else {
-                                json!([{"role": "assistant", "message": format!("done\nSHA: {SHA}")}])
-                            };
                             (
                                 200,
                                 json!({
@@ -7245,7 +7253,7 @@ mod tests {
                                     "status": "running",
                                     "status_detail": "finished",
                                     "url": "https://app.devin.ai/sessions/devin-created",
-                                    "messages": messages,
+                                    "pull_requests": [],
                                 })
                                 .to_string(),
                             )
@@ -7459,6 +7467,17 @@ mod tests {
                 } else if method == "POST" && path.contains("/messages") {
                     posts_t.fetch_add(1, Ordering::SeqCst);
                     (200, json!({"ok": true}).to_string())
+                } else if method == "GET" && path.contains("/messages") {
+                    gets_t.fetch_add(1, Ordering::SeqCst);
+                    if posts_t.load(Ordering::SeqCst) == 0 {
+                        (
+                            200,
+                            json!({"items": [], "has_next_page": false, "end_cursor": null, "total": 0})
+                                .to_string(),
+                        )
+                    } else {
+                        (429, json!({"error": "slow down"}).to_string())
+                    }
                 } else if method == "GET" && path.contains("/sessions/") {
                     gets_t.fetch_add(1, Ordering::SeqCst);
                     if posts_t.load(Ordering::SeqCst) == 0 {
@@ -7469,7 +7488,7 @@ mod tests {
                                 "status": "running",
                                 "status_detail": "working",
                                 "url": "https://app.devin.ai/sessions/devin-created",
-                                "messages": [],
+                                "pull_requests": [],
                             })
                             .to_string(),
                         )

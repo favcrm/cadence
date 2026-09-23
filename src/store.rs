@@ -1810,8 +1810,9 @@ impl Store {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let already: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='cloud_recover_escalated'",
-            [&message.alias],
+            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='cloud_recover_escalated' \
+             AND json_extract(payload,'$.message')=?2",
+            params![&message.alias, &message.id],
             |row| row.get(0),
         )?;
         if already == 0 {
@@ -3084,8 +3085,11 @@ impl Store {
                     "cloud_recover_escalated" => format!(
                         "A Devin cloud worker stopped polling a held turn after repeated \
                          failures. The worker is not fenced and the queued work was not \
-                         replayed. This is an informational notice, not a result; do not \
-                         treat it as worker output. {payload}"
+                         replayed. Stop the agent and resume it to poll again: \
+                         `cadence agent stop {alias}` then `cadence agent resume {alias}`. \
+                         This is an informational notice, not a result; do not treat it as \
+                         worker output. {payload}",
+                        alias = message.alias
                     ),
                     "interrupted" => format!(
                 "An operator closed a managed worker's turn as interrupted — the outcome was \
@@ -6445,45 +6449,73 @@ fn flatten_controls(text: &str) -> String {
         .collect()
 }
 
-/// Drop absolute host paths so a cloud session is not pointed at a
-/// machine-local file. `https://` URLs are left intact.
+fn path_boundary(prev: Option<u8>) -> bool {
+    matches!(
+        prev,
+        None | Some(b' ' | b'\n' | b'\t' | b'\r' | b'`' | b'"' | b'(')
+    )
+}
+
+/// Drop absolute host paths and `~/` paths so a cloud session is not
+/// pointed at a machine-local file. Paths after a space, newline,
+/// backtick, quote, or `(` are included. `https://` URLs are left intact.
 pub fn omit_host_paths(text: &str) -> String {
+    let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(index) = rest.find('/') {
-        let absolute = index == 0
-            || rest.as_bytes().get(index.wrapping_sub(1)).copied() == Some(b' ')
-            || rest.as_bytes().get(index.wrapping_sub(1)).copied() == Some(b'\n');
-        let url = index >= 1 && rest.as_bytes().get(index - 1) == Some(&b':');
-        if absolute && !url {
-            out.push_str(&rest[..index]);
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'/' {
+            let ch = text[index..].chars().next().unwrap_or('\u{fffd}');
+            out.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+        let prev = if index == 0 {
+            None
+        } else {
+            Some(bytes[index - 1])
+        };
+        let tilde = prev == Some(b'~')
+            && path_boundary(if index >= 2 {
+                Some(bytes[index - 2])
+            } else {
+                None
+            });
+        let url = prev == Some(b':');
+        if tilde || (path_boundary(prev) && !url) {
+            let start = if tilde { index - 1 } else { index };
+            if tilde {
+                out.pop();
+            }
             out.push_str("(omitted)");
-            rest = rest[index..]
+            let token = text[start..]
                 .split_whitespace()
                 .next()
-                .map(|token| &rest[index + token.len()..])
-                .unwrap_or("");
+                .map(str::len)
+                .unwrap_or(text.len() - start);
+            index = start + token;
         } else {
-            let end = index + 1;
-            out.push_str(&rest[..end]);
-            rest = &rest[end..];
+            out.push('/');
+            index += 1;
         }
     }
-    out.push_str(rest);
     out
 }
 
-/// Inlined cloud spec text. Real dispatch specs run past 5k characters,
-/// so the cap sits above that. A cut spec says so in the prompt.
-const CLOUD_SPEC_CHARS: usize = 16_000;
+/// Enqueue rejects a body over 48_000 bytes. The inlined spec is cut in
+/// bytes, on a char boundary, so a multibyte spec cannot blow that limit.
+const ENQUEUE_BYTES: usize = 48_000;
+const SPEC_NOTE: &str = "… (spec text truncated; the inlined copy is incomplete)";
 
-fn take_spec_chars(text: &str) -> String {
-    if text.chars().count() <= CLOUD_SPEC_CHARS {
+fn take_bytes(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(CLOUD_SPEC_CHARS).collect();
-    out.push_str("… (spec text truncated; the inlined copy is incomplete)");
-    out
+    let mut end = limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 /// Cloud sessions cannot read the host spec path or run `cadence self`.
@@ -6492,7 +6524,7 @@ fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> String {
     let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
     let raw = std::fs::read_to_string(spec)
         .unwrap_or_else(|_| "(spec text was not available to inline)".to_string());
-    let spec_text = take_spec_chars(&omit_host_paths(&flatten_controls(&raw)));
+    let cleaned = omit_host_paths(&flatten_controls(&raw));
     let mut scope = String::new();
     if let Some(branch) = &task.branch {
         scope.push_str(&format!(" branch {}", flatten_controls(branch)));
@@ -6513,14 +6545,32 @@ fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> String {
         .as_deref()
         .map(|id| format!(" This job tracks issue {id}."))
         .unwrap_or_default();
-    format!(
-        "Cadence task {} (job {}, revision {}). You are a Devin cloud session and cannot \
-         read host paths or invoke the cadence CLI. Spec text follows. {spec_text}.{scope}{acceptance}{issue} \
-         Report when done: end your final answer with a one-line summary followed by a last \
-         line `SHA: <40-hex>` naming the commit you produced — the daemon reads that line as \
-         the reported revision. Do not report a SHA you have not committed.",
-        task.id, job.id, revision
-    )
+    let assemble = |spec_text: &str| {
+        format!(
+            "Cadence task {} (job {}, revision {}). You are a Devin cloud session and cannot \
+             read host paths or invoke the cadence CLI. Spec text follows. {spec_text}.{scope}{acceptance}{issue} \
+             Report when done: end your final answer with a one-line summary followed by a last \
+             line `SHA: <40-hex>` naming the commit you produced — the daemon reads that line as \
+             the reported revision. Do not report a SHA you have not committed.",
+            task.id, job.id, revision
+        )
+    };
+    let full = assemble(&cleaned);
+    if full.len() <= ENQUEUE_BYTES {
+        return full;
+    }
+    let bare = assemble("");
+    let room = ENQUEUE_BYTES
+        .saturating_sub(bare.len())
+        .saturating_sub(SPEC_NOTE.len());
+    let mut spec_text = take_bytes(&cleaned, room);
+    spec_text.push_str(SPEC_NOTE);
+    let body = assemble(&spec_text);
+    if body.len() <= ENQUEUE_BYTES {
+        body
+    } else {
+        take_bytes(&body, ENQUEUE_BYTES)
+    }
 }
 
 fn kickoff_correlation(message_id: &str) -> String {
@@ -8044,7 +8094,7 @@ mod tests {
     fn cloud_kickoff_states_when_the_spec_is_truncated() {
         let dir = tempfile::tempdir().unwrap();
         let spec = dir.path().join("spec.md");
-        let mut raw = "S".repeat(CLOUD_SPEC_CHARS);
+        let mut raw = "你".repeat(20_000);
         raw.push_str("UNIQUE_TAIL_MARKER");
         std::fs::write(&spec, &raw).unwrap();
         let job = Job {
@@ -8089,7 +8139,54 @@ mod tests {
         );
         assert!(!body.contains("UNIQUE_TAIL_MARKER"), "{body}");
         assert!(body.contains("SHA:"), "{body}");
+        assert!(body.len() <= 48_000, "kickoff is {} bytes", body.len());
         assert!(!body.contains(&spec.display().to_string()), "{body}");
+    }
+
+    #[test]
+    fn cloud_omit_host_paths_strips_a_backticked_path() {
+        let text = "see `/home/ubuntu/secret` and \"/tmp/x\" and (~/notes/a) plus ~/bare and https://example.com/a";
+        let out = omit_host_paths(text);
+        assert!(!out.contains("/home/ubuntu/secret"), "{out}");
+        assert!(!out.contains("/tmp/x"), "{out}");
+        assert!(!out.contains("~/notes"), "{out}");
+        assert!(!out.contains("~/bare"), "{out}");
+        assert!(out.contains("https://example.com/a"), "{out}");
+        assert!(out.contains("see"), "{out}");
+    }
+
+    #[test]
+    fn cloud_two_holds_on_one_agent_escalate_twice() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "w1", &cwd);
+        reg(&s, "pm", &cwd);
+        s.enqueue("w1", "one", Some("pm"), "m1", "user").unwrap();
+        s.enqueue("w1", "two", Some("pm"), "m2", "user").unwrap();
+        let first = s.message("m1").unwrap().unwrap();
+        let second = s.message("m2").unwrap().unwrap();
+        s.escalate_cloud_hold(&first, "budget").unwrap();
+        s.escalate_cloud_hold(&first, "budget").unwrap();
+        s.escalate_cloud_hold(&second, "budget").unwrap();
+        let escalations = s
+            .events("w1", 0, 40)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "cloud_recover_escalated")
+            .count();
+        assert_eq!(escalations, 2);
+        let notices: Vec<_> = s
+            .messages("pm")
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.body.contains("stopped polling"))
+            .collect();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().all(|message| {
+            message.body.contains("cadence agent stop w1")
+                && message.body.contains("cadence agent resume w1")
+                && message.body.contains("not fenced")
+        }));
     }
 
     #[test]
