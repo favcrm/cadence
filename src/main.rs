@@ -93,8 +93,10 @@ enum Commands {
         reason: String,
     },
     /// Write a portable bundle (`cadence.sqlite3` + `manifest.json`) to
-    /// a new directory. Only the store goes in: endpoint and turn tokens
-    /// are nulled, freed pages dropped, and every text cell scanned for
+    /// a new directory. Only the store goes in: endpoint columns are
+    /// nulled, every turn token and generation is redacted from every
+    /// text cell (refused if any remain), freed pages dropped, and every
+    /// text cell scanned for
     /// credential patterns. One blocking finding refuses the export and
     /// writes nothing; warnings pass. The bundle is not signed: its
     /// sha256 detects corruption, not tampering.
@@ -4277,7 +4279,26 @@ fn run() -> Result<i32> {
                 as_identity,
             } => {
                 std::fs::create_dir_all(&state_dir)?;
+                // CAD-396: an interrupted `restore --force` leaves the old
+                // store renamed aside; a daemon started now would create an
+                // empty store next to it.
+                let leftovers = cadence_agent::backup::interrupted_restore_leftovers(&state_dir);
+                if !leftovers.is_empty() {
+                    eprintln!(
+                        "warning: an interrupted restore left {} in {}; the previous store \
+                         may be there. Stop the daemon and move it back to cadence.sqlite3",
+                        leftovers
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        state_dir.display()
+                    );
+                }
                 let mut result = client::daemon_start_as(&state_dir, as_identity.as_deref())?;
+                if !leftovers.is_empty() {
+                    result["warning"] = json!({"interrupted_restore": leftovers});
+                }
                 // --resume: once the daemon answers, sweep every agent
                 // with a stored thread and no live endpoint.
                 if resume {

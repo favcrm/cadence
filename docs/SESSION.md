@@ -909,7 +909,11 @@ creates is `0700`; an existing `--dir` keeps the mode it already has.
 - Age comes from the UTC stamp in the file name
   (`cadence-<reason>-<stamp>-<id>`), then the manifest's mtime. Manifest
   content never decides age, so clock skew or a planted future-dated
-  manifest cannot push out the fresh copy.
+  manifest cannot push out the fresh copy. The name is checked for its
+  shape (`YYYYMMDDTHHMMSSZ` digits and an 8-hex id), not for valid date
+  ranges. A backup written while the clock ran ahead carries that
+  future stamp and outranks newer copies until real time catches up;
+  the fresh copy still always survives.
 - A copy is deleted only when it is the regular file
   `<manifest stem>.sqlite3` next to its manifest and its sha256 and size
   match that manifest. A symlink, an edited file, or a manifest naming
@@ -950,6 +954,13 @@ Only the store goes in. It is changed in these ways:
 
 - `agents.generation`, the generation every turn token is bound to, is set to NULL.
 - `messages.turn_id`, the turn token itself, is set to NULL.
+- Every turn token and generation the store knows — `messages.turn_id`,
+  `agents.generation`, each `"turn_id": "…"` value in any text cell
+  (event payloads outlive their messages), and the generation inside
+  each `<prefix>-<generation>-<uuid>` token — is replaced with
+  `[redacted]` in every text cell, before the columns above are nulled.
+  The export refuses if any of those values is still present afterwards.
+  The result reports `redacted: {tokens, cells}`.
 - `agents.pid` is set to NULL.
 - The file is `VACUUM`ed, so deleted rows left in freed pages do not travel.
 
@@ -1006,8 +1017,15 @@ of these cases:
   `<state>/backups`. It then renames the old store and its `-wal`/`-shm`
   aside, links the verified copy in without overwriting (`hard_link`),
   and removes the aside files only after that succeeded; on failure the
-  old files are renamed back. `cadence.lock` is opened with
-  `O_NOFOLLOW`, so a symlinked lock is refused.
+  old files are renamed back. If that rollback itself fails, the error
+  says `ROLLBACK FAILED` and names where the previous store now is.
+  `cadence.lock` is opened with `O_NOFOLLOW`, so a symlinked lock is
+  refused.
+- **An earlier forced restore was interrupted**: a
+  `cadence.sqlite3*.replaced-*` file in the state dir may hold the
+  previous store. Every restore refuses until it is moved back or away,
+  and `cadence daemon start` prints a warning (and a `warning` field)
+  while one exists.
 
 Repo paths are rewritten by remote. The restore matches each recorded
 repo to the `--repo` checkout whose `origin` is the same remote.
