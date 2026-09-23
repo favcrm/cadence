@@ -333,6 +333,8 @@ fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpts, ServeOpt
 fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
     let host = eff.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
     let port = eff.port.unwrap_or(3010);
+    // A sandbox board never takes production's port (CAD-310).
+    crate::sandbox::refuse_production_port(port)?;
     if eff.tailscale.is_some() && !is_loopback_host(&host) {
         return Err(Error::rejected(format!(
             "--tailscale shares the board through a proxy on this host, \

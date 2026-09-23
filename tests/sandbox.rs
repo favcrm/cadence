@@ -383,10 +383,11 @@ fn sandbox_reset_requires_the_marker() {
     assert!(plain.is_dir() && foreign.is_dir());
 }
 
-/// The tailnet is host-wide: under a sandbox profile both ways onto it
-/// refuse before tailscale is ever asked.
+/// The tailnet and port 3010 are production's: under a sandbox profile
+/// both ways onto the tailnet refuse before tailscale is ever asked,
+/// and a board with no port of its own does not default to 3010.
 #[test]
-fn tailscale_is_refused_under_a_sandbox_profile() {
+fn tailscale_and_port_3010_are_refused_under_a_sandbox_profile() {
     let host = Host::new();
     let state = host.tmp.path().join("state");
     let state_arg = state.to_str().unwrap();
@@ -397,6 +398,13 @@ fn tailscale_is_refused_under_a_sandbox_profile() {
         let out = host.run(&args, &[("CADENCE_PROFILE", "sandbox:x")]);
         refused(&out, "refused under CADENCE_PROFILE=sandbox:x");
         assert!(text(&out).contains("tailscale"), "{}", text(&out));
+    }
+    for args in [
+        vec!["--state-dir", state_arg, "ui", "start"],
+        vec!["--state-dir", state_arg, "ui", "start", "--port", "3010"],
+    ] {
+        let out = host.run(&args, &[("CADENCE_PROFILE", "sandbox:x")]);
+        refused(&out, "port 3010 is the production board");
     }
     assert!(!state.join("ui.pid").exists(), "no board started");
 }

@@ -427,7 +427,9 @@ fn choose_port(sb: &Sandbox, wanted: Option<u16>) -> Result<u16> {
         .is_some()
         .then(|| persisted_port(&state))
         .flatten();
-    let port = match (wanted, running) {
+    // Where the port came from decides the hint when it cannot be used:
+    // only a `--port` the caller typed can be "omitted".
+    let (port, flag) = match (wanted, running) {
         (Some(p), Some(r)) if p != r => {
             return Err(Error::rejected(format!(
                 "sandbox '{}' board is running on port {r} — \
@@ -435,35 +437,59 @@ fn choose_port(sb: &Sandbox, wanted: Option<u16>) -> Result<u16> {
                 sb.name, sb.name
             )))
         }
-        (Some(p), _) => p,
-        (None, Some(r)) => r,
+        (Some(p), _) => (p, true),
+        (None, Some(r)) => (r, false),
         (None, None) => match persisted_port(&state) {
-            Some(p) => p,
+            Some(p) => (p, false),
             None => {
                 let taken = sandbox_roots(&sb.base)
                     .iter()
                     .filter_map(|root| persisted_port(&root.join("state")))
                     .collect::<Vec<_>>();
-                PORTS
+                let free = PORTS
                     .clone()
                     .find(|p| !taken.contains(p) && bindable(*p))
                     .ok_or_else(|| {
                         Error::rejected("no free port in 3110-3199 — pass `--port <n>`")
-                    })?
+                    })?;
+                (free, false)
             }
         },
     };
+    let hint = if flag {
+        "pass another `--port` or omit it"
+    } else {
+        "it is this sandbox's last port (state/ui.json); free it or pass \
+         `--port <n>` to move the board"
+    };
     if port == PRODUCTION_UI_PORT {
-        return Err(Error::rejected(
-            "port 3010 is the production board — pass another `--port` or omit it",
-        ));
+        return Err(Error::rejected(format!(
+            "port {PRODUCTION_UI_PORT} is the production board — {hint}"
+        )));
     }
     if running.is_none() && !bindable(port) {
         return Err(Error::rejected(format!(
-            "port {port} is in use on 127.0.0.1 — pass another `--port` or omit it"
+            "port {port} is in use on 127.0.0.1 — {hint}"
         )));
     }
     Ok(port)
+}
+
+/// Under a sandbox profile, refuse the production board's port — the
+/// default a board without a persisted port would otherwise take.
+pub fn refuse_production_port(port: u16) -> Result<()> {
+    production_port_gate(profile().as_deref(), port)
+}
+
+fn production_port_gate(profile: Option<&str>, port: u16) -> Result<()> {
+    match profile {
+        Some(name) if port == PRODUCTION_UI_PORT => Err(Error::rejected(format!(
+            "port {PRODUCTION_UI_PORT} is the production board — refused under \
+             CADENCE_PROFILE={PROFILE_PREFIX}{name}; pass `--port <n>`, or \
+             `cadence sandbox up {name}` picks a free one"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 // ---------- verbs ----------
@@ -476,6 +502,7 @@ fn sh_quote(s: &str) -> String {
 fn env_lines(sb: &Sandbox, port: Option<u16>) -> String {
     let mut text = format!(
         "# cadence sandbox {name} — `eval \"$(cadence sandbox env {name})\"`\n\
+         unset CADENCE_ALIAS CADENCE_ROLLOUT_AS\n\
          export CADENCE_STATE_DIR={state}\n\
          export CADENCE_PM_DIR={pm}\n\
          export CADENCE_PROFILE={profile}\n",
@@ -835,6 +862,39 @@ mod tests {
     }
 
     #[test]
+    fn production_port_is_refused_only_under_a_profile() {
+        assert!(production_port_gate(None, 3010).is_ok());
+        assert!(production_port_gate(Some("x"), 3111).is_ok());
+        let err = production_port_gate(Some("x"), 3010).unwrap_err();
+        assert!(err.to_string().contains("sandbox:x"), "{err}");
+    }
+
+    /// Only a `--port` the caller typed can be "omitted"; a taken port
+    /// from `state/ui.json` says where it came from.
+    #[test]
+    fn a_taken_port_hint_names_where_the_port_came_from() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sb = Sandbox {
+            name: "pt".into(),
+            base: dir.path().to_path_buf(),
+            root: dir.path().join("pt"),
+        };
+        std::fs::create_dir_all(sb.state_dir()).unwrap();
+        let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        std::fs::write(
+            sb.state_dir().join("ui.json"),
+            format!(r#"{{"port":{port}}}"#),
+        )
+        .unwrap();
+        let persisted = choose_port(&sb, None).unwrap_err().to_string();
+        assert!(persisted.contains("state/ui.json"), "{persisted}");
+        assert!(!persisted.contains("omit it"), "{persisted}");
+        let typed = choose_port(&sb, Some(port)).unwrap_err().to_string();
+        assert!(typed.contains("omit it"), "{typed}");
+    }
+
+    #[test]
     fn env_lines_quote_paths() {
         let sb = Sandbox {
             name: "q".into(),
@@ -848,6 +908,11 @@ mod tests {
         );
         assert!(
             text.contains("export CADENCE_PROFILE='sandbox:q'"),
+            "{text}"
+        );
+        // Like the sandbox's own children, never a pane or rollout identity.
+        assert!(
+            text.contains("unset CADENCE_ALIAS CADENCE_ROLLOUT_AS\n"),
             "{text}"
         );
         assert!(text.contains("127.0.0.1:3111"), "{text}");
