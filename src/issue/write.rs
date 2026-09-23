@@ -1127,13 +1127,18 @@ pub fn add_report(
         &format!("{}-{agent}.md", time::basic(time::now_epoch())),
         text.as_bytes(),
     )?;
-    commit_who(
+    // A failed commit must not leave the file behind: a retry would hit
+    // the duplicate short-circuit and never commit it.
+    if let Err(e) = commit_who(
         pm,
         &format!("{id}: report {kind} by {agent}"),
         &[id],
         actor,
         Some(&agent),
-    )?;
+    ) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())

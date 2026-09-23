@@ -1890,7 +1890,7 @@ enum ReportAction {
         /// The ticket the report is about (must match `task:` if set).
         #[arg(long)]
         task: String,
-        /// done|question|blocked (must match `kind:` if set).
+        /// done|question|blocked|answer (must match `kind:` if set).
         #[arg(long, value_enum)]
         kind: cadence_agent::issue::task_report::Kind,
         /// The report Markdown; else stdin.
@@ -2232,6 +2232,59 @@ fn read_body_capped(text: Option<String>, file: Option<PathBuf>, max: u64) -> Re
         .take(read_limit)
         .read_to_string(&mut body)?;
     Ok(body)
+}
+
+/// `message result --report` (CAD-341): the result text with its
+/// `Report: <path>` line. Order matters — nothing is filed until the
+/// report validates locally AND the daemon's token/state gates pass
+/// (`check`), and the report's task must be the issue the message's
+/// task is bound to. A retry after a completed result files nothing:
+/// the stored result text is re-sent so the daemon sees a duplicate.
+fn report_result_text(
+    state_dir: &Path,
+    message: &str,
+    token: &str,
+    text: String,
+    sha: Option<&str>,
+    path: PathBuf,
+) -> Result<String> {
+    use cadence_agent::issue::task_report;
+    let body = read_body_capped(None, Some(path), task_report::BODY_MAX as u64)?;
+    let pm = cadence_agent::issue::Pm::open_default()?;
+    let prepared = task_report::prepare(&pm, &body, None, None)?;
+    let check = client::rpc(
+        state_dir,
+        "message_report",
+        json!({"message": message, "token": token, "kind": "result",
+               "text": text, "sha": sha, "check": true}),
+    )?;
+    match check["issue"].as_str() {
+        Some(bound) if bound == prepared.task() => {}
+        Some(bound) => {
+            return Err(Error::rejected(format!(
+                "Report task {} is not {bound}, the issue message {message} is bound to",
+                prepared.task()
+            )))
+        }
+        None => {
+            return Err(Error::rejected(format!(
+                "Message {message} is not bound to an issue task — file the report \
+                 with `cadence report file --task <ID>` instead"
+            )))
+        }
+    }
+    let with_report = |at: &str| format!("{}\n\nReport: {at}", text.trim_end());
+    if check["state"] == "completed" {
+        let stored = check["result_text"].as_str().unwrap_or_default();
+        let prefix = with_report("");
+        return Ok(if stored.starts_with(&prefix) {
+            stored.to_string()
+        } else {
+            text
+        });
+    }
+    let filed = task_report::store(&pm, &prepared, "")?;
+    Ok(with_report(filed["path"].as_str().unwrap_or_default()))
 }
 
 fn atty_stdin() -> bool {
@@ -5137,15 +5190,14 @@ fn run() -> Result<i32> {
                     report,
                 } => {
                     let text = match report {
-                        Some(path) => {
-                            use cadence_agent::issue::task_report;
-                            let body =
-                                read_body_capped(None, Some(path), task_report::BODY_MAX as u64)?;
-                            let pm = cadence_agent::issue::Pm::open_default()?;
-                            let filed = task_report::file(&pm, &body, None, None, "")?;
-                            let at = filed["path"].as_str().unwrap_or_default();
-                            format!("{}\n\nReport: {at}", text.trim_end())
-                        }
+                        Some(path) => report_result_text(
+                            &state_dir,
+                            &message,
+                            &token,
+                            text,
+                            sha.as_deref(),
+                            path,
+                        )?,
                         None => text,
                     };
                     (

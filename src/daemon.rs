@@ -3886,6 +3886,34 @@ impl Shared {
                 "This endpoint's turn result completes the message — report `ack` only",
             ));
         }
+        // CAD-341: `check` runs the token/generation/state gates of a
+        // result report and changes nothing — `message result --report`
+        // files its report only once the daemon would take the result.
+        // It also names the board issue the message's task is bound to.
+        if params
+            .get("check")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if kind != "result" {
+                return Err(Error::rejected("`check` applies to result reports only"));
+            }
+            if !matches!(message.state.as_str(), "running" | "completed") {
+                return Err(Error::rejected(format!(
+                    "Message is not awaiting a report (state {})",
+                    message.state
+                )));
+            }
+            let issue = message
+                .task_id
+                .as_deref()
+                .and_then(|t| self.store.task(t).ok())
+                .and_then(|t| self.store.job(&t.job_id).ok())
+                .and_then(|j| j.issue_id);
+            let result_text = message.result.as_ref().and_then(|r| r.get("text")).cloned();
+            return Ok(json!({"state": message.state, "task": message.task_id,
+                             "issue": issue, "result_text": result_text}));
+        }
         // A valid ack/result report is explicit agent activity — it
         // feeds the stall clock for every endpoint kind.
         self.bump_activity(&message.alias);

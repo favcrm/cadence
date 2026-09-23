@@ -7,7 +7,7 @@
 //! ```markdown
 //! ---
 //! schema: cadence.report/2
-//! kind: done              # done | question | blocked
+//! kind: done              # done | question | blocked | answer
 //! task: CAD-341
 //! agent: dev-1
 //! sha: <40 or 64 hex>     # optional
@@ -27,7 +27,11 @@
 //!
 //! The body carries the six reflection headings of the cadence skill,
 //! each exactly once. A `question` also carries `options`, `impact` and
-//! `state: input-required`; the other kinds carry none of them. A new
+//! `state: input-required`; the other kinds carry none of them. An
+//! `answer` carries `answers: <question report file name>` and a free
+//! body instead of the headings; a question is open until an answer
+//! names it (files stay create-only — the question is never edited).
+//! With `CADENCE_ALIAS` set, `agent` must be that alias. A new
 //! kind is a new [`Kind`] value — the record, writer and readers stay
 //! the same. Unknown frontmatter fields are refused, not ignored, so a
 //! typo cannot silently drop feedback.
@@ -67,6 +71,8 @@ pub enum Kind {
     Done,
     Question,
     Blocked,
+    /// Answers one `question` report on the same ticket (`answers:`).
+    Answer,
 }
 
 impl Kind {
@@ -75,6 +81,7 @@ impl Kind {
             Kind::Done => "done",
             Kind::Question => "question",
             Kind::Blocked => "blocked",
+            Kind::Answer => "answer",
         }
     }
 }
@@ -140,6 +147,9 @@ pub struct Front {
     pub options: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impact: Option<String>,
+    /// `answer` only: the file name of the question report it answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<String>,
 }
 
 /// Split and parse a report file. A file without a `---` fence is all
@@ -266,7 +276,7 @@ pub fn validate(
     };
     let Some(k) = front.kind else {
         return Err(Error::rejected(
-            "report needs a kind (done|question|blocked) — `kind:` or --kind",
+            "report needs a kind (done|question|blocked|answer) — `kind:` or --kind",
         ));
     };
     let agent = front
@@ -332,8 +342,54 @@ pub fn validate(
             k.as_str()
         )));
     }
-    check_sections(body)?;
+    match (k, front.answers.as_deref()) {
+        (Kind::Answer, Some(q)) if valid_report_name(q) => {}
+        (Kind::Answer, _) => {
+            return Err(Error::rejected(
+                "an answer report names the question it answers \
+                 (`answers: <question report file name>`)",
+            ))
+        }
+        (_, Some(_)) => {
+            return Err(Error::rejected(format!(
+                "`answers` belongs to an answer report, not '{}'",
+                k.as_str()
+            )))
+        }
+        (_, None) => {}
+    }
+    // An answer is a reply, not a reflection — it needs a body, not
+    // the six headings.
+    if k == Kind::Answer {
+        if body.trim().is_empty() {
+            return Err(Error::rejected("an answer report needs a body"));
+        }
+    } else {
+        check_sections(body)?;
+    }
     Ok(front)
+}
+
+/// A stored report's file name: `[A-Za-z0-9._-]+.md`, no leading dot —
+/// never a path.
+fn valid_report_name(n: &str) -> bool {
+    n.ends_with(".md")
+        && !n.starts_with('.')
+        && n.len() <= 200
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// With `CADENCE_ALIAS` set the caller is that alias: a frontmatter
+/// `agent`/`author` naming anyone else is refused, never trusted.
+fn check_claim(front: &Front, alias: Option<&str>) -> Result<()> {
+    match (alias.filter(|a| !a.is_empty()), front.agent.as_deref()) {
+        (Some(me), Some(claimed)) if claimed != me => Err(Error::rejected(format!(
+            "report agent '{claimed}' is not the caller '{me}' (CADENCE_ALIAS) — \
+             a report is filed by its own author"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Who files by default: the pane's alias, else `operator`.
@@ -351,17 +407,24 @@ fn strip_controls(text: &str) -> String {
         .collect()
 }
 
-/// `cadence report file` and `message result --report`: validate,
-/// secret-scan and store one report. Refuses before anything is
-/// written; filing byte-identical content again returns the existing
-/// file (`duplicate: true`) so a retried `message result` is safe.
-pub fn file(
-    pm: &Pm,
-    text: &str,
-    task: Option<&str>,
-    kind: Option<Kind>,
-    actor: &str,
-) -> Result<Value> {
+/// A validated, secret-scanned report that has not been written yet.
+pub struct Prepared {
+    pub front: Front,
+    body: String,
+    warnings: Vec<crate::secret::Finding>,
+}
+
+impl Prepared {
+    /// The ticket the report files on.
+    pub fn task(&self) -> &str {
+        self.front.task.as_deref().unwrap_or_default()
+    }
+}
+
+/// Validate and secret-scan one report without writing anything:
+/// schema, headings, the caller's identity (`CADENCE_ALIAS`), and for
+/// an `answer` that its question exists on the same ticket.
+pub fn prepare(pm: &Pm, text: &str, task: Option<&str>, kind: Option<Kind>) -> Result<Prepared> {
     if text.len() > BODY_MAX {
         return Err(Error::rejected(format!(
             "Report exceeds the {} KB cap — trim it",
@@ -370,14 +433,51 @@ pub fn file(
     }
     let text = strip_controls(text);
     let (front, body) = parse_text(&text)?;
+    check_claim(&front, std::env::var("CADENCE_ALIAS").ok().as_deref())?;
     let front = validate(front, &body, task, kind, &default_agent())?;
     let id = front.task.clone().unwrap_or_default();
-    let secret_warnings = crate::secret::guard(&format!("{id}: report"), &text)?;
-    let mut out = write::add_report(pm, &id, &front, &body, actor)?;
-    if !secret_warnings.is_empty() {
-        out["secret_warnings"] = crate::secret::warnings_json(&secret_warnings);
+    let (_, dir) = write::issue_dir(pm, &id)?;
+    if let Some(q) = &front.answers {
+        let is_question = names(&dir).contains(q)
+            && std::fs::read_to_string(dir.join(DIR).join(q))
+                .ok()
+                .and_then(|t| load(&t, &id).ok())
+                .is_some_and(|(f, _)| f.kind == Some(Kind::Question));
+        if !is_question {
+            return Err(Error::rejected(format!(
+                "{id} has no question report '{q}' to answer — `cadence issue show {id}` \
+                 lists its reports"
+            )));
+        }
+    }
+    let warnings = crate::secret::guard(&format!("{id}: report"), &text)?;
+    Ok(Prepared {
+        front,
+        body,
+        warnings,
+    })
+}
+
+/// Write a prepared report through the tracker writer. Filing
+/// byte-identical content again returns the existing file
+/// (`duplicate: true`) so a retried `message result` is safe.
+pub fn store(pm: &Pm, p: &Prepared, actor: &str) -> Result<Value> {
+    let mut out = write::add_report(pm, p.task(), &p.front, &p.body, actor)?;
+    if !p.warnings.is_empty() {
+        out["secret_warnings"] = crate::secret::warnings_json(&p.warnings);
     }
     Ok(out)
+}
+
+/// `cadence report file`: [`prepare`] then [`store`].
+pub fn file(
+    pm: &Pm,
+    text: &str,
+    task: Option<&str>,
+    kind: Option<Kind>,
+    actor: &str,
+) -> Result<Value> {
+    store(pm, &prepare(pm, text, task, kind)?, actor)
 }
 
 /// `20260917T172400Z-dev.md` → `2026-09-17T17:24:00Z`.
@@ -442,9 +542,11 @@ pub fn names(issue_dir: &Path) -> Vec<String> {
 
 /// Every report on a ticket, read-only, for `issue show` and the issue
 /// detail API. An unreadable or malformed file is listed with its
-/// error rather than hidden — `issue lint` refuses it at commit.
+/// error rather than hidden — `issue lint` refuses it at commit. A
+/// question carries `open` (no answer names it yet) and `answered_by`;
+/// an answer whose question is not on the ticket is listed as an error.
 pub fn list(issue_dir: &Path, id: &str) -> Vec<Value> {
-    names(issue_dir)
+    let mut rows: Vec<Value> = names(issue_dir)
         .into_iter()
         .map(|name| {
             let path = format!("{id}/{DIR}/{name}");
@@ -463,12 +565,51 @@ pub fn list(issue_dir: &Path, id: &str) -> Vec<Value> {
                     "state": f.state, "constraints": f.constraints,
                     "context_feedback": f.context_feedback,
                     "options": f.options, "impact": f.impact,
-                    "body": body,
+                    "answers": f.answers, "body": body,
                 }),
                 Err(e) => json!({"name": name, "path": path, "at": at, "error": e.to_string()}),
             }
         })
-        .collect()
+        .collect();
+    let questions: Vec<String> = rows
+        .iter()
+        .filter(|r| r["kind"] == "question")
+        .filter_map(|r| r["name"].as_str().map(str::to_string))
+        .collect();
+    let answers: Vec<(String, String)> = rows
+        .iter()
+        .filter(|r| r["kind"] == "answer")
+        .filter_map(|r| {
+            Some((
+                r["answers"].as_str()?.to_string(),
+                r["name"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    for r in &mut rows {
+        match r["kind"].as_str() {
+            Some("question") => {
+                let name = r["name"].as_str().unwrap_or_default().to_string();
+                let by: Vec<&String> = answers
+                    .iter()
+                    .filter(|(q, _)| *q == name)
+                    .map(|(_, a)| a)
+                    .collect();
+                r["open"] = json!(by.is_empty());
+                r["answered_by"] = json!(by);
+            }
+            Some("answer") => {
+                let q = r["answers"].as_str().unwrap_or_default();
+                if !questions.iter().any(|n| n == q) {
+                    r["error"] = json!(format!(
+                        "answers '{q}', which is not a question report on {id}"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -586,6 +727,50 @@ mod tests {
         // No frontmatter at all: flags supply task and kind.
         let (f, b) = parse_text(&body()).unwrap();
         assert!(validate(f, &b, Some("CAD-1"), Some(Kind::Blocked), "a").is_ok());
+    }
+
+    #[test]
+    fn answer_names_a_report_file_and_skips_headings() {
+        let front = |answers: Option<&str>, kind: Kind| Front {
+            kind: Some(kind),
+            task: Some("CAD-1".into()),
+            answers: answers.map(str::to_string),
+            ..Front::default()
+        };
+        let f = validate(
+            front(Some("20260923T000000Z-dev.md"), Kind::Answer),
+            "ship now",
+            None,
+            None,
+            "pm",
+        )
+        .unwrap();
+        assert_eq!(f.kind, Some(Kind::Answer));
+        // Required, a bare file name, a body; never on other kinds.
+        for (a, k, b) in [
+            (None, Kind::Answer, "x"),
+            (Some("../CAD-2/reports/q.md"), Kind::Answer, "x"),
+            (Some("q.md"), Kind::Answer, "  "),
+            (Some("q.md"), Kind::Done, body().as_str()),
+        ] {
+            assert!(
+                validate(front(a, k), b, None, None, "pm").is_err(),
+                "{a:?} {k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_must_match_the_calling_alias() {
+        let claimed = Front {
+            agent: Some("qa-1".into()),
+            ..Front::default()
+        };
+        assert!(check_claim(&claimed, Some("dev-1")).is_err());
+        assert!(check_claim(&claimed, Some("qa-1")).is_ok());
+        // No alias (operator shell) or no claim: nothing to contradict.
+        assert!(check_claim(&claimed, None).is_ok());
+        assert!(check_claim(&Front::default(), Some("dev-1")).is_ok());
     }
 
     #[test]

@@ -26304,14 +26304,28 @@ fn task_report_text(front: &str) -> String {
 }
 
 /// Run the real binary with PATH led by the build dir (the tracker's
-/// pre-commit hook calls `cadence`); stdout+stderr, raw.
+/// pre-commit hook calls `cadence`); HOME/XDG/TMPDIR inside the fixture;
+/// stdout+stderr, raw.
 fn task_report_cli(s: &ReportFx, state: &Path, args: &[&str]) -> (bool, String) {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .arg("--state-dir")
+    task_report_cli_env(s, state, args, &[])
+}
+
+/// [`task_report_cli`] with extra env (e.g. `CADENCE_ALIAS`).
+fn task_report_cli_env(
+    s: &ReportFx,
+    state: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (bool, String) {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"));
+    cmd.arg("--state-dir")
         .arg(state)
         .args(args)
         .env("CADENCE_PM_DIR", &s.pm_dir)
         .env("HOME", &s.home)
+        .env("XDG_STATE_HOME", s.home.join(".state"))
+        .env("XDG_CONFIG_HOME", s.home.join(".config"))
+        .env("TMPDIR", &s.home)
         .env(
             "PATH",
             format!(
@@ -26321,9 +26335,11 @@ fn task_report_cli(s: &ReportFx, state: &Path, args: &[&str]) -> (bool, String) 
             ),
         )
         .env_remove("CADENCE_ALIAS")
-        .current_dir(&s.product_repo)
-        .output()
-        .unwrap();
+        .current_dir(&s.product_repo);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
     (
         out.status.success(),
         format!(
@@ -26332,6 +26348,14 @@ fn task_report_cli(s: &ReportFx, state: &Path, args: &[&str]) -> (bool, String) 
             String::from_utf8_lossy(&out.stderr)
         ),
     )
+}
+
+/// Report files on a ticket plus the tracker's commit count — the
+/// "nothing was filed" probe.
+fn task_report_footprint(s: &ReportFx, id: &str) -> (usize, String) {
+    let reports = s.pm_dir.join("product").join(id).join("reports");
+    let n = std::fs::read_dir(&reports).map(|d| d.count()).unwrap_or(0);
+    (n, git_at(&s.pm_dir, &["rev-list", "--count", "HEAD"]))
 }
 
 fn task_report_issue(s: &ReportFx) -> String {
@@ -26532,82 +26556,269 @@ fn task_report_lint_validates_files() {
     assert!(show["reports"][0]["error"].is_string(), "{show}");
 }
 
-/// A pty worker attaches a report to `message result --report`: the
-/// report is filed on its ticket and the result text carries the
-/// `Report:` line; a malformed report refuses the result, leaving the
-/// message running; a retry with the same file is idempotent.
+/// A dispatched task-bound pty turn on the stub, bound to board issue
+/// `issue`: returns (daemon, mock guard, message id, token).
+fn task_report_bound_turn(issue: &str) -> (TestDaemon, MockStub, String, String) {
+    let d = TestDaemon::start();
+    let mock = d.mock_stub();
+    d.register_inbox("pm");
+    d.register_stub("st", json!({"upstream": "pm", "auto_ready": "verified"}));
+    d.wait_agent("st", "idle", 20);
+    let (spec, sha) = d.spec_file("spec.md", "report me");
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
+               "issue": issue, "task_assignee": "st"}),
+    )
+    .unwrap();
+    let r = d.job_dispatch("j1-t1", json!({})).unwrap();
+    let k = r["message"].as_str().unwrap().to_string();
+    let token = pty_token(&d, "st", &k);
+    (d, mock, k, token)
+}
+
+/// A pty worker attaches a report to `message result --report`. The
+/// daemon's gates run before anything is filed: a malformed report, a
+/// wrong token, or a report for another ticket refuses the result and
+/// leaves no report file and no tracker commit. The accepted result
+/// carries the `Report:` line; a retry is idempotent on both sides.
 #[test]
 fn task_report_attaches_to_message_result() {
     let s = ReportFx::new();
     let id = task_report_issue(&s);
-    let d = TestDaemon::start();
-    let _mock = d.mock_stub();
-    d.register_stub("st", json!({"auto_ready": "verified"}));
-    d.wait_agent("st", "idle", 20);
-    d.rpc(
-        "agent_send",
-        json!({"alias": "st", "text": "do the thing", "message": "m1"}),
-    )
-    .unwrap();
-    let token = pty_token(&d, "st", "m1");
-
-    let bad = s.home.join("bad.md");
-    std::fs::write(
-        &bad,
-        task_report_text(&format!("kind: done\ntask: {id}\n")).replace("## Next", ""),
-    )
-    .unwrap();
-    let (ok, text) = task_report_cli(
-        &s,
-        &d.state,
-        &[
-            "message",
-            "result",
-            "m1",
-            "--token",
-            &token,
-            "--text",
-            "done",
-            "--report",
-            bad.to_str().unwrap(),
-        ],
-    );
-    assert!(!ok && text.contains("## Next"), "{text}");
-    assert_eq!(d.message_state("st", "m1"), "running");
-
-    let good = s.home.join("good.md");
-    std::fs::write(
-        &good,
+    let other = task_report_issue(&s);
+    let (d, _mock, k, token) = task_report_bound_turn(&id);
+    let result = |token: &str, file: &Path| {
+        task_report_cli(
+            &s,
+            &d.state,
+            &[
+                "message",
+                "result",
+                &k,
+                "--token",
+                token,
+                "--text",
+                "done",
+                "--report",
+                file.to_str().unwrap(),
+            ],
+        )
+    };
+    let write = |name: &str, text: String| {
+        let p = s.home.join(name);
+        std::fs::write(&p, text).unwrap();
+        p
+    };
+    let good = write(
+        "good.md",
         task_report_text(&format!("kind: done\ntask: {id}\nagent: st\n")),
-    )
-    .unwrap();
-    let args = [
-        "message",
-        "result",
-        "m1",
-        "--token",
-        &token,
-        "--text",
-        "done",
-        "--report",
-        good.to_str().unwrap(),
-    ];
-    let (ok, text) = task_report_cli(&s, &d.state, &args);
+    );
+    let before = task_report_footprint(&s, &id);
+
+    // Malformed report: refused locally.
+    let bad = write(
+        "bad.md",
+        task_report_text(&format!("kind: done\ntask: {id}\n")).replace("## Next", ""),
+    );
+    let (ok, text) = result(&token, &bad);
+    assert!(!ok && text.contains("## Next"), "{text}");
+    // Wrong token: the daemon refuses before anything is filed.
+    let (ok, text) = result("pty-0-not-the-token", &good);
+    assert!(!ok && text.contains("Token"), "{text}");
+    // A report for another ticket than the message's bound issue.
+    let stray = write(
+        "stray.md",
+        task_report_text(&format!("kind: done\ntask: {other}\n")),
+    );
+    let (ok, text) = result(&token, &stray);
+    assert!(!ok && text.contains(&format!("is not {id}")), "{text}");
+    assert_eq!(
+        task_report_footprint(&s, &id),
+        before,
+        "a refused result filed"
+    );
+    assert_eq!(task_report_footprint(&s, &other).0, 0);
+    assert_eq!(d.message_state("st", &k), "running");
+
+    let (ok, text) = result(&token, &good);
     assert!(ok, "{text}");
-    let m = d.wait_message("st", "m1", &["completed"], 10);
-    let result = m["result"]["text"].as_str().unwrap_or_default().to_string();
+    let m = d.wait_message("st", &k, &["completed"], 10);
+    let stored = m["result"]["text"].as_str().unwrap_or_default().to_string();
     assert!(
-        result.starts_with("done\n\nReport: ") && result.contains(&format!("{id}/reports/")),
+        stored.starts_with("done\n\nReport: ") && stored.contains(&format!("{id}/reports/")),
         "{m}"
     );
     let (_, show) = s.cli(&["issue", "show", &id, "--json"]);
     assert_eq!(show["reports"][0]["agent"], "st", "{show}");
-    // Retry: same report, same text — the daemon sees an idempotent
-    // duplicate and no second report is filed.
-    let (ok, text) = task_report_cli(&s, &d.state, &args);
+    // Retry: nothing new is filed; the daemon sees an idempotent duplicate.
+    let after = task_report_footprint(&s, &id);
+    let (ok, text) = result(&token, &good);
     assert!(ok && text.contains("duplicate"), "{text}");
+    assert_eq!(task_report_footprint(&s, &id), after);
+}
+
+/// With `CADENCE_ALIAS` set the report's author is the caller: a
+/// frontmatter `agent`/`author` naming someone else is refused, and a
+/// traversal-shaped agent name is refused whoever files it.
+#[test]
+fn task_report_author_is_the_caller() {
+    let s = ReportFx::new();
+    let id = task_report_issue(&s);
+    let file = |name: &str, front: &str| {
+        let p = s.home.join(name);
+        std::fs::write(&p, task_report_text(front)).unwrap();
+        p.to_str().unwrap().to_string()
+    };
+    let args = |f: &str| {
+        vec![
+            "report".to_string(),
+            "file".into(),
+            "--task".into(),
+            id.clone(),
+            "--kind".into(),
+            "done".into(),
+            "--file".into(),
+            f.to_string(),
+        ]
+    };
+    let run = |f: &str, env: &[(&str, &str)]| {
+        let a = args(f);
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        task_report_cli_env(&s, &s.state, &a, env)
+    };
+    let before = task_report_footprint(&s, &id);
+    for (name, front) in [("a.md", "agent: qa-1\n"), ("b.md", "author: qa-1\n")] {
+        let (ok, text) = run(&file(name, front), &[("CADENCE_ALIAS", "dev-1")]);
+        assert!(
+            !ok && text.contains("is not the caller 'dev-1'"),
+            "{name}: {text}"
+        );
+    }
+    for bad in ["../x", "a/b", "..", "x y"] {
+        let (ok, text) = run(&file("t.md", &format!("agent: '{bad}'\n")), &[]);
+        assert!(!ok && text.contains("Bad report agent"), "{bad}: {text}");
+    }
+    assert_eq!(task_report_footprint(&s, &id), before);
+    // The matching claim (or none) files under the alias.
+    let (ok, text) = run(
+        &file("c.md", "agent: dev-1\n"),
+        &[("CADENCE_ALIAS", "dev-1")],
+    );
+    assert!(ok && text.contains("-dev-1.md"), "{text}");
+    assert!(s.tracker_log(1).contains("Actor: dev-1"));
+}
+
+/// A question stays open until an `answer` report names it; the answer
+/// must name an existing question on the same ticket, and the question
+/// file is never edited.
+#[test]
+fn task_report_answer_closes_a_question() {
+    let s = ReportFx::new();
+    let id = task_report_issue(&s);
+    let file = |name: &str, text: String| {
+        let p = s.home.join(name);
+        std::fs::write(&p, text).unwrap();
+        p.to_str().unwrap().to_string()
+    };
+    let q = file(
+        "q.md",
+        task_report_text("options: [a, b]\nimpact: blocks merge\n"),
+    );
+    let (ok, out) = s.cli(&[
+        "report", "file", "--task", &id, "--kind", "question", "--file", &q,
+    ]);
+    assert!(ok, "{out}");
+    let qname = out["report"].as_str().unwrap().to_string();
+    let qpath = s
+        .pm_dir
+        .join("product")
+        .join(&id)
+        .join("reports")
+        .join(&qname);
+    let qbytes = std::fs::read(&qpath).unwrap();
     let (_, show) = s.cli(&["issue", "show", &id, "--json"]);
-    assert_eq!(show["reports"].as_array().unwrap().len(), 1, "{show}");
+    assert_eq!(show["reports"][0]["open"], true, "{show}");
+
+    // Answers must name a question on this ticket.
+    let done = file("d.md", task_report_text(""));
+    let (ok, out) = s.cli(&[
+        "report", "file", "--task", &id, "--kind", "done", "--file", &done,
+    ]);
+    assert!(ok, "{out}");
+    let done_name = out["report"].as_str().unwrap().to_string();
+    for target in ["20990101T000000Z-nobody.md", done_name.as_str(), "../x.md"] {
+        let a = file(
+            "a.md",
+            format!("---\nanswers: {target}\n---\n\nGo with a.\n"),
+        );
+        let (ok, text) = task_report_cli(
+            &s,
+            &s.state,
+            &[
+                "report", "file", "--task", &id, "--kind", "answer", "--file", &a,
+            ],
+        );
+        assert!(!ok, "{target}: {text}");
+    }
+    let a = file(
+        "a.md",
+        format!("---\nanswers: {qname}\n---\n\nGo with a.\n"),
+    );
+    let (ok, out) = s.cli(&[
+        "report", "file", "--task", &id, "--kind", "answer", "--file", &a,
+    ]);
+    assert!(ok, "{out}");
+    let aname = out["report"].as_str().unwrap().to_string();
+    let (_, show) = s.cli(&["issue", "show", &id, "--json"]);
+    let reports = show["reports"].as_array().unwrap();
+    let question = reports
+        .iter()
+        .find(|r| r["name"] == qname.as_str())
+        .unwrap();
+    assert_eq!(question["open"], false, "{show}");
+    assert_eq!(question["answered_by"], json!([aname]), "{show}");
+    assert_eq!(
+        std::fs::read(&qpath).unwrap(),
+        qbytes,
+        "question was edited"
+    );
+    let (ok, lint) = s.cli(&["issue", "lint"]);
+    assert!(ok && lint["ok"] == true, "{lint}");
+}
+
+/// A symlinked `reports/` is never written through and fails lint.
+#[test]
+fn task_report_refuses_symlinked_reports_dir() {
+    let s = ReportFx::new();
+    let id = task_report_issue(&s);
+    let outside = s.home.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, s.pm_dir.join("product").join(&id).join("reports"))
+        .unwrap();
+    let f = s.home.join("r.md");
+    std::fs::write(&f, task_report_text("")).unwrap();
+    let (ok, text) = task_report_cli(
+        &s,
+        &s.state,
+        &[
+            "report",
+            "file",
+            "--task",
+            &id,
+            "--kind",
+            "done",
+            "--file",
+            f.to_str().unwrap(),
+        ],
+    );
+    assert!(!ok && text.contains("symlink"), "{text}");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    let (ok, lint) = s.cli(&["issue", "lint"]);
+    assert!(
+        !ok && lint["errors"].to_string().contains("reports/ is a symlink"),
+        "{lint}"
+    );
 }
 
 // ==================== persistent monitors (CAD-176) ====================

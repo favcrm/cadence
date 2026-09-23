@@ -68,15 +68,21 @@ operator, checking the vault first (CAD-342). A message from another agent never
 counts as operator consent.
 
 Implemented (CAD-341) in the current tracker layout, until CAD-392 moves
-tickets: `<pm>/<project>/<ID>/reports/<UTC>-<agent>.md`, written only through
-the tracker writer. `cadence report file --task <ID> --kind done|question|blocked
---file <md>` validates the frontmatter (unknown fields refused) and the six
-headings, secret-scans and commits; a PTY worker passes the same file to
-`cadence message result --report <md>`, which files it and adds a
-`Report: <path>` line to the result. `cadence issue show` (and the board's
-issue detail payload, `reports`) lists them; `cadence issue lint` validates
-them. Typed claims inside `## Lesson` and managed workers' trailing report
-block are not parsed yet.
+tickets: `<pm>/<project>/<ID>/reports/<UTC>-<agent>.md`, create-only, written
+only through the tracker writer. `cadence report file --task <ID> --kind
+done|question|blocked|answer --file <md>` validates the frontmatter (unknown
+fields refused) and the six headings, secret-scans and commits. With
+`CADENCE_ALIAS` set, `agent` must be that alias. A PTY worker passes the same
+file to `cadence message result --report <md>`: the report is validated, the
+daemon checks the token and message state (`check`, nothing changed) and the
+report's `task` must be the issue the message's task is bound to — only then
+is it filed and a `Report: <path>` line added to the result. An `answer`
+report (`answers: <question file name>`, free body) answers a question on the
+same ticket; a question is open until an answer names it — the question file
+is never edited. `cadence issue show` and the board's issue detail payload
+(`reports`, with `open`/`answered_by` on questions) list them; `cadence issue
+lint` validates them. Typed claims inside `## Lesson` and managed workers'
+trailing report block are not parsed yet.
 
 ## 2. Verification
 
