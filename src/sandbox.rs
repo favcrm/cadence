@@ -438,8 +438,21 @@ fn run_child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Result<Value> {
     Ok(serde_json::from_slice(&out.stdout).unwrap_or(Value::Null))
 }
 
+/// `sun_path` holds 108 bytes including the NUL — a longer socket path
+/// fails only inside the detached daemon, so `up` checks it first.
+const SOCKET_PATH_MAX: usize = 107;
+
 fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
     refuse_production(sb)?;
+    let socket = client::socket_path(&sb.state_dir());
+    let len = socket.as_os_str().len();
+    if len > SOCKET_PATH_MAX {
+        return Err(Error::rejected(format!(
+            "socket path {} is {len} bytes, over the {SOCKET_PATH_MAX}-byte Unix socket \
+             limit — point CADENCE_SANDBOX_ROOT at a shorter dir",
+            socket.display()
+        )));
+    }
     let existing = read_marker(sb)?;
     if existing.is_none()
         && std::fs::read_dir(&sb.root).is_ok_and(|mut entries| entries.next().is_some())

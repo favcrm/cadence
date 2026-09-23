@@ -241,6 +241,16 @@ fn sandbox_up_refuses_production_dirs_and_port_3010() {
     );
     assert_eq!(std::fs::read_dir(&prod).unwrap().count(), 0);
 
+    // A socket path past the Unix limit would only fail in the
+    // detached daemon — refused up front, nothing created.
+    let deep = host.tmp.path().join("d".repeat(120));
+    let out = host.run(
+        &["sandbox", "up", "deep"],
+        &[("CADENCE_SANDBOX_ROOT", &deep)],
+    );
+    refused(&out, "Unix socket limit");
+    assert!(!deep.exists());
+
     // A shell exported at a live cadence that is this sandbox's dir.
     let exported = host.base().join("exp/state");
     let out = host.run(
