@@ -9,6 +9,7 @@ pub mod client;
 pub mod daemon;
 pub mod doctor;
 pub mod error;
+pub mod inbox;
 pub mod issue;
 pub mod mcp;
 pub mod memory;

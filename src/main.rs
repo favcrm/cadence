@@ -855,7 +855,9 @@ enum Commands {
     /// What needs a human right now: merge-ready PRs, open approvals,
     /// fenced or stalled agents, review/unblocked issues, unread
     /// inboxes, a behind-tracker, deploy drift — each with the exact
-    /// command. The same payload as the board's Overview screen.
+    /// command. The same payload as the board's Overview screen. Rows
+    /// naming the same agent, issue or PR merge into one row listing
+    /// its causes.
     Overview {
         /// Emit the payload as JSON instead of the aligned list.
         #[arg(long)]
@@ -863,6 +865,14 @@ enum Commands {
         /// Re-render every <secs> until interrupted.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         watch: Option<u64>,
+        /// Scope rows to one tracker project key (an unknown key is an
+        /// error).
+        #[arg(long)]
+        project: Option<String>,
+        /// Scope rows to one group root and its members, as
+        /// `cadence status --group` does (an unknown root is an error).
+        #[arg(long)]
+        group: Option<String>,
     },
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
@@ -1828,16 +1838,19 @@ fn send_message(
             )?;
         }
     }
-    Ok((
-        client::rpc(
-            state_dir,
-            "agent_send",
-            json!({"alias": alias, "text": body,
-                   "message": message, "reply_to": reply_to,
-                   "task": task}),
-        )?,
-        false,
-    ))
+    let receipt = client::rpc(
+        state_dir,
+        "agent_send",
+        json!({"alias": alias, "text": body,
+               "message": message, "reply_to": reply_to,
+               "task": task}),
+    )?;
+    // CAD-251: a stale mailbox still accepted the message — say so on
+    // stderr so stdout stays the JSON receipt.
+    if let Some(warning) = receipt["warning"].as_str() {
+        eprintln!("warning: {warning}");
+    }
+    Ok((receipt, false))
 }
 
 /// Has the daemon released the state-dir singleton? `serve` holds an
@@ -2273,6 +2286,9 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
         .unwrap_or(0.0);
     let mut rows = Vec::new();
     let mut unread_inboxes = Vec::new();
+    // CAD-251: mailboxes past their unread threshold with no recent
+    // `inbox_read` — named with count, oldest age and owner.
+    let mut stale_inboxes = Vec::new();
     for a in &agents {
         let alias = a["alias"].as_str().unwrap_or_default().to_string();
         let provider = a["provider"].as_str().unwrap_or_default();
@@ -2283,6 +2299,16 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
         let unknown = show["unknown"].as_i64().unwrap_or(0);
         if provider == registry::INBOX && queued > 0 {
             unread_inboxes.push(alias.clone());
+        }
+        let health = &a["inbox_health"];
+        if health["stale"].as_bool().unwrap_or(false) {
+            stale_inboxes.push(json!({
+                "alias": alias,
+                "unread": health["unread"],
+                "oldest_unread_age_secs": health["oldest_unread_age_secs"],
+                "last_read_at": health["last_read_at"],
+                "owner": health["owner"],
+            }));
         }
         // The in-flight message: `running` (managed turn live) or
         // `submitted` (pty paste acknowledged, report pending). Age
@@ -2382,6 +2408,7 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
         "footer": {
             "states": states,
             "unread_inboxes": unread_inboxes,
+            "stale_inboxes": stale_inboxes,
             "slots": slots,
         },
         "tracker": tracker,
@@ -2491,6 +2518,25 @@ fn print_status_table(view: &Value) {
         .unwrap_or_default();
     if !unread.is_empty() {
         println!("unread: {}", unread.join(", "));
+    }
+    let stale = view["footer"]["stale_inboxes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !stale.is_empty() {
+        let names: Vec<String> = stale
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} {} unread, oldest {}, owner {}",
+                    s["alias"].as_str().unwrap_or_default(),
+                    s["unread"].as_u64().unwrap_or(0),
+                    fmt_age(s["oldest_unread_age_secs"].as_i64().unwrap_or(0)),
+                    s["owner"].as_str().unwrap_or("operator"),
+                )
+            })
+            .collect();
+        println!("stale inboxes (no consumer): {}", names.join("; "));
     }
     // Slot occupancy — the one-line build-queue summary.
     let slots = &view["footer"]["slots"];
@@ -2736,11 +2782,21 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
 /// summary, rendered as an aligned list (or the raw payload with
 /// `--json`). Read-only: every source degrades rather than failing the
 /// screen.
-fn run_overview(state_dir: &Path, json_out: bool, watch: Option<u64>) -> Result<i32> {
+fn run_overview(
+    state_dir: &Path,
+    json_out: bool,
+    watch: Option<u64>,
+    scope: cadence_agent::overview::Scope,
+) -> Result<i32> {
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let pm_dir = cadence_agent::issue::default_dir().unwrap_or_default();
+    let opts = cadence_agent::overview::Options {
+        scope,
+        ..cadence_agent::overview::Options::cli()
+    };
     loop {
-        let view = cadence_agent::overview::overview(state_dir, &pm_dir);
+        let view = cadence_agent::overview::overview_with(state_dir, &pm_dir, &opts)
+            .map_err(Error::rejected)?;
         if json_out {
             print_json(&view);
         } else {
@@ -2783,8 +2839,18 @@ fn print_overview(view: &Value) {
         for n in &needs {
             let title = n["title"].as_str().unwrap_or_default();
             let title: String = title.chars().take(52).collect();
+            // One row per subject: every cause, most severe first.
+            let causes: Vec<&str> = n["causes"]
+                .as_array()
+                .map(|cs| cs.iter().filter_map(|c| c["cause"].as_str()).collect())
+                .unwrap_or_default();
+            let kind = if causes.is_empty() {
+                n["kind"].as_str().unwrap_or_default().to_string()
+            } else {
+                causes.join("+")
+            };
             let row = [
-                n["kind"].as_str().unwrap_or_default().to_string(),
+                kind,
                 fmt_age(n["age"].as_i64().unwrap_or(0)),
                 n["project"].as_str().unwrap_or_default().to_string(),
                 title,
@@ -2876,6 +2942,16 @@ fn print_overview(view: &Value) {
     }
     if !view["daemon"]["reachable"].as_bool().unwrap_or(false) {
         println!("daemon: unreachable — agent, approval and drift rows absent");
+    }
+    // CAD-249: sources that missed their bound — the screen narrowed.
+    for d in view["degraded"].as_array().cloned().unwrap_or_default() {
+        let subject = d["subject"].as_str().filter(|s| !s.is_empty());
+        println!(
+            "degraded: {}{}: {}",
+            d["source"].as_str().unwrap_or("?"),
+            subject.map(|s| format!(" {s}")).unwrap_or_default(),
+            d["detail"].as_str().unwrap_or("")
+        );
     }
 }
 
@@ -4492,7 +4568,15 @@ fn run() -> Result<i32> {
             cwd: std::env::current_dir()?,
             state_dir,
         }),
-        Commands::Overview { json, watch } => run_overview(&state_dir, json, watch),
+        Commands::Overview {
+            json,
+            watch,
+            project,
+            group,
+        } => {
+            let scope = cadence_agent::overview::Scope { project, group };
+            run_overview(&state_dir, json, watch, scope)
+        }
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
 }

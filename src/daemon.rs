@@ -1188,6 +1188,8 @@ impl Shared {
                     j["resumable"] = json!(resumable);
                     if let Some(inbox) = self.store.inbox_status(&agent.alias)? {
                         j["inbox"] = inbox;
+                        // CAD-251: stale-consumer evidence + owner.
+                        j["inbox_health"] = self.inbox_health(&agent).unwrap_or(Value::Null);
                     }
                     if let Some(view) = self.stall_view(&agent.alias) {
                         view.apply(&mut j);
@@ -1822,7 +1824,12 @@ impl Shared {
                 .enqueue_task(&alias, text, reply_to.as_deref(), &message, source, task)?;
         self.notify_agent(&alias);
         self.wake();
-        Ok(json!({"message": message, "state": state, "duplicate": duplicate}))
+        let mut receipt = json!({"message": message, "state": state, "duplicate": duplicate});
+        // CAD-251: an undrained mailbox warns the sender — never refuses.
+        if let Some(warning) = self.inbox_warning(&alias) {
+            receipt["warning"] = json!(warning);
+        }
+        Ok(receipt)
     }
 
     /// Send and wait for the message's terminal state, bounded by `wait`.
@@ -3566,14 +3573,84 @@ impl Shared {
             .map(str::to_string)
     }
 
+    // ---- Unconsumed inboxes: warn, never refuse or drop (CAD-251) ----
+
+    /// The mailbox's health block ([`crate::inbox::health`]) — `None`
+    /// for an agent with an actor (it consumes its own queue) or when
+    /// the store read fails.
+    fn inbox_health(&self, agent: &Agent) -> Option<Value> {
+        if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            return None;
+        }
+        let consumer = self.store.inbox_consumer(&agent.alias).ok()?;
+        let policy = crate::inbox::Policy::from_params(agent.params.as_ref());
+        let owner = crate::inbox::owner_of(&agent.alias, |a| self.upstream_of(a));
+        Some(crate::inbox::health(
+            &agent.alias,
+            &consumer,
+            policy,
+            &owner,
+            epoch_secs(),
+        ))
+    }
+
+    /// The sender-facing warning for a delivery into `alias`, when it
+    /// is a stale mailbox.
+    fn inbox_warning(&self, alias: &str) -> Option<String> {
+        let agent = self.store.agent(alias).ok()?;
+        let health = self.inbox_health(&agent)?;
+        health["warning"].as_str().map(str::to_string)
+    }
+
+    /// Routed deliveries (reply_to results, upstream notices) have no
+    /// CLI caller to warn, so a stale mailbox that received anything
+    /// since its last warning gets one `inbox_unconsumed` event — at
+    /// most once per idle window, never per message.
+    fn inbox_sweep(&self) {
+        let Ok(agents) = self.store.agents() else {
+            return;
+        };
+        let now = epoch_secs();
+        for agent in &agents {
+            let Some(health) = self.inbox_health(agent) else {
+                continue;
+            };
+            if health["stale"] != json!(true) {
+                continue;
+            }
+            let received = health["last_received_at"].as_f64().unwrap_or(0.0);
+            let window = health["threshold"]["idle_secs"].as_f64().unwrap_or(0.0);
+            let warned = self
+                .store
+                .last_event_at(&agent.alias, "inbox_unconsumed")
+                .ok()
+                .flatten();
+            if let Some(at) = warned {
+                if received <= at || now - at < window {
+                    continue;
+                }
+            }
+            let _ = self
+                .store
+                .event_public(&agent.alias, "inbox_unconsumed", health);
+        }
+    }
+
     // ---- Stall watch: report silent turns, never touch them (CAD-52) ----
 
     /// Sample owned agents on a slow cadence until shutdown. The watch
     /// only ever emits events and notices — it never interrupts,
     /// re-dispatches or fences anything it observes.
     fn run_stall_watch(self: &Arc<Self>) {
+        let mut inbox_swept: Option<Instant> = None;
         while !self.closing.load(Ordering::SeqCst) {
             self.stall_tick();
+            // CAD-251: the unconsumed-inbox sweep rides the screen-sample
+            // cadence (one minute by default) — a store read per mailbox.
+            if inbox_swept.is_none_or(|at| at.elapsed() >= screen_sample(&self.stall_sample_secs)) {
+                self.inbox_sweep();
+                inbox_swept = Some(Instant::now());
+            }
             std::thread::sleep(STALL_TICK);
         }
     }

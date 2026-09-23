@@ -208,6 +208,12 @@ export interface NeedsMe {
   project: string;
   link?: string | null;
   command: string;
+  /** What the row is about — rows sharing a subject are merged. */
+  subject?: { kind: string; id: string };
+  /** Every cause for the subject, most severe first (`kind` is the first). */
+  causes?: { cause: string; title: string; age: number; command: string }[];
+  /** Who must act on a stale inbox: its group root, or `operator`. */
+  owner?: string;
 }
 
 /** Deploy drift — merged commits on the default branch past the
@@ -300,9 +306,17 @@ export interface Overview {
   needs_me: NeedsMe[];
   drift: Drift;
   projects: OverviewProject[];
-  github: { state: "ok" | "cached" | "stale" | "unavailable"; error?: string | null; at?: number };
+  github: {
+    state: "ok" | "cached" | "stale" | "unavailable";
+    error?: string | null;
+    at?: number;
+    /** When the served PR/CI rows were fetched. */
+    as_of?: number | null;
+  };
   daemon: { reachable: boolean; build_commit?: string; build_time?: string; started_at?: number; info?: string };
   monitoring?: Monitoring;
+  /** Sources that missed their time bound — the view narrowed. */
+  degraded?: { source: string; subject?: string; detail: string }[];
   generated_at: number;
 }
 

@@ -8,16 +8,26 @@
 //! git walks bounded through `proc::run_bounded`. Every source degrades
 //! — an unreachable daemon, a missing tracker, or a failing `gh`
 //! narrows the screen instead of failing it.
+//!
+//! The sources run concurrently and every external probe is bounded
+//! (CAD-249): daemon RPCs by [`PROBE_TIMEOUT`] under a pass budget, `gh`
+//! by [`GH_TIMEOUT`] plus a caller wait past which the board serves the
+//! cache. A probe that misses its bound becomes a `degraded` note.
+//! Rows naming the same subject merge into one row carrying `causes`
+//! (CAD-252).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::adapter::registry;
 use crate::client;
+use crate::inbox;
 use crate::issue::{self, board, project, report};
 use crate::proc::run_bounded;
 
@@ -37,6 +47,16 @@ const GH_TIMEOUT: Duration = Duration::from_secs(20);
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// `git log` subjects surfaced in the drift tile.
 const DRIFT_SUBJECTS: usize = 20;
+/// Read bound on each daemon RPC the overview makes (CAD-249).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The per-agent probe pass starts no probe past this budget; agents
+/// it never reached become one `degraded` note.
+const PROBE_BUDGET: Duration = Duration::from_secs(4);
+/// Concurrent per-agent probes.
+const PROBE_WORKERS: usize = 8;
+/// The board waits this long on a gh refresh before serving the last
+/// cache; the refresh keeps running and lands for the next request.
+const GH_BOARD_WAIT: Duration = Duration::from_millis(1500);
 
 fn now_epoch() -> i64 {
     std::time::SystemTime::now()
@@ -559,7 +579,7 @@ fn monitoring_unavailable(error: impl Into<String>) -> Value {
 /// older than the monitor RPC; it must not open the live SQLite store itself.
 pub fn monitoring(state_dir: &Path) -> Value {
     let now = now_epoch();
-    let list = match client::rpc(state_dir, "monitor_list", json!({})) {
+    let list = match client::rpc_timeout(state_dir, "monitor_list", json!({}), PROBE_TIMEOUT) {
         Ok(value) => value,
         Err(error) => {
             return monitoring_unavailable(error.to_string());
@@ -575,10 +595,11 @@ pub fn monitoring(state_dir: &Path) -> Value {
     let mut alerts_by_monitor = HashMap::new();
     for monitor in &monitors {
         let id = monitor["id"].as_str().unwrap_or_default();
-        match client::rpc(
+        match client::rpc_timeout(
             state_dir,
             "monitor_alerts",
             json!({"monitor": id, "open": false, "limit": 100}),
+            PROBE_TIMEOUT,
         ) {
             Ok(value) => match validate_monitor_alert_response(id, &value) {
                 Ok(rows) => {
@@ -596,10 +617,16 @@ pub fn monitoring(state_dir: &Path) -> Value {
     monitoring_view(monitors, alerts_by_monitor, HashMap::new(), now)
 }
 
-/// A needs-me row before the urgency sort.
+/// A needs-me row before the subject merge and the urgency sort.
 struct Item {
     rank: u8,
     age: i64,
+    /// `(kind, id)` — rows naming the same agent, issue or PR merge
+    /// into one ([`merge_by_subject`]).
+    subject: (&'static str, String),
+    /// Aliases the row belongs to — `--group` keeps a row when one of
+    /// them is a group member.
+    agents: Vec<String>,
     json: Value,
 }
 
@@ -613,19 +640,131 @@ fn item(
     command: &str,
 ) -> Item {
     let age = age.max(0);
+    // Until `about` names it, a row is its own subject.
+    let id = format!("{kind}:{title}");
     Item {
         rank,
         age,
         json: json!({
-            "kind": kind, "title": title, "age": age,
+            "kind": kind, "cause": kind, "title": title, "age": age,
             "project": project, "link": link, "command": command,
+            "subject": {"kind": "row", "id": id},
         }),
+        subject: ("row", id),
+        agents: Vec::new(),
+    }
+}
+
+impl Item {
+    /// Name the row's subject: `agent`, `issue`, `pr`, `repo`,
+    /// `deploy`, `tracker` or `report`.
+    fn about(mut self, kind: &'static str, id: &str) -> Self {
+        self.json["subject"] = json!({"kind": kind, "id": id});
+        self.subject = (kind, id.to_string());
+        self
+    }
+
+    fn for_agent(mut self, alias: &str) -> Self {
+        if !alias.is_empty() && !self.agents.iter().any(|a| a == alias) {
+            self.agents.push(alias.to_string());
+        }
+        self
     }
 }
 
 /// Urgency order: kind rank ascending, then oldest first inside a kind.
 fn sort_needs(needs: &mut [Item]) {
     needs.sort_by(|a, b| a.rank.cmp(&b.rank).then(b.age.cmp(&a.age)));
+}
+
+/// One row per subject (CAD-252): rows naming the same agent, issue or
+/// PR collapse into the most severe one (lowest rank; ties keep emit
+/// order), which lists every cause most severe first under `causes`.
+/// `kind`/`cause` stay the primary cause, so a consumer that predates
+/// `causes` still reads one sensible row. The CLI and the board both
+/// render this merged list — the merge lives here and nowhere else.
+fn merge_by_subject(items: Vec<Item>) -> Vec<Item> {
+    let mut order: Vec<(&'static str, String)> = Vec::new();
+    let mut groups: HashMap<(&'static str, String), Vec<Item>> = HashMap::new();
+    for it in items {
+        if !groups.contains_key(&it.subject) {
+            order.push(it.subject.clone());
+        }
+        groups.entry(it.subject.clone()).or_default().push(it);
+    }
+    order
+        .into_iter()
+        .filter_map(|key| {
+            let mut group = groups.remove(&key)?;
+            group.sort_by_key(|i| i.rank);
+            let causes: Vec<Value> = group
+                .iter()
+                .map(|i| {
+                    json!({
+                        "cause": i.json["kind"], "title": i.json["title"],
+                        "age": i.age, "command": i.json["command"],
+                    })
+                })
+                .collect();
+            let mut agents: Vec<String> = group.iter().flat_map(|i| i.agents.clone()).collect();
+            agents.sort();
+            agents.dedup();
+            let mut primary = group.into_iter().next()?;
+            primary.json["causes"] = json!(causes);
+            primary.agents = agents;
+            Some(primary)
+        })
+        .collect()
+}
+
+/// Row scope for `cadence overview --project/--group` (CAD-252).
+#[derive(Clone, Debug, Default)]
+pub struct Scope {
+    /// Keep rows attributed to this tracker project key.
+    pub project: Option<String>,
+    /// Keep rows owned by this group root or one of its members
+    /// (`params.upstream == root`), the way `cadence status --group`
+    /// resolves a group.
+    pub group: Option<String>,
+}
+
+/// How one overview build bounds its sources (CAD-249).
+#[derive(Clone, Debug)]
+pub struct Options {
+    pub scope: Scope,
+    /// Serve the gh block from the cache only — never fetch, never write.
+    pub cache_only: bool,
+    /// How long to wait on a gh refresh before serving the last cache.
+    pub gh_wait: Duration,
+    /// Read bound on each daemon RPC.
+    pub probe_timeout: Duration,
+    /// The per-agent probe pass starts no probe past this budget.
+    pub probe_budget: Duration,
+}
+
+impl Options {
+    /// One-shot callers (`cadence overview`, `session`): the process
+    /// exits after one build, so a background gh refresh would never
+    /// land — wait it out (each gh call is bounded by [`GH_TIMEOUT`]).
+    pub fn cli() -> Self {
+        Self {
+            scope: Scope::default(),
+            cache_only: false,
+            gh_wait: GH_TIMEOUT * 2 + Duration::from_secs(1),
+            probe_timeout: PROBE_TIMEOUT,
+            probe_budget: PROBE_BUDGET,
+        }
+    }
+
+    /// The long-lived board server: past [`GH_BOARD_WAIT`] the last
+    /// cache is served (`github.state: stale`, with `as_of`) while the
+    /// refresh finishes in the background for the next request.
+    pub fn board() -> Self {
+        Self {
+            gh_wait: GH_BOARD_WAIT,
+            ..Self::cli()
+        }
+    }
 }
 
 fn git_text(repo: &Path, args: &[String]) -> Result<String, String> {
@@ -767,6 +906,7 @@ fn cache_file(state_dir: &Path) -> PathBuf {
 /// plus the repo payloads. A body only serves a request for the same
 /// slug set — a tracker with no GitHub remotes must not blank the
 /// board's rows, and a different tracker must not inherit them.
+#[derive(Clone)]
 struct GhCache {
     at: i64,
     slugs: Vec<String>,
@@ -804,28 +944,137 @@ fn write_cache(file: &Path, slugs: &[String], repos: &HashMap<String, Value>, at
     }
 }
 
-/// The GitHub block, 60 s-cached under the state dir. Returns the
-/// repos map plus `{state: ok|cached|stale|unavailable, error?}` —
-/// `stale` serves the last good body through a `gh` outage, and the
-/// screen narrows instead of failing either way.
+/// One repo's `gh` read — [`gh_repo`] in production, a stub in tests.
+type GhFetch = fn(&str) -> Result<Value, String>;
+
+/// gh refreshes in flight in this process, by cache file: while one
+/// runs, other requests serve the cache instead of starting another.
+static GH_REFRESHING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// The GitHub block, 60 s-cached under the state dir, waiting as long
+/// as the one-shot CLI needs.
 fn github(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Value>, Value) {
+    github_bounded(state_dir, slugs, Options::cli().gh_wait, gh_repo)
+}
+
+/// The GitHub block with a bounded wait (CAD-249). Returns the repos
+/// map plus `{state: ok|cached|stale|unavailable, as_of, error?}` —
+/// `as_of` is when the rows were fetched. A fresh cache answers at
+/// once; otherwise a refresh starts (every slug concurrently) and the
+/// caller waits at most `wait` for it. Past that, the last good body
+/// for this slug set is served as `stale` while the refresh finishes
+/// in the background and lands in the cache for the next request.
+fn github_bounded(
+    state_dir: &Path,
+    slugs: &[String],
+    wait: Duration,
+    fetch: GhFetch,
+) -> (HashMap<String, Value>, Value) {
     let file = cache_file(state_dir);
     let now = now_epoch();
     let cached = read_cache(&file);
     if let Some(c) = &cached {
         if now - c.at < GH_CACHE_SECS && c.slugs == slugs {
-            return (c.repos.clone(), json!({"state": "cached", "at": c.at}));
+            return (
+                c.repos.clone(),
+                json!({"state": "cached", "at": c.at, "as_of": c.at}),
+            );
         }
     }
     if slugs.is_empty() {
         // Nothing to fetch — and nothing to write: an empty slug set
         // must never stamp over a good cache.
-        return (HashMap::new(), json!({"state": "ok"}));
+        return (HashMap::new(), json!({"state": "ok", "as_of": now}));
     }
+    let claimed = {
+        let mut running = GH_REFRESHING.lock().unwrap_or_else(|e| e.into_inner());
+        if running.contains(&file) {
+            false
+        } else {
+            running.push(file.clone());
+            true
+        }
+    };
+    if claimed {
+        let (tx, rx) = mpsc::channel();
+        let (dir, want, prior) = (state_dir.to_path_buf(), slugs.to_vec(), cached.clone());
+        std::thread::spawn(move || {
+            let out = refresh_github(&dir, &want, prior, fetch);
+            GH_REFRESHING
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|f| f != &file);
+            let _ = tx.send(out);
+        });
+        if let Ok(out) = rx.recv_timeout(wait) {
+            return out;
+        }
+    }
+    stale_github(
+        cached,
+        slugs,
+        Some(format!(
+            "github refresh still running after {:.1}s — serving the last cache",
+            wait.as_secs_f64()
+        )),
+    )
+}
+
+/// The last good rows for this slug set, untimed — better stale rows
+/// than blank ones. `unavailable` when the cache covers none of them.
+fn stale_github(
+    cached: Option<GhCache>,
+    slugs: &[String],
+    error: Option<String>,
+) -> (HashMap<String, Value>, Value) {
+    let at = cached.as_ref().map(|c| c.at);
+    let stale: HashMap<String, Value> = cached
+        .map(|c| {
+            c.repos
+                .into_iter()
+                .filter(|(k, _)| slugs.contains(k))
+                .collect()
+        })
+        .unwrap_or_default();
+    if stale.is_empty() {
+        return (
+            stale,
+            json!({"state": "unavailable", "error": error, "as_of": null}),
+        );
+    }
+    (
+        stale,
+        json!({"state": "stale", "error": error, "as_of": at}),
+    )
+}
+
+/// Fetch every slug concurrently (each `gh` call bounded by
+/// [`GH_TIMEOUT`]), fill failed slugs from the cache, and write the
+/// cache when anything came back.
+fn refresh_github(
+    state_dir: &Path,
+    slugs: &[String],
+    cached: Option<GhCache>,
+    fetch: GhFetch,
+) -> (HashMap<String, Value>, Value) {
+    let results: Vec<Result<Value, String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = slugs
+            .iter()
+            .map(|slug| s.spawn(move || fetch(slug)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("gh fetch panicked".to_string()))
+            })
+            .collect()
+    });
+    let now = now_epoch();
     let mut repos = HashMap::new();
     let mut first_err = None;
-    for slug in slugs {
-        match gh_repo(slug) {
+    for (slug, result) in slugs.iter().zip(results) {
+        match result {
             Ok(v) => {
                 repos.insert(slug.clone(), v);
             }
@@ -837,22 +1086,8 @@ fn github(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Value>, Value)
         }
     }
     if repos.is_empty() {
-        // Every call failed: keep the last good rows for this slug
-        // set, untimed — better stale rows than blank ones.
-        let stale: HashMap<String, Value> = cached
-            .map(|c| {
-                c.repos
-                    .into_iter()
-                    .filter(|(k, _)| slugs.contains(k))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let state = if stale.is_empty() {
-            "unavailable"
-        } else {
-            "stale"
-        };
-        return (stale, json!({"state": state, "error": first_err}));
+        // Every call failed: keep the last good rows for this slug set.
+        return stale_github(cached, slugs, first_err);
     }
     // Partial failure: stale rows fill the missing slugs when the
     // cache covered them, so one flaky repo can't blank its PRs.
@@ -866,8 +1101,11 @@ fn github(state_dir: &Path, slugs: &[String]) -> (HashMap<String, Value>, Value)
         }
     }
     let _ = std::fs::create_dir_all(state_dir);
-    write_cache(&file, slugs, &repos, now);
-    (repos, json!({"state": "ok", "error": first_err}))
+    write_cache(&cache_file(state_dir), slugs, &repos, now);
+    (
+        repos,
+        json!({"state": "ok", "error": first_err, "as_of": now}),
+    )
 }
 
 /// The tracker project matching the repo this binary was built from:
@@ -918,171 +1156,489 @@ fn build_repo_match(projects: &[project::Project]) -> Option<(String, PathBuf)> 
 /// — that just empties the tracker sections); `state_dir` names the
 /// runtime dir (daemon socket + the gh cache).
 pub fn overview(state_dir: &Path, pm_dir: &Path) -> Value {
-    overview_inner(state_dir, pm_dir, false)
+    unscoped(overview_with(state_dir, pm_dir, &Options::cli()))
 }
 
 /// The overview with the gh block served from the cache only — a dry
 /// run must write nothing, cache included, so it never fetches.
 pub(crate) fn overview_cached(state_dir: &Path, pm_dir: &Path) -> Value {
-    overview_inner(state_dir, pm_dir, true)
+    let opts = Options {
+        cache_only: true,
+        ..Options::cli()
+    };
+    unscoped(overview_with(state_dir, pm_dir, &opts))
 }
 
-fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
-    let now = now_epoch();
-    let mut needs: Vec<Item> = Vec::new();
+/// `GET /api/overview` — bounded gh wait, background refresh.
+pub fn overview_board(state_dir: &Path, pm_dir: &Path) -> Value {
+    unscoped(overview_with(state_dir, pm_dir, &Options::board()))
+}
 
-    // ---- daemon: agents, approvals, drift identity ----
-    // Reachability comes from `health` — a pre-daemon_info daemon
-    // answers it, so an old build never reads as "unreachable" while
-    // `agent list` works. `daemon_info` only carries the build id.
-    let daemon_reachable = client::rpc(state_dir, "health", json!({})).is_ok();
-    let info = client::rpc(state_dir, "daemon_info", json!({})).ok();
-    let agents = client::rpc(state_dir, "agent_list", json!({}))
-        .ok()
-        .and_then(|v| v["agents"].as_array().cloned())
-        .unwrap_or_default();
-    let mut panes_idle = daemon_reachable;
-    // An old daemon without `agent_probe` cannot confirm a pane is
-    // idle — the drift row must say so instead of vanishing quietly.
-    let mut probes_unknown = false;
-    for a in &agents {
-        let alias = a["alias"].as_str().unwrap_or_default();
-        let show = client::rpc(state_dir, "agent_show", json!({"alias": alias}))
-            .unwrap_or_else(|_| json!({"messages": [], "queued": 0}));
-        let queued = show["queued"].as_i64().unwrap_or(0);
-        let age = now - a["updated"].as_f64().unwrap_or(now as f64) as i64;
-        if a["state"].as_str() == Some("attention") {
-            needs.push(item(
-                30,
-                "fenced",
-                &format!("agent {alias} fenced — reconcile then resume"),
-                age,
-                "",
-                None,
-                &cmd_agent_unfence(alias),
-            ));
+/// Only a scope can fail a build, and these callers pass none.
+fn unscoped(view: Result<Value, String>) -> Value {
+    view.unwrap_or_else(|e| json!({"error": e}))
+}
+
+/// A `degraded` note: one source answered late or not at all, and the
+/// screen narrowed instead of failing.
+fn degraded(source: &str, subject: &str, detail: impl Into<String>) -> Value {
+    json!({"source": source, "subject": subject, "detail": detail.into()})
+}
+
+/// What one agent's probes returned. A mailbox (no actor) needs none —
+/// its `agent_list` row carries the backlog and health.
+#[derive(Default)]
+struct AgentProbe {
+    show: Option<Value>,
+    requests: Vec<Value>,
+    /// A running/submitted turn, a busy pane, or a probe that could not
+    /// tell — any of them holds the drift restart back.
+    holds_drift: bool,
+    /// The daemon predates `agent_probe`.
+    probe_unknown: bool,
+    /// The probe budget ran out before this agent was reached.
+    unprobed: bool,
+    degraded: Vec<Value>,
+}
+
+/// One daemon RPC under the overview's bounds: the per-call timeout,
+/// clipped to what is left of the pass's deadline.
+fn bounded_rpc(
+    state_dir: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<Value, String> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left < Duration::from_millis(50) {
+        return Err("overview probe budget spent".to_string());
+    }
+    let bound = left.min(timeout);
+    client::rpc_timeout(state_dir, method, params, bound).map_err(|e| {
+        let text = e.to_string();
+        // A read timeout surfaces as EAGAIN/"timed out" — name the bound.
+        if text.contains("os error 11") || text.contains("timed out") {
+            format!("no answer within {}ms", bound.as_millis())
+        } else {
+            text
         }
-        if a["stalled"].as_bool().unwrap_or(false) {
-            needs.push(item(
-                40,
-                "stalled",
-                &format!("agent {alias} turn silent"),
-                a["silent_secs"].as_f64().unwrap_or(age as f64) as i64,
-                "",
-                None,
-                &cmd_agent_show(alias),
-            ));
-        }
-        // A sampled approval menu ranks with brokered approvals — the
-        // pane is waiting on a human either way.
-        if let Some(line) = show["agent"]["pane_menu"].as_str() {
-            needs.push(item(
-                20,
-                "approval_menu",
-                &format!("agent {alias} approval menu: {line}"),
-                age,
-                "",
-                None,
-                &cmd_agent_answer(alias),
-            ));
-        }
-        if show["agent"]["silent_ended"].as_bool().unwrap_or(false) {
-            needs.push(item(
-                40,
-                "silent_end",
-                &format!("agent {alias} turn ended at an idle pane — never reported"),
-                show["agent"]["ended_secs"].as_f64().unwrap_or(age as f64) as i64,
-                "",
-                None,
-                &cmd_send_ready(alias),
-            ));
-        }
-        if a["provider"].as_str() == Some(registry::INBOX) && queued > 0 {
-            needs.push(item(
-                100,
-                "inbox_unread",
-                &format!("{queued} unread for {alias}"),
-                age,
-                "",
-                None,
-                &cmd_inbox(alias),
-            ));
-        }
-        if let Ok(reqs) = client::rpc(state_dir, "agent_requests", json!({"alias": alias})) {
-            for req in reqs["requests"].as_array().cloned().unwrap_or_default() {
-                let handle = req["request"].as_str().unwrap_or_default();
-                let method = req["method"].as_str().unwrap_or("request");
-                let what = if method == "item/tool/requestUserInput" {
-                    "input request"
-                } else {
-                    "approval"
-                };
-                needs.push(item(
-                    20,
-                    "approval",
-                    &format!("{method} {what} for {alias}"),
-                    age,
-                    "",
-                    None,
-                    &cmd_agent_respond(alias, handle, method),
-                ));
-            }
-        }
-        // Drift is only actionable when everything is idle: any running
-        // or submitted message, or any busy pty pane, holds it back.
-        let busy_turn = show["messages"]
-            .as_array()
-            .map(|ms| {
-                ms.iter().any(|m| {
-                    matches!(
-                        m["state"].as_str().unwrap_or_default(),
-                        "running" | "submitted"
-                    )
-                })
+    })
+}
+
+/// Show, pending requests and (for an idle pty pane) the pane probe of
+/// one agent, each bounded.
+fn probe_agent(state_dir: &Path, a: &Value, timeout: Duration, deadline: Instant) -> AgentProbe {
+    let alias = a["alias"].as_str().unwrap_or_default();
+    let provider = a["provider"].as_str().unwrap_or_default();
+    let kind = a["endpoint_kind"].as_str().unwrap_or_default();
+    let mut p = AgentProbe::default();
+    // A mailbox has no pane and no requests: its `agent_list` row
+    // carries the backlog. Only rows that predate the `inbox` block
+    // (an older daemon) need the show read for the queued count.
+    let mailbox = !registry::has_actor(provider, kind);
+    if mailbox && a["inbox"]["queued"].is_i64() {
+        return p;
+    }
+    if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(50) {
+        p.unprobed = true;
+        // A mailbox never holds a restart back.
+        p.holds_drift = !mailbox;
+        return p;
+    }
+    let rpc = |method: &str| {
+        bounded_rpc(
+            state_dir,
+            method,
+            json!({"alias": alias}),
+            timeout,
+            deadline,
+        )
+    };
+    match rpc("agent_show") {
+        Ok(v) => p.show = Some(v),
+        Err(e) => p.degraded.push(degraded("agent_show", alias, e)),
+    }
+    if mailbox {
+        return p;
+    }
+    match rpc("agent_requests") {
+        Ok(v) => p.requests = v["requests"].as_array().cloned().unwrap_or_default(),
+        Err(e) if e.contains("Unknown method") => {}
+        Err(e) => p.degraded.push(degraded("agent_requests", alias, e)),
+    }
+    // Drift is only actionable when everything is idle: any running or
+    // submitted message, or any busy pty pane, holds it back — and so
+    // does a show that never answered.
+    let busy_turn = p.show.as_ref().is_none_or(|show| {
+        show["messages"].as_array().is_some_and(|ms| {
+            ms.iter().any(|m| {
+                matches!(
+                    m["state"].as_str().unwrap_or_default(),
+                    "running" | "submitted"
+                )
             })
-            .unwrap_or(false);
-        if busy_turn {
-            panes_idle = false;
-        } else if a["endpoint_kind"].as_str() == Some("pty") && a["endpoint"].is_string() {
-            match client::rpc(state_dir, "agent_probe", json!({"alias": alias})) {
-                Ok(p) if p["idle"].as_bool().unwrap_or(false) => {}
-                Ok(_) => panes_idle = false,
-                // "Unknown method" — a daemon that predates the RPC;
-                // any other failure reads as busy, conservatively.
-                Err(e) if e.to_string().contains("Unknown method") => probes_unknown = true,
-                Err(_) => panes_idle = false,
+        })
+    });
+    if busy_turn {
+        p.holds_drift = true;
+    } else if kind == "pty" && a["endpoint"].is_string() {
+        match rpc("agent_probe") {
+            Ok(v) if v["idle"].as_bool().unwrap_or(false) => {}
+            Ok(_) => p.holds_drift = true,
+            // "Unknown method" — a daemon that predates the RPC; any
+            // other failure reads as busy, conservatively.
+            Err(e) if e.contains("Unknown method") => p.probe_unknown = true,
+            Err(e) => {
+                p.holds_drift = true;
+                p.degraded.push(degraded("agent_probe", alias, e));
             }
         }
     }
+    p
+}
 
-    // ---- tracker + GitHub ----
-    // The GitHub read happens first: the tracker's review rows need
-    // the open-PR list for the branch-name match (`refs` alone misses
-    // PRs nobody linked).
+/// Probe every agent on [`PROBE_WORKERS`] threads — the daemon answers
+/// each connection on its own thread, so the pass costs the slowest
+/// probes, not their sum. No probe starts past `opts.probe_budget`.
+fn probe_agents(state_dir: &Path, agents: &[Value], opts: &Options) -> Vec<AgentProbe> {
+    let deadline = Instant::now() + opts.probe_budget;
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<AgentProbe>>> = agents.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..PROBE_WORKERS.min(agents.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(a) = agents.get(i) else {
+                    break;
+                };
+                let p = probe_agent(state_dir, a, opts.probe_timeout, deadline);
+                *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The daemon's half of the screen: reachability, build identity, the
+/// agent rows and their probes.
+struct DaemonView {
+    reachable: bool,
+    info: Option<Value>,
+    agents: Vec<Value>,
+    probes: Vec<AgentProbe>,
+    degraded: Vec<Value>,
+}
+
+fn daemon_view(state_dir: &Path, opts: &Options) -> DaemonView {
+    let t = opts.probe_timeout;
+    let mut view = DaemonView {
+        // Reachability comes from `health` — a pre-daemon_info daemon
+        // answers it, so an old build never reads as "unreachable"
+        // while `agent list` works. `daemon_info` only carries the id.
+        reachable: client::rpc_timeout(state_dir, "health", json!({}), t).is_ok(),
+        info: None,
+        agents: Vec::new(),
+        probes: Vec::new(),
+        degraded: Vec::new(),
+    };
+    if !view.reachable {
+        return view;
+    }
+    view.info = client::rpc_timeout(state_dir, "daemon_info", json!({}), t).ok();
+    match client::rpc_timeout(state_dir, "agent_list", json!({}), t) {
+        Ok(v) => view.agents = v["agents"].as_array().cloned().unwrap_or_default(),
+        Err(e) => view.degraded.push(degraded(
+            "agent_list",
+            "",
+            format!("agent rows missing — {e}"),
+        )),
+    }
+    view.probes = probe_agents(state_dir, &view.agents, opts);
+    let unprobed: Vec<&str> = view
+        .agents
+        .iter()
+        .zip(&view.probes)
+        .filter(|(_, p)| p.unprobed)
+        .filter_map(|(a, _)| a["alias"].as_str())
+        .collect();
+    if !unprobed.is_empty() {
+        view.degraded.push(degraded(
+            "agent_probe_budget",
+            "",
+            format!(
+                "{} agent(s) not probed within {:.1}s: {}",
+                unprobed.len(),
+                opts.probe_budget.as_secs_f64(),
+                unprobed.join(", ")
+            ),
+        ));
+    }
+    for p in &mut view.probes {
+        view.degraded.append(&mut p.degraded);
+    }
+    view
+}
+
+/// The tracker project an agent works in: the longest declared repo
+/// path its cwd sits under (worktrees under `.cadence/wt/` included).
+/// "" — a global row — when nothing matches.
+fn agent_project(a: &Value, repos: &[(PathBuf, String)]) -> String {
+    let Some(cwd) = a["cwd"].as_str().filter(|c| !c.is_empty()) else {
+        return String::new();
+    };
+    let cwd = PathBuf::from(cwd);
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    repos
+        .iter()
+        .filter(|(path, _)| cwd.starts_with(path))
+        .max_by_key(|(path, _)| path.components().count())
+        .map(|(_, key)| key.clone())
+        .unwrap_or_default()
+}
+
+/// The needs-me rows one agent contributes: its `agent_list` row (state,
+/// stall view, mailbox backlog and health) plus its probe.
+fn agent_items(a: &Value, probe: &AgentProbe, project: &str, now: i64) -> Vec<Item> {
+    let alias = a["alias"].as_str().unwrap_or_default();
+    let age = now - a["updated"].as_f64().unwrap_or(now as f64) as i64;
+    let row = |rank: u8, kind: &str, title: &str, age: i64, command: &str| {
+        item(rank, kind, title, age, project, None, command)
+            .about("agent", alias)
+            .for_agent(alias)
+    };
+    let mut items = Vec::new();
+    if a["state"].as_str() == Some("attention") {
+        items.push(row(
+            30,
+            "fenced",
+            &format!("agent {alias} fenced — reconcile then resume"),
+            age,
+            &cmd_agent_unfence(alias),
+        ));
+    }
+    if a["stalled"].as_bool().unwrap_or(false) {
+        items.push(row(
+            40,
+            "stalled",
+            &format!("agent {alias} turn silent"),
+            a["silent_secs"].as_f64().unwrap_or(age as f64) as i64,
+            &cmd_agent_show(alias),
+        ));
+    }
+    // A sampled approval menu ranks with brokered approvals — the pane
+    // is waiting on a human either way.
+    if let Some(line) = a["pane_menu"].as_str() {
+        items.push(row(
+            20,
+            "approval_menu",
+            &format!("agent {alias} approval menu: {line}"),
+            age,
+            &cmd_agent_answer(alias),
+        ));
+    }
+    if a["silent_ended"].as_bool().unwrap_or(false) {
+        items.push(row(
+            40,
+            "silent_end",
+            &format!("agent {alias} turn ended at an idle pane — never reported"),
+            a["ended_secs"].as_f64().unwrap_or(age as f64) as i64,
+            &cmd_send_ready(alias),
+        ));
+    }
+    let queued = a["inbox"]["queued"]
+        .as_i64()
+        .or_else(|| probe.show.as_ref().and_then(|s| s["queued"].as_i64()))
+        .unwrap_or(0);
+    if a["provider"].as_str() == Some(registry::INBOX) && queued > 0 {
+        items.push(row(
+            100,
+            "inbox_unread",
+            &format!("{queued} unread for {alias}"),
+            age,
+            &cmd_inbox(alias),
+        ));
+    }
+    // CAD-251: a mailbox past its unread threshold with no recent
+    // `inbox_read`, attributed to its owner (group root, else operator).
+    let health = &a["inbox_health"];
+    if health["stale"].as_bool().unwrap_or(false) {
+        let owner = health["owner"].as_str().unwrap_or(inbox::OPERATOR);
+        let oldest = health["oldest_unread_age_secs"].as_i64().unwrap_or(0);
+        let mut stale = row(
+            95,
+            "inbox_stale",
+            &format!(
+                "inbox {alias} has no consumer — {} unread, oldest {}, owner {owner}",
+                health["unread"].as_u64().unwrap_or(0),
+                inbox::fmt_age(oldest.max(0) as u64),
+            ),
+            oldest,
+            &cmd_inbox(alias),
+        )
+        .for_agent(owner);
+        stale.json["owner"] = json!(owner);
+        items.push(stale);
+    }
+    for req in &probe.requests {
+        let handle = req["request"].as_str().unwrap_or_default();
+        let method = req["method"].as_str().unwrap_or("request");
+        let what = if method == "item/tool/requestUserInput" {
+            "input request"
+        } else {
+            "approval"
+        };
+        items.push(row(
+            20,
+            "approval",
+            &format!("{method} {what} for {alias}"),
+            age,
+            &cmd_agent_respond(alias, handle, method),
+        ));
+    }
+    items
+}
+
+/// Scope the merged rows: `--project` keeps rows attributed to the key,
+/// `--group` keeps rows owned by the root or a member.
+fn scope_rows(items: Vec<Item>, project: Option<&str>, members: Option<&[String]>) -> Vec<Item> {
+    items
+        .into_iter()
+        .filter(|i| project.is_none_or(|p| i.json["project"].as_str() == Some(p)))
+        .filter(|i| members.is_none_or(|m| i.agents.iter().any(|a| m.contains(a))))
+        .collect()
+}
+
+/// A group's aliases — the root plus every agent whose upstream names
+/// it (one level, like `cadence status --group`). An alias no agent
+/// carries is an error, not an empty screen.
+fn group_members(view: &DaemonView, root: &str) -> Result<Vec<String>, String> {
+    if !view.reachable {
+        return Err(format!("cannot resolve group '{root}': daemon unreachable"));
+    }
+    if !view
+        .agents
+        .iter()
+        .any(|a| a["alias"].as_str() == Some(root))
+    {
+        return Err(format!(
+            "unknown group '{root}' — no registered agent has that alias (see `cadence agent list`)"
+        ));
+    }
+    Ok(view
+        .agents
+        .iter()
+        .filter(|a| {
+            a["alias"].as_str() == Some(root) || a["params"]["upstream"].as_str() == Some(root)
+        })
+        .filter_map(|a| a["alias"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// Build the screen under `opts`. The daemon probes, the gh refresh and
+/// the tracker read run concurrently — each bounded — so the view costs
+/// its slowest source, not their sum. Fails only on a scope naming an
+/// unknown project key or group.
+pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<Value, String> {
+    let now = now_epoch();
     let pm = issue::Pm::at(pm_dir).ok();
+    let projects = pm
+        .as_ref()
+        .map(|pm| project::list(&pm.dir).unwrap_or_default())
+        .unwrap_or_default();
+    if let Some(key) = opts.scope.project.as_deref() {
+        if !projects.iter().any(|p| p.key == key) {
+            let known: Vec<&str> = projects.iter().map(|p| p.key.as_str()).collect();
+            return Err(if known.is_empty() {
+                format!(
+                    "unknown project '{key}' — no tracker projects under {}",
+                    pm_dir.display()
+                )
+            } else {
+                format!("unknown project '{key}' — known: {}", known.join(", "))
+            });
+        }
+    }
     let mut slugs = Vec::new();
     let mut slug_project: HashMap<String, String> = HashMap::new();
-    if let Some(pm) = &pm {
-        for p in project::list(&pm.dir).unwrap_or_default() {
-            for r in &p.repos {
-                if let Some(remote) = &r.remote {
-                    let norm = project::normalize_remote(remote);
-                    if let Some(slug) = norm.strip_prefix("github.com/") {
-                        let slug = slug.to_string();
-                        slug_project.insert(slug.clone(), p.key.clone());
-                        slugs.push(slug);
-                    }
+    let mut repo_paths: Vec<(PathBuf, String)> = Vec::new();
+    for p in &projects {
+        for r in &p.repos {
+            if let Some(remote) = &r.remote {
+                let norm = project::normalize_remote(remote);
+                if let Some(slug) = norm.strip_prefix("github.com/") {
+                    slug_project.insert(slug.to_string(), p.key.clone());
+                    slugs.push(slug.to_string());
                 }
+            }
+            if let Some(path) = &r.path {
+                let path = project::expand_home(path);
+                repo_paths.push((path.canonicalize().unwrap_or(path), p.key.clone()));
             }
         }
     }
     slugs.sort();
     slugs.dedup();
-    let (gh_repos, gh_state) = if cache_only {
-        github_repos_cached(state_dir, &slugs)
-    } else {
-        github(state_dir, &slugs)
+
+    // ---- the three sources, concurrently ----
+    let (daemon, (gh_repos, gh_state), views, monitoring_view) = std::thread::scope(|s| {
+        let daemon = s.spawn(|| daemon_view(state_dir, opts));
+        let gh = s.spawn(|| {
+            if opts.cache_only {
+                github_repos_cached(state_dir, &slugs)
+            } else {
+                github_bounded(state_dir, &slugs, opts.gh_wait, gh_repo)
+            }
+        });
+        // Local files only — the notes index keeps it one pass.
+        let tracker = s.spawn(|| {
+            pm.as_ref().map(|pm| {
+                let issues = board::load_all(&pm.dir, None).unwrap_or_default();
+                board::views(&pm.config.notes_dir(), issues)
+            })
+        });
+        let monitoring = s.spawn(|| monitoring(state_dir));
+        (
+            daemon.join().expect("overview daemon probe panicked"),
+            gh.join().expect("overview gh refresh panicked"),
+            tracker.join().expect("overview tracker read panicked"),
+            monitoring
+                .join()
+                .expect("overview monitoring read panicked"),
+        )
+    });
+    let mut degraded_notes = daemon.degraded.clone();
+    if !slugs.is_empty() {
+        if let Some(e) = gh_state["error"].as_str() {
+            degraded_notes.push(degraded("github", "", e));
+        }
+    }
+    let members = match opts.scope.group.as_deref() {
+        Some(root) => Some(group_members(&daemon, root)?),
+        None => None,
     };
+
+    // ---- daemon rows ----
+    let mut needs: Vec<Item> = Vec::new();
+    let mut panes_idle = daemon.reachable;
+    // An old daemon without `agent_probe` cannot confirm a pane is idle
+    // — the drift row must say so instead of vanishing quietly.
+    let mut probes_unknown = false;
+    for (a, probe) in daemon.agents.iter().zip(&daemon.probes) {
+        let project = agent_project(a, &repo_paths);
+        needs.extend(agent_items(a, probe, &project, now));
+        panes_idle &= !probe.holds_drift;
+        probes_unknown |= probe.probe_unknown;
+    }
+
+    // ---- tracker rows ----
     // Lowercased headRefName of every open PR — an issue in review
     // counts as "has a PR" when a `cadence/<id-lowercase>-…` branch is
     // open, even without an explicit `pr` ref.
@@ -1094,18 +1650,25 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
             }
         }
     }
+    // `cadence/<id-lowercase>-` branch prefix → (issue id, owner): a
+    // PR row belongs to the issue's owner for `--group`.
+    let mut branch_issue: Vec<(String, String, Option<String>)> = Vec::new();
     let mut projects_out = Vec::new();
-    if let Some(pm) = &pm {
-        let issues = board::load_all(&pm.dir, None).unwrap_or_default();
-        let views = board::views(&pm.config.notes_dir(), issues);
+    if let (Some(pm), Some(views)) = (&pm, &views) {
         let mut status_of: HashMap<String, String> = HashMap::new();
-        for v in &views {
+        for v in views {
             status_of.insert(v.issue.front.id.clone(), v.status.clone());
+            branch_issue.push((
+                format!("cadence/{}-", v.issue.front.id.to_lowercase()),
+                v.issue.front.id.clone(),
+                v.issue.front.owner.clone(),
+            ));
         }
         let mut intake: Vec<Item> = Vec::new();
-        for v in &views {
+        for v in views {
             let id = v.issue.front.id.as_str();
             let project = v.issue.project.as_str();
+            let owner = v.issue.front.owner.as_deref().unwrap_or_default();
             let age = parse_iso(&v.issue.front.created)
                 .map(|c| now - c)
                 .unwrap_or(0);
@@ -1120,15 +1683,19 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
                     .iter()
                     .any(|b| b.starts_with(&branch_prefix));
             if v.status == "review" && !open_pr {
-                needs.push(item(
-                    70,
-                    "review_no_pr",
-                    &format!("{id} in review with no open PR"),
-                    age,
-                    project,
-                    None,
-                    &cmd_issue_show(id),
-                ));
+                needs.push(
+                    item(
+                        70,
+                        "review_no_pr",
+                        &format!("{id} in review with no open PR"),
+                        age,
+                        project,
+                        None,
+                        &cmd_issue_show(id),
+                    )
+                    .about("issue", id)
+                    .for_agent(owner),
+                );
             }
             let unblocked = !v.issue.front.blocked_by.is_empty()
                 && v.issue
@@ -1137,15 +1704,19 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
                     .iter()
                     .all(|b| status_of.get(b).map(String::as_str) == Some("done"));
             if !matches!(v.status.as_str(), "done" | "dropped") && unblocked {
-                needs.push(item(
-                    80,
-                    "blocked_ready",
-                    &format!("{id} unblocked — blockers all done"),
-                    age,
-                    project,
-                    None,
-                    &cmd_issue_set_ready(id),
-                ));
+                needs.push(
+                    item(
+                        80,
+                        "blocked_ready",
+                        &format!("{id} unblocked — blockers all done"),
+                        age,
+                        project,
+                        None,
+                        &cmd_issue_set_ready(id),
+                    )
+                    .about("issue", id)
+                    .for_agent(owner),
+                );
             }
             // `cadence report` intake: a backlog-tagged row surfaces
             // until triage moves it off backlog — the effective status
@@ -1165,15 +1736,19 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
                             .map(String::as_str)
                     })
                     .unwrap_or("intake");
-                intake.push(item(
-                    85,
-                    "intake",
-                    &format!("{id} {kind_tag} report — {}", v.issue.front.title),
-                    age,
-                    project,
-                    None,
-                    &format!("cadence report show {id}"),
-                ));
+                intake.push(
+                    item(
+                        85,
+                        "intake",
+                        &format!("{id} {kind_tag} report — {}", v.issue.front.title),
+                        age,
+                        project,
+                        None,
+                        &format!("cadence report show {id}"),
+                    )
+                    .about("issue", id)
+                    .for_agent(owner),
+                );
             }
         }
         // Cap the intake block — hundreds of untriaged reports must not
@@ -1182,18 +1757,24 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
         if intake.len() > report::NEEDS_ME_CAP {
             let extra = intake.len() - report::NEEDS_ME_CAP;
             intake.truncate(report::NEEDS_ME_CAP);
-            intake.push(item(
-                85,
-                "intake",
-                &format!("… {extra} more intake reports"),
-                0,
-                "",
-                None,
-                "cadence report ls",
-            ));
+            intake.push(
+                item(
+                    85,
+                    "intake",
+                    &format!("… {extra} more intake reports"),
+                    0,
+                    "",
+                    None,
+                    "cadence report ls",
+                )
+                .about("report", "intake-overflow"),
+            );
         }
         needs.extend(intake);
-        for p in project::list(&pm.dir).unwrap_or_default() {
+        for p in &projects {
+            if opts.scope.project.as_deref().is_some_and(|k| k != p.key) {
+                continue;
+            }
             let mut open_by_status = serde_json::Map::new();
             let mut oldest_review: Option<i64> = None;
             for v in views.iter().filter(|v| v.issue.project == p.key) {
@@ -1229,15 +1810,18 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
         ) {
             if let Ok(n) = behind.trim().parse::<i64>() {
                 if n > 0 {
-                    needs.push(item(
-                        110,
-                        "tracker_behind",
-                        &format!("tracker {n} commit(s) behind upstream"),
-                        0,
-                        "",
-                        None,
-                        CMD_ISSUE_SYNC,
-                    ));
+                    needs.push(
+                        item(
+                            110,
+                            "tracker_behind",
+                            &format!("tracker {n} commit(s) behind upstream"),
+                            0,
+                            "",
+                            None,
+                            CMD_ISSUE_SYNC,
+                        )
+                        .about("tracker", "pm"),
+                    );
                 }
             }
         }
@@ -1259,55 +1843,70 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
                 .and_then(parse_iso)
                 .map(|u| now - u)
                 .unwrap_or(0);
+            let head_ref = pr["headRefName"].as_str().unwrap_or("").to_lowercase();
+            let owner = branch_issue
+                .iter()
+                .find(|(prefix, _, _)| head_ref.starts_with(prefix.as_str()))
+                .and_then(|(_, _, owner)| owner.clone())
+                .unwrap_or_default();
+            let subject = format!("{slug}#{n}");
             match verdict_state(&rollup).as_deref() {
                 Some("SUCCESS") if checks_green(&rollup) => {
                     // The verdict binds this head — a push after it
                     // makes the copied command refuse instead of
                     // merging an unreviewed head.
                     let head = pr["headRefOid"].as_str().unwrap_or("");
-                    needs.push(item(
-                        10,
-                        "merge",
-                        &format!("PR #{n} {title} — verdict pass, checks green"),
+                    needs.push(
+                        item(
+                            10,
+                            "merge",
+                            &format!("PR #{n} {title} — verdict pass, checks green"),
+                            age,
+                            &project,
+                            url.as_deref(),
+                            &format!(
+                                "gh pr merge {n} --repo {slug} --squash --admin --match-head-commit {head}"
+                            ),
+                        )
+                        .about("pr", &subject)
+                        .for_agent(&owner),
+                    );
+                }
+                Some("SUCCESS") | Some("FAILURE") | Some("ERROR") => {}
+                _ => needs.push(
+                    item(
+                        60,
+                        "pr_no_verdict",
+                        &format!("PR #{n} {title} — no verdict"),
                         age,
                         &project,
                         url.as_deref(),
-                        &format!(
-                            "gh pr merge {n} --repo {slug} --squash --admin --match-head-commit {head}"
-                        ),
-                    ));
-                }
-                Some("SUCCESS") | Some("FAILURE") | Some("ERROR") => {}
-                _ => needs.push(item(
-                    60,
-                    "pr_no_verdict",
-                    &format!("PR #{n} {title} — no verdict"),
-                    age,
-                    &project,
-                    url.as_deref(),
-                    &format!("gh pr view {n} --repo {slug}"),
-                )),
+                        &format!("gh pr view {n} --repo {slug}"),
+                    )
+                    .about("pr", &subject)
+                    .for_agent(&owner),
+                ),
             }
         }
         if matches!(data["ci"]["state"].as_str(), Some("failure" | "error")) {
-            needs.push(item(
-                90,
-                "ci_red",
-                &format!("default branch CI failing on {slug}"),
-                0,
-                &project,
-                None,
-                &format!("gh run list --repo {slug}"),
-            ));
+            needs.push(
+                item(
+                    90,
+                    "ci_red",
+                    &format!("default branch CI failing on {slug}"),
+                    0,
+                    &project,
+                    None,
+                    &format!("gh run list --repo {slug}"),
+                )
+                .about("repo", slug),
+            );
         }
     }
 
     // ---- deploy drift: is what we merged actually running ----
-    let projects = pm
-        .as_ref()
-        .map(|pm| project::list(&pm.dir).unwrap_or_default())
-        .unwrap_or_default();
-    let mut drift = if !daemon_reachable {
+    let info = daemon.info.clone();
+    let mut drift = if !daemon.reachable {
         json!({"matched": false, "reason": "daemon unreachable — cannot tell"})
     } else if info.is_none() {
         // Reachable but predates `daemon_info` — the build commit is
@@ -1338,15 +1937,19 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
     if drift["known"].as_bool().unwrap_or(false) && drift["count"].as_i64().unwrap_or(0) > 0 {
         if panes_idle {
             let n = drift["count"].as_i64().unwrap_or(0);
-            needs.push(item(
-                50,
-                "drift",
-                &format!("{n} merged commit(s) not running — all panes idle"),
-                0,
-                drift["project"].as_str().unwrap_or(""),
-                None,
-                CMD_RESTART_WHEN_IDLE,
-            ));
+            let project = drift["project"].as_str().unwrap_or("");
+            needs.push(
+                item(
+                    50,
+                    "drift",
+                    &format!("{n} merged commit(s) not running — all panes idle"),
+                    0,
+                    project,
+                    None,
+                    CMD_RESTART_WHEN_IDLE,
+                )
+                .about("deploy", project),
+            );
         } else {
             // Held back, but say why — a busy pane is different from
             // a daemon that cannot answer `agent_probe` at all.
@@ -1358,27 +1961,34 @@ fn overview_inner(state_dir: &Path, pm_dir: &Path, cache_only: bool) -> Value {
         }
     }
 
+    let mut needs = scope_rows(
+        merge_by_subject(needs),
+        opts.scope.project.as_deref(),
+        members.as_deref(),
+    );
     sort_needs(&mut needs);
-    let daemon = match info {
+    let daemon_json = match info {
         Some(mut i) => {
-            i["reachable"] = json!(daemon_reachable);
+            i["reachable"] = json!(daemon.reachable);
             i
         }
-        None if daemon_reachable => json!({
+        None if daemon.reachable => json!({
             "reachable": true,
             "info": "daemon predates daemon_info — build identity unreadable",
         }),
         None => json!({"reachable": false}),
     };
-    json!({
+    Ok(json!({
         "needs_me": needs.iter().map(|i| i.json.clone()).collect::<Vec<_>>(),
         "drift": drift,
         "projects": projects_out,
         "github": gh_state,
-        "daemon": daemon,
-        "monitoring": monitoring(state_dir),
+        "daemon": daemon_json,
+        "monitoring": monitoring_view,
+        "degraded": degraded_notes,
+        "scope": {"project": opts.scope.project, "group": opts.scope.group},
         "generated_at": now,
-    })
+    }))
 }
 
 // ---------- shared with `cadence session` ----------
@@ -1398,7 +2008,10 @@ pub(crate) fn github_repos_cached(
     slugs: &[String],
 ) -> (HashMap<String, Value>, Value) {
     match read_cache(&cache_file(state_dir)) {
-        Some(c) if c.slugs == slugs => (c.repos, json!({"state": "cached", "at": c.at})),
+        Some(c) if c.slugs == slugs => (
+            c.repos,
+            json!({"state": "cached", "at": c.at, "as_of": c.at}),
+        ),
         _ => (HashMap::new(), json!({"state": "unavailable"})),
     }
 }
@@ -1476,6 +2089,253 @@ mod tests {
         let kinds: Vec<&str> = v.iter().map(|i| i.json["kind"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["merge", "pr_no_verdict", "pr_no_verdict"]);
         assert_eq!(v[1].json["title"], "c"); // older first within a kind
+    }
+
+    /// CAD-252: an agent that is both stalled and silently ended is one
+    /// row with two causes, most severe first; other subjects stay put.
+    #[test]
+    fn stalled_and_silent_end_merge_into_one_row() {
+        let now = 1_000_000;
+        let agent = json!({
+            "alias": "w1", "provider": "devin", "endpoint_kind": "pty",
+            "state": "busy", "updated": (now - 30) as f64,
+            "stalled": true, "silent_secs": 900,
+            "silent_ended": true, "ended_secs": 600,
+        });
+        let mut rows = agent_items(&agent, &AgentProbe::default(), "cadence", now);
+        assert_eq!(rows.len(), 2, "two raw causes");
+        rows.push(
+            item(
+                70,
+                "review_no_pr",
+                "CAD-1 in review",
+                5,
+                "cadence",
+                None,
+                "c",
+            )
+            .about("issue", "CAD-1"),
+        );
+        let merged = merge_by_subject(rows);
+        assert_eq!(merged.len(), 2, "one row per subject");
+        let w1 = &merged[0].json;
+        assert_eq!(w1["subject"], json!({"kind": "agent", "id": "w1"}));
+        assert_eq!(w1["kind"], "stalled", "primary cause keeps `kind`");
+        assert_eq!(w1["cause"], "stalled");
+        let causes: Vec<&str> = w1["causes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["cause"].as_str().unwrap())
+            .collect();
+        assert_eq!(causes, ["stalled", "silent_end"]);
+        assert_eq!(w1["causes"][1]["command"], cmd_send_ready("w1"));
+        assert_eq!(w1["project"], "cadence");
+        // A lone row still carries its one cause.
+        assert_eq!(merged[1].json["causes"].as_array().unwrap().len(), 1);
+        assert_eq!(merged[1].json["subject"]["kind"], "issue");
+    }
+
+    /// Severity decides the primary cause, not emit order; a stale inbox
+    /// merges with its unread row and names its owner.
+    #[test]
+    fn merge_orders_causes_by_severity_and_keeps_stale_owner() {
+        let now = 1_000_000;
+        let inbox = json!({
+            "alias": "obs", "provider": "inbox", "endpoint_kind": "inbox",
+            "state": "idle", "updated": now as f64,
+            "inbox": {"queued": 60},
+            "inbox_health": {"stale": true, "unread": 60,
+                             "oldest_unread_age_secs": 90_000, "owner": "pm"},
+        });
+        let merged = merge_by_subject(agent_items(&inbox, &AgentProbe::default(), "", now));
+        assert_eq!(merged.len(), 1);
+        let row = &merged[0];
+        assert_eq!(row.json["kind"], "inbox_stale", "{}", row.json);
+        assert_eq!(row.json["owner"], "pm");
+        assert!(row.json["title"].as_str().unwrap().contains("60 unread"));
+        let causes: Vec<&str> = row.json["causes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["cause"].as_str().unwrap())
+            .collect();
+        assert_eq!(causes, ["inbox_stale", "inbox_unread"]);
+        // Attributed to the owner for `--group pm`, and to the inbox.
+        assert_eq!(row.agents, ["obs", "pm"]);
+    }
+
+    #[test]
+    fn scope_keeps_project_and_group_rows() {
+        let rows = || {
+            vec![
+                item(40, "stalled", "a", 1, "cadence", None, "c")
+                    .about("agent", "w1")
+                    .for_agent("w1"),
+                item(40, "stalled", "b", 1, "other", None, "c")
+                    .about("agent", "w2")
+                    .for_agent("w2"),
+                item(90, "ci_red", "c", 1, "cadence", None, "c").about("repo", "a/b"),
+            ]
+        };
+        let titles = |v: Vec<Item>| -> Vec<String> {
+            v.iter()
+                .map(|i| i.json["title"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            titles(scope_rows(rows(), Some("cadence"), None)),
+            ["a", "c"]
+        );
+        let members = vec!["pm".to_string(), "w2".to_string()];
+        assert_eq!(titles(scope_rows(rows(), None, Some(&members))), ["b"]);
+        assert_eq!(titles(scope_rows(rows(), None, None)).len(), 3);
+    }
+
+    #[test]
+    fn agent_project_is_longest_repo_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let wt = root.join(".cadence/wt/x");
+        std::fs::create_dir_all(&wt).unwrap();
+        let repos = vec![
+            (root.clone(), "outer".to_string()),
+            (root.join(".cadence"), "inner".to_string()),
+        ];
+        let a = json!({"cwd": wt.to_str().unwrap()});
+        assert_eq!(agent_project(&a, &repos), "inner");
+        assert_eq!(agent_project(&json!({"cwd": "/elsewhere"}), &repos), "");
+        assert_eq!(agent_project(&json!({}), &repos), "");
+    }
+
+    fn slow_gh(_slug: &str) -> Result<Value, String> {
+        std::thread::sleep(Duration::from_secs(3));
+        Ok(json!({"prs": [{"number": 2}], "ci": {"state": "success"}}))
+    }
+
+    /// CAD-249: a gh refresh slower than the caller's wait serves the
+    /// last cache as `stale` with its `as_of` inside the bound, and the
+    /// refresh still lands in the cache for the next request.
+    #[test]
+    fn slow_gh_serves_stale_cache_within_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let slugs = vec!["acme/widgets".to_string()];
+        let old = now_epoch() - 600;
+        let mut repos = HashMap::new();
+        repos.insert(
+            "acme/widgets".to_string(),
+            json!({"prs": [{"number": 1}], "ci": {}}),
+        );
+        write_cache(&cache_file(dir.path()), &slugs, &repos, old);
+
+        let started = Instant::now();
+        let (got, state) = github_bounded(dir.path(), &slugs, Duration::from_millis(300), slow_gh);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(state["state"], "stale", "{state}");
+        assert_eq!(state["as_of"], old, "{state}");
+        assert!(
+            state["error"].as_str().unwrap().contains("still running"),
+            "{state}"
+        );
+        assert_eq!(got["acme/widgets"]["prs"][0]["number"], 1);
+
+        // A second request while the refresh runs starts no other one.
+        let (_, again) = github_bounded(dir.path(), &slugs, Duration::from_millis(100), slow_gh);
+        assert_eq!(again["state"], "stale", "{again}");
+
+        // The background refresh lands; the next request is a cache hit.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while read_cache(&cache_file(dir.path())).is_none_or(|c| c.at == old) {
+            assert!(Instant::now() < deadline, "refresh never landed");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (got, state) = github_bounded(dir.path(), &slugs, Duration::from_millis(1), slow_gh);
+        assert_eq!(state["state"], "cached", "{state}");
+        assert_eq!(got["acme/widgets"]["prs"][0]["number"], 2);
+    }
+
+    /// No cache at all and a slow gh: `unavailable` inside the bound,
+    /// never a hang.
+    #[test]
+    fn slow_gh_without_cache_is_unavailable_not_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let slugs = vec!["acme/gadgets".to_string()];
+        let started = Instant::now();
+        let (got, state) = github_bounded(dir.path(), &slugs, Duration::from_millis(200), slow_gh);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(got.is_empty());
+        assert_eq!(state["state"], "unavailable", "{state}");
+        assert!(state["as_of"].is_null());
+    }
+
+    /// A daemon that answers `health`/`agent_list` but never answers
+    /// the per-agent probes: the overview still returns inside its
+    /// bounds, naming what timed out in `degraded`.
+    #[test]
+    fn wedged_agent_probes_degrade_within_the_bound() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(client::socket_path(dir.path())).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut line = String::new();
+                    let mut reader = BufReader::new(&stream);
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let req: Value = serde_json::from_str(&line).unwrap_or_default();
+                    let result = match req["method"].as_str().unwrap_or_default() {
+                        "health" => json!({"state": "ready"}),
+                        "daemon_info" => json!({"build_commit": "unknown"}),
+                        "agent_list" => json!({"agents": [{
+                            "alias": "w1", "provider": "claude",
+                            "endpoint_kind": "managed", "state": "busy",
+                            "updated": 0.0,
+                        }]}),
+                        // agent_show / agent_requests / monitors: wedged.
+                        _ => {
+                            std::thread::sleep(Duration::from_secs(30));
+                            return;
+                        }
+                    };
+                    let frame = json!({"ok": true, "result": result});
+                    let _ = writeln!(&stream, "{frame}");
+                });
+            }
+        });
+        let opts = Options {
+            probe_timeout: Duration::from_millis(300),
+            probe_budget: Duration::from_millis(800),
+            ..Options::board()
+        };
+        let started = Instant::now();
+        let view = overview_with(dir.path(), &dir.path().join("no-pm"), &opts).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(view["daemon"]["reachable"], true, "{view}");
+        let notes = view["degraded"].as_array().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|d| d["source"] == "agent_show" && d["subject"] == "w1"),
+            "{view}"
+        );
+        assert!(
+            notes[0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("no answer within"),
+            "{view}"
+        );
     }
 
     #[test]

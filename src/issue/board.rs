@@ -368,10 +368,22 @@ pub fn derive_status(
         }
         return (file_status.to_string(), "rollup");
     }
+    derive_leaf(file_status, job, || {
+        notes::derive(notes_dir, id).map(|(status, _)| status)
+    })
+}
+
+/// Job, then notes, then the file field — `notes` runs only when no
+/// job decides, so a caller holding a [`notes::index`] skips the read.
+fn derive_leaf(
+    file_status: &str,
+    job: Option<JobOutcome>,
+    notes: impl FnOnce() -> Option<&'static str>,
+) -> (String, &'static str) {
     if let Some(JobOutcome::Status(status)) = job {
         return (status.to_string(), "job");
     }
-    if let Some((status, _)) = notes::derive(notes_dir, id) {
+    if let Some(status) = notes() {
         return (status.to_string(), "notes");
     }
     (file_status.to_string(), "file")
@@ -386,6 +398,8 @@ pub fn views(notes_dir: &Path, issues: Vec<Issue>) -> Vec<View> {
 /// Compute views for a set of issues (usually everything under the PM
 /// dir so cross-project links resolve) against the daemon's job state.
 pub fn views_with_jobs(notes_dir: &Path, issues: Vec<Issue>, jobs: &JobOutcomes) -> Vec<View> {
+    // One pass over the notes dir for every issue's chain and status.
+    let mut notes_of = notes::index(notes_dir);
     // Children edges decide containers before statuses derive.
     let children_of: HashMap<String, Vec<String>> = {
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
@@ -429,12 +443,15 @@ pub fn views_with_jobs(notes_dir: &Path, issues: Vec<Issue>, jobs: &JobOutcomes)
         if children_of.contains_key(&issue.front.id) {
             continue;
         }
-        let (s, src) = derive_status(
-            &[],
-            notes_dir,
-            &issue.front.id,
+        let (s, src) = derive_leaf(
             &issue.front.status,
             jobs.get(&issue.front.id).copied(),
+            || {
+                notes_of
+                    .get(&issue.front.id)
+                    .and_then(|chain| chain.last())
+                    .and_then(notes::derive_from)
+            },
         );
         status_of.insert(issue.front.id.clone(), (s, src));
     }
@@ -488,7 +505,7 @@ pub fn views_with_jobs(notes_dir: &Path, issues: Vec<Issue>, jobs: &JobOutcomes)
             let duplicates = duplicates_of.get(&id).cloned().unwrap_or_default();
             let (checks_done, checks_total) = parse::checkbox_progress(&issue.body);
             View {
-                chain: notes::chain(notes_dir, &id),
+                chain: notes_of.remove(&id).unwrap_or_default(),
                 container: !children.is_empty(),
                 children,
                 blocks,
