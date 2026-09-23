@@ -519,6 +519,7 @@ mod tests {
             tags: vec![],
             default_owner: None,
             build,
+            memory: None,
         }
     }
 

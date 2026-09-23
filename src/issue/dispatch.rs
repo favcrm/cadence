@@ -609,6 +609,10 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     let mut lessons: Vec<String> = vec![];
     let mut lessons_file: Option<PathBuf> = None;
     let mut lessons_error: Option<String> = None;
+    // CAD-203: in-scope lessons withheld for stale evidence, with the
+    // reason — recorded on the dispatch comment and in the output so
+    // "why did I not get this?" is answerable.
+    let mut lessons_withheld: Vec<(String, String)> = vec![];
     // The message id is minted up front so the `message` ref commits
     // BEFORE the send: a finish racing the dispatch sees the binding
     // the moment the ref lands. The old send→add_ref order left the
@@ -633,6 +637,11 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
                     if let Some(line) = memory::load_errors_line(&mem_errors) {
                         lessons_error = Some(line);
                     }
+                    lessons_withheld = matched
+                        .withheld
+                        .iter()
+                        .map(|(m, reason)| (m.front.id.clone(), reason.clone()))
+                        .collect();
                     let (text, slugs) = memory::render_lessons(&matched);
                     if !slugs.is_empty() {
                         let ddir = state_dir.join("dispatch");
@@ -757,6 +766,13 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     if !lessons.is_empty() {
         comment_text.push_str(&format!("\nLessons injected: {}", lessons.join(", ")));
     }
+    if !lessons_withheld.is_empty() {
+        let items: Vec<String> = lessons_withheld
+            .iter()
+            .map(|(slug, reason)| format!("{slug} ({reason})"))
+            .collect();
+        comment_text.push_str(&format!("\nLessons withheld: {}", items.join("; ")));
+    }
     // A `--job` dispatch's override is already recorded by `issue
     // start`, which re-checks the assignee; the plain path records it
     // here, with the dispatch it allowed.
@@ -788,6 +804,10 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         .as_ref()
         .map(|p| json!(p))
         .unwrap_or(Value::Null);
+    out["lessons_withheld"] = json!(lessons_withheld
+        .iter()
+        .map(|(slug, reason)| json!({"slug": slug, "reason": reason}))
+        .collect::<Vec<_>>());
     out["lessons_error"] = lessons_error
         .as_ref()
         .map(|e| json!(e))

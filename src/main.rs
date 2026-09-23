@@ -7442,8 +7442,9 @@ fn briefing_body(
         let mut omitted = 0usize;
         for m in rules.iter().take(8) {
             let line = format!(
-                "- `{}`: {} — {}",
+                "- `{}` ({}): {} — {}",
                 m.front.id,
+                cadence_agent::memory::evidence_label(m),
                 cadence_agent::memory::fact_line(&m.body),
                 cadence_agent::memory::apply_line(&m.body)
             );

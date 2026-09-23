@@ -568,10 +568,12 @@ fn memory_context(pm: &Pm, selected: &project::Project, paths: &[String]) -> Val
         providers: Vec::new(),
         tags: Vec::new(),
     };
-    let matched = memory::match_memories(&pool, &context);
+    let fresh = memory::Freshness::for_project(Some(selected));
+    let matched = memory::match_memories(&pool, &context, &fresh);
     let (lessons, slugs) = memory::render_lessons(&matched);
     let included_ids: HashSet<&str> = slugs.iter().map(String::as_str).collect();
     let included: Vec<Value> = matched
+        .lessons
         .iter()
         .filter(|memory| included_ids.contains(memory.front.id.as_str()))
         .map(|memory| {
@@ -579,13 +581,20 @@ fn memory_context(pm: &Pm, selected: &project::Project, paths: &[String]) -> Val
                 "id": memory.front.id,
                 "kind": memory.front.kind,
                 "confidence": memory.front.confidence,
-                "verified_at": memory.front.verified_at,
+                "verified_at": memory::last_verified(memory),
+                "evidence": memory::evidence_label(memory),
             })
         })
         .collect();
     let matched_ids: HashSet<&str> = matched
+        .lessons
         .iter()
         .map(|memory| memory.front.id.as_str())
+        .collect();
+    let stale: std::collections::HashMap<&str, &str> = matched
+        .withheld
+        .iter()
+        .map(|(memory, reason)| (memory.front.id.as_str(), reason.as_str()))
         .collect();
     let withheld_all: Vec<Value> = pool
         .iter()
@@ -593,6 +602,8 @@ fn memory_context(pm: &Pm, selected: &project::Project, paths: &[String]) -> Val
         .map(|memory| {
             let reason = if matched_ids.contains(memory.front.id.as_str()) {
                 "lesson renderer omitted this eligible entry at its cap".to_string()
+            } else if let Some(reason) = stale.get(memory.front.id.as_str()) {
+                reason.to_string()
             } else if memory.front.status == "accepted" {
                 let (eligible, reason) = memory::retrieval_status(memory);
                 if !eligible {
@@ -632,7 +643,7 @@ fn memory_context(pm: &Pm, selected: &project::Project, paths: &[String]) -> Val
         "load_errors": errors,
         "load_errors_total": load_errors_total,
         "load_errors_omitted": load_errors_omitted,
-        "matched_total": matched.len(),
+        "matched_total": matched.lessons.len(),
     })
 }
 
@@ -1098,6 +1109,7 @@ mod tests {
                     confidence: "high".to_string(),
                     created: "2026-01-01T00:00:00Z".to_string(),
                     verified_at: Some("2026-01-01T00:00:00Z".to_string()),
+                    stale: None,
                     supersedes: None,
                     author: None,
                     author_proof: None,
@@ -1114,7 +1126,10 @@ mod tests {
                 ),
             })
             .collect::<Vec<_>>();
-        let (lessons, slugs) = memory::render_lessons(&memories);
+        let (lessons, slugs) = memory::render_lessons(&memory::Matched {
+            lessons: memories,
+            withheld: Vec::new(),
+        });
         assert!(slugs.len() <= memory::LESSON_MAX_ENTRIES);
         assert!(lessons.len() <= memory::LESSON_MAX_BYTES);
     }
