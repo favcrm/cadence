@@ -977,6 +977,12 @@ fn daemon_pid_for_proof(state_dir: &Path) -> Result<u32> {
     Ok(flock_holder(&state_dir.join("cadence.lock"))?.unwrap_or(0))
 }
 
+/// `Some(pid)` while a daemon holds `<state>/cadence.lock`, `None` when
+/// the lock file is absent or free (a stale socket is not a daemon).
+pub fn daemon_lock_holder(state_dir: &Path) -> Result<Option<u32>> {
+    flock_holder(&state_dir.join("cadence.lock"))
+}
+
 /// `Some(pid)` when an exclusive flock is held. `None` when the file is
 /// absent or the lock is free — a successful probe lock is dropped
 /// before returning, so this function does not leave a daemon lock behind.

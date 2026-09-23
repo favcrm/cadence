@@ -5,6 +5,7 @@
 
 pub mod adapter;
 pub mod audit;
+pub mod backup;
 pub mod client;
 pub mod daemon;
 pub mod doctor;
