@@ -5,8 +5,8 @@ import {
   toggle,
   type BoardFilters,
   type Facet,
-} from "../filters";
-import type { IssueCard } from "../types";
+} from "../../lib/filters";
+import type { IssueCard } from "../../lib/types";
 
 interface Props {
   /** Cards in scope before the chips apply — the facet values and

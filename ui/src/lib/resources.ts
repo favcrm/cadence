@@ -1,5 +1,5 @@
 import { api } from "./api";
-import { Resource } from "./resource";
+import { Resource } from "./cache";
 import type { AgentsPayload, IssueCard, Overview, Project } from "./types";
 
 /**

@@ -1,5 +1,5 @@
-import { agentIsUnassigned, agentIssueIds, agentMatchesProject, issueIndex } from "./scope";
-import type { Agent, IssueCard } from "./types";
+import { agentIsUnassigned, agentIssueIds, agentMatchesProject, issueIndex } from "../src/lib/scope";
+import type { Agent, IssueCard } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);

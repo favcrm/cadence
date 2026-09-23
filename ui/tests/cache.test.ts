@@ -1,4 +1,4 @@
-import { invalidatedBy, Resource, RESOURCE_NAMES } from "./resource";
+import { invalidatedBy, Resource, RESOURCE_NAMES } from "../src/lib/cache";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);

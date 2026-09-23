@@ -1,4 +1,4 @@
-import type { IssueCard } from "../types";
+import type { IssueCard } from "../../lib/types";
 
 const PRIORITY_CHIP: Record<string, string> = {
   P0: "bg-warn/10 text-warn",

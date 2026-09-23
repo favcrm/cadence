@@ -18,7 +18,7 @@
  * have been answered from before the change.
  *
  * No React here — `useResource` adapts a store to a component — so the
- * state machine is unit-tested in plain node (see resource.test.ts).
+ * state machine is unit-tested in plain node (see tests/cache.test.ts).
  */
 
 export type ResourceStatus = "loading" | "ok" | "stale" | "failed" | "empty";

@@ -1,5 +1,5 @@
 import ProjectContext from "./ProjectContext";
-import type { ProjectContext as ProjectContextPayload } from "../types";
+import type { ProjectContext as ProjectContextPayload } from "../../lib/types";
 
 const API_ROWS: [string, string, string, number][] = [
   ["GET", "/api/projects", "folders, prefixes, counts", 1],

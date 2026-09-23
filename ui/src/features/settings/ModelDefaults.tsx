@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ApiError } from "../api";
-import { canonicalJson } from "../modelDefaultsCompare";
-import { modelIdProblem } from "../modelId";
+import { api, ApiError } from "../../lib/api";
+import { canonicalJson } from "./modelDefaultsCompare";
+import { modelIdProblem } from "./modelId";
 import type {
   ModelDefaultsConfig,
   ModelDefaultsSnapshot,
   ModelProviderInfo,
   ModelRoleInfo,
   ProviderModelDefaults,
-} from "../types";
+} from "../../lib/types";
 
 type BaselineChoice = "provider_default" | "model";
 type RoleChoice = "inherit" | "provider_default" | "model";

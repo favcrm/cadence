@@ -1,4 +1,4 @@
-import { provenanceDetail } from "./modelProvenance";
+import { provenanceDetail } from "../src/features/agents/modelProvenance";
 
 function equal(actual: unknown, expected: unknown): void {
   if (actual !== expected) {

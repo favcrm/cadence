@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
-import { fmtTime } from "../fmt";
-import { provenanceDetail } from "../modelProvenance";
-import type { ResourceState } from "../resource";
-import { agentIsUnassigned, agentMatchesProject, issueIndex, type IssueIndex } from "../scope";
-import { agentsEmptyCopy } from "../uxCopy";
-import { ResourceGate, StaleChip } from "./ResourceStatus";
+import { api } from "../../lib/api";
+import { fmtTime } from "../../lib/fmt";
+import { provenanceDetail } from "./modelProvenance";
+import type { ResourceState } from "../../lib/cache";
+import { agentIsUnassigned, agentMatchesProject, issueIndex, type IssueIndex } from "../../lib/scope";
+import { agentsEmptyCopy } from "../../lib/uxCopy";
+import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import type {
   Agent,
   AgentDetail,
@@ -13,7 +13,7 @@ import type {
   AgentsPayload,
   IssueCard,
   UsageLimit,
-} from "../types";
+} from "../../lib/types";
 
 const STATE_CHIP: Record<string, string> = {
   busy: "bg-info/10 text-info",

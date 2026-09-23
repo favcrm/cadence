@@ -1,5 +1,5 @@
-import type { NeedAudience, NeedsMe } from "./types";
-import { NEED_SECTION_LABEL, NEEDS_DECISION_EMPTY } from "./uxCopy";
+import type { NeedAudience, NeedsMe } from "../../lib/types";
+import { NEED_SECTION_LABEL, NEEDS_DECISION_EMPTY } from "../../lib/uxCopy";
 
 const ORDER: readonly NeedAudience[] = ["operator", "team", "dependency", "info"];
 

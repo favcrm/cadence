@@ -1,4 +1,4 @@
-import { canonicalJson } from "./modelDefaultsCompare";
+import { canonicalJson } from "../src/features/settings/modelDefaultsCompare";
 
 function equal(actual: unknown, expected: unknown): void {
   if (actual !== expected) {

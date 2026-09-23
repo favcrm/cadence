@@ -1,14 +1,14 @@
 import { useState } from "react";
-import { api, type WriteResp } from "../api";
-import { boardHeadline, boardScope, boardVisible, issueCounts } from "../counts";
-import { epicProgress, matches, type BoardFilters } from "../filters";
-import type { ResourceState } from "../resource";
-import { agentIsUnassigned, agentMatchesProject, issueIndex } from "../scope";
-import type { AgentsPayload, Health, IssueCard, Project } from "../types";
-import type { ProjectView } from "../urlState";
+import { api, type WriteResp } from "../../lib/api";
+import { boardHeadline, boardScope, boardVisible, issueCounts } from "../../lib/counts";
+import { epicProgress, matches, type BoardFilters } from "../../lib/filters";
+import type { ResourceState } from "../../lib/cache";
+import { agentIsUnassigned, agentMatchesProject, issueIndex } from "../../lib/scope";
+import type { AgentsPayload, Health, IssueCard, Project } from "../../lib/types";
+import type { ProjectView } from "../../lib/urlState";
 import Card, { noDragReason } from "./Card";
 import FilterBar from "./FilterBar";
-import { ResourceGate, StaleChip } from "./ResourceStatus";
+import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 
 const COLS: [string, string, number?][] = [
   ["backlog", "Backlog"],

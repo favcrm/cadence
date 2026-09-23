@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError } from "../api";
-import type { MemoryCard, MemoryDetail } from "../types";
-import Md from "./Md";
+import { api, ApiError } from "../../lib/api";
+import type { MemoryCard, MemoryDetail } from "../../lib/types";
+import Md from "../../ui/Md";
 
 const STATUSES = ["", "proposed", "accepted", "rejected", "superseded"];
 const TYPES = ["", "rule", "gotcha", "decision", "recipe"];

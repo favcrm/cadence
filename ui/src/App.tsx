@@ -1,21 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, type WriteResp } from "./api";
-import Agents from "./components/Agents";
-import Board from "./components/Board";
-import Drawer from "./components/Drawer";
-import Memory from "./components/Memory";
-import ModelDefaults from "./components/ModelDefaults";
-import OverviewView from "./components/Overview";
-import Plan from "./components/Plan";
-import Sidebar from "./components/Sidebar";
-import Toast, { type ToastMsg } from "./components/Toast";
-import { Logo } from "./components/Logo";
-import { countLabel, issueCounts } from "./counts";
-import type { BoardFilters } from "./filters";
-import { invalidatedBy } from "./resource";
-import { resources } from "./resources";
-import { useResource } from "./useResource";
-import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./projectContextGuard";
+import { api, ApiError, type WriteResp } from "./lib/api";
+import Agents from "./features/agents/Agents";
+import Board from "./features/projects/Board";
+import Drawer from "./features/projects/Drawer";
+import Memory from "./features/settings/Memory";
+import ModelDefaults from "./features/settings/ModelDefaults";
+import OverviewView from "./features/home/Overview";
+import Plan from "./features/projects/Plan";
+import Sidebar from "./ui/Sidebar";
+import Toast, { type ToastMsg } from "./ui/Toast";
+import { Logo } from "./ui/Logo";
+import { countLabel, issueCounts } from "./lib/counts";
+import type { BoardFilters } from "./lib/filters";
+import { invalidatedBy } from "./lib/cache";
+import { resources } from "./lib/resources";
+import { useResource } from "./lib/useResource";
+import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./features/projects/projectContextGuard";
 import {
   browserStoredProjectView,
   persistBrowserProjectView,
@@ -24,14 +24,14 @@ import {
   serializeAppUrlState,
   type AppTab,
   type ProjectView,
-} from "./urlState";
+} from "./lib/urlState";
 import type {
   Health,
   IssueCard,
   IssueDetail,
   Meta,
   ProjectContext,
-} from "./types";
+} from "./lib/types";
 
 export default function App() {
   const initialState = useRef<ReturnType<typeof readAppUrlState> | null>(null);
@@ -51,7 +51,7 @@ export default function App() {
   const observedContextRevisions = useRef<Record<string, string>>({});
   const [query, setQuery] = useState("");
   const [filters, setFilters] = useState<BoardFilters>(initial.filters);
-  // Per-resource state (resource.ts): loading, failed and empty stay
+  // Per-resource state (lib/cache.ts): loading, failed and empty stay
   // distinct, and a failed refresh keeps the last good payload as stale.
   const issuesState = useResource(resources.issues);
   const projectsState = useResource(resources.projects);

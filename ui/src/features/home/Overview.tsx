@@ -1,5 +1,5 @@
-import { exclusionLabel, issueCounts, statusBreakdown } from "../counts";
-import type { ResourceState } from "../resource";
+import { exclusionLabel, issueCounts, statusBreakdown } from "../../lib/counts";
+import type { ResourceState } from "../../lib/cache";
 import type {
   IssueCard,
   MainCi,
@@ -8,10 +8,10 @@ import type {
   Overview,
   Project,
   ProjectContext,
-} from "../types";
-import { needSections } from "../needSections";
-import { needLabel, shaCiLabel } from "../uxCopy";
-import { StaleChip } from "./ResourceStatus";
+} from "../../lib/types";
+import { needSections } from "./needSections";
+import { needLabel, shaCiLabel } from "../../lib/uxCopy";
+import { StaleChip } from "../../ui/ResourceStatus";
 
 const KIND_CHIP: Record<string, string> = {
   merge: "bg-ok/15 text-ok",

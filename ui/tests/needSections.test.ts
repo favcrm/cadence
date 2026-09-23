@@ -1,5 +1,5 @@
-import { needSections } from "./needSections";
-import type { NeedsMe } from "./types";
+import { needSections } from "../src/features/home/needSections";
+import type { NeedsMe } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {

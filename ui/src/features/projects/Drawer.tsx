@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type WriteResp } from "../api";
-import { fmtBytes, fmtTime } from "../fmt";
-import { notesStatusSentence } from "../uxCopy";
-import Md from "./Md";
+import { api, type WriteResp } from "../../lib/api";
+import { fmtBytes, fmtTime } from "../../lib/fmt";
+import { notesStatusSentence } from "../../lib/uxCopy";
+import Md from "../../ui/Md";
 import { noDragReason } from "./Card";
 import type {
   AgentsPayload,
@@ -10,7 +10,7 @@ import type {
   IssueHistoryEntry,
   LinkRef,
   Project,
-} from "../types";
+} from "../../lib/types";
 
 const NOTE_CHIP: Record<string, string> = {
   kickoff: "bg-info/10 text-info",

@@ -5,7 +5,7 @@ import {
   needLabel,
   notesStatusSentence,
   shaCiLabel,
-} from "./uxCopy";
+} from "../src/lib/uxCopy";
 
 function equal(actual: unknown, expected: unknown): void {
   if (actual !== expected) {

@@ -1,4 +1,4 @@
-import { modelIdProblem } from "./modelId";
+import { modelIdProblem } from "../src/features/settings/modelId";
 
 function equal(actual: unknown, expected: unknown): void {
   if (actual !== expected) {

@@ -1,4 +1,4 @@
-import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./projectContextGuard";
+import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "../src/features/projects/projectContextGuard";
 
 function equal(actual: unknown, expected: unknown): void {
   if (actual !== expected) {

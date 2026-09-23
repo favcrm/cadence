@@ -3,8 +3,8 @@ import {
   readStoredProjectView,
   serializeAppUrlState,
   writeStoredProjectView,
-} from "./urlState";
-import { NO_FILTERS } from "./filters";
+} from "../src/lib/urlState";
+import { NO_FILTERS } from "../src/lib/filters";
 
 function equal(actual: unknown, expected: unknown): void {
   if (actual !== expected) {

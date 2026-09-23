@@ -1,4 +1,4 @@
-import type { ResourceState } from "../resource";
+import type { ResourceState } from "../lib/cache";
 
 function clock(ms: number | null): string {
   return ms === null ? "never" : new Date(ms).toLocaleTimeString();

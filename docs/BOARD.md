@@ -1263,15 +1263,15 @@ between columns (derived/container cards don't — the reason shows on
 hover), the drawer edits fields/body/links/refs, comments and attaches
 artifacts, and backlog has quick-add. In I3 the board is live: the SPA
 opens an `EventSource` on `/api/stream` and each frame refetches only the
-resources its data names (`ui/src/resource.ts`: one store per resource,
+resources its data names (`ui/src/lib/cache.ts`: one store per resource,
 requests coalesced, a failed refresh keeps the last good payload as
 stale) — EventSource reconnects on its own and the 30 s/focus poll stays
 as the fallback. Issue counts in the sidebar, board header and overview
-summary all derive from `ui/src/counts.ts` over the cards, with epics,
+summary all derive from `ui/src/lib/counts.ts` over the cards, with epics,
 done and dropped named as exclusions. A project's Agents view binds an
 agent by dispatch (a job task on one of the project's issues) or by
 ownership (owner of a `doing`/`review` issue) — the `cadence status`
-ISSUES rule (`ui/src/scope.ts`). The Agents screen ranks
+ISSUES rule (`ui/src/lib/scope.ts`). The Agents screen ranks
 fenced agents first, shows the daemon's recovery text verbatim, and
 opens a drawer with identity, params, capabilities, tasks, bound
 issues, running messages, and the event tail. A fence banner on the

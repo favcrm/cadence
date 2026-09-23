@@ -1,6 +1,6 @@
-import { countLabel, issueCounts } from "../counts";
-import type { ResourceState } from "../resource";
-import type { IssueCard, Project } from "../types";
+import { countLabel, issueCounts } from "../lib/counts";
+import type { ResourceState } from "../lib/cache";
+import type { IssueCard, Project } from "../lib/types";
 import { Logo } from "./Logo";
 
 interface Props {

@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import type { Resource, ResourceState } from "./resource";
+import type { Resource, ResourceState } from "./cache";
 
 /** Subscribe a component to one resource store. */
 export function useResource<T>(resource: Resource<T>): ResourceState<T> {

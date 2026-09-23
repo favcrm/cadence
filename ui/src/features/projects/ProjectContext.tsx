@@ -1,4 +1,4 @@
-import type { ProjectContext as ProjectContextPayload } from "../types";
+import type { ProjectContext as ProjectContextPayload } from "../../lib/types";
 
 interface ProjectContextProps {
   project: string;

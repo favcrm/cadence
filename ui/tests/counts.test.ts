@@ -5,9 +5,9 @@ import {
   countLabel,
   issueCounts,
   statusBreakdown,
-} from "./counts";
-import { NO_FILTERS } from "./filters";
-import type { IssueCard } from "./types";
+} from "../src/lib/counts";
+import { NO_FILTERS } from "../src/lib/filters";
+import type { IssueCard } from "../src/lib/types";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
