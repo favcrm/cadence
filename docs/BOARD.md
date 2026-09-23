@@ -1009,7 +1009,7 @@ CAD-263), never from anything the request says:
 
 | Peer | Writes as |
 |---|---|
-| tied to exactly one registered pane, or descends from exactly one live managed endpoint's provider | that agent's alias — commit subject, `Actor:` trailer, comment author, ack `by`, settings attribution; never `operator`. A model-defaults write is refused (`403`, `check: "operator_only"`): the board relays it over its own daemon connection, which the daemon's operator gate sees instead of the caller (CAD-337) |
+| tied to exactly one registered pane, or descends from exactly one live managed endpoint's provider | that agent's alias — commit subject, `Actor:` trailer, comment author, ack `by`; never `operator`. A model-defaults write is refused (`403`, `check: "operator_only"`): the board relays it over its own daemon connection, which the daemon's operator gate sees instead of the caller (CAD-337) |
 | walks cleanly and is tied to no agent (the operator's browser, an ssh tunnel, the loopback gateway, the tailnet `socat` relay) | `operator (ui)` |
 | proven `tailscale serve` proxy (see Remote access) | `<login> (tailscale)` |
 | cannot be attributed — socket owned by another user's process, ancestry unreadable, tied to several agents, or a store exists but the daemon cannot list its agents | refused: `403`, `check: "caller_identity"`, naming why |
