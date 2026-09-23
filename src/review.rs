@@ -2239,12 +2239,12 @@ pub fn run(opts: &Options) -> Result<i32> {
                         // This PR itself does not merge into the base —
                         // already a blocking reason; no pair can be judged.
                         not_assessed.push(json!({"pr": num, "title": other["title"],
-                            "reason": "this PR does not merge into the current base"}));
+                            "reason": NOT_ASSESSED_THIS_PR}));
                         continue;
                     }
                     Ok((_, None)) => {
                         not_assessed.push(json!({"pr": num, "title": other["title"],
-                            "reason": "it does not merge into the current base"}));
+                            "reason": NOT_ASSESSED_OTHER_PR}));
                         continue;
                     }
                     Err(e) => {
@@ -2344,6 +2344,12 @@ pub fn run(opts: &Options) -> Result<i32> {
 // ---------------------------------------------------------------------------
 // Verdict
 // ---------------------------------------------------------------------------
+
+/// `open_pr_not_assessed` reasons. Only the second one is a verdict
+/// reason of its own: the first means this PR does not merge, which the
+/// merge-conflict reason already blocks on.
+const NOT_ASSESSED_THIS_PR: &str = "this PR does not merge into the current base";
+const NOT_ASSESSED_OTHER_PR: &str = "it does not merge into the current base";
 
 fn push_reason(level: &mut u8, reasons: &mut Vec<String>, l: u8, r: String) {
     *level = (*level).max(l);
@@ -2604,6 +2610,34 @@ pub fn suggest(report: &Value, prepare_failed: bool) -> (&'static str, Vec<Strin
                 ),
             );
         }
+    }
+    // An open PR that does not merge into the base has no as-landed
+    // tree, so an overlap with it is unknown until it rebases. Named
+    // here so it is not missed; needs hands-on, never blocking (CAD-295).
+    let unassessed: Vec<String> = report["open_pr_not_assessed"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|c| c["reason"] == NOT_ASSESSED_OTHER_PR)
+                .map(|c| format!("#{}", c["pr"].as_i64().unwrap_or(0)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !unassessed.is_empty() {
+        let they = if unassessed.len() == 1 {
+            "it does"
+        } else {
+            "they do"
+        };
+        push_reason(
+            &mut level,
+            &mut reasons,
+            1,
+            format!(
+                "overlap not assessed with {} — {they} not merge into the current base",
+                unassessed.join(", ")
+            ),
+        );
     }
     if reasons.is_empty() {
         reasons.push("all mechanical checks green — the hands-on check remains".into());
@@ -3366,6 +3400,66 @@ result_path = "target/nextest/cadence/junit.xml"
         r["open_pr_conflicts"] = json!([]);
         r["base_prepare"] = json!([{"outcome": "fail"}]);
         assert_eq!(suggest(&r, false).0, "blocked");
+    }
+
+    /// CAD-295: an open PR that does not merge into the base has no
+    /// as-landed tree, so its overlap is unknown. That is named in the
+    /// verdict — needs hands-on, never blocking. When this PR is the
+    /// one that does not merge, the merge-conflict reason already
+    /// blocks and no second reason is added.
+    #[test]
+    fn not_assessed_open_prs_are_a_verdict_reason() {
+        let clean = json!({"merge": {}, "prepare": [], "gates": [], "failures": [],
+            "stress": [], "open_pr_conflicts": []});
+
+        let mut r = clean.clone();
+        r["open_pr_not_assessed"] = json!([
+            {"pr": 136, "title": "a", "reason": "it does not merge into the current base"},
+            {"pr": 154, "title": "b", "reason": "it does not merge into the current base"},
+        ]);
+        let (verdict, reasons) = suggest(&r, false);
+        assert_eq!(verdict, "needs-hands-on", "{reasons:?}");
+        assert_eq!(
+            reasons,
+            vec!["overlap not assessed with #136, #154 — they do not merge into the current base"]
+        );
+
+        r["open_pr_not_assessed"] = json!([
+            {"pr": 136, "title": "a", "reason": "it does not merge into the current base"},
+        ]);
+        let (verdict, reasons) = suggest(&r, false);
+        assert_eq!(verdict, "needs-hands-on", "{reasons:?}");
+        assert_eq!(
+            reasons,
+            vec!["overlap not assessed with #136 — it does not merge into the current base"]
+        );
+
+        // Never raised to blocking, and never lowers a block either.
+        r["gates"] = json!([{"cmd": "g", "outcome": "fail"}]);
+        let (verdict, reasons) = suggest(&r, false);
+        assert_eq!(verdict, "blocked");
+        assert!(
+            reasons
+                .iter()
+                .any(|s| s.starts_with("overlap not assessed with #136")),
+            "{reasons:?}"
+        );
+
+        // This PR does not merge: every other PR is listed, but the
+        // blocking merge-conflict reason is the only one.
+        let mut r = clean.clone();
+        r["merge"] = json!({"result": "conflict", "conflict_files": ["x.txt"]});
+        r["open_pr_not_assessed"] = json!([
+            {"pr": 7, "title": "a", "reason": "this PR does not merge into the current base"},
+            {"pr": 8, "title": "b", "reason": "this PR does not merge into the current base"},
+        ]);
+        let (verdict, reasons) = suggest(&r, false);
+        assert_eq!(verdict, "blocked");
+        assert_eq!(
+            reasons,
+            vec!["does not merge into the current base — x.txt"],
+            "no duplicate reason for this PR's own conflict"
+        );
     }
 
     /// CAD-273: a missing or untrusted runner is named as such — one
