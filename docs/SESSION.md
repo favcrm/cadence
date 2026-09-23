@@ -158,6 +158,16 @@ defers to the next tick. Successes record `wal_checkpointed` on the
 bytes. Opt out with `[host] wal_checkpoint: false`; preview with
 `wal_dry_run: true` (emits `wal_checkpoint_pending`, never writes) —
 `doctor --host` also flags stores `over_checkpoint_limit`.
+Dead agent registry rows are the other thing the daemon *can* sweep
+itself, but only when you opt in: `[host] agent_gc_older_than_secs`
+(unset = off; below 7 days is raised to 7 days with a warning) makes
+the daemon run the `agent gc` rule at most hourly, skipping enabled
+agents, live pty panes and any agent with a queued, running or
+`unknown` message, and recording `agent_gc_removed` per row on the
+`daemon` stream. It is **records only** — it frees no memory and no
+disk, and a removed agent can no longer be resumed — so it is not a
+remedy for memory or disk pressure. `cadence daemon status` shows the
+effective setting under `agent_gc_timer`.
 `pm.yaml [host]` also tunes `mem_warn_pct`/`mem_fail_pct` (15/5) and
 `swap_warn_pct`/`swap_fail_pct` (20/5) — and note `Committed_AS` over
 `CommitLimit` under heuristic overcommit is normal, not a failure.

@@ -1233,7 +1233,9 @@ enum DaemonAction {
         #[arg(long)]
         resume: bool,
     },
-    /// Report daemon health.
+    /// Report daemon health, including `agent_gc_timer`: whether the
+    /// opt-in agent-gc timer is on (pm.yaml `[host]
+    /// agent_gc_older_than_secs`), its effective age, and its last sweep.
     Status,
     /// Ask the daemon to shut down gracefully, then wait until the
     /// process has actually exited and released the state-dir lock
@@ -1516,8 +1518,22 @@ enum AgentAction {
     /// launched before briefings existed. Refuses an unknown alias;
     /// pty targets still need the usual ready claim.
     Bootstrap { alias: String },
-    /// Sweep dead agents: endpoint NULL and state `attention` or
-    /// `stopped`. Prints what it removed. Never runs on a timer.
+    /// Sweep dead agent records: endpoint NULL and state `attention` or
+    /// `stopped`. Prints what it removed. No memory or disk remedy.
+    ///
+    /// Records only: it deletes registry rows with their message and
+    /// event history. It frees no disk and is no memory remedy — the one
+    /// process it touches is a fenced pty agent's surviving pane, killed
+    /// so no orphan outlives its row. A removed agent can no longer be
+    /// resumed.
+    ///
+    /// The daemon runs the same sweep on a timer ONLY when pm.yaml sets
+    /// `[host] agent_gc_older_than_secs` (off by default; 7-day floor; at
+    /// most hourly). The timer additionally keeps enabled agents, pty
+    /// agents whose pane is up, and any agent with a queued, running or
+    /// unknown message, and records `agent_gc_removed` per row on the
+    /// daemon event stream. The timer kills nothing: it frees no memory
+    /// and no disk. `cadence daemon status` shows the setting.
     Gc {
         /// Only remove agents last updated more than this long ago
         /// (e.g. 30m, 12h, 7d; bare number = seconds).

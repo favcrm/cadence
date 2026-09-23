@@ -36,7 +36,7 @@ Error kinds:
 
 | Method | Params | Result |
 |---|---|---|
-| `health` | — | `{state:"ready", protocol:1, capabilities:[...]}` |
+| `health` | — | `{state:"ready", protocol:1, capabilities:[...], agent_gc_timer:{enabled, older_than_secs, ...}}` |
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded), writes the clean-stop marker, then exits |
 | `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?, team_role?, model_policy?` | `{alias,state:"starting"|"idle",provider}`. `team_role` is model-lookup metadata (`ops` normalizes to `devops`); it does not change runtime `role`. `model_policy` is `inherit` (default) or `provider_default` |
 | `agent_list` | — | `{agents:[Agent+tasks+capabilities]}` — `tasks` names the alias's non-terminal task assignments; `capabilities` is the registry descriptor |
@@ -290,8 +290,31 @@ stopped-or-dead, still holds a saved native thread/session, and has no
 unreconciled `unknown` fencing it. `agent remove <alias>` deletes the
 row and its message/event history, refusing while an endpoint is live
 or a lifecycle actor owns the alias. `agent gc [--older-than <dur>]`
-sweeps dead agents (manual only, never automatic); each candidate is
-independent so one in-transition alias doesn't fail the sweep. A fenced
+sweeps dead agents on command; each candidate is independent so one
+in-transition alias doesn't fail the sweep. Both remove **records**
+(the row plus its message/event history): they free no disk and are no
+memory remedy — the only process either touches is a fenced pty
+agent's surviving pane, which they kill so no orphan outlives its row —
+and a removed agent can no longer be resumed.
+
+**Agent-gc timer (opt-in, CAD-199).** The daemon runs the same sweep on
+its own only when pm.yaml sets `[host] agent_gc_older_than_secs` —
+unset, it never removes anything. A configured age below 7 days is
+raised to 7 days with a warning. From the stall-watch tick it re-reads
+the setting every minute and sweeps at most once an hour, never on an
+actor loop. On top of the manual rule (endpoint NULL, `attention` or
+`stopped`, idle longer than the age) it keeps any enabled agent, any
+alias a lifecycle actor owns, any pty agent whose pane is still up, and
+any agent with a message in a state other than completed, failed,
+interrupted or cancelled — queued, running and `unknown` all keep the
+row. It kills nothing: unlike `agent gc` it never touches a pane. Each
+removal records one `agent_gc_removed` event on the `daemon` stream
+(`cadence events daemon`) with the alias, `reason`, `age_secs`,
+`older_than_secs` and the saved `thread_id`/`session_id`, in the same
+transaction that deletes the row. `health` (`cadence daemon status`)
+reports the effective setting as `agent_gc_timer` — `enabled`,
+`older_than_secs`, `configured_secs`, `warning`, and the last check and
+sweep. A fenced
 agent with no endpoint prints the `devin -r <session>` resume hint from
 its launch summary.
 
@@ -1442,6 +1465,10 @@ host:
   # warns above 1.25x that plan (floor 1.0), never below it.
   io_stall_warn_pct: 30 # doctor --host io stall warn %
   io_stall_fail_pct: 60 # doctor --host io stall fail %
+  # agent_gc_older_than_secs — unset (default) keeps the daemon's
+  # agent-gc timer OFF. Set, it removes dead agent registry rows idle
+  # longer than this (7-day floor), at most hourly. Records only:
+  # frees no memory and no disk; removed agents cannot be resumed.
 ```
 
 `cadence issue start`/`dispatch` write `<worktree>/.env` atomically
