@@ -20,6 +20,35 @@ use cadence_agent::store::{NewAgent, Store, Take};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+/// [`TestDaemon::operator_rpc`]'s caller: it waits until it is off the
+/// test process's ancestry (the `setsid -f` parent has exited), sends
+/// one frame and lands the raw response frame atomically.
+const OPERATOR_RPC_PY: &str = r#"
+import json, os, socket, sys, time
+
+sock_path, frame, out, runner = sys.argv[1:5]
+
+def on_lineage(pid):
+    p = os.getpid()
+    while p > 1:
+        if p == pid:
+            return True
+        with open("/proc/%d/status" % p) as f:
+            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
+    return False
+
+while on_lineage(int(runner)):
+    time.sleep(0.02)
+s = socket.socket(socket.AF_UNIX)
+s.connect(sock_path)
+s.sendall((frame + "\n").encode())
+line = s.makefile().readline()
+s.close()
+with open(out + ".tmp", "w") as f:
+    f.write(line)
+os.rename(out + ".tmp", out)
+"#;
+
 struct TestDaemon {
     dir: TempDir,
     state: PathBuf,
@@ -83,6 +112,55 @@ impl TestDaemon {
 
     fn rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
         client::rpc(&self.state, method, params)
+    }
+
+    /// `rpc` from a caller that is provably the operator however the
+    /// suite is run. Operator-only methods (`slot_reconcile`,
+    /// `approval_record`, …) refuse any connection whose ancestry
+    /// carries an agent, and when the suite itself runs in an agent
+    /// pane this test process is one (CAD-291). The call is made the
+    /// way an operator shell outside every pane looks to the daemon:
+    /// `setsid -f` hands it to a fresh session leader reparented off
+    /// this process's ancestry, `env_clear` leaves no `CADENCE_ALIAS`,
+    /// and stdio is not a pane tty. `peer::operator_proof` documents
+    /// that shape as the residual it accepts, so the gate itself is
+    /// untouched — agent-descended callers are still refused.
+    fn operator_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        let script = self.dir.path().join("operator-rpc.py");
+        if !script.exists() {
+            std::fs::write(&script, OPERATOR_RPC_PY).unwrap();
+        }
+        let out = self.dir.path().join(format!(
+            "operator-rpc-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let frame = json!({"method": method, "params": params}).to_string();
+        let status = std::process::Command::new("setsid")
+            .arg("-f")
+            .arg("python3")
+            .arg(&script)
+            .arg(client::socket_path(&self.state))
+            .arg(&frame)
+            .arg(&out)
+            .arg(std::process::id().to_string())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "setsid -f failed: {status}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "operator rpc {method} never answered"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let frame: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        cadence_agent::proto::unwrap(frame)
     }
 
     fn register(&self, alias: &str) {
@@ -27380,6 +27458,64 @@ fn audit_binds_human_merge_to_exact_head_approval() {
     }
 }
 
+/// CAD-291: the suite may run from an agent pane, so `CADENCE_ALIAS`
+/// can sit on the runner's own ancestry. Re-run the probe below in a
+/// child whose environment carries an agent's alias: there,
+/// `operator_rpc` must still be accepted as the operator while a plain
+/// call from the same (agent-descended) runner is refused.
+#[test]
+fn operator_rpc_is_the_operator_even_from_an_agent_runner() {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "operator_rpc_from_an_agent_runner_probe",
+            "--ignored",
+        ])
+        .env("CADENCE_ALIAS", "cad291-runner")
+        .env("CAD291_PROBE", "1")
+        // A plain libtest child: the outer run's suite lock and
+        // nextest markers are not its to honour.
+        .env_remove("CADENCE_SUITE_LOCK")
+        .env_remove("CADENCE_REVIEW_SUITE_LOCK_HELD");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("NEXTEST") {
+            child.env_remove(key);
+        }
+    }
+    let out = child.output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("1 passed"),
+        "the probe must actually run: {text}"
+    );
+}
+
+#[test]
+#[ignore = "run by operator_rpc_is_the_operator_even_from_an_agent_runner as an agent-shaped child"]
+fn operator_rpc_from_an_agent_runner_probe() {
+    if std::env::var("CAD291_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    assert!(std::env::var("CADENCE_ALIAS").is_ok());
+    let d = TestDaemon::start();
+    let params = json!({"id": "ap-291", "source": "operator in chat",
+                        "head": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                        "repo": "x/y", "pr": 291});
+    // This process carries an agent's environment: refused as such.
+    let err = d.rpc("approval_record", params.clone()).unwrap_err();
+    assert!(err.to_string().contains("carries CADENCE_ALIAS"), "{err}");
+    // The harness's operator caller from the same runner is the operator.
+    let r = d.operator_rpc("approval_record", params).unwrap();
+    assert_eq!(r["state"], "recorded", "{r}");
+    assert_eq!(r["recorded_via"], "operator-connection", "{r}");
+}
+
 /// CAD-217: only an operator connection records or revokes approval
 /// evidence. A pane (and every process descended from it — the RPC
 /// and the `cadence audit approve` CLI alike) is refused, as is an
@@ -27410,23 +27546,23 @@ fn audit_approval_record_is_operator_only() {
 
     let mut forged = params.clone();
     forged["by"] = json!("operator");
-    let err = d.rpc("approval_record", forged).unwrap_err();
+    let err = d.operator_rpc("approval_record", forged).unwrap_err();
     assert!(err.to_string().contains("'by'"), "{err}");
 
-    let r = d.rpc("approval_record", params.clone()).unwrap();
+    let r = d.operator_rpc("approval_record", params.clone()).unwrap();
     assert_eq!(r["state"], "recorded", "{r}");
     assert_eq!(r["duplicate"], false, "{r}");
     assert_eq!(r["recorded_via"], "operator-connection", "{r}");
-    let r = d.rpc("approval_record", params.clone()).unwrap();
+    let r = d.operator_rpc("approval_record", params.clone()).unwrap();
     assert_eq!(r["duplicate"], true, "{r}");
     let mut other = params.clone();
     other["head"] = json!("0123456789012345678901234567890123456789");
-    let err = d.rpc("approval_record", other).unwrap_err();
+    let err = d.operator_rpc("approval_record", other).unwrap_err();
     assert!(err.to_string().contains("different evidence"), "{err}");
     let mut short = params.clone();
     short["id"] = json!("ap-short");
     short["head"] = json!("abcdefa");
-    assert!(d.rpc("approval_record", short).is_err());
+    assert!(d.operator_rpc("approval_record", short).is_err());
 
     let revoke = json!({"id": "ap-7", "source": "operator", "reason": "moved"});
     let r = pane.rpc(&d.state, "approval_revoke", revoke.clone());
@@ -27437,10 +27573,12 @@ fn audit_approval_record_is_operator_only() {
             .contains("operator action"),
         "{r}"
     );
-    let r = d.rpc("approval_revoke", revoke).unwrap();
+    let r = d.operator_rpc("approval_revoke", revoke).unwrap();
     assert_eq!(r["state"], "revoked", "{r}");
     // A revoked id is never re-recorded — the operator is told why.
-    let err = d.rpc("approval_record", params.clone()).unwrap_err();
+    let err = d
+        .operator_rpc("approval_record", params.clone())
+        .unwrap_err();
     assert!(
         err.to_string().contains("was revoked") && err.to_string().contains("--id"),
         "{err}"
@@ -27450,22 +27588,22 @@ fn audit_approval_record_is_operator_only() {
     // `<base>-2`, never a silent duplicate of the revoked one.
     let auto = json!({"source": "operator in chat", "head": head,
                       "repo": "x/y", "pr": 9});
-    let r = d.rpc("approval_record", auto.clone()).unwrap();
+    let r = d.operator_rpc("approval_record", auto.clone()).unwrap();
     assert_eq!(r["approval_id"], "merge-pr9-abcdefabcdef", "{r}");
     assert_eq!(r["duplicate"], false, "{r}");
-    let r = d.rpc("approval_record", auto.clone()).unwrap();
+    let r = d.operator_rpc("approval_record", auto.clone()).unwrap();
     assert_eq!(r["duplicate"], true, "{r}");
     let r = d
-        .rpc(
+        .operator_rpc(
             "approval_revoke",
             json!({"id": "merge-pr9-abcdefabcdef", "source": "operator", "reason": "moved"}),
         )
         .unwrap();
     assert_eq!(r["state"], "revoked", "{r}");
-    let r = d.rpc("approval_record", auto.clone()).unwrap();
+    let r = d.operator_rpc("approval_record", auto.clone()).unwrap();
     assert_eq!(r["approval_id"], "merge-pr9-abcdefabcdef-2", "{r}");
     assert_eq!(r["duplicate"], false, "{r}");
-    let r = d.rpc("approval_record", auto).unwrap();
+    let r = d.operator_rpc("approval_record", auto).unwrap();
     assert_eq!(r["approval_id"], "merge-pr9-abcdefabcdef-2", "{r}");
     assert_eq!(r["duplicate"], true, "{r}");
 
@@ -27476,7 +27614,7 @@ fn audit_approval_record_is_operator_only() {
     let mut second = params.clone();
     second["id"] = json!("ap-8");
     second["pr"] = json!(8);
-    let r = d.rpc("approval_record", second).unwrap();
+    let r = d.operator_rpc("approval_record", second).unwrap();
     assert_eq!(r["duplicate"], false, "{r}");
 
     // Exactly the operator's writes reached the approval stream.
@@ -28997,14 +29135,14 @@ fn slot_reconcile_refuses_agents_and_live_holds() {
             .contains("operator action"),
         "{r}"
     );
-    // The operator (this test process: no pane, no enrollment) with a
-    // forged `by` is refused before anything else…
+    // The operator (`operator_rpc`: no pane, no enrollment, no agent
+    // ancestry) with a forged `by` is refused before anything else…
     let mut forged = params.clone();
     forged["by"] = json!("operator");
-    let err = d.rpc("slot_reconcile", forged).unwrap_err();
+    let err = d.operator_rpc("slot_reconcile", forged).unwrap_err();
     assert!(err.to_string().contains("'by'"), "{err}");
     // …and without it still cannot free a live holder.
-    let err = d.rpc("slot_reconcile", params).unwrap_err();
+    let err = d.operator_rpc("slot_reconcile", params).unwrap_err();
     assert!(err.to_string().contains("is alive"), "{err}");
     let s = pane.rpc(&d.state, "slot_status", json!({}));
     assert_eq!(
@@ -29022,8 +29160,8 @@ fn slot_reconcile_refuses_agents_and_live_holds() {
 /// derives no slot identity at all, yet is refused: with
 /// `CADENCE_ALIAS` still in its environment by the alias, and with the
 /// alias scrubbed by its orphaned session (the session leader exited).
-/// This test process — a plain operator shell: attached, no pane, no
-/// endpoint, no alias — passes the gate and meets the live-hold rule.
+/// The harness's operator caller (`operator_rpc`: no pane, no endpoint,
+/// no alias on its ancestry) passes the gate and meets the live-hold rule.
 #[test]
 fn slot_reconcile_refuses_detached_agent_processes() {
     let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
@@ -29096,7 +29234,7 @@ fn slot_reconcile_refuses_detached_agent_processes() {
     }
 
     // The operator passes the gate; the live holder is still refused.
-    let err = d.rpc("slot_reconcile", params).unwrap_err();
+    let err = d.operator_rpc("slot_reconcile", params).unwrap_err();
     assert!(err.to_string().contains("is alive"), "{err}");
     let s = pane.rpc(&d.state, "slot_status", json!({}));
     assert_eq!(
