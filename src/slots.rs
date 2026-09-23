@@ -948,7 +948,8 @@ impl Slots {
     }
 
     /// Validate the whole v2 envelope, then apply it in order. Any
-    /// schema fault is an `Err` before anything is applied.
+    /// schema fault — or a revoked+live same-root enrollment pair
+    /// across owners — is an `Err` before anything is applied.
     fn restore_v2(
         &mut self,
         doc: &Value,
@@ -970,13 +971,26 @@ impl Slots {
         for e in list("enrollments")? {
             let parsed = Enrollment::from_json(&e, now, wall)
                 .ok_or_else(|| format!("malformed enrollment {e}"))?;
-            // Ids are unique; a root may appear again only under a
-            // tombstone (a revoked enrollment kept for its holds).
+            // Ids are unique. A shared root alone never rejects the
+            // file (CAD-276) — `strict_caller` chooses between such
+            // records deterministically — but a revoked record beside
+            // a live one on the same root is the same-root supersession
+            // tombstone, which only ever names the SAME owner: across
+            // owners the pair has no lineage and the file is invalid.
             let revoked = |e: &Enrollment| matches!(e.auth, AuthState::Revoked(_));
-            if enrollments.iter().any(|o: &Enrollment| {
-                o.id == parsed.id || (o.root == parsed.root && !revoked(o) && !revoked(&parsed))
-            }) {
+            if enrollments.iter().any(|o: &Enrollment| o.id == parsed.id) {
                 return Err(format!("duplicate enrollment {}", parsed.id));
+            }
+            if let Some(o) = enrollments.iter().find(|o: &&Enrollment| {
+                o.root == parsed.root
+                    && revoked(o) != revoked(&parsed)
+                    && o.owner_actor != parsed.owner_actor
+            }) {
+                return Err(format!(
+                    "enrollments {} and {} share root pid {} across owners ({} / {}) \
+                     with one revoked — a supersession tombstone names its own owner",
+                    o.id, parsed.id, parsed.root.pid, o.owner_actor, parsed.owner_actor
+                ));
             }
             enrollments.push(parsed);
         }
@@ -1534,7 +1548,7 @@ impl Slots {
 
     /// Status fields of a hold's binding: `legacy`, or `strict` with
     /// its enrollment's authorization kept separate from the hold's own
-    /// liveness and accounting.
+    /// liveness and accounting, plus `reconcile_required` / `remedy`.
     fn strict_hold_json(&self, h: &SlotHold, now: f64, j: &mut Value) {
         let Some(b) = &h.strict else {
             j["binding"] = json!("legacy");
@@ -1553,7 +1567,29 @@ impl Slots {
         j["auth_state"] = json!(auth);
         j["liveness"] = json!(b.liveness.as_str());
         j["accounting"] = json!(accounting);
-        j["reconcile_required"] = json!(b.liveness == Liveness::Unknown || accounting != "held");
+        // `reconcile_required` only where `slot_reconcile` can act — a
+        // holder proven dead whose free has not landed yet, while the
+        // strict writer (which reconcile frees through) is available
+        // (CAD-276). A live or unknown holder is refused by reconcile
+        // whatever the evidence says, and a blocked writer refuses
+        // every strict write, so those name the remedy that does work.
+        let writable = self.blocked.is_none();
+        let remedy = match b.liveness {
+            Liveness::Dead if writable => None,
+            Liveness::Dead => Some(
+                "holder dead but strict state is unwritable — restart the daemon \
+                 once slots.json is writable",
+            ),
+            Liveness::Unknown => Some("liveness unknown — restart the daemon after verifying"),
+            Liveness::Alive if accounting != "held" => {
+                Some("holder alive — release from the holder or stop it")
+            }
+            Liveness::Alive => None,
+        };
+        j["reconcile_required"] = json!(b.liveness == Liveness::Dead && writable);
+        if let Some(remedy) = remedy {
+            j["remedy"] = json!(remedy);
+        }
     }
 }
 
@@ -1572,8 +1608,9 @@ impl Slots {
     /// provider process `root_pid` as `/proc` reads it now. The same
     /// owner generation and root identity renew an existing active or
     /// expired enrollment (resume); anything else supersedes the
-    /// owner's older enrollments. Refuses the daemon itself, init, and
-    /// any root not running as the daemon's uid.
+    /// owner's older enrollments. Refuses the daemon itself, init, any
+    /// root not running as the daemon's uid, and a process already
+    /// enrolled for another owner.
     pub fn enroll(
         &mut self,
         owner: &str,
@@ -1598,6 +1635,21 @@ impl Slots {
             return Err(Error::rejected(format!(
                 "cannot enroll pid {root_pid}: it runs as uid {} — not the daemon's uid {}",
                 root.uid, self.daemon_uid
+            )));
+        }
+        // One provider process is one endpoint: the exact identity
+        // already enrolled for another owner is never enrolled again —
+        // the pair would be the cross-owner same-root state `restore`
+        // rejects (CAD-276).
+        if let Some(other) = self
+            .enrollments
+            .iter()
+            .find(|e| e.root == root && e.owner_actor != owner)
+        {
+            return Err(Error::rejected(format!(
+                "cannot enroll pid {root_pid} for '{owner}': that exact process is \
+                 already enrolled for '{}' ({})",
+                other.owner_actor, other.id
             )));
         }
         let expires_at = clk.mono + ENROLLMENT_TTL_SECS;
@@ -1737,23 +1789,43 @@ impl Slots {
         })
     }
 
+    /// Every enrollment rooted at `root_pid`, in the one order a caller
+    /// is matched against them (CAD-276): live first (`active`, then
+    /// `expired`, then revoked tombstones), then the most recently
+    /// issued, then the enrollment id — never file or map order, so two
+    /// records sharing a root always resolve the same way.
+    fn enrollments_at(&self, root_pid: u32) -> Vec<&Enrollment> {
+        let rank = |e: &Enrollment| match e.auth {
+            AuthState::Active => 0,
+            AuthState::Expired => 1,
+            AuthState::Revoked(_) => 2,
+        };
+        let mut at: Vec<&Enrollment> = self
+            .enrollments
+            .iter()
+            .filter(|e| e.root.pid == root_pid)
+            .collect();
+        at.sort_by(|a, b| {
+            rank(a)
+                .cmp(&rank(b))
+                .then(b.issued_epoch.total_cmp(&a.issued_epoch))
+                .then(a.id.cmp(&b.id))
+        });
+        at
+    }
+
     /// Verify `peer_pid` against the enrollment rooted at `root_pid`:
     /// the peer must be the root or reach it through a complete,
-    /// verified ancestry (see [`ProcFs::verified_descent`]). There is
-    /// no fallback — a failed verification refuses the call.
+    /// verified ancestry (see [`ProcFs::verified_descent`]). Several
+    /// enrollments on one root are tried in [`Self::enrollments_at`]
+    /// order and the first that verifies wins. There is no fallback —
+    /// a failed verification refuses the call.
     pub fn strict_caller(&self, peer_pid: u32, root_pid: u32) -> Result<StrictCaller> {
         if let Some(b) = &self.blocked {
             return Err(strict_unavailable(&b.reason));
         }
         let mut why = Vec::new();
-        // A live enrollment before any tombstone sharing its root.
-        let mut candidates: Vec<&Enrollment> = self
-            .enrollments
-            .iter()
-            .filter(|e| e.root.pid == root_pid)
-            .collect();
-        candidates.sort_by_key(|e| matches!(e.auth, AuthState::Revoked(_)));
-        for e in candidates {
+        for e in self.enrollments_at(root_pid) {
             match self
                 .proc
                 .verified_descent(peer_pid, &e.root, self.daemon_uid)
@@ -1829,7 +1901,13 @@ impl Slots {
         )
     }
 
-    /// Strict release — see [`Self::release_as`].
+    /// Strict release — see [`Self::release_as`]. The caller was
+    /// matched to its root's preferred enrollment; when the hold names
+    /// ANOTHER enrollment on that exact root (pid and starttime — a
+    /// same-root supersession left the hold under the tombstone), the
+    /// same verified segment proves descent from that one too, so the
+    /// release runs as the enrollment whose id matches the hold
+    /// (CAD-276). The exact-holder rule still applies unchanged.
     pub fn release_strict(
         &mut self,
         token: &str,
@@ -1840,17 +1918,58 @@ impl Slots {
         if let Some(b) = &self.blocked {
             return Err(strict_unavailable(&b.reason));
         }
+        let caller = self.hold_enrollment_caller(token, caller);
         let lane = caller.lane.clone();
-        self.release_as(token, &lane, pid, now, Some(caller))
+        self.release_as(token, &lane, pid, now, Some(&caller))
     }
 
-    /// The exact identity a strict hold binds: `pid` on the caller's
-    /// verified segment, running as the daemon's uid.
+    /// `caller` rebound to the enrollment the hold `token` names, when
+    /// that enrollment shares the exact root identity of the one the
+    /// caller verified against; otherwise `caller` unchanged.
+    fn hold_enrollment_caller(&self, token: &str, caller: &StrictCaller) -> StrictCaller {
+        let by_id = |id: &str| self.enrollments.iter().find(|e| e.id == id);
+        let held = self
+            .held
+            .iter()
+            .find(|h| h.token == token)
+            .and_then(SlotHold::enrollment_id)
+            .filter(|id| *id != caller.enrollment_id)
+            .and_then(by_id);
+        match (held, by_id(&caller.enrollment_id)) {
+            (Some(held), Some(verified)) if held.root == verified.root => StrictCaller {
+                enrollment_id: held.id.clone(),
+                lane: held.owner_actor.clone(),
+                segment: caller.segment.clone(),
+            },
+            _ => caller.clone(),
+        }
+    }
+
+    /// The exact identity a strict hold binds: the connection peer or
+    /// one of its verified NON-ROOT ancestors, running as the daemon's
+    /// uid (CAD-276). The enrolled provider root lives as long as its
+    /// endpoint, so a hold a descendant binds to it (`acquire --pid
+    /// <root>`) would never end with the work; `build-slot run` binds
+    /// its own pid and `acquire --pid $$` its shell. The root may hold
+    /// only when it is itself the peer.
     fn strict_holder(&self, caller: &StrictCaller, pid: u32) -> Result<ProcIdentity> {
-        if !caller.segment.contains(&pid) {
+        let peer = caller.segment.first() == Some(&pid);
+        let below_root = caller
+            .segment
+            .split_last()
+            .is_some_and(|(_, below)| below.contains(&pid));
+        if !peer && !below_root {
+            let root = caller.segment.last().copied().unwrap_or_default();
+            let why = if pid == root {
+                "it is the enrolled provider root, which outlives the work — \
+                 claim the connection peer or a non-root ancestor (`build-slot \
+                 run` binds its own pid)"
+            } else {
+                "it is not the connection peer or its verified ancestor below \
+                 the enrolled root"
+            };
             return Err(Error::rejected(format!(
-                "Slot caller cannot claim pid {pid} — it is not the connection \
-                 peer or its verified ancestor up to the enrolled root"
+                "Slot caller cannot claim pid {pid} — {why}"
             )));
         }
         let holder = self
