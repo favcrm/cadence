@@ -431,6 +431,8 @@ fn restart_fences_unknown_inflight() {
         json!({"alias": "w1", "text": "later", "message": "m2"}),
     )
     .unwrap();
+    // CAD-184 kept sleep: absence window — no actor runs for a fenced or
+    // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
     let m2 = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["messages"]
         .as_array()
@@ -517,6 +519,8 @@ fn restart_keeps_original_unknown_reason_beside_later_inflight() {
         json!({"alias": "w1", "text": "later", "message": "m3"}),
     )
     .unwrap();
+    // CAD-184 kept sleep: absence window — no actor runs for a fenced or
+    // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
     assert_eq!(d.message_state("w1", "m3"), "queued");
     assert_eq!(d.message_state("w1", "m1"), "unknown");
@@ -591,6 +595,8 @@ fn unknown_outcome_never_replays() {
         json!({"alias": "w1", "text": "after", "message": "x2"}),
     )
     .unwrap();
+    // CAD-184 kept sleep: absence window — no actor runs for a fenced or
+    // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     let x2 = show["messages"]
@@ -963,6 +969,8 @@ fn daemon_restart_skips_fenced_and_relaunches_healthy() {
         json!({"alias": "fenced", "text": "later", "message": "m2"}),
     )
     .unwrap();
+    // CAD-184 kept sleep: absence window — no actor runs for a fenced or
+    // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
     assert_eq!(d.message_state("fenced", "m2"), "queued");
     // Unfence + resume still recovers it through the normal path.
@@ -1052,6 +1060,8 @@ fn restart_preserves_attention_fence_without_unknowns() {
         json!({"alias": "mismatch", "text": "later", "message": "m2"}),
     )
     .unwrap();
+    // CAD-184 kept sleep: absence window — no actor runs for a fenced or
+    // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
     assert_eq!(d.message_state("mismatch", "m2"), "queued");
     // `resume --all` agrees with startup: reported under `fenced` with
@@ -1142,6 +1152,8 @@ fn unfenced_agent_stays_stopped_across_restart() {
     std::mem::forget(d);
     let d = TestDaemon::start_on(state);
     d.wait_agent("w2", "idle", 15);
+    // CAD-184 kept sleep: absence window — the relaunch pass records
+    // nothing for a stopped, disabled member.
     thread::sleep(Duration::from_secs(1));
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(agent["state"], "stopped");
@@ -1153,6 +1165,8 @@ fn unfenced_agent_stays_stopped_across_restart() {
         json!({"alias": "w1", "text": "later", "message": "x2"}),
     )
     .unwrap();
+    // CAD-184 kept sleep: absence window — no actor runs for a fenced or
+    // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_secs(1));
     assert_eq!(d.message_state("w1", "x2"), "queued");
     // The operator's explicit resume still works — the normal path.
@@ -2358,8 +2372,9 @@ fn resume_rejected_while_actor_stopping() {
         thread::spawn(move || client::rpc(&state, "agent_stop", json!({"alias": "w1"})))
     };
     // While the stop grace runs, the actor is still owned: resume must
-    // be rejected and must not re-enable the agent.
-    thread::sleep(Duration::from_millis(500));
+    // be rejected and must not re-enable the agent. `stopping` is
+    // written after the stop reserved the alias and before the grace.
+    d.wait_agent("w1", "stopping", 10);
     let resumed = d.rpc("agent_resume", json!({"alias": "w1"}));
     assert!(resumed.is_err(), "resume during stop must be rejected");
     let stopped = stop.join().unwrap().unwrap();
@@ -2385,6 +2400,8 @@ fn resume_rejected_while_actor_stopping() {
         json!({"alias": "w1", "text": "later", "message": "m2"}),
     )
     .unwrap();
+    // CAD-184 kept sleep: absence window — no actor runs for a fenced or
+    // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_millis(500));
     assert_eq!(d.message_state("w1", "m2"), "queued");
 }
@@ -2461,6 +2478,8 @@ fn unclassifiable_completion_fences_agent() {
         json!({"alias": "w1", "text": "after", "message": "m2"}),
     )
     .unwrap();
+    // CAD-184 kept sleep: absence window — no actor runs for a fenced or
+    // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_millis(500));
     assert_eq!(d.message_state("w1", "m2"), "queued");
 }
@@ -3016,6 +3035,8 @@ def handle(conn):
             continue
         if method == "initialize":
             if mode == "slow-init":
+                # Marks the handshake done and initialize in flight.
+                open(pidfile + ".init", "w").close()
                 time.sleep(30)
             send_json(conn, {"id": mid, "result": {
                 "serverInfo": {"name": "mock-ws", "version": "0"}}})
@@ -3675,6 +3696,8 @@ fn malformed_turn_start_is_unknown_not_failed() {
         json!({"alias": "w1", "text": "later", "message": "m2"}),
     )
     .unwrap();
+    // CAD-184 kept sleep: absence window — no actor runs for a fenced or
+    // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_millis(500));
     assert_eq!(d.message_state("w1", "m2"), "queued");
 }
@@ -3901,13 +3924,17 @@ fn ws_stop_during_init_is_bounded() {
     let mock = d.mock_codex_ws("slow-init");
     d.register_codex_ws("w1");
     // Wait until the provider accepted the WebSocket: the adapter is
-    // published and the 30s initialize RPC is in flight.
+    // published and the 30s initialize RPC is in flight — the mock
+    // writes `<pidfile>.init` when that request arrives.
+    let init = mock.pidfile.with_extension("pid.init");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !mock.pidfile.exists() {
-        assert!(Instant::now() < deadline, "provider never launched");
+    while !init.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "initialize never reached the provider"
+        );
         thread::sleep(Duration::from_millis(50));
     }
-    thread::sleep(Duration::from_millis(500)); // let connect+handshake land
     let began = Instant::now();
     let stopped = d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
     assert!(
@@ -4221,6 +4248,8 @@ fn ws_second_pending_request_keeps_waiting() {
         .unwrap();
     assert_eq!(answered["state"], "answered");
     // One request still pending: the agent must stay waiting_input.
+    // CAD-184 kept sleep: absence window — nothing records that the
+    // relaxation check ran and left waiting_input alone.
     thread::sleep(Duration::from_millis(300));
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     assert_eq!(
@@ -5308,7 +5337,15 @@ fn pty_claim_is_single_use_and_expires() {
         json!({"alias": "dv1", "text": "two", "message": "m2"}),
     )
     .unwrap();
-    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m2", 20);
+    // The recorded refusal proves the actor tried m2 and held it; the
+    // reason proves it was the missing claim.
+    let gate = d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m2", 20);
+    assert!(
+        gate["payload"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("no fresh `agent ready` claim")),
+        "{gate}"
+    );
     assert_eq!(d.message_state("dv1", "m2"), "queued");
     let input = std::fs::read_to_string(d.pane_file(&_mock, "dv1", "input")).unwrap_or_default();
     assert!(!input.contains("two"), "second send pasted without a claim");
@@ -5415,16 +5452,27 @@ fn pty_locked_session_refuses_takeover() {
     let mock = d.mock_devin();
     // A foreign process holds the session lock — simulating another TUI.
     let lock = mock.locks.join("held-session.lock");
+    // The holder marks `held` only once it owns the flock.
+    let held = d.dir.path().join("holder.held");
     let mut holder = std::process::Command::new("python3")
         .args([
             "-c",
             "import fcntl,sys,time; f=open(sys.argv[1],'a'); \
-             fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB); time.sleep(30)",
+             fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB); \
+             open(sys.argv[2],'w').close(); time.sleep(30)",
             lock.to_str().unwrap(),
+            held.to_str().unwrap(),
         ])
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_millis(300));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !held.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "lock holder never took the flock"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     d.register_devin("dv1", Some("held-session"));
     let agent = d.wait_agent("dv1", "attention", 20);
     assert!(
@@ -5682,7 +5730,13 @@ fn pty_respond_rejected_and_mode_blocks_send() {
     )
     .unwrap();
     // The recorded refusal, not a fixed sleep (CAD-286).
-    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
+    let gate = d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
+    assert!(
+        gate["payload"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("tmux mode")),
+        "{gate}"
+    );
     assert_eq!(d.message_state("dv1", "m1"), "queued");
     std::fs::remove_file(d.pane_file(&mock, "dv1", "mode")).unwrap();
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
@@ -5767,6 +5821,8 @@ fn pty_send_rejects_control_chars() {
     );
     // A pre-write rejection must not fence the agent: it stays idle,
     // the pane survives, and the queue keeps draining.
+    // CAD-184 kept sleep: absence window — the refusal happened in the
+    // RPC; any later fence would be a side effect with no event to await.
     thread::sleep(Duration::from_millis(500));
     let agent = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["agent"].clone();
     assert_eq!(agent["state"].as_str().unwrap(), "idle", "{agent}");
@@ -6015,7 +6071,13 @@ fn join_bootstrap_briefs_and_queues() {
     for want in ["w-join", "pm", briefing.to_str().unwrap(), "cadence self"] {
         assert!(body.contains(want), "bootstrap body missing {want}: {body}");
     }
-    thread::sleep(Duration::from_millis(400));
+    // The gate's recorded refusal proves the actor tried it and held it.
+    d.wait_event_where(
+        "w-join",
+        "gate_wait",
+        |e| e["payload"]["message"] == "bootstrap-w-join",
+        10,
+    );
     let mid = d.message_state("w-join", "bootstrap-w-join");
     assert!(matches!(mid.as_str(), "queued" | "submitting"), "{mid}");
     // A claim releases it — gated like any send, never bypassed.
@@ -7361,6 +7423,39 @@ impl TestDaemon {
     }
 }
 
+/// CAD-185: prove the per-daemon `CADENCE_PTY_RETRY_SECS=1` was honoured.
+/// Each render miss that retried is followed by the next attempt's
+/// `submitting` event; with the knob the gap is ~1s, with the default 5s
+/// it is >= 5s. Timed from durable event stamps, not the test's clock.
+fn assert_retry_gaps_under(d: &TestDaemon, alias: &str, id: &str, want: usize, max_secs: f64) {
+    let events = d.events(alias);
+    let of = |kind: &str| -> Vec<f64> {
+        events
+            .iter()
+            .filter(|e| e["kind"] == kind && e["payload"]["message"].as_str() == Some(id))
+            .filter_map(|e| e["at"].as_f64())
+            .collect()
+    };
+    let (misses, starts) = (of("paste_not_rendered"), of("submitting"));
+    let gaps: Vec<f64> = misses
+        .iter()
+        .take(misses.len().saturating_sub(1))
+        .map(|miss| {
+            let next = starts
+                .iter()
+                .copied()
+                .find(|at| at > miss)
+                .unwrap_or_else(|| panic!("no attempt after the miss at {miss}: {events:?}"));
+            next - miss
+        })
+        .collect();
+    assert_eq!(gaps.len(), want, "retry gaps {gaps:?}");
+    assert!(
+        gaps.iter().all(|gap| *gap < max_secs),
+        "retry base knob ignored — gaps {gaps:?} not under {max_secs}s"
+    );
+}
+
 /// Emit a test-only timing trace for a routed PTY delivery. The daemon's
 /// durable event/message timestamps are the phase clock here: using them
 /// avoids charging the test's 50ms RPC polling to a render or retry phase.
@@ -7558,6 +7653,7 @@ fn inbox_wait_blocks_until_arrival() {
     d.register_inbox("obs");
     let state = d.state.clone();
     let sender = thread::spawn(move || {
+        // CAD-184 kept sleep: the late arrival IS the behaviour under test.
         thread::sleep(Duration::from_millis(300));
         client::rpc(
             &state,
@@ -7845,7 +7941,8 @@ fn pty_auto_ready_waits_on_busy_pane_then_delivers() {
             .contains("busy"),
         "{wait}"
     );
-    thread::sleep(Duration::from_millis(400));
+    // The actor requeues before it records `gate_wait`, and the back-off
+    // holds it there — no settle sleep needed.
     assert_eq!(d.message_state("dv", "m1"), "queued");
     // Nothing was pasted while the pane looked busy.
     assert!(std::fs::read_to_string(d.pane_file(&mock, "dv", "input"))
@@ -8661,6 +8758,10 @@ fn agent_set_rejects_non_allowlisted_params() {
 
 #[test]
 fn pty_unrendered_worker_result_requeues_then_parks() {
+    // CAD-185: the retry waits (5s after each miss, 5s gate back-off) were
+    // most of this test's ~41s and nothing here asserts their length — the
+    // count, flags, park and survival are the contract. 1s keeps them.
+    test_env().set("CADENCE_PTY_RETRY_SECS", "1");
     let d = TestDaemon::start();
     let mock = d.mock_devin();
     d.register_devin_opts("pm", json!({"auto_ready": "verified"}));
@@ -8758,6 +8859,7 @@ fn pty_unrendered_worker_result_requeues_then_parks() {
     // Delivered = render-verified `running` (a task then awaits an
     // explicit report, so the agent correctly stays busy on it).
     d.wait_message("pm", "after", &["running"], 20);
+    assert_retry_gaps_under(&d, "pm", &routed_id, 3, 4.0);
     emit_park_phase_trace(
         &d,
         "pty_unrendered_worker_result_requeues_then_parks",
@@ -10869,8 +10971,9 @@ fn job_cancel_semantics() {
         .unwrap();
     assert_eq!(d.task_state("j1-tr"), "cancelled");
     // The kickoff still ran to completion; the task stays cancelled.
+    // The task edge commits in the message's own finish transaction, so
+    // `completed` already carries any task effect — no settle sleep.
     d.wait_message("w1", &k, &["completed"], 15);
-    thread::sleep(Duration::from_millis(300));
     assert_eq!(d.task_state("j1-tr"), "cancelled");
     d.wait_agent("w1", "idle", 10); // agent alive and untouched
 
@@ -11106,6 +11209,10 @@ fn task_attached_send_and_self() {
 
 #[test]
 fn job_event_parks_on_unrendered_pty_pm() {
+    // CAD-185: three 5s retry waits were ~15s of this test and nothing
+    // here asserts their length; the four render misses keep the real
+    // RENDER_DEADLINE, since that timeout path is what the park proves.
+    test_env().set("CADENCE_PTY_RETRY_SECS", "1");
     let state_dir = TempDir::new().unwrap();
     let mock_dir = TempDir::new().unwrap();
     let mock = install_mock_devin(mock_dir.path());
@@ -11204,6 +11311,7 @@ fn job_event_parks_on_unrendered_pty_pm() {
     d.wait_agent("pm", "idle", 15);
     let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap()["agent"].clone();
     assert_eq!(pm["dead"], false);
+    assert_retry_gaps_under(&d, "pm", parked_id, 3, 4.0);
     emit_park_phase_trace(&d, "job_event_parks_on_unrendered_pty_pm", "pm", parked_id);
 }
 
@@ -13083,9 +13191,6 @@ fn message_cancel_gate_pty_and_running_refusal() {
     // A ready claim now must NOT paste m1 — the gate only releases a
     // queued message.
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    thread::sleep(Duration::from_secs(2));
-    let input = std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
-    assert!(!input.contains("first"), "{input}");
 
     // The claim stays outstanding, so the next queued message delivers
     // normally.
@@ -13095,6 +13200,11 @@ fn message_cancel_gate_pty_and_running_refusal() {
     )
     .unwrap();
     let token = pty_token(&d, "dv1", "m2");
+    // m2 consumed the one claim, so m1 never did: no trace of it on the
+    // screen or in the input line (a pasted m1 would sit in either).
+    let pane = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap_or_default()
+        + &std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    assert!(!pane.contains("first"), "{pane}");
 
     // A running turn refuses — interruption happens at the provider.
     let err = d
@@ -14357,6 +14467,7 @@ fn pty_stall_static_screen_fires_once_and_notices() {
     );
 
     // Once per episode: the silence continues but no second event fires.
+    // CAD-184 kept sleep: timing is the behaviour (stall ticks over time).
     thread::sleep(Duration::from_secs(7));
     assert_eq!(wait_event_count(&d, "w1", "turn_stalled", 1, 2).len(), 1);
 
@@ -14432,6 +14543,8 @@ fn pty_stall_resume_rearms_and_spinner_is_not_activity() {
             d.stub_pane_file(&mock, "w1", "tui-state"),
             format!("⠋ Working · {i}s\n"),
         );
+        // CAD-184 kept sleep: timing is the behaviour (the counter must tick
+        // across screen samples).
         thread::sleep(Duration::from_secs(2));
     }
     assert!(
@@ -14721,6 +14834,8 @@ fn stall_secs_zero_disables_and_live_set_rearms() {
     )
     .unwrap();
     d.wait_message("w1", "m-zero", &["running"], 10);
+    // CAD-184 kept sleep: timing is the behaviour (silence past a budget
+    // that is disabled).
     thread::sleep(Duration::from_secs(7));
     assert!(
         d.events("w1")
@@ -14786,6 +14901,7 @@ fn pty_stall_sampling_runs_while_the_pane_lives() {
     // The actor is gone — sampling stops with it. Settle first so a
     // sample already in flight at the stop lands in the baseline.
     d.wait_agent("w1", "stopped", 15);
+    // CAD-184 kept sleep: timing is the behaviour (sampler cadence).
     thread::sleep(Duration::from_secs(4));
     let idle_count = captures();
     thread::sleep(Duration::from_secs(4));
@@ -14965,6 +15081,8 @@ fn pty_silent_end_fires_once_and_recovers() {
     );
 
     // Once per message: the pane stays idle but no second event fires.
+    // CAD-184 kept sleep: timing is the behaviour (once per message over
+    // several sweeps).
     thread::sleep(Duration::from_secs(6));
     assert_eq!(wait_event_count(&d, "w1", "turn_silent_end", 1, 2).len(), 1);
 
@@ -15173,7 +15291,7 @@ fn pty_menu_event_refires_after_close() {
         if show["pane_menu"].is_null() {
             break;
         }
-        assert!(deadline.elapsed() < Duration::from_secs(20), "{show}");
+        assert!(std::time::Instant::now() < deadline, "{show}");
         thread::sleep(Duration::from_millis(250));
     }
 
@@ -20047,6 +20165,8 @@ fn review_verb_suite_lock_serializes() {
     let mut child = review_cmd(&f).arg("7").spawn().unwrap();
     // Everything before the suite takes well under 4s here; a still-
     // running child with no suite marker is waiting on the lock.
+    // CAD-184 kept sleep: absence window — the review prints nothing while
+    // it waits on the flock.
     std::thread::sleep(Duration::from_secs(4));
     assert!(
         child.try_wait().unwrap().is_none(),
@@ -20970,6 +21090,7 @@ fn inbox_without_consumer_warns_on_send_and_route() {
         }
         job(&format!("j-a{i}"));
     }
+    // CAD-184 kept sleep: timing is the behaviour (staleness window).
     thread::sleep(Duration::from_millis(WINDOW * 1000 + 300));
 
     // Routed results into the now-stale `routed` mailbox have no caller
@@ -20980,6 +21101,8 @@ fn inbox_without_consumer_warns_on_send_and_route() {
     assert_eq!(e["payload"]["owner"], "boss", "{e}");
     assert!(e["payload"]["unread"].as_u64().unwrap_or(0) >= 3, "{e}");
     job("j-b0");
+    // CAD-184 kept sleep: absence window — no second event inside the
+    // window, across sweeps.
     thread::sleep(Duration::from_millis(1500));
     let kinds = event_kinds(&d, "routed");
     assert_eq!(
@@ -21028,6 +21151,8 @@ fn inbox_without_consumer_warns_on_send_and_route() {
     );
     let receipt: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(receipt["warning"].is_string(), "{receipt}");
+    // CAD-184 kept sleep: absence window — a drained inbox never warns,
+    // across sweeps.
     thread::sleep(Duration::from_millis(2500));
     let late: Vec<Value> = d
         .events("drained")
@@ -24067,6 +24192,37 @@ fn wait_monitor_state(d: &TestDaemon, monitor: &str, want: &str, secs: u64) -> V
     }
 }
 
+/// Wait for a successful check of `monitor` that began after `after`
+/// (epoch seconds): the positive barrier for "the watcher looked and
+/// did nothing", instead of sleeping one interval and hoping it ran.
+/// `last_success_at` is the time its pass started, so that pass saw
+/// every row committed before `after`; passes run one after another,
+/// so every earlier pass (dispatch reconcile included) has finished.
+fn wait_monitor_check_after(d: &TestDaemon, monitor: &str, after: f64, secs: u64) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let value = d.rpc("monitor_show", json!({"monitor": monitor})).unwrap()["monitor"].clone();
+        if value["last_success_at"]
+            .as_f64()
+            .is_some_and(|at| at > after)
+        {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "monitor {monitor} ran no check after {after}: {value}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn epoch_now() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
 #[test]
 fn monitor_persists_coverage_heartbeats_and_deduplicates_alerts() {
     let mut d = TestDaemon::start();
@@ -24119,7 +24275,7 @@ fn monitor_persists_coverage_heartbeats_and_deduplicates_alerts() {
             Some("mjob-watch"),
         )
         .unwrap();
-    thread::sleep(Duration::from_millis(1200));
+    wait_monitor_check_after(&d, "m1", epoch_now(), 5);
     let no_alert = d.rpc("monitor_alerts", json!({"monitor": "m1"})).unwrap();
     assert!(
         no_alert["alerts"].as_array().unwrap().is_empty(),
@@ -24153,7 +24309,7 @@ fn monitor_persists_coverage_heartbeats_and_deduplicates_alerts() {
         ["event_cursor"]
         .as_i64()
         .unwrap();
-    thread::sleep(Duration::from_millis(1200));
+    wait_monitor_check_after(&d, "m1", epoch_now(), 5);
     let again = d.rpc("monitor_alerts", json!({"monitor": "m1"})).unwrap();
     assert_eq!(again["alerts"].as_array().unwrap().len(), 1, "{again}");
     assert!(
@@ -24289,6 +24445,8 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
         json!({"alias": "w1", "text": "after", "message": "after-unknown"}),
     )
     .unwrap();
+    // CAD-184 kept sleep: absence window — no actor runs for a fenced or
+    // stopped agent, so nothing records a refusal to poll for.
     thread::sleep(Duration::from_millis(400));
     assert_eq!(d.message_state("w1", "after-unknown"), "queued");
     assert_eq!(d.message_state("w1", &kickoff), "unknown");
@@ -24344,7 +24502,13 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
     let fingerprint = alert["fingerprint"].clone();
 
     // The cursor and event fingerprint make repeated monitor ticks one alert.
-    thread::sleep(Duration::from_millis(2200));
+    let tick = wait_monitor_check_after(&d, "unknown-monitor", epoch_now(), 5);
+    wait_monitor_check_after(
+        &d,
+        "unknown-monitor",
+        tick["last_success_at"].as_f64().unwrap(),
+        5,
+    );
     let repeated = d
         .rpc(
             "monitor_alerts",
@@ -24376,7 +24540,7 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
     )
     .unwrap();
     drop(conn);
-    thread::sleep(Duration::from_millis(1200));
+    wait_monitor_check_after(&d, "unknown-monitor", epoch_now(), 5);
     let unscoped = d
         .rpc(
             "monitor_alerts",
@@ -24417,9 +24581,10 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
     let state = d.state.clone();
     d.rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
+    let restarted_at = epoch_now();
     let d2 = TestDaemon::start_on(state);
     wait_monitor_state(&d2, "unknown-monitor", "active", 5);
-    thread::sleep(Duration::from_millis(1200));
+    wait_monitor_check_after(&d2, "unknown-monitor", restarted_at, 5);
     let restored = d2
         .rpc(
             "monitor_alerts",
@@ -24488,7 +24653,7 @@ fn monitor_dispatch_requires_explicit_safe_eligibility() {
     wait_monitor_state(&d, "dm", "active", 5);
     // The legacy manual permission remains inert under the background
     // watcher. Automatic reconciliation requires its separate opt-in bit.
-    thread::sleep(Duration::from_millis(1200));
+    wait_monitor_check_after(&d, "dm", epoch_now(), 5);
     assert_eq!(d.task_state("djob-ready"), "draft");
     let before_manual = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     assert_eq!(
@@ -24700,7 +24865,27 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
         .contains("quota unknown"));
     assert!(blocked["payload"]["next_action"].is_string());
     let blocked_seq = blocked["seq"].as_i64().unwrap();
-    thread::sleep(Duration::from_millis(1500));
+    // A later reconcile refuses again: poll until it has counted its
+    // attempt on the same row, then check nothing new was minted.
+    let retried_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = d.rpc("monitor_alerts", json!({"monitor": "auto"})).unwrap();
+        let attempts = page["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|alert| alert["seq"] == blocked_seq)
+            .and_then(|alert| alert["attempts"].as_i64())
+            .unwrap_or(0);
+        if attempts >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < retried_deadline,
+            "blocked dispatch was never retried: {page}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     let repeated = d.rpc("monitor_alerts", json!({"monitor": "auto"})).unwrap();
     let alerts = repeated["alerts"].as_array().unwrap();
     assert_eq!(
@@ -24774,9 +24959,24 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
     let state = d.state.clone();
     d.rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
+    let restarted_at = epoch_now();
     let d2 = TestDaemon::start_on(state);
     wait_monitor_state(&d2, "auto", "active", 5);
-    thread::sleep(Duration::from_millis(1200));
+    // The first post-restart reconcile records its reuse of the live
+    // kickoff after its dispatch transaction — the barrier for "no second
+    // kickoff was minted".
+    let reused = d2.wait_event_where(
+        "daemon",
+        "monitor_dispatch",
+        |e| {
+            e["payload"]["task"] == "ajob-duplicate"
+                && e["payload"]["automatic"] == true
+                && e["at"].as_f64().is_some_and(|at| at > restarted_at)
+        },
+        5,
+    );
+    assert_eq!(reused["payload"]["duplicate"], true, "{reused}");
+    assert_eq!(reused["payload"]["message"], existing_kickoff, "{reused}");
     let w1 = d2.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     assert_eq!(
         w1["messages"]
@@ -29067,6 +29267,8 @@ fn pty_stop_reaps_pane_session_tree() {
 
     // A second stop is idempotent: the tree is already reaped.
     d.rpc("agent_stop", json!({"alias": "st"})).unwrap();
+    // CAD-184 kept sleep: absence window — a declined reap records
+    // nothing; a started one would land on its own thread.
     thread::sleep(Duration::from_millis(300));
     let intents = d
         .events("st")
