@@ -420,7 +420,9 @@ mod tests {
         );
         for name in CLOUD_SECRET_ENV {
             assert!(
-                !text.lines().any(|line| line.starts_with(&format!("{name}="))),
+                !text
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{name}="))),
                 "{name} leaked into a spawned worker:\n{text}"
             );
         }

@@ -1587,7 +1587,10 @@ mod tests {
     fn assert_hygiene(adapter: &DevinCloudAdapter, hits: &[Hit], events: &[Value], params: &Value) {
         let log = adapter.log.lock().unwrap().clone();
         assert!(!log.contains(KEY), "provider log contained the api key");
-        assert!(log.len() <= LOG_LIMIT + 8, "provider log grew without a bound");
+        assert!(
+            log.len() <= LOG_LIMIT + 8,
+            "provider log grew without a bound"
+        );
         assert!(
             !events.iter().any(|event| event.to_string().contains(KEY)),
             "event contained the api key"
@@ -1616,7 +1619,12 @@ mod tests {
 
     #[test]
     fn create_binds_identity_default_limit_and_scrubs_the_host_path() {
-        let Harness { adapter, mock, events, .. } = adapter_for(Script::Happy);
+        let Harness {
+            adapter,
+            mock,
+            events,
+            ..
+        } = adapter_for(Script::Happy);
         let worker = agent(json!({
             "repos": ["favcrm/cadence"],
             "devin_mode": "fast",
@@ -1711,7 +1719,12 @@ mod tests {
 
     #[test]
     fn waiting_for_user_emits_one_request_and_respond_posts_the_answer() {
-        let Harness { adapter, mock, requests, .. } = adapter_for(Script::Wait);
+        let Harness {
+            adapter,
+            mock,
+            requests,
+            ..
+        } = adapter_for(Script::Wait);
         let worker = agent(json!({"repos": ["favcrm/cadence"]}));
         adapter.open(&worker).unwrap();
         let turn = thread::scope(|scope| {
@@ -1803,7 +1816,12 @@ mod tests {
 
     #[test]
     fn create_server_error_is_scrubbed_and_does_not_bind_a_session() {
-        let Harness { adapter, mock, events, .. } = adapter_for(Script::Create500);
+        let Harness {
+            adapter,
+            mock,
+            events,
+            ..
+        } = adapter_for(Script::Create500);
         let worker = agent(json!({"repos": ["favcrm/cadence"]}));
         let err = adapter.open(&worker).pipe_err();
         assert_eq!(err.kind(), "provider");
@@ -2097,7 +2115,11 @@ mod tests {
 
     #[test]
     fn log_note_is_scrubbed_and_bounded() {
-        let Harness { adapter, mock: _mock, .. } = adapter_for(Script::Happy);
+        let Harness {
+            adapter,
+            mock: _mock,
+            ..
+        } = adapter_for(Script::Happy);
         for _ in 0..400 {
             adapter.note(&format!("provider said {KEY}"));
         }
@@ -2109,7 +2131,11 @@ mod tests {
 
     #[test]
     fn later_turn_does_not_bind_an_earlier_sha() {
-        let Harness { adapter, mock: _mock, .. } = adapter_for(Script::StaleSha);
+        let Harness {
+            adapter,
+            mock: _mock,
+            ..
+        } = adapter_for(Script::StaleSha);
         adapter
             .open(&agent(json!({"repos": ["favcrm/cadence"]})))
             .unwrap();
@@ -2121,7 +2147,11 @@ mod tests {
             "revision 2 bound revision 1's SHA: {}",
             second.text
         );
-        assert!(second.text.contains("revision two has no trailer"), "{}", second.text);
+        assert!(
+            second.text.contains("revision two has no trailer"),
+            "{}",
+            second.text
+        );
     }
 
     #[test]
@@ -2143,12 +2173,20 @@ mod tests {
 
     #[test]
     fn create_429_is_not_unknown() {
-        let Harness { adapter, mock: _mock, .. } = adapter_for(Script::Create429);
+        let Harness {
+            adapter,
+            mock: _mock,
+            ..
+        } = adapter_for(Script::Create429);
         let ident = adapter
             .open(&agent(json!({"repos": ["favcrm/cadence"]})))
             .unwrap();
         assert_eq!(ident.session_id, "devin-created");
-        let Harness { adapter, mock: _mock, .. } = adapter_for(Script::Create429Forever);
+        let Harness {
+            adapter,
+            mock: _mock,
+            ..
+        } = adapter_for(Script::Create429Forever);
         let err = adapter
             .open(&agent(json!({"repos": ["favcrm/cadence"]})))
             .pipe_err();

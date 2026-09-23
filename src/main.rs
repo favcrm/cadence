@@ -6724,12 +6724,7 @@ fn cloud_session_prompt(
     report_line: &str,
 ) -> String {
     let role = instructions
-        .map(|text| {
-            format!(
-                " Role instructions: {}.",
-                text.replace(['\n', '\r'], " ")
-            )
-        })
+        .map(|text| format!(" Role instructions: {}.", text.replace(['\n', '\r'], " ")))
         .unwrap_or_default();
     format!(
         "Cadence bootstrap: you are '{alias}', reporting to group root '{root}'. \
@@ -7222,13 +7217,7 @@ mod tests {
                 ..
             } if params == "repo=favcrm/cadence;devin_mode=fast"
         ));
-        assert!(Cli::try_parse_from([
-            "cadence",
-            "devin",
-            "--cloud-params",
-            "repo=x/y",
-        ])
-        .is_err());
+        assert!(Cli::try_parse_from(["cadence", "devin", "--cloud-params", "repo=x/y",]).is_err());
         use clap::CommandFactory;
         let mut cmd = Cli::command();
         let help = cmd
@@ -7277,7 +7266,10 @@ mod tests {
             Some("Ship the widget from the role file."),
             "do the work, then finish",
         );
-        assert!(body.contains("Ship the widget from the role file."), "{body}");
+        assert!(
+            body.contains("Ship the widget from the role file."),
+            "{body}"
+        );
         assert!(body.contains("SHA:"), "{body}");
         assert!(!body.contains('/'), "{body}");
         assert!(!body.contains("cadence self"), "{body}");

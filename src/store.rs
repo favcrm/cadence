@@ -3033,34 +3033,33 @@ impl Store {
             "message": message.id, "notice": kind,
             "result": routed, "worker": message.alias,
         });
-        let prompt = if kind == "unknown"
-            && result.get("held").and_then(Value::as_bool) == Some(true)
-        {
-            format!(
-                "A Devin cloud worker's turn is held — the poll outcome was not learned and \
+        let prompt =
+            if kind == "unknown" && result.get("held").and_then(Value::as_bool) == Some(true) {
+                format!(
+                    "A Devin cloud worker's turn is held — the poll outcome was not learned and \
                  the session is still working. The worker is not fenced. A later poll can \
                  still capture the result. This is an informational notice, not a result; \
                  do not treat it as worker output. {payload}"
-            )
-        } else {
-            match kind {
-            "interrupted" => format!(
+                )
+            } else {
+                match kind {
+                    "interrupted" => format!(
                 "An operator closed a managed worker's turn as interrupted — the outcome was \
                  never learned. This is an informational notice, not a result; do not treat it \
                  as worker output. {payload}"
             ),
-            "cancelled" => format!(
+                    "cancelled" => format!(
                 "A managed worker's queued message was cancelled before delivery — nothing \
                  ran. This is an informational notice, not a result; do not treat it as \
                  worker output. {payload}"
             ),
-            _ => format!(
-                "A managed worker's turn outcome is unknown — the worker is fenced and an \
+                    _ => format!(
+                        "A managed worker's turn outcome is unknown — the worker is fenced and an \
                  operator reconcile is pending. This is an informational notice, not a result; \
                  do not treat it as worker output. {payload}"
-            ),
-        }
-        } + &pointer;
+                    ),
+                }
+            } + &pointer;
         tx.execute(
             "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
              VALUES(?,?,?,NULL,'worker_notice',?,?)",
@@ -4667,7 +4666,7 @@ impl Store {
                 | "paste_not_rendered"
                 | "delivery_parked"
                 | "turn_silent_end"
-                |             "approval_menu"
+                | "approval_menu"
                 | "draft_pending"
                 | "cloud_hold"
         )
@@ -7981,7 +7980,10 @@ mod tests {
             updated: 0.0,
         };
         let body = kickoff_body(&job, &task, 1, "m1", &assignee);
-        assert!(body.contains("Implement the cloud task from this text."), "{body}");
+        assert!(
+            body.contains("Implement the cloud task from this text."),
+            "{body}"
+        );
         assert!(body.contains("SHA:"), "{body}");
         assert!(!body.contains(&spec.display().to_string()), "{body}");
         assert!(!body.contains(&worktree.display().to_string()), "{body}");

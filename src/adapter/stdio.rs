@@ -67,7 +67,10 @@ impl EnvScrub {
 
     pub fn removes_name(&self, name: &str) -> bool {
         self.names.iter().any(|have| have == name)
-            || (self.prefixes.iter().any(|prefix| name.starts_with(prefix.as_str()))
+            || (self
+                .prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_str()))
                 && !self.keep.iter().any(|keep| keep == name))
     }
 }

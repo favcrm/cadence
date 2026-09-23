@@ -7147,7 +7147,8 @@ mod tests {
                 let (status, payload): (u16, String) = if path.contains("/repositories") {
                     (
                         200,
-                        json!({"repositories": [{"name": "cadence", "owner": "favcrm"}]}).to_string(),
+                        json!({"repositories": [{"name": "cadence", "owner": "favcrm"}]})
+                            .to_string(),
                     )
                 } else if method == "POST" && path.ends_with("/sessions") {
                     (
@@ -7195,16 +7196,23 @@ mod tests {
                 } else {
                     (200, json!({"ok": true}).to_string())
                 };
-                let _ = req.respond(tiny_http::Response::from_string(payload).with_status_code(status));
+                let _ =
+                    req.respond(tiny_http::Response::from_string(payload).with_status_code(status));
             }
         });
         let (dir, shared) = shared();
         let base = format!("http://{addr}");
         shared.provider_env.set("CADENCE_DEVIN_API_BASE", &base);
-        shared.provider_env.set("CADENCE_DEVIN_API_KEY", "cog_test_secret_value");
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_API_KEY", "cog_test_secret_value");
         shared.provider_env.set("CADENCE_DEVIN_ORG_ID", "org-test");
-        shared.provider_env.set("CADENCE_DEVIN_POLL_INTERVAL_MS", "20");
-        shared.provider_env.set("CADENCE_DEVIN_POLL_BUDGET_MS", "120");
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_POLL_INTERVAL_MS", "20");
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_POLL_BUDGET_MS", "120");
         let cwd = dir.path().to_str().unwrap();
         let spec = dir.path().join("spec.md");
         std::fs::write(&spec, "Do the cloud work.").unwrap();
@@ -7262,13 +7270,32 @@ mod tests {
             .unwrap();
         shared
             .store
-            .create_task("j1", "t1", None, Some("cloud-1"), None, None, None, None, None)
+            .create_task(
+                "j1",
+                "t1",
+                None,
+                Some("cloud-1"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
-        let (_task, kickoff, dup, _) = shared.store.dispatch_task("t1", None, None, "test").unwrap();
+        let (_task, kickoff, dup, _) = shared
+            .store
+            .dispatch_task("t1", None, None, "test")
+            .unwrap();
         assert!(!dup);
         shared
             .store
-            .enqueue("cloud-1", "follow-up while the session works", Some("pm"), "follow-up", "user")
+            .enqueue(
+                "cloud-1",
+                "follow-up while the session works",
+                Some("pm"),
+                "follow-up",
+                "user",
+            )
             .unwrap();
         shared.launch_actor("cloud-1").unwrap();
         let started = Instant::now();
@@ -7286,7 +7313,10 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(!early_post.load(Ordering::SeqCst), "posted the next message while the session was still held");
+        assert!(
+            !early_post.load(Ordering::SeqCst),
+            "posted the next message while the session was still held"
+        );
         assert!(shared
             .store
             .events("cloud-1", 0, 40)
