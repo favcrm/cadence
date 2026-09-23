@@ -11,7 +11,17 @@ set -eu
 
 PINNED_NEXTEST_VERSION=0.9.145
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-BIN=${CADENCE_NEXTTEST_BIN:-cargo-nextest}
+# CADENCE_NEXTTEST_BIN wins; else the durable tools dir that
+# scripts/install-cadence-nextest writes by default (CAD-273); else PATH.
+# The checksum check below applies to whichever is chosen.
+TOOLS_BIN="${XDG_DATA_HOME:-${HOME:-}/.local/share}/cadence/tools/cadence-nextest-$PINNED_NEXTEST_VERSION/cargo-nextest"
+if [ -n "${CADENCE_NEXTTEST_BIN:-}" ]; then
+    BIN=$CADENCE_NEXTTEST_BIN
+elif [ -x "$TOOLS_BIN" ]; then
+    BIN=$TOOLS_BIN
+else
+    BIN=cargo-nextest
+fi
 PROFILE="$ROOT/.config/nextest.toml"
 TRUST_MANIFEST="$ROOT/.config/cargo-nextest.sha256"
 

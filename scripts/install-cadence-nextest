@@ -1,7 +1,13 @@
 #!/bin/sh
-# CAD-173 activation follow-up: install the reviewed nextest artifact only
-# into a task-local directory. This never writes PATH, rustup, Cargo home,
-# the repository, or a production state directory.
+# CAD-173 activation follow-up: install the reviewed nextest artifact into
+# the durable per-user tools dir (default) or a task-local TMPDIR path (CI).
+# This never writes PATH, rustup, Cargo home, the repository, or a
+# production state directory.
+#
+# CAD-273 (operator-approved 2026-09-23): the default moved out of /tmp,
+# where `doctor --host` reported it as a leaked temp dir and it was
+# deleted; scripts/cadence-nextest finds this default without
+# CADENCE_NEXTTEST_BIN.
 set -eu
 
 VERSION=0.9.145
@@ -10,7 +16,9 @@ ARCHIVE="cargo-nextest-$VERSION-$TARGET.tar.gz"
 URL="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$VERSION/$ARCHIVE"
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 MANIFEST="$ROOT/.config/cargo-nextest.sha256"
-INSTALL_DIR=${CADENCE_NEXTTEST_INSTALL_DIR:-/tmp/cadence-nextest-$VERSION}
+DATA_HOME=${XDG_DATA_HOME:-${HOME:?HOME is required}/.local/share}
+DEFAULT_DIR="$DATA_HOME/cadence/tools/cadence-nextest-$VERSION"
+INSTALL_DIR=${CADENCE_NEXTTEST_INSTALL_DIR:-$DEFAULT_DIR}
 TASK_TMP=${TMPDIR:-/tmp}
 
 die() {
@@ -27,8 +35,9 @@ case "$TASK_TMP" in
     *) die "TMPDIR must be an absolute path" ;;
 esac
 case "$INSTALL_DIR" in
-    "$TASK_TMP"|"$TASK_TMP"/*) ;;
-    *) die "refusing install outside task-local TMPDIR ($TASK_TMP)" ;;
+    "$DEFAULT_DIR") ;;
+    "$TASK_TMP"/*) ;;
+    *) die "refusing install outside the tools dir ($DEFAULT_DIR) or a task-local TMPDIR path ($TASK_TMP)" ;;
 esac
 case "$INSTALL_DIR" in
     "$ROOT"|"$ROOT"/*) die "refusing to install inside the repository" ;;
@@ -83,6 +92,7 @@ actual_sha256=$(sha256sum "$extract_dir/cargo-nextest" | awk '{print $1}')
     die "extracted binary checksum mismatch: expected $binary_sha256, got $actual_sha256"
 chmod 755 "$extract_dir/cargo-nextest"
 mv "$extract_dir/cargo-nextest" "$binary_path"
+rm -rf "$extract_dir"
 trap - EXIT HUP INT TERM
 
 version=$("$binary_path" --version 2>&1) || die "installed binary could not report its version"

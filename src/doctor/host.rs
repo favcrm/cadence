@@ -3802,6 +3802,14 @@ fn check_sessions(scan: &Scan) -> Check {
 
 // ---------- leaked temp dirs ----------
 
+/// `cadence-nextest-<version>/cargo-nextest`, as written by
+/// `scripts/install-cadence-nextest` into a task-local TMPDIR.
+fn is_pinned_runner_dir(dir: &Path, name: &str) -> bool {
+    name.strip_prefix("cadence-nextest-")
+        .is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        && std::fs::symlink_metadata(dir.join("cargo-nextest")).is_ok_and(|m| m.is_file())
+}
+
 fn check_temp_dirs(scan: &Scan) -> Check {
     let name = "temp-dirs";
     let t = &scan.thresholds;
@@ -3822,6 +3830,12 @@ fn check_temp_dirs(scan: &Scan) -> Check {
                 continue;
             };
             if !meta.is_dir() {
+                continue;
+            }
+            // The pinned test runner's task-local install is a tool, not a
+            // leak: listing it put `rm -rf` on the reviewed binary and
+            // every local review then blocked (CAD-273).
+            if is_pinned_runner_dir(&ent.path(), &name_s) {
                 continue;
             }
             // Only our own dirs — /tmp is shared, and the remedy prints
@@ -6908,6 +6922,41 @@ mod tests {
         assert_eq!(c.value["count"].as_u64().unwrap(), 4);
         assert!(c.remedy.contains("rm -rf"));
         assert!(c.remedy.contains("cadence-issue-at-1-2"));
+    }
+
+    /// CAD-273: an old pinned-runner install is never a leak, so the
+    /// remedy can never `rm -rf` the reviewed binary. A look-alike dir
+    /// without the binary, or with a non-version suffix, still counts.
+    #[test]
+    fn temp_dirs_never_list_the_pinned_runner() {
+        let root = TempDir::new().unwrap();
+        let scan = fake_scan(&root);
+        let tmp = scan.temp_dir.clone();
+        let runner = tmp.join("cadence-nextest-0.9.145");
+        real_bytes(&runner.join("cargo-nextest"), 64);
+        std::fs::create_dir_all(tmp.join("cadence-nextest-0.9.146")).unwrap();
+        std::fs::create_dir_all(tmp.join("cadence-nextest-contract.AbC")).unwrap();
+        real_bytes(&tmp.join("cadence-nextest-contract.AbC/cargo-nextest"), 8);
+        for name in [
+            "cadence-nextest-0.9.145",
+            "cadence-nextest-0.9.146",
+            "cadence-nextest-contract.AbC",
+        ] {
+            set_mtime_old(&tmp.join(name), 90_000);
+        }
+        let c = check_temp_dirs(&scan);
+        assert_eq!(c.value["count"].as_u64().unwrap(), 2, "{}", c.value);
+        assert!(
+            !c.remedy.contains("cadence-nextest-0.9.145"),
+            "{}",
+            c.remedy
+        );
+        assert!(c.remedy.contains("cadence-nextest-0.9.146"), "{}", c.remedy);
+        assert!(
+            c.remedy.contains("cadence-nextest-contract.AbC"),
+            "{}",
+            c.remedy
+        );
     }
 
     // ---------- legacy task cargo targets ----------

@@ -6,7 +6,16 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RUNNER="$ROOT/scripts/cadence-nextest"
-PINNED_BIN=${CADENCE_NEXTTEST_TEST_BIN:-/tmp/cadence-nextest-0.9.145/cargo-nextest}
+# The durable tools dir is the default install (CAD-273); /tmp is the
+# legacy task-local location.
+TOOLS_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/cadence/tools/cadence-nextest-0.9.145/cargo-nextest"
+if [ -n "${CADENCE_NEXTTEST_TEST_BIN:-}" ]; then
+    PINNED_BIN=$CADENCE_NEXTTEST_TEST_BIN
+elif [ -x "$TOOLS_BIN" ]; then
+    PINNED_BIN=$TOOLS_BIN
+else
+    PINNED_BIN=/tmp/cadence-nextest-0.9.145/cargo-nextest
+fi
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/cadence-nextest-activation.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 

@@ -36,7 +36,26 @@ if CADENCE_NEXTTEST_BIN="$TMP/cargo-nextest" "$RUNNER" --help \
 fi
 contains "untrusted cargo-nextest executable checksum" "$TMP/err"
 
-PINNED_BIN=${CADENCE_NEXTTEST_TEST_BIN:-/tmp/cadence-nextest-0.9.145/cargo-nextest}
+# CAD-273: the installer refuses a directory that is neither the durable
+# tools dir nor under TMPDIR, and never inside the repository.
+INSTALLER="$ROOT/scripts/install-cadence-nextest"
+if XDG_DATA_HOME="$TMP/data" TMPDIR="$TMP/task" \
+    CADENCE_NEXTTEST_INSTALL_DIR="$HOME/cadence-nextest-elsewhere" \
+    "$INSTALLER" >"$TMP/out" 2>"$TMP/err"; then
+    die "installer accepted a directory outside the tools dir and TMPDIR"
+fi
+contains "refusing install outside the tools dir" "$TMP/err"
+
+# The durable tools dir is the default install (CAD-273); /tmp is the
+# legacy task-local location.
+TOOLS_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/cadence/tools/cadence-nextest-0.9.145/cargo-nextest"
+if [ -n "${CADENCE_NEXTTEST_TEST_BIN:-}" ]; then
+    PINNED_BIN=$CADENCE_NEXTTEST_TEST_BIN
+elif [ -x "$TOOLS_BIN" ]; then
+    PINNED_BIN=$TOOLS_BIN
+else
+    PINNED_BIN=/tmp/cadence-nextest-0.9.145/cargo-nextest
+fi
 if [ ! -x "$PINNED_BIN" ]; then
     printf '%s\n' 'nextest contract checks passed (trusted binary unavailable; execution checks skipped)'
     exit 0
@@ -47,6 +66,32 @@ if CADENCE_NEXTTEST_BIN="$PINNED_BIN" "$RUNNER" --help \
     die "direct invocation without a lock was accepted"
 fi
 contains "requires CADENCE_SUITE_LOCK" "$TMP/err"
+
+# CAD-273: with CADENCE_NEXTTEST_BIN unset and nothing on PATH, the wrapper
+# finds the durable tools-dir install (a copy still passes the checksum
+# because the manifest keys the executable by name).
+tools="$TMP/data/cadence/tools/cadence-nextest-0.9.145"
+mkdir -p "$tools"
+cp "$PINNED_BIN" "$tools/cargo-nextest"
+if env -u CADENCE_NEXTTEST_BIN XDG_DATA_HOME="$TMP/data" PATH=/usr/bin:/bin \
+    "$RUNNER" --help >"$TMP/out" 2>"$TMP/err"; then
+    die "direct invocation without a lock was accepted"
+fi
+contains "requires CADENCE_SUITE_LOCK" "$TMP/err"
+
+# CAD-273: a successful install leaves no .nextest-extract.* dir behind.
+# Reuses a cached, checksum-verified archive so no network is needed.
+archive=$(dirname "$PINNED_BIN")/cargo-nextest-0.9.145-x86_64-unknown-linux-gnu.tar.gz
+if [ -f "$archive" ]; then
+    fresh="$TMP/fresh/cadence/tools/cadence-nextest-0.9.145"
+    mkdir -p "$fresh"
+    cp "$archive" "$fresh/"
+    XDG_DATA_HOME="$TMP/fresh" TMPDIR="$TMP/task" "$INSTALLER" >"$TMP/out" 2>"$TMP/err" ||
+        { cat "$TMP/err" >&2; die "installer failed on a cached archive"; }
+    [ -x "$fresh/cargo-nextest" ] || die "installer did not install into the tools dir"
+    leftover=$(find "$fresh" -maxdepth 1 -name '.nextest-extract.*' | head -1)
+    [ -z "$leftover" ] || die "installer left its extract dir behind: $leftover"
+fi
 
 if CADENCE_NEXTTEST_BIN="$PINNED_BIN" CADENCE_SUITE_LOCK="$TMP/suite.lock" \
     "$RUNNER" --retries=1 >"$TMP/out" 2>"$TMP/err"; then
