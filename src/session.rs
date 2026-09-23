@@ -29,6 +29,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::adapter::registry;
@@ -66,6 +67,46 @@ struct Row {
     fixed: Option<String>,
     /// Sub-findings inside one named check (reconcile rows).
     items: Vec<String>,
+    /// Ack key of the finding the detail line names (the host row's
+    /// head check) and its acknowledgement note.
+    key: Option<String>,
+    ack: Option<String>,
+    /// Keyed sub-findings — each one acknowledgeable on its own.
+    findings: Vec<Finding>,
+}
+
+/// One keyed finding inside a check — the unit an operator
+/// acknowledges (`cadence session ack <key>`) and the unit the cwd
+/// scope sorts (CAD-257). `project` is `None` when nothing attributes
+/// it to a project: an unattributed finding always stays in scope, so
+/// the scope can only narrow what it can name (fail closed).
+struct Finding {
+    key: String,
+    project: Option<String>,
+    sev: Sev,
+    text: String,
+    /// `(acknowledged until …: reason)` or `(acknowledgement expired …)`.
+    ack: Option<String>,
+}
+
+impl Finding {
+    fn new(key: String, project: Option<String>, sev: Sev, text: String) -> Self {
+        Self {
+            key,
+            project,
+            sev,
+            text,
+            ack: None,
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "key": self.key, "project": self.project,
+            "severity": self.sev.name(), "text": scrub_line(&self.text),
+            "acknowledged": self.ack.as_deref().map(scrub_line),
+        })
+    }
 }
 
 impl Row {
@@ -77,6 +118,9 @@ impl Row {
             remedy: None,
             fixed: None,
             items: Vec::new(),
+            key: None,
+            ack: None,
+            findings: Vec::new(),
         }
     }
 
@@ -113,6 +157,9 @@ impl Row {
             "remedy": self.remedy.as_deref().map(scrub_line),
             "fixed": self.fixed.as_deref().map(scrub_line),
             "items": self.items.iter().map(|i| scrub_line(i)).collect::<Vec<_>>(),
+            "key": self.key,
+            "acknowledged": self.ack.as_deref().map(scrub_line),
+            "findings": self.findings.iter().map(Finding::json).collect::<Vec<_>>(),
         })
     }
 }
@@ -509,12 +556,28 @@ fn orphan_items(c: &Value) -> Vec<String> {
     items
 }
 
+/// `ok|warn|fail` text → `Sev`; anything else reads as ok.
+fn sev_of(level: &Value) -> Sev {
+    match level.as_str() {
+        Some("fail") => Sev::Fail,
+        Some("warn") => Sev::Warn,
+        _ => Sev::Ok,
+    }
+}
+
 /// A `doctor --host` report as one Row: worst level wins, each non-ok
-/// check becomes an item with its remedy. Orphan checks get count-only
-/// details plus per-pid `exe (arg count)` items — no argv. A fixture
-/// (`--host-report`) is labelled in the row — no fixture run can be
-/// mistaken for a real scan.
-fn host_row(name: &'static str, report: &Value, fixture: Option<&Path>) -> Row {
+/// check becomes a keyed finding (`host:<check>`) with its remedy — so
+/// a known host condition can be acknowledged like any other item.
+/// Orphan checks get count-only details plus per-pid `exe (arg count)`
+/// items — no argv. A fixture (`--host-report`) is labelled in the row
+/// — no fixture run can be mistaken for a real scan.
+fn host_row(
+    name: &'static str,
+    report: &Value,
+    fixture: Option<&Path>,
+    acks: &Acks,
+    now: i64,
+) -> Row {
     let mut row = Row::new(name);
     if let Some(path) = fixture {
         row.items.push(format!(
@@ -522,11 +585,6 @@ fn host_row(name: &'static str, report: &Value, fixture: Option<&Path>) -> Row {
             path.display()
         ));
     }
-    let level = match report["level"].as_str() {
-        Some("fail") => Sev::Fail,
-        Some("warn") => Sev::Warn,
-        _ => Sev::Ok,
-    };
     let checks = report["checks"].as_array().cloned().unwrap_or_default();
     let bad: Vec<&Value> = checks
         .iter()
@@ -536,49 +594,103 @@ fn host_row(name: &'static str, report: &Value, fixture: Option<&Path>) -> Row {
         .iter()
         .position(|c| c["level"].as_str() == Some("fail"))
         .unwrap_or(0);
+    // A report with no non-ok checks keeps its own level (fixture
+    // shorthand); otherwise the worst check after acknowledgements.
+    let mut worst = if bad.is_empty() {
+        sev_of(&report["level"])
+    } else {
+        Sev::Ok
+    };
     for (i, c) in bad.iter().enumerate() {
-        if i == head {
-            continue;
-        }
         let cname = c["name"].as_str().unwrap_or("?");
         let detail = check_detail(c);
         let remedy = c["remedy"].as_str().unwrap_or_default();
-        row.items.push(if remedy.is_empty() {
+        let text = if i == head || remedy.is_empty() {
             format!("{cname}: {detail}")
         } else {
             format!("{cname}: {detail} — {remedy}")
-        });
-        row.items.extend(orphan_items(c));
-    }
-    row.sev = level;
-    if let Some(c) = bad.get(head) {
-        let cname = c["name"].as_str().unwrap_or("?");
-        let detail = check_detail(c);
-        let remedy = c["remedy"].as_str().unwrap_or_default();
-        row.detail = format!("{cname}: {detail}");
-        if !remedy.is_empty() {
-            row.remedy = Some(remedy.to_string());
+        };
+        let mut f = Finding::new(format!("host:{cname}"), None, sev_of(&c["level"]), text);
+        acks.apply(&mut f, now);
+        worst = worst.max(f.sev);
+        if i == head {
+            row.detail = f.text;
+            if !remedy.is_empty() {
+                row.remedy = Some(remedy.to_string());
+            }
+            row.key = Some(f.key);
+            row.ack = f.ack;
+        } else {
+            row.findings.push(f);
         }
         row.items.extend(orphan_items(c));
-    } else {
+    }
+    if bad.is_empty() {
         row.detail = "host clean".to_string();
     }
+    row.sev = worst;
     row
 }
 
+/// Print `first` after `lead`, then any further lines of a multi-line
+/// text (a kill remedy is one line per pid) indented under it. Every
+/// line is scrubbed on its own — a newline is not an argv separator.
+fn print_lines(lead: &str, text: &str, tail: &str) {
+    let mut lines = text.lines();
+    println!(
+        "{lead}{}{tail}",
+        scrub_line(lines.next().unwrap_or_default())
+    );
+    for l in lines {
+        println!("               {}", scrub_line(l));
+    }
+}
+
+/// ` (acknowledged until …: reason)` — empty without an ack note.
+fn ack_tail(ack: &Option<String>) -> String {
+    ack.as_deref()
+        .map(|a| format!(" {}", scrub_line(a)))
+        .unwrap_or_default()
+}
+
 fn print_row(r: &Row) {
+    // Keys print unscrubbed: they are ids, aliases and paths the
+    // gate built itself, and an operator must copy them verbatim.
+    let key = r
+        .key
+        .as_deref()
+        .map(|k| format!("[{k}] "))
+        .unwrap_or_default();
     let mut line = format!(
-        "{:<9} {:<4} {}",
+        "{:<9} {:<4} {key}{}",
         r.name,
         r.sev.name(),
         scrub_line(&r.detail)
     );
+    // A multi-line remedy (named kill lines) joins the detail line with
+    // its first line; the rest follow indented.
+    let mut rest = "".lines();
     if let Some(rem) = &r.remedy {
-        line.push_str(&format!(" — {}", scrub_line(rem)));
+        let mut lines = rem.lines();
+        line.push_str(&format!(
+            " — {}",
+            scrub_line(lines.next().unwrap_or_default())
+        ));
+        rest = lines;
     }
-    println!("{line}");
+    println!("{line}{}", ack_tail(&r.ack));
+    for l in rest {
+        println!("               {}", scrub_line(l));
+    }
     for i in &r.items {
-        println!("           · {}", scrub_line(i));
+        print_lines("           · ", i, "");
+    }
+    for f in &r.findings {
+        print_lines(
+            &format!("           · [{}] ", f.key),
+            &f.text,
+            &ack_tail(&f.ack),
+        );
     }
     if let Some(f) = &r.fixed {
         println!("           fixed: {}", scrub_line(f));
@@ -821,10 +933,494 @@ fn issue_stem(name: &str) -> Option<String> {
     Some(format!("{}-{}", prefix.to_uppercase(), num))
 }
 
+// ---------- acknowledgements ----------
+
+/// The longest an acknowledgement may run — a known backlog is parked
+/// for two weeks at most, then it fails the gate again.
+const ACK_MAX_SECS: i64 = 14 * 86_400;
+
+/// One `cadence session ack` record. Times are ISO-8601 UTC.
+#[derive(Clone, Serialize, Deserialize)]
+struct Ack {
+    key: String,
+    reason: String,
+    actor: String,
+    created: String,
+    expires: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct AckFile {
+    acks: Vec<Ack>,
+}
+
+/// The acknowledgements the gate reads. `error` names an unreadable
+/// store — the gate then applies none (an ack can only soften) and
+/// says so in its own row.
+#[derive(Default)]
+struct Acks {
+    list: Vec<Ack>,
+    error: Option<String>,
+}
+
+impl Acks {
+    fn load(state_dir: &Path) -> Self {
+        match read_acks(state_dir) {
+            Ok(list) => Self { list, error: None },
+            Err(e) => Self {
+                list: Vec::new(),
+                error: Some(e.to_string()),
+            },
+        }
+    }
+
+    /// The record with the latest expiry for `key` decides: unexpired,
+    /// a `fail` finding downgrades to `warn` and prints `(acknowledged
+    /// until …: reason)`; expired, the finding keeps its severity and
+    /// prints `(acknowledgement expired …)`. An ack never hides an item.
+    fn apply(&self, f: &mut Finding, now: i64) {
+        let Some(a) = self
+            .list
+            .iter()
+            .filter(|a| a.key == f.key)
+            .max_by_key(|a| itime::parse_iso(&a.expires).unwrap_or(0))
+        else {
+            return;
+        };
+        if itime::parse_iso(&a.expires).is_some_and(|e| e > now) {
+            if f.sev == Sev::Fail {
+                f.sev = Sev::Warn;
+            }
+            f.ack = Some(format!("(acknowledged until {}: {})", a.expires, a.reason));
+        } else {
+            f.ack = Some(format!(
+                "(acknowledgement expired {}: {})",
+                a.expires, a.reason
+            ));
+        }
+    }
+}
+
+/// `<state>/sessions/acks.json` — beside the handoff notes.
+fn acks_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("sessions").join("acks.json")
+}
+
+/// Every recorded acknowledgement, expired ones included. A missing
+/// file is an empty store; an unparsable one is an error, never an
+/// empty store (a rewrite would drop the history).
+fn read_acks(state_dir: &Path) -> Result<Vec<Ack>> {
+    let path = acks_path(state_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::internal(format!("{}: {e}", path.display()))),
+    };
+    serde_json::from_str::<AckFile>(&text)
+        .map(|f| f.acks)
+        .map_err(|e| Error::internal(format!("{} is not an ack store: {e}", path.display())))
+}
+
+/// `--expires`: a duration (`90m`, `12h`, `3d`, bare seconds) from
+/// `now`, or an absolute `YYYY-MM-DDTHH:MM:SSZ`. Must land in the
+/// future and within `ACK_MAX_SECS`.
+fn parse_expiry(spec: &str, now: i64) -> Result<i64> {
+    let at = match itime::parse_iso(spec) {
+        Some(t) => t,
+        None => {
+            let (num, mult) = match spec.chars().last() {
+                Some('s') => (&spec[..spec.len() - 1], 1),
+                Some('m') => (&spec[..spec.len() - 1], 60),
+                Some('h') => (&spec[..spec.len() - 1], 3_600),
+                Some('d') => (&spec[..spec.len() - 1], 86_400),
+                _ => (spec, 1),
+            };
+            let n: i64 = num.parse().map_err(|_| {
+                Error::rejected(format!(
+                    "--expires '{spec}': use a duration (90m, 12h, 3d) or YYYY-MM-DDTHH:MM:SSZ"
+                ))
+            })?;
+            now.saturating_add(n.saturating_mul(mult))
+        }
+    };
+    if at <= now {
+        return Err(Error::rejected(format!(
+            "--expires '{spec}' is not in the future"
+        )));
+    }
+    if at - now > ACK_MAX_SECS {
+        return Err(Error::rejected(format!(
+            "--expires '{spec}' is past the 14-day maximum — acknowledge again when it lapses"
+        )));
+    }
+    Ok(at)
+}
+
+/// Who acknowledged: the cadence alias inside a pane, else the OS user.
+fn actor() -> String {
+    std::env::var("CADENCE_ALIAS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("USER").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "operator".to_string())
+}
+
+pub struct AckOptions {
+    pub key: Option<String>,
+    pub reason: Option<String>,
+    pub expires: Option<String>,
+    pub list: bool,
+    pub json: bool,
+    pub state_dir: PathBuf,
+}
+
+/// `cadence session ack <key> --reason … --expires …` records one
+/// acknowledgement; `--list` prints every record, expired ones marked
+/// expired. Records are appended, never rewritten or pruned.
+pub fn run_ack(opts: &AckOptions) -> Result<i32> {
+    let now = itime::now_epoch();
+    let path = acks_path(&opts.state_dir);
+    let mut acks = read_acks(&opts.state_dir)?;
+    if opts.list {
+        let state = |a: &Ack| {
+            if itime::parse_iso(&a.expires).is_some_and(|e| e > now) {
+                "active"
+            } else {
+                "expired"
+            }
+        };
+        if opts.json {
+            let rows: Vec<Value> = acks
+                .iter()
+                .map(|a| {
+                    let mut v = serde_json::to_value(a).unwrap_or_default();
+                    v["state"] = json!(state(a));
+                    v
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "session-acks", "path": path, "acks": rows,
+                }))
+                .unwrap_or_default()
+            );
+        } else if acks.is_empty() {
+            println!("no acknowledgements ({})", path.display());
+        } else {
+            println!("acknowledgements ({})", path.display());
+            for a in &acks {
+                let st = state(a);
+                println!(
+                    "{st:<8} {}  {} {}  by {} at {}: {}",
+                    a.key,
+                    if st == "active" { "until" } else { "expired" },
+                    a.expires,
+                    a.actor,
+                    a.created,
+                    scrub_line(&a.reason)
+                );
+            }
+        }
+        return Ok(0);
+    }
+    let key = opts
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty() && !k.contains(char::is_whitespace))
+        .ok_or_else(|| {
+            Error::rejected("an ack needs the item key session start printed in [brackets]")
+        })?;
+    let reason = opts
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| Error::rejected("--reason is required — say why this is known"))?;
+    // CAD-109: the reason is agent-authored text written durably — a
+    // credential-shaped reason is refused before anything is written.
+    let allow = crate::secret::Allowlist::load(&opts.state_dir)?;
+    let secret_warnings = crate::secret::guard_with("session ack", reason, &allow)?;
+    let expires = parse_expiry(
+        opts.expires
+            .as_deref()
+            .ok_or_else(|| Error::rejected("--expires is required (at most 14d)"))?,
+        now,
+    )?;
+    let ack = Ack {
+        key: key.to_string(),
+        reason: reason.to_string(),
+        actor: actor(),
+        created: itime::iso(now),
+        expires: itime::iso(expires),
+    };
+    acks.push(ack.clone());
+    let dir = opts.state_dir.join("sessions");
+    let tmp = dir.join(format!(".acks.json.{}", std::process::id()));
+    let body = serde_json::to_string_pretty(&AckFile { acks })
+        .map_err(|e| Error::internal(e.to_string()))?;
+    std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::write(&tmp, body))
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .map_err(|e| Error::internal(format!("{}: {e}", path.display())))?;
+    if opts.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "session-ack", "path": path, "ack": ack,
+                "secret_warnings": crate::secret::warnings_json(&secret_warnings),
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "acknowledged {} until {} — {} ({})",
+            ack.key,
+            ack.expires,
+            scrub_line(&ack.reason),
+            path.display()
+        );
+    }
+    Ok(0)
+}
+
+// ---------- scope ----------
+
+/// Which project `session start` judges. Findings outside it collapse
+/// into one summary row that never fails the gate.
+enum Focus {
+    /// Fleet-wide — `--all`, or (with the note) no project matched the
+    /// cwd.
+    All(Option<String>),
+    /// `--project`, or the project whose repo holds the cwd.
+    Project(String),
+}
+
+impl Focus {
+    fn covers(&self, project: Option<&str>) -> bool {
+        match (self, project) {
+            (Focus::All(_), _) | (_, None) => true,
+            (Focus::Project(want), Some(p)) => want == p,
+        }
+    }
+
+    fn json(&self) -> Value {
+        match self {
+            Focus::All(note) => json!({"project": null, "all": true, "note": note}),
+            Focus::Project(p) => json!({"project": p, "all": false}),
+        }
+    }
+}
+
+/// The project whose declared repo holds `cwd` — `issue`'s own match
+/// (remote first, then checkout path) without `CADENCE_PROJECT`: an
+/// ambient env var must never narrow what the gate judges.
+fn cwd_project(projects: &[project::Project], cwd: &Path) -> Option<String> {
+    let (root, remote) = project::repo_identity(cwd)?;
+    if let Some(remote) = &remote {
+        let hit = projects.iter().find(|p| {
+            p.repos.iter().any(|r| {
+                r.remote
+                    .as_deref()
+                    .is_some_and(|x| project::normalize_remote(x) == *remote)
+            })
+        });
+        if let Some(p) = hit {
+            return Some(p.key.clone());
+        }
+    }
+    projects
+        .iter()
+        .find(|p| {
+            p.repos.iter().any(|r| {
+                r.path.as_deref().is_some_and(|path| {
+                    let path = project::expand_home(path);
+                    path.canonicalize().unwrap_or(path) == root
+                })
+            })
+        })
+        .map(|p| p.key.clone())
+}
+
+/// Alias → project for every agent something attributes: its cwd under
+/// a declared repo checkout (deepest match), else the one project whose
+/// open issues it owns. Anything else stays unattributed.
+fn agent_projects(agents: &[Value], sc: &Scope) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for a in agents {
+        let alias = a["alias"].as_str().unwrap_or_default();
+        let cwd = Path::new(a["cwd"].as_str().unwrap_or_default());
+        let by_cwd = sc
+            .repos
+            .iter()
+            .filter(|(_, _, p)| {
+                // An empty declared path starts_with()s every cwd.
+                !p.as_os_str().is_empty() && !cwd.as_os_str().is_empty() && cwd.starts_with(p)
+            })
+            .max_by_key(|(_, _, p)| p.components().count())
+            .map(|(k, _, _)| k.clone());
+        let key = by_cwd.or_else(|| {
+            let owned: HashSet<&str> = sc
+                .views
+                .iter()
+                .filter(|v| {
+                    v.issue.front.owner.as_deref() == Some(alias)
+                        && !matches!(v.status.as_str(), "done" | "dropped")
+                })
+                .map(|v| v.issue.project.as_str())
+                .collect();
+            (owned.len() == 1).then(|| owned.into_iter().next().unwrap_or_default().to_string())
+        });
+        if let Some(k) = key {
+            out.insert(alias.to_string(), k);
+        }
+    }
+    out
+}
+
+/// `CAD-12` — an uppercase prefix, a dash, digits.
+fn is_issue_id(w: &str) -> bool {
+    w.split_once('-').is_some_and(|(p, n)| {
+        !p.is_empty()
+            && p.starts_with(|c: char| c.is_ascii_uppercase())
+            && p.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            && !n.is_empty()
+            && n.chars().all(|c| c.is_ascii_digit())
+    })
+}
+
+/// A stable ack key, plus the agent alias when the row names one, for
+/// an overview needs-me row. The rows carry `kind`/`title`/`command`
+/// but no id, so the identity is read back from the shapes `overview`
+/// writes: `agent <alias> …`, `… for <alias>`, `PR #<n> …` beside
+/// `--repo <slug>`, `<ISSUE-ID> …`. A shape it can't read keys on the
+/// kind alone — coarse, never wrong about which row it names.
+fn need_key(n: &Value) -> (String, Option<String>) {
+    let kind = n["kind"].as_str().unwrap_or("needs");
+    let title = n["title"].as_str().unwrap_or_default();
+    let words: Vec<&str> = title.split_whitespace().collect();
+    match kind {
+        "inbox_unread" | "approval" => {
+            if let Some((_, alias)) = title.rsplit_once(" for ") {
+                let alias = alias.trim();
+                let k = if kind == "inbox_unread" {
+                    "inbox"
+                } else {
+                    kind
+                };
+                return (format!("{k}:{alias}"), Some(alias.to_string()));
+            }
+        }
+        "merge" | "pr_no_verdict" => {
+            let num = title
+                .strip_prefix("PR #")
+                .and_then(|r| r.split_whitespace().next());
+            let cmd: Vec<&str> = n["command"]
+                .as_str()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect();
+            let slug = cmd
+                .iter()
+                .position(|w| *w == "--repo")
+                .and_then(|i| cmd.get(i + 1));
+            if let (Some(num), Some(slug)) = (num, slug) {
+                return (format!("{kind}:{slug}#{num}"), None);
+            }
+        }
+        "ci_red" => {
+            if let Some(slug) = words.last() {
+                return (format!("{kind}:{slug}"), None);
+            }
+        }
+        _ => {}
+    }
+    if words.first() == Some(&"agent") {
+        if let Some(alias) = words.get(1) {
+            return (format!("{kind}:{alias}"), Some(alias.to_string()));
+        }
+    }
+    if let Some(id) = words.first().filter(|w| is_issue_id(w)) {
+        return (format!("{kind}:{id}"), None);
+    }
+    (kind.to_string(), None)
+}
+
+/// Findings outside the focus, as one summary row: count and worst
+/// severity per project. Capped at `warn` — another project's backlog
+/// is worth a line, never a no-go.
+fn others_row(out: &[Finding], focus: &Focus) -> Option<Row> {
+    if out.is_empty() {
+        return None;
+    }
+    let mut per: Vec<(String, usize, Sev)> = Vec::new();
+    for f in out {
+        let p = f.project.clone().unwrap_or_default();
+        match per.iter_mut().find(|(k, _, _)| *k == p) {
+            Some(e) => {
+                e.1 += 1;
+                e.2 = e.2.max(f.sev);
+            }
+            None => per.push((p, 1, f.sev)),
+        }
+    }
+    per.sort();
+    let worst = per.iter().map(|e| e.2).max().unwrap_or(Sev::Ok);
+    let here = match focus {
+        Focus::Project(p) => p.as_str(),
+        Focus::All(_) => "",
+    };
+    let mut row = Row::new("others");
+    row.sev = worst.min(Sev::Warn);
+    row.detail = format!(
+        "{} item(s) outside {here}: {}",
+        out.len(),
+        per.iter()
+            .map(|(k, n, s)| format!("{k} {n} (worst {})", s.name()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    row.remedy = Some("cadence session start --all".to_string());
+    Some(row)
+}
+
+/// A check row from its keyed findings — acks applied, the ones in
+/// focus kept, the rest handed back for the summary row.
+fn findings_row(
+    name: &'static str,
+    mut findings: Vec<Finding>,
+    focus: &Focus,
+    acks: &Acks,
+    now: i64,
+    clean: &str,
+    elsewhere: &mut Vec<Finding>,
+) -> Row {
+    for f in &mut findings {
+        acks.apply(f, now);
+    }
+    let (mine, theirs): (Vec<Finding>, Vec<Finding>) = findings
+        .into_iter()
+        .partition(|f| focus.covers(f.project.as_deref()));
+    elsewhere.extend(theirs);
+    let mut row = Row::new(name);
+    if mine.is_empty() {
+        return row.ok(clean);
+    }
+    row.sev = mine.iter().map(|f| f.sev).max().unwrap_or(Sev::Ok);
+    row.detail = format!("{} item(s)", mine.len());
+    row.findings = mine;
+    row
+}
+
 // ---------- session start ----------
 
 pub struct StartOptions {
     pub project: Option<String>,
+    /// `--all`: judge every project, today's fleet-wide gate.
+    pub all: bool,
     pub json: bool,
     pub fix: bool,
     /// `--host-report` fixture — debug/tests only; labelled in output.
@@ -837,20 +1433,53 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
     let mut rows: Vec<Row> = Vec::new();
     let mut fixes: Vec<String> = Vec::new();
 
+    let now = itime::now_epoch();
+    // ---- scope: every project is read; the focus decides which
+    // findings can move the exit code (CAD-257) ----
+    let sc = scope(None)?;
+    let focus = if opts.all {
+        Focus::All(None)
+    } else if let Some(p) = &opts.project {
+        if !sc.projects.iter().any(|x| &x.key == p) {
+            return Err(Error::rejected(format!(
+                "unknown project '{p}' — `cadence issue project ls` lists the keys"
+            )));
+        }
+        Focus::Project(p.clone())
+    } else {
+        match cwd_project(&sc.projects, &opts.cwd) {
+            Some(p) => Focus::Project(p),
+            None => Focus::All(Some(format!(
+                "{} is not inside a known project repo — judging every project, as --all",
+                opts.cwd.display()
+            ))),
+        }
+    };
+    let acks = Acks::load(&opts.state_dir);
+    if let Some(e) = &acks.error {
+        rows.push(Row::new("acks").warn(
+            format!("{e} — no acknowledgement applied"),
+            "fix or move the file, then `cadence session ack --list`",
+        ));
+    }
+
     // ---- host: the CAD-72 watchdog — disk, WAL, pipes, orphans,
     // temp dirs, stale worktrees in one read-only scan ----
-    let sc = scope(opts.project.as_deref())?;
     let host_scan = host_report(
         &host_scan_for(opts.state_dir.clone(), opts.cwd.clone()),
         opts.host_report.as_deref(),
     )?;
-    let host = host_row("host", &host_scan, opts.host_report.as_deref());
+    let host = host_row("host", &host_scan, opts.host_report.as_deref(), &acks, now);
     rows.push(host);
 
     // ---- binary vs main ----
     let mut bin = Row::new("binary");
     let repo_for_binary = match &opts.project {
-        Some(_) => sc.repos.first().map(|(_, _, p)| p.clone()),
+        Some(p) => sc
+            .repos
+            .iter()
+            .find(|(k, _, _)| k == p)
+            .map(|(_, _, r)| r.clone()),
         None => overview::build_repo_match_pub(&sc.projects).map(|(_, r)| r),
     };
     match repo_for_binary {
@@ -996,17 +1625,20 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
     }
     rows.push(board);
 
-    // ---- reconcile + inbox ----
-    let mut recon = Row::new("reconcile");
-    let mut inbox = Row::new("inbox");
-    let mut inbox_warns = Vec::new();
+    // ---- reconcile + inbox: keyed findings, each attributed to a
+    // project where something names one ----
+    let mut elsewhere: Vec<Finding> = Vec::new();
     if !fl.reachable {
-        recon = recon.fail(
+        rows.push(Row::new("reconcile").fail(
             "cannot inspect agents — daemon unreachable",
             "cadence daemon start",
-        );
-        inbox = inbox.fail("cannot read mailboxes — daemon unreachable", "");
+        ));
+        rows.push(Row::new("inbox").fail("cannot read mailboxes — daemon unreachable", ""));
     } else {
+        let owner_of = agent_projects(&fl.agents, &sc);
+        let agent_proj = |alias: &str| owner_of.get(alias).cloned();
+        let mut recon: Vec<Finding> = Vec::new();
+        let mut inbox: Vec<Finding> = Vec::new();
         // Overview computes the shared needs-me rows once (gh cache
         // included); inbox rows split out into their own check.
         let pm_dir = issue::default_dir().unwrap_or_default();
@@ -1014,8 +1646,8 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
         let needs = view["needs_me"].as_array().cloned().unwrap_or_default();
         // Hard failures: a fenced agent and an unknown message both
         // mean a turn's outcome is unaccounted for — the gate refuses
-        // go until a human reconciles them. Everything else warns.
-        let mut recon_fail = false;
+        // go until a human reconciles (or acknowledges) them.
+        // Everything else warns.
         for n in &needs {
             let kind = n["kind"].as_str().unwrap_or_default();
             let line = format!(
@@ -1023,13 +1655,22 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                 n["title"].as_str().unwrap_or_default(),
                 n["command"].as_str().unwrap_or_default()
             );
-            if kind == "inbox_unread" {
-                inbox_warns.push(line);
+            let (key, alias) = need_key(n);
+            let project = n["project"]
+                .as_str()
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .or_else(|| alias.as_deref().and_then(agent_proj));
+            let sev = if kind == "fenced" {
+                Sev::Fail
             } else {
-                if kind == "fenced" {
-                    recon_fail = true;
-                }
-                recon.items.push(line);
+                Sev::Warn
+            };
+            let f = Finding::new(key, project, sev, line);
+            if kind == "inbox_unread" {
+                inbox.push(f);
+            } else {
+                recon.push(f);
             }
         }
         // Unknown messages — a fence the overview rows don't name.
@@ -1040,7 +1681,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
             for m in show["messages"].as_array().cloned().unwrap_or_default() {
                 if m["state"].as_str() == Some("unknown") {
                     named = true;
-                    recon_fail = true;
+                    let id = m["id"].as_str().unwrap_or("?");
                     let head = m["body"]
                         .as_str()
                         .unwrap_or_default()
@@ -1050,17 +1691,22 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                         .chars()
                         .take(50)
                         .collect::<String>();
-                    recon.items.push(format!(
-                        "agent {alias}: unknown message {} ({head}) — cadence message reconcile {} --status interrupted",
-                        m["id"].as_str().unwrap_or("?"),
-                        m["id"].as_str().unwrap_or("?")
+                    recon.push(Finding::new(
+                        format!("reconcile:{id}"),
+                        agent_proj(alias),
+                        Sev::Fail,
+                        format!(
+                            "agent {alias}: unknown message {id} ({head}) — cadence message reconcile {id} --status interrupted"
+                        ),
                     ));
                 }
             }
             if !named && show["unknown"].as_i64().unwrap_or(0) > 0 {
-                recon_fail = true;
-                recon.items.push(format!(
-                    "agent {alias}: unknown message(s) — cadence agent show {alias}"
+                recon.push(Finding::new(
+                    format!("unknown:{alias}"),
+                    agent_proj(alias),
+                    Sev::Fail,
+                    format!("agent {alias}: unknown message(s) — cadence agent show {alias}"),
                 ));
             }
         }
@@ -1070,8 +1716,8 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                 continue;
             }
             let id = &v.issue.front.id;
-            match v.issue.front.owner.as_deref() {
-                None => recon.items.push(format!(
+            let text = match v.issue.front.owner.as_deref() {
+                None => Some(format!(
                     "{id} doing with no owner — cadence issue set {id} owner=<alias>"
                 )),
                 Some(owner) => {
@@ -1083,12 +1729,18 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                                 "stopped" | "stopping" | "offline"
                             )
                     });
-                    if !live {
-                        recon.items.push(format!(
-                            "{id} doing but owner {owner} is not live — resume or reassign"
-                        ));
-                    }
+                    (!live).then(|| {
+                        format!("{id} doing but owner {owner} is not live — resume or reassign")
+                    })
                 }
+            };
+            if let Some(text) = text {
+                recon.push(Finding::new(
+                    format!("doing:{id}"),
+                    Some(v.issue.project.clone()),
+                    Sev::Warn,
+                    text,
+                ));
             }
         }
         // Open PR on a cadence/<wt> branch whose local worktree is gone
@@ -1096,7 +1748,7 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
         // the worktree may legitimately live on another host).
         let (pr_branches, gh_repos) = gh_open(&opts.state_dir, &sc, false);
         for (slug, data) in &gh_repos {
-            let Some((_, _, root)) = sc
+            let Some((key, _, root)) = sc
                 .repos
                 .iter()
                 .find(|(_, s, _)| s.as_deref() == Some(slug.as_str()))
@@ -1111,9 +1763,12 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                     continue;
                 };
                 if !root.join(".cadence").join("wt").join(name).exists() {
-                    recon.items.push(format!(
-                        "PR #{} branch {head} — no .cadence/wt/{name} locally",
-                        pr["number"].as_i64().unwrap_or(0)
+                    let n = pr["number"].as_i64().unwrap_or(0);
+                    recon.push(Finding::new(
+                        format!("pr:{slug}#{n}"),
+                        Some(key.clone()),
+                        Sev::Warn,
+                        format!("PR #{n} branch {head} — no .cadence/wt/{name} locally"),
                     ));
                 }
             }
@@ -1126,40 +1781,56 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                 .and_then(|id| sc.issue_status.get(&id))
                 .is_some_and(|s| !matches!(s.as_str(), "done" | "dropped"));
             if !has_pr && !open_issue {
-                recon.items.push(format!(
-                    "orphan worktree {}/.cadence/wt/{name} — no open PR or issue; \
-                     inspect, then `git -C {} worktree remove .cadence/wt/{name}`",
-                    root.display(),
-                    root.display()
+                let project = sc
+                    .repos
+                    .iter()
+                    .find(|(_, _, r)| *r == root)
+                    .map(|(k, _, _)| k.clone());
+                recon.push(Finding::new(
+                    format!("worktree:{}/.cadence/wt/{name}", root.display()),
+                    project,
+                    Sev::Warn,
+                    format!(
+                        "orphan worktree {}/.cadence/wt/{name} — no open PR or issue; \
+                         inspect, then `git -C {} worktree remove .cadence/wt/{name}`",
+                        root.display(),
+                        root.display()
+                    ),
                 ));
             }
         }
-        if !recon.items.is_empty() {
-            recon.sev = if recon_fail { Sev::Fail } else { Sev::Warn };
-            recon.detail = format!("{} item(s)", recon.items.len());
-        } else {
-            recon = recon.ok("nothing stale");
-        }
-        if inbox_warns.is_empty() {
-            inbox = inbox.ok("no unread");
-        } else {
-            inbox = Row {
-                name: "inbox",
-                sev: Sev::Warn,
-                detail: format!("{} mailbox(es)", inbox_warns.len()),
-                remedy: None,
-                fixed: None,
-                items: inbox_warns,
-            };
-        }
+        rows.push(findings_row(
+            "reconcile",
+            recon,
+            &focus,
+            &acks,
+            now,
+            "nothing stale",
+            &mut elsewhere,
+        ));
+        rows.push(findings_row(
+            "inbox",
+            inbox,
+            &focus,
+            &acks,
+            now,
+            "no unread",
+            &mut elsewhere,
+        ));
     }
-    rows.push(recon);
-    rows.push(inbox);
+    if let Some(r) = others_row(&elsewhere, &focus) {
+        rows.push(r);
+    }
 
-    finish_start(rows, opts.json, host_source(opts.host_report.as_deref()))
+    finish_start(
+        rows,
+        &focus,
+        opts.json,
+        host_source(opts.host_report.as_deref()),
+    )
 }
 
-fn finish_start(rows: Vec<Row>, json_out: bool, host_source: String) -> Result<i32> {
+fn finish_start(rows: Vec<Row>, focus: &Focus, json_out: bool, host_source: String) -> Result<i32> {
     let worst = rows.iter().map(|r| r.sev).max().unwrap_or(Sev::Ok);
     let exit = match worst {
         Sev::Ok => 0,
@@ -1172,6 +1843,7 @@ fn finish_start(rows: Vec<Row>, json_out: bool, host_source: String) -> Result<i
             serde_json::to_string_pretty(&json!({
                 "kind": "session-start",
                 "go": worst != Sev::Fail,
+                "scope": focus.json(),
                 "host_source": host_source,
                 "checks": rows.iter().map(|r| r.json()).collect::<Vec<_>>(),
             }))
@@ -1184,8 +1856,23 @@ fn finish_start(rows: Vec<Row>, json_out: bool, host_source: String) -> Result<i
             Sev::Fail => "NO-GO",
         };
         println!("session start — {label}");
+        match focus {
+            Focus::Project(p) => {
+                println!("scope: project {p} — other projects summarised; --all for the fleet")
+            }
+            Focus::All(None) => println!("scope: every project (--all)"),
+            Focus::All(Some(note)) => println!("scope: {}", scrub_line(note)),
+        }
         for r in &rows {
             print_row(r);
+        }
+        let failing = rows.iter().any(|r| {
+            (r.sev == Sev::Fail && r.key.is_some()) || r.findings.iter().any(|f| f.sev == Sev::Fail)
+        });
+        if failing {
+            println!(
+                "known and parked? cadence session ack <key> --reason <why> --expires <3d, max 14d>"
+            );
         }
     }
     Ok(exit)
@@ -1370,19 +2057,13 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
             opts.idle_secs
         ));
     } else {
-        idle_row = Row {
-            name: "agents",
-            sev: Sev::Ok,
-            detail: format!(
-                "{} agent(s) idle > {}s{}",
-                stop_candidates.len(),
-                opts.idle_secs,
-                if opts.dry_run { " (dry-run)" } else { "" }
-            ),
-            remedy: None,
-            fixed: None,
-            items: stop_candidates.clone(),
-        };
+        idle_row = Row::new("agents").ok(format!(
+            "{} agent(s) idle > {}s{}",
+            stop_candidates.len(),
+            opts.idle_secs,
+            if opts.dry_run { " (dry-run)" } else { "" }
+        ));
+        idle_row.items = stop_candidates.clone();
         if !opts.dry_run {
             for (i, alias) in stop_candidates.iter().enumerate() {
                 // The fleet snapshot is stale — the finish sweep ran
@@ -1474,7 +2155,8 @@ pub fn run_end(opts: &EndOptions) -> Result<i32> {
     // a gate: a full disk is `warn` here — `session start` is where a
     // full host is correctly `fail` — so only this verb's own failures
     // (a sweep RPC error, an unwritable handoff) set exit 2. ----
-    let mut sweep_row = host_row("sweep", &host_scan, opts.host_report.as_deref());
+    let acks = Acks::load(&opts.state_dir);
+    let mut sweep_row = host_row("sweep", &host_scan, opts.host_report.as_deref(), &acks, now);
     if sweep_row.sev == Sev::Fail {
         sweep_row.sev = Sev::Warn;
     }
@@ -2008,5 +2690,147 @@ mod tests {
         assert_eq!(j["fixed"], "restarted --api-key=[REDACTED]");
         assert_eq!(j["items"][0], "pid 9 --secret=[REDACTED]");
         assert_eq!(j["items"][1], "clean");
+    }
+
+    fn ack(key: &str, expires: i64) -> Ack {
+        Ack {
+            key: key.into(),
+            reason: "known".into(),
+            actor: "t".into(),
+            created: itime::iso(0),
+            expires: itime::iso(expires),
+        }
+    }
+
+    #[test]
+    fn ack_downgrades_fail_until_expiry_then_fails_again() {
+        let now = 1_800_000_000;
+        let acks = Acks {
+            list: vec![ack("reconcile:m1", now + 60)],
+            error: None,
+        };
+        let fresh = || Finding::new("reconcile:m1".into(), None, Sev::Fail, "lost".into());
+        let mut f = fresh();
+        acks.apply(&mut f, now);
+        assert!(f.sev == Sev::Warn);
+        assert!(f.ack.as_deref().unwrap().starts_with("(acknowledged until"));
+        // Same record, clock past its expiry: fail again, still named.
+        let mut f = fresh();
+        acks.apply(&mut f, now + 61);
+        assert!(f.sev == Sev::Fail);
+        assert!(f
+            .ack
+            .as_deref()
+            .unwrap()
+            .starts_with("(acknowledgement expired"));
+        // Another key is untouched; a warn stays warn under an ack.
+        let mut g = Finding::new("host:disk".into(), None, Sev::Fail, "x".into());
+        acks.apply(&mut g, now);
+        assert!(g.sev == Sev::Fail && g.ack.is_none());
+        let mut w = Finding::new("reconcile:m1".into(), None, Sev::Warn, "x".into());
+        acks.apply(&mut w, now);
+        assert!(w.sev == Sev::Warn && w.ack.is_some());
+        // The latest expiry decides — a stale record can't mask a
+        // fresh one, and vice versa.
+        let both = Acks {
+            list: vec![ack("reconcile:m1", now - 10), ack("reconcile:m1", now + 10)],
+            error: None,
+        };
+        let mut f = fresh();
+        both.apply(&mut f, now);
+        assert!(f.sev == Sev::Warn);
+    }
+
+    #[test]
+    fn expiry_parses_durations_and_timestamps_within_14_days() {
+        let now = 1_800_000_000;
+        assert_eq!(parse_expiry("3d", now).unwrap(), now + 3 * 86_400);
+        assert_eq!(parse_expiry("90m", now).unwrap(), now + 5_400);
+        assert_eq!(parse_expiry("14d", now).unwrap(), now + 14 * 86_400);
+        assert_eq!(
+            parse_expiry(&itime::iso(now + 3_600), now).unwrap(),
+            now + 3_600
+        );
+        for bad in ["15d", "0", "-1h", "soon", &itime::iso(now - 1)] {
+            assert!(parse_expiry(bad, now).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn other_projects_collapse_and_cap_at_warn() {
+        let f = |key: &str, p: Option<&str>, sev| {
+            Finding::new(key.into(), p.map(str::to_string), sev, key.into())
+        };
+        let items = || {
+            vec![
+                f("worktree:/a", Some("tst"), Sev::Warn),
+                f("reconcile:m-oth", Some("oth"), Sev::Fail),
+                f("worktree:/b", Some("oth"), Sev::Warn),
+                // Unattributed stays in scope — fail closed.
+                f("fenced:w9", None, Sev::Fail),
+            ]
+        };
+        let none = Acks::default();
+        let focus = Focus::Project("tst".into());
+        let mut elsewhere = Vec::new();
+        let row = findings_row("reconcile", items(), &focus, &none, 0, "", &mut elsewhere);
+        let keys: Vec<&str> = row.findings.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["worktree:/a", "fenced:w9"]);
+        assert!(row.sev == Sev::Fail);
+        let others = others_row(&elsewhere, &focus).unwrap();
+        assert!(others.sev == Sev::Warn, "capped at warn");
+        assert!(
+            others.detail.contains("oth 2 (worst fail)"),
+            "{}",
+            others.detail
+        );
+        // --all: everything judged, nothing summarised.
+        let mut elsewhere = Vec::new();
+        let row = findings_row(
+            "reconcile",
+            items(),
+            &Focus::All(None),
+            &none,
+            0,
+            "",
+            &mut elsewhere,
+        );
+        assert_eq!(row.findings.len(), 4);
+        assert!(others_row(&elsewhere, &Focus::All(None)).is_none());
+    }
+
+    #[test]
+    fn need_keys_read_identity_from_overview_rows() {
+        let row = |kind: &str, title: &str, command: &str| {
+            need_key(&json!({"kind": kind, "title": title, "command": command}))
+        };
+        assert_eq!(
+            row("fenced", "agent w1 fenced — reconcile then resume", "x"),
+            ("fenced:w1".into(), Some("w1".into()))
+        );
+        assert_eq!(
+            row("inbox_unread", "644 unread for fable-cc", "x"),
+            ("inbox:fable-cc".into(), Some("fable-cc".into()))
+        );
+        assert_eq!(
+            row(
+                "pr_no_verdict",
+                "PR #12 fix for thing — no verdict",
+                "gh pr view 12 --repo o/r"
+            ),
+            ("pr_no_verdict:o/r#12".into(), None)
+        );
+        assert_eq!(
+            row("intake", "CAD-3 idea report — for everyone", "x"),
+            ("intake:CAD-3".into(), None)
+        );
+        assert_eq!(
+            row("ci_red", "default branch CI failing on o/r", "x"),
+            ("ci_red:o/r".into(), None)
+        );
+        assert_eq!(
+            row("drift", "3 merged commit(s) not running", "x").0,
+            "drift"
+        );
     }
 }
