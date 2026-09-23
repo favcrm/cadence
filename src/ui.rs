@@ -1207,19 +1207,23 @@ fn tailnet_request(request: &Request, opts: &ServeOpts) -> bool {
     peer_ok && name.eq_ignore_ascii_case(dns)
 }
 
-/// Who a board write commits as (CAD-254, CAD-263). The cross-site
-/// guards stop browsers, not local processes: an agent with a shell can
-/// send the same headers. So a write derives its caller from the peer
-/// module the daemon shares — the TCP peer's process, attributed to a
-/// registered pane by a process signal: its `/proc` ancestry or the
-/// pane's pty on its stdio. A caller-chosen `CADENCE_ALIAS` alone never
-/// attributes ([`crate::peer::tcp_peer_pane`]).
+/// Who a board write commits as (CAD-254, CAD-263, CAD-335). The
+/// cross-site guards stop browsers, not local processes: an agent with a
+/// shell can send the same headers. So a write derives its caller from
+/// the peer module the daemon shares — the TCP peer's process,
+/// attributed to a registered pane by a process signal (its `/proc`
+/// ancestry or the pane's pty on its stdio), or to a managed endpoint
+/// whose provider process is on its ancestry. A caller-chosen
+/// `CADENCE_ALIAS` alone never attributes
+/// ([`crate::peer::tcp_peer_agent`]).
 enum WriteCaller {
-    /// The operator — `actor` is `operator (ui)` or a trusted tailnet
-    /// login; comment authors and monitor acks record `operator`.
+    /// Tied to no agent — `actor` is `operator (ui)` or a trusted
+    /// tailnet login; comment authors and monitor acks record
+    /// `operator`. This is a default, not a proof (see [`write_caller`]).
     Operator(String),
-    /// A process tied to a registered pane IS that agent: its alias is
-    /// the actor and author, never `operator`.
+    /// A process tied to a registered pane, or descending from a live
+    /// managed endpoint's provider, IS that agent: its alias is the
+    /// actor and author, never `operator`.
     Agent(String),
 }
 
@@ -1239,27 +1243,38 @@ impl WriteCaller {
     }
 }
 
-/// Derive the write caller, or refuse (`403`, `check:
-/// "caller_identity"`) when the peer cannot be attributed — fail
-/// closed, never `operator` by default. A tailnet-shaped request keeps
-/// its header-based identity unless its peer provably descends from a
-/// pane: the real proxy is another user's process this user cannot
-/// inspect, so an unattributable peer there is the expected case.
+/// Derive the write caller:
+///
+/// - a peer tied to a registered pane, or descending from a live
+///   managed endpoint's provider process, is that agent — never the
+///   operator, whatever the request's shape or headers;
+/// - a peer that cannot be attributed at all (unreadable ancestry, a
+///   socket owner this user cannot see, several agents, a store the
+///   daemon cannot list) is refused (`403`, `check: "caller_identity"`)
+///   — unless the request is tailnet-shaped: the real tailnet proxy is
+///   another user's process this user cannot inspect;
+/// - a peer that walks cleanly and is tied to NO agent is still the
+///   operator (`operator (ui)` or its tailnet login). That is a
+///   DEFAULT, not proof: the operator's own peer (the tailnet `socat`
+///   relay, an ssh tunnel) carries no signal, and neither does a
+///   same-uid process that left every agent's ancestry (`setsid -f`
+///   with redirected stdio, an orphan of a dead managed provider).
+///   Replacing it with positive proof is CAD-335 phase 2 (ADR 0004).
 fn write_caller(
     request: &Request,
     state_dir: &Path,
     opts: &ServeOpts,
 ) -> std::result::Result<WriteCaller, HttpResp> {
-    let pane = registered_panes(state_dir).and_then(|panes| {
-        if panes.is_empty() {
+    let agent = agent_roots(state_dir).and_then(|roots| {
+        if roots.is_empty() {
             return Ok(None);
         }
         let peer = request
             .remote_addr()
             .ok_or_else(|| "the request has no peer address".to_string())?;
-        crate::peer::tcp_peer_pane(opts.port, *peer, &panes)
+        crate::peer::tcp_peer_agent(opts.port, *peer, &roots)
     });
-    match pane {
+    match agent {
         Ok(Some(alias)) => Ok(WriteCaller::Agent(alias)),
         Ok(None) => Ok(WriteCaller::Operator(request_actor(request, opts))),
         Err(_) if tailnet_request(request, opts) => {
@@ -1270,34 +1285,54 @@ fn write_caller(
             &format!(
                 "board write refused: caller identity underivable — {why}. \
                  Writes attribute the peer process to the registered pane \
-                 it is tied to, or to the operator when it is tied to none."
+                 or managed endpoint it is tied to, or to the operator when \
+                 it is tied to none."
             ),
         )),
     }
 }
 
-/// Live registered panes, pane pid → alias — the same rows the
-/// daemon's slot identity resolves against (`pty` endpoints with a pid
-/// and a generation), read over the daemon's `agent_list` RPC. No
-/// store file means no agent was ever registered here: provably no
-/// panes. A store the daemon cannot answer for is an error.
-fn registered_panes(state_dir: &Path) -> std::result::Result<HashMap<u32, String>, String> {
+/// The live agents a write can be attributed to, read over the
+/// daemon's `agent_list` RPC:
+///
+/// - registered panes, pane pid → alias — the same rows the daemon's
+///   slot identity resolves against (`pty` endpoints with a pid and a
+///   generation);
+/// - managed endpoints (CAD-335), provider pid → alias — a claude or
+///   codex `managed`/`managed-ws` endpoint with a pid: the provider
+///   process the daemon launched, the same pid its build-slot
+///   enrollment roots at. The daemon clears the pid when the endpoint
+///   closes, stops or errors.
+///
+/// No store file means no agent was ever registered here: provably no
+/// agents. A store the daemon cannot answer for is an error.
+fn agent_roots(state_dir: &Path) -> std::result::Result<crate::peer::AgentRoots, String> {
+    let mut roots = crate::peer::AgentRoots::default();
     if !state_dir.join("cadence.sqlite3").exists() {
-        return Ok(HashMap::new());
+        return Ok(roots);
     }
     let list = client::rpc(state_dir, "agent_list", json!({}))
-        .map_err(|e| format!("the daemon cannot list registered panes ({e})"))?;
+        .map_err(|e| format!("the daemon cannot list registered agents ({e})"))?;
     let agents = list["agents"]
         .as_array()
         .ok_or_else(|| "the daemon's agent list is malformed".to_string())?;
-    Ok(agents
-        .iter()
-        .filter(|a| a["endpoint_kind"] == "pty" && !a["generation"].is_null())
-        .filter_map(|a| {
-            let pid = u32::try_from(a["pid"].as_u64()?).ok()?;
-            Some((pid, a["alias"].as_str()?.to_string()))
-        })
-        .collect())
+    for a in agents {
+        let (Some(pid), Some(alias)) = (
+            a["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+            a["alias"].as_str(),
+        ) else {
+            continue;
+        };
+        let kind = a["endpoint_kind"].as_str().unwrap_or_default();
+        if kind == "pty" && !a["generation"].is_null() {
+            roots.panes.insert(pid, alias.to_string());
+        } else if pid > 1
+            && registry::enrolls_build_slots(a["provider"].as_str().unwrap_or_default(), kind)
+        {
+            roots.managed.insert(pid, alias.to_string());
+        }
+    }
+    Ok(roots)
 }
 
 /// The login lands in a commit `Actor:` trailer — take the first
