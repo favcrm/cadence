@@ -15,6 +15,7 @@
 //! `rollout_leases` is absent. It does not authorize any later crossing.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -56,17 +57,28 @@ static FORWARDED_AS: OnceLock<String> = OnceLock::new();
 
 /// Remember the holder forwarded by `daemon start` for this process.
 pub fn set_forwarded_identity(identity: Option<String>) {
+    remember_forwarded(&FORWARDED_AS, identity);
+}
+
+/// Set `slot` once. Tests pass a local lock so a run of
+/// `cargo test --lib rollout` does not stick a process-wide identity
+/// that later tests cannot clear.
+fn remember_forwarded(slot: &OnceLock<String>, identity: Option<String>) {
     let Some(identity) = identity
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     else {
         return;
     };
-    let _ = FORWARDED_AS.set(identity);
+    let _ = slot.set(identity);
 }
 
 fn forwarded_identity() -> Option<String> {
-    FORWARDED_AS.get().cloned()
+    read_forwarded(&FORWARDED_AS)
+}
+
+fn read_forwarded(slot: &OnceLock<String>) -> Option<String> {
+    slot.get().cloned()
 }
 
 pub fn default_ttl() -> Duration {
@@ -668,10 +680,17 @@ pub fn release(state_dir: &Path, caller: &Caller) -> Result<Value> {
 /// caller to be the holder. Records the ousted holder.
 ///
 /// A live, unexpired lease is refused unless `ousted_holder` names that
-/// holder. `peer::operator_proof` is not used: it proves a TCP peer of a
-/// running daemon (pane map, enrolled roots, daemon pid) for
-/// `slot_reconcile`, and force-release has to work while the daemon is
-/// stopped — that is the dead-holder recovery path.
+/// holder. The caller must also pass [`crate::peer::operator_proof`] for
+/// this process: its own pid and current uid, the registered pane pids
+/// from a read-only peek, and enrolled roots from `slots.json` (a missing
+/// file means nothing is enrolled). The proof reads `/proc` and those
+/// inputs; it does not need a running daemon.
+///
+/// `daemon_pid` is the pid that holds the `cadence.lock` flock while a
+/// daemon is running. When the daemon is stopped — the dead-holder
+/// recovery path — the value is `0`. [`crate::adapter::pty::caller_chain`]
+/// records only pids greater than 1, so `0` cannot match an ancestor and
+/// the daemon-descendant hop does not apply.
 pub fn release_forced(
     state_dir: &Path,
     caller: &Caller,
@@ -693,30 +712,22 @@ pub fn release_forced(
         }
         None => None,
     };
+    let now = unix_now();
+    if let Some(message) = preview_force_refusal(state_dir, named.as_deref(), now)? {
+        return Err(Error::rejected(message));
+    }
+    // After the holder checks, before any write. The proof peeks the
+    // database itself; doing it under the write transaction can stall
+    // that peek on the same file.
+    require_operator_proof(state_dir)?;
     let conn = connect_ensured(&db_file(state_dir))?;
     let now = unix_now();
     committed(immediate(&conn, |conn| {
         let Some(lease) = active_lease(conn)? else {
             return Ok(TxResult::Refuse("no rollout lease is held".into()));
         };
-        let live = lease.expires_at > now;
-        match named.as_deref() {
-            Some(name) if name != lease.holder => {
-                return Ok(TxResult::Refuse(format!(
-                    "--holder {name} does not match the lease holder {}",
-                    lease.holder
-                )));
-            }
-            None if live => {
-                return Ok(TxResult::Refuse(format!(
-                    "rollout release --force of a live lease held by {} \
-                     expires_at {} must name that holder with --holder. \
-                     A live lease is not cleared by --force alone.",
-                    lease.holder,
-                    fmt_epoch(lease.expires_at)
-                )));
-            }
-            _ => {}
+        if let Some(message) = force_holder_refusal(&lease, named.as_deref(), now) {
+            return Ok(TxResult::Refuse(message));
         }
         mark_ended(conn, lease.id, "released", "force", now)?;
         insert_event(
@@ -771,6 +782,277 @@ pub fn reject_registered_alias(state_dir: &Path, caller: &Caller) -> Result<()> 
         )));
     }
     Ok(())
+}
+
+/// Holder rules for `--force`, shared by the read-only preview and the
+/// write so the two cannot drift. `None` means the named holder (or its
+/// absence on an expired lease) is acceptable.
+fn force_holder_refusal(lease: &Lease, named: Option<&str>, now: f64) -> Option<String> {
+    let live = lease.expires_at > now;
+    match named.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) if name != lease.holder => Some(format!(
+            "--holder {name} does not match the lease holder {}",
+            lease.holder
+        )),
+        None if live => Some(format!(
+            "rollout release --force of a live lease held by {} \
+             expires_at {} must name that holder with --holder. \
+             A live lease is not cleared by --force alone.",
+            lease.holder,
+            fmt_epoch(lease.expires_at)
+        )),
+        _ => None,
+    }
+}
+
+/// The holder decision from a read-only peek, before operator proof and
+/// before any write. A missing database is "no lease", not a created file.
+fn preview_force_refusal(
+    state_dir: &Path,
+    named: Option<&str>,
+    now: f64,
+) -> Result<Option<String>> {
+    let path = db_file(state_dir);
+    if !path.exists() {
+        return Ok(Some("no rollout lease is held".into()));
+    }
+    let peek = open_peek(&path)?;
+    match active_lease(&peek.conn)? {
+        None => Ok(Some("no rollout lease is held".into())),
+        Some(lease) => Ok(force_holder_refusal(&lease, named, now)),
+    }
+}
+
+/// `peer::operator_proof` for this process. Pane pids come from a
+/// read-only peek. Enrolled roots come from `slots.json`.
+fn require_operator_proof(state_dir: &Path) -> Result<()> {
+    let panes = registered_panes(state_dir)?;
+    let roots = enrolled_roots(state_dir)?;
+    let daemon_pid = daemon_pid_for_proof(state_dir)?;
+    crate::peer::operator_proof(
+        std::process::id(),
+        unsafe { libc::getuid() },
+        daemon_pid,
+        &panes,
+        |pid| roots.contains(&pid),
+    )
+    .map_err(|why| {
+        Error::rejected(format!(
+            "rollout release --force is an operator action — this process is not \
+             provably the operator: {why}; run it from a shell outside every pane \
+             and managed endpoint"
+        ))
+    })
+}
+
+/// Registered pty panes (pane pid → alias), the same rows
+/// [`crate::store::Store::pty_endpoint_facts`] reads, via the rollout
+/// read-only peek. No database, or no `agents` table, means no panes.
+fn registered_panes(state_dir: &Path) -> Result<HashMap<u32, String>> {
+    let path = db_file(state_dir);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let peek = open_peek(&path)?;
+    if !table_exists(&peek.conn, "agents")? {
+        return Ok(HashMap::new());
+    }
+    let mut stmt = peek.conn.prepare(
+        "SELECT alias, pid FROM agents \
+         WHERE endpoint_kind='pty' AND generation IS NOT NULL AND pid IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut panes = HashMap::new();
+    for row in rows {
+        let (alias, pid) = row?;
+        if let Ok(pid) = u32::try_from(pid) {
+            panes.insert(pid, alias);
+        }
+    }
+    Ok(panes)
+}
+
+/// Enrollment root pids from `<state>/slots.json`. A missing file means
+/// nothing is enrolled. A root whose `/proc` starttime still matches
+/// (or cannot be read) counts, including tombstones; a recycled pid
+/// does not. Anything the file claims to be but cannot be parsed fails
+/// closed — an unreadable enrollment list is not "nothing enrolled".
+fn enrolled_roots(state_dir: &Path) -> Result<HashSet<u32>> {
+    let path = state_dir.join("slots.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HashSet::new());
+        }
+        Err(error) => {
+            return Err(Error::rejected(format!(
+                "rollout release --force cannot read {} ({error})",
+                path.display()
+            )));
+        }
+    };
+    let doc: Value = serde_json::from_str(&text).map_err(|error| {
+        Error::rejected(format!(
+            "rollout release --force cannot parse {} ({error})",
+            path.display()
+        ))
+    })?;
+    let rows = match doc.get("enrollments") {
+        Some(Value::Array(rows)) => rows,
+        Some(_) => {
+            return Err(Error::rejected(format!(
+                "rollout release --force: {} enrollments is not a list",
+                path.display()
+            )));
+        }
+        // Legacy v1 holds have no enrollment list.
+        None if doc.get("format").is_none() => return Ok(HashSet::new()),
+        None => {
+            return Err(Error::rejected(format!(
+                "rollout release --force: {} has no enrollments to prove against",
+                path.display()
+            )));
+        }
+    };
+    let mut roots = HashSet::new();
+    for row in rows {
+        let root = row.get("root").ok_or_else(|| {
+            Error::rejected(format!(
+                "rollout release --force: {} has an enrollment without root",
+                path.display()
+            ))
+        })?;
+        let pid = root
+            .get("pid")
+            .and_then(Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "rollout release --force: {} has an enrollment without root.pid",
+                    path.display()
+                ))
+            })?;
+        let starttime = root
+            .get("starttime")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "rollout release --force: {} has an enrollment without root.starttime",
+                    path.display()
+                ))
+            })?;
+        if enrolled_root_matches(pid, starttime) {
+            roots.insert(pid);
+        }
+    }
+    Ok(roots)
+}
+
+/// Same rule as slot enrollment: an unreadable starttime still matches,
+/// so a root we cannot disprove stays enrolled. A different starttime
+/// is a recycled pid and is not that root.
+fn enrolled_root_matches(pid: u32, starttime: u64) -> bool {
+    match proc_starttime(pid) {
+        Some(now) => now == starttime,
+        None => true,
+    }
+}
+
+/// `/proc/<pid>/stat` field 22 (starttime, jiffies since boot).
+fn proc_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit(')').next()?;
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Pid of the running daemon, or `0` when it is stopped.
+///
+/// `serve` holds an exclusive flock on `cadence.lock` for its whole
+/// life. The holder recorded in `/proc/locks` is that daemon's pid.
+/// When the lock is free, the daemon is stopped and the proof sentinel
+/// is `0`: it is not a process, and caller ancestry never contains it.
+fn daemon_pid_for_proof(state_dir: &Path) -> Result<u32> {
+    Ok(flock_holder(&state_dir.join("cadence.lock"))?.unwrap_or(0))
+}
+
+/// `Some(pid)` when an exclusive flock is held. `None` when the file is
+/// absent or the lock is free — a successful probe lock is dropped
+/// before returning, so this function does not leave a daemon lock behind.
+fn flock_holder(path: &Path) -> Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+    let file = match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::rejected(format!(
+                "rollout release --force cannot probe {} ({error})",
+                path.display()
+            )));
+        }
+    };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(None);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+        return Err(Error::rejected(format!(
+            "rollout release --force cannot probe {} ({error})",
+            path.display()
+        )));
+    }
+    let meta = file.metadata().map_err(|error| {
+        Error::rejected(format!(
+            "rollout release --force cannot stat {} ({error})",
+            path.display()
+        ))
+    })?;
+    let dev = meta.dev();
+    let major = libc::major(dev);
+    let minor = libc::minor(dev);
+    let inode = meta.ino();
+    let text = std::fs::read_to_string("/proc/locks").map_err(|error| {
+        Error::rejected(format!(
+            "rollout release --force cannot read /proc/locks ({error})"
+        ))
+    })?;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 || fields[1] != "FLOCK" || fields[3] != "WRITE" {
+            continue;
+        }
+        let Some((dev, inode_text)) = fields[5].rsplit_once(':') else {
+            continue;
+        };
+        let Some((major_text, minor_text)) = dev.rsplit_once(':') else {
+            continue;
+        };
+        let (Ok(line_inode), Ok(line_major), Ok(line_minor)) = (
+            inode_text.parse::<u64>(),
+            u32::from_str_radix(major_text, 16),
+            u32::from_str_radix(minor_text, 16),
+        ) else {
+            continue;
+        };
+        if line_inode == inode && line_major == major && line_minor == minor {
+            let pid = fields[4].parse::<u32>().map_err(|_| {
+                Error::rejected("rollout release --force: daemon lock holder pid is not a number")
+            })?;
+            if pid == 0 {
+                return Err(Error::rejected(
+                    "rollout release --force: daemon lock holder pid is 0",
+                ));
+            }
+            return Ok(Some(pid));
+        }
+    }
+    Err(Error::rejected(format!(
+        "rollout release --force: {} is locked but its holder is not in /proc/locks",
+        path.display()
+    )))
 }
 
 pub fn handoff(state_dir: &Path, caller: &Caller, to: &str) -> Result<Value> {
@@ -2297,13 +2579,9 @@ mod tests {
             !err.to_string().contains("release --force"),
             "a live lease must not advertise force-release: {err}"
         );
-        let released = release_forced(
-            &state,
-            &caller("operator:ada"),
-            "holder died",
-            Some("alice"),
-        )
-        .unwrap();
+        let released =
+            release_as_plain_operator(&state, "operator:ada", "holder died", Some("alice"))
+                .unwrap();
         assert_eq!(released["holder"], "alice");
         assert_eq!(released["forced"], true);
         let events = events_of(&state);
@@ -2425,8 +2703,13 @@ mod tests {
 
     #[test]
     fn forwarded_rollout_identity_is_visible_to_other_threads() {
-        set_forwarded_identity(Some("operator:thread-proof".into()));
-        let seen = std::thread::spawn(forwarded_identity).join().unwrap();
+        // A local lock, not the process-wide `FORWARDED_AS`: that one
+        // can never be reset, so setting it here would make later
+        // `cargo test --lib rollout` cases order-dependent.
+        let slot = std::sync::OnceLock::new();
+        remember_forwarded(&slot, Some("operator:thread-proof".into()));
+        let seen =
+            std::thread::scope(|scope| scope.spawn(|| read_forwarded(&slot)).join().unwrap());
         assert_eq!(seen.as_deref(), Some("operator:thread-proof"));
     }
 
@@ -2469,7 +2752,7 @@ mod tests {
         let err = begin_restart(&expired, &caller("bob")).unwrap_err();
         assert!(err.to_string().contains("release --force"), "{err}");
         let released =
-            release_forced(&expired, &caller("operator:ada"), "expired holder", None).unwrap();
+            release_as_plain_operator(&expired, "operator:ada", "expired holder", None).unwrap();
         assert_eq!(released["forced"], true);
         assert_eq!(released["holder"], "alice");
     }
@@ -2518,5 +2801,334 @@ mod tests {
 
     fn status_at(state: &Path) -> Value {
         super::status(state).unwrap()
+    }
+
+    /// Success-path force-release from a process `operator_proof` accepts:
+    /// reparented to init, `CADENCE_ALIAS` removed, stdio off any pane pty.
+    fn release_as_plain_operator(
+        state: &Path,
+        identity: &str,
+        reason: &str,
+        holder: Option<&str>,
+    ) -> Result<Value> {
+        run_operator_probe(state, identity, reason, holder, true)
+    }
+
+    fn run_operator_probe(
+        state: &Path,
+        identity: &str,
+        reason: &str,
+        holder: Option<&str>,
+        reparent: bool,
+    ) -> Result<Value> {
+        if let Some(home) = std::env::var_os("HOME") {
+            let live = PathBuf::from(home).join(".local/state/cadence");
+            assert!(
+                !state.starts_with(&live),
+                "refusing to probe the live state dir {}",
+                live.display()
+            );
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let req = scratch.path().join("req.json");
+        let pid_path = scratch.path().join("pid");
+        let out_path = scratch.path().join("out.json");
+        let err_path = scratch.path().join("err");
+        std::fs::write(
+            &req,
+            serde_json::json!({
+                "state": state,
+                "identity": identity,
+                "reason": reason,
+                "holder": holder,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = if reparent {
+            let mut cmd = std::process::Command::new("setsid");
+            cmd.arg("-f")
+                .arg("env")
+                .arg("-u")
+                .arg("CADENCE_ALIAS")
+                .arg("-u")
+                .arg("CADENCE_STATE_DIR")
+                .arg(&exe);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new("env");
+            cmd.arg("-u")
+                .arg("CADENCE_ALIAS")
+                .arg("-u")
+                .arg("CADENCE_STATE_DIR")
+                .arg(&exe);
+            cmd
+        };
+        let err_file = std::fs::File::create(&err_path).unwrap();
+        cmd.args([
+            "--ignored",
+            "rollout_operator_shell_probe",
+            "--test-threads",
+            "1",
+        ])
+        .env("CADENCE_ROLLOUT_OPERATOR_PROBE", &req)
+        .env("CADENCE_ROLLOUT_OPERATOR_PROBE_PID", &pid_path)
+        .env("CADENCE_ROLLOUT_OPERATOR_PROBE_OUT", &out_path)
+        .env_remove("CADENCE_ALIAS")
+        .env_remove("CADENCE_STATE_DIR")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(err_file));
+        if reparent {
+            let status = cmd.status().unwrap();
+            assert!(status.success(), "setsid exited {status}");
+            wait_for_operator_probe(&pid_path, &out_path, &err_path)
+        } else {
+            let status = cmd.status().unwrap();
+            let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+            assert!(status.success(), "probe harness failed: {stderr}");
+            let text = std::fs::read_to_string(&out_path)
+                .unwrap_or_else(|error| panic!("probe wrote no result ({error}): {stderr}"));
+            decode_operator_probe(&text)
+        }
+    }
+
+    fn wait_for_operator_probe(pid_path: &Path, out_path: &Path, err_path: &Path) -> Result<Value> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut pid = None;
+        loop {
+            if pid.is_none() {
+                pid = std::fs::read_to_string(pid_path)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok());
+            }
+            if out_path.exists() {
+                let text = std::fs::read_to_string(out_path).unwrap();
+                reap_operator_probe(pid);
+                return decode_operator_probe(&text);
+            }
+            if std::time::Instant::now() > deadline {
+                reap_operator_probe(pid);
+                let stderr = std::fs::read_to_string(err_path).unwrap_or_default();
+                panic!("operator probe timed out: {stderr}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn reap_operator_probe(pid: Option<u32>) {
+        let Some(pid) = pid else {
+            return;
+        };
+        if pid <= 1 || pid == std::process::id() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && unsafe { libc::kill(pid as i32, 0) } == 0 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if unsafe { libc::kill(pid as i32, 0) } == 0 {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    }
+
+    fn decode_operator_probe(text: &str) -> Result<Value> {
+        let payload: Value = serde_json::from_str(text).unwrap();
+        if payload["ok"].as_bool() == Some(true) {
+            Ok(payload["value"].clone())
+        } else {
+            Err(Error::rejected(
+                payload["error"]
+                    .as_str()
+                    .unwrap_or("operator probe failed")
+                    .to_string(),
+            ))
+        }
+    }
+
+    fn register_pane(state: &Path, alias: &str, pid: u32) {
+        Connection::open(db_file(state))
+            .unwrap()
+            .execute(
+                "INSERT INTO agents(alias, provider, endpoint_kind, role, cwd, sandbox, \
+                 state, created, updated, pid, generation) \
+                 VALUES(?1,'cursor','pty','worker','/tmp','none','idle',0,0,?2,'g1')",
+                rusqlite::params![alias, i64::from(pid)],
+            )
+            .unwrap();
+    }
+
+    fn write_enrolled_root(state: &Path, pid: u32) {
+        let starttime = proc_starttime(pid).unwrap();
+        let doc = serde_json::json!({
+            "format": "cadence-slots",
+            "version": 2,
+            "enrollments": [{
+                "root": {"pid": pid, "starttime": starttime, "uid": unsafe { libc::getuid() }}
+            }]
+        });
+        std::fs::write(state.join("slots.json"), doc.to_string()).unwrap();
+    }
+
+    /// Re-exec target for [`run_operator_probe`]. Ignored in a normal
+    /// run; the probe sets `CADENCE_ROLLOUT_OPERATOR_PROBE` and passes
+    /// `--ignored`.
+    #[test]
+    #[ignore = "re-exec helper for force-release operator proof"]
+    fn rollout_operator_shell_probe() {
+        let Ok(req_path) = std::env::var("CADENCE_ROLLOUT_OPERATOR_PROBE") else {
+            return;
+        };
+        let pid_path = std::env::var("CADENCE_ROLLOUT_OPERATOR_PROBE_PID").unwrap();
+        let out_path = std::env::var("CADENCE_ROLLOUT_OPERATOR_PROBE_OUT").unwrap();
+        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        let req: Value = serde_json::from_str(&std::fs::read_to_string(req_path).unwrap()).unwrap();
+        let state = PathBuf::from(req["state"].as_str().unwrap());
+        let released = release_forced(
+            &state,
+            &caller(req["identity"].as_str().unwrap()),
+            req["reason"].as_str().unwrap(),
+            req["holder"].as_str(),
+        );
+        let payload = match released {
+            Ok(value) => serde_json::json!({"ok": true, "value": value}),
+            Err(error) => serde_json::json!({"ok": false, "error": error.to_string()}),
+        };
+        std::fs::write(out_path, payload.to_string()).unwrap();
+    }
+
+    #[test]
+    fn daemon_pid_for_proof_is_zero_when_stopped_and_the_lock_holder_when_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        std::fs::create_dir_all(state).unwrap();
+        assert_eq!(daemon_pid_for_proof(state).unwrap(), 0);
+        let chain = crate::adapter::pty::caller_chain(std::process::id()).unwrap();
+        assert!(
+            !chain.contains(&0),
+            "sentinel 0 is on the ancestry: {chain:?}"
+        );
+        let path = state.join("cadence.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "lock probe failed"
+        );
+        assert_eq!(daemon_pid_for_proof(state).unwrap(), std::process::id());
+        drop(file);
+        assert_eq!(daemon_pid_for_proof(state).unwrap(), 0);
+    }
+
+    #[test]
+    fn force_release_refuses_a_caller_whose_ancestry_includes_a_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        claim_as(
+            &state,
+            "alice",
+            unix_now(),
+            Duration::from_secs(3600),
+            false,
+        )
+        .unwrap();
+        register_pane(&state, "pane-a", std::process::id());
+        let err = run_operator_probe(&state, "operator:ada", "from a pane", Some("alice"), false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("on its ancestry") && err.to_string().contains("pane-a"),
+            "{err}"
+        );
+        assert!(status_at(&state)["held"].as_bool().unwrap(), "{err}");
+    }
+
+    #[test]
+    fn force_release_refuses_an_enrolled_root_on_the_ancestry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        claim_as(
+            &state,
+            "alice",
+            unix_now(),
+            Duration::from_secs(3600),
+            false,
+        )
+        .unwrap();
+        write_enrolled_root(&state, std::process::id());
+        let err = run_operator_probe(
+            &state,
+            "operator:ada",
+            "from an endpoint",
+            Some("alice"),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("enrolled managed endpoint"),
+            "{err}"
+        );
+        assert!(status_at(&state)["held"].as_bool().unwrap(), "{err}");
+    }
+
+    #[test]
+    fn force_release_accepts_a_plain_operator_when_the_daemon_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        claim_as(
+            &state,
+            "alice",
+            unix_now(),
+            Duration::from_secs(3600),
+            false,
+        )
+        .unwrap();
+        assert_eq!(daemon_pid_for_proof(&state).unwrap(), 0);
+        let released =
+            release_as_plain_operator(&state, "operator:ada", "daemon stopped", Some("alice"))
+                .unwrap();
+        assert_eq!(released["forced"], true);
+        assert_eq!(released["holder"], "alice");
+        assert!(!status_at(&state)["held"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn force_release_accepts_a_plain_operator_when_the_daemon_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = fresh(&dir);
+        claim_as(
+            &state,
+            "alice",
+            unix_now(),
+            Duration::from_secs(3600),
+            false,
+        )
+        .unwrap();
+        let path = state.join("cadence.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        use std::os::unix::io::AsRawFd;
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert_eq!(daemon_pid_for_proof(&state).unwrap(), std::process::id());
+        let released =
+            release_as_plain_operator(&state, "operator:ada", "daemon running", Some("alice"))
+                .unwrap();
+        drop(file);
+        assert_eq!(released["forced"], true);
+        assert_eq!(released["holder"], "alice");
+        assert!(!status_at(&state)["held"].as_bool().unwrap());
     }
 }
