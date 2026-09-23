@@ -1780,6 +1780,19 @@ impl Shared {
     fn rpc_send(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
+        // A pty endpoint pastes literally and fails a body with control
+        // characters at delivery; refuse it here so `send` never answers
+        // `queued` for a message that cannot be delivered (CAD-218).
+        let pty = self
+            .store
+            .agent_opt(&alias)?
+            .is_some_and(|a| a.endpoint_kind == "pty");
+        if pty && crate::adapter::pty::has_control_chars(text) {
+            return Err(Error::rejected(
+                "PTY messages must be a single line without control characters \
+                 — put a long body in a file and send its path",
+            ));
+        }
         // An explicit reply_to always wins; absent one, a worker joined
         // to a group (params.upstream) reports results to its PM by
         // default. `enqueue` still validates the target.

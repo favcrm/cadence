@@ -5691,29 +5691,25 @@ fn pty_send_rejects_control_chars() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
-    d.rpc(
-        "agent_send",
-        json!({"alias": "dv1", "text": "line1\nline2", "message": "m1"}),
-    )
-    .unwrap();
-    // The newline is rejected by the adapter's literal-content rule —
-    // the message fails without ever touching the pane.
-    d.wait_message("dv1", "m1", &["failed"], 15);
+    // CAD-175: a body the literal paste can never deliver is refused at
+    // send, not answered `queued` and failed later at delivery.
+    let err = d
+        .rpc(
+            "agent_send",
+            json!({"alias": "dv1", "text": "line1\nline2", "message": "m1"}),
+        )
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("control characters"), "{err:?}");
     let input = std::fs::read_to_string(d.pane_file(&_mock, "dv1", "input")).unwrap_or_default();
     assert!(!input.contains("line1"));
-    let failed = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["id"] == "m1")
-        .unwrap()
-        .clone();
+    let shown = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap();
     assert!(
-        failed["result"]["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("control characters"),
-        "{failed}"
+        !shown["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "m1"),
+        "refused body must not be stored: {shown}"
     );
     // A pre-write rejection must not fence the agent: it stays idle,
     // the pane survives, and the queue keeps draining.
@@ -20132,7 +20128,8 @@ fn doctor_host_json_reports_all_checks() {
             "temp-dirs",
             "task-targets",
             "worktrees",
-            "load"
+            "load",
+            "config"
         ]
     );
     for c in report["checks"].as_array().unwrap() {

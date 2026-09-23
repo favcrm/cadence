@@ -397,7 +397,6 @@ export default function OverviewView({
                   {(drift.commits ?? []).map((c, i) => (
                     <li key={i} className="text-micro text-ink-400 truncate">
                       {c.subject}
-                      {c.pr ? <span className="text-ink-500"> #{c.pr}</span> : null}
                     </li>
                   ))}
                 </ul>

@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+// Unknown keys are refused on every project.yaml table: a misspelled
+// policy key must fail loudly, not be dropped (CAD-170).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Repo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -22,12 +25,14 @@ pub struct Repo {
 /// classic fully-private `target/` (the opt-out for hosts where the
 /// cargo lock queue costs more than the disk it saves).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Build {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Project {
     pub key: String,
     pub prefix: String,
@@ -216,6 +221,30 @@ pub(crate) fn unknown_project(name: &str, pm_dir: &Path) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_yaml_refuses_unknown_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("project.yaml");
+        std::fs::write(&file, "key: x\nprefix: X\nbuild:\n  target_dir: shared\n").unwrap();
+        assert!(load(&file).is_ok());
+        // A misspelled top-level or nested policy key names itself.
+        for (yaml, key) in [
+            ("key: x\nprefix: X\nworktrees:\n  root: /tmp\n", "worktrees"),
+            (
+                "key: x\nprefix: X\nbuild:\n  target-dir: shared\n",
+                "target-dir",
+            ),
+            (
+                "key: x\nprefix: X\nrepos:\n- path: /r\n  remot: r\n",
+                "remot",
+            ),
+        ] {
+            std::fs::write(&file, yaml).unwrap();
+            let err = load(&file).unwrap_err().to_string();
+            assert!(err.contains(key), "{key}: {err}");
+        }
+    }
 
     #[test]
     fn remote_normalisation() {
