@@ -2,10 +2,15 @@
 # Required keys: prepare, gates, full_suite, test_globs, test_command,
 # stress_pattern. Optional: [timeouts] *_secs overrides.
 #
-# Every command below runs like GitHub CI, with no git identity (CAD-301):
-# HOME is a scratch dir the review deletes afterwards, GIT_CONFIG_NOSYSTEM=1,
-# user.useConfigOnly=true, and EMAIL/GIT_AUTHOR_*/GIT_COMMITTER_* unset.
-# CARGO_HOME, RUSTUP_HOME and XDG_DATA_HOME keep their real locations.
+# Every command below runs like GitHub CI, with no git identity (CAD-301,
+# CAD-307). Set: HOME (a scratch dir, mode 0700, deleted afterwards),
+# GIT_CONFIG_NOSYSTEM=1, user.useConfigOnly=true (appended through
+# GIT_CONFIG_COUNT/GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n>; the caller's
+# own entries are kept except identity keys), and CARGO_HOME, RUSTUP_HOME
+# and XDG_DATA_HOME at their real locations (from the real home when
+# unset). Unset: EMAIL, GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL,
+# GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL, GIT_CONFIG_PARAMETERS,
+# GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM and XDG_CONFIG_HOME.
 # A test or tool that commits must pass `-c user.name=… -c user.email=…`
 # (see gate_env in src/review.rs).
 
