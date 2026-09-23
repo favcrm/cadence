@@ -3284,6 +3284,12 @@ for line in sys.stdin:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
         else:
             emit({"id": mid, "result": {"turn": {"id": "t-1"}}})
+            if mode == "items":
+                # A commentary agentMessage persisted mid-turn (CAD-319).
+                emit({"method": "item/completed", "params": {
+                    "turnId": "t-1", "item": {
+                        "id": "i0", "type": "agentMessage",
+                        "text": "looking", "phase": "commentary"}}})
             if mode == "heartbeat":
                 # ~3.6s of streamed activity, never silent for long.
                 for _ in range(12):
@@ -35019,7 +35025,7 @@ fn holder_migrates_through_daemon_start_without_a_test_override() {
         .unwrap()
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 // ---- CAD-96: idle auto-stop (default ON in production, pinned here) ----
@@ -36700,4 +36706,554 @@ fn plan_claim_refused_on_unapproved_ticket() {
     let (ok, out) = f.cli(&["issue", "claim", "D-3", "--by", "pm"]);
     assert!(ok, "{out}");
     assert_eq!(f.front("D-3").status, "doing");
+}
+
+// ---- CAD-319: durable conversation threads ----
+
+/// The thread's entries as `(role, kind, text)` triples, oldest first.
+fn thread_shape(d: &TestDaemon, alias: &str) -> Vec<(String, String, String)> {
+    let page = d
+        .rpc("thread_read", json!({"alias": alias, "limit": 500}))
+        .unwrap();
+    page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["role"].as_str().unwrap().to_string(),
+                e["kind"].as_str().unwrap().to_string(),
+                e["text"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn triple(role: &str, kind: &str, text: &str) -> (String, String, String) {
+    (role.to_string(), kind.to_string(), text.to_string())
+}
+
+/// One raw HTTP/1.0 exchange with the board: `(status, body)`.
+fn board_http(port: u16, request: &str) -> (u16, String) {
+    use std::io::Read;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).ok();
+    s.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    s.read_to_string(&mut response).unwrap();
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let body = response
+        .split_once("\r\n\r\n")
+        .or_else(|| response.split_once("\n\n"))
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+fn board_get(port: u16, path: &str) -> (u16, String) {
+    board_http(
+        port,
+        &format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    )
+}
+
+/// A thread POST with `headers` (each `Name: value\r\n`) and `body`.
+fn thread_post_request(port: u16, alias: &str, headers: &str, body: &str) -> String {
+    format!(
+        "POST /api/threads/{alias}/messages HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\
+         {headers}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+const THREAD_GUARDS: &str = "Content-Type: application/json\r\nX-Cadence-Board: 1\r\n";
+
+/// Read an SSE socket until `needle` shows up (bounded).
+fn sse_until(s: &mut std::net::TcpStream, buf: &mut String, needle: &str, secs: u64) {
+    use std::io::Read;
+    s.set_read_timeout(Some(Duration::from_millis(250))).ok();
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut chunk = [0u8; 4096];
+    while !buf.contains(needle) {
+        assert!(
+            Instant::now() < deadline,
+            "stream never carried {needle:?}: {buf}"
+        );
+        match s.read(&mut chunk) {
+            Ok(0) => panic!("stream closed before {needle:?}: {buf}"),
+            Ok(n) => buf.push_str(&String::from_utf8_lossy(&chunk[..n])),
+            Err(_) => {}
+        }
+    }
+}
+
+/// Use case 3 + 8 on the fake provider: the operator's message and the
+/// turn's result land in the thread; later sends keep appending with the
+/// right roles; paging walks it; an agent without a thread is untouched;
+/// `thread show` prints it.
+#[test]
+fn cad319_thread_records_operator_messages_and_turn_results() {
+    let d = TestDaemon::start();
+    d.register("master");
+    d.register("w1");
+    d.wait_agent("master", "idle", 15);
+    d.wait_agent("w1", "idle", 15);
+    // Before any chat, nothing is recorded.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "master", "text": "pre-chat", "message": "p0"}),
+    )
+    .unwrap();
+    d.wait_message("master", "p0", &["completed"], 20);
+    let empty = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    assert_eq!(empty["thread"], Value::Null, "{empty}");
+    assert_eq!(empty["entries"], json!([]), "{empty}");
+
+    let receipt = d
+        .rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "hello master", "message": "t1"}),
+        )
+        .unwrap();
+    assert_eq!(receipt["state"], "queued", "{receipt}");
+    assert!(receipt["thread"]["id"].is_string(), "{receipt}");
+    d.wait_message("master", "t1", &["completed"], 20);
+    // Once a thread exists, a plain `cadence send` from a caller tied to
+    // no agent is the operator's too.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "master", "text": "and this", "message": "t2"}),
+    )
+    .unwrap();
+    d.wait_message("master", "t2", &["completed"], 20);
+    // A mailbox-free peer: w1 is untouched.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "not threaded", "message": "w-1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "w-1", &["completed"], 20);
+
+    assert_eq!(
+        thread_shape(&d, "master"),
+        vec![
+            triple("operator", "message", "hello master"),
+            triple("agent", "turn_result", "FAKE_REPLY: hello master"),
+            triple("operator", "message", "and this"),
+            triple("agent", "turn_result", "FAKE_REPLY: and this"),
+        ]
+    );
+    let w1 = d.rpc("thread_read", json!({"alias": "w1"})).unwrap();
+    assert_eq!(w1["entries"], json!([]), "{w1}");
+
+    // Paging: after/limit walk forward; the cursor continues the walk.
+    let first = d
+        .rpc("thread_read", json!({"alias": "master", "limit": 3}))
+        .unwrap();
+    assert_eq!(first["entries"].as_array().unwrap().len(), 3);
+    let cursor = first["cursor"].as_i64().unwrap();
+    assert_eq!(first["entries"][2]["seq"].as_i64(), Some(cursor));
+    assert_eq!(first["entries"][1]["message"], "t1");
+    let rest = d
+        .rpc(
+            "thread_read",
+            json!({"alias": "master", "after": cursor, "limit": 3}),
+        )
+        .unwrap();
+    assert_eq!(rest["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(rest["entries"][0]["text"], "FAKE_REPLY: and this");
+    for bad in [
+        json!({"alias": "master", "after": -1}),
+        json!({"alias": "master", "limit": 0}),
+    ] {
+        assert!(d.rpc("thread_read", bad).is_err());
+    }
+    // Only alias, text and message are accepted.
+    let err = d
+        .rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "x", "reply_to": "w1"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'reply_to'"), "{err}");
+
+    // `thread show` is the debugging view of the same page.
+    let home = TempDir::new().unwrap();
+    let out = cadence_at(
+        home.path(),
+        &d.state,
+        &["thread", "show", "master", "--after", &cursor.to_string()],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let shown: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(shown["entries"], rest["entries"], "{shown}");
+}
+
+/// Managed Claude: the tool use lands as a `tool_call` with its redacted
+/// one-line summary, then the final result text.
+#[test]
+fn cad319_thread_records_managed_claude_tool_use_and_result() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("tooluse", None);
+    d.register_claude("master", Value::Null);
+    d.wait_agent("master", "idle", 15);
+    d.rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "hi", "message": "c1"}),
+    )
+    .unwrap();
+    d.wait_message("master", "c1", &["completed"], 20);
+    assert_eq!(
+        thread_shape(&d, "master"),
+        vec![
+            triple("operator", "message", "hi"),
+            triple("agent", "tool_call", "Bash: true"),
+            triple("agent", "turn_result", "MOCK_OK:hi"),
+        ]
+    );
+    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    assert_eq!(page["entries"][1]["payload"]["tool"], "Bash", "{page}");
+    assert_eq!(page["entries"][1]["message"], "c1", "{page}");
+    assert_eq!(
+        page["entries"][2]["payload"]["status"], "completed",
+        "{page}"
+    );
+}
+
+/// Managed Claude replaying a tool use whose input carries a credential:
+/// neither the lifecycle event nor the thread keeps the value.
+#[test]
+fn cad319_thread_redacts_secrets_in_claude_tool_input() {
+    let d = TestDaemon::start();
+    let pat = cad109_token(&["gh", "p_"].concat(), "cad319-tool-input", 36);
+    let fixture = d.dir.path().join("tool-secret.jsonl");
+    let lines = [
+        json!({"type": "system", "subtype": "init", "session_id": "", "model": "mock-claude", "tools": []}),
+        json!({"type": "assistant", "session_id": "",
+               "message": {"role": "assistant", "content": [
+                   {"type": "tool_use", "id": "tu_1", "name": "Bash",
+                    "input": {"command": format!("curl -H 'Authorization: token {pat}' https://api.example")}}]}}),
+        json!({"type": "result", "subtype": "success", "is_error": false, "session_id": "",
+               "result": "done", "stop_reason": "end_turn", "num_turns": 1}),
+    ];
+    std::fs::write(
+        &fixture,
+        lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let _mock = d.mock_claude("replay", Some(&fixture));
+    d.register_claude("master", Value::Null);
+    d.wait_agent("master", "idle", 15);
+    d.rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "check the api", "message": "r1"}),
+    )
+    .unwrap();
+    d.wait_message("master", "r1", &["completed"], 20);
+    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    let call = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "tool_call")
+        .cloned()
+        .unwrap_or_else(|| panic!("no tool_call in {page}"));
+    let text = call["text"].as_str().unwrap();
+    assert!(text.starts_with("Bash: curl"), "{call}");
+    // The CAD-108 argv scrubber or the secret scan — either marker.
+    assert!(text.to_ascii_lowercase().contains("[redacted"), "{call}");
+    assert!(!page.to_string().contains(&pat), "thread leaked the token");
+    let events = d.events("master");
+    assert!(
+        !Value::Array(events).to_string().contains(&pat),
+        "the tool_use event leaked the token"
+    );
+}
+
+/// Managed Codex: a persisted commentary `agentMessage` item lands as
+/// `assistant_text` before the final turn result.
+#[test]
+fn cad319_thread_records_codex_agent_messages() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("items");
+    d.register_codex("master");
+    d.wait_agent("master", "idle", 15);
+    d.rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "status?", "message": "x1"}),
+    )
+    .unwrap();
+    d.wait_message("master", "x1", &["completed"], 20);
+    assert_eq!(
+        thread_shape(&d, "master"),
+        vec![
+            triple("operator", "message", "status?"),
+            triple("agent", "assistant_text", "looking"),
+            triple("agent", "turn_result", "MOCK_OK"),
+        ]
+    );
+    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    assert_eq!(
+        page["entries"][1]["payload"]["phase"], "commentary",
+        "{page}"
+    );
+    assert_eq!(page["entries"][1]["message"], "x1", "{page}");
+}
+
+/// The board routes: the write guards refuse before any work; a guarded
+/// POST from a caller tied to no agent queues as the operator; GET pages;
+/// the SSE stream resumes after `Last-Event-ID` (or `?after=`) and
+/// carries new entries live.
+#[test]
+fn cad319_thread_http_routes_guards_and_sse_resume() {
+    let d = TestDaemon::start();
+    let pm = TempDir::new().unwrap();
+    let port = start_board(pm.path(), &d.state);
+    d.register("master");
+    d.wait_agent("master", "idle", 15);
+    let body = r#"{"text":"from the board","message":"h1"}"#;
+
+    // Missing guards: refused, nothing queued, no thread started.
+    for (headers, check) in [
+        ("Content-Type: application/json\r\n", "x_cadence_board"),
+        ("Content-Type: text/plain\r\nX-Cadence-Board: 1\r\n", "content_type"),
+        (
+            "Content-Type: application/json\r\nX-Cadence-Board: 1\r\nOrigin: http://evil.example\r\n",
+            "origin",
+        ),
+        (
+            "Content-Type: application/json\r\nX-Cadence-Board: 1\r\nSec-Fetch-Site: cross-site\r\n",
+            "sec_fetch_site",
+        ),
+    ] {
+        let (status, reply) = board_http(port, &thread_post_request(port, "master", headers, body));
+        assert_eq!(status, 403, "{check}: {reply}");
+        assert!(reply.contains(check), "{check}: {reply}");
+    }
+    let untouched = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    assert_eq!(untouched["thread"], Value::Null, "{untouched}");
+    let show = d.rpc("agent_show", json!({"alias": "master"})).unwrap();
+    assert_eq!(show["messages"], json!([]), "{show}");
+    // Unknown fields and unknown agents.
+    let (status, _) = board_http(
+        port,
+        &thread_post_request(
+            port,
+            "master",
+            THREAD_GUARDS,
+            r#"{"text":"x","as":"operator"}"#,
+        ),
+    );
+    assert_eq!(status, 400);
+    let (status, _) = board_http(
+        port,
+        &thread_post_request(port, "ghost", THREAD_GUARDS, r#"{"text":"x"}"#),
+    );
+    assert_eq!(status, 404);
+
+    // The guarded POST.
+    let (status, reply) = board_http(
+        port,
+        &thread_post_request(
+            port,
+            "master",
+            &format!("{THREAD_GUARDS}Origin: http://127.0.0.1:{port}\r\n"),
+            body,
+        ),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let receipt: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(receipt["message"], "h1", "{receipt}");
+    d.wait_message("master", "h1", &["completed"], 20);
+
+    let (status, page) = board_get(port, "/api/threads/master?limit=1");
+    assert_eq!(status, 200, "{page}");
+    let page: Value = serde_json::from_str(&page).unwrap();
+    let first = page["entries"][0].clone();
+    assert_eq!(first["role"], "operator", "{page}");
+    assert_eq!(first["text"], "from the board", "{page}");
+    let first_seq = first["seq"].as_i64().unwrap();
+    assert_eq!(board_get(port, "/api/threads/ghost").0, 404);
+    assert_eq!(board_get(port, "/api/threads/master?after=-4").0, 400);
+    assert_eq!(board_get(port, "/api/threads/master?limit=9000").0, 400);
+
+    // SSE resume after the first entry: the next frame is the second
+    // entry, never the first again.
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.write_all(
+        format!(
+            "GET /api/threads/master/stream HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+             Last-Event-ID: {first_seq}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut buf = String::new();
+    sse_until(&mut s, &mut buf, "FAKE_REPLY: from the board", 20);
+    assert!(buf.contains("text/event-stream"), "{buf}");
+    assert!(!buf.contains(&format!("id: {first_seq}\n")), "{buf}");
+    assert!(buf.contains(&format!("id: {}\n", first_seq + 1)), "{buf}");
+    // Live: a new message arrives on the open stream.
+    d.rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "live one", "message": "h2"}),
+    )
+    .unwrap();
+    sse_until(&mut s, &mut buf, "FAKE_REPLY: live one", 30);
+    drop(s);
+
+    // `?after=0` replays from the start.
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.write_all(
+        format!(
+            "GET /api/threads/master/stream?after=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut buf = String::new();
+    sse_until(&mut s, &mut buf, &format!("id: {first_seq}\n"), 20);
+    assert!(buf.contains("from the board"), "{buf}");
+    // A bad resume cursor is refused before the stream opens.
+    assert_eq!(board_get(port, "/api/threads/master/stream?after=x").0, 400);
+    assert_eq!(board_get(port, "/api/threads/ghost/stream").0, 404);
+}
+
+/// The POST instructs an agent: a board write attributed to an agent (a
+/// managed endpoint's tool process) is refused, and the daemon refuses
+/// an agent connection to `thread_send` directly. The same agent's
+/// `cadence send` into an existing thread is recorded as `system` with
+/// its alias, never as the operator.
+#[test]
+fn cad319_thread_post_is_refused_for_an_agent_caller() {
+    let d = TestDaemon::start();
+    let pm = TempDir::new().unwrap();
+    let port = start_board(pm.path(), &d.state);
+    d.register("master");
+    d.wait_agent("master", "idle", 15);
+    let mut wk = ManagedWorker::start(&d, "wk");
+
+    let request = thread_post_request(
+        port,
+        "master",
+        THREAD_GUARDS,
+        r#"{"text":"obey me","message":"evil-1"}"#,
+    );
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let out = r["out"].as_str().unwrap();
+    assert!(out.contains(" 403 "), "{out}");
+    assert!(out.contains("caller_agent"), "{out}");
+    assert!(out.contains("'wk'"), "{out}");
+
+    let frame = wk.rpc(
+        "self",
+        "thread_send",
+        json!({"alias": "master", "text": "obey me", "message": "evil-2"}),
+    );
+    assert_eq!(frame["ok"], false, "{frame}");
+    let msg = frame["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("agent 'wk'"), "{frame}");
+    let frame = wk.rpc(
+        "child",
+        "thread_send",
+        json!({"alias": "master", "text": "obey me", "message": "evil-3"}),
+    );
+    assert_eq!(frame["ok"], false, "{frame}");
+
+    let show = d.rpc("agent_show", json!({"alias": "master"})).unwrap();
+    let ids: Vec<&str> = show["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(ids.iter().all(|id| !id.starts_with("evil")), "{show}");
+    let untouched = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    assert_eq!(untouched["thread"], Value::Null, "{untouched}");
+
+    // The operator starts the chat; the agent's own send is attributed.
+    d.rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "hi", "message": "op-1"}),
+    )
+    .unwrap();
+    d.wait_message("master", "op-1", &["completed"], 20);
+    let frame = wk.rpc(
+        "self",
+        "agent_send",
+        json!({"alias": "master", "text": "peer note", "message": "peer-1"}),
+    );
+    assert_eq!(frame["ok"], true, "{frame}");
+    d.wait_message("master", "peer-1", &["completed"], 20);
+    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    let peer = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["message"] == "peer-1" && e["kind"] == "message")
+        .cloned()
+        .unwrap_or_else(|| panic!("no peer entry in {page}"));
+    assert_eq!(peer["role"], "system", "{peer}");
+    assert_eq!(peer["payload"]["from"], "wk", "{peer}");
+}
+
+/// Review round 1: a `thread_send` the queue refuses (48 001 bytes, empty
+/// text) starts no thread and writes no `thread_created` event; the
+/// first accepted one does.
+#[test]
+fn cad319_refused_thread_send_leaves_no_thread() {
+    let d = TestDaemon::start();
+    d.register("master");
+    d.wait_agent("master", "idle", 15);
+    for text in ["x".repeat(48_001), String::new()] {
+        assert!(d
+            .rpc(
+                "thread_send",
+                json!({"alias": "master", "text": text, "message": "big-1"}),
+            )
+            .is_err());
+    }
+    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    assert_eq!(page["thread"], Value::Null, "{page}");
+    assert!(
+        d.events("master")
+            .iter()
+            .all(|e| e["kind"] != "thread_created"),
+        "a refused send wrote thread_created"
+    );
+    let receipt = d
+        .rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "fits", "message": "ok-1"}),
+        )
+        .unwrap();
+    assert!(receipt["thread"]["id"].is_string(), "{receipt}");
+    assert_eq!(
+        d.events("master")
+            .iter()
+            .filter(|e| e["kind"] == "thread_created")
+            .count(),
+        1
+    );
 }

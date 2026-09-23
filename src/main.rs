@@ -798,6 +798,13 @@ enum Commands {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// An agent's durable conversation thread (CAD-319): the operator's
+    /// chat with it, outliving every provider session. Read-only here —
+    /// the chat itself is the board's `/api/threads/<alias>`.
+    Thread {
+        #[command(subcommand)]
+        action: ThreadAction,
+    },
     /// Daemon-owned persistent supervision registrations and local alerts.
     /// Monitor state describes the observer; delivery remains explicitly
     /// unconfigured in this bounded increment.
@@ -1308,6 +1315,22 @@ enum JobAction {
     Task {
         #[command(subcommand)]
         action: TaskAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ThreadAction {
+    /// Print the thread's entries (oldest first) and the cursor to
+    /// continue from — for debugging the chat.
+    Show {
+        /// Agent alias or provider-native id.
+        alias: String,
+        /// Entries after this sequence number.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        /// Page size (1-500).
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
     },
 }
 
@@ -5420,6 +5443,22 @@ fn run() -> Result<i32> {
         }
         Commands::Job { action } => run_job(&state_dir, &action),
         Commands::Monitor { action } => run_monitor(&state_dir, &action),
+        Commands::Thread {
+            action:
+                ThreadAction::Show {
+                    alias,
+                    after,
+                    limit,
+                },
+        } => {
+            let page = client::rpc(
+                &state_dir,
+                "thread_read",
+                json!({"alias": alias, "after": after, "limit": limit}),
+            )?;
+            print_json(&page);
+            Ok(0)
+        }
         Commands::Dispatch {
             issue,
             to,

@@ -988,3 +988,82 @@ fn cad396_a_failed_rollback_is_reported_not_hidden() {
     assert!(!err.contains("was put back"), "{err}");
     assert!(err.contains(&aside.display().to_string()), "{err}");
 }
+
+/// CAD-319: the thread tables ride the generic export scrub. Entries the
+/// store wrote are already redacted, so they never refuse an export; a
+/// turn token quoted in thread prose is redacted like any other text
+/// cell; and a credential planted into `thread_entries` behind the
+/// store's back still refuses the export, naming the column.
+#[test]
+fn cad319_export_scans_and_redacts_thread_entries() {
+    let root = TempDir::new().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let pat = github_token("thread-export");
+    let generation = uuid::Uuid::new_v4().simple().to_string();
+    let token = format!("claude-{generation}-{}", uuid::Uuid::new_v4().simple());
+    {
+        drop(Store::open(&live(&state)).unwrap());
+        let conn = writer(&state);
+        add_agent(&conn, "master", "/nowhere");
+        conn.execute(
+            "UPDATE agents SET generation=?1 WHERE alias='master'",
+            [&generation],
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open(&live(&state)).unwrap();
+        store.ensure_thread("master").unwrap();
+        store
+            .enqueue("master", "please do the thing", None, "m1", "user")
+            .unwrap();
+        store.mark_running("m1", &token).unwrap();
+        store
+            .thread_append_running(
+                "master",
+                crate::store::ROLE_AGENT,
+                crate::store::KIND_ASSISTANT_TEXT,
+                &format!("my token is {token} and a key {pat}"),
+                None,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        count(
+            &live(&state),
+            &format!("SELECT count(*) FROM thread_entries WHERE text LIKE '%{pat}%'")
+        ),
+        0,
+        "the store redacts before writing"
+    );
+
+    let out = export(&state, &root.path().join("bundle")).unwrap();
+
+    let db = root.path().join("bundle").join(BUNDLE_DB);
+    let bytes = std::fs::read(&db).unwrap();
+    for secret in [&token, &generation, &pat] {
+        assert!(!contains(&bytes, secret), "{secret} left in the bundle");
+    }
+    assert!(
+        count(
+            &db,
+            "SELECT count(*) FROM thread_entries WHERE text LIKE '%[redacted]%'"
+        ) == 1,
+        "{out}"
+    );
+    assert_eq!(count(&db, "SELECT count(*) FROM thread_entries"), 2);
+
+    // Planted raw — the export scan covers the new table like any other.
+    let conn = writer(&state);
+    conn.execute(
+        "UPDATE thread_entries SET payload=?1 WHERE seq=(SELECT max(seq) FROM thread_entries)",
+        [format!("{{\"raw\":\"{pat}\"}}")],
+    )
+    .unwrap();
+    drop(conn);
+    let out_dir = root.path().join("bundle2");
+    let err = export(&state, &out_dir).unwrap_err().to_string();
+    assert!(err.contains("thread_entries.payload"), "{err}");
+    assert!(!err.contains(&pat), "{err}");
+    assert!(!out_dir.exists());
+}

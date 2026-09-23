@@ -25,7 +25,8 @@
 //!   `params.turn_idle_secs` of silence (default 900) or the optional
 //!   `params.turn_max_secs` absolute cap — a healthy multi-hour turn is
 //!   never fenced for being long.
-//! - One `tool_use` lifecycle event per assistant tool call (name only)
+//! - One `tool_use` lifecycle event per assistant tool call (name plus a
+//!   one-line redacted input summary, never the raw input)
 //!   keeps `events --follow` meaningful without proxying the transcript.
 //! - `--permission-mode` (default `manual`) and `--allowedTools`
 //!   (always `Bash(cadence *)` plus `params.allowed_tools`) are fixed at
@@ -335,9 +336,11 @@ impl Shared {
         }
     }
 
-    /// One compact lifecycle event per tool use — name only, never
-    /// arguments or text — so `cadence events --follow` shows progress
-    /// on a long turn without proxying the transcript.
+    /// One compact lifecycle event per tool use — the name and a
+    /// one-line redacted summary ([`crate::store::tool_summary`], CAD-319),
+    /// never the raw arguments or text — so `cadence events --follow`
+    /// and a threaded agent's chat show progress on a long turn without
+    /// proxying the transcript.
     fn on_assistant(&self, event: &Value) {
         let Some(content) = event
             .get("message")
@@ -349,7 +352,15 @@ impl Shared {
         for block in content {
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                 if let Some(name) = block.get("name").and_then(Value::as_str) {
-                    self.emit("cadence/tool_use", &json!({"tool": name}));
+                    let input = block.get("input").unwrap_or(&Value::Null);
+                    self.emit(
+                        "cadence/tool_use",
+                        &json!({
+                            "tool": name,
+                            "summary": crate::store::tool_summary(name, input),
+                            "tool_use_id": block.get("id"),
+                        }),
+                    );
                 }
             }
         }
