@@ -436,15 +436,6 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         .map_err(|_| Error::rejected(format!("Note {} is unreadable", note_arg.display())))?;
     std::fs::metadata(&note)
         .map_err(|_| Error::rejected(format!("Note {} is unreadable", note_arg.display())))?;
-    // CAD-339: the daemon's own check, by connection identity, before
-    // anything is written — the CAD-360 gate for everyone, and for the
-    // master "tickets of approved plans only".
-    // A daemon from before CAD-339 knows no master and no such check.
-    if let Err(e) = client::rpc(state_dir, "plan_check", json!({"issue": front.id})) {
-        if !e.to_string().contains("Unknown method 'plan_check'") {
-            return Err(e);
-        }
-    }
     // CAD-383: an issue someone else holds in doing/review refuses here,
     // before the daemon is asked anything. The requester is the PM
     // (`--reply-to`) and the worker; `issue start` re-checks under the
@@ -743,8 +734,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         let sent = client::rpc(
             state_dir,
             "agent_send",
-            json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid,
-                   "issue": front.id}),
+            json!({"alias": args.to, "text": body, "reply_to": reply_to, "message": mid}),
         )
         .map_err(&send_failed)?;
         (

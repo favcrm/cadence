@@ -27,6 +27,9 @@ use uuid::Uuid;
 
 mod master_rpc;
 
+/// CAD-339: the daemon methods a master connection may call.
+pub use master_rpc::MASTER_ALLOWED;
+
 use crate::adapter::{
     self, registry, AdapterHooks, Probe, ProviderAdapter, ProviderEnv, ProviderRequest,
     SettledPoll, TurnResult,
@@ -504,8 +507,13 @@ pub struct Shared {
     auto_stop: AutoStopTimer,
     /// CAD-339: a report was filed — the report router scans at once.
     reports_dirty: AtomicBool,
-    /// CAD-339: whether the report router runs at all.
-    report_router: bool,
+    /// CAD-339: the report router's scan period; `None` is off.
+    router_every: Option<Duration>,
+    /// CAD-339: reports due to the master but held back by the per-pass
+    /// cap at the router's last pass.
+    router_backlog: std::sync::atomic::AtomicUsize,
+    /// CAD-339: serializes writers of the escalation record.
+    escalation_lock: Mutex<()>,
 }
 
 impl Shared {
@@ -568,7 +576,13 @@ impl Shared {
             slot_clock,
             agent_gc: AgentGcTimer::new(opts.agent_gc.clone()),
             reports_dirty: AtomicBool::new(false),
-            report_router: opts.report_router.unwrap_or(true),
+            router_every: match opts.report_router {
+                None => Some(Duration::from_secs(30)),
+                Some(0) => None,
+                Some(secs) => Some(Duration::from_secs(secs)),
+            },
+            router_backlog: std::sync::atomic::AtomicUsize::new(0),
+            escalation_lock: Mutex::new(()),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
         });
         // Holds dropped by boot-time revalidation get their release
@@ -888,10 +902,10 @@ impl Shared {
     /// It instructs an agent, so an agent must never reach it: a
     /// connection the daemon attributes to a pane or managed endpoint is
     /// refused, and so is one whose identity cannot be derived (fail
-    /// closed). Tied to no agent is accepted as the operator — a default,
-    /// not positive proof: the board relays browser writes from its own
-    /// process, so the browser's identity is the board's to establish
-    /// (CAD-313). Identity-shaped and routing fields are refused rather
+    /// closed), and a connection tied to no agent must still be provably
+    /// the operator (CAD-276's positive proof, CAD-339): the board relays
+    /// browser writes from its own process, so the browser's identity is
+    /// the board's to establish (CAD-313). Identity-shaped and routing fields are refused rather
     /// than read.
     fn rpc_thread_send(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         if let Some(obj) = params.as_object() {
@@ -906,7 +920,11 @@ impl Shared {
             }
         }
         match self.caller_identity(peer_pid) {
-            Ok(Caller::NoAgentIdentity) => {}
+            // CAD-339 (review round 1): no agent identity is not enough —
+            // a detached child of an agent derives none. The connection
+            // must be provably the operator (CAD-276); the board relays
+            // browser writes from its own operator process (CAD-313 gap).
+            Ok(Caller::NoAgentIdentity) => self.proven_operator("thread send", peer_pid)?,
             Ok(Caller::Agent(v)) => {
                 return Err(Error::rejected(format!(
                     "thread send is the operator's chat — this connection is agent \
@@ -2220,11 +2238,12 @@ impl Shared {
             "project_work_approvals" => Ok(json!({
                 "approvals": self.store.work_approvals()?,
             })),
-            "plan_check" => self.rpc_plan_check(params, peer_pid),
+            "master_dispatch" => self.rpc_master_dispatch(params, peer_pid),
+            "question_escalate" => self.rpc_question_escalate(params, peer_pid),
             "agent_file_write" => self.rpc_agent_file_write(params, peer_pid),
             "master_start" => self.rpc_master_start(params, peer_pid),
             "master_summary" => self.rpc_master_summary(params, peer_pid),
-            "reports_changed" => self.rpc_reports_changed(),
+            "reports_changed" => self.rpc_reports_changed(peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -8351,9 +8370,10 @@ pub struct ServeOptions {
     /// The auto-stop clock (epoch seconds) — `None` is the wall clock;
     /// tests inject one they advance instead of sleeping.
     pub auto_stop_clock: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
-    /// CAD-339 report router: `None` (production) runs it; `Some(false)`
-    /// keeps a test daemon hermetic — no tracker scan.
-    pub report_router: Option<bool>,
+    /// CAD-339 report router scan period in seconds: `None` (production)
+    /// is 30; `Some(0)` turns it off — test daemons stay hermetic, no
+    /// tracker scan.
+    pub report_router: Option<u64>,
 }
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then

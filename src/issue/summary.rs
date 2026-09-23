@@ -82,8 +82,9 @@ fn at_or_after(at: Option<&str>, since: i64) -> bool {
     at.and_then(time::parse_iso).is_some_and(|t| t >= since)
 }
 
-/// The summary since `since` (epoch seconds).
-pub fn since(pm: &Pm, since: i64) -> Result<Value> {
+/// The summary since `since` (epoch seconds). `escalated` is the
+/// daemon's escalation record, keyed `<issue>/<question report>`.
+pub fn since(pm: &Pm, since: i64, escalated: &serde_json::Map<String, Value>) -> Result<Value> {
     let views = board::views(&pm.config.notes_dir(), board::load_all(&pm.dir, None)?);
     let mut proposed = Vec::new();
     let mut decided = Vec::new();
@@ -117,7 +118,9 @@ pub fn since(pm: &Pm, since: i64) -> Result<Value> {
             open.push(json!({
                 "issue": f.id, "title": f.title, "report": q["name"],
                 "agent": q["agent"], "at": q["at"], "impact": q["impact"],
-                "escalated": !q["escalation"].is_null(),
+                "escalated": escalated.contains_key(&format!(
+                    "{}/{}", f.id, q["name"].as_str().unwrap_or_default()
+                )),
             }));
         }
     }

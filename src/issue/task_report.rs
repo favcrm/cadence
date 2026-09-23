@@ -7,7 +7,7 @@
 //! ```markdown
 //! ---
 //! schema: cadence.report/2
-//! kind: done              # done | question | blocked | answer | escalate
+//! kind: done              # done | question | blocked | answer
 //! task: CAD-341
 //! agent: dev-1
 //! sha: <40 or 64 hex>     # optional
@@ -31,10 +31,6 @@
 //! `answer` carries `answers: <question report file name>` and a free
 //! body instead of the headings; a question is open until an answer
 //! names it (files stay create-only — the question is never edited).
-//! An `escalate` (CAD-339) carries `escalates: <question report file
-//! name>` and a free body — the summary for the operator — and leaves
-//! the question open: it is how the master hands a question it cannot
-//! answer to the operator's Needs-you list.
 //! With `CADENCE_ALIAS` set, `agent` must be that alias. A new
 //! kind is a new [`Kind`] value — the record, writer and readers stay
 //! the same. Unknown frontmatter fields are refused, not ignored, so a
@@ -77,9 +73,6 @@ pub enum Kind {
     Blocked,
     /// Answers one `question` report on the same ticket (`answers:`).
     Answer,
-    /// Hands one open `question` on the same ticket to the operator
-    /// (`escalates:`), with a summary body; the question stays open.
-    Escalate,
 }
 
 impl Kind {
@@ -89,7 +82,6 @@ impl Kind {
             Kind::Question => "question",
             Kind::Blocked => "blocked",
             Kind::Answer => "answer",
-            Kind::Escalate => "escalate",
         }
     }
 }
@@ -158,10 +150,6 @@ pub struct Front {
     /// `answer` only: the file name of the question report it answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answers: Option<String>,
-    /// `escalate` only: the file name of the question report it hands
-    /// to the operator.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub escalates: Option<String>,
 }
 
 /// Split and parse a report file. A file without a `---` fence is all
@@ -288,7 +276,7 @@ pub fn validate(
     };
     let Some(k) = front.kind else {
         return Err(Error::rejected(
-            "report needs a kind (done|question|blocked|answer|escalate) — `kind:` or --kind",
+            "report needs a kind (done|question|blocked|answer) — `kind:` or --kind",
         ));
     };
     let agent = front
@@ -370,31 +358,11 @@ pub fn validate(
         }
         (_, None) => {}
     }
-    match (k, front.escalates.as_deref()) {
-        (Kind::Escalate, Some(q)) if valid_report_name(q) => {}
-        (Kind::Escalate, _) => {
-            return Err(Error::rejected(
-                "an escalate report names the question it hands to the operator \
-                 (`escalates: <question report file name>`)",
-            ))
-        }
-        (_, Some(_)) => {
-            return Err(Error::rejected(format!(
-                "`escalates` belongs to an escalate report, not '{}'",
-                k.as_str()
-            )))
-        }
-        (_, None) => {}
-    }
-    // An answer or escalation is a reply, not a reflection — it needs a
-    // body (the answer, or the summary for the operator), not the six
-    // headings.
-    if matches!(k, Kind::Answer | Kind::Escalate) {
+    // An answer is a reply, not a reflection — it needs a body, not
+    // the six headings.
+    if k == Kind::Answer {
         if body.trim().is_empty() {
-            return Err(Error::rejected(format!(
-                "an {} report needs a body",
-                k.as_str()
-            )));
+            return Err(Error::rejected("an answer report needs a body"));
         }
     } else {
         check_sections(body)?;
@@ -469,28 +437,16 @@ pub fn prepare(pm: &Pm, text: &str, task: Option<&str>, kind: Option<Kind>) -> R
     let front = validate(front, &body, task, kind, &default_agent())?;
     let id = front.task.clone().unwrap_or_default();
     let (_, dir) = write::issue_dir(pm, &id)?;
-    if let Some(q) = front.answers.as_ref().or(front.escalates.as_ref()) {
+    if let Some(q) = &front.answers {
         let is_question = names(&dir).contains(q)
             && std::fs::read_to_string(dir.join(DIR).join(q))
                 .ok()
                 .and_then(|t| load(&t, &id).ok())
                 .is_some_and(|(f, _)| f.kind == Some(Kind::Question));
         if !is_question {
-            let verb = front.kind.map_or("answer", Kind::as_str);
             return Err(Error::rejected(format!(
-                "{id} has no question report '{q}' to {verb} — `cadence issue show {id}` \
+                "{id} has no question report '{q}' to answer — `cadence issue show {id}` \
                  lists its reports"
-            )));
-        }
-        // An answered question is settled — escalating it would put a
-        // closed question in front of the operator.
-        if front.kind == Some(Kind::Escalate)
-            && list(&dir, &id)
-                .iter()
-                .any(|r| r["name"] == q.as_str() && r["open"] == false)
-        {
-            return Err(Error::rejected(format!(
-                "{id}: question '{q}' is already answered — nothing to escalate"
             )));
         }
     }
@@ -609,7 +565,7 @@ pub fn list(issue_dir: &Path, id: &str) -> Vec<Value> {
                     "state": f.state, "constraints": f.constraints,
                     "context_feedback": f.context_feedback,
                     "options": f.options, "impact": f.impact,
-                    "answers": f.answers, "escalates": f.escalates, "body": body,
+                    "answers": f.answers, "body": body,
                 }),
                 Err(e) => json!({"name": name, "path": path, "at": at, "error": e.to_string()}),
             }
@@ -630,19 +586,6 @@ pub fn list(issue_dir: &Path, id: &str) -> Vec<Value> {
             ))
         })
         .collect();
-    // Escalations, oldest first: (question, escalate file, agent, body).
-    let escalations: Vec<(String, String, Value, Value)> = rows
-        .iter()
-        .filter(|r| r["kind"] == "escalate")
-        .filter_map(|r| {
-            Some((
-                r["escalates"].as_str()?.to_string(),
-                r["name"].as_str()?.to_string(),
-                r["agent"].clone(),
-                r["body"].clone(),
-            ))
-        })
-        .collect();
     for r in &mut rows {
         match r["kind"].as_str() {
             Some("question") => {
@@ -654,25 +597,12 @@ pub fn list(issue_dir: &Path, id: &str) -> Vec<Value> {
                     .collect();
                 r["open"] = json!(by.is_empty());
                 r["answered_by"] = json!(by);
-                let up: Vec<&(String, String, Value, Value)> =
-                    escalations.iter().filter(|(q, ..)| *q == name).collect();
-                r["escalated_by"] = json!(up.iter().map(|(_, n, ..)| n).collect::<Vec<_>>());
-                // The latest escalation's summary is what the operator reads.
-                r["escalation"] = up.last().map_or(
-                    Value::Null,
-                    |(_, n, agent, body)| json!({"report": n, "agent": agent, "summary": body}),
-                );
             }
-            Some(kind @ ("answer" | "escalate")) => {
-                let field = if kind == "answer" {
-                    "answers"
-                } else {
-                    "escalates"
-                };
-                let q = r[field].as_str().unwrap_or_default();
+            Some("answer") => {
+                let q = r["answers"].as_str().unwrap_or_default();
                 if !questions.iter().any(|n| n == q) {
                     r["error"] = json!(format!(
-                        "{field} '{q}', which is not a question report on {id}"
+                        "answers '{q}', which is not a question report on {id}"
                     ));
                 }
             }
@@ -683,7 +613,8 @@ pub fn list(issue_dir: &Path, id: &str) -> Vec<Value> {
 }
 
 /// The open questions on a ticket — [`list`] rows of kind `question`
-/// that no answer names yet, each with its `escalation` (or null).
+/// that no answer names yet (CAD-339: what the report router and the
+/// operator's Needs-you read).
 pub fn open_questions(issue_dir: &Path, id: &str) -> Vec<Value> {
     list(issue_dir, id)
         .into_iter()
@@ -835,40 +766,6 @@ mod tests {
             assert!(
                 validate(front(a, k), b, None, None, "pm").is_err(),
                 "{a:?} {k:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn escalate_names_a_question_and_carries_a_summary() {
-        let front = |escalates: Option<&str>, answers: Option<&str>, kind: Kind| Front {
-            kind: Some(kind),
-            task: Some("CAD-1".into()),
-            escalates: escalates.map(str::to_string),
-            answers: answers.map(str::to_string),
-            ..Front::default()
-        };
-        let q = "20260923T000000Z-dev.md";
-        let f = validate(
-            front(Some(q), None, Kind::Escalate),
-            "Needs a pricing call.",
-            None,
-            None,
-            "master",
-        )
-        .unwrap();
-        assert_eq!(f.kind, Some(Kind::Escalate));
-        assert_eq!(f.escalates.as_deref(), Some(q));
-        for (e, a, k, b) in [
-            (None, None, Kind::Escalate, "x"),
-            (Some("../q.md"), None, Kind::Escalate, "x"),
-            (Some(q), None, Kind::Escalate, " "),
-            (Some(q), None, Kind::Answer, "x"),
-            (Some(q), Some(q), Kind::Escalate, "x"),
-        ] {
-            assert!(
-                validate(front(e, a, k), b, None, None, "master").is_err(),
-                "{e:?} {a:?} {k:?}"
             );
         }
     }

@@ -84,21 +84,20 @@ report's `task` must be the issue the message's task is bound to — only then
 is it filed and a `Report: <path>` line added to the result. An `answer`
 report (`answers: <question file name>`, free body) answers a question on the
 same ticket; a question is open until an answer names it — the question file
-is never edited. An `escalate` report (CAD-339: `escalates: <question file
-name>`, free body = a summary for the operator) hands an open question up
-without answering it — the master files it when the ticket, the plan and the
-operator's words do not settle the question. `cadence issue show` and the
-board's issue detail payload (`reports`, with `open`/`answered_by`/`escalation`
-on questions) list them; `cadence issue lint` validates them.
+is never edited. `cadence issue show` and the board's issue detail payload
+(`reports`, with `open`/`answered_by` on questions) list them; `cadence issue
+lint` validates them.
 
 Routing (CAD-339, MVP): with a master registered, the daemon's report router
-queues every `done`/`blocked` report filed after the master started to the
-master (so it lands in the master's thread), and every question still open
-and unescalated after `[host] question_escalate_after_secs` (default 900 s —
-the window a PM has to answer). An escalated question stays in the operator's
-Needs-you (the overview's `needs_me`, kind `question`, with the master's
-summary) until an answer names it. Typed claims inside `## Lesson` and managed workers'
-trailing report block are not parsed yet.
+queues to the master (so it lands in the master's thread) every `done`/`blocked`
+report filed after the master started, and every question still open and
+unescalated after `[host] question_escalate_after_secs` (default 900 s — the
+window a PM has to answer), including questions open before the master
+started; at most five per pass, the rest counted as the routing backlog in the
+summary. A question the master cannot answer is escalated through the daemon
+(`cadence master escalate`, master or operator only — not a report kind); it
+stays in the operator's Needs-you (the overview's `needs_me`, kind `question`,
+with the master's summary) until an answer names it.
 
 ## 2. Verification
 

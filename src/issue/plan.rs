@@ -479,20 +479,6 @@ pub fn gate_master(pm_dir: &Path, front: &Front, body: &str) -> Result<()> {
     }
 }
 
-/// [`gate_master`] by issue id. Unlike [`gate_id`], an id no project
-/// holds is refused: the master's work is always a tracker ticket.
-pub fn gate_master_id(pm_dir: &Path, id: &str) -> Result<()> {
-    match probe_issue(pm_dir, id)? {
-        Some(issue) => gate_master(pm_dir, &issue.front, &issue.body),
-        None => Err(Error::invalid(
-            "master_outside_plan",
-            format!(
-                "{id} is not a tracker issue — the master dispatches only approved plan tickets"
-            ),
-        )),
-    }
-}
-
 /// [`gate`] by issue id — for callers holding only an id (the daemon's
 /// job dispatch). An id no project holds passes (jobs need not name a
 /// tracker issue); one that exists but cannot be read refuses.

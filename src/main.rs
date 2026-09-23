@@ -2297,6 +2297,28 @@ enum MasterAction {
         #[arg(long)]
         file: PathBuf,
     },
+    /// The master's dispatch: hand a `ready` ticket of an approved plan,
+    /// its blockers done, to the ticket's agent. The daemon composes and
+    /// sends the kickoff; `--to` only when the ticket names no agent.
+    /// Master only.
+    Dispatch {
+        /// The ticket id.
+        issue: String,
+        /// Target agent when the ticket names none.
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Hand an open question the master cannot answer to the operator's
+    /// Needs-you, with a summary (master or operator only).
+    Escalate {
+        /// The ticket id.
+        issue: String,
+        /// The question report's file name.
+        question: String,
+        /// The summary for the operator; `-` reads stdin.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// "Since you left": plans proposed and decided, tickets moved,
     /// reports filed and open questions since a time.
     Summary {
@@ -2327,6 +2349,23 @@ fn run_master(state_dir: &Path, action: MasterAction) -> Result<i32> {
                 state_dir,
                 "agent_file_write",
                 json!({"agent": cadence_agent::master::ALIAS, "file": name, "text": text}),
+            )?
+        }
+        MasterAction::Dispatch { issue, to } => client::rpc(
+            state_dir,
+            "master_dispatch",
+            json!({"issue": issue, "to": to}),
+        )?,
+        MasterAction::Escalate {
+            issue,
+            question,
+            file,
+        } => {
+            let summary = read_body_capped(None, Some(file), 4 * 4_000)?;
+            client::rpc(
+                state_dir,
+                "question_escalate",
+                json!({"issue": issue, "question": question, "summary": summary}),
             )?
         }
         MasterAction::Summary { since, post } => client::rpc(
@@ -5620,6 +5659,17 @@ fn run() -> Result<i32> {
             force,
             take_over,
         } => {
+            // CAD-339: the master dispatches only through the daemon,
+            // which composes the kickoff itself — never this client path.
+            if std::env::var("CADENCE_ALIAS").as_deref() == Ok(cadence_agent::master::ALIAS) {
+                let out = client::rpc(
+                    &state_dir,
+                    "master_dispatch",
+                    json!({"issue": issue, "to": to}),
+                )?;
+                print_json(&out);
+                return Ok(0);
+            }
             let pm = cadence_agent::issue::Pm::open_default()?;
             let args = cadence_agent::issue::dispatch::DispatchArgs {
                 to: to.clone(),

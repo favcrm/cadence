@@ -2388,6 +2388,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
             .collect();
         let mut clock = StatusClock::new(&pm.dir, STATUS_CLOCK_BUDGET);
         let mut intake: Vec<Item> = Vec::new();
+        let escalations = crate::master::escalations(state_dir);
         for v in views {
             let id = v.issue.front.id.as_str();
             let project = v.issue.project.as_str();
@@ -2486,8 +2487,18 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                                           "tickets": plan.tickets});
                 needs.push(row);
             }
-            for q in issue::task_report::open_questions(&v.issue.dir, id) {
-                let Some(up) = q["escalation"].as_object() else {
+            // Only the daemon's escalation record puts a question here —
+            // a report file never can (review round 1, I3); reports are
+            // parsed only for tickets that have one.
+            let escalated_here = escalations.keys().any(|k| k.starts_with(&format!("{id}/")));
+            let open = if escalated_here {
+                issue::task_report::open_questions(&v.issue.dir, id)
+            } else {
+                vec![]
+            };
+            for q in open {
+                let key = format!("{id}/{}", q["name"].as_str().unwrap_or_default());
+                let Some(up) = escalations.get(&key).and_then(Value::as_object) else {
                     continue;
                 };
                 let since = q["at"].as_str().and_then(parse_iso);
@@ -2519,7 +2530,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                     "options": q["options"], "impact": q["impact"], "body": q["body"],
                 });
                 row.json["summary"] = up.get("summary").cloned().unwrap_or(Value::Null);
-                row.json["escalated_by"] = up.get("agent").cloned().unwrap_or(Value::Null);
+                row.json["escalated_by"] = up.get("by").cloned().unwrap_or(Value::Null);
                 needs.push(row);
             }
             // `cadence report` intake: a backlog-tagged row surfaces

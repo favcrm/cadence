@@ -276,13 +276,14 @@ cadence issue epic stage CAD-40 verify
                                       # forward = operator only)
 cadence milestone ls               # milestones with weighted progress
 cadence master start               # operator only: the one `master` agent
-                                      # (managed claude|codex) briefed from
+                                      # (managed claude) briefed from
                                       # <pm>/agents/master/{SOUL,AGENT}.md,
                                       # defaults installed when missing; chat
-                                      # via its thread. It proposes plans,
-                                      # dispatches approved tickets, answers
-                                      # or escalates questions; the daemon
-                                      # refuses it everything else (CAD-339)
+                                      # via its thread. It may only read,
+                                      # propose plans, `master dispatch`
+                                      # approved tickets and `master escalate`
+                                      # questions; the daemon refuses it
+                                      # everything else (CAD-339)
 cadence master edit SOUL.md --file f
                                    # the one writer of the master's files
                                       # (operator only; start refuses files

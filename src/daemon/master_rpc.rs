@@ -1,20 +1,22 @@
 //! The master agent's daemon side (CAD-339): starting it from its agent
 //! files, the operator-only agent-file writer, the master policy every
-//! RPC passes through, the report router that brings workers' reports
-//! and unanswered questions into the master's thread, and the "since
-//! you left" summary.
+//! RPC passes through, the master's own dispatch and escalation verbs,
+//! the report router that brings workers' reports and unanswered
+//! questions into the master's thread, and the "since you left" summary.
 //!
 //! The master is the agent whose alias is [`crate::master::ALIAS`]; the
 //! daemon recognises it on a connection only through the one identity
 //! verifier ([`Shared::caller_identity`], CAD-381) — never from request
-//! fields or `CADENCE_ALIAS`. Every check here is a process guard, not
-//! a security boundary: a same-uid process that escapes the master's
-//! process tree (setsid + double fork) is not recognised as the master,
-//! the residual CAD-276 documents for operator authority.
+//! fields or `CADENCE_ALIAS`. The policy is an **allowlist**: a master
+//! connection reaches only [`MASTER_ALLOWED`]; every other method,
+//! including any added later, is refused. Every check here is a process
+//! guard, not a security boundary: a same-uid process that escapes the
+//! master's process tree (setsid + double fork) is not recognised as the
+//! master — CAD-276's residual, tracked for all agents in CAD-384.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -26,73 +28,31 @@ use crate::issue::{self, task_report};
 use crate::master::{self, ALIAS};
 use crate::store;
 
-/// Daemon methods the master is refused outright, with the reason it
-/// hears. Everything that decides, accepts, merges, reconfigures an
-/// agent or answers for the operator is here; reading, proposing a plan
-/// and dispatching approved tickets are not.
-const MASTER_REFUSED: &[(&str, &str)] = &[
-    (
-        "plan_approve",
-        "approving a plan is the operator's decision",
-    ),
-    ("plan_reject", "rejecting a plan is the operator's decision"),
-    ("approval_record", "merge approvals are the operator's"),
-    ("approval_revoke", "merge approvals are the operator's"),
-    ("task_verdict", "the master never reviews or accepts work"),
-    ("task_accept", "the master never reviews or accepts work"),
-    ("agent_file_write", "only the operator changes agent files"),
-    ("master_start", "only the operator starts the master"),
-    (
-        "agent_register",
-        "the master works with registered agents; staffing from agent files is CAD-338",
-    ),
-    (
-        "agent_set",
-        "the master never changes an agent's launch params",
-    ),
-    ("agent_remove", "the master never removes agents"),
-    ("agent_gc", "the master never removes agents"),
-    (
-        "agent_unfence",
-        "reconciling a fenced agent is the operator's",
-    ),
-    (
-        "agent_respond",
-        "answering a provider's permission prompt is the operator's consent",
-    ),
-    (
-        "agent_answer",
-        "answering a provider's permission prompt is the operator's consent",
-    ),
-    (
-        "job_new",
-        "the master dispatches with `cadence dispatch <ID>`, not jobs",
-    ),
-    (
-        "task_new",
-        "the master dispatches with `cadence dispatch <ID>`, not jobs",
-    ),
-    (
-        "task_dispatch",
-        "the master dispatches with `cadence dispatch <ID>`, not jobs",
-    ),
-    (
-        "task_reopen",
-        "the master dispatches with `cadence dispatch <ID>`, not jobs",
-    ),
-    ("monitor_register", "the master runs no monitors"),
-    ("monitor_dispatch", "the master runs no monitors"),
-    ("slot_launch", "the master runs no builds or recipes"),
+/// The daemon methods a master connection may call — everything else is
+/// refused (review round 1, C2). Reads, proposing a plan, its own
+/// dispatch/escalate/summary verbs, and a report on its own message.
+pub const MASTER_ALLOWED: &[&str] = &[
+    "health",
+    "daemon_info",
+    "agent_list",
+    "agent_show",
+    "agent_events",
+    "thread_read",
+    "job_list",
+    "job_show",
+    "job_events",
+    "task_show",
+    "model_defaults_get",
+    "plan_propose",
+    "master_dispatch",
+    "question_escalate",
+    "master_summary",
+    "message_report",
 ];
 
-/// Methods whose sends the master may make only as the kickoff of an
-/// approved plan ticket.
-const MASTER_SENDS: &[&str] = &["agent_send", "agent_ask"];
-
-/// The report router's full-scan period; a `reports_changed` ping (sent
-/// by `cadence report file`) scans at once.
-const ROUTER_EVERY: Duration = Duration::from_secs(30);
-const ROUTER_TICK: Duration = Duration::from_millis(250);
+/// Most reports one router pass queues to the master; the rest wait for
+/// the next pass and are counted as the routing backlog.
+const ROUTES_PER_PASS: usize = 5;
 /// Default wait before an unanswered question reaches the master.
 const QUESTION_GRACE_SECS: u64 = 900;
 /// Body bytes a routed report carries; the file keeps the rest.
@@ -151,6 +111,11 @@ fn clip(text: &str, max: usize) -> String {
     )
 }
 
+/// Is `method` open to a master connection.
+pub(crate) fn master_may_call(method: &str) -> bool {
+    MASTER_ALLOWED.contains(&method)
+}
+
 impl Shared {
     /// Is a master registered at all — every master check is skipped,
     /// at no cost, on an install without one.
@@ -159,8 +124,7 @@ impl Shared {
     }
 
     /// Is this connection the master's (its process tree, per the one
-    /// identity verifier). An underivable identity is not the master —
-    /// the operator-only verbs refuse it on their own.
+    /// identity verifier). An underivable identity is not the master.
     pub(super) fn caller_is_master(&self, peer_pid: u32) -> bool {
         self.master_exists()
             && matches!(
@@ -169,57 +133,210 @@ impl Shared {
             )
     }
 
-    /// CAD-339: the master policy, run before every RPC. The master is
-    /// refused [`MASTER_REFUSED`] outright, and may send a message only
-    /// as the kickoff of a ticket of an approved plan (`issue` names
-    /// it; `cadence dispatch` passes it). A refusal happens before the
-    /// method runs, so it leaves no write.
+    /// CAD-339: run before every RPC. Nobody but `master_start` registers
+    /// the alias `master`; a master connection reaches only
+    /// [`MASTER_ALLOWED`], and its `message_report` only for its own
+    /// messages. A refusal happens before the method runs, so it leaves
+    /// no write.
     pub(super) fn master_policy(&self, method: &str, params: &Value, peer_pid: u32) -> Result<()> {
-        let refused = MASTER_REFUSED.iter().find(|(m, _)| *m == method);
-        let send = MASTER_SENDS.contains(&method);
-        if refused.is_none() && !send {
-            return Ok(());
+        if method == "agent_register" && optional_str(params, "alias") == Some(ALIAS) {
+            return Err(Error::invalid(
+                "master_reserved",
+                "the alias 'master' is reserved — only `cadence master start` registers it",
+            ));
         }
         if !self.caller_is_master(peer_pid) {
             return Ok(());
         }
-        if let Some((_, why)) = refused {
+        if !master_may_call(method) {
             return Err(Error::invalid(
                 "master_refused",
-                format!("the master may not call {method}: {why}"),
+                format!(
+                    "the master may not call {method} — it reads, proposes plans, dispatches \
+                     approved tickets (`cadence master dispatch`), answers and escalates \
+                     questions; everything else is the operator's"
+                ),
             ));
         }
-        let Some(issue) = optional_str(params, "issue") else {
-            return Err(Error::invalid(
-                "master_outside_plan",
-                "the master sends only the kickoff of an approved plan ticket — \
-                 `cadence dispatch <ID> --to <alias> --reply-to master`",
-            ));
-        };
-        crate::issue::plan::gate_master_id(&self.pm_dir()?, issue)
+        if method == "message_report" {
+            let id = required_str(params, "message")?;
+            let own = self.store.message(id)?.is_some_and(|m| m.alias == ALIAS);
+            if !own {
+                return Err(Error::invalid(
+                    "master_refused",
+                    format!("the master reports only on its own messages, not {id}"),
+                ));
+            }
+        }
+        Ok(())
     }
 
-    /// `plan_check` — the dispatch pre-flight `cadence dispatch` runs
-    /// before it writes anything: the CAD-360 gate for everyone, and for
-    /// the master the stricter "approved plan tickets only".
-    pub(super) fn rpc_plan_check(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        let issue = required_str(params, "issue")?;
-        let pm_dir = self.pm_dir()?;
-        let is_master = self.caller_is_master(peer_pid);
-        if is_master {
-            crate::issue::plan::gate_master_id(&pm_dir, issue)?;
-        } else {
-            crate::issue::plan::gate_id(&pm_dir, issue)?;
+    /// `master_dispatch` — the master's only way to hand work to an
+    /// agent (review round 1, I1). The daemon, not the master, decides
+    /// what is sent: the issue must be a ticket of an approved plan
+    /// ([`crate::issue::plan::gate_master`]), `ready`, with every
+    /// `blocked_by` done or dropped; it goes to the ticket's own agent
+    /// (`owner`, set from the plan's `agent:`), or to `to` only when the
+    /// ticket names none; and the kickoff is the standard one composed
+    /// from the ticket (its `issue.md` is the note). A ticket dispatches
+    /// once: dispatch moves it to `doing`.
+    pub(super) fn rpc_master_dispatch(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        if !self.caller_is_master(peer_pid) {
+            return Err(Error::invalid(
+                "master_only",
+                "master_dispatch is the master's verb — others use `cadence dispatch`",
+            ));
         }
-        Ok(json!({"issue": issue, "ok": true, "master": is_master}))
+        let id = required_str(params, "issue")?;
+        let pm = issue::Pm::at(&self.pm_dir()?)?;
+        let ticket = issue::board::find_issue(&pm.dir, id)?;
+        let front = &ticket.front;
+        crate::issue::plan::gate_master(&pm.dir, front, &ticket.body)?;
+        if front.status != "ready" {
+            return Err(Error::invalid(
+                "master_dispatch_state",
+                format!(
+                    "{id} is {} — the master dispatches a ticket once, from ready",
+                    front.status
+                ),
+            ));
+        }
+        for blocker in &front.blocked_by {
+            let b = issue::board::find_issue(&pm.dir, blocker)?;
+            if !matches!(b.front.status.as_str(), "done" | "dropped") {
+                return Err(Error::invalid(
+                    "master_dispatch_blocked",
+                    format!(
+                        "{id} depends on {blocker}, which is {} — dispatch it once that is done",
+                        b.front.status
+                    ),
+                ));
+            }
+        }
+        let to = match (front.owner.as_deref(), optional_str(params, "to")) {
+            (Some(owner), None) => owner.to_string(),
+            (Some(owner), Some(to)) if owner == to => owner.to_string(),
+            (Some(owner), Some(to)) => {
+                return Err(Error::invalid(
+                    "master_dispatch_target",
+                    format!(
+                        "{id} is assigned to {owner} — the master cannot send it to {to}; \
+                         ask the operator to reassign it"
+                    ),
+                ))
+            }
+            (None, Some(to)) => to.to_string(),
+            (None, None) => {
+                return Err(Error::invalid(
+                    "master_dispatch_target",
+                    format!("{id} names no agent — pass --to <alias>"),
+                ))
+            }
+        };
+        if master::is_master(&to) {
+            return Err(Error::invalid(
+                "master_dispatch_target",
+                "the master never dispatches to itself — it does not implement",
+            ));
+        }
+        let agent = self.store.agent(&to)?;
+        if agent.state == "attention" {
+            return Err(Error::rejected(format!(
+                "{to} is fenced — the operator reconciles it before work goes there"
+            )));
+        }
+        let args = issue::dispatch::DispatchArgs {
+            to: to.clone(),
+            note: None,
+            name: None,
+            base: None,
+            repo: None,
+            reply_to: Some(ALIAS.to_string()),
+            summary: None,
+            job_spec: None,
+            no_lessons: false,
+            force: false,
+            take_over: None,
+        };
+        // The daemon runs the ordinary dispatch on the master's behalf:
+        // worktree, tracker refs and comment, one kickoff — attributed
+        // to the master.
+        let out = issue::dispatch::run(&pm, id, &args, ALIAS, &self.state_dir)?;
+        let _ = self.store.event_public(
+            DAEMON_ALIAS,
+            "master_dispatched",
+            json!({"issue": id, "to": to, "message": out["message"]}),
+        );
+        Ok(out)
+    }
+
+    /// `question_escalate` — hand an open question the master cannot
+    /// answer to the operator (review round 1, I3). Only the master's
+    /// connection (or the proven operator) may; the record lives in the
+    /// daemon's state dir, which is the only source the operator's
+    /// Needs-you reads — a report file can never put a question there.
+    /// A tracker comment keeps the human record on the ticket.
+    pub(super) fn rpc_question_escalate(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let by = if self.caller_is_master(peer_pid) {
+            ALIAS
+        } else {
+            self.proven_operator("question escalate", peer_pid)?;
+            "operator"
+        };
+        let id = required_str(params, "issue")?;
+        let question = required_str(params, "question")?;
+        let summary = required_str(params, "summary")?.trim();
+        if summary.is_empty() || summary.len() > master::ESCALATION_SUMMARY_MAX {
+            return Err(Error::rejected(format!(
+                "the summary is 1-{} bytes",
+                master::ESCALATION_SUMMARY_MAX
+            )));
+        }
+        crate::secret::guard(&format!("{id}: escalation"), summary)?;
+        let pm = issue::Pm::at(&self.pm_dir()?)?;
+        let ticket = issue::board::find_issue(&pm.dir, id)?;
+        let open = task_report::open_questions(&ticket.dir, id)
+            .into_iter()
+            .any(|q| q["name"] == question);
+        if !open {
+            return Err(Error::rejected(format!(
+                "{id} has no open question '{question}' — `cadence issue show {id}` lists its reports"
+            )));
+        }
+        let key = format!("{id}/{question}");
+        let record = json!({
+            "issue": id, "question": question, "summary": summary,
+            "by": by, "at": crate::issue::time::iso(now_epoch()),
+        });
+        {
+            let _guard = self
+                .escalation_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            master::record_escalation(&self.state_dir, &key, record.clone())?;
+        }
+        let _ = issue::write::add_comment(
+            &pm,
+            id,
+            &format!("Question {question} escalated to the operator by {by}:\n\n{summary}"),
+            Some(by),
+            None,
+            None,
+            by,
+        );
+        let _ = self
+            .store
+            .event_public(DAEMON_ALIAS, "question_escalated", record.clone());
+        self.wake();
+        Ok(record)
     }
 
     /// `agent_file_write` — the one writer of an agent's SOUL.md and
-    /// AGENT.md, for the proven operator only (the connection-bound rule
-    /// of the approval verbs). The master's digest is recorded so a
-    /// later edit around this writer is caught at `master start`.
+    /// AGENT.md, for the proven operator only. The file's digest is
+    /// recorded so a later edit around this writer is caught at
+    /// `master start`.
     pub(super) fn rpc_agent_file_write(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        self.approval_operator("agent file write", params, peer_pid)?;
+        self.operator_connection("agent file write", params, peer_pid)?;
         let slug = required_str(params, "agent")?;
         let name = required_str(params, "file")?;
         let text = required_str(params, "text")?;
@@ -231,15 +348,16 @@ impl Shared {
 
     /// `master_start` — operator only. Installs any missing default agent
     /// file, refuses files changed around the writer, then registers the
-    /// one `master` agent (managed Claude or Codex, cwd the tracker) and
-    /// queues its bootstrap: the briefing built from SOUL.md + AGENT.md.
-    /// Its thread starts here, so reports routed to it land in the chat.
+    /// one `master` agent — managed Claude, in an empty working dir under
+    /// the state dir — and queues its bootstrap: the briefing built from
+    /// SOUL.md + AGENT.md. Its thread starts here, so reports routed to
+    /// it land in the chat.
     pub(super) fn rpc_master_start(
         self: &Arc<Self>,
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
-        self.approval_operator("master start", params, peer_pid)?;
+        self.operator_connection("master start", params, peer_pid)?;
         if let Some(agent) = self.store.agent_opt(ALIAS)? {
             return Err(Error::invalid(
                 "master_exists",
@@ -258,6 +376,19 @@ impl Shared {
             ALIAS,
             &master::read_files(&pm.dir, ALIAS, false)?,
         )?;
+        // Claude only for the MVP (review round 1, C1): a Codex session
+        // cannot yet run read-only with its writes through daemon verbs.
+        let requested = optional_str(params, "provider");
+        if requested.is_some_and(|p| p != "claude") {
+            return Err(Error::invalid(
+                "master_provider",
+                format!(
+                    "the master runs on claude only for now, not '{}': a codex master needs a \
+                     read-only sandbox with its writes going through daemon verbs (follow-up)",
+                    requested.unwrap_or_default()
+                ),
+            ));
+        }
         let installed = master::install_defaults(&pm, "operator")?;
         let files = master::read_files(&pm.dir, ALIAS, true)?;
         master::verify(&self.state_dir, ALIAS, &files)?;
@@ -266,26 +397,14 @@ impl Shared {
             .find(|(n, _)| n == "AGENT.md")
             .map(|(_, t)| t.as_str())
             .unwrap_or_default();
-        let choices = preferred(agent_md);
-        let provider = optional_str(params, "provider")
-            .map(str::to_string)
-            .or_else(|| choices.first().map(|c| c.0.clone()))
-            .unwrap_or_else(|| "claude".to_string());
-        let endpoint_kind = match provider.as_str() {
-            "claude" | "codex" => "managed",
-            other => {
-                return Err(Error::rejected(format!(
-                    "the master runs on claude or codex, not '{other}' (pi comes later)"
-                )))
-            }
-        };
-        let choice = choices.iter().find(|c| c.0 == provider);
+        let provider = "claude";
+        let choice = preferred(agent_md).into_iter().find(|c| c.0 == provider);
         let model = optional_str(params, "model")
             .map(str::to_string)
-            .or_else(|| choice.and_then(|c| c.1.clone()));
+            .or_else(|| choice.as_ref().and_then(|c| c.1.clone()));
         let effort = optional_str(params, "effort")
             .map(str::to_string)
-            .or_else(|| choice.and_then(|c| c.2.clone()));
+            .or_else(|| choice.as_ref().and_then(|c| c.2.clone()));
         let mut launch = serde_json::Map::new();
         if let Some(m) = &model {
             launch.insert("model".into(), json!(m));
@@ -294,23 +413,24 @@ impl Shared {
             launch.insert("effort".into(), json!(e));
         }
         let launch = Value::Object(launch);
-        crate::adapter::registry::validate_launch_params(&provider, endpoint_kind, &launch)?;
+        crate::adapter::registry::validate_launch_params(provider, "managed", &launch)?;
         let briefing = master::compose(&files);
         let file = client::briefing_path(&self.state_dir, &Value::Null, ALIAS);
         if let Some(dir) = file.parent() {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(&file, &briefing)?;
-        let cwd = pm.dir.canonicalize()?;
+        // An empty working dir the daemon owns — never the tracker or a
+        // repo, where any agent can plant CLAUDE.md, hooks or settings.
+        let cwd = master::workdir(&self.state_dir);
+        std::fs::create_dir_all(&cwd)?;
         self.store.register_agent(&store::NewAgent {
             alias: ALIAS,
-            provider: &provider,
-            endpoint_kind,
+            provider,
+            endpoint_kind: "managed",
             role: "worker",
-            cwd: &cwd.to_string_lossy(),
-            // Codex writes only inside the tracker; Claude's tools are
-            // restricted by the adapter instead.
-            sandbox: "workspace-write",
+            cwd: &cwd.canonicalize()?.to_string_lossy(),
+            sandbox: "read-only",
             instructions: Some(&briefing),
             params: Some(&launch.to_string()),
             team_role: None,
@@ -332,7 +452,8 @@ impl Shared {
         } else {
             format!(
                 "Cadence bootstrap: you are 'master', the operator's company assistant. \
-                 Read your briefing at {} first. Reply to the operator in this thread.",
+                 Your briefing is on disk at {} and too long to inline; ask the operator \
+                 to shorten SOUL.md/AGENT.md. Reply to the operator in this thread.",
                 file.display()
             )
         };
@@ -350,12 +471,13 @@ impl Shared {
         Ok(json!({
             "alias": ALIAS,
             "provider": provider,
-            "endpoint_kind": endpoint_kind,
+            "endpoint_kind": "managed",
             "model": model,
             "effort": effort,
             "state": "starting",
             "installed": installed,
             "agent_dir": master::agent_dir(&pm.dir, ALIAS),
+            "cwd": cwd,
             "briefing": file,
             "thread": thread.to_json(),
         }))
@@ -363,7 +485,8 @@ impl Shared {
 
     /// `master_summary` — the "since you left" summary (`since`: epoch,
     /// ISO or a look-back like `24h`). `post` appends it to the master's
-    /// thread as a system entry; only the operator or the master posts.
+    /// thread as a system entry: only the master or the proven operator
+    /// posts.
     pub(super) fn rpc_master_summary(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         let since = match params.get("since") {
             Some(Value::Number(n)) => n
@@ -379,18 +502,14 @@ impl Shared {
                     "no master to post to — `cadence master start` first",
                 ));
             }
-            if let Ok(Caller::Agent(v)) = self.caller_identity(peer_pid) {
-                if !master::is_master(&v.agent.alias) {
-                    return Err(Error::rejected(format!(
-                        "only the operator or the master posts into the master's thread — \
-                         this connection is '{}'",
-                        v.agent.alias
-                    )));
-                }
+            if !self.caller_is_master(peer_pid) {
+                self.proven_operator("posting into the master's thread", peer_pid)?;
             }
         }
         let pm = issue::Pm::at(&self.pm_dir()?)?;
-        let mut out = issue::summary::since(&pm, since)?;
+        let escalated = master::escalations(&self.state_dir);
+        let mut out = issue::summary::since(&pm, since, &escalated)?;
+        out["routing_backlog"] = json!(self.router_backlog.load(Ordering::SeqCst));
         if post {
             self.store.ensure_thread(ALIAS)?;
             let seq = self.store.thread_append(
@@ -409,46 +528,48 @@ impl Shared {
         Ok(out)
     }
 
-    /// `reports_changed` — a hint that a report was filed; the router
-    /// scans at once instead of at its next period.
-    pub(super) fn rpc_reports_changed(&self) -> Result<Value> {
+    /// `reports_changed` — the operator's hint that a report was filed;
+    /// the router scans at once instead of at its next period. Anyone
+    /// else waits for the period.
+    pub(super) fn rpc_reports_changed(&self, peer_pid: u32) -> Result<Value> {
+        self.proven_operator("reports changed", peer_pid)?;
         self.reports_dirty.store(true, Ordering::SeqCst);
         Ok(json!({"ok": true}))
     }
 
-    /// The report router's thread: a scan every [`ROUTER_EVERY`], or at
-    /// once after a `reports_changed` ping.
+    /// The report router's thread: a scan every period, or at once after
+    /// an operator's `reports_changed`.
     pub(super) fn run_report_router(self: &Arc<Self>) {
-        if !self.report_router {
+        let Some(every) = self.router_every else {
             return;
-        }
+        };
         let mut next = Instant::now();
         while !self.closing.load(Ordering::SeqCst) {
             if self.reports_dirty.swap(false, Ordering::SeqCst) || Instant::now() >= next {
                 if let Err(e) = self.route_reports() {
                     tracing::debug!("report router: {e}");
                 }
-                next = Instant::now() + ROUTER_EVERY;
+                next = Instant::now() + every;
             }
-            std::thread::sleep(ROUTER_TICK);
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
     }
 
-    /// One router pass (CAD-339). With a master registered, every task
-    /// report filed after the master was created and not by the master:
+    /// One router pass (CAD-339). With a master registered:
     ///
-    /// - `done` / `blocked` → one message to the master (so it lands in
-    ///   the master's thread and the master can dispatch what is next);
-    /// - `question` still open, not escalated, and older than
-    ///   `[host] question_escalate_after_secs` (default 900 — the window
-    ///   a PM has to answer) → one message to the master with the
-    ///   question and how to answer or escalate it.
+    /// - every `done` / `blocked` report filed after the master started
+    ///   (and not by it) → one message to the master, so it lands in the
+    ///   master's thread and the master can dispatch what is next;
+    /// - every open, unescalated question older than `[host]
+    ///   question_escalate_after_secs` (default 900 — the window a PM has
+    ///   to answer), including questions open before the master started
+    ///   → one message with the question and how to answer or escalate.
     ///
-    /// Each routes once: the message id is derived from the report path
-    /// and an existing id is skipped. Reports from before the master
-    /// existed are never replayed into it.
+    /// Each routes once (the message id is derived from the report path).
+    /// At most [`ROUTES_PER_PASS`] are queued per pass — one master turn
+    /// each; the rest wait and are counted in `router_backlog`.
     pub(super) fn route_reports(self: &Arc<Self>) -> Result<usize> {
-        let Some(master) = self.store.agent_opt(ALIAS)? else {
+        let Some(master_row) = self.store.agent_opt(ALIAS)? else {
             return Ok(0);
         };
         let pm_dir = self.pm_dir()?;
@@ -460,52 +581,61 @@ impl Shared {
             .flatten()
             .and_then(|o| o.question_escalate_after_secs)
             .unwrap_or(QUESTION_GRACE_SECS) as i64;
-        let baseline = master.created.floor() as i64;
+        let baseline = master_row.created.floor() as i64;
+        let escalated = master::escalations(&self.state_dir);
         let now = now_epoch();
-        let mut routed = 0;
+        let mut due: Vec<(String, String, Value)> = Vec::new();
         for project in issue::project::list(&pm_dir)? {
-            let project_dir = pm_dir.join(&project.key);
-            let Ok(entries) = std::fs::read_dir(&project_dir) else {
+            let Ok(entries) = std::fs::read_dir(pm_dir.join(&project.key)) else {
                 continue;
             };
             for entry in entries.flatten() {
                 let id = entry.file_name().to_string_lossy().to_string();
                 let dir = entry.path();
-                if !issue::model::valid_id(&id) || !issue::board::is_real_dir(&dir) {
-                    continue;
-                }
-                // Cheap pre-filter: nothing filed since the baseline.
-                let fresh = task_report::names(&dir).iter().any(|n| {
-                    n.get(..16)
-                        .and_then(|p| issue::time::parse_iso(&basic_to_iso(p)))
-                        .is_some_and(|t| t >= baseline)
-                });
-                if !fresh {
+                if !issue::model::valid_id(&id)
+                    || !issue::board::is_real_dir(&dir)
+                    || task_report::names(&dir).is_empty()
+                {
                     continue;
                 }
                 for row in task_report::list(&dir, &id) {
-                    if !row["error"].is_null() {
+                    if !row["error"].is_null() || row["agent"].as_str() == Some(ALIAS) {
                         continue;
                     }
                     let Some(at) = row["at"].as_str().and_then(issue::time::parse_iso) else {
                         continue;
                     };
-                    if at < baseline || row["agent"].as_str() == Some(ALIAS) {
-                        continue;
-                    }
+                    let name = row["name"].as_str().unwrap_or_default();
                     let route = match row["kind"].as_str() {
-                        Some("done" | "blocked") => true,
+                        Some("done" | "blocked") => at >= baseline,
                         Some("question") => {
-                            row["open"] == true && row["escalation"].is_null() && now - at >= grace
+                            row["open"] == true
+                                && !escalated.contains_key(&format!("{id}/{name}"))
+                                && now - at >= grace
                         }
                         _ => false,
                     };
-                    if route && self.route_one(&project.key, &id, &row)? {
-                        routed += 1;
+                    if route
+                        && self
+                            .store
+                            .message(&route_id(&project.key, &id, &row))?
+                            .is_none()
+                    {
+                        due.push((project.key.clone(), id.clone(), row));
                     }
                 }
             }
         }
+        // Oldest first, then a bounded batch.
+        due.sort_by(|a, b| a.2["at"].as_str().cmp(&b.2["at"].as_str()));
+        let mut routed = 0;
+        for (project, id, row) in due.iter().take(ROUTES_PER_PASS) {
+            if self.route_one(project, id, row)? {
+                routed += 1;
+            }
+        }
+        self.router_backlog
+            .store(due.len().saturating_sub(routed), Ordering::SeqCst);
         Ok(routed)
     }
 
@@ -517,12 +647,7 @@ impl Shared {
         let agent = row["agent"].as_str().unwrap_or_default();
         let at = row["at"].as_str().unwrap_or_default();
         let path = format!("{project}/{id}/{}/{name}", task_report::DIR);
-        let what = if kind == "question" {
-            "question"
-        } else {
-            "report"
-        };
-        let mid = format!("{what}-{}", short_hash(&path));
+        let mid = route_id(project, id, row);
         if self.store.message(&mid)?.is_some() {
             return Ok(false);
         }
@@ -545,8 +670,8 @@ impl Shared {
                  Report: {path}\nImpact: {}\nOptions: {options}\n\n{body}\n\n\
                  Answer it: `cadence report file --task {id} --kind answer` with frontmatter \
                  `answers: {name}`. If the ticket, the plan and the operator's words do not \
-                 settle it: `--kind escalate` with `escalates: {name}` and a one-paragraph \
-                 summary — the operator then sees it in Needs-you.",
+                 settle it: `cadence master escalate {id} {name} --file -` with a \
+                 one-paragraph summary — the operator then sees it in Needs-you.",
                 row["impact"].as_str().unwrap_or_default()
             )
         } else {
@@ -565,20 +690,16 @@ impl Shared {
     }
 }
 
-/// `20260917T172400Z` (a report file name's prefix) → ISO.
-fn basic_to_iso(p: &str) -> String {
-    if p.len() < 16 {
-        return String::new();
-    }
-    format!(
-        "{}-{}-{}T{}:{}:{}Z",
-        &p[0..4],
-        &p[4..6],
-        &p[6..8],
-        &p[9..11],
-        &p[11..13],
-        &p[13..15]
-    )
+/// The message id a routed report is queued under — one per report file.
+fn route_id(project: &str, id: &str, row: &Value) -> String {
+    let name = row["name"].as_str().unwrap_or_default();
+    let what = if row["kind"] == "question" {
+        "question"
+    } else {
+        "report"
+    };
+    let path = format!("{project}/{id}/{}/{name}", task_report::DIR);
+    format!("{what}-{}", short_hash(&path))
 }
 
 #[cfg(test)]
@@ -598,12 +719,6 @@ mod tests {
     }
 
     #[test]
-    fn basic_prefix_parses_like_the_report_filename() {
-        assert_eq!(basic_to_iso("20260917T172400Z"), "2026-09-17T17:24:00Z");
-        assert_eq!(basic_to_iso("short"), "");
-    }
-
-    #[test]
     fn clip_keeps_char_boundaries() {
         let s = "é".repeat(10);
         let c = clip(&s, 5);
@@ -612,13 +727,80 @@ mod tests {
         assert_eq!(clip("short", 10), "short");
     }
 
-    #[test]
-    fn every_refused_method_names_a_reason() {
-        for (m, why) in MASTER_REFUSED {
-            assert!(!m.is_empty() && !why.is_empty());
-            assert!(!MASTER_SENDS.contains(m));
+    /// Every method name in `Shared::dispatch`'s match — parsed from the
+    /// source so the test sees methods added later.
+    pub(crate) fn dispatch_methods() -> Vec<String> {
+        let src = include_str!("../daemon.rs");
+        let start = src.find("    pub fn dispatch(\n").expect("dispatch fn");
+        let body = &src[start..];
+        let body = &body[body.find("match method {").expect("match")..];
+        let body = &body[..body
+            .find("other => Err(Error::rejected(format!(\"Unknown method")
+            .expect("end")];
+        let mut out = Vec::new();
+        for line in body.lines() {
+            let t = line.trim_start();
+            if line.len() - t.len() != 12 || !t.starts_with('"') {
+                continue;
+            }
+            let Some((arms, _)) = t.split_once("=>") else {
+                continue;
+            };
+            for arm in arms.split('|') {
+                let name = arm.trim().trim_matches('"');
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    out.push(name.to_string());
+                }
+            }
         }
-        assert!(MASTER_REFUSED.iter().any(|(m, _)| *m == "plan_approve"));
-        assert!(!MASTER_REFUSED.iter().any(|(m, _)| *m == "plan_propose"));
+        out
+    }
+
+    /// Review round 1, C2: the master policy is an allowlist over the
+    /// daemon's method table — every method of `Shared::dispatch` not
+    /// in [`MASTER_ALLOWED`] is refused, so a method added later is
+    /// refused by default; and nothing that acts for the operator,
+    /// messages an agent or execs is on the list.
+    #[test]
+    fn master_policy_allowlists_the_method_table() {
+        let table = dispatch_methods();
+        assert!(table.len() > 50, "method table parse: {table:?}");
+        for allowed in MASTER_ALLOWED {
+            assert!(
+                table.contains(&allowed.to_string()),
+                "{allowed} not a method"
+            );
+        }
+        for m in &table {
+            let open = master_may_call(m);
+            assert_eq!(open, MASTER_ALLOWED.contains(&m.as_str()), "{m}");
+        }
+        for never in [
+            "shutdown",
+            "agent_send",
+            "agent_ask",
+            "agent_stop",
+            "thread_send",
+            "plan_approve",
+            "plan_reject",
+            "slot_acquire",
+            "slot_release",
+            "slot_runner",
+            "slot_launch",
+            "agent_register",
+            "agent_set",
+            "agent_respond",
+            "approval_record",
+            "task_accept",
+            "agent_file_write",
+            "master_start",
+            "reports_changed",
+            "memory_finalize",
+            "model_defaults_set",
+        ] {
+            assert!(table.contains(&never.to_string()), "{never}");
+            assert!(!master_may_call(never), "{never} must be refused");
+        }
+        assert!(!master_may_call("a_method_added_tomorrow"));
     }
 }

@@ -1,6 +1,7 @@
 //! The master agent (CAD-339): one per install, alias `master`, a
-//! managed Claude or Codex session the daemon starts from the agent
-//! files `agents/master/SOUL.md` and `AGENT.md`.
+//! managed Claude session (Codex waits for a read-only sandbox) the
+//! daemon starts from the agent files `agents/master/SOUL.md` and
+//! `AGENT.md`.
 //!
 //! **Where the files live.** CAD-338 (the agent filesystem) is not
 //! implemented yet, so this uses the smallest location its design
@@ -19,15 +20,17 @@
 //! made around the writer is caught at the next launch instead of
 //! becoming the master's instructions.
 //!
-//! **Launch hardening.** The master never implements, so its provider
-//! session is launched without forge or platform credentials in its env
-//! ([`DENIED_ENV`], an empty `GH_CONFIG_DIR`) and — for Claude — with
-//! only `Bash(cadence *)` allowed and file edits, `gh` and `git push`
-//! explicitly disallowed ([`CLAUDE_DISALLOWED_TOOLS`]). These are keyed
-//! on the alias, not on stored params, so neither the master nor a
-//! stored param can loosen them. All of this is a process guard, not a
-//! security boundary: a same-uid process can still read credential
-//! files and edit the tracker by hand (see docs/design/AGENT-FILESYSTEM.md).
+//! **Launch hardening.** The master never implements, so its Claude
+//! session runs in an empty cwd under the state dir, with no settings
+//! files, hooks or MCP servers (`--restricted`, `--strict-mcp-config`),
+//! only the Bash tool, `dontAsk`, and exactly the `cadence` subcommands
+//! in [`CLAUDE_ALLOWED_TOOLS`]; forge and platform credentials are
+//! dropped from its env ([`DENIED_ENV`], an empty `GH_CONFIG_DIR`). All
+//! of it is keyed on the alias, not on stored params. The daemon's own
+//! allowlist (`daemon::MASTER_ALLOWED`) is the second line. This is a
+//! process guard, not a security boundary: a same-uid process can still
+//! read credential files and edit the tracker by hand (see
+//! docs/design/AGENT-FILESYSTEM.md).
 
 use std::path::{Path, PathBuf};
 
@@ -48,8 +51,37 @@ pub const AGENT_MAX_CHARS: usize = 20_000;
 const SOUL_TEMPLATE: &str = include_str!("../agents/master/SOUL.md");
 const AGENT_TEMPLATE: &str = include_str!("../agents/master/AGENT.md");
 
+/// The exact `cadence` subcommands the master's Claude session may run
+/// — its whole toolset. Nothing else is allowed: the session runs in
+/// `dontAsk` mode, so anything not listed is denied without a prompt.
+/// Never a bare `Bash(cadence *)`: `cadence build-slot run -- <argv>`
+/// execs anything (review round 1, C1).
+pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
+    "Bash(cadence issue ls)",
+    "Bash(cadence issue ls *)",
+    "Bash(cadence issue show *)",
+    "Bash(cadence issue project ls)",
+    "Bash(cadence issue project ls *)",
+    "Bash(cadence plan show *)",
+    "Bash(cadence plan propose *)",
+    "Bash(cadence master dispatch *)",
+    "Bash(cadence master escalate *)",
+    "Bash(cadence master summary)",
+    "Bash(cadence master summary *)",
+    "Bash(cadence report file *)",
+    "Bash(cadence agent list)",
+    "Bash(cadence agent list *)",
+    "Bash(cadence agent show *)",
+    "Bash(cadence status)",
+    "Bash(cadence status *)",
+];
+
+/// The only built-in tool the master's Claude session has (`--tools`):
+/// Bash, narrowed by [`CLAUDE_ALLOWED_TOOLS`]. No Read/Edit/Write/Web.
+pub const CLAUDE_TOOLS: &str = "Bash";
+
 /// Tools the master's Claude session may never use, whatever its
-/// stored params say. `Bash(cadence *)` stays the only allowed tool.
+/// stored params say — belt and braces over `--tools`/`dontAsk`.
 pub const CLAUDE_DISALLOWED_TOOLS: &[&str] = &[
     "Edit",
     "Write",
@@ -89,18 +121,34 @@ pub fn is_master(alias: &str) -> bool {
 }
 
 /// Env the master's provider gets on top of the usual identity pair:
-/// `gh` finds no stored login (an empty config dir under the state dir)
-/// and git never prompts for credentials.
-pub fn env_overrides(state_dir: &Path) -> Vec<(String, String)> {
+/// `gh` finds no stored login (an empty config dir under the state dir),
+/// git never prompts for credentials, and the tracker is named
+/// explicitly — the master's cwd is not the tracker.
+pub fn env_overrides(state_dir: &Path, pm_dir: Option<&Path>) -> Vec<(String, String)> {
     let gh = state_dir.join("master").join("no-forge");
     let _ = std::fs::create_dir_all(&gh);
-    vec![
+    let mut env = vec![
         (
             "GH_CONFIG_DIR".to_string(),
             gh.to_string_lossy().to_string(),
         ),
         ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-    ]
+    ];
+    if let Some(pm) = pm_dir {
+        env.push((
+            "CADENCE_PM_DIR".to_string(),
+            pm.to_string_lossy().to_string(),
+        ));
+    }
+    env
+}
+
+/// The master's working directory: an empty folder under the state dir
+/// (review round 1, I4). Never the tracker or a repo — Claude would load
+/// a CLAUDE.md, `.mcp.json`, hooks or `.claude/settings*.json` any
+/// agent can plant there.
+pub fn workdir(state_dir: &Path) -> PathBuf {
+    state_dir.join("master").join("cwd")
 }
 
 /// `<pm>/agents/<slug>` — the agent's folder.
@@ -359,6 +407,42 @@ pub fn verify(state_dir: &Path, slug: &str, files: &[(String, String)]) -> Resul
     Ok(())
 }
 
+/// Longest escalation summary the operator is shown.
+pub const ESCALATION_SUMMARY_MAX: usize = 4_000;
+
+fn escalations_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("escalations.json")
+}
+
+/// The escalations the daemon recorded (CAD-339), keyed
+/// `<issue>/<question report>`: `{issue, question, summary, by, at}`.
+/// Only the daemon's `question_escalate` writes this file — a report
+/// file can never put a question in front of the operator.
+pub fn escalations(state_dir: &Path) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(escalations_path(state_dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Record one escalation; refuses a question already escalated. The
+/// caller (the daemon) serializes writers.
+pub fn record_escalation(state_dir: &Path, key: &str, record: Value) -> Result<()> {
+    let mut all = escalations(state_dir);
+    if all.contains_key(key) {
+        return Err(Error::rejected(format!(
+            "{key} is already escalated to the operator"
+        )));
+    }
+    all.insert(key.to_string(), record);
+    let path = escalations_path(state_dir);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&Value::Object(all))?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 /// The briefing text: SOUL.md then AGENT.md, verbatim and byte-stable
 /// (the prefix caches), under one heading naming their source.
 pub fn compose(files: &[(String, String)]) -> String {
@@ -410,6 +494,18 @@ mod tests {
         record(tmp.path(), "master", "SOUL.md", &digest("v2")).unwrap();
         verify(tmp.path(), "master", &both).unwrap();
         assert!(load_records(tmp.path())["master"]["AGENT.md"].is_object());
+    }
+
+    #[test]
+    fn escalations_record_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(escalations(tmp.path()).is_empty());
+        record_escalation(tmp.path(), "D-1/q.md", json!({"summary": "s"})).unwrap();
+        let err = record_escalation(tmp.path(), "D-1/q.md", json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already escalated"), "{err}");
+        assert_eq!(escalations(tmp.path())["D-1/q.md"]["summary"], "s");
     }
 
     #[test]

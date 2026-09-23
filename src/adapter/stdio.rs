@@ -147,19 +147,6 @@ impl StdioAdapter {
         stderr_log: &std::path::Path,
         env: &[(String, String)],
     ) -> Result<u32> {
-        self.launch_scrubbing(cwd, stderr_log, env, &[])
-    }
-
-    /// [`Self::launch`], also removing `remove` from the child's env —
-    /// per-launch names on top of the adapter's own scrub (CAD-339: the
-    /// master's forge and platform credentials).
-    pub fn launch_scrubbing(
-        self: &Arc<Self>,
-        cwd: &str,
-        stderr_log: &std::path::Path,
-        env: &[(String, String)],
-        remove: &[&str],
-    ) -> Result<u32> {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -172,9 +159,6 @@ impl StdioAdapter {
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log));
         for name in &self.env_scrub.names {
-            command.env_remove(name);
-        }
-        for name in remove {
             command.env_remove(name);
         }
         if !self.env_scrub.prefixes.is_empty() {

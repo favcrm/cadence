@@ -146,30 +146,39 @@ fn build_command(
     if let Some(effort) = params.get("effort").and_then(Value::as_str) {
         cmd.extend(["--effort".to_string(), effort.to_string()]);
     }
-    // CAD-339: the master's tool posture is fixed by its alias, never by
-    // stored params — `cadence` commands only, edits/gh/push disallowed.
-    let master = crate::master::is_master(&agent.alias);
+    // CAD-339: the master's posture is fixed by its alias, never by
+    // stored params (review round 1, C1/I4): only the Bash tool, only
+    // the listed `cadence` subcommands, deny-by-default without prompts
+    // (`dontAsk`), no user/project/local settings files, hooks or MCP
+    // servers (`--restricted`, `--strict-mcp-config`).
+    if crate::master::is_master(&agent.alias) {
+        cmd.extend([
+            "--restricted".to_string(),
+            "--strict-mcp-config".to_string(),
+            "--tools".to_string(),
+            crate::master::CLAUDE_TOOLS.to_string(),
+            "--permission-mode".to_string(),
+            "dontAsk".to_string(),
+        ]);
+        for tool in crate::master::CLAUDE_ALLOWED_TOOLS {
+            cmd.extend(["--allowedTools".to_string(), tool.to_string()]);
+        }
+        for tool in crate::master::CLAUDE_DISALLOWED_TOOLS {
+            cmd.extend(["--disallowedTools".to_string(), tool.to_string()]);
+        }
+        return cmd;
+    }
     let mode = params
         .get("permission_mode")
         .and_then(Value::as_str)
-        .filter(|_| !master)
         .unwrap_or("manual");
     cmd.extend(["--permission-mode".to_string(), mode.to_string()]);
     let mut allowed: Vec<String> = vec!["Bash(cadence *)".to_string()];
-    if let Some(list) = params
-        .get("allowed_tools")
-        .and_then(Value::as_array)
-        .filter(|_| !master)
-    {
+    if let Some(list) = params.get("allowed_tools").and_then(Value::as_array) {
         allowed.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
     }
     for tool in allowed {
         cmd.extend(["--allowedTools".to_string(), tool]);
-    }
-    if master {
-        for tool in crate::master::CLAUDE_DISALLOWED_TOOLS {
-            cmd.extend(["--disallowedTools".to_string(), tool.to_string()]);
-        }
     }
     if let Some(config) = mcp_config {
         cmd.extend([
@@ -535,7 +544,9 @@ impl ProviderAdapter for ClaudeAdapter {
         // every other launch param, and carrying the identity env the
         // `mcp-permission` server needs explicitly (independent of the
         // provider's own env propagation).
-        let mcp_config = if brokered(agent) {
+        let master = crate::master::is_master(&agent.alias);
+        // The master never brokers prompts: it runs `dontAsk`.
+        let mcp_config = if brokered(agent) && !master {
             Some(self.write_mcp_config(agent)?)
         } else {
             None
@@ -554,9 +565,17 @@ impl ProviderAdapter for ClaudeAdapter {
             ),
         ];
         env.extend(super::daemon_context_env(&self.env));
-        let master = crate::master::is_master(&agent.alias);
         if master {
-            env.extend(crate::master::env_overrides(&self.state_dir));
+            // Its cwd is not the tracker: name the tracker explicitly
+            // when the daemon's context does not already.
+            let pm = self
+                .env
+                .var("CADENCE_PM_DIR")
+                .filter(|v| !v.is_empty())
+                .is_none()
+                .then(crate::issue::default_dir)
+                .and_then(Result::ok);
+            env.extend(crate::master::env_overrides(&self.state_dir, pm.as_deref()));
         }
         let params = agent.params.clone().unwrap_or(Value::Null);
         let idle_secs = params
@@ -819,8 +838,26 @@ mod tests {
         let loose = json!({"permission_mode": "bypassPermissions",
                            "allowed_tools": ["Bash(gh *)", "Edit"]});
         let cmd = build_command(&env, &agent("master", loose.clone()), "s", false, None);
-        assert_eq!(flag_values(&cmd, "--permission-mode"), ["manual"]);
-        assert_eq!(flag_values(&cmd, "--allowedTools"), ["Bash(cadence *)"]);
+        assert_eq!(flag_values(&cmd, "--permission-mode"), ["dontAsk"]);
+        assert_eq!(flag_values(&cmd, "--tools"), ["Bash"]);
+        assert!(cmd.iter().any(|a| a == "--restricted"), "{cmd:?}");
+        assert!(cmd.iter().any(|a| a == "--strict-mcp-config"), "{cmd:?}");
+        let allowed = flag_values(&cmd, "--allowedTools");
+        assert_eq!(allowed, crate::master::CLAUDE_ALLOWED_TOOLS);
+        // Review round 1, C1: never a bare `cadence *` — build-slot run
+        // execs arbitrary argv — and nothing that execs or writes agents.
+        for a in &allowed {
+            assert!(a.starts_with("Bash(cadence "), "{a}");
+            for bad in [
+                "Bash(cadence *)",
+                "build-slot",
+                "agent set",
+                "cadence send",
+                "cadence dispatch",
+            ] {
+                assert!(!a.contains(bad), "{a}");
+            }
+        }
         let denied = flag_values(&cmd, "--disallowedTools");
         for tool in ["Edit", "Write", "Bash(gh *)", "Bash(git push *)"] {
             assert!(denied.iter().any(|d| d == tool), "{tool}: {cmd:?}");

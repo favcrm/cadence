@@ -92,6 +92,13 @@ pub fn run_with(
         };
         work_configs.insert(project.key.clone(), cfg);
     }
+    // CAD-339: `<pm>/agents/` holds the agent files — never a project.
+    if projects.iter().any(|p| p.key == "agents") {
+        lint.err(
+            "agents/project.yaml: the project key 'agents' is reserved for the agent files \
+             (<pm>/agents/<slug>/) — rename the project",
+        );
+    }
     let mut fronts: HashMap<String, (String, model::Front, String)> = HashMap::new();
     for project in &projects {
         if let Some(only) = only_project {
