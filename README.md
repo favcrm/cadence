@@ -101,7 +101,10 @@ cadence daemon start --resume   # run the same sweep once the daemon is up
 cadence stop <group>            # stop PM + members (registered + resumable still)
 
 cadence agent remove <slug>     # delete a dead agent + its history
-cadence agent gc --older-than 1d  # sweep dead agents (never automatic)
+cadence agent gc --older-than 1d  # sweep dead agent records — no disk or
+                                  #  memory remedy; removed agents cannot
+                                  #  resume. Daemon timer: opt-in via pm.yaml
+                                  #  [host] agent_gc_older_than_secs
 cadence agent bootstrap <slug>  # write + enqueue the briefing for an
                                 #  already-live agent (launched pre-briefing)
 
