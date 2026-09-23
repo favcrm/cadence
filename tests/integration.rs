@@ -25943,3 +25943,324 @@ fn model_defaults_register_resume_and_mock_argv() {
         "qa-model"
     );
 }
+
+/// Run the built CLI against `d`'s state dir.
+fn launch_cli(d: &TestDaemon, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// CAD-110: `--instructions-file` content reaches every provider through
+/// the briefing's role-instructions section, and a later briefing
+/// rewrite (`agent bootstrap`) carries it forward.
+#[test]
+fn instructions_file_lands_in_briefing() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let file = d.dir.path().join("qa-role.md");
+    std::fs::write(&file, "# QA role\n\nNever merge; report defects to pm.\n").unwrap();
+    let file_s = file.to_str().unwrap();
+
+    for (provider, alias) in [("fake", "w-fake"), ("claude", "w-claude")] {
+        let out = launch_cli(
+            &d,
+            &[
+                "join",
+                "pm",
+                provider,
+                "--alias",
+                alias,
+                "--detach",
+                "--instructions-file",
+                file_s,
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{provider}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        d.wait_agent(alias, "idle", 20);
+        let briefing = d.state.join(format!("briefings/pm/BRIEFING-{alias}.md"));
+        let text = std::fs::read_to_string(&briefing).unwrap();
+        assert!(text.contains("## Role instructions"), "{provider}: {text}");
+        assert!(
+            text.contains("# QA role\n\nNever merge; report defects to pm."),
+            "{provider}: {text}"
+        );
+        // The kickoff points the agent at the section.
+        let m = d.rpc("agent_show", json!({"alias": alias})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["source"] == "bootstrap")
+            .cloned()
+            .unwrap();
+        assert!(
+            m["body"].as_str().unwrap().contains("role instructions"),
+            "{provider}: {m}"
+        );
+    }
+
+    // `agent bootstrap` rewrites the file without the launch's
+    // instructions in hand — the section survives.
+    let out = launch_cli(&d, &["agent", "bootstrap", "w-fake"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(d.state.join("briefings/pm/BRIEFING-w-fake.md")).unwrap();
+    assert!(
+        text.contains("Never merge; report defects to pm."),
+        "{text}"
+    );
+    assert_eq!(text.matches("## Role instructions").count(), 1, "{text}");
+
+    // No instructions file → no section.
+    let out = launch_cli(
+        &d,
+        &["join", "pm", "fake", "--alias", "w-plain", "--detach"],
+    );
+    assert!(out.status.success());
+    d.wait_agent("w-plain", "idle", 15);
+    let text = std::fs::read_to_string(d.state.join("briefings/pm/BRIEFING-w-plain.md")).unwrap();
+    assert!(!text.contains("Role instructions"), "{text}");
+}
+
+/// CAD-110: with `--no-bootstrap` the briefing is skipped, so on every
+/// provider but codex the instructions would have no delivery channel —
+/// refused before anything is registered. Codex keeps its native
+/// `developerInstructions` channel and still launches.
+#[test]
+fn instructions_file_with_no_bootstrap_refused_except_codex() {
+    let d = TestDaemon::start();
+    let mock = d.mock_codex_ws("ok");
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let file = d.dir.path().join("role.md");
+    std::fs::write(&file, "Role: reviewer.").unwrap();
+    let file_s = file.to_str().unwrap();
+
+    let refused: [&[&str]; 5] = [
+        &["join", "pm", "fake", "--alias", "r-fake"],
+        &["join", "pm", "claude", "--alias", "r-claude"],
+        &["join", "pm", "devin", "--alias", "r-devin"],
+        &["join", "pm", "cursor", "--alias", "r-cursor"],
+        &["claude", "--alias", "r-solo"],
+    ];
+    for verb in refused {
+        let mut args = verb.to_vec();
+        args.extend(["--detach", "--no-bootstrap", "--instructions-file", file_s]);
+        let out = launch_cli(&d, &args);
+        assert!(!out.status.success(), "{verb:?} was accepted");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--instructions-file with --no-bootstrap")
+                && stderr.contains("no delivery channel"),
+            "{verb:?}: {stderr}"
+        );
+        let alias = verb[verb.iter().position(|a| *a == "--alias").unwrap() + 1];
+        assert!(
+            d.rpc("agent_show", json!({"alias": alias})).is_err(),
+            "{alias} was registered"
+        );
+    }
+
+    let out = launch_cli(
+        &d,
+        &[
+            "join",
+            "pm",
+            "codex",
+            "--alias",
+            "r-codex",
+            "--detach",
+            "--no-bootstrap",
+            "--instructions-file",
+            file_s,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    d.wait_agent("r-codex", "idle", 20);
+    let reqs = mock_requests(&mock);
+    assert_eq!(reqs[0]["method"], "thread/start", "{reqs:?}");
+    assert_eq!(
+        reqs[0]["params"]["developerInstructions"],
+        "Role: reviewer."
+    );
+}
+
+/// CAD-110: `agent show` advertises the briefing path only while the
+/// file exists — a missing file is reported as missing.
+#[test]
+fn agent_show_reports_missing_briefing() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let out = launch_cli(&d, &["join", "pm", "fake", "--alias", "w1", "--detach"]);
+    assert!(out.status.success());
+    d.wait_agent("w1", "idle", 15);
+    let file = d.state.join("briefings/pm/BRIEFING-w1.md");
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["agent"]["briefing"], file.to_str().unwrap());
+    assert!(show["agent"].get("briefing_missing").is_none(), "{show}");
+
+    std::fs::remove_file(&file).unwrap();
+    let out = launch_cli(&d, &["agent", "show", "w1"]);
+    assert!(out.status.success());
+    let show: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(show["agent"]["briefing"].is_null(), "{show}");
+    assert_eq!(show["agent"]["briefing_missing"], file.to_str().unwrap());
+
+    // A --no-bootstrap worker never had one — missing, not advertised.
+    let out = launch_cli(
+        &d,
+        &[
+            "join",
+            "pm",
+            "fake",
+            "--alias",
+            "w2",
+            "--detach",
+            "--no-bootstrap",
+        ],
+    );
+    assert!(out.status.success());
+    d.wait_agent("w2", "idle", 15);
+    let show = d.rpc("agent_show", json!({"alias": "w2"})).unwrap();
+    assert!(show["agent"]["briefing"].is_null(), "{show}");
+    assert_eq!(
+        show["agent"]["briefing_missing"],
+        d.state
+            .join("briefings/pm/BRIEFING-w2.md")
+            .to_str()
+            .unwrap()
+    );
+}
+
+/// CAD-214: email-style flags on `message send` / `send` fail with the
+/// real usage line, not clap's `-- --to` value tip.
+#[test]
+fn send_email_flags_print_real_usage() {
+    let state = TempDir::new().unwrap();
+    for verb in [&["message", "send"][..], &["send"][..]] {
+        let usage = format!("cadence {} <ALIAS> --text <body>", verb.join(" "));
+        for flag in ["--to", "--subject", "--body", "--cc"] {
+            for tail in [&[flag, "x"][..], &["pm", "--text", "hi", flag, "x"][..]] {
+                let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+                    .arg("--state-dir")
+                    .arg(state.path())
+                    .args(verb)
+                    .args(tail)
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(out.status.code(), Some(2), "{verb:?} {tail:?}: {stderr}");
+                assert!(stderr.contains(&usage), "{verb:?} {tail:?}: {stderr}");
+                assert!(
+                    stderr.contains(&format!("no `{flag}` flag")),
+                    "{verb:?} {tail:?}: {stderr}"
+                );
+                assert!(!stderr.contains("-- --"), "{verb:?} {tail:?}: {stderr}");
+                assert!(stderr.contains("SUBJECT:"), "{verb:?} {tail:?}: {stderr}");
+            }
+        }
+    }
+    // Other unknown flags keep clap's own error.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state.path())
+        .args(["send", "pm", "--bogus"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument '--bogus'"));
+    // `--help` documents the SUBJECT convention.
+    for verb in [&["message", "send"][..], &["send"][..]] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .args(verb)
+            .arg("--help")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(help.contains("SUBJECT: <topic>"), "{verb:?}: {help}");
+    }
+}
+
+/// CAD-214: `--text` and `-m` carry the body on `message send`, `send`
+/// and `issue comment` alike.
+#[test]
+fn body_flags_match_on_send_and_comment() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    let sends: [(&[&str], &str, &str); 4] = [
+        (&["message", "send"], "--text", "b-ms-text"),
+        (&["message", "send"], "-m", "b-ms-m"),
+        (&["send"], "--text", "b-s-text"),
+        (&["send"], "-m", "b-s-m"),
+    ];
+    for (verb, flag, id) in sends {
+        let mut args = verb.to_vec();
+        args.extend(["w1", flag, id, "--message", id]);
+        let out = launch_cli(&d, &args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let m = d.wait_message("w1", id, &["completed"], 15);
+        assert_eq!(m["body"], id, "{args:?}");
+    }
+
+    let pm_dir = d.dir.path().join("pm");
+    let home = d.dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence")).parent().unwrap();
+    let issue = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    issue(&["issue", "init"]);
+    issue(&["issue", "project", "add", "demo", "--prefix", "D"]);
+    issue(&["issue", "new", "One", "--project", "demo"]);
+    issue(&["issue", "comment", "D-1", "-m", "comment-via-m"]);
+    issue(&["issue", "comment", "D-1", "--text", "comment-via-text"]);
+    let show = issue(&["issue", "show", "D-1"]);
+    for want in ["comment-via-m", "comment-via-text"] {
+        assert!(show.contains(want), "{want}: {show}");
+    }
+}

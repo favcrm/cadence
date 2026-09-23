@@ -98,7 +98,9 @@ enum Commands {
         /// `devops`.
         #[arg(long)]
         team_role: Option<String>,
-        /// File with reusable provider instructions.
+        /// File with role instructions, embedded in the agent's briefing
+        /// under a role-instructions section. Refused with
+        /// `--no-bootstrap` — the briefing is their only delivery channel.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
         /// Run the session in an isolated checkout:
@@ -171,7 +173,9 @@ enum Commands {
         /// read-only only when asked].
         #[arg(long, value_parser = ["read-only", "workspace-write"])]
         sandbox: Option<String>,
-        /// File with reusable provider instructions.
+        /// File with role instructions, sent natively as codex developer
+        /// instructions and embedded in the agent's briefing under a
+        /// role-instructions section (skipped with `--no-bootstrap`).
         #[arg(long)]
         instructions_file: Option<PathBuf>,
         /// Run the session in an isolated checkout:
@@ -270,7 +274,9 @@ enum Commands {
         /// turn. Unset by default. Managed endpoint only.
         #[arg(long, conflicts_with = "tui", value_parser = clap::value_parser!(u64).range(1..))]
         turn_max_secs: Option<u64>,
-        /// File with reusable provider instructions.
+        /// File with role instructions, embedded in the agent's briefing
+        /// under a role-instructions section. Refused with
+        /// `--no-bootstrap` — the briefing is their only delivery channel.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
         /// Run the session in an isolated checkout:
@@ -343,7 +349,9 @@ enum Commands {
         /// Shortcut for --permission-mode force.
         #[arg(long, conflicts_with = "permission_mode")]
         bypass: bool,
-        /// File with reusable provider instructions.
+        /// File with role instructions, embedded in the agent's briefing
+        /// under a role-instructions section. Refused with
+        /// `--no-bootstrap` — the briefing is their only delivery channel.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
         /// Run the session in an isolated checkout:
@@ -373,11 +381,20 @@ enum Commands {
     /// Enqueue a durable message to an agent — the hot-path alias for
     /// `message send`. Returns once the message is durable; delivery and
     /// reporting continue asynchronously.
+    ///
+    /// `cadence send <ALIAS> --text <body>`: the recipient is the
+    /// positional alias and the body is `--text`, `-m` or `--file`.
+    /// There are no email-style `--to`, `--subject`, `--body` or `--cc`
+    /// flags.
+    ///
+    /// Multi-topic reports: open the body with a `SUBJECT: <topic>`
+    /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
+    /// so the recipient can scan topics; there is no subject field.
     Send {
         /// Agent alias or provider-native id.
         alias: String,
         /// Literal single-line body.
-        #[arg(long, conflicts_with = "file")]
+        #[arg(short = 'm', long, conflicts_with = "file")]
         text: Option<String>,
         /// Read the body from a file.
         #[arg(long)]
@@ -483,14 +500,19 @@ enum Commands {
         /// read-only default.
         #[arg(long, value_parser = ["read-only", "workspace-write"])]
         sandbox: Option<String>,
-        /// File with reusable provider instructions.
+        /// File with role instructions, embedded in the worker's briefing
+        /// under a role-instructions section (codex also receives them
+        /// natively as developer instructions). Refused with
+        /// `--no-bootstrap` on every provider but codex — the briefing is
+        /// their only delivery channel there.
         #[arg(long)]
         instructions_file: Option<PathBuf>,
         /// Run the worker in an isolated checkout of the PM's repo:
         /// `git worktree add <repo>/.cadence/wt/<name> -b cadence/<name>`.
         #[arg(long)]
         worktree: Option<String>,
-        /// Do not enqueue the join bootstrap briefing message.
+        /// Skip the briefing file, AGENTS.md block and bootstrap
+        /// message entirely.
         #[arg(long)]
         no_bootstrap: bool,
         /// Opt the worker into verified auto-ready (pty providers only):
@@ -1523,10 +1545,22 @@ enum SessionAction {
 #[derive(Subcommand)]
 enum MessageAction {
     /// Enqueue a message; returns once it is durable.
+    ///
+    /// `cadence message send <ALIAS> --text <body>`: the recipient is
+    /// the positional alias and the body is `--text`, `-m` or `--file`.
+    /// There are no email-style `--to`, `--subject`, `--body` or `--cc`
+    /// flags.
+    ///
+    /// Multi-topic reports: open the body with a `SUBJECT: <topic>`
+    /// line (a single-line pty body leads with `SUBJECT: <topic> —`)
+    /// so the recipient can scan topics; there is no subject field.
     Send {
+        /// Agent alias or provider-native id.
         alias: String,
-        #[arg(long, conflicts_with = "file")]
+        /// Literal body.
+        #[arg(short = 'm', long, conflicts_with = "file")]
         text: Option<String>,
+        /// Read the body from a file.
         #[arg(long)]
         file: Option<PathBuf>,
         /// Idempotency key; retries with the same id+content dedupe.
@@ -3123,7 +3157,7 @@ fn refresh_briefing(state_dir: &Path, alias: &str) -> Result<Option<PathBuf>> {
     if file.exists() && !opted_in {
         return Ok(None);
     }
-    brief_agent(state_dir, alias, false).map(Some)
+    brief_agent(state_dir, alias, false, None).map(Some)
 }
 
 /// Resume a list of aliases in order, printing a per-member status line
@@ -3256,8 +3290,52 @@ fn stop_group(state_dir: &Path, group: &str) -> Result<i32> {
     Ok(0)
 }
 
+/// Email-style flags callers guess for `message send` / `send`.
+const EMAIL_FLAGS: [&str; 4] = ["--to", "--subject", "--body", "--cc"];
+
+/// `message send --to …` would get clap's `to pass '--to' as a value,
+/// use '-- --to'` tip, which steers the caller to smuggle the flag in as
+/// text. Swap that for the real usage line; every other parse error
+/// (help and version included) passes through untouched.
+fn email_flag_error(err: &clap::Error) -> Option<clap::Error> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if err.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    let Some(ContextValue::String(arg)) = err.get(ContextKind::InvalidArg) else {
+        return None;
+    };
+    let flag = arg.split('=').next().unwrap_or_default();
+    if !EMAIL_FLAGS.contains(&flag) {
+        return None;
+    }
+    // The usage line names the subcommand the parse failed in.
+    let Some(ContextValue::StyledStr(usage)) = err.get(ContextKind::Usage) else {
+        return None;
+    };
+    let usage = usage.to_string();
+    let verb = if usage.contains(" message send ") {
+        "message send"
+    } else if usage.contains(" send ") {
+        "send"
+    } else {
+        return None;
+    };
+    Some(clap::Error::raw(
+        ErrorKind::UnknownArgument,
+        format!(
+            "`cadence {verb}` has no `{flag}` flag — it takes no email-style \
+             --to/--subject/--body/--cc; the recipient is the positional alias\n\n\
+             Usage: cadence {verb} <ALIAS> --text <body>\n\n\
+             \x20 body: --text <body>, -m <body> or --file <path>\n\
+             \x20 multi-topic report: open the body with `SUBJECT: <topic>`\n\n\
+             For more information, try 'cadence {verb} --help'.\n"
+        ),
+    ))
+}
+
 fn run() -> Result<i32> {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|e| email_flag_error(&e).unwrap_or(e).exit());
     let state_dir = match cli.state_dir {
         Some(dir) => dir,
         None => client::state_dir()?,
@@ -3561,7 +3639,7 @@ fn run() -> Result<i32> {
                     client::rpc(&state_dir, "agent_remove", json!({"alias": alias}))?
                 }
                 AgentAction::Bootstrap { alias } => {
-                    let file = brief_agent(&state_dir, &alias, true)?;
+                    let file = brief_agent(&state_dir, &alias, true, None)?;
                     print_json(&json!({"alias": alias, "briefing": file,
                                        "message": format!("bootstrap-{alias}")}));
                     return Ok(0);
@@ -5185,6 +5263,18 @@ fn provider_launch(
     team_role: Option<&str>,
     provider_default_model: bool,
 ) -> Result<i32> {
+    // Role instructions reach every provider but codex only through the
+    // briefing — refuse before anything is registered, created or
+    // launched rather than store text nothing will ever read.
+    if instructions_file.is_some() && briefing == BriefMode::Off && provider != "codex" {
+        return Err(Error::rejected(format!(
+            "--instructions-file with --no-bootstrap is refused for provider \
+             '{provider}': the instructions would have no delivery channel — \
+             only codex takes them natively; every other provider receives \
+             them in the briefing, which --no-bootstrap skips. Drop \
+             --no-bootstrap to deliver them in the briefing"
+        )));
+    }
     // `--tui` selects the provider's pty endpoint where one exists;
     // otherwise the launch kind comes from the registry's default.
     let endpoint_kind = if tui {
@@ -5460,7 +5550,12 @@ fn provider_launch(
     let mut briefing_file = Value::Null;
     if opened && briefing != BriefMode::Off {
         if registered_fresh {
-            let file = brief_agent(state_dir, &alias, briefing == BriefMode::FilesAndMessage)?;
+            let file = brief_agent(
+                state_dir,
+                &alias,
+                briefing == BriefMode::FilesAndMessage,
+                instructions.as_deref(),
+            )?;
             briefing_file = json!(file);
         } else if let Ok(Some(file)) = refresh_briefing(state_dir, &alias) {
             // A re-launched pre-existing agent: regen a missing
@@ -5647,6 +5742,17 @@ fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
 const AGENTS_BEGIN: &str = "<!-- cadence:begin -->";
 const AGENTS_END: &str = "<!-- cadence:end -->";
 
+/// Marker pair around the role instructions inside a briefing.
+const ROLE_BEGIN: &str = "<!-- cadence:role-instructions:begin -->";
+const ROLE_END: &str = "<!-- cadence:role-instructions:end -->";
+
+/// The role instructions an existing briefing carries, if any.
+fn role_instructions(briefing: &str) -> Option<&str> {
+    let start = briefing.find(ROLE_BEGIN)? + ROLE_BEGIN.len();
+    let end = briefing.rfind(ROLE_END)?;
+    (start <= end).then(|| briefing[start..end].trim_matches('\n'))
+}
+
 /// Brief an agent: write `BRIEFING-<alias>.md` under the daemon's
 /// state dir — `<state>/briefings/<root>/`, where `<root>` is the
 /// upstream PM's alias when wired, else the agent's own — never inside
@@ -5656,9 +5762,18 @@ const AGENTS_END: &str = "<!-- cadence:end -->";
 /// `bootstrap-<alias>` message (`source = "bootstrap"` — provenance
 /// only, no routing role; the deterministic id dedupes re-enqueues of
 /// an in-flight copy).
+/// `instructions` is the launch's `--instructions-file` text, embedded
+/// under the role-instructions section; `None` (resume housekeeping,
+/// `agent bootstrap`) carries forward the section an existing briefing
+/// already holds.
 /// Returns the briefing path. `agent_show` on the alias propagates the
 /// usual unknown-name rejection.
-fn brief_agent(state_dir: &Path, alias: &str, enqueue: bool) -> Result<PathBuf> {
+fn brief_agent(
+    state_dir: &Path,
+    alias: &str,
+    enqueue: bool,
+    instructions: Option<&str>,
+) -> Result<PathBuf> {
     let agent = client::rpc(state_dir, "agent_show", json!({"alias": alias}))?["agent"].clone();
     // A mailbox consumes no briefing — nothing runs in it.
     if !registry::has_actor(
@@ -5676,7 +5791,17 @@ fn brief_agent(state_dir: &Path, alias: &str, enqueue: bool) -> Result<PathBuf> 
     let dir = state_dir.join("briefings").join(root_alias);
     std::fs::create_dir_all(&dir)?;
     let file = client::briefing_path(state_dir, &agent["params"], alias);
-    std::fs::write(&file, briefing_body(state_dir, &agent, root_alias))?;
+    let instructions = match instructions {
+        Some(text) => Some(text.to_string()),
+        None => std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|old| role_instructions(&old).map(str::to_string)),
+    }
+    .filter(|text| !text.trim().is_empty());
+    std::fs::write(
+        &file,
+        briefing_body(state_dir, &agent, root_alias, instructions.as_deref()),
+    )?;
     // AGENTS.md is opt-in (`--agents-md` persists the param and resume
     // replays it). Only the agent's own cwd repo is ever touched, and
     // only when it sits inside a git repository.
@@ -5701,9 +5826,14 @@ fn brief_agent(state_dir: &Path, alias: &str, enqueue: bool) -> Result<PathBuf> 
             "do the work, then report: `cadence message result <id> \
              --token <turn_id> --text '<summary>'`"
         };
+        let role = if instructions.is_some() {
+            " (it carries your role instructions)"
+        } else {
+            ""
+        };
         let body = format!(
             "Cadence bootstrap: you are '{alias}', reporting to group root \
-             '{root_alias}'. Your briefing is on disk at {} — read it. Run \
+             '{root_alias}'. Your briefing is on disk at {}{role} — read it. Run \
              `cadence self` for this message's id and turn_id, {report_line}. \
              List peers with `cadence agent list`.",
             file.display()
@@ -5722,8 +5852,28 @@ fn brief_agent(state_dir: &Path, alias: &str, enqueue: bool) -> Result<PathBuf> 
 /// The briefing document: identity, protocol quickref, and the group
 /// roster at write time. It is a snapshot — `cadence self` and
 /// `agent list` remain the live truth.
-fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
+fn briefing_body(
+    state_dir: &Path,
+    agent: &Value,
+    root: &str,
+    instructions: Option<&str>,
+) -> String {
     let alias = agent["alias"].as_str().unwrap_or_default();
+    // `--instructions-file` content, verbatim between markers so a
+    // later rewrite (`agent bootstrap`, resume housekeeping) can carry
+    // it forward — every provider reads it here; codex also gets it
+    // natively as developer instructions.
+    let role = instructions
+        .map(|text| {
+            format!(
+                "## Role instructions\n\n\
+                 Given at launch (`--instructions-file`) — they apply for\n\
+                 this whole session.\n\n\
+                 {ROLE_BEGIN}\n{}\n{ROLE_END}\n\n",
+                text.trim_end()
+            )
+        })
+        .unwrap_or_default();
     let native = agent["thread_id"]
         .as_str()
         .or_else(|| agent["session_id"].as_str())
@@ -5854,6 +6004,7 @@ fn briefing_body(state_dir: &Path, agent: &Value, root: &str) -> String {
          You are `{alias}`, a cadence-managed agent (provider `{provider}`,\n\
          endpoint `{kind}`). Native session: `{native}`.\n\
          Upstream: {upstream}.{permission}\n\n\
+         {role}\
          ## Protocol\n\n\
          - `cadence self` — prints your alias, running message ids and\n\
          \x20 `turn_id` report tokens.\n\

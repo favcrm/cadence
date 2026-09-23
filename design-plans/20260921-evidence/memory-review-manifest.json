@@ -1,0 +1,49 @@
+{
+  "project": "cadence",
+  "records": [
+    {
+      "slug": "a-plan-that-cites-bare-risk-clas",
+      "sha256": "6b92794baf6fe9df641fae043669f1c738089b6864ab1a6bc2c3349344d4b612"
+    },
+    {
+      "slug": "an-acceptance-check-of-the-shape",
+      "sha256": "01547a74b3be79059069969584ab405b1799bcad69fa4acd1ce5f7bde3702ef9"
+    },
+    {
+      "slug": "browser-agents-cannot-reach-loop",
+      "sha256": "78ba64308c880f800f49a099922e52416918c1ad4ea3382e2cbe650984749309"
+    },
+    {
+      "slug": "delivery-retry-budget-survives-gate-waits",
+      "sha256": "2465caa88ffd9819c114fc22bd60dbc664440bef5c2a224b2dd7762ab761f471"
+    },
+    {
+      "slug": "empty-git-diff-output-on-this-ho",
+      "sha256": "d5b83da3c7805fa1ffc36f6d0899f8748c12d0fdf7de0290c3b2015d308865b1"
+    },
+    {
+      "slug": "env-target-dir-can-break-fixture-paths",
+      "sha256": "856f24d49694b473dcfc1db5eeef6a3692d72f2aaa0c086c315d8659950a787c"
+    },
+    {
+      "slug": "filtered-tests-need-exact-nonempty-receipts",
+      "sha256": "1057b99feb87d1149a0c3425bee50ae81df06bb57244ae75110cbdb6b54b1b77"
+    },
+    {
+      "slug": "qa-verdicts-expire-on-head-change",
+      "sha256": "e4f2dd1c1ad81b2220d4bcd1cef95acbe08a5663d33e3caa8aeca5e5d295438f"
+    },
+    {
+      "slug": "queued-delivery-is-not-execution",
+      "sha256": "2b116adf863a981f9d62cfdca749f9e7af8c74fcd2848bda8afd4c493c7c6339"
+    },
+    {
+      "slug": "reading-a-pr-with-git-checkout-r",
+      "sha256": "e364b90b93f9b73cf396729847aec40efee1560c3a090ef41102cdb4d240031c"
+    },
+    {
+      "slug": "shared-structs-need-all-target-validation",
+      "sha256": "2593b29d3fe77c142ace8b5d8506b3b6f0f5f461daa126b1d1d31406de9f976d"
+    }
+  ]
+}
