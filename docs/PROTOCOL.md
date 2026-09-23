@@ -675,7 +675,10 @@ verdict it overrode. A refused send returns the message to `queued`
 (event `gate_wait`) and retries after a back-off (5 → 10 → 20 → 30s; a
 claim or inbox arrival wakes it early); it is never pasted blind and
 never dropped. `CADENCE_PTY_RETRY_SECS` sets the 5s base for both waits
-(tests shrink it; production leaves it unset). Message text is a
+and scales the whole schedule, the 30s cap included (cap = 6 × base). It
+takes seconds in [0.1, 3600]; any other value (0, negative, NaN, inf,
+not a number) is refused with a stderr warning and the 5s default
+applies. Tests shrink it; production leaves it unset. Message text is a
 single line of 1–4000 chars with no control characters (`agent_send` to a pty agent refuses a body with
 control characters up front instead of answering `queued`), delivered
 literally via `load-buffer` + `paste-buffer -p` + `Enter` — no shell

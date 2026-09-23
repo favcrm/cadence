@@ -7423,6 +7423,39 @@ impl TestDaemon {
     }
 }
 
+/// CAD-185: prove the per-daemon `CADENCE_PTY_RETRY_SECS=1` was honoured.
+/// Each render miss that retried is followed by the next attempt's
+/// `submitting` event; with the knob the gap is ~1s, with the default 5s
+/// it is >= 5s. Timed from durable event stamps, not the test's clock.
+fn assert_retry_gaps_under(d: &TestDaemon, alias: &str, id: &str, want: usize, max_secs: f64) {
+    let events = d.events(alias);
+    let of = |kind: &str| -> Vec<f64> {
+        events
+            .iter()
+            .filter(|e| e["kind"] == kind && e["payload"]["message"].as_str() == Some(id))
+            .filter_map(|e| e["at"].as_f64())
+            .collect()
+    };
+    let (misses, starts) = (of("paste_not_rendered"), of("submitting"));
+    let gaps: Vec<f64> = misses
+        .iter()
+        .take(misses.len().saturating_sub(1))
+        .map(|miss| {
+            let next = starts
+                .iter()
+                .copied()
+                .find(|at| at > miss)
+                .unwrap_or_else(|| panic!("no attempt after the miss at {miss}: {events:?}"));
+            next - miss
+        })
+        .collect();
+    assert_eq!(gaps.len(), want, "retry gaps {gaps:?}");
+    assert!(
+        gaps.iter().all(|gap| *gap < max_secs),
+        "retry base knob ignored — gaps {gaps:?} not under {max_secs}s"
+    );
+}
+
 /// Emit a test-only timing trace for a routed PTY delivery. The daemon's
 /// durable event/message timestamps are the phase clock here: using them
 /// avoids charging the test's 50ms RPC polling to a render or retry phase.
@@ -8826,6 +8859,7 @@ fn pty_unrendered_worker_result_requeues_then_parks() {
     // Delivered = render-verified `running` (a task then awaits an
     // explicit report, so the agent correctly stays busy on it).
     d.wait_message("pm", "after", &["running"], 20);
+    assert_retry_gaps_under(&d, "pm", &routed_id, 3, 4.0);
     emit_park_phase_trace(
         &d,
         "pty_unrendered_worker_result_requeues_then_parks",
@@ -11277,6 +11311,7 @@ fn job_event_parks_on_unrendered_pty_pm() {
     d.wait_agent("pm", "idle", 15);
     let pm = d.rpc("agent_show", json!({"alias": "pm"})).unwrap()["agent"].clone();
     assert_eq!(pm["dead"], false);
+    assert_retry_gaps_under(&d, "pm", parked_id, 3, 4.0);
     emit_park_phase_trace(&d, "job_event_parks_on_unrendered_pty_pm", "pm", parked_id);
 }
 

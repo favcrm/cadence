@@ -118,8 +118,39 @@ const WAL_TICK: Duration = Duration::from_secs(60);
 /// render-miss requeue waits this long, a gate refusal backs off from it
 /// (×1, ×2, ×4, capped at ×6 — 5 → 10 → 20 → 30s). Claims and inbox
 /// arrivals still wake either wait early. `CADENCE_PTY_RETRY_SECS`
-/// overrides it per daemon — tests shrink it (`Shared::pty_retry_base`).
+/// overrides it per daemon — tests shrink it (see [`parse_pty_retry_base`]).
 const PTY_RETRY_BASE: Duration = Duration::from_secs(5);
+/// `CADENCE_PTY_RETRY_SECS` bounds. The floor keeps a busy pane's gate
+/// from becoming a tight probe loop; the ceiling keeps a typo from
+/// parking deliveries for hours.
+const PTY_RETRY_MIN_SECS: f64 = 0.1;
+const PTY_RETRY_MAX_SECS: f64 = 3600.0;
+
+/// The pty retry base from `CADENCE_PTY_RETRY_SECS`: unset is the 5s
+/// default; a number of seconds in [0.1, 3600] is used as is; anything
+/// else (0, negative, NaN, inf, out of range, not a number) is refused
+/// with the reason, and the caller falls back to the default.
+fn parse_pty_retry_base(raw: Option<&str>) -> std::result::Result<Duration, String> {
+    let Some(raw) = raw else {
+        return Ok(PTY_RETRY_BASE);
+    };
+    let secs: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("CADENCE_PTY_RETRY_SECS={raw:?} is not a number of seconds"))?;
+    if !(PTY_RETRY_MIN_SECS..=PTY_RETRY_MAX_SECS).contains(&secs) {
+        return Err(format!(
+            "CADENCE_PTY_RETRY_SECS={raw:?} is outside [{PTY_RETRY_MIN_SECS}, {PTY_RETRY_MAX_SECS}]s"
+        ));
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
+/// Gate-refusal back-off before retry number `waits` (0-based): base ×1,
+/// ×2, ×4, then capped at ×6 — 5 → 10 → 20 → 30 → 30s at the default.
+fn gate_backoff(base: Duration, waits: u32) -> Duration {
+    (base * (1u32 << waits.min(3))).min(base * 6)
+}
 /// Persistent monitor reconciliation cadence. Individual registrations
 /// carry their own interval; this tick only bounds how soon a due check
 /// starts after its deadline.
@@ -1036,12 +1067,11 @@ impl Shared {
                                 );
                                 gate_notice = Some(reason);
                             }
-                            // 5s → 10 → 20 → 30s cap (PTY_RETRY_BASE):
+                            // 5s → 10 → 20 → 30s cap (`gate_backoff`):
                             // claims and inbox arrivals wake the wait
                             // early, so the poll is only the fallback for
                             // a busy pane.
-                            let wait =
-                                (retry_base * (1u32 << gate_waits.min(3))).min(retry_base * 6);
+                            let wait = gate_backoff(retry_base, gate_waits);
                             gate_waits = gate_waits.saturating_add(1);
                             ctl.wake
                                 .wait_if_unchanged(retry_ticket, Instant::now() + wait);
@@ -3902,15 +3932,15 @@ impl Shared {
         Ok(Some(root))
     }
 
-    /// `PTY_RETRY_BASE`, unless this daemon's provider env (a test) or
-    /// the environment sets `CADENCE_PTY_RETRY_SECS` in (0, 3600].
+    /// This daemon's pty retry base: its provider env (a test) or the
+    /// environment's `CADENCE_PTY_RETRY_SECS`, else the default. An
+    /// invalid value warns on stderr and keeps the default.
     fn pty_retry_base(&self) -> Duration {
-        self.provider_env
-            .var("CADENCE_PTY_RETRY_SECS")
-            .and_then(|v| v.trim().parse::<f64>().ok())
-            .filter(|s| *s > 0.0 && *s <= 3600.0)
-            .map(Duration::from_secs_f64)
-            .unwrap_or(PTY_RETRY_BASE)
+        let raw = self.provider_env.var("CADENCE_PTY_RETRY_SECS");
+        parse_pty_retry_base(raw.as_deref()).unwrap_or_else(|reason| {
+            eprintln!("pty retry: {reason}; using the default {PTY_RETRY_BASE:?}");
+            PTY_RETRY_BASE
+        })
     }
 
     /// CAD-201: reap what is left of a stopped pane's session — off
@@ -6582,6 +6612,64 @@ fn bound_unknown_detail(detail: &str) -> String {
     let mut out: String = safe.chars().take(UNKNOWN_DETAIL_CHARS).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod pty_retry_tests {
+    use super::*;
+
+    #[test]
+    fn retry_base_defaults_to_five_seconds() {
+        assert_eq!(parse_pty_retry_base(None), Ok(Duration::from_secs(5)));
+        assert_eq!(PTY_RETRY_BASE, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn retry_base_accepts_seconds_inside_the_bounds() {
+        assert_eq!(parse_pty_retry_base(Some("1")), Ok(Duration::from_secs(1)));
+        assert_eq!(
+            parse_pty_retry_base(Some(" 2.5 ")),
+            Ok(Duration::from_millis(2500))
+        );
+        assert_eq!(
+            parse_pty_retry_base(Some("0.1")),
+            Ok(Duration::from_millis(100))
+        );
+        assert_eq!(
+            parse_pty_retry_base(Some("3600")),
+            Ok(Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
+    fn retry_base_refuses_values_outside_the_bounds_or_not_numbers() {
+        for raw in [
+            "0", "-1", "0.05", "0.099", "3600.5", "1e9", "NaN", "nan", "inf", "-inf", "", "five",
+            "5s",
+        ] {
+            let got = parse_pty_retry_base(Some(raw));
+            assert!(got.is_err(), "{raw:?} must be refused, got {got:?}");
+            assert!(
+                got.unwrap_err().contains("CADENCE_PTY_RETRY_SECS"),
+                "reason names the knob for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_backoff_doubles_to_a_six_times_cap() {
+        let five = Duration::from_secs(5);
+        let schedule: Vec<u64> = (0..6).map(|n| gate_backoff(five, n).as_secs()).collect();
+        assert_eq!(schedule, vec![5, 10, 20, 30, 30, 30]);
+        // The cap scales with the base, and a huge count cannot overflow.
+        let one = Duration::from_secs(1);
+        assert_eq!(gate_backoff(one, 0), one);
+        assert_eq!(gate_backoff(one, 2), Duration::from_secs(4));
+        assert_eq!(gate_backoff(one, 3), Duration::from_secs(6));
+        assert_eq!(gate_backoff(one, u32::MAX), Duration::from_secs(6));
+        let floor = Duration::from_millis(100);
+        assert_eq!(gate_backoff(floor, 9), Duration::from_millis(600));
+    }
 }
 
 #[cfg(test)]
