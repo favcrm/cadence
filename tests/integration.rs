@@ -25555,6 +25555,386 @@ fn slot_planted_pane_row_survives_restart() {
     assert_eq!(g["granted"], true, "{g}");
 }
 
+/// A managed "claude" provider for the CAD-230 enrollment tests. It
+/// never answers a turn; it performs slot RPCs on the test's behalf —
+/// as itself (the enrolled root), from a child (a verified descendant)
+/// or from a double-forked `setsid` grandchild (off the root's
+/// ancestry). Requests arrive as `<cmd_dir>/req-N.json`, answers land
+/// as `resp-N.json`; a `"$PID"` pid param means the performing process.
+const MOCK_ENROLL_PY: &str = r#"
+import json, os, socket, subprocess, sys, threading, time
+
+def rpc(sock_path, frame):
+    params = frame.setdefault("params", {})
+    if params.get("pid") == "$PID":
+        params["pid"] = os.getpid()
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sock_path)
+    s.sendall((json.dumps(frame) + "\n").encode())
+    line = s.makefile().readline()
+    s.close()
+    return json.loads(line)
+
+def land(path, value):
+    with open(path + ".tmp", "w") as f:
+        json.dump(value, f)
+    os.rename(path + ".tmp", path)
+
+def off_lineage(pid):
+    p = os.getpid()
+    while p > 1:
+        if p == pid:
+            return False
+        with open("/proc/%d/status" % p) as f:
+            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
+    return True
+
+if sys.argv[1] == "--child":
+    sock_path, frame, out = sys.argv[2:5]
+    land(out, rpc(sock_path, json.loads(frame)))
+    sys.exit(0)
+
+if sys.argv[1] == "--detached":
+    sock_path, frame, out, root = sys.argv[2:6]
+    if os.fork() > 0:
+        os.wait()
+        sys.exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    while not off_lineage(int(root)):
+        time.sleep(0.02)
+    land(out, rpc(sock_path, json.loads(frame)))
+    os._exit(0)
+
+pidfile, sock_path, cmd_dir = sys.argv[1:4]
+with open(pidfile + ".tmp", "w") as f:
+    f.write(str(os.getpid()))
+os.rename(pidfile + ".tmp", pidfile)
+
+def serve():
+    n = 0
+    while True:
+        req = os.path.join(cmd_dir, "req-%d.json" % n)
+        if not os.path.exists(req):
+            time.sleep(0.02)
+            continue
+        cmd = json.load(open(req))
+        out = os.path.join(cmd_dir, "resp-%d.json" % n)
+        frame = json.dumps(cmd["frame"])
+        me = sys.executable, os.path.abspath(__file__)
+        if cmd["how"] == "self":
+            land(out, rpc(sock_path, cmd["frame"]))
+        elif cmd["how"] == "child":
+            # Answer only once the child is reaped: its hold's holder
+            # is then provably dead for the next reap pass.
+            subprocess.run([*me, "--child", sock_path, frame, out + ".c"], check=True)
+            os.rename(out + ".c", out)
+        else:
+            subprocess.run([*me, "--detached", sock_path, frame, out,
+                            str(os.getpid())], check=True)
+        n += 1
+
+threading.Thread(target=serve, daemon=True).start()
+for _ in sys.stdin:
+    pass
+"#;
+
+/// The managed provider under test and its request channel.
+struct ManagedWorker {
+    pid: u32,
+    cmd_dir: TempDir,
+    seq: u64,
+    _mock: MockClaude,
+}
+
+impl ManagedWorker {
+    /// Register `alias` as a managed claude endpoint running the
+    /// enrollment mock and wait for the daemon to enroll it.
+    fn start(d: &TestDaemon, alias: &str) -> ManagedWorker {
+        let cmd_dir = TempDir::new().unwrap();
+        let pidfile = d.dir.path().join(format!("claude-{alias}.pid"));
+        let script = d.dir.path().join("claude-enroll.py");
+        std::fs::write(&script, MOCK_ENROLL_PY).unwrap();
+        test_env().set(
+            "CADENCE_CLAUDE_COMMAND",
+            format!(
+                "python3 {} {} {} {}",
+                script.display(),
+                pidfile.display(),
+                client::socket_path(&d.state).display(),
+                cmd_dir.path().display()
+            ),
+        );
+        let mock = MockClaude {
+            pidfile: pidfile.clone(),
+        };
+        d.register_claude(alias, Value::Null);
+        // The daemon's own record of the provider it launched — the
+        // mock may not even have written its pidfile yet.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let pid = loop {
+            let enrolled = d
+                .events(alias)
+                .into_iter()
+                .find(|e| e["kind"].as_str() == Some("slot_enrolled"));
+            if let Some(e) = enrolled {
+                break e["payload"]["root_pid"].as_u64().unwrap() as u32;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{alias} was never enrolled: {:?}",
+                d.events(alias)
+            );
+            thread::sleep(Duration::from_millis(25));
+        };
+        ManagedWorker {
+            pid,
+            cmd_dir,
+            seq: 0,
+            _mock: mock,
+        }
+    }
+
+    /// One slot RPC performed `how` = `self` | `child` | `detached`;
+    /// the answer is the wire frame.
+    fn rpc(&mut self, how: &str, method: &str, params: Value) -> Value {
+        let n = self.seq;
+        self.seq += 1;
+        let req = self.cmd_dir.path().join(format!("req-{n}.json"));
+        let tmp = req.with_extension("tmp");
+        std::fs::write(
+            &tmp,
+            json!({"how": how, "frame": {"method": method, "params": params}}).to_string(),
+        )
+        .unwrap();
+        std::fs::rename(&tmp, &req).unwrap();
+        let resp = self.cmd_dir.path().join(format!("resp-{n}.json"));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !resp.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "managed worker never answered {how} {method}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        serde_json::from_str(&std::fs::read_to_string(&resp).unwrap()).unwrap()
+    }
+}
+
+/// CAD-230 phase a ACCEPTANCE: the daemon enrolls a managed provider
+/// it launched (no tmux pane) from the pid it recorded. A build-slot
+/// acquire from that exact process, and from a verified descendant
+/// (its tool subprocess), is admitted under the owner's lane whatever
+/// the request claims; a double-forked detached grandchild, a pane-less
+/// unrelated process and a forged alias/lane/pid are refused. Owner
+/// generation drift then revokes: no new work — and no fallback to an
+/// outer pane even with one registered above it — while the live hold
+/// stays accounted until its exact holder releases it.
+#[test]
+fn slot_managed_endpoint_enrolls_and_admits_only_its_verified_processes() {
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut observer = LaneShell::spawn(home.path());
+    plant_pane(&d, "observer", observer.pid());
+    let mut wk = ManagedWorker::start(&d, "wk");
+    let status = |observer: &mut LaneShell| {
+        let s = observer.rpc(&d.state, "slot_status", json!({}));
+        assert_eq!(s["ok"], true, "{s}");
+        s["result"].clone()
+    };
+    let enrollment = status(&mut observer)["enrollments"][0].clone();
+    assert_eq!(enrollment["owner_actor"], "wk");
+    assert_eq!(enrollment["auth_state"], "active");
+    assert_eq!(enrollment["root"]["pid"], wk.pid);
+    assert_eq!(enrollment["root"], enrollment["worker"]);
+
+    // The enrolled root itself — a forged lane in the request changes
+    // nothing: the hold is the owner's.
+    let g = wk.rpc(
+        "self",
+        "slot_acquire",
+        json!({"kind": "build", "pid": "$PID", "request_id": "root-1",
+               "lane": "observer"}),
+    );
+    assert_eq!(g["result"]["granted"], true, "{g}");
+    let root_token = g["result"]["token"].as_str().unwrap().to_string();
+    // A verified descendant (the provider's tool subprocess) is
+    // admitted too, holding for its own pid; it exits right after, so
+    // its hold is the next reap's proven death.
+    let g = wk.rpc(
+        "child",
+        "slot_acquire",
+        json!({"kind": "suite", "pid": "$PID", "request_id": "child-1"}),
+    );
+    assert_eq!(g["result"]["granted"], true, "{g}");
+    let s = status(&mut observer);
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "{s}");
+    assert_eq!(held[0]["lane"], "wk");
+    assert_eq!(held[0]["pid"], wk.pid);
+    assert_eq!(held[0]["binding"], "strict");
+    assert_eq!(held[0]["auth_state"], "active");
+    assert_eq!(held[0]["liveness"], "alive");
+    assert_eq!(held[0]["accounting"], "held");
+    assert_eq!(held[0]["owner_generation"], enrollment["owner_generation"]);
+    assert!(held[0].get("token").is_none(), "the observer never sees it");
+    assert!(
+        s["pools"]["suite"]["held"].as_array().unwrap().is_empty(),
+        "the exited descendant's hold was reaped: {s}"
+    );
+    assert!(d
+        .events("wk")
+        .iter()
+        .any(|e| e["kind"] == "slot_released" && e["payload"]["reason"] == "holder died"));
+
+    // Off the root's ancestry (setsid + double fork): refused.
+    let r = wk.rpc(
+        "detached",
+        "slot_acquire",
+        json!({"kind": "build", "pid": "$PID", "request_id": "detached-1"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("caller identity underivable"),
+        "{r}"
+    );
+    // A pane-less unrelated process claiming the alias, the lane and
+    // even the root's pid: refused.
+    let mut stray = LaneShell::spawn(home.path());
+    let r = stray.rpc(
+        &d.state,
+        "slot_acquire",
+        json!({"kind": "build", "pid": wk.pid, "request_id": "forged-1",
+               "lane": "wk", "alias": "wk"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    let (rc, out) = stray.cadence(
+        &d.state,
+        "build-slot acquire build --pid $$ --lane wk --wait-secs 0",
+    );
+    assert_ne!(rc, 0, "{out}");
+    assert!(out.contains("caller identity underivable"), "{out}");
+    let r = stray.run(&format!(
+        "CADENCE_ALIAS=wk {} --state-dir {} build-slot status",
+        env!("CARGO_BIN_EXE_cadence"),
+        d.state.display()
+    ));
+    assert_ne!(r.0, 0, "an env alias is no identity: {}", r.1);
+    assert_eq!(
+        status(&mut observer)["pools"]["build"]["held"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "no refused caller got a hold"
+    );
+
+    // Owner generation drift: plant the test process as a pane ABOVE
+    // the provider first — the strict path must not fall through to it.
+    plant_self(&d);
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET generation='drifted' WHERE alias='wk'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let r = wk.rpc(
+        "self",
+        "slot_acquire",
+        json!({"kind": "build", "pid": "$PID", "request_id": "root-2"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(
+        r["error"]["message"].as_str().unwrap().contains("revoked"),
+        "{r}"
+    );
+    let s = status(&mut observer);
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "revocation frees nothing: {s}");
+    assert_eq!(held[0]["auth_state"], "revoked");
+    assert_eq!(held[0]["liveness"], "alive");
+    // Only the exact holder's release frees it.
+    let r = wk.rpc(
+        "self",
+        "slot_release",
+        json!({"token": root_token, "pid": "$PID"}),
+    );
+    assert_eq!(r["result"]["released"], true, "{r}");
+    assert!(status(&mut observer)["pools"]["build"]["held"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+/// CAD-230: `slot_reconcile` is operator authority — an agent's
+/// connection (a pane or an enrolled endpoint) is refused, as are
+/// identity-shaped request fields; and it never frees a live hold.
+#[test]
+fn slot_reconcile_refuses_agents_and_live_holds() {
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&d, "pane-1", pane.pid());
+    let mut wk = ManagedWorker::start(&d, "wk");
+    let g = wk.rpc(
+        "self",
+        "slot_acquire",
+        json!({"kind": "build", "pid": "$PID", "request_id": "r1"}),
+    );
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    let s = pane.rpc(&d.state, "slot_status", json!({}));
+    let hold = s["result"]["pools"]["build"]["held"][0].clone();
+    let enrollment = hold["enrollment_id"].as_str().unwrap().to_string();
+    let start = s["result"]["enrollments"][0]["root"]["starttime"].clone();
+    let evidence = json!({
+        "owner_generation": hold["owner_generation"], "pid": wk.pid,
+        "starttime": start, "uid": s["result"]["enrollments"][0]["root"]["uid"],
+        "observed_at": "now", "process_read": "claimed exited",
+        "command_outcome": "done", "side_effect_review": "none",
+    });
+    let params = json!({"enrollment_id": enrollment, "token": token,
+                        "evidence": evidence});
+    // A pane and the enrolled endpoint itself are agents.
+    let r = pane.rpc(&d.state, "slot_reconcile", params.clone());
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("operator action"),
+        "{r}"
+    );
+    let r = wk.rpc("self", "slot_reconcile", params.clone());
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("operator action"),
+        "{r}"
+    );
+    // The operator (this test process: no pane, no enrollment) with a
+    // forged `by` is refused before anything else…
+    let mut forged = params.clone();
+    forged["by"] = json!("operator");
+    let err = d.rpc("slot_reconcile", forged).unwrap_err();
+    assert!(err.to_string().contains("'by'"), "{err}");
+    // …and without it still cannot free a live holder.
+    let err = d.rpc("slot_reconcile", params).unwrap_err();
+    assert!(err.to_string().contains("is alive"), "{err}");
+    let s = pane.rpc(&d.state, "slot_status", json!({}));
+    assert_eq!(
+        s["result"]["pools"]["build"]["held"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 /// `starve_secs` promotes a long waiter ahead of a priority lane:
 /// priority wins inside the window, the starved waiter wins after it.
 /// The slot clock is injected — the test advances it instead of
