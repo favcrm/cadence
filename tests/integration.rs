@@ -18410,8 +18410,9 @@ fn finish_guard_per_worktree() {
     // Re-start under a new --name while the old pair is open would
     // fork the issue's work — refused, naming the open lane (CAD-274).
     // Once the old pair is force-finished, the re-started pair is not
-    // bound to a message scoped to the old worktree.
-    let (ok, err) = cli(&["issue", "start", "D-6", "--name", "scd"]);
+    // bound to a message scoped to the old worktree. The re-starts run
+    // as `pm`, which dispatched D-6 and holds its claim (CAD-383).
+    let (ok, err) = cli(&["issue", "start", "D-6", "--name", "scd", "--by", "pm"]);
     assert!(
         !ok && err["error"].as_str().unwrap().contains("d-6-"),
         "a second lane under --name is refused: {err}"
@@ -18425,7 +18426,7 @@ fn finish_guard_per_worktree() {
             .any(|o| o == "bound-message"),
         "the bound-message block is what --force overrode: {out}"
     );
-    let (ok, out) = cli(&["issue", "start", "D-6", "--name", "scd"]);
+    let (ok, out) = cli(&["issue", "start", "D-6", "--name", "scd", "--by", "pm"]);
     assert!(ok, "{out}");
     // The new pair's work is merged by ancestry and the still-live
     // message is scoped to the removed pair — the finish succeeds

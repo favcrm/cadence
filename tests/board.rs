@@ -4744,8 +4744,15 @@ fn issue_start_conflicting_branch_refused_and_status_owner() {
         )
         .0
     );
-    let (ok, _) = cli(&pm, &state, &["issue", "start", "D-2"]);
-    assert!(ok);
+    // CAD-383: bob holds the review issue — another requester is
+    // refused; bob's own start keeps the status and the owner.
+    let (ok, err) = cli(&pm, &state, &["issue", "start", "D-2"]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("bob"),
+        "{err}"
+    );
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-2", "--by", "bob"]);
+    assert!(ok, "{out}");
     let front = std::fs::read_to_string(pm.join("demo/D-2/issue.md")).unwrap();
     assert!(
         front.contains("status: review") && front.contains("owner: bob"),
@@ -6053,6 +6060,369 @@ fn dispatch_refusals_leave_nothing() {
         .0
     );
     assert_eq!(commits(&pm), before);
+}
+
+// ---------- CAD-383: claims guard dispatch and issue start ----------
+
+fn show_issue(pm: &Path, state: &Path, id: &str) -> Value {
+    let (ok, out) = cli(pm, state, &["issue", "show", id, "--json"]);
+    assert!(ok, "{out}");
+    out
+}
+
+fn has_comment(issue: &Value, needles: &[&str]) -> bool {
+    issue["comments"].as_array().unwrap().iter().any(|c| {
+        let body = c["body"].as_str().unwrap_or_default();
+        needles.iter().all(|n| body.contains(n))
+    })
+}
+
+/// A claim recorded outside cadence (`issue claim`) guards `issue
+/// start` on a doing issue: a foreign requester is refused naming the
+/// holder and the claim age, the holder is let through, a take-over
+/// needs a reason and is recorded, and backlog/unowned issues start
+/// exactly as before (an owned backlog issue only warns).
+#[test]
+fn issue_claim_guards_start_and_take_over_is_recorded() {
+    let (_tmp, pm, state, repo) = start_fx();
+    for title in ["Claimed", "Taken", "Fresh", "Soft"] {
+        assert!(cli(&pm, &state, &["issue", "new", title, "--project", "demo"]).0);
+    }
+
+    // A PM whose lane runs outside cadence records a claim: owner,
+    // claim and a comment in one tracker commit; backlog → doing.
+    let before = commits(&pm);
+    let (ok, out) = cli(
+        &pm,
+        &state,
+        &[
+            "issue",
+            "claim",
+            "D-1",
+            "--by",
+            "pm-a",
+            "--note",
+            "claude subagent lane",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["claim"]["by"], "pm-a", "{out}");
+    assert_eq!(commits(&pm), before + 1);
+    let d1 = show_issue(&pm, &state, "D-1");
+    assert_eq!(d1["status"], "doing", "{d1}");
+    // The claim is the PM's; `owner` stays for the lane.
+    assert!(d1["owner"].is_null(), "{d1}");
+    assert_eq!(d1["claim"]["by"], "pm-a", "{d1}");
+    assert!(d1["claim"]["at"].as_str().is_some(), "{d1}");
+    assert!(d1["claim"]["age_secs"].as_i64().is_some(), "{d1}");
+    assert!(
+        has_comment(&d1, &["Claimed by pm-a", "claude subagent lane"]),
+        "{d1}"
+    );
+    // The card view (issue ls / board) carries the claim too.
+    let (_, ls) = cli(&pm, &state, &["issue", "ls", "--json"]);
+    let card = ls["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "D-1")
+        .unwrap()
+        .clone();
+    assert_eq!(card["claim"]["by"], "pm-a", "{card}");
+    // `overview` lists the in-flight claim with its age.
+    let (ok, ov) = cli(&pm, &state, &["overview", "--json"]);
+    assert!(ok, "{ov}");
+    let claim = ov["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["key"] == "demo")
+        .and_then(|p| p["claims"].as_array())
+        .and_then(|cs| cs.iter().find(|c| c["issue"] == "D-1"))
+        .unwrap_or_else(|| panic!("no D-1 claim row: {ov}"))
+        .clone();
+    assert_eq!(claim["by"], "pm-a", "{claim}");
+    assert!(claim["age_secs"].as_i64().is_some(), "{claim}");
+
+    // A foreign requester is refused before anything is created: the
+    // refusal names the holder, the claim age and the take-over flag.
+    let before = commits(&pm);
+    for args in [
+        &["issue", "start", "D-1"][..],
+        &["issue", "start", "D-1", "--by", "pm-b"][..],
+    ] {
+        let (ok, err) = cli(&pm, &state, args);
+        assert!(!ok, "{err}");
+        let msg = err["error"].as_str().unwrap();
+        assert!(
+            msg.contains("pm-a") && msg.contains("ago") && msg.contains("--take-over"),
+            "{msg}"
+        );
+    }
+    assert!(!repo.join(".cadence/wt/d-1-claimed").exists());
+    assert_eq!(commits(&pm), before);
+    // Another requester's claim is refused the same way.
+    let (ok, err) = cli(&pm, &state, &["issue", "claim", "D-1", "--by", "pm-b"]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("pm-a"),
+        "{err}"
+    );
+    assert_eq!(commits(&pm), before);
+
+    // The holder is let through — by CADENCE_ALIAS or --by — and the
+    // claim is kept as it was.
+    let (ok, out) = cli_env(
+        &pm,
+        &state,
+        &["issue", "start", "D-1"],
+        &[("CADENCE_ALIAS", "pm-a")],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["created"], true);
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1", "--by", "pm-a"]);
+    assert!(ok && out["created"] == false, "{out}");
+    let d1 = show_issue(&pm, &state, "D-1");
+    assert_eq!(d1["claim"]["by"], "pm-a", "{d1}");
+    assert_eq!(d1["owner"], "pm-a", "{d1}");
+
+    // Take-over: an empty reason is refused, a real one is recorded as
+    // the new claim, a comment and a `claim` history entry.
+    assert!(cli(&pm, &state, &["issue", "claim", "D-2", "--by", "pm-a"]).0);
+    let before = commits(&pm);
+    let (ok, err) = cli(
+        &pm,
+        &state,
+        &["issue", "start", "D-2", "--by", "pm-b", "--take-over", "  "],
+    );
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("reason"),
+        "{err}"
+    );
+    assert_eq!(commits(&pm), before);
+    let (ok, out) = cli(
+        &pm,
+        &state,
+        &[
+            "issue",
+            "start",
+            "D-2",
+            "--by",
+            "pm-b",
+            "--take-over",
+            "pm-a lane died at 09:00",
+        ],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["claim"]["take_over"]["from"], "pm-a", "{out}");
+    let d2 = show_issue(&pm, &state, "D-2");
+    assert_eq!(d2["claim"]["by"], "pm-b", "{d2}");
+    assert_eq!(d2["owner"], "pm-b", "{d2}");
+    assert!(
+        has_comment(
+            &d2,
+            &["Take-over by pm-b", "pm-a", "pm-a lane died at 09:00"]
+        ),
+        "{d2}"
+    );
+    let (ok, log) = cli(&pm, &state, &["issue", "log", "D-2"]);
+    assert!(ok, "{log}");
+    assert!(
+        log["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "claim" && e["summary"].as_str().unwrap().contains("take-over")),
+        "{log}"
+    );
+
+    // Backlog/unowned is unchanged: no warning, owner = the actor.
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-3"]);
+    assert!(ok, "{out}");
+    assert!(out["claim"]["warning"].is_null(), "{out}");
+    let d3 = show_issue(&pm, &state, "D-3");
+    assert_eq!(d3["owner"], "operator", "{d3}");
+    assert_eq!(d3["claim"]["by"], "operator", "{d3}");
+    // An owned backlog issue only warns, naming the owner, and keeps it.
+    assert!(cli(&pm, &state, &["issue", "set", "D-4", "owner=bob"]).0);
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-4"]);
+    assert!(ok, "{out}");
+    assert!(
+        out["claim"]["warning"].as_str().unwrap().contains("bob"),
+        "{out}"
+    );
+    assert_eq!(show_issue(&pm, &state, "D-4")["owner"], "bob");
+
+    // Release: only a holder may release; it clears the claim.
+    let (ok, err) = cli(&pm, &state, &["issue", "release", "D-1", "--by", "pm-b"]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("pm-a"),
+        "{err}"
+    );
+    let (ok, out) = cli(
+        &pm,
+        &state,
+        &[
+            "issue",
+            "release",
+            "D-1",
+            "--by",
+            "pm-a",
+            "--note",
+            "done here",
+        ],
+    );
+    assert!(ok, "{out}");
+    let d1 = show_issue(&pm, &state, "D-1");
+    assert!(d1["claim"].is_null(), "{d1}");
+    assert!(d1["owner"].is_null(), "{d1}");
+    assert!(has_comment(&d1, &["Released by pm-a", "done here"]), "{d1}");
+    // Unclaimed now: anyone may start it again.
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1", "--by", "pm-b"]);
+    assert!(ok, "{out}");
+}
+
+/// `dispatch` (plain and `--job`) reads the claim: re-dispatching to
+/// the same worker and the claiming PM dispatching another worker go
+/// through; a different PM is refused before anything is created
+/// unless it takes over with a reason; a claim recorded with `issue
+/// claim` by a PM whose lanes run outside cadence is seen too.
+#[test]
+fn dispatch_respects_claims() {
+    let (tmp, pm, state, repo) = start_fx();
+    let d = UiDaemon::start_on(state.clone());
+    let cwd = pm.to_str().unwrap();
+    for (alias, upstream) in [
+        ("pm-a", None),
+        ("pm-b", None),
+        ("w1", Some("pm-a")),
+        ("w2", Some("pm-a")),
+        ("w3", Some("pm-b")),
+    ] {
+        // Mailboxes: kickoffs stay queued, so counts are exact.
+        let mut req = json!({"alias": alias, "provider": "inbox",
+                             "endpoint_kind": "inbox", "cwd": cwd});
+        if let Some(up) = upstream {
+            req["params"] = json!(format!("{{\"upstream\":\"{up}\"}}"));
+        }
+        d.rpc("agent_register", req);
+    }
+    for title in ["Lane", "Outside"] {
+        assert!(cli(&pm, &state, &["issue", "new", title, "--project", "demo"]).0);
+    }
+    let note = tmp.path().join("note.md");
+    std::fs::write(&note, "# kickoff").unwrap();
+    let note_s = note.to_str().unwrap().to_string();
+    let spec = tmp.path().join("spec.md");
+    std::fs::write(&spec, "# spec").unwrap();
+    let spec_s = spec.to_str().unwrap().to_string();
+    let dispatch = |id: &str, to: &str, by: &str, extra: &[&str]| {
+        let mut args = vec![
+            "dispatch",
+            id,
+            "--to",
+            to,
+            "--note",
+            &note_s,
+            "--reply-to",
+            by,
+        ];
+        args.extend_from_slice(extra);
+        cli(&pm, &state, &args)
+    };
+    let messages = |alias: &str| {
+        d.rpc("agent_show", json!({"alias": alias}))["messages"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+
+    // pm-a dispatches w1: the worker owns the lane, pm-a holds the claim.
+    let (ok, out) = dispatch("D-1", "w1", "pm-a", &[]);
+    assert!(ok && out["dispatched"] == true, "{out}");
+    let d1 = show_issue(&pm, &state, "D-1");
+    assert_eq!(d1["owner"], "w1", "{d1}");
+    assert_eq!(d1["claim"]["by"], "pm-a", "{d1}");
+    // `status` shows the claim, with its age, on the worker's row and
+    // in the footer.
+    let (ok, st) = cli(&pm, &state, &["status", "--json"]);
+    assert!(ok, "{st}");
+    let footer = st["footer"]["claims"].as_array().unwrap();
+    let c = footer.iter().find(|c| c["issue"] == "D-1").unwrap();
+    assert!(
+        c["by"] == "pm-a" && c["owner"] == "w1" && c["age_secs"].as_i64().is_some(),
+        "{c}"
+    );
+    let w1 = st["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "w1")
+        .unwrap();
+    assert!(
+        w1["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["issue"] == "D-1"),
+        "{w1}"
+    );
+    // (a) re-dispatching to the same worker still works.
+    let (ok, out) = dispatch("D-1", "w1", "pm-a", &[]);
+    assert!(ok, "{out}");
+    // (b) the claiming PM may hand the issue to another of its workers.
+    let (ok, out) = dispatch("D-1", "w2", "pm-a", &[]);
+    assert!(ok, "{out}");
+
+    // (c) a different PM is refused, plain and --job, naming the holder
+    // and the claim age — no commit, no message, no job.
+    let before = commits(&pm);
+    let (ok, err) = dispatch("D-1", "w3", "pm-b", &[]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("pm-a") && msg.contains("ago") && msg.contains("--take-over"),
+        "{msg}"
+    );
+    let (ok, err) = dispatch("D-1", "w3", "pm-b", &["--job", "--spec", &spec_s]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("pm-a"),
+        "{err}"
+    );
+    assert_eq!(commits(&pm), before);
+    assert_eq!(messages("w3"), 0);
+    let jobs = d.rpc("job_list", json!({"all": true}));
+    assert_eq!(jobs["jobs"].as_array().unwrap().len(), 0, "{jobs}");
+
+    // A claim recorded outside cadence is seen by dispatch.
+    assert!(cli(&pm, &state, &["issue", "claim", "D-2", "--by", "pm-x"]).0);
+    let (ok, err) = dispatch("D-2", "w1", "pm-a", &[]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("pm-x"),
+        "{err}"
+    );
+    assert!(!repo.join(".cadence/wt/d-2-outside").exists());
+    assert_eq!(messages("w1"), 1);
+
+    // Take-over with a reason goes through and is recorded: the new
+    // claim, the new owner and a comment naming the old holder.
+    let (ok, out) = dispatch(
+        "D-2",
+        "w1",
+        "pm-a",
+        &["--take-over", "pm-x asked pm-a to finish it"],
+    );
+    assert!(ok && out["dispatched"] == true, "{out}");
+    let d2 = show_issue(&pm, &state, "D-2");
+    assert_eq!(d2["claim"]["by"], "pm-a", "{d2}");
+    assert_eq!(d2["owner"], "w1", "{d2}");
+    assert!(
+        has_comment(
+            &d2,
+            &["Take-over by pm-a", "pm-x", "pm-x asked pm-a to finish it"]
+        ),
+        "{d2}"
+    );
+    assert_eq!(messages("w1"), 2);
 }
 
 // ---------- CAD-69: board over Tailscale ----------

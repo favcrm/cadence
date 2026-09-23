@@ -558,6 +558,12 @@ enum Commands {
         /// is recorded on the issue. A deleted cwd still refuses.
         #[arg(long)]
         force: bool,
+        /// Dispatch an issue that another PM or lane holds in
+        /// doing/review (CAD-383). Without it such a dispatch is
+        /// refused, naming the holder and the claim age. The reason is
+        /// required and recorded on the issue.
+        #[arg(long, value_name = "REASON")]
+        take_over: Option<String>,
     },
     /// Join a new worker agent to a group. `<group>` is the PM agent —
     /// its alias or provider-native id — and `<provider>` is devin,
@@ -2663,20 +2669,33 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
     let tracker = pm.is_some();
     let mut owned_issues: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // CAD-383: every doing/review issue with a holder, and its claim age.
+    let mut claims: Vec<Value> = Vec::new();
     if let Some(pm) = &pm {
+        use cadence_agent::issue::claim;
         let issues = cadence_agent::issue::board::load_all(&pm.dir, None).unwrap_or_default();
         let views = cadence_agent::issue::board::views(&pm.config.notes_dir(), issues);
+        let clock = claim::Clock::new(&pm.dir, Duration::from_secs(3));
+        let now = cadence_agent::issue::time::now_epoch();
         for v in views {
             if !matches!(v.status.as_str(), "doing" | "review") {
                 continue;
             }
-            if let Some(owner) = &v.issue.front.owner {
+            let front = &v.issue.front;
+            if let Some(owner) = &front.owner {
                 owned_issues
                     .entry(owner.clone())
                     .or_default()
-                    .push(v.issue.front.id.clone());
+                    .push(front.id.clone());
+            }
+            if !claim::holders(front).is_empty() {
+                let since = clock.since(&v.issue.project, front);
+                let mut row = claim::row(&v.issue.project, front, since, now);
+                row["status"] = json!(v.status);
+                claims.push(row);
             }
         }
+        claims.sort_by(|a, b| a["issue"].as_str().cmp(&b["issue"].as_str()));
         for ids in owned_issues.values_mut() {
             ids.sort();
         }
@@ -2778,6 +2797,11 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
             None
         };
         let issues = owned_issues.get(&alias).cloned().unwrap_or_default();
+        let held: Vec<Value> = claims
+            .iter()
+            .filter(|c| c["by"] == alias || c["owner"] == alias)
+            .cloned()
+            .collect();
         rows.push(json!({
             "alias": alias,
             "provider": provider,
@@ -2796,6 +2820,9 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
             "unknown": unknown,
             "pane": pane,
             "issues": issues,
+            // CAD-383: doing/review issues this agent owns or claims,
+            // with the claim age.
+            "claims": held,
             // CAD-202: the pane's cwd was deleted — delivery refuses.
             "cwd_deleted": show["agent"]["cwd_deleted"].as_bool().unwrap_or(false),
         }));
@@ -2822,6 +2849,9 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
             "unread_inboxes": unread_inboxes,
             "stale_inboxes": stale_inboxes,
             "slots": slots,
+            // CAD-383: every in-flight claim, listed agents or not — a
+            // PM whose lanes run outside cadence shows up here.
+            "claims": claims,
         },
         "tracker": tracker,
     }))
@@ -2859,11 +2889,18 @@ fn print_status_table(view: &Value) {
                 flags.push("awaiting_report");
             }
             let pane = a["pane"]["verdict"].as_str().unwrap_or("-").to_string();
-            let issues = a["issues"]
+            // CAD-383: each owned or claimed issue with its claim age.
+            let issues = a["claims"]
                 .as_array()
-                .map(|ids| {
-                    ids.iter()
-                        .filter_map(Value::as_str)
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| {
+                            let id = c["issue"].as_str().unwrap_or_default();
+                            match c["age_secs"].as_i64() {
+                                Some(age) => format!("{id}({})", fmt_age(age)),
+                                None => id.to_string(),
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join(",")
                 })
@@ -2983,6 +3020,32 @@ fn print_status_table(view: &Value) {
             waiting,
             cadence_agent::slots::fmt_wait(longest)
         );
+    }
+    // CAD-383: claims held by someone with no row here — a PM whose
+    // lanes run outside cadence, or an agent outside the scope.
+    let listed: Vec<&str> = agents.iter().filter_map(|a| a["alias"].as_str()).collect();
+    let unlisted: Vec<String> = view["footer"]["claims"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| {
+            !listed.contains(&c["by"].as_str().unwrap_or_default())
+                && !listed.contains(&c["owner"].as_str().unwrap_or_default())
+        })
+        .map(|c| {
+            format!(
+                "{} {} {}",
+                c["issue"].as_str().unwrap_or_default(),
+                c["by"].as_str().unwrap_or("?"),
+                c["age_secs"]
+                    .as_i64()
+                    .map(fmt_age)
+                    .unwrap_or_else(|| "age unknown".to_string())
+            )
+        })
+        .collect();
+    if !unlisted.is_empty() {
+        println!("claims: {}", unlisted.join("; "));
     }
     if !view["tracker"].as_bool().unwrap_or(false) {
         println!("tracker: unreachable (no pm dir) — issue column empty");
@@ -3606,6 +3669,24 @@ fn print_overview(view: &Value) {
                 counts,
                 review
             );
+            // CAD-383: who holds each in-flight issue, and since when.
+            for c in p["claims"].as_array().cloned().unwrap_or_default() {
+                let by = c["by"].as_str().unwrap_or("?");
+                let owner = c["owner"]
+                    .as_str()
+                    .filter(|o| *o != by)
+                    .map(|o| format!(" (owner {o})"))
+                    .unwrap_or_default();
+                let age = c["age_secs"]
+                    .as_i64()
+                    .map(|a| format!("claimed {} ago", fmt_age(a)))
+                    .unwrap_or_else(|| "claim age unknown".to_string());
+                println!(
+                    "    {:<10} {:<7} {by}{owner} — {age}",
+                    c["issue"].as_str().unwrap_or(""),
+                    c["status"].as_str().unwrap_or(""),
+                );
+            }
         }
     }
     if view["github"]["state"].as_str() == Some("unavailable") {
@@ -5128,6 +5209,7 @@ fn run() -> Result<i32> {
             spec,
             no_lessons,
             force,
+            take_over,
         } => {
             let pm = cadence_agent::issue::Pm::open_default()?;
             let args = cadence_agent::issue::dispatch::DispatchArgs {
@@ -5141,9 +5223,14 @@ fn run() -> Result<i32> {
                 job_spec: job.then(|| spec.clone().unwrap_or_default()),
                 no_lessons,
                 force,
+                take_over,
             };
             let out =
                 cadence_agent::issue::dispatch::run(&pm, issue.as_str(), &args, "", &state_dir)?;
+            // CAD-383: a backlog/ready issue someone else owns warns only.
+            if let Some(warning) = out["claim"]["warning"].as_str() {
+                eprintln!("warning: {warning}");
+            }
             // CAD-159: an issue with no acceptance items still
             // dispatches, but the operator sees why it should not.
             if let Some(warning) = out["acceptance"]["warning"].as_str() {

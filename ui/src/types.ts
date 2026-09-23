@@ -279,10 +279,23 @@ export interface MainCi {
   shas?: ShaCi[];
 }
 
+/** CAD-383: one in-flight (doing/review) issue and who holds it. */
+export interface OverviewClaim {
+  issue: string;
+  project: string;
+  status: string;
+  by: string | null;
+  owner: string | null;
+  note?: string | null;
+  since: string | null;
+  age_secs: number | null;
+}
+
 export interface OverviewProject {
   key: string;
   open_by_status: Record<string, number>;
   oldest_review_age?: number | null;
+  claims?: OverviewClaim[];
 }
 
 export interface MonitorAlert {

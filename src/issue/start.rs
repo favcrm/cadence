@@ -10,13 +10,14 @@
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::model::{self, Front, Ref};
-use crate::issue::{git, parse, project, write, Pm};
+use crate::issue::{claim, git, parse, project, write, Pm};
 use crate::{proto, worktree};
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
@@ -36,6 +37,13 @@ pub struct StartArgs {
     pub base: Option<String>,
     pub owner: Option<String>,
     pub job: Option<JobArgs>,
+    /// CAD-383: who is asking — `--by`, else the job's `--pm`, else
+    /// `CADENCE_ALIAS`, else `operator`. `dispatch` passes its
+    /// `--reply-to`.
+    pub by: Option<String>,
+    /// CAD-383 `--take-over <reason>`: start an issue someone else holds
+    /// in doing/review; recorded on the issue.
+    pub take_over: Option<String>,
 }
 
 /// ASCII-lower `-`-separated slug, ≤32 chars — `New Login Form` →
@@ -362,8 +370,44 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
     let root = resolve_repo(&project, args.repo.as_deref(), &cwd)?;
     let (base, base_sha) = resolve_base(&root, args.base.as_deref())?;
 
+    // CAD-383: who is asking, and the owner this start would record.
+    if let Some(by) = &args.by {
+        claim::check_alias(by, "--by")?;
+    }
+    let requester = write::actor_who(
+        actor,
+        args.by
+            .as_deref()
+            .or(args.job.as_ref().map(|j| j.pm.as_str())),
+    );
+    let new_owner = args
+        .owner
+        .clone()
+        .or_else(|| args.job.as_ref().and_then(|j| j.assignee.clone()));
+
     let _lock = pm.lock()?;
     let (mut front, body) = write::load_front(&dir)?;
+    // CAD-383: a doing/review issue held by someone else refuses before
+    // any lane is touched; a take-over is its own commit, made now.
+    let mut asking = vec![requester.as_str()];
+    asking.extend(new_owner.as_deref());
+    let checked = claim::check(
+        &front,
+        &asking,
+        args.take_over.as_deref(),
+        "issue start",
+        || claim::since(&pm.dir, &project.key, &front, Duration::from_secs(2)),
+    )?;
+    if let Some(t) = &checked.take_over {
+        let mut taken = front.clone();
+        taken.claim = Some(claim::new_claim(&requester, Some(t.reason.clone())));
+        taken.owner = Some(new_owner.clone().unwrap_or_else(|| requester.clone()));
+        let (text, subject) = claim::take_over_record(&requester, t);
+        write::commit_front_with_comment(
+            pm, &dir, &front, &taken, &body, &requester, &text, &subject, actor,
+        )?;
+        front = taken;
+    }
     // CAD-274: an open worktree ref IS the issue's lane — a re-start
     // reuses it (re-applying the cargo target) rather than minting a
     // second lane from the title. Several open refs are ambiguous:
@@ -525,10 +569,15 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         }
         if new_front.owner.is_none() {
             new_front.owner = Some(
-                args.owner
+                new_owner
                     .clone()
-                    .unwrap_or_else(|| write::actor_who(actor, None)),
+                    .unwrap_or_else(|| write::actor_who(actor, args.by.as_deref())),
             );
+        }
+        // CAD-383: the start that puts the issue into work claims it —
+        // the requester (the dispatching PM), not the lane.
+        if new_front.claim.is_none() || checked.warning.is_some() {
+            new_front.claim = Some(claim::new_claim(&requester, None));
         }
         // The worktree, the branch and the tracker commit stand or
         // fall together: a refused commit (hook lint, disk error)
@@ -560,6 +609,12 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         Ok(path) => json!({"path": path}),
         Err(e) => json!({"error": e.to_string()}),
     };
+    let mut claim_out = claim::json(&front, crate::issue::time::now_epoch());
+    claim_out["warning"] = json!(checked.warning);
+    claim_out["take_over"] = json!(checked
+        .take_over
+        .as_ref()
+        .map(|t| json!({"from": t.from, "reason": t.reason})));
     let mut out = json!({
         "issue": front.id,
         "repo": root,
@@ -570,6 +625,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "created": created,
         "target_dir": cargo_target,
         "slot_env": slot_env,
+        "claim": claim_out,
     });
     if let (Some(job), Some((state_dir, spec, spec_sha256))) = (&args.job, job_probe) {
         // CAD-159: the issue's acceptance items ride the scoped task,

@@ -24,6 +24,7 @@ const FIELD_ORDER: &[&str] = &[
     "status",
     "priority",
     "owner",
+    "claim",
     "component",
     "tags",
     "parent",
@@ -155,6 +156,9 @@ fn parse_subject(subject: &str, id: &str) -> Option<(&'static str, String, Strin
         "ref" => "ref",
         "comment" => "comment",
         "attach" => "attach",
+        // CAD-383: `claim by|refreshed by|take-over by …`, `release by …`.
+        "claim" => "claim",
+        "release" => "release",
         _ => return None,
     };
     Some((kind, summary, actor.unwrap_or_default()))
@@ -603,6 +607,25 @@ pub fn status_changed_at(
     let out = git_bounded(
         pm_dir,
         &["log", "-1", "--format=%at", "-G", "^status:", "--", &rel],
+        timeout,
+    )
+    .ok()?;
+    out.trim().parse().ok()
+}
+
+/// CAD-383: when the issue's `owner:` line last changed — the claim age
+/// of an issue owned before claims were recorded. Same bounded
+/// `git log -G` as [`status_changed_at`].
+pub fn owner_changed_at(
+    pm_dir: &Path,
+    project_key: &str,
+    id: &str,
+    timeout: Duration,
+) -> Option<i64> {
+    let rel = format!("{}/issue.md", issue_rel(project_key, id));
+    let out = git_bounded(
+        pm_dir,
+        &["log", "-1", "--format=%at", "-G", "^owner:", "--", &rel],
         timeout,
     )
     .ok()?;
