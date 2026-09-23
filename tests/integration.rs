@@ -19242,25 +19242,6 @@ fn write_reviewed_memory(
     path
 }
 
-struct PmDirGuard(Option<std::ffi::OsString>);
-
-impl PmDirGuard {
-    fn set(path: &Path) -> Self {
-        let old = std::env::var_os("CADENCE_PM_DIR");
-        std::env::set_var("CADENCE_PM_DIR", path);
-        Self(old)
-    }
-}
-
-impl Drop for PmDirGuard {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(value) => std::env::set_var("CADENCE_PM_DIR", value),
-            None => std::env::remove_var("CADENCE_PM_DIR"),
-        }
-    }
-}
-
 /// The positive CAD-191 path uses four real mock Devin panes. Each bridge
 /// request is opened by the lockholding provider process itself, so the
 /// daemon must resolve the actual Unix peer pid through the pane's /proc
@@ -19280,7 +19261,9 @@ fn memory_native_socket_identity_requires_distinct_reviewers() {
 
     let mock_dir = TempDir::new().unwrap();
     let mock = install_mock_devin(mock_dir.path());
-    let _pm_env = PmDirGuard::set(&pm_dir);
+    // The daemon's own env, not the process's: concurrent tests never
+    // share (or fall back to the host's ~/pm for) a tracker dir.
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start();
     let cwd = d.dir.path().to_str().unwrap().to_string();
     for (alias, role) in [
@@ -29239,8 +29222,7 @@ fn memory_managed_endpoints_authenticate_through_daemon_enrollment() {
     )
     .unwrap();
     pm.commit("project fixture\n\nActor: test\n").unwrap();
-    let _pm_env = PmDirGuard::set(&pm_dir);
-
+    test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
     let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
     let mut author = ManagedWorker::start(&d, "author");
     let mut reviewer_a = ManagedWorker::start(&d, "reviewer-a");

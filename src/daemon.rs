@@ -2248,6 +2248,13 @@ impl Shared {
         })
     }
 
+    /// The tracker memory RPCs read and write — [`Self::pm_dir`], so an
+    /// in-process test daemon pins its own and never races another
+    /// test over the process-wide `CADENCE_PM_DIR`.
+    fn memory_pm(&self) -> Result<crate::issue::Pm> {
+        crate::issue::Pm::at(&self.pm_dir()?)
+    }
+
     fn reject_memory_identity_claims(params: &Value) -> Result<()> {
         for field in [
             "actor",
@@ -2272,7 +2279,7 @@ impl Shared {
     fn rpc_memory_propose(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         Self::reject_memory_identity_claims(params)?;
         let actor = self.memory_actor(peer_pid)?;
-        let pm = crate::issue::Pm::open_default()?;
+        let pm = self.memory_pm()?;
         let key = required_str(params, "project")?;
         let kind = required_str(params, "kind")?;
         let scope = params
@@ -2299,7 +2306,7 @@ impl Shared {
     fn rpc_memory_review(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         Self::reject_memory_identity_claims(params)?;
         let actor = self.memory_actor(peer_pid)?;
-        let pm = crate::issue::Pm::open_default()?;
+        let pm = self.memory_pm()?;
         let request = memory::ReviewRequest {
             operation: required_str(params, "operation")?,
             verdict: required_str(params, "verdict")?,
@@ -2323,7 +2330,7 @@ impl Shared {
             ));
         }
         let actor = self.memory_actor(peer_pid)?;
-        let pm = crate::issue::Pm::open_default()?;
+        let pm = self.memory_pm()?;
         let operation = required_str(params, "operation")?;
         match operation {
             "reject" => memory::reject_native(
@@ -2561,7 +2568,7 @@ impl Shared {
         }
     }
 
-    /// The tracker dir recipes are read from: this daemon's own
+    /// The tracker dir recipes and memory are read from: this daemon's own
     /// `CADENCE_PM_DIR` (its per-instance env — tests), else the
     /// process default.
     fn pm_dir(&self) -> Result<PathBuf> {
