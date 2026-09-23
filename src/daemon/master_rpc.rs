@@ -419,6 +419,9 @@ impl Shared {
     /// The report router's thread: a scan every [`ROUTER_EVERY`], or at
     /// once after a `reports_changed` ping.
     pub(super) fn run_report_router(self: &Arc<Self>) {
+        if !self.report_router {
+            return;
+        }
         let mut next = Instant::now();
         while !self.closing.load(Ordering::SeqCst) {
             if self.reports_dirty.swap(false, Ordering::SeqCst) || Instant::now() >= next {

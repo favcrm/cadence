@@ -265,6 +265,12 @@ pub fn project_add(
     owner: Option<&str>,
 ) -> Result<Value> {
     model::check_key(key)?;
+    // CAD-339: `<pm>/agents/` holds agent folders (SOUL.md, AGENT.md).
+    if key == "agents" {
+        return Err(Error::rejected(
+            "Project key 'agents' is reserved — <pm>/agents/ holds the agent files",
+        ));
+    }
     let tags = model::normalize_tags(tags)?;
     let prefix = prefix.to_ascii_uppercase();
     if prefix.is_empty()

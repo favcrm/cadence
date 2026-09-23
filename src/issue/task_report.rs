@@ -7,7 +7,7 @@
 //! ```markdown
 //! ---
 //! schema: cadence.report/2
-//! kind: done              # done | question | blocked | answer
+//! kind: done              # done | question | blocked | answer | escalate
 //! task: CAD-341
 //! agent: dev-1
 //! sha: <40 or 64 hex>     # optional

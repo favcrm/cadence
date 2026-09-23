@@ -215,6 +215,30 @@ dir, never into the product repository, and regenerated on every launch.
 3. Drift between `AGENT.md` and a running session (model, effort, permissions) is
    reported as "restart to apply", never switched mid-task.
 
+## First implementation: the master (CAD-339, MVP)
+
+Until CAD-338 lands, only the master is an agent folder, and it lives where
+this record puts the system filesystem: **`<pm>/agents/master/`** — the
+tracker dir (`~/pm`, or `CADENCE_PM_DIR`), which is already git with one
+writer. `agents/` carries no `project.yaml`, so the tracker never reads it as
+a project; a project may not use the key `agents`. The repo ships the default
+`agents/master/SOUL.md` and `AGENT.md`; `cadence master start` (operator only)
+installs whichever is missing in one tracker commit, then has the daemon launch
+alias `master` as a managed Claude or Codex session (cwd: the tracker) and queue
+its briefing — SOUL.md then AGENT.md, verbatim. `AGENT.md`'s `preferred` and
+`fallbacks` pick provider, model and effort unless the operator names them.
+The master is started explicitly, never at daemon start (auto-start belongs to
+the setup wizard, CAD-327).
+
+What is enforced, and how:
+
+| Rule | Enforced by | Gap (process guard, not a security boundary) |
+|---|---|---|
+| Only the operator writes `SOUL.md`/`AGENT.md` | `cadence master edit` → daemon `agent_file_write`, proven operator only; every write and install records a per-file sha256 in the state dir, and `master start` refuses a file whose digest changed (before it writes anything) | A same-uid process can edit the file and the digest record; the edit is caught only at the next start |
+| The master approves, rejects, accepts or merges nothing | Daemon policy by connection identity (CAD-381): plan decisions, approval records, task verdict/accept refused | A process that escapes the master's tree (setsid + double fork) is not recognised as the master (CAD-276's residual) |
+| It dispatches only approved plan tickets | `plan_check` pre-flight in `cadence dispatch` (before any write) and the daemon refusing every master `agent_send`/`agent_ask` not bound to an approved plan ticket; jobs/tasks refused | As above |
+| No merge, push or platform effect | Launch: no forge/platform tokens in env, `GH_CONFIG_DIR` empty, `GIT_TERMINAL_PROMPT=0`; Claude: only `Bash(cadence *)` allowed, `Edit`/`Write`/`gh`/`git push|merge|commit` disallowed — fixed by alias, never by stored params | Credentials in files (ssh keys, a token file) stay readable by the same uid; Codex has no per-command deny, only its sandbox and the env |
+
 ## Migration
 
 - `docs/roles/*.md` and `~/.local/state/cadence/roles/` become

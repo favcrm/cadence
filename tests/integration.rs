@@ -3436,6 +3436,9 @@ fn daemon_opts() -> daemon::ServeOptions {
         // daemons pin it off so no test's agent is stopped mid-test.
         auto_stop: Some(daemon::AutoStopSetting::off()),
         auto_stop_clock: None,
+        // CAD-339: the report router scans a tracker; only the master
+        // tests (which bind CADENCE_PM_DIR) turn it on.
+        report_router: Some(false),
     }
 }
 
@@ -37817,6 +37820,10 @@ struct PlanFixture {
 
 impl PlanFixture {
     fn start() -> PlanFixture {
+        Self::start_with(daemon_opts())
+    }
+
+    fn start_with(opts: daemon::ServeOptions) -> PlanFixture {
         let tmp = TempDir::new().unwrap();
         let (pm_dir, repo) = (tmp.path().join("pm"), tmp.path().join("repo"));
         for sub in ["home", "tmp"] {
@@ -37850,7 +37857,7 @@ impl PlanFixture {
         // The daemon's own env: never the host's ~/pm.
         test_env().set("CADENCE_PM_DIR", pm_dir.to_str().unwrap());
         let f = PlanFixture {
-            d: TestDaemon::start(),
+            d: TestDaemon::start_opts(opts),
             tmp,
             pm_dir,
         };
@@ -40234,4 +40241,562 @@ fn cad320_claude_held_text_lands_before_an_unknown_turn_result() {
         let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
         assert_eq!(page["entries"][1]["message"], "c1", "{mode}: {page}");
     }
+}
+
+// ==== CAD-339: the master agent ====
+
+/// A three-ticket plan, as the master would write it.
+const MASTER_PLAN: &str = "---\ntitle: Reminders\ngoal: Users get a reminder email\n---\n\n\
+## Schema\nsize: S\n\nThe reminders table.\n\n### Acceptance\n- [ ] migration adds reminders\n\n\
+## Sender\nsize: M\ndepends_on: 1\n\n### Acceptance\n- [ ] an email goes out at the due time\n\n\
+## Settings\nsize: S\ndepends_on: 1\n\n### Acceptance\n- [ ] a user can turn reminders off\n";
+
+/// The six reflection headings a done/question report carries.
+const REFLECTION: &str = "## Expected\ne\n## Evidence\nv\n## Cause\nc\n## Correction\nnone\n\
+## Lesson\nnone\n## Next\nnone\n";
+
+impl PlanFixture {
+    /// A fixture whose daemon runs the report router.
+    fn start_routed() -> PlanFixture {
+        Self::start_with(daemon::ServeOptions {
+            report_router: Some(true),
+            ..daemon_opts()
+        })
+    }
+
+    /// `cli` as agent `alias` (its `CADENCE_ALIAS`), outside any pane.
+    fn cli_as(&self, alias: &str, args: &[&str]) -> (bool, Value) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&self.d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &self.pm_dir)
+            .env("HOME", self.tmp.path().join("home"))
+            .env("XDG_CONFIG_HOME", self.tmp.path().join("home/.config"))
+            .env("TMPDIR", self.tmp.path().join("tmp"))
+            .env("CADENCE_ALIAS", alias)
+            .output()
+            .unwrap();
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).to_string()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        let value = serde_json::from_str(text.trim()).unwrap_or(Value::String(text));
+        (out.status.success(), value)
+    }
+
+    /// `master_start` (as the operator) with the enrollment mock as the
+    /// master's claude; waits for the daemon to enroll it.
+    fn start_master(&self) -> (ManagedWorker, Value) {
+        let mock = ManagedWorker::install(self.d.dir.path(), &self.d.state, "master");
+        let out = self
+            .d
+            .operator_rpc("master_start", json!({"provider": "claude"}))
+            .unwrap();
+        assert_eq!(out["alias"], "master", "{out}");
+        (mock.enrolled(&self.d, "master"), out)
+    }
+
+    /// The shell line the master's tool subprocess runs for `cadence
+    /// <args>` — isolated home, the daemon's state dir.
+    fn master_line(&self, args: &str) -> String {
+        let home = self.tmp.path().join("home");
+        format!(
+            "env HOME={h} XDG_CONFIG_HOME={h}/.config TMPDIR={t} {bin} --state-dir {s} {args}",
+            h = home.display(),
+            t = self.tmp.path().join("tmp").display(),
+            bin = env!("CARGO_BIN_EXE_cadence"),
+            s = self.d.state.display(),
+        )
+    }
+
+    /// `cadence <args>` run BY the master — a tool subprocess of its
+    /// provider, so the daemon attributes it to `master`.
+    fn as_master(&self, m: &mut ManagedWorker, args: &str) -> (bool, Value) {
+        let r = m.exec(&["sh", "-c", &self.master_line(args)]);
+        let out = r["out"].as_str().unwrap_or_default();
+        let text = if out.trim().is_empty() {
+            r["err"].as_str().unwrap_or_default()
+        } else {
+            out
+        };
+        let value =
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| Value::String(text.to_string()));
+        (r["rc"] == 0, value)
+    }
+
+    fn file(&self, name: &str, text: &str) -> String {
+        let path = self.tmp.path().join("tmp").join(name);
+        std::fs::write(&path, text).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn thread(&self, alias: &str) -> Vec<Value> {
+        self.d
+            .rpc("thread_read", json!({"alias": alias, "limit": 500}))
+            .unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    /// Wait for an entry of the master's thread containing `needle`.
+    fn wait_thread(&self, needle: &str, secs: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(e) = self
+                .thread("master")
+                .into_iter()
+                .find(|e| e["text"].as_str().is_some_and(|t| t.contains(needle)))
+            {
+                return e;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no master thread entry contains {needle:?}: {:#?}",
+                self.thread("master")
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn messages_of(&self, alias: &str) -> Vec<Value> {
+        self.d.rpc("agent_show", json!({"alias": alias})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    fn needs_me(&self) -> Vec<Value> {
+        let home = self.tmp.path().join("home");
+        overview_at(&home, &self.d.state, Some(&self.pm_dir), &[])["needs_me"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+}
+
+/// CAD-339 acceptance 6 (end to end, fake provider): the operator chats
+/// with the master in its thread → the master proposes a 3-ticket plan
+/// → the operator approves → the master dispatches a ticket to a worker
+/// session → the worker's done report shows up in the master's thread.
+/// Then the "since you left" summary posts into the same thread.
+#[test]
+fn master_end_to_end_chat_plan_approve_dispatch_report() {
+    let f = PlanFixture::start_routed();
+    f.d.register("w1");
+    f.d.wait_agent("w1", "idle", 10);
+    let started = cadence_agent::issue::time::now_epoch() - 1;
+    let (mut m, out) = f.start_master();
+    assert_eq!(out["installed"], json!(["SOUL.md", "AGENT.md"]), "{out}");
+    // The briefing is the agent files, delivered as the first message.
+    let boot = f.wait_thread("# Master briefing", 10);
+    assert_eq!(boot["role"], "system", "{boot}");
+    assert!(boot["text"].as_str().unwrap().contains("You are `master`"));
+
+    // The operator's chat.
+    f.d.operator_rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "Plan reminder emails for demo."}),
+    )
+    .unwrap();
+    let chat = f.wait_thread("Plan reminder emails", 10);
+    assert_eq!(chat["role"], "operator", "{chat}");
+
+    // The master proposes — through stdin, the way its briefing teaches.
+    let plan = f.file("plan.md", MASTER_PLAN);
+    let (ok, proposed) = f.as_master(
+        &mut m,
+        &format!("plan propose --project demo --file - < {plan}"),
+    );
+    assert!(ok, "{proposed}");
+    assert_eq!(proposed["epic"], "D-1", "{proposed}");
+    assert_eq!(proposed["tickets"], json!(["D-2", "D-3", "D-4"]));
+    assert_eq!(proposed["proposed_by"], "master", "{proposed}");
+    // Needs-you: the plan waits on the operator.
+    assert!(
+        f.needs_me()
+            .iter()
+            .any(|r| r["kind"] == "plan" && r["audience"] == "operator"),
+        "{:#?}",
+        f.needs_me()
+    );
+
+    // The operator approves.
+    let approved =
+        f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+            .unwrap();
+    assert_eq!(approved["state"], "approved", "{approved}");
+    assert!(!f.needs_me().iter().any(|r| r["kind"] == "plan"));
+
+    // The master dispatches an approved ticket; the note defaults to
+    // the ticket's own issue.md.
+    let (ok, sent) = f.as_master(&mut m, "dispatch D-2 --to w1 --reply-to master");
+    assert!(ok, "{sent}");
+    assert_eq!(sent["dispatched"], true, "{sent}");
+    assert!(
+        sent["note"]
+            .as_str()
+            .unwrap()
+            .ends_with("demo/D-2/issue.md"),
+        "{sent}"
+    );
+    let kickoff = sent["message"].as_str().unwrap().to_string();
+    assert!(
+        f.messages_of("w1").iter().any(|msg| msg["id"] == kickoff),
+        "the worker got the kickoff"
+    );
+    assert_eq!(f.front("D-2").status, "doing");
+
+    // The worker files its done report → it reaches the master's thread.
+    let report = f.file("done.md", &format!("---\nkind: done\n---\n{REFLECTION}"));
+    let (ok, filed) = f.cli_as(
+        "w1",
+        &[
+            "report", "file", "--task", "D-2", "--kind", "done", "--file", &report,
+        ],
+    );
+    assert!(ok, "{filed}");
+    let routed = f.wait_thread("[report] D-2 done by w1", 20);
+    assert_eq!(routed["role"], "system", "{routed}");
+    assert!(
+        routed["text"]
+            .as_str()
+            .unwrap()
+            .contains(filed["report"].as_str().unwrap()),
+        "{routed}"
+    );
+
+    // Since you left: posted into the master's thread.
+    let summary =
+        f.d.operator_rpc(
+            "master_summary",
+            json!({"since": started.to_string(), "post": true}),
+        )
+        .unwrap();
+    assert_eq!(summary["plans_proposed"].as_array().unwrap().len(), 1);
+    assert_eq!(summary["plans_decided"][0]["state"], "approved");
+    assert_eq!(summary["reports"][0]["issue"], "D-2", "{summary}");
+    assert!(
+        summary["tickets_moved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["issue"] == "D-2" && t["status"] == "doing"),
+        "{summary}"
+    );
+    assert!(summary["posted"].is_i64(), "{summary}");
+    let posted = f.wait_thread("Plans proposed (1)", 5);
+    assert_eq!(posted["payload"]["event"], "since_summary", "{posted}");
+}
+
+/// CAD-339 acceptance 3: the daemon refuses the master — approving or
+/// rejecting plans, dispatching or messaging outside an approved plan,
+/// writing its own agent files, recording merge approvals, registering
+/// or reconfiguring agents — and each refusal leaves no write. Its
+/// launch carries no forge or platform credentials and a Claude tool
+/// posture limited to `cadence`.
+#[test]
+fn master_limits_are_enforced_by_the_daemon() {
+    let f = PlanFixture::start_routed();
+    f.d.register("w1");
+    f.d.wait_agent("w1", "idle", 10);
+    // A forge credential in the daemon's env, shaped at runtime.
+    let gl = format!("glpat-{}", "q7".repeat(10));
+    std::env::set_var("GL_TOKEN", &gl);
+    let (mut m, _) = f.start_master();
+    std::env::remove_var("GL_TOKEN");
+    let (ok, _) = f.cli(&["issue", "new", "Loose", "--project", "demo"]);
+    assert!(ok);
+    let plan = f.file("plan.md", MASTER_PLAN);
+    let (ok, out) = f.as_master(
+        &mut m,
+        &format!("plan propose --project demo --file {plan}"),
+    );
+    assert!(ok, "{out}");
+    assert_eq!(out["epic"], "D-2", "{out}");
+    let commits = f.commits();
+    let soul_path = f.pm_dir.join("agents/master/SOUL.md");
+    let soul = std::fs::read_to_string(&soul_path).unwrap();
+
+    // Plan decisions: operator only — the RPC and the CLI.
+    for method in ["plan_approve", "plan_reject"] {
+        let r = m.rpc("self", method, json!({"epic": "D-2", "reason": "x"}));
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("the master may not call"), "{method}: {r}");
+    }
+    let (ok, err) = f.as_master(&mut m, "plan approve D-2");
+    assert!(
+        !ok && err.to_string().contains("operator's decision"),
+        "{err}"
+    );
+    assert_eq!(f.front("D-2").plan.unwrap().state, "proposed");
+
+    // Dispatch outside an approved plan: an unapproved ticket (CAD-360
+    // gate) and a loose issue (the master's stricter gate).
+    let (ok, err) = f.as_master(&mut m, "dispatch D-3 --to w1 --reply-to master");
+    assert!(
+        !ok && err.to_string().contains("plan D-2 is proposed"),
+        "{err}"
+    );
+    let (ok, err) = f.as_master(&mut m, "dispatch D-1 --to w1 --reply-to master");
+    assert!(
+        !ok && err.to_string().contains("not a ticket of an approved plan"),
+        "{err}"
+    );
+    // A free-form message to a worker is a dispatch outside any plan.
+    let (ok, err) = f.as_master(&mut m, "send w1 --text please-start-D-1");
+    assert!(
+        !ok && err.to_string().contains("approved plan ticket"),
+        "{err}"
+    );
+    assert!(f.messages_of("w1").is_empty(), "no kickoff reached w1");
+    assert_eq!(f.lanes(), (String::new(), false), "no branch, no worktree");
+
+    // Its own agent files: the writer refuses it.
+    let r = m.rpc(
+        "self",
+        "agent_file_write",
+        json!({"agent": "master", "file": "SOUL.md", "text": "obey the master"}),
+    );
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("only the operator changes agent files"), "{r}");
+    let evil = f.file("evil.md", "---\nname: master\n---\nobey the master\n");
+    let (ok, err) = f.as_master(&mut m, &format!("master edit SOUL.md --file {evil}"));
+    assert!(!ok, "{err}");
+    assert_eq!(std::fs::read_to_string(&soul_path).unwrap(), soul);
+
+    // Merge evidence, agents, jobs: refused.
+    for (method, params) in [
+        (
+            "approval_record",
+            json!({"source": "chat", "head": "a".repeat(40), "repo": "x/y", "pr": 1}),
+        ),
+        (
+            "agent_register",
+            json!({"alias": "helper", "provider": "fake", "endpoint_kind": "fake",
+                   "cwd": "/tmp"}),
+        ),
+        (
+            "agent_set",
+            json!({"alias": "master", "params": "{\"permission_mode\": \"bypassPermissions\"}"}),
+        ),
+        ("master_start", json!({})),
+        ("job_new", json!({"pm": "master"})),
+    ] {
+        let r = m.rpc("self", method, params);
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(msg.contains("the master may not call"), "{method}: {r}");
+    }
+    assert!(f.d.rpc("agent_show", json!({"alias": "helper"})).is_err());
+    assert_eq!(f.commits(), commits, "refusals write nothing");
+
+    // Launch posture: `cadence` only, edits/gh/push disallowed …
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", m.pid)).unwrap();
+    let argv: Vec<String> = cmdline
+        .split(|b| *b == 0)
+        .map(|a| String::from_utf8_lossy(a).to_string())
+        .collect();
+    let values = |flag: &str| -> Vec<String> {
+        argv.windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].clone())
+            .collect()
+    };
+    assert_eq!(values("--allowedTools"), ["Bash(cadence *)"], "{argv:?}");
+    assert_eq!(values("--permission-mode"), ["manual"], "{argv:?}");
+    for tool in ["Edit", "Write", "Bash(gh *)", "Bash(git push *)"] {
+        assert!(
+            values("--disallowedTools").iter().any(|t| t == tool),
+            "{tool}: {argv:?}"
+        );
+    }
+    // … and no forge credentials in its env; gh sees an empty config.
+    let env = m.exec(&["env"]);
+    let env = env["out"].as_str().unwrap();
+    assert!(env.lines().any(|l| l == "CADENCE_ALIAS=master"), "{env}");
+    assert!(!env.contains(&gl), "the forge token reached the master");
+    let gh_dir = f.d.state.join("master/no-forge");
+    assert!(
+        env.lines()
+            .any(|l| l == format!("GH_CONFIG_DIR={}", gh_dir.display())),
+        "{env}"
+    );
+
+    // The same dispatch passes once the operator approves the plan.
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-2"}))
+        .unwrap();
+    let (ok, sent) = f.as_master(&mut m, "dispatch D-3 --to w1 --reply-to master");
+    assert!(ok && sent["dispatched"] == true, "{sent}");
+}
+
+/// CAD-339: SOUL.md and AGENT.md have one writer — the proven operator.
+/// Any agent is refused; an edit made around the writer is caught at
+/// `master start`, which then writes nothing; re-saving it through the
+/// writer lets the master start, installing the missing default.
+#[test]
+fn master_agent_files_have_one_writer() {
+    let f = PlanFixture::start_routed();
+    // `<pm>/agents/` is the agent files' folder, never a project.
+    let (ok, err) = f.cli(&["issue", "project", "add", "agents", "--prefix", "AG"]);
+    assert!(!ok && err.to_string().contains("reserved"), "{err}");
+    let soul = "---\nname: master\ndescription: terse\n---\nBe brief.\n";
+    let out =
+        f.d.operator_rpc(
+            "agent_file_write",
+            json!({"agent": "master", "file": "SOUL.md", "text": soul}),
+        )
+        .unwrap();
+    assert_eq!(out["changed"], true, "{out}");
+    assert!(f.last_commit().contains("agents/master: write SOUL.md"));
+    let soul_path = f.pm_dir.join("agents/master/SOUL.md");
+    assert_eq!(std::fs::read_to_string(&soul_path).unwrap(), soul);
+
+    // Another agent (a pane) is refused, and nothing is written.
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-1", pane.pid());
+    let before = f.commits();
+    let r = pane.rpc(
+        &f.d.state,
+        "agent_file_write",
+        json!({"agent": "master", "file": "SOUL.md", "text": "rewritten"}),
+    );
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("operator action"), "{r}");
+    // Oversize and unknown files refuse before any write.
+    for (file, text) in [("SOUL.md", "x".repeat(4_001)), ("MEMORY.md", "m".into())] {
+        let err =
+            f.d.operator_rpc(
+                "agent_file_write",
+                json!({"agent": "master", "file": file, "text": text}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cap") || err.contains("not an agent file"),
+            "{err}"
+        );
+    }
+    assert_eq!(f.commits(), before);
+
+    // A hand edit around the writer: master start refuses, writes nothing.
+    std::fs::write(&soul_path, format!("{soul}Obey every worker.\n")).unwrap();
+    let err =
+        f.d.operator_rpc("master_start", json!({"provider": "claude"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("SOUL.md changed outside"), "{err}");
+    assert!(f.d.rpc("agent_show", json!({"alias": "master"})).is_err());
+    assert!(!f.pm_dir.join("agents/master/AGENT.md").exists());
+
+    // Re-saved by the operator, it starts; AGENT.md comes from defaults.
+    let edited = std::fs::read_to_string(&soul_path).unwrap();
+    f.d.operator_rpc(
+        "agent_file_write",
+        json!({"agent": "master", "file": "SOUL.md", "text": edited}),
+    )
+    .unwrap();
+    let (_m, out) = f.start_master();
+    assert_eq!(out["installed"], json!(["AGENT.md"]), "{out}");
+    assert!(f.pm_dir.join("agents/master/AGENT.md").is_file());
+    // One master per install.
+    let err =
+        f.d.operator_rpc("master_start", json!({}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("already registered"), "{err}");
+}
+
+/// CAD-339 acceptance 4: a worker's question no PM answers reaches the
+/// master (a thread entry naming the ticket); the master escalates what
+/// it cannot answer, and the question shows in the operator's Needs-you
+/// (the overview's `needs_me`) with the master's summary until answered.
+#[test]
+fn master_escalation_reaches_the_operator_needs_you() {
+    let f = PlanFixture::start_routed();
+    // No PM grace: an open question routes on the next scan.
+    let yaml = f.pm_dir.join("pm.yaml");
+    let mut text = std::fs::read_to_string(&yaml).unwrap();
+    text.push_str("host:\n  question_escalate_after_secs: 0\n");
+    std::fs::write(&yaml, text).unwrap();
+    let (ok, out) = f.cli(&["issue", "new", "Pricing page", "--project", "demo"]);
+    assert!(ok, "{out}");
+    let (mut m, _) = f.start_master();
+
+    let question = f.file(
+        "q.md",
+        &format!(
+            "---\nkind: question\noptions: [ship now, wait for legal]\n\
+             impact: blocks D-1\n---\n{REFLECTION}"
+        ),
+    );
+    let (ok, q) = f.cli_as(
+        "w1",
+        &[
+            "report", "file", "--task", "D-1", "--kind", "question", "--file", &question,
+        ],
+    );
+    assert!(ok, "{q}");
+    let qname = q["report"].as_str().unwrap().to_string();
+    let routed = f.wait_thread("[question] D-1 from w1", 20);
+    let routed_text = routed["text"].as_str().unwrap();
+    assert!(
+        routed_text.contains("ship now | wait for legal"),
+        "{routed}"
+    );
+    assert!(
+        routed_text.contains(&format!("escalates: {qname}")),
+        "{routed}"
+    );
+    // Not escalated yet: nothing for the operator.
+    assert!(!f.needs_me().iter().any(|r| r["kind"] == "question"));
+
+    // The master cannot answer it — it escalates with a summary.
+    let esc = f.file(
+        "esc.md",
+        &format!(
+            "---\nescalates: {qname}\n---\nPricing call: ship now or wait for legal. \
+             I recommend waiting.\n"
+        ),
+    );
+    let (ok, filed) = f.as_master(
+        &mut m,
+        &format!("report file --task D-1 --kind escalate --file {esc}"),
+    );
+    assert!(ok, "{filed}");
+    let needs = f.needs_me();
+    let row = needs
+        .iter()
+        .find(|r| r["kind"] == "question")
+        .unwrap_or_else(|| panic!("no question row: {needs:#?}"));
+    assert_eq!(row["audience"], "operator", "{row}");
+    assert_eq!(row["escalated_by"], "master", "{row}");
+    assert!(
+        row["summary"]
+            .as_str()
+            .unwrap()
+            .contains("I recommend waiting"),
+        "{row}"
+    );
+    assert_eq!(row["question"]["report"], qname.as_str(), "{row}");
+    // Routed once: no second message for the same question.
+    thread::sleep(Duration::from_millis(600));
+    f.d.rpc("reports_changed", json!({})).unwrap();
+    thread::sleep(Duration::from_millis(600));
+    let questions = f
+        .messages_of("master")
+        .iter()
+        .filter(|msg| msg["source"] == "report")
+        .count();
+    assert_eq!(questions, 1);
+
+    // The operator answers: it leaves Needs-you.
+    let answer = f.file("a.md", &format!("---\nanswers: {qname}\n---\nWait.\n"));
+    let (ok, out) = f.cli(&[
+        "report", "file", "--task", "D-1", "--kind", "answer", "--file", &answer,
+    ]);
+    assert!(ok, "{out}");
+    assert!(!f.needs_me().iter().any(|r| r["kind"] == "question"));
 }

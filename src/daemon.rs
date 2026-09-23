@@ -504,6 +504,8 @@ pub struct Shared {
     auto_stop: AutoStopTimer,
     /// CAD-339: a report was filed — the report router scans at once.
     reports_dirty: AtomicBool,
+    /// CAD-339: whether the report router runs at all.
+    report_router: bool,
 }
 
 impl Shared {
@@ -566,6 +568,7 @@ impl Shared {
             slot_clock,
             agent_gc: AgentGcTimer::new(opts.agent_gc.clone()),
             reports_dirty: AtomicBool::new(false),
+            report_router: opts.report_router.unwrap_or(true),
             auto_stop: AutoStopTimer::new(opts.auto_stop.clone(), opts.auto_stop_clock.clone()),
         });
         // Holds dropped by boot-time revalidation get their release
@@ -8348,6 +8351,9 @@ pub struct ServeOptions {
     /// The auto-stop clock (epoch seconds) — `None` is the wall clock;
     /// tests inject one they advance instead of sleeping.
     pub auto_stop_clock: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
+    /// CAD-339 report router: `None` (production) runs it; `Some(false)`
+    /// keeps a test daemon hermetic — no tracker scan.
+    pub report_router: Option<bool>,
 }
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
