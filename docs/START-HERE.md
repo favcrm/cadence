@@ -16,6 +16,7 @@ verified delivery with routine coordination handled by the system.
 | What are we building, and what is outside scope? | [Charter](CHARTER.md) — goal, principles, non-goals and roadmap. Its autonomy labels are planning context; verify current capability evidence below. |
 | How is it built? | [Architecture and code map](ARCHITECTURE.md) — boundaries, durable stores, adapters and file ownership. |
 | What experience are we aiming for? | [Development-team design proposal](design/DEVELOPMENT-TEAM.md) — feedback, memory, project context and staged acceptance. Proposed behavior is labelled. |
+| Where is the plan for onboarding, the master agent and the autonomous team? | [Design plan](../design-plans/20260923-onboarding-master-agent/README.md) (Markdown: plan, roadmap, research, technical, direction, decision ledger), plus the proposed records [agent filesystem](design/AGENT-FILESYSTEM.md) and [learning loop](design/LEARNING-LOOP.md). |
 | How do roles deliver work? | [Team](TEAM.md), [session workflow](SESSION.md), [role briefings](roles/pm.md). Historical aliases/model assignments are not live registry evidence. |
 | What are the task/message contracts? | [Jobs](JOBS.md), [protocol](PROTOCOL.md), [steering ADR](adr/0002-steering-contract.md). |
 | Where are projects, issues and memories? | [Board and tracker](BOARD.md), [workspaces](WORKSPACES.md), [worktree-policy ADR](adr/0003-worktree-policy.md). |
