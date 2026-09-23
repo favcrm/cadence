@@ -53,6 +53,33 @@ with open(out + ".tmp", "w") as f:
 os.rename(out + ".tmp", out)
 "#;
 
+/// [`TestDaemon::operator_cadence`]'s runner: off the test process's
+/// ancestry like `OPERATOR_RPC_PY`, it runs the cadence CLI and lands
+/// `{rc, stdout, stderr}` atomically.
+const OPERATOR_CLI_PY: &str = r#"
+import json, os, subprocess, sys, time
+
+out, runner = sys.argv[1:3]
+argv = sys.argv[3:]
+
+def on_lineage(pid):
+    p = os.getpid()
+    while p > 1:
+        if p == pid:
+            return True
+        with open("/proc/%d/status" % p) as f:
+            p = int([l for l in f if l.startswith("PPid:")][0].split()[1])
+    return False
+
+while on_lineage(int(runner)):
+    time.sleep(0.02)
+r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True)
+with open(out + ".tmp", "w") as f:
+    json.dump({"rc": r.returncode, "stdout": r.stdout.decode(errors="replace"),
+               "stderr": r.stderr.decode(errors="replace")}, f)
+os.rename(out + ".tmp", out)
+"#;
+
 struct TestDaemon {
     dir: TempDir,
     state: PathBuf,
@@ -217,6 +244,54 @@ impl TestDaemon {
         }
         let frame: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         cadence_agent::proto::unwrap(frame)
+    }
+
+    /// `cadence --state-dir <state> <args>` run the way
+    /// [`Self::operator_rpc`] calls: as an operator shell outside every
+    /// pane, however the suite is run. Answers `(success, stdout,
+    /// stderr)`.
+    fn operator_cadence(&self, args: &[&str]) -> (bool, String, String) {
+        let script = self.dir.path().join("operator-cli.py");
+        if !script.exists() {
+            std::fs::write(&script, OPERATOR_CLI_PY).unwrap();
+        }
+        let out = self.dir.path().join(format!(
+            "operator-cli-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let status = std::process::Command::new("setsid")
+            .arg("-f")
+            .arg("python3")
+            .arg(&script)
+            .arg(&out)
+            .arg(std::process::id().to_string())
+            .arg(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&self.state)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self.dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "setsid -f failed: {status}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !out.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "operator cadence {args:?} never finished"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        (
+            v["rc"] == 0,
+            v["stdout"].as_str().unwrap_or_default().to_string(),
+            v["stderr"].as_str().unwrap_or_default().to_string(),
+        )
     }
 
     fn register(&self, alias: &str) {
@@ -4082,7 +4157,7 @@ fn codex_approval_policy_rejected_at_register_and_next_launch() {
     // `agent set --next-launch`: the same vocabulary is enforced, the
     // same error lists all four.
     let err = d
-        .rpc(
+        .operator_rpc(
             "agent_set",
             json!({"alias": "w1", "next_launch": true,
                    "patch": {"approval_policy": "bogus"}}),
@@ -4097,7 +4172,7 @@ fn codex_approval_policy_rejected_at_register_and_next_launch() {
     }
     // A valid next-launch value is stored and reaches the wire on the
     // next open — resume replays it verbatim.
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "w1", "next_launch": true,
                "patch": {"approval_policy": "untrusted"}}),
@@ -6421,14 +6496,14 @@ fn devin_permission_mode_validated_at_register_and_not_settable() {
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
     let err = d
-        .rpc(
+        .operator_rpc(
             "agent_set",
             json!({"alias": "dv1", "patch": {"permission_mode": "smart"}}),
         )
         .unwrap_err();
     assert!(err.to_string().contains("not live-settable"), "{err}");
     // auto_ready stays the one live-settable key — the patch still works.
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "dv1", "patch": {"auto_ready": "verified"}}),
     )
@@ -7122,12 +7197,14 @@ fn agent_remove_and_gc_sweep() {
     d.wait_agent("w-recent", "idle", 10);
 
     // Refused while the endpoint is live — suggests agent stop.
-    let err = d.rpc("agent_remove", json!({"alias": "dv1"})).unwrap_err();
+    let err = d
+        .operator_rpc("agent_remove", json!({"alias": "dv1"}))
+        .unwrap_err();
     assert!(err.to_string().contains("agent stop"), "{err}");
 
     // Fake agents have no endpoint but are actor-owned while running.
     let err = d
-        .rpc("agent_remove", json!({"alias": "w-old"}))
+        .operator_rpc("agent_remove", json!({"alias": "w-old"}))
         .unwrap_err();
     assert!(err.to_string().contains("agent stop"), "{err}");
 
@@ -7157,14 +7234,17 @@ fn agent_remove_and_gc_sweep() {
     assert_eq!(live["resumable"], false, "{live}");
 
     // Explicit remove drops the row and its history.
-    d.rpc("agent_remove", json!({"alias": "w-old"})).unwrap();
+    d.operator_rpc("agent_remove", json!({"alias": "w-old"}))
+        .unwrap();
     assert!(d.rpc("agent_show", json!({"alias": "w-old"})).is_err());
 
     // gc --older-than filters by `updated` age: both were just stopped.
-    let swept = d.rpc("agent_gc", json!({"older_than": 3600.0})).unwrap();
+    let swept = d
+        .operator_rpc("agent_gc", json!({"older_than": 3600.0}))
+        .unwrap();
     assert_eq!(swept["removed"].as_array().unwrap().len(), 0);
     // Default sweep removes every dead stopped/attention agent.
-    let swept = d.rpc("agent_gc", json!({})).unwrap();
+    let swept = d.operator_rpc("agent_gc", json!({})).unwrap();
     let removed: Vec<&str> = swept["removed"]
         .as_array()
         .unwrap()
@@ -7205,7 +7285,7 @@ fn agent_remove_refuses_queued_message_and_force_overrides() {
     assert_eq!(d.message_state("w1", "m-queued"), "queued");
 
     let err = d
-        .rpc("agent_remove", json!({"alias": "w1"}))
+        .operator_rpc("agent_remove", json!({"alias": "w1"}))
         .unwrap_err()
         .to_string();
     assert!(
@@ -7215,7 +7295,7 @@ fn agent_remove_refuses_queued_message_and_force_overrides() {
     assert_eq!(d.message_state("w1", "m-queued"), "queued");
     assert!(forced_removals(&d).is_empty());
 
-    d.rpc("agent_remove", json!({"alias": "w1", "force": true}))
+    d.operator_rpc("agent_remove", json!({"alias": "w1", "force": true}))
         .unwrap();
     assert!(d.rpc("agent_show", json!({"alias": "w1"})).is_err());
     let forced = forced_removals(&d);
@@ -7246,17 +7326,12 @@ fn agent_remove_refuses_non_terminal_task_and_cli_force_overrides() {
     d.wait_agent("w1", "stopped", 15);
 
     let remove = |extra: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-            .arg("--state-dir")
-            .arg(&d.state)
-            .args(["agent", "remove", "w1"])
-            .args(extra)
-            .output()
-            .unwrap()
+        let mut args = vec!["agent", "remove", "w1"];
+        args.extend_from_slice(extra);
+        d.operator_cadence(&args)
     };
-    let out = remove(&[]);
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "removal with an open task succeeded");
+    let (ok, _, err) = remove(&[]);
+    assert!(!ok, "removal with an open task succeeded");
     assert!(
         err.contains("task j1-fix (draft)") && err.contains("--force"),
         "{err}"
@@ -7264,12 +7339,8 @@ fn agent_remove_refuses_non_terminal_task_and_cli_force_overrides() {
     d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     assert!(forced_removals(&d).is_empty());
 
-    let out = remove(&["--force"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let (ok, _, err) = remove(&["--force"]);
+    assert!(ok, "{err}");
     assert!(d.rpc("agent_show", json!({"alias": "w1"})).is_err());
     let forced = forced_removals(&d);
     assert_eq!(forced.len(), 1, "{forced:?}");
@@ -7330,7 +7401,8 @@ fn agent_remove_keeps_job_history() {
     for alias in ["w1", "qa"] {
         d.rpc("agent_stop", json!({"alias": alias})).unwrap();
         d.wait_agent(alias, "stopped", 15);
-        d.rpc("agent_remove", json!({"alias": alias})).unwrap();
+        d.operator_rpc("agent_remove", json!({"alias": alias}))
+            .unwrap();
     }
 
     let task = d.rpc("job_show", json!({"job": "j1"})).unwrap()["job"]["tasks"]
@@ -7365,8 +7437,10 @@ fn agent_remove_keeps_job_history() {
         );
     }
 
-    // Re-join under the same aliases: the kept rows resolve, the
-    // unreferenced chat is gone, nothing is redelivered.
+    // Re-join under the same aliases: the kept rows still resolve by
+    // id, the unreferenced chat is gone, nothing is redelivered — and
+    // the new agents do not list the old agents' rows as their own
+    // (CAD-304 S4).
     d.register_member("w1", "pm");
     d.register("qa");
     d.wait_agent("w1", "idle", 10);
@@ -7384,11 +7458,26 @@ fn agent_remove_keeps_job_history() {
             })
             .collect()
     };
-    assert_eq!(messages("w1"), vec![(kickoff.clone(), "completed".into())]);
-    assert_eq!(
-        messages("qa"),
-        vec![("qa-report".into(), "completed".into())]
-    );
+    assert_eq!(messages("w1"), vec![]);
+    assert_eq!(messages("qa"), vec![]);
+    let task = d.rpc("job_show", json!({"job": "j1"})).unwrap()["job"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "j1-fix")
+        .unwrap()
+        .clone();
+    assert_eq!(task["kickoff"]["id"], kickoff.as_str(), "{task}");
+    assert_eq!(task["kickoff"]["state"], "completed", "{task}");
+    assert_eq!(task["latest_verdict"]["message"], "qa-report", "{task}");
+    // The new w1's own traffic is listed as usual.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "fresh", "message": "fresh-1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "fresh-1", &["completed"], 15);
+    assert_eq!(messages("w1"), vec![("fresh-1".into(), "completed".into())]);
 }
 
 /// CAD-284 train finding with CAD-250: a job kickoff whose pty turn
@@ -7417,7 +7506,7 @@ fn agent_remove_force_refuses_unknown_kickoff_and_rejoin_is_unfenced() {
         .unwrap()
         .to_string();
     pty_token(&d, "w1", &kickoff);
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "w1", "patch": {"report_timeout_secs": "1"}}),
     )
@@ -7426,7 +7515,7 @@ fn agent_remove_force_refuses_unknown_kickoff_and_rejoin_is_unfenced() {
     d.wait_agent("w1", "attention", 20);
 
     let err = d
-        .rpc("agent_remove", json!({"alias": "w1"}))
+        .operator_rpc("agent_remove", json!({"alias": "w1"}))
         .unwrap_err()
         .to_string();
     assert!(
@@ -7434,7 +7523,7 @@ fn agent_remove_force_refuses_unknown_kickoff_and_rejoin_is_unfenced() {
         "{err}"
     );
     let err = d
-        .rpc("agent_remove", json!({"alias": "w1", "force": true}))
+        .operator_rpc("agent_remove", json!({"alias": "w1", "force": true}))
         .unwrap_err()
         .to_string();
     assert!(
@@ -7450,7 +7539,7 @@ fn agent_remove_force_refuses_unknown_kickoff_and_rejoin_is_unfenced() {
     )
     .unwrap();
     // The task is still open, so removal still needs --force.
-    d.rpc("agent_remove", json!({"alias": "w1", "force": true}))
+    d.operator_rpc("agent_remove", json!({"alias": "w1", "force": true}))
         .unwrap();
     let forced = forced_removals(&d);
     assert_eq!(forced.len(), 1, "{forced:?}");
@@ -9007,7 +9096,8 @@ fn inbox_lifecycle_guards() {
         assert!(err.contains("inbox"), "{method}: {err}");
     }
     // Removal works directly — a mailbox is never "live".
-    d.rpc("agent_remove", json!({"alias": "obs"})).unwrap();
+    d.operator_rpc("agent_remove", json!({"alias": "obs"}))
+        .unwrap();
     assert!(d.rpc("agent_show", json!({"alias": "obs"})).is_err());
 }
 
@@ -9493,12 +9583,12 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
     // remove` — even `--force` — refuses and leaves the pane alone;
     // once reconciled, remove drops the row and kills the pane.
     let err = d
-        .rpc("agent_remove", json!({"alias": "dv-rm"}))
+        .operator_rpc("agent_remove", json!({"alias": "dv-rm"}))
         .unwrap_err()
         .to_string();
     assert!(err.contains("message m-dv-rm (unknown)"), "{err}");
     let err = d
-        .rpc("agent_remove", json!({"alias": "dv-rm", "force": true}))
+        .operator_rpc("agent_remove", json!({"alias": "dv-rm", "force": true}))
         .unwrap_err()
         .to_string();
     assert!(err.contains("message reconcile m-dv-rm"), "{err}");
@@ -9508,12 +9598,13 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
         json!({"message": "m-dv-rm", "status": "interrupted"}),
     )
     .unwrap();
-    d.rpc("agent_remove", json!({"alias": "dv-rm"})).unwrap();
+    d.operator_rpc("agent_remove", json!({"alias": "dv-rm"}))
+        .unwrap();
     wait_pid_gone(&d.pane_file(&mock, "dv-rm", "pid"), 10);
     assert!(d.rpc("agent_show", json!({"alias": "dv-rm"})).is_err());
     // `agent gc` never forces: it skips the fenced agent until its
     // unknown is reconciled, then kills the pane with the row.
-    let swept = d.rpc("agent_gc", json!({})).unwrap();
+    let swept = d.operator_rpc("agent_gc", json!({})).unwrap();
     assert!(
         !swept["removed"]
             .as_array()
@@ -9527,7 +9618,7 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
         json!({"message": "m-dv-gc", "status": "interrupted"}),
     )
     .unwrap();
-    let swept = d.rpc("agent_gc", json!({})).unwrap();
+    let swept = d.operator_rpc("agent_gc", json!({})).unwrap();
     assert!(
         swept["removed"]
             .as_array()
@@ -9924,14 +10015,14 @@ fn agent_set_rejects_non_allowlisted_params() {
     d.wait_agent("fk", "idle", 10);
     // Wiring keys are not live-settable.
     let e = d
-        .rpc(
+        .operator_rpc(
             "agent_set",
             json!({"alias": "dv", "patch": {"upstream": "x"}}),
         )
         .unwrap_err();
     assert!(e.to_string().contains("auto_ready"), "{e}");
     let e = d
-        .rpc(
+        .operator_rpc(
             "agent_set",
             json!({"alias": "dv", "patch": {"session": "other"}}),
         )
@@ -9939,7 +10030,7 @@ fn agent_set_rejects_non_allowlisted_params() {
     assert!(e.to_string().contains("auto_ready"), "{e}");
     // Only "verified" (or removal) is a valid value.
     let e = d
-        .rpc(
+        .operator_rpc(
             "agent_set",
             json!({"alias": "dv", "patch": {"auto_ready": "bogus"}}),
         )
@@ -9947,14 +10038,14 @@ fn agent_set_rejects_non_allowlisted_params() {
     assert!(e.to_string().contains("verified"), "{e}");
     // auto_ready only exists on pty endpoints.
     let e = d
-        .rpc(
+        .operator_rpc(
             "agent_set",
             json!({"alias": "fk", "patch": {"auto_ready": "verified"}}),
         )
         .unwrap_err();
     assert!(e.to_string().contains("pty"), "{e}");
     // The allowed operations still work on a live pty agent.
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "dv", "patch": {"auto_ready": "verified"}}),
     )
@@ -9963,7 +10054,7 @@ fn agent_set_rejects_non_allowlisted_params() {
         d.rpc("agent_show", json!({"alias": "dv"})).unwrap()["agent"]["params"]["auto_ready"],
         "verified"
     );
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "dv", "patch": {"auto_ready": null}}),
     )
@@ -10106,7 +10197,7 @@ fn agent_set_opts_live_agent_into_auto_ready() {
     d.wait_event("dv", "gate_wait", 20);
     assert_eq!(d.message_state("dv", "m1"), "queued");
     // Retrofit via agent_set — the running actor reads params per send.
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "dv", "patch": {"auto_ready": "verified"}}),
     )
@@ -10998,7 +11089,7 @@ fn claude_effort_next_launch_and_model_reported() {
 
     // Without --next-launch the live-set refusal is unchanged.
     let err = d
-        .rpc(
+        .operator_rpc(
             "agent_set",
             json!({"alias": "w1", "patch": {"model": "opus"}}),
         )
@@ -11006,25 +11097,16 @@ fn claude_effort_next_launch_and_model_reported() {
     assert!(err.to_string().contains("not live-settable"), "{err}");
     // With it (through the CLI): stored, the live process untouched.
     let pid = agent["pid"].clone();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
-        .arg("--state-dir")
-        .arg(&d.state)
-        .args([
-            "agent",
-            "set",
-            "w1",
-            "model=opus",
-            "effort=high",
-            "--next-launch",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let (ok, stdout, stderr) = d.operator_cadence(&[
+        "agent",
+        "set",
+        "w1",
+        "model=opus",
+        "effort=high",
+        "--next-launch",
+    ]);
+    assert!(ok, "{stderr}");
+    let reply: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(reply["applies"], "next launch", "{reply}");
     let agent = d.rpc("agent_show", json!({"alias": "w1"})).unwrap()["agent"].clone();
     assert_eq!(agent["pid"], pid, "live process must not change: {agent}");
@@ -11050,7 +11132,7 @@ fn claude_effort_next_launch_and_model_reported() {
     assert!(argv2.contains("--effort\nhigh"), "{argv2}");
 
     // A bare key clears back to the provider default for the next open.
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "w1", "patch": {"model": null}, "next_launch": true}),
     )
@@ -11101,7 +11183,7 @@ fn claude_effort_validated() {
         (json!({"model": ""}), "non-empty"),
     ] {
         let err = d
-            .rpc(
+            .operator_rpc(
                 "agent_set",
                 json!({"alias": "w1", "patch": patch, "next_launch": true}),
             )
@@ -14015,7 +14097,7 @@ fn pty_cursor_minted_session_persists_and_model_replays() {
         sid,
         "{show}"
     );
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "cu", "patch": {"model": "grok-two"},
                "next_launch": true}),
@@ -16562,7 +16644,7 @@ fn stall_secs_zero_disables_and_live_set_rearms() {
 
     // Live-set to a real budget — silence already past it fires on the
     // next tick; the string form proves `agent set` parsing.
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "w1", "patch": {"stall_secs": "3"}}),
     )
@@ -16977,7 +17059,7 @@ fn pty_unreported_turn_holds_queue_and_bounds_to_unknown() {
     assert_eq!(running_ids(&d), ["acc2"]);
 
     // The bound, lowered live: acc2 goes `unknown`, never completed.
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "w1", "patch": {"report_timeout_secs": "1"}}),
     )
@@ -20926,7 +21008,8 @@ fn status_rows_probe_once_and_footer() {
     assert!(table.contains("busy:"), "{table}");
     assert!(table.contains("unread: pm"), "{table}");
     // --group scopes to the root + its upstream members.
-    d.rpc("agent_set", json!({"alias": "w1", "patch": {}})).ok();
+    d.operator_rpc("agent_set", json!({"alias": "w1", "patch": {}}))
+        .ok();
 }
 
 /// --group filters to the named root plus agents naming it upstream.
@@ -29516,6 +29599,387 @@ impl Drop for LaneShell {
     }
 }
 
+/// CAD-149 / CAD-304 S3 fleet: `pm` and `pm2` are group roots, `w1` a
+/// worker in pm's group — each a planted pane whose [`LaneShell`]
+/// commands derive that agent from `/proc` ancestry. The rows stay
+/// inert like [`plant_pane`]'s; `w1` is planted as a claude pty so its
+/// own `--next-launch model/effort` validates.
+struct GuardPanes {
+    pm: LaneShell,
+    pm2: LaneShell,
+    w1: LaneShell,
+    _home: TempDir,
+}
+
+fn plant_member_pane(
+    d: &TestDaemon,
+    alias: &str,
+    provider: &str,
+    upstream: Option<&str>,
+    pid: u32,
+) {
+    let mut req = json!({"alias": alias, "provider": "inbox",
+                         "endpoint_kind": "inbox",
+                         "cwd": d.dir.path().to_str().unwrap()});
+    if let Some(pm) = upstream {
+        req["params"] = json!(json!({"upstream": pm}).to_string());
+    }
+    d.rpc("agent_register", req).unwrap();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET provider=?1, endpoint_kind='pty', pid=?2, enabled=0, \
+            generation='planted', session_id='planted' WHERE alias=?3",
+        rusqlite::params![provider, pid as i64, alias],
+    )
+    .unwrap();
+}
+
+fn guard_panes(d: &TestDaemon) -> GuardPanes {
+    let home = TempDir::new().unwrap();
+    let pm = LaneShell::spawn(home.path());
+    let pm2 = LaneShell::spawn(home.path());
+    let w1 = LaneShell::spawn(home.path());
+    plant_member_pane(d, "pm", "inbox", None, pm.pid());
+    plant_member_pane(d, "pm2", "inbox", None, pm2.pid());
+    plant_member_pane(d, "w1", "claude", Some("pm"), w1.pid());
+    GuardPanes {
+        pm,
+        pm2,
+        w1,
+        _home: home,
+    }
+}
+
+/// One raw RPC from a process tied to no pane that is not provably the
+/// operator either: its own environment carries an agent's alias (a
+/// detached pane process that kept its env looks like this).
+fn unprovable_rpc(d: &TestDaemon, method: &str, params: Value) -> Value {
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import socket,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);\
+             s.sendall(sys.argv[2].encode()+b'\\n');print(s.makefile().readline())",
+        )
+        .arg(client::socket_path(&d.state))
+        .arg(cadence_agent::proto::request(method, params).to_string())
+        .env("CADENCE_ALIAS", "detached-w1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn frame_err(frame: &Value) -> String {
+    frame["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `params_updated` events on `alias`'s stream that carry a caller.
+fn audited_param_updates(d: &TestDaemon, alias: &str) -> Vec<Value> {
+    d.rpc("agent_events", json!({"alias": alias, "after": 0}))
+        .unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "params_updated" && !e["payload"]["by"].is_null())
+        .map(|e| e["payload"].clone())
+        .collect()
+}
+
+/// CAD-149: who may change which `--next-launch` key, per caller kind,
+/// with the caller derived from the connection — never claimed.
+#[test]
+fn agent_set_caller_rule_per_caller_kind() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("ok");
+    let mut p = guard_panes(&d);
+    d.rpc(
+        "agent_register",
+        json!({"alias": "w2", "provider": "codex", "endpoint_kind": "managed",
+               "cwd": d.dir.path().to_str().unwrap(),
+               "params": json!({"upstream": "pm",
+                                "approval_policy": "on-request"}).to_string()}),
+    )
+    .unwrap();
+    d.wait_agent("w2", "idle", 15);
+    let set = |policy: &str| {
+        json!({"alias": "w2", "next_launch": true,
+               "patch": {"approval_policy": policy}})
+    };
+    let param = |alias: &str, key: &str| {
+        d.rpc("agent_show", json!({"alias": alias})).unwrap()["agent"]["params"][key].clone()
+    };
+
+    // A peer worker's pane: trust-bearing and self-service keys alike.
+    let r = p.w1.rpc(&d.state, "agent_set", set("never"));
+    let e = frame_err(&r);
+    assert!(
+        e.contains("agent 'w1' cannot change another agent") && e.contains("its PM 'pm'"),
+        "{r}"
+    );
+    let r = p.w1.rpc(
+        &d.state,
+        "agent_set",
+        json!({"alias": "w2", "next_launch": true, "patch": {"model": "gpt-x"}}),
+    );
+    assert!(frame_err(&r).contains("cannot change another agent"), "{r}");
+    // Another group's PM.
+    let r = p.pm2.rpc(&d.state, "agent_set", set("never"));
+    assert!(
+        frame_err(&r).contains("agent 'pm2' cannot change another agent"),
+        "{r}"
+    );
+    // Tied to no pane and not provably the operator.
+    let r = unprovable_rpc(&d, "agent_set", set("never"));
+    assert!(frame_err(&r).contains("not provably the operator"), "{r}");
+    // A claimed identity never changes who is asking: identity-shaped
+    // request fields are refused, and an exported CADENCE_ALIAS of the
+    // PM leaves the CLI caller the pane it runs in.
+    for field in ["by", "pane", "as", "reviewer"] {
+        let mut forged = set("never");
+        forged[field] = json!("operator");
+        let r = p.w1.rpc(&d.state, "agent_set", forged);
+        assert!(
+            frame_err(&r).contains(&format!("'{field}' is not accepted")),
+            "{r}"
+        );
+    }
+    let (rc, out) = p.w1.run(&format!(
+        "CADENCE_ALIAS=pm {} --state-dir {} agent set w2 approval_policy=never --next-launch",
+        env!("CARGO_BIN_EXE_cadence"),
+        d.state.display()
+    ));
+    assert_ne!(rc, 0, "{out}");
+    assert!(
+        out.contains("agent 'w1' cannot change another agent"),
+        "{out}"
+    );
+    assert_eq!(param("w2", "approval_policy"), "on-request");
+    assert!(audited_param_updates(&d, "w2").is_empty());
+
+    // The worker on itself: model/effort only.
+    let r = p.w1.rpc(
+        &d.state,
+        "agent_set",
+        json!({"alias": "w1", "next_launch": true,
+               "patch": {"model": "opus", "effort": "high"}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(param("w1", "model"), "opus");
+    for patch in [
+        json!({"approval_policy": "never"}),
+        // A mixed patch is judged by its most sensitive key — and
+        // applies nothing.
+        json!({"model": "sonnet", "approval_policy": "never"}),
+    ] {
+        let r = p.w1.rpc(
+            &d.state,
+            "agent_set",
+            json!({"alias": "w1", "next_launch": true, "patch": patch}),
+        );
+        assert!(
+            frame_err(&r).contains("agent 'w1' cannot make this change to itself"),
+            "{r}"
+        );
+    }
+    assert_eq!(param("w1", "model"), "opus");
+    // Posture (a live key) is not self-service either.
+    let r = p.w1.rpc(
+        &d.state,
+        "agent_set",
+        json!({"alias": "w1", "patch": {"auto_stop": "off"}}),
+    );
+    assert!(
+        frame_err(&r).contains("cannot make this change to itself"),
+        "{r}"
+    );
+    // A PM is not its own PM.
+    let r = p.pm.rpc(
+        &d.state,
+        "agent_set",
+        json!({"alias": "pm", "next_launch": true,
+               "patch": {"approval_policy": "never"}}),
+    );
+    assert!(
+        frame_err(&r).contains("agent 'pm' cannot make this change to itself"),
+        "{r}"
+    );
+
+    // The target's own PM, then the operator: accepted and recorded
+    // with the derived caller and each key's old and new value.
+    let r = p.pm.rpc(&d.state, "agent_set", set("never"));
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(param("w2", "approval_policy"), "never");
+    d.operator_rpc("agent_set", set("untrusted")).unwrap();
+    assert_eq!(param("w2", "approval_policy"), "untrusted");
+    let updates = audited_param_updates(&d, "w2");
+    assert_eq!(updates.len(), 2, "{updates:?}");
+    assert_eq!(updates[0]["by"], "pm", "{updates:?}");
+    assert_eq!(updates[0]["by_kind"], "agent", "{updates:?}");
+    assert_eq!(updates[0]["target"], "w2", "{updates:?}");
+    assert_eq!(updates[0]["next_launch"], true, "{updates:?}");
+    assert_eq!(
+        updates[0]["changes"],
+        json!([{"key": "approval_policy", "old": "on-request", "new": "never"}])
+    );
+    assert_eq!(updates[1]["by"], "operator", "{updates:?}");
+    assert_eq!(updates[1]["by_kind"], "operator", "{updates:?}");
+    assert_eq!(
+        updates[1]["changes"],
+        json!([{"key": "approval_policy", "old": "never", "new": "untrusted"}])
+    );
+    let own = audited_param_updates(&d, "w1");
+    assert_eq!(own.len(), 1, "{own:?}");
+    assert_eq!(own[0]["by"], "w1", "{own:?}");
+}
+
+/// CAD-304 S3: `agent remove` (plain or `--force`) and `agent gc`
+/// delete history — the operator's or the target's own PM's call,
+/// never a peer's, another group's PM's or the agent's own.
+#[test]
+fn agent_remove_and_gc_caller_rule_per_caller_kind() {
+    let d = TestDaemon::start();
+    let mut p = guard_panes(&d);
+    for w in ["w3", "w4", "w5"] {
+        d.register_member(w, "pm");
+    }
+    d.register("w6");
+    for w in ["w3", "w4", "w5", "w6"] {
+        d.wait_agent(w, "idle", 10);
+        d.rpc("agent_stop", json!({"alias": w})).unwrap();
+        d.wait_agent(w, "stopped", 15);
+    }
+    let present = |alias: &str| d.rpc("agent_show", json!({"alias": alias})).is_ok();
+
+    for force in [false, true] {
+        let r = p.w1.rpc(
+            &d.state,
+            "agent_remove",
+            json!({"alias": "w3", "force": force}),
+        );
+        assert!(
+            frame_err(&r).contains("agent 'w1' cannot change another agent"),
+            "{r}"
+        );
+        let r = p.pm2.rpc(
+            &d.state,
+            "agent_remove",
+            json!({"alias": "w3", "force": force}),
+        );
+        assert!(
+            frame_err(&r).contains("agent 'pm2' cannot change another agent"),
+            "{r}"
+        );
+    }
+    let r = p.w1.rpc(&d.state, "agent_remove", json!({"alias": "w1"}));
+    assert!(
+        frame_err(&r).contains("agent 'w1' cannot make this change to itself"),
+        "{r}"
+    );
+    let r = unprovable_rpc(&d, "agent_remove", json!({"alias": "w3"}));
+    assert!(frame_err(&r).contains("not provably the operator"), "{r}");
+    let r =
+        p.w1.rpc(&d.state, "agent_remove", json!({"alias": "w3", "by": "pm"}));
+    assert!(frame_err(&r).contains("'by' is not accepted"), "{r}");
+    let (rc, out) = p.w1.run(&format!(
+        "CADENCE_ALIAS=pm {} --state-dir {} agent remove w3 --force",
+        env!("CARGO_BIN_EXE_cadence"),
+        d.state.display()
+    ));
+    assert_ne!(rc, 0, "{out}");
+    assert!(
+        out.contains("agent 'w1' cannot change another agent"),
+        "{out}"
+    );
+    // A sweep from a worker's pane removes nothing it is not PM of.
+    let r = p.w1.rpc(&d.state, "agent_gc", json!({}));
+    assert_eq!(r["result"]["removed"], json!([]), "{r}");
+    assert_eq!(
+        r["result"]["not_permitted"],
+        json!(["w3", "w4", "w5", "w6"]),
+        "{r}"
+    );
+    let r = unprovable_rpc(&d, "agent_gc", json!({}));
+    assert!(frame_err(&r).contains("not provably the operator"), "{r}");
+    for w in ["w1", "w3", "w4", "w5", "w6"] {
+        assert!(present(w), "{w} was removed by a refused caller");
+    }
+
+    // The target's own PM: removes its member, sweeps only its group.
+    let r = p.pm.rpc(&d.state, "agent_remove", json!({"alias": "w3"}));
+    assert_eq!(r["ok"], true, "{r}");
+    let r = p.pm.rpc(&d.state, "agent_gc", json!({}));
+    assert_eq!(r["result"]["removed"], json!(["w4", "w5"]), "{r}");
+    assert_eq!(r["result"]["not_permitted"], json!(["w6"]), "{r}");
+    // The operator: anything.
+    d.operator_rpc("agent_remove", json!({"alias": "w6"}))
+        .unwrap();
+    let removals: Vec<(String, String)> = d
+        .rpc("agent_events", json!({"alias": "daemon", "after": 0}))
+        .unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "agent_removed")
+        .map(|e| {
+            (
+                e["payload"]["alias"].as_str().unwrap().to_string(),
+                e["payload"]["by"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let want: Vec<(String, String)> =
+        [("w3", "pm"), ("w4", "pm"), ("w5", "pm"), ("w6", "operator")]
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+    assert_eq!(removals, want);
+}
+
+/// CAD-304 S2: a forced removal cancels queued work through the normal
+/// cancel path — the `reply_to` hears it, and the forced event names
+/// who was notified and by whom.
+#[test]
+fn agent_remove_force_notifies_reply_to() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.wait_agent("pm", "idle", 10);
+    d.wait_agent("w1", "idle", 10);
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "later", "message": "m-queued", "reply_to": "pm"}),
+    )
+    .unwrap();
+    d.operator_rpc("agent_remove", json!({"alias": "w1", "force": true}))
+        .unwrap();
+    let forced = forced_removals(&d);
+    assert_eq!(forced.len(), 1, "{forced:?}");
+    assert_eq!(
+        forced[0]["payload"]["notified"],
+        json!(["pm"]),
+        "{forced:?}"
+    );
+    assert_eq!(forced[0]["payload"]["by"], "operator", "{forced:?}");
+    let notice = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        b"cadence-notice:cancelled:m-queued",
+    )
+    .simple()
+    .to_string();
+    let m = d.wait_message("pm", &notice, &["completed", "queued", "running"], 15);
+    assert_eq!(m["source"], "worker_notice", "{m}");
+    assert!(
+        m["body"].as_str().unwrap_or_default().contains("m-queued"),
+        "{m}"
+    );
+}
+
 /// `slot_acquire` with the test process's pid — alive for the whole
 /// test, so the pid check never reaps a live waiter here. The lane
 /// param is ignored by the daemon (identity is the connection's);
@@ -32717,7 +33181,7 @@ fn model_defaults_register_resume_and_mock_argv() {
     let argv = std::fs::read_to_string(&argv_file).unwrap();
     assert!(argv.contains("--model\nbaseline-b"), "{argv}");
 
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "fresh", "next_launch": true, "patch": {"model": null}}),
     )
@@ -35234,27 +35698,27 @@ fn auto_stop_keeps_pm_inbox_opted_out_and_busy_agents() {
         d.wait_agent(alias, "idle", 20);
     }
     // Per-agent opt-out rides the ordinary `agent set` allowlist.
-    d.rpc(
+    d.operator_rpc(
         "agent_set",
         json!({"alias": "w-opt", "patch": {"auto_stop": "off"}}),
     )
     .unwrap();
     let err = d
-        .rpc(
+        .operator_rpc(
             "agent_set",
             json!({"alias": "w-opt", "patch": {"auto_stop": "on"}}),
         )
         .unwrap_err();
     assert!(err.to_string().contains("accepts \"off\""), "{err}");
     let err = d
-        .rpc(
+        .operator_rpc(
             "agent_set",
             json!({"alias": "w-opt", "patch": {"auto_stop_idle_secs": "1h"}}),
         )
         .unwrap_err();
     assert!(err.to_string().contains("non-negative integer"), "{err}");
     let err = d
-        .rpc(
+        .operator_rpc(
             "agent_set",
             json!({"alias": "box", "patch": {"auto_stop": "off"}}),
         )

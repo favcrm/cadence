@@ -341,6 +341,89 @@ pub(crate) fn operator_proof(
     Ok(())
 }
 
+/// Who is asking to change or delete an agent row — derived from the
+/// connection, never from a request field (CAD-149, CAD-304 S3). The
+/// daemon builds it from the peer's `/proc` ancestry (the nearest
+/// registered pane or enrolled managed endpoint IS that agent) and,
+/// deriving none, from [`operator_proof`]; anything else is refused
+/// before a caller exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentCaller {
+    /// Positive operator proof.
+    Operator,
+    /// A registered agent, by alias.
+    Agent(String),
+}
+
+impl AgentCaller {
+    /// `(by, by_kind)` for audit events.
+    pub(crate) fn audit(&self) -> (&str, &'static str) {
+        match self {
+            AgentCaller::Operator => ("operator", "operator"),
+            AgentCaller::Agent(alias) => (alias, "agent"),
+        }
+    }
+}
+
+/// What a mutation of an agent can do — the key class of the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentMutation {
+    /// Only self-service params (model, effort — see
+    /// `registry::ParamClass::SelfService`).
+    SelfService,
+    /// Anything else: trust-bearing or posture params, and removal
+    /// (which deletes the agent's history).
+    Controlled,
+}
+
+/// The one rule for "may `caller` mutate agent `target`" (CAD-149,
+/// shared with `agent remove`/`agent gc`, CAD-304 S3). `target_pm` is
+/// the target's own PM — its `params.upstream`.
+///
+/// - the operator may do anything;
+/// - the target's own PM may do anything to it (a PM is never its own
+///   PM, even if an upstream names itself);
+/// - the agent itself may make a self-service change only;
+/// - everyone else — a peer worker, the PM of another group — is
+///   refused.
+///
+/// `Err` is the refusal text, naming the rule.
+pub(crate) fn may_mutate_agent(
+    caller: &AgentCaller,
+    target: &str,
+    target_pm: Option<&str>,
+    mutation: AgentMutation,
+    verb: &str,
+) -> Result<(), String> {
+    let alias = match caller {
+        AgentCaller::Operator => return Ok(()),
+        AgentCaller::Agent(alias) => alias.as_str(),
+    };
+    if alias != target && target_pm == Some(alias) {
+        return Ok(());
+    }
+    let owner = match target_pm.filter(|pm| *pm != target) {
+        Some(pm) => format!("the operator or its PM '{pm}'"),
+        None => "the operator (it has no PM)".to_string(),
+    };
+    if alias == target {
+        return match mutation {
+            AgentMutation::SelfService => Ok(()),
+            AgentMutation::Controlled => Err(format!(
+                "{verb} refused: agent '{alias}' cannot make this change to itself — \
+                 an agent may set only its own model/effort; trust-bearing and \
+                 posture params and removal of '{target}' belong to {owner} \
+                 (caller rule, CAD-149)"
+            )),
+        };
+    }
+    Err(format!(
+        "{verb} refused: agent '{alias}' cannot change another agent — only \
+         '{target}' itself (model/effort) and {owner} may change '{target}' \
+         (caller rule, CAD-149)"
+    ))
+}
+
 /// Real and effective uid from `/proc/<pid>/status`.
 pub(crate) fn proc_uids(pid: u32) -> Result<(u32, u32), String> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
@@ -660,5 +743,44 @@ mod tests {
         let (_, own) = proc_uids(std::process::id()).unwrap();
         let (_, uid) = client_socket(port, peer).unwrap().unwrap();
         assert_eq!(uid, own);
+    }
+
+    /// CAD-149: the policy per caller kind and mutation class.
+    #[test]
+    fn may_mutate_agent_per_caller_kind() {
+        use AgentMutation::{Controlled, SelfService};
+        let op = AgentCaller::Operator;
+        let pm = AgentCaller::Agent("pm".into());
+        let pm2 = AgentCaller::Agent("pm2".into());
+        let w1 = AgentCaller::Agent("w1".into());
+        let w2 = AgentCaller::Agent("w2".into());
+        let may = |c: &AgentCaller, target: &str, target_pm: Option<&str>, m| {
+            may_mutate_agent(c, target, target_pm, m, "agent set")
+        };
+        for m in [SelfService, Controlled] {
+            // Operator: everything, PM or not.
+            assert!(may(&op, "w2", Some("pm"), m).is_ok());
+            assert!(may(&op, "root", None, m).is_ok());
+            // The target's own PM: everything.
+            assert!(may(&pm, "w2", Some("pm"), m).is_ok());
+            // A peer worker and another group's PM: nothing.
+            let e = may(&w1, "w2", Some("pm"), m).unwrap_err();
+            assert!(e.contains("cannot change another agent"), "{e}");
+            assert!(e.contains("its PM 'pm'"), "{e}");
+            assert!(may(&pm2, "w2", Some("pm"), m).is_err());
+            // A worker that happens to be named as nothing: refused.
+            assert!(may(&w2, "w1", None, m).is_err());
+        }
+        // Self: self-service only — trust/posture/removal refused, and
+        // the refusal names the rule.
+        assert!(may(&w1, "w1", Some("pm"), SelfService).is_ok());
+        let e = may(&w1, "w1", Some("pm"), Controlled).unwrap_err();
+        assert!(e.contains("cannot make this change to itself"), "{e}");
+        assert!(e.contains("caller rule"), "{e}");
+        // A PM on itself is not its own PM.
+        assert!(may(&pm, "pm", None, Controlled).is_err());
+        assert!(may(&pm, "pm", None, SelfService).is_ok());
+        // An upstream naming the target itself grants it nothing.
+        assert!(may(&w1, "w1", Some("w1"), Controlled).is_err());
     }
 }

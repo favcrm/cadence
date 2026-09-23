@@ -998,6 +998,79 @@ pub fn claude_effort(level: &str) -> Result<()> {
 /// next open, never pushed to the live process.
 const NEXT_LAUNCH_PARAMS: &[&str] = &["model", "effort", "approval_policy"];
 
+/// Who may change an agent param through `agent set` (CAD-149) — see
+/// [`param_class`]. Every key a spec lists in `launch_params` or
+/// `live_settable_params` is classified explicitly (a registry test
+/// holds that), so a new param forces the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamClass {
+    /// Which model runs and how hard it thinks — the agent itself may
+    /// change these; they grant nothing.
+    SelfService,
+    /// Widens what the agent may do unattended: approvals, permission
+    /// modes, tool allowlists, secrets, spend. Only the operator or the
+    /// agent's own PM.
+    TrustBearing,
+    /// Oversight, delivery and wiring (watchdogs, auto-stop, readiness,
+    /// routing). Not a grant, but a peer — or the agent on itself — must
+    /// not switch off what watches it: only the operator or its PM.
+    Posture,
+}
+
+/// The only params an agent may set on itself.
+pub const SELF_SERVICE_PARAMS: &[&str] = &["model", "effort"];
+
+/// Params that widen what an agent may do unattended — enumerated from
+/// every spec's `launch_params`.
+pub const TRUST_BEARING_PARAMS: &[&str] = &[
+    "approval_policy",
+    "sandbox",
+    "permission_mode",
+    "bypass",
+    "bypass_approval",
+    "allowed_tools",
+    "broker_approvals",
+    "permission_timeout_secs",
+    "secret_ids",
+    "max_acu_limit",
+    "repos",
+    "devin_mode",
+    "playbook_id",
+    "knowledge_ids",
+];
+
+/// Oversight, delivery and wiring params.
+pub const POSTURE_PARAMS: &[&str] = &[
+    "auto_ready",
+    "auto_stop",
+    "auto_stop_idle_secs",
+    "stall_secs",
+    "silent_end_secs",
+    "report_timeout_secs",
+    "turn_idle_secs",
+    "turn_max_secs",
+    "inbox_warn_unread",
+    "inbox_warn_idle_secs",
+    "session",
+    "upstream",
+    "agents_md",
+    "platform",
+    "tags",
+    "attachment_urls",
+];
+
+/// The class of one param key. A key no list names is trust-bearing —
+/// fail closed, never self-service by omission.
+pub fn param_class(key: &str) -> ParamClass {
+    if SELF_SERVICE_PARAMS.contains(&key) && !TRUST_BEARING_PARAMS.contains(&key) {
+        ParamClass::SelfService
+    } else if POSTURE_PARAMS.contains(&key) && !TRUST_BEARING_PARAMS.contains(&key) {
+        ParamClass::Posture
+    } else {
+        ParamClass::TrustBearing
+    }
+}
+
 /// Validate one `agent set --next-launch` key: `model`/`effort` only,
 /// and only where the endpoint launches with that param. A null value
 /// (bare key) clears it back to the provider default.
@@ -2025,5 +2098,41 @@ mod tests {
             };
             assert_eq!(s.turn_token, expected, "{}/{}", s.provider, s.endpoint_kind);
         }
+    }
+
+    /// CAD-149: every param any endpoint launches with or patches live
+    /// — and every `--next-launch` key — is classified by name in
+    /// exactly one list; nothing falls into the fail-closed default by
+    /// accident. Only model and effort are self-service.
+    #[test]
+    fn every_registry_param_is_classified_once() {
+        let lists = [SELF_SERVICE_PARAMS, TRUST_BEARING_PARAMS, POSTURE_PARAMS];
+        let keys = SPECS
+            .iter()
+            .flat_map(|s| s.launch_params.iter().chain(s.live_settable_params))
+            .chain(NEXT_LAUNCH_PARAMS);
+        for key in keys {
+            let named = lists.iter().filter(|l| l.contains(key)).count();
+            assert_eq!(named, 1, "'{key}' must be classified in exactly one list");
+        }
+        assert_eq!(SELF_SERVICE_PARAMS, &["model", "effort"]);
+        for key in [
+            "approval_policy",
+            "permission_mode",
+            "bypass",
+            "bypass_approval",
+            "allowed_tools",
+            "broker_approvals",
+            "secret_ids",
+        ] {
+            assert_eq!(param_class(key), ParamClass::TrustBearing, "{key}");
+        }
+        assert_eq!(param_class("model"), ParamClass::SelfService);
+        assert_eq!(param_class("effort"), ParamClass::SelfService);
+        assert_eq!(param_class("auto_ready"), ParamClass::Posture);
+        assert_eq!(param_class("stall_secs"), ParamClass::Posture);
+        assert_eq!(param_class("sandbox"), ParamClass::TrustBearing);
+        // Unknown keys fail closed.
+        assert_eq!(param_class("no_such_key"), ParamClass::TrustBearing);
     }
 }
