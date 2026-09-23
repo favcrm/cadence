@@ -635,6 +635,8 @@ pub fn validate_config(config: &mut ModelDefaults) -> Result<()> {
     Ok(())
 }
 
+/// `Some` is the daemon's verified caller, never a request field
+/// (CAD-337): its transport is the proven operator connection.
 pub fn normalize_attribution(raw: Option<&str>) -> Result<Attribution> {
     match raw {
         None => Ok(Attribution {
@@ -651,7 +653,7 @@ pub fn normalize_attribution(raw: Option<&str>) -> Result<Attribution> {
             }
             Ok(Attribution {
                 actor: actor.to_string(),
-                transport: "board",
+                transport: "operator-connection",
             })
         }
     }
