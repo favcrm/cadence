@@ -168,7 +168,7 @@ export default function Memory({
 
   return (
     <div className="px-4 lg:px-8 py-4 max-w-[1100px]">
-      <div className="flex items-center gap-2 mb-3">
+      <div className="flex flex-wrap items-center gap-2 mb-3">
         <span className="slabel">status</span>
         {STATUSES.map((s) => (
           <button

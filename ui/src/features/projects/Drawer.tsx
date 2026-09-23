@@ -712,13 +712,13 @@ export default function Drawer({
                     {detail.artifacts.map((f) => (
                       <li
                         key={f.name}
-                        className="flex items-center gap-3 px-3 py-2"
+                        className="flex items-center gap-3 px-3 py-2 min-w-0"
                       >
                         <a
                           href={api.artifactUrl(id, f.name)}
                           target="_blank"
                           rel="noreferrer"
-                          className="lnk num text-label"
+                          className="lnk num text-label min-w-0 break-all"
                         >
                           artifacts/{f.name}
                         </a>
@@ -726,11 +726,11 @@ export default function Drawer({
                           <img
                             src={api.artifactUrl(id, f.name)}
                             alt={f.name}
-                            className="h-8 w-8 object-cover rounded border border-ink-700"
+                            className="h-8 w-8 shrink-0 object-cover rounded border border-ink-700"
                             loading="lazy"
                           />
                         )}
-                        <span className="num text-micro text-ink-500 ml-auto">
+                        <span className="num text-micro text-ink-500 ml-auto shrink-0">
                           {fmtBytes(f.size)}
                         </span>
                       </li>
@@ -738,7 +738,7 @@ export default function Drawer({
                   </ul>
                 )}
                 {!readOnly && (
-                  <div className="flex gap-1.5 mt-2">
+                  <div className="flex flex-wrap gap-1.5 mt-2">
                     <select
                       value={refKind}
                       onChange={(e) => setRefKind(e.target.value)}
@@ -752,7 +752,7 @@ export default function Drawer({
                     <input
                       value={refTarget}
                       onChange={(e) => setRefTarget(e.target.value)}
-                      className="field !h-8 flex-1 num text-label"
+                      className="field !h-8 flex-1 min-w-0 basis-40 num text-label"
                       placeholder="https://… or path"
                     />
                     <input

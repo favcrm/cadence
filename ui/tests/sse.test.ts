@@ -1,5 +1,5 @@
 import { Resource } from "../src/lib/cache";
-import { streamInto, subscribeSse, withResume, type EventSourceLike } from "../src/lib/sse";
+import { isPermanent, streamInto, subscribeSse, withResume, type EventSourceLike, type SseErrorState } from "../src/lib/sse";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -11,6 +11,7 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 class FakeSource implements EventSourceLike {
   readyState = 0;
   onerror: ((e: Event) => void) | null = null;
+  onopen: ((e: Event) => void) | null = null;
   closed = false;
   private readonly listeners = new Map<string, ((e: MessageEvent<string>) => void)[]>();
   constructor(readonly url: string) {}
@@ -26,6 +27,10 @@ class FakeSource implements EventSourceLike {
       l({ data, lastEventId: id } as MessageEvent<string>);
     }
   }
+  opened(): void {
+    this.readyState = 1;
+    this.onopen?.({} as Event);
+  }
   fail(readyState: number): void {
     this.readyState = readyState;
     this.onerror?.({} as Event);
@@ -39,24 +44,38 @@ async function main() {
   equal(withResume("/api/threads/pm/stream", "7"), "/api/threads/pm/stream?after=7", "cursor added");
   equal(withResume("/x?after=3&y=1", "9"), "/x?after=9&y=1", "cursor replaced");
 
-  // Tracks ids, resumes a closed source with ?after=, ignores the old one.
+  // Tracks ids, resumes a closed source with ?after=, ignores the old one,
+  // backs off exponentially up to the cap and resets once a source opens.
   {
     const opened: FakeSource[] = [];
     const seen: string[] = [];
-    const closedFlags: boolean[] = [];
+    const states: SseErrorState[] = [];
+    const delays: number[] = [];
+    const due: (() => void)[] = [];
     const sub = subscribeSse({
       url: "/api/threads/pm/stream",
       events: ["entry"],
       lastEventId: "4",
-      retryMs: 0,
+      retryMs: 100,
+      maxRetryMs: 300,
       onEvent: (e) => seen.push(`${e.type}:${e.id}:${e.data}`),
-      onError: (closed) => closedFlags.push(closed),
+      onError: (state) => states.push(state),
+      probe: async () => 503,
+      schedule: (fn, ms) => {
+        delays.push(ms);
+        due.push(fn);
+        return () => {};
+      },
       open: (url) => {
         const s = new FakeSource(url);
         opened.push(s);
         return s;
       },
     });
+    const fire = async () => {
+      await flush();
+      due.shift()?.();
+    };
     equal(opened[0].url, "/api/threads/pm/stream?after=4", "first open resumes from the given id");
     opened[0].emit("entry", "a", "5");
     opened[0].emit("entry", "b");
@@ -66,21 +85,61 @@ async function main() {
     await flush();
     equal(opened.length, 1, "no manual reopen while the browser retries");
     opened[0].emit("entry", "c", "6");
-    // CLOSED: the helper reopens with the cursor.
+    // CLOSED: the helper reopens with the cursor, once.
     opened[0].fail(2);
     opened[0].fail(2);
-    await flush();
+    await fire();
     equal(opened.length, 2, "exactly one reopen after a close");
     equal(opened[1].url, "/api/threads/pm/stream?after=6", "reopen resumes after the last id");
     opened[0].emit("entry", "late", "99");
     equal(sub.lastEventId(), "6", "the dead source is ignored");
-    equal(seen, ["entry:5:a", "entry:null:b", "entry:6:c"], "frames delivered in order");
-    equal(closedFlags, [false, true], "error reports say whether it reopens");
-    sub.close();
-    equal(opened[1].closed, true, "close closes the live source");
     opened[1].fail(2);
+    await fire();
+    opened[2].fail(2);
+    await fire();
+    opened[3].fail(2);
+    await fire();
+    equal(delays, [100, 200, 300, 300], "exponential backoff with a cap");
+    opened[4].opened();
+    opened[4].fail(2);
+    await fire();
+    equal(delays[4], 100, "an open resets the backoff");
+    equal(seen, ["entry:5:a", "entry:null:b", "entry:6:c"], "frames delivered in order");
+    equal(states.slice(0, 2), ["reconnecting", "reopening"], "error states");
+    sub.close();
+    equal(opened[5].closed, true, "close closes the live source");
+    opened[5].fail(2);
     await flush();
-    equal(opened.length, 2, "no reopen after close");
+    equal(opened.length, 6, "no reopen after close");
+  }
+
+  // A permanent 4xx stops the subscription; timeouts and 5xx keep retrying.
+  {
+    const opened: FakeSource[] = [];
+    const states: SseErrorState[] = [];
+    subscribeSse({
+      url: "/api/threads/ghost/stream",
+      events: ["entry"],
+      onEvent: () => {},
+      onError: (state) => states.push(state),
+      probe: async () => 404,
+      schedule: (fn) => {
+        fn();
+        return () => {};
+      },
+      open: (url) => {
+        const s = new FakeSource(url);
+        opened.push(s);
+        return s;
+      },
+    });
+    opened[0].fail(2);
+    await flush();
+    await flush();
+    equal(states, ["stopped"], "404 stops");
+    equal(opened.length, 1, "no reopen after a permanent refusal");
+    equal(isPermanent(404) && isPermanent(410) && isPermanent(400), true, "4xx permanent");
+    equal(isPermanent(408) || isPermanent(429) || isPermanent(503) || isPermanent(null), false, "retryable");
   }
 
   // streamInto folds frames into a cache store.
