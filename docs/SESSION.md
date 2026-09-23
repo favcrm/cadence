@@ -299,6 +299,24 @@ cadence issue start CAD-60 --name short-slug --owner dev-a
 cadence send dev-a --text "read /var/www/agent-notes/<kickoff>.md — CAD-60: one line. Your worktree exists: .cadence/wt/cad-60-short-slug. PR to main, qa note to pm."
 ```
 
+**Claim before you start (CAD-383).** `dispatch` and `issue start`
+refuse a doing/review issue that another PM or lane holds, naming the
+holder and the claim age. A dispatch records you (`--reply-to`) as the
+claimant. When your lanes run outside cadence — Claude Code subagents,
+Codex, a human — nothing records the claim for you, so do it first and
+refresh it on long work:
+
+```bash
+cadence issue claim CAD-60 --note "claude subagent, branch fix/cad60-x"
+cadence issue release CAD-60 --note "handed back"      # when you stop
+cadence dispatch CAD-60 --to dev-b --note <kickoff> --take-over "pm-a's lane died 09:00; agreed in #ops"
+```
+
+Refused? Ask the holder first (`cadence issue show <ID>`, `cadence
+status` shows claims and their age). `--take-over "<reason>"` is for a
+stale or agreed hand-over; it is recorded on the issue. Backlog/ready
+issues with an owner only warn.
+
 The kickoff note carries everything; the message only points at it.
 Messages to terminal workers must be one line and must not start with
 `/`, `!` or `@`.

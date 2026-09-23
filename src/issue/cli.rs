@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::issue::{
-    board, doctor, finish, history, hooks, lint, model, project, retro, start, sync, write, Pm,
+    board, claim, doctor, finish, history, hooks, lint, model, project, retro, start, sync, write,
+    Pm,
 };
 
 #[derive(Subcommand)]
@@ -98,7 +99,7 @@ pub enum IssueAction {
     },
     /// `git log` for the issue folder, parsed: `sha`, `at`, `by`
     /// (the ` (actor)` suffix, else the commit author), `kind`
-    /// (`created|set|tag|link|unlink|ref|comment|attach|other`), `summary`
+    /// (`created|set|tag|link|unlink|ref|comment|attach|claim|release|other`), `summary`
     /// and a `fields` map for `set` entries. Read-only.
     Log {
         /// Issue id (CAD-16).
@@ -179,6 +180,47 @@ pub enum IssueAction {
         /// override is recorded as an issue comment.
         #[arg(long, requires = "assignee")]
         force: bool,
+        /// Who is asking (CAD-383) — the claim check's requester and the
+        /// claimant recorded when this start puts the issue into work
+        /// [default: --pm, else CADENCE_ALIAS, else operator].
+        #[arg(long)]
+        by: Option<String>,
+        /// Start an issue someone else holds in doing/review (CAD-383).
+        /// The reason is required; the take-over replaces the claim and
+        /// owner and is recorded as a comment in its own commit.
+        #[arg(long, value_name = "REASON")]
+        take_over: Option<String>,
+    },
+    /// Record a claim on an issue (CAD-383) — for a PM whose lanes run
+    /// outside cadence (Claude subagents, Codex, humans), so `dispatch`
+    /// and `issue start` see it. One commit: the claim (who, when,
+    /// note), backlog|ready → doing, and a comment; owner (the lane) is
+    /// left alone except on a take-over.
+    /// Re-claiming your own claim refreshes its time. Someone else's
+    /// doing/review issue refuses unless --take-over.
+    Claim {
+        id: String,
+        /// Claimant [default: CADENCE_ALIAS, else operator].
+        #[arg(long)]
+        by: Option<String>,
+        /// One line on where the work runs (lane, branch, session).
+        #[arg(long)]
+        note: Option<String>,
+        /// Take the issue from its current holder; the reason is
+        /// recorded.
+        #[arg(long, value_name = "REASON")]
+        take_over: Option<String>,
+    },
+    /// Give up a claim (CAD-383): clears the claim, and owner when it is
+    /// the releaser; status is left alone. Only a holder may release.
+    Release {
+        id: String,
+        /// Releaser [default: CADENCE_ALIAS, else operator].
+        #[arg(long)]
+        by: Option<String>,
+        /// One line on why (handed back, finished, abandoned).
+        #[arg(long)]
+        note: Option<String>,
     },
     /// Finish an issue's worktree: refuse while the worktree is in use
     /// (a live message recorded against it, a pane tree or any process
@@ -625,9 +667,13 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             spec,
             assignee,
             force,
+            by,
+            take_over,
         } => {
             let pm_dir = open_pm()?;
             let args = start::StartArgs {
+                by: by.clone(),
+                take_over: take_over.clone(),
                 repo: repo.clone(),
                 name: name.clone(),
                 base: base.clone(),
@@ -643,7 +689,43 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     None
                 },
             };
-            print_json(&start::run(&pm_dir, id, &args, "", state_dir)?);
+            let out = start::run(&pm_dir, id, &args, "", state_dir)?;
+            if let Some(w) = out["claim"]["warning"].as_str() {
+                eprintln!("warning: {w}");
+            }
+            print_json(&out);
+            Ok(0)
+        }
+        IssueAction::Claim {
+            id,
+            by,
+            note,
+            take_over,
+        } => {
+            let pm = open_pm()?;
+            let out = claim::claim(
+                &pm,
+                id,
+                by.as_deref(),
+                note.as_deref(),
+                take_over.as_deref(),
+                "",
+            )?;
+            if let Some(w) = out["warning"].as_str() {
+                eprintln!("warning: {w}");
+            }
+            print_json(&out);
+            Ok(0)
+        }
+        IssueAction::Release { id, by, note } => {
+            let pm = open_pm()?;
+            print_json(&claim::release(
+                &pm,
+                id,
+                by.as_deref(),
+                note.as_deref(),
+                "",
+            )?);
             Ok(0)
         }
         IssueAction::Finish {

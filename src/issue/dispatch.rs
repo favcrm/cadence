@@ -7,6 +7,7 @@
 //! branch, commit or queued message behind.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -15,7 +16,7 @@ use crate::adapter::pty;
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::parse::AcceptanceItem;
-use crate::issue::{board, parse, start, write, Pm};
+use crate::issue::{board, claim, parse, start, write, Pm};
 use crate::memory;
 use crate::store;
 
@@ -39,6 +40,9 @@ pub struct DispatchArgs {
     /// `--force` — dispatch even when the worker's pty pane cwd is
     /// outside the project's repos (CAD-202); recorded on the issue.
     pub force: bool,
+    /// CAD-383 `--take-over <reason>` — dispatch an issue another PM or
+    /// lane holds in doing/review; recorded on the issue.
+    pub take_over: Option<String>,
 }
 
 /// The fixed single-line kickoff body — note path, issue id, summary
@@ -426,6 +430,17 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         .map_err(|_| Error::rejected(format!("Note {} is unreadable", args.note.display())))?;
     std::fs::metadata(&note)
         .map_err(|_| Error::rejected(format!("Note {} is unreadable", args.note.display())))?;
+    // CAD-383: an issue someone else holds in doing/review refuses here,
+    // before the daemon is asked anything. The requester is the PM
+    // (`--reply-to`) and the worker; `issue start` re-checks under the
+    // tracker lock and records a take-over.
+    claim::check(
+        &front,
+        &[reply_to.as_str(), args.to.as_str()],
+        args.take_over.as_deref(),
+        "dispatch",
+        || claim::since(&pm.dir, &project.key, &front, Duration::from_secs(2)),
+    )?;
 
     // Pre-flight, before ANYTHING is created: the worker exists and is
     // not fenced; for --job it is the PM itself or a group member.
@@ -491,6 +506,8 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
             assignee: Some(args.to.clone()),
             force: args.force,
         }),
+        by: Some(reply_to.clone()),
+        take_over: args.take_over.clone(),
     };
     let started = start::run(pm, id, &start_args, actor, state_dir)?;
 
@@ -565,6 +582,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         "target_dir": started["target_dir"],
         "slot_env": started["slot_env"],
         "acceptance": acceptance,
+        "claim": started["claim"],
     });
     if let Some(msg) = live {
         out["dispatched"] = json!(false);
