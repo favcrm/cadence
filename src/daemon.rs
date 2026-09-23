@@ -1806,8 +1806,75 @@ impl Shared {
     // ---- dispatch ----
 
     /// The socket peer's `SO_PEERCRED` pid binds slot and approval-answer
-    /// caller identity; clients cannot supply this identity.
+    /// caller identity; clients cannot supply this identity. Every
+    /// answer leaves through [`Self::withhold_turn_tokens`] (CAD-375).
     pub fn dispatch(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let answer = self.dispatch_method(method, params, peer_pid)?;
+        Ok(self.withhold_turn_tokens(answer, peer_pid))
+    }
+
+    /// CAD-375: a running turn's token is the one credential
+    /// `message_report` checks, so no answer carries it to anyone but
+    /// the agent that owns the turn — the connection whose `/proc`
+    /// ancestry derives that agent ([`Self::slot_identity`]). The
+    /// operator, the board and every other agent read `null` where a
+    /// `turn_id` held it (and a redaction marker where prose quoted
+    /// it), on every read path at once: `agent_show`/`agent_list`
+    /// (`awaiting_report`, message rows), events, job and task views,
+    /// threads. Only tokens a report would accept now are withheld —
+    /// a finished or stale-generation turn's token is history, not a
+    /// credential. Fail closed: a caller whose identity cannot be
+    /// derived owns nothing.
+    fn withhold_turn_tokens(&self, answer: Value, peer_pid: u32) -> Value {
+        let live: Vec<(String, String)> = match self.store.running_turn_tokens() {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|(_, provider, kind, generation, token)| {
+                    registry::turn_token_current(provider, kind, generation.as_deref(), token)
+                })
+                .map(|(alias, _, _, _, token)| (alias, token))
+                .collect(),
+            // Unreadable: withhold every string that looks like a turn
+            // token rather than answer with one.
+            Err(_) => return withhold_all_turn_ids(answer),
+        };
+        if live.is_empty() {
+            return answer;
+        }
+        let text = answer.to_string();
+        let present: Vec<&(String, String)> = live
+            .iter()
+            .filter(|(_, token)| text.contains(token.as_str()))
+            .collect();
+        if present.is_empty() {
+            return answer;
+        }
+        let owner = self
+            .revalidate_enrollments()
+            .and_then(|()| self.slot_identity(peer_pid))
+            .ok()
+            .flatten()
+            .map(|who| who.lane().to_string())
+            .filter(|lane| !lane.is_empty());
+        let foreign: Vec<&str> = present
+            .into_iter()
+            .filter(|(alias, _)| owner.as_deref() != Some(alias.as_str()))
+            .map(|(_, token)| token.as_str())
+            .collect();
+        if foreign.is_empty() {
+            return answer;
+        }
+        let mut answer = answer;
+        redact_tokens(&mut answer, &foreign);
+        answer
+    }
+
+    fn dispatch_method(
         self: &Arc<Self>,
         method: &str,
         params: &Value,
@@ -1965,7 +2032,7 @@ impl Shared {
                     .collect::<Vec<_>>();
                 Ok(json!({"requests": requests}))
             }
-            "agent_respond" => self.rpc_respond(params),
+            "agent_respond" => self.rpc_respond(params, peer_pid),
             "request_open" => self.rpc_request_open(params),
             "request_wait" => self.rpc_request_wait(params),
             "request_close" => self.rpc_request_close(params),
@@ -1976,7 +2043,7 @@ impl Shared {
             "agent_set" => self.rpc_set(params, peer_pid),
             "agent_inbox" => self.rpc_inbox(params),
             "message_report" => self.rpc_message_report(params),
-            "message_reconcile" => self.rpc_reconcile(params),
+            "message_reconcile" => self.rpc_reconcile(params, peer_pid),
             "message_cancel" => self.rpc_cancel(params),
             "job_new" => self.rpc_job_new(params),
             "job_list" => self.rpc_job_list(params),
@@ -1987,11 +2054,11 @@ impl Shared {
             "task_new" => self.rpc_task_new(params),
             "task_show" => self.rpc_task_show(params),
             "task_dispatch" => self.rpc_task_dispatch(params),
-            "task_verdict" => self.rpc_task_verdict(params),
+            "task_verdict" => self.rpc_task_verdict(params, peer_pid),
             "task_accept" => self.rpc_task_accept(params),
             "task_sha" => self.rpc_task_sha(params),
             "task_fail" => self.rpc_task_fail(params),
-            "task_reopen" => self.rpc_task_reopen(params),
+            "task_reopen" => self.rpc_task_reopen(params, peer_pid),
             "task_cancel" => self.rpc_task_cancel(params),
             "memory_propose" => self.rpc_memory_propose(params, peer_pid),
             "memory_review" => self.rpc_memory_review(params, peer_pid),
@@ -2002,9 +2069,9 @@ impl Shared {
             "monitor_heartbeat" => self.rpc_monitor_heartbeat(params),
             "monitor_alerts" => self.rpc_monitor_alerts(params),
             "monitor_alert_ack" => self.rpc_monitor_alert_ack(params),
-            "monitor_stop" => self.rpc_monitor_stop(params),
-            "monitor_dispatch" => self.rpc_monitor_dispatch(params),
-            "agent_unfence" => self.rpc_unfence(params),
+            "monitor_stop" => self.rpc_monitor_stop(params, peer_pid),
+            "monitor_dispatch" => self.rpc_monitor_dispatch(params, peer_pid),
+            "agent_unfence" => self.rpc_unfence(params, peer_pid),
             "agent_stop" => self.rpc_stop(params),
             "agent_remove" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -3345,6 +3412,24 @@ impl Shared {
         self.proven_operator(verb, peer_pid)
     }
 
+    /// [`Self::operator_connection`] for a verb whose `alias` param
+    /// names the TARGET agent (`agent unfence`), not the caller: the
+    /// same connection gate and identity-field refusal, with `alias`
+    /// left to the verb (CAD-374).
+    fn operator_connection_on_agent(
+        &self,
+        verb: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<()> {
+        let mut fields = params.clone();
+        if let Some(object) = fields.as_object_mut() {
+            object.remove("alias");
+        }
+        reject_identity_fields(&fields, verb)?;
+        self.operator_connection(verb, &fields, peer_pid)
+    }
+
     /// `approval_record` — persist an operator's merge approval for one
     /// exact head as audit evidence (`id` optional: the store picks a
     /// fresh default, see `Store::record_approval`). It grants nothing: dispatch and
@@ -3933,8 +4018,44 @@ impl Shared {
         }
     }
 
-    fn rpc_respond(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    /// Who may answer an agent's pending provider or brokered request
+    /// (CAD-370), from the connection: the proven operator, or the
+    /// requester's own PM (`params.upstream`, bound to the PM's
+    /// registration — docs/SESSION.md: "approvals come to you"). The
+    /// requesting agent itself never answers its own request — that
+    /// would defeat the broker — and neither does a peer or another
+    /// group's PM. Identity fields are refused, not read.
+    fn authorize_respond(&self, params: &Value, peer_pid: u32, requester: &str) -> Result<()> {
+        reject_identity_fields(params, "agent respond")?;
+        let caller = self.agent_caller(peer_pid, "agent respond")?;
+        let AgentCaller::Agent(alias) = caller else {
+            return Ok(());
+        };
+        let target = self.store.agent(requester)?;
+        let pm = self.effective_pm(&target)?;
+        if alias != requester && pm.as_deref() == Some(alias.as_str()) {
+            return Ok(());
+        }
+        let owner = match pm.filter(|pm| pm != requester) {
+            Some(pm) => format!("the operator or its PM '{pm}'"),
+            None => "the operator (it has no PM)".to_string(),
+        };
+        let who = if alias == requester {
+            format!("agent '{alias}' cannot answer its own request")
+        } else {
+            format!("agent '{alias}' cannot answer another agent's request")
+        };
+        Err(Error::rejected(format!(
+            "agent respond refused: {who} — '{requester}''s pending requests are \
+             answered only by {owner} (caller rule, CAD-370)"
+        )))
+    }
+
+    fn rpc_respond(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
+        // Decided before the handle is claimed, so a refused caller
+        // consumes nothing and the request stays pending.
+        self.authorize_respond(params, peer_pid, &alias)?;
         let handle = required_str(params, "request")?;
         let decision = optional_str(params, "decision");
         // Explicit JSON null means "not provided".
@@ -4672,11 +4793,23 @@ impl Shared {
     /// token is stale by definition when a message is `unknown`. The
     /// store transaction enforces unknown-only; `completed`/`failed`
     /// route `reply_to`, `interrupted` routes nothing.
-    fn rpc_reconcile(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    ///
+    /// Operator only, by the connection (CAD-374): settling an outcome
+    /// nobody could prove routes a result upstream as real, so an
+    /// agent — the fenced one, a peer or its PM — is refused, and `by`
+    /// is refused rather than read: the record says `operator`, the one
+    /// caller this accepts.
+    fn rpc_reconcile(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("message reconcile", params, peer_pid)?;
+        self.reconcile_message(params)
+    }
+
+    /// The reconcile itself, once [`Self::rpc_reconcile`]'s gate passed.
+    fn reconcile_message(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let message_id = required_str(params, "message")?;
         let status = required_str(params, "status")?;
         let note = optional_str(params, "note");
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = "operator";
         // An operator-stated SHA on a `completed` reconcile is bound
         // like a worker's `--sha` — explicit, never inferred.
         let sha = optional_str(params, "sha");
@@ -4803,11 +4936,15 @@ impl Shared {
         (dead, resumable)
     }
 
-    fn rpc_unfence(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    /// `agent unfence` — the bulk `message reconcile` plus an optional
+    /// resume. Operator only, by the connection (CAD-374): the same
+    /// gate as reconcile, `alias` being the target; `by` is refused.
+    fn rpc_unfence(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection_on_agent("agent unfence", params, peer_pid)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let status = required_str(params, "status")?;
         let note = optional_str(params, "note");
-        let by = optional_str(params, "by").unwrap_or("operator");
+        let by = "operator";
         // Resolve the agent before any reconcile so a bad alias fails
         // without side effects.
         let agent = self.store.agent(&alias)?;
@@ -5147,37 +5284,49 @@ impl Shared {
                   "duplicate": duplicate, "queued_behind_dead": behind_dead}))
     }
 
-    /// `job verdict` — reviewer identity is self-asserted on this
-    /// same-host socket: inside a cadence pane the reviewer IS
-    /// `CADENCE_ALIAS` (`--reviewer` and `operator` are refused there);
-    /// outside, `--reviewer` is required. The store binds the verdict
-    /// to `head_sha` + current revision.
-    fn rpc_task_verdict(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    /// `job verdict` — the reviewer is the verified caller (CAD-372),
+    /// never a request field: the agent whose pane or enrolled managed
+    /// endpoint the connection descends from, or `operator` on positive
+    /// operator proof ([`Self::agent_caller`]). `reviewer`, `pane`, `by`
+    /// and the other identity fields are refused, not read. The task's
+    /// assignee — and the agent that reported the judged revision, its
+    /// author — can never judge it (the store re-checks the assignee in
+    /// the verdict transaction). The store binds the verdict to
+    /// `head_sha` + current revision.
+    fn rpc_task_verdict(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let task_id = required_str(params, "task")?;
         let sha = required_str(params, "sha")?;
         let verdict = required_str(params, "verdict")?;
-        let pane = optional_str(params, "pane");
-        let claimed = optional_str(params, "reviewer");
-        let reviewer = match pane {
-            Some(alias) => {
-                if claimed.is_some() {
-                    return Err(Error::rejected(
-                        "--reviewer cannot be asserted inside a cadence pane — \
-                         the pane alias is the reviewer",
-                    ));
-                }
-                if alias == "operator" {
-                    return Err(Error::rejected(
-                        "'operator' cannot be claimed inside a cadence pane — \
-                         verdicts from the human run outside panes",
-                    ));
-                }
-                alias.to_string()
-            }
-            None => claimed.map(str::to_string).ok_or_else(|| {
-                Error::rejected("Outside a cadence pane, --reviewer <alias|operator> is required")
-            })?,
+        reject_identity_fields(params, "job verdict")?;
+        let caller = self.agent_caller(peer_pid, "job verdict")?;
+        // The verdict row names the verified caller; `pane` records that
+        // it was an agent's (the event's `pane` field, as before).
+        let reviewer = caller.audit().0.to_string();
+        let pane = match &caller {
+            AgentCaller::Agent(alias) => Some(alias.as_str()),
+            AgentCaller::Operator => None,
         };
+        if let AgentCaller::Agent(alias) = &caller {
+            let task = self.store.task(task_id)?;
+            let author = match &task.dispatch_message {
+                Some(id) => self.store.message(id)?.map(|m| m.alias),
+                None => None,
+            };
+            let role = if task.assignee.as_deref() == Some(alias) {
+                Some("assignee")
+            } else if author.as_deref() == Some(alias) {
+                Some("author of the reported revision")
+            } else {
+                None
+            };
+            if let Some(role) = role {
+                return Err(Error::rejected(format!(
+                    "job verdict refused: this connection is agent '{alias}', the \
+                     task's {role} — a worker cannot verdict its own work; the \
+                     reviewer is the verified caller (reviewer independence, CAD-372)"
+                )));
+            }
+        }
         let verify = params
             .get("verify")
             .filter(|v| !v.is_null())
@@ -5237,14 +5386,14 @@ impl Shared {
         Ok(json!({"task": task.to_json()}))
     }
 
-    /// `job task reopen` — operator only: a pane alias means an agent
-    /// is asking, and re-scoping blocked work is the human's call.
-    fn rpc_task_reopen(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        if optional_str(params, "pane").is_some() {
-            return Err(Error::rejected(
-                "job task reopen is an operator action — run it outside a cadence pane",
-            ));
-        }
+    /// `job task reopen` — operator only (docs/JOBS.md transition
+    /// table): re-scoping blocked work is the human's call. Authority
+    /// is the connection's (CAD-373, [`Self::operator_connection`]): an
+    /// agent's pane or managed endpoint — its PM's included — and any
+    /// caller not provably the operator are refused; no request field
+    /// (`pane`, `by`, …) decides who is asking.
+    fn rpc_task_reopen(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("job task reopen", params, peer_pid)?;
         let task = self
             .store
             .reopen_task(required_str(params, "task")?, "operator")?;
@@ -5346,12 +5495,9 @@ impl Shared {
         Ok(json!({"alert": alert.to_json()}))
     }
 
-    fn rpc_monitor_stop(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        if optional_str(params, "pane").is_some() {
-            return Err(Error::rejected(
-                "monitor stop is an operator action — run it outside a cadence pane",
-            ));
-        }
+    /// `monitor stop` — operator only, by the connection (CAD-373).
+    fn rpc_monitor_stop(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("monitor stop", params, peer_pid)?;
         let id = required_str(params, "monitor")?;
         let monitor = self.store.stop_monitor(id)?;
         let (monitor, coverage, open, total) = self.store.monitor_view(&monitor.id)?;
@@ -5360,15 +5506,12 @@ impl Shared {
     }
 
     /// One guarded handoff into the existing job-dispatch transaction. The
-    /// public RPC remains an explicit operator action; the monitor watcher
-    /// may call the same helper only for a separately persisted automatic
-    /// opt-in.
-    fn rpc_monitor_dispatch(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        if optional_str(params, "pane").is_some() {
-            return Err(Error::rejected(
-                "monitor dispatch is an operator action — run it outside a cadence pane",
-            ));
-        }
+    /// public RPC remains an explicit operator action — proven from the
+    /// connection (CAD-373), never from a `pane` field; the monitor
+    /// watcher may call the same helper only for a separately persisted
+    /// automatic opt-in.
+    fn rpc_monitor_dispatch(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("monitor dispatch", params, peer_pid)?;
         let monitor_id = required_str(params, "monitor")?;
         let task_id = required_str(params, "task")?;
         self.monitor_dispatch_task(monitor_id, task_id, false)
@@ -8004,6 +8147,50 @@ fn upstream_roots(agents: &[Agent]) -> HashSet<String> {
         .collect()
 }
 
+/// Replace every occurrence of `tokens` in `value`'s strings (CAD-375):
+/// a string that IS a token becomes `null` (a withheld `turn_id`), one
+/// that quotes it keeps its text with the token masked.
+fn redact_tokens(value: &mut Value, tokens: &[&str]) {
+    match value {
+        Value::String(text) => {
+            if tokens.contains(&text.as_str()) {
+                *value = Value::Null;
+            } else if tokens.iter().any(|t| text.contains(t)) {
+                let mut masked = text.clone();
+                for token in tokens {
+                    masked = masked.replace(token, "[turn token withheld]");
+                }
+                *value = Value::String(masked);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|v| redact_tokens(v, tokens)),
+        Value::Object(map) => map.values_mut().for_each(|v| redact_tokens(v, tokens)),
+        _ => {}
+    }
+}
+
+/// The fail-closed form of [`redact_tokens`] when the running turns
+/// cannot be read: every `turn_id` value is withheld.
+fn withhold_all_turn_ids(mut value: Value) -> Value {
+    fn walk(value: &mut Value) {
+        match value {
+            Value::Array(items) => items.iter_mut().for_each(walk),
+            Value::Object(map) => {
+                for (key, v) in map.iter_mut() {
+                    if key == "turn_id" {
+                        *v = Value::Null;
+                    } else {
+                        walk(v);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&mut value);
+    value
+}
+
 /// Request fields that claim an identity — refused on the
 /// agent-mutating verbs (CAD-149): the caller is the connection's,
 /// never a name the request carries.
@@ -9273,6 +9460,26 @@ mod tests {
         let _ = server.join();
     }
 
+    /// CAD-375: a withheld token is `null` where it is the whole value
+    /// and masked where prose quotes it; other strings are untouched.
+    #[test]
+    fn redact_tokens_withholds_values_and_quotes() {
+        let tok = "pty-g1-abc";
+        let mut v = json!({
+            "agent": {"awaiting_report": {"turn_id": tok, "message": "m1"}},
+            "events": [{"payload": {"turn_id": tok}}, {"text": format!("token {tok} here")}],
+            "other": "pty-g1-abd",
+        });
+        redact_tokens(&mut v, &[tok]);
+        assert!(v["agent"]["awaiting_report"]["turn_id"].is_null(), "{v}");
+        assert_eq!(v["agent"]["awaiting_report"]["message"], "m1");
+        assert!(v["events"][0]["payload"]["turn_id"].is_null(), "{v}");
+        assert_eq!(v["events"][1]["text"], "token [turn token withheld] here");
+        assert_eq!(v["other"], "pty-g1-abd");
+        let all = withhold_all_turn_ids(json!({"m": [{"turn_id": "x", "id": "m1"}]}));
+        assert!(all["m"][0]["turn_id"].is_null() && all["m"][0]["id"] == "m1");
+    }
+
     /// The notice's live exit works: a reconcile while the actor holds
     /// the turn ends the hold and the next message runs.
     #[test]
@@ -9281,7 +9488,7 @@ mod tests {
         let (dir, shared) = shared();
         hold_cloud_turn(&shared, dir.path(), &base, "held-1");
         shared
-            .rpc_reconcile(&json!({"message": "held-1", "status": "interrupted"}))
+            .reconcile_message(&json!({"message": "held-1", "status": "interrupted"}))
             .unwrap();
         calls.healthy.store(true, Ordering::SeqCst);
         shared

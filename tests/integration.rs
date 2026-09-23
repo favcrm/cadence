@@ -603,12 +603,12 @@ fn approval_lifecycle() {
     let handle = list[0]["request"].as_str().unwrap();
     // Wrong shape rejected.
     assert!(d
-        .rpc(
+        .operator_rpc(
             "agent_respond",
             json!({"alias": "w1", "request": handle, "decision": "maybe"}),
         )
         .is_err());
-    d.rpc(
+    d.operator_rpc(
         "agent_respond",
         json!({"alias": "w1", "request": handle, "decision": "accept"}),
     )
@@ -892,12 +892,20 @@ fn reconcile_interrupted_clears_fence_and_preserves_history() {
     assert!(err.contains("resume refused"), "{err}");
     assert!(err.contains("--no-resume"), "{err}");
     assert!(!err.contains("then `cadence agent resume"), "{err}");
-    // The operator's verdict: interrupted, with a note and caller.
+    // The operator's verdict: interrupted, with a note. The caller is
+    // the verified connection's (CAD-374): a claimed `by` is refused.
+    let e = d
+        .operator_rpc(
+            "message_reconcile",
+            json!({"message": "x1", "status": "interrupted", "by": "cookie-cesium"}),
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("'by' is not accepted"), "{e}");
     let r = d
-        .rpc(
+        .operator_rpc(
             "message_reconcile",
             json!({"message": "x1", "status": "interrupted",
-                   "note": "pane lost mid-turn", "by": "cookie-cesium"}),
+                   "note": "pane lost mid-turn"}),
         )
         .unwrap();
     assert_eq!(r["state"], "reconciled");
@@ -919,7 +927,7 @@ fn reconcile_interrupted_clears_fence_and_preserves_history() {
     assert_eq!(rec["payload"]["message"], "x1");
     assert_eq!(rec["payload"]["status"], "interrupted");
     assert_eq!(rec["payload"]["note"], "pane lost mid-turn");
-    assert_eq!(rec["payload"]["by"], "cookie-cesium");
+    assert_eq!(rec["payload"]["by"], "operator");
     // History is intact: x1 still listed (interrupted), x2 still queued.
     let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
     assert_eq!(show["unknown"], 0);
@@ -978,7 +986,7 @@ fn reconcile_completed_routes_result_interrupted_routes_notice() {
     assert!(x1_notice["reply_to"].is_null());
     // completed → the reconciled result routes to pm exactly once,
     // under the `cadence-result:` id the notice never touched.
-    d.rpc(
+    d.operator_rpc(
         "message_reconcile",
         json!({"message": "x1", "status": "completed",
                "note": "pane showed the answer"}),
@@ -986,7 +994,7 @@ fn reconcile_completed_routes_result_interrupted_routes_notice() {
     .unwrap();
     // interrupted → one more notice (the operator closed the turn),
     // still no result.
-    d.rpc(
+    d.operator_rpc(
         "message_reconcile",
         json!({"message": "x2", "status": "interrupted"}),
     )
@@ -1062,7 +1070,7 @@ fn reconcile_rejects_non_unknown_and_repeats() {
     .unwrap();
     d.wait_message("w1", "c1", &["completed"], 15);
     let err = d
-        .rpc(
+        .operator_rpc(
             "message_reconcile",
             json!({"message": "c1", "status": "interrupted"}),
         )
@@ -1076,7 +1084,7 @@ fn reconcile_rejects_non_unknown_and_repeats() {
     .unwrap();
     d.wait_message("w1", "r1", &["running"], 15);
     let err = d
-        .rpc(
+        .operator_rpc(
             "message_reconcile",
             json!({"message": "r1", "status": "interrupted"}),
         )
@@ -1090,7 +1098,7 @@ fn reconcile_rejects_non_unknown_and_repeats() {
     .unwrap();
     assert_eq!(d.message_state("w1", "q2"), "queued");
     let err = d
-        .rpc(
+        .operator_rpc(
             "message_reconcile",
             json!({"message": "q2", "status": "interrupted"}),
         )
@@ -1101,13 +1109,13 @@ fn reconcile_rejects_non_unknown_and_repeats() {
     d.register("w2");
     d.wait_agent("w2", "idle", 10);
     fence_agent(&d, "w2", "x9");
-    d.rpc(
+    d.operator_rpc(
         "message_reconcile",
         json!({"message": "x9", "status": "failed"}),
     )
     .unwrap();
     let err = d
-        .rpc(
+        .operator_rpc(
             "message_reconcile",
             json!({"message": "x9", "status": "failed"}),
         )
@@ -1115,7 +1123,7 @@ fn reconcile_rejects_non_unknown_and_repeats() {
     assert!(err.to_string().contains("'failed'"), "{err}");
     // An invalid status is rejected before any state check.
     let err = d
-        .rpc(
+        .operator_rpc(
             "message_reconcile",
             json!({"message": "x9", "status": "bogus"}),
         )
@@ -1136,7 +1144,7 @@ fn agent_unfence_reconciles_all_then_resume_works() {
     d.register("w2");
     d.wait_agent("w2", "idle", 10);
     let err = d
-        .rpc(
+        .operator_rpc(
             "agent_unfence",
             json!({"alias": "w2", "status": "interrupted"}),
         )
@@ -1148,7 +1156,7 @@ fn agent_unfence_reconciles_all_then_resume_works() {
     );
     // Unfence reconciles each unknown and lands the agent stopped.
     let r = d
-        .rpc(
+        .operator_rpc(
             "agent_unfence",
             json!({"alias": "w1", "status": "interrupted",
                    "note": "bulk"}),
@@ -1217,7 +1225,7 @@ fn daemon_restart_skips_fenced_and_relaunches_healthy() {
     thread::sleep(Duration::from_secs(1));
     assert_eq!(d.message_state("fenced", "m2"), "queued");
     // Unfence + resume still recovers it through the normal path.
-    d.rpc(
+    d.operator_rpc(
         "agent_unfence",
         json!({"alias": "fenced", "status": "interrupted"}),
     )
@@ -1382,7 +1390,7 @@ fn unfenced_agent_stays_stopped_across_restart() {
     fence_agent(&d, "w1", "x1");
     // Unfence without resume: the reconcile leaves the agent in the
     // same condition as an operator stop — stopped AND disabled.
-    d.rpc(
+    d.operator_rpc(
         "agent_unfence",
         json!({"alias": "w1", "status": "interrupted"}),
     )
@@ -1517,7 +1525,7 @@ fn pty_restart_fence_unfence_resume_readopts_pane() {
         .unwrap();
     assert_eq!(pid_now, pane_pid);
     // Unfence → stopped, then resume adopts the surviving pane.
-    d.rpc(
+    d.operator_rpc(
         "agent_unfence",
         json!({"alias": "dv1", "status": "interrupted"}),
     )
@@ -1628,7 +1636,7 @@ fn pty_shutdown_straggler_detaches_pane() {
     // Recover fenced the in-flight turn; the pane itself survived the
     // straggler stop, so unfence → resume re-adopts the same pane.
     d.wait_agent("dv1", "attention", 15);
-    d.rpc(
+    d.operator_rpc(
         "agent_unfence",
         json!({"alias": "dv1", "status": "interrupted"}),
     )
@@ -2741,7 +2749,7 @@ fn pty_hot_restart_fenced_agent_resume_opens_fresh() {
     // Unfence + resume: the pane is still alive so the open re-adopts
     // it by session ownership — but under a NEW generation, and with
     // no adoption event.
-    d.rpc(
+    d.operator_rpc(
         "agent_unfence",
         json!({"alias": "dv1", "status": "interrupted"}),
     )
@@ -4739,7 +4747,7 @@ fn ws_approval_is_brokered() {
     let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
     let handle = requests["requests"][0]["request"].as_str().unwrap();
     let answered = d
-        .rpc(
+        .operator_rpc(
             "agent_respond",
             json!({"alias": "w1", "request": handle, "decision": "accept"}),
         )
@@ -4935,7 +4943,7 @@ fn ws_external_approval_resolution_drops_pending() {
     std::fs::write(format!("{}.resolve", mock.pidfile.display()), b"1").unwrap();
     d.wait_message("w1", "m1", &["completed"], 20);
     // The stale handle is rejected; the provider already resolved it.
-    let late = d.rpc(
+    let late = d.operator_rpc(
         "agent_respond",
         json!({"alias": "w1", "request": handle, "decision": "accept"}),
     );
@@ -5025,7 +5033,7 @@ fn ws_concurrent_respond_has_single_winner() {
             let d = &d;
             let handle = handle.clone();
             racers.push(scope.spawn(move || {
-                d.rpc(
+                d.operator_rpc(
                     "agent_respond",
                     json!({"alias": "w1", "request": handle, "decision": "accept"}),
                 )
@@ -5071,7 +5079,7 @@ fn ws_second_pending_request_keeps_waiting() {
         .collect();
     assert_eq!(handles.len(), 2, "{requests}");
     let answered = d
-        .rpc(
+        .operator_rpc(
             "agent_respond",
             json!({"alias": "w1", "request": handles[0], "decision": "accept"}),
         )
@@ -5087,7 +5095,7 @@ fn ws_second_pending_request_keeps_waiting() {
         "relaxation clobbered the remaining request"
     );
     let answered = d
-        .rpc(
+        .operator_rpc(
             "agent_respond",
             json!({"alias": "w1", "request": handles[1], "decision": "accept"}),
         )
@@ -6049,8 +6057,19 @@ fn socket_for(state_dir: &Path) -> String {
 }
 
 fn pty_token(d: &TestDaemon, alias: &str, id: &str) -> String {
-    let m = d.wait_message(alias, id, &["running"], 20);
-    m["turn_id"].as_str().unwrap().to_string()
+    d.wait_message(alias, id, &["running"], 20);
+    running_token(d, id)
+}
+
+/// A running message's turn token, read from the store: the daemon
+/// shows it only to the owning agent's own pane or endpoint (CAD-375),
+/// and the test process plays that worker's report without being it.
+fn running_token(d: &TestDaemon, id: &str) -> String {
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.query_row("SELECT turn_id FROM messages WHERE id=?1", [id], |r| {
+        r.get::<_, String>(0)
+    })
+    .unwrap()
 }
 
 /// Report a pty turn's result and wait for it to complete. Since CAD-250
@@ -6681,7 +6700,7 @@ fn pty_respond_rejected_and_mode_blocks_send() {
     d.wait_agent("dv1", "idle", 20);
     // No approval channel exists for pty.
     assert!(d
-        .rpc(
+        .operator_rpc(
             "agent_respond",
             json!({"alias": "dv1", "request": "r1", "decision": "accept"}),
         )
@@ -6827,6 +6846,11 @@ fn pty_pane_env_exports_identity() {
     );
 }
 
+/// CAD-375: `CADENCE_ALIAS` names the agent `cadence self` asks about,
+/// but the daemon shows a running turn's token only to that agent's own
+/// pane — a process outside it that sets the env is refused, naming the
+/// rule, and never prints the token. The pane's own `cadence self` is
+/// `turn_tokens_are_shown_only_to_the_owning_connection`.
 #[test]
 fn cadence_self_reports_running_token() {
     let d = TestDaemon::start();
@@ -6841,7 +6865,7 @@ fn cadence_self_reports_running_token() {
     .unwrap();
     let token = pty_token(&d, "dv1", "m1");
 
-    // Inside a cadence pane (CADENCE_ALIAS set): alias + report token.
+    // CADENCE_ALIAS set, but not inside dv1's pane: refused, no token.
     let bin = env!("CARGO_BIN_EXE_cadence");
     let out = std::process::Command::new(bin)
         .arg("--state-dir")
@@ -6850,15 +6874,14 @@ fn cadence_self_reports_running_token() {
         .env("CADENCE_ALIAS", "dv1")
         .output()
         .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stdout}");
     assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr.contains("shown only to that agent's own pane"),
+        "{stderr}"
     );
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["alias"], "dv1");
-    assert_eq!(v["running"][0]["id"], "m1");
-    assert_eq!(v["running"][0]["turn_id"].as_str().unwrap(), token);
+    assert!(!stdout.contains(&token) && !stderr.contains(&token));
 
     // Outside a cadence pane the command fails with a clear error.
     let out = std::process::Command::new(bin)
@@ -7428,10 +7451,10 @@ fn agent_remove_keeps_job_history() {
     )
     .unwrap();
     d.wait_message("qa", "qa-report", &["completed"], 15);
-    d.rpc(
+    d.operator_rpc(
         "task_verdict",
         json!({"task": "j1-fix", "sha": SHA_A, "verdict": "pass",
-               "reviewer": "qa", "message": "qa-report"}),
+               "message": "qa-report"}),
     )
     .unwrap();
     assert_eq!(d.task_state("j1-fix"), "verified");
@@ -7571,7 +7594,7 @@ fn agent_remove_force_refuses_unknown_kickoff_and_rejoin_is_unfenced() {
     assert_eq!(d.message_state("w1", &kickoff), "unknown");
     assert!(forced_removals(&d).is_empty());
 
-    d.rpc(
+    d.operator_rpc(
         "message_reconcile",
         json!({"message": kickoff, "status": "interrupted"}),
     )
@@ -9563,7 +9586,7 @@ fn pty_fence_detaches_pane_for_resume() {
         .unwrap();
     assert_eq!(pid_now, pane_pid);
     // Reconcile, then resume: the surviving pane is re-adopted.
-    d.rpc(
+    d.operator_rpc(
         "agent_unfence",
         json!({"alias": "dv1", "status": "interrupted"}),
     )
@@ -9631,7 +9654,7 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
         .to_string();
     assert!(err.contains("message reconcile m-dv-rm"), "{err}");
     assert!(pid_alive(&d.pane_file(&mock, "dv-rm", "pid")));
-    d.rpc(
+    d.operator_rpc(
         "message_reconcile",
         json!({"message": "m-dv-rm", "status": "interrupted"}),
     )
@@ -9651,7 +9674,7 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
         "{swept}"
     );
     assert!(pid_alive(&d.pane_file(&mock, "dv-gc", "pid")));
-    d.rpc(
+    d.operator_rpc(
         "message_reconcile",
         json!({"message": "m-dv-gc", "status": "interrupted"}),
     )
@@ -9701,7 +9724,7 @@ fn pty_unfence_resume_reports_adopted_pane() {
     d.wait_agent("dv1", "attention", 25);
     // One call reconciles the unknown and brings the agent back.
     let r = d
-        .rpc(
+        .operator_rpc(
             "agent_unfence",
             json!({"alias": "dv1", "status": "interrupted",
                    "resume": true}),
@@ -9752,7 +9775,7 @@ fn pty_unfence_resume_reports_respawned_pane() {
         .unwrap();
     wait_pid_gone(&d.pane_file(&mock, "dv1", "pid"), 10);
     let r = d
-        .rpc(
+        .operator_rpc(
             "agent_unfence",
             json!({"alias": "dv1", "status": "interrupted",
                    "resume": true}),
@@ -9779,7 +9802,7 @@ fn unfence_resume_non_pty_reports_no_pane() {
     d.wait_agent("w1", "idle", 10);
     fence_agent(&d, "w1", "x1");
     let r = d
-        .rpc(
+        .operator_rpc(
             "agent_unfence",
             json!({"alias": "w1", "status": "interrupted",
                    "resume": true}),
@@ -9812,7 +9835,7 @@ fn pty_unfence_resume_busy_adopted_pane_stays_gated() {
     // The surviving pane is visibly busy — adoption still lands.
     atomic_write(d.stub_pane_file(&mock, "st", "tui-state"), "stub working\n");
     let r = d
-        .rpc(
+        .operator_rpc(
             "agent_unfence",
             json!({"alias": "st", "status": "interrupted",
                    "resume": true}),
@@ -9874,7 +9897,7 @@ fn agent_dead_and_resumable_per_endpoint_kind() {
     assert_eq!(agent["resumable"], false, "{agent}");
     // Unfence without resume → stopped: not dead, resumable — the
     // recorded thread can be re-attached.
-    d.rpc(
+    d.operator_rpc(
         "agent_unfence",
         json!({"alias": "dv1", "status": "interrupted"}),
     )
@@ -10593,8 +10616,8 @@ fn claude_managed_ack_keeps_running_until_the_turn_result() {
         json!({"alias": "w1", "text": "long task", "message": "m1"}),
     )
     .unwrap();
-    let m = d.wait_message("w1", "m1", &["running"], 20);
-    let token = m["turn_id"].as_str().unwrap().to_string();
+    d.wait_message("w1", "m1", &["running"], 20);
+    let token = running_token(&d, "m1");
     assert!(token.starts_with(&format!("claude-{gen}-")), "{token}");
 
     d.rpc(
@@ -10645,8 +10668,8 @@ fn claude_managed_report_refuses_stale_generation_and_pty_token() {
         json!({"alias": "w1", "text": "task", "message": "m1"}),
     )
     .unwrap();
-    let m = d.wait_message("w1", "m1", &["running"], 20);
-    let token = m["turn_id"].as_str().unwrap().to_string();
+    d.wait_message("w1", "m1", &["running"], 20);
+    let token = running_token(&d, "m1");
 
     cad162_sql(
         &d,
@@ -10693,8 +10716,8 @@ fn report_refused_on_endpoint_kinds_without_a_token_scheme() {
             json!({"alias": alias, "text": "hold", "message": format!("m-{alias}")}),
         )
         .unwrap();
-        let m = d.wait_message(alias, &format!("m-{alias}"), &["running"], 20);
-        let real = m["turn_id"].as_str().unwrap().to_string();
+        d.wait_message(alias, &format!("m-{alias}"), &["running"], 20);
+        let real = running_token(&d, &format!("m-{alias}"));
         cad162_assert_refused(
             &d,
             alias,
@@ -10867,7 +10890,7 @@ fn claude_death_mid_turn_unknown_then_unfence_resume() {
     // The same mock command relaunches; flip it to "ok" for the resume.
     std::fs::write(mock.pidfile.with_extension("pid.mode"), "ok").unwrap();
     let unfenced = d
-        .rpc(
+        .operator_rpc(
             "agent_unfence",
             json!({"alias": "w1", "status": "interrupted"}),
         )
@@ -11288,7 +11311,7 @@ fn claude_respond_is_rejected_naming_opt_ups() {
     d.register_claude("w1", Value::Null);
     d.wait_agent("w1", "idle", 15);
     let err = d
-        .rpc(
+        .operator_rpc(
             "agent_respond",
             json!({"alias": "w1", "request": "req-1", "decision": "accept"}),
         )
@@ -11584,7 +11607,7 @@ fn claude_brokered_permission_accept() {
     );
     // Accept unblocks the tool call; the turn completes and the agent
     // leaves waiting_input.
-    d.rpc(
+    d.operator_rpc(
         "agent_respond",
         json!({"alias": "w1", "request": handle, "decision": "accept"}),
     )
@@ -11645,7 +11668,7 @@ fn claude_brokered_permission_decline_with_reason() {
     let req = d.wait_request("w1", 15);
     d.wait_agent("w1", "waiting_input", 15);
     // The operator's reason reaches the provider as the denial message.
-    d.rpc(
+    d.operator_rpc(
         "agent_respond",
         json!({"alias": "w1", "request": req["request"],
                "decision": "decline", "reason": "no destructive commands"}),
@@ -11787,7 +11810,7 @@ fn claude_brokered_params_replayed_on_resume() {
     d.wait_agent("w1", "waiting_input", 15);
     // Answer it so the launch turn completes — one request only.
     let req = d.wait_request("w1", 10);
-    d.rpc(
+    d.operator_rpc(
         "agent_respond",
         json!({"alias": "w1", "request": req["request"], "decision": "accept"}),
     )
@@ -11834,7 +11857,7 @@ fn claude_brokered_params_replayed_on_resume() {
     .unwrap();
     d.wait_agent("w1", "waiting_input", 15);
     let req2 = d.wait_request("w1", 10);
-    d.rpc(
+    d.operator_rpc(
         "agent_respond",
         json!({"alias": "w1", "request": req2["request"], "decision": "accept"}),
     )
@@ -11988,18 +12011,13 @@ impl TestDaemon {
         self.rpc("task_dispatch", p)
     }
 
-    fn job_verdict(
-        &self,
-        task: &str,
-        sha: &str,
-        verdict: &str,
-        reviewer: Option<&str>,
-        pane: Option<&str>,
-    ) -> cadence_agent::Result<Value> {
-        self.rpc(
+    /// A verdict from the operator: the reviewer is the verified
+    /// connection (CAD-372), so the call is made from a caller that is
+    /// provably the operator however the suite is run.
+    fn job_verdict(&self, task: &str, sha: &str, verdict: &str) -> cadence_agent::Result<Value> {
+        self.operator_rpc(
             "task_verdict",
-            json!({"task": task, "sha": sha, "verdict": verdict,
-                   "reviewer": reviewer, "pane": pane}),
+            json!({"task": task, "sha": sha, "verdict": verdict}),
         )
     }
 
@@ -12131,8 +12149,7 @@ fn job_seeded_bug_loop_end_to_end() {
     assert_eq!(t["head_sha"], SHA_A, "{t}");
 
     // verdict revise (r1 < max 2) → revising; PM got a job_event.
-    d.job_verdict("j1-fix", SHA_A, "revise", Some("pm"), None)
-        .unwrap();
+    d.job_verdict("j1-fix", SHA_A, "revise").unwrap();
     assert_eq!(d.task_state("j1-fix"), "revising");
 
     // r2: a fresh deterministic kickoff id, not the r1 one.
@@ -12144,8 +12161,7 @@ fn job_seeded_bug_loop_end_to_end() {
     d.wait_task("j1-fix", "review", 15);
 
     // pass → verified → accept → done; PM notification routed.
-    d.job_verdict("j1-fix", SHA_A, "pass", Some("pm"), None)
-        .unwrap();
+    d.job_verdict("j1-fix", SHA_A, "pass").unwrap();
     assert_eq!(d.task_state("j1-fix"), "verified");
     d.rpc(
         "task_accept",
@@ -12212,8 +12228,7 @@ fn job_inbox_pm_receives_notifications() {
     let kickoff = r["message"].as_str().unwrap().to_string();
     d.wait_message("w1", &kickoff, &["completed"], 15);
     d.wait_task("j1-t2", "review", 15);
-    d.job_verdict("j1-t2", SHA_A, "pass", Some("operator"), None)
-        .unwrap();
+    d.job_verdict("j1-t2", SHA_A, "pass").unwrap();
     d.rpc("task_accept", json!({"task": "j1-t2", "by": "operator"}))
         .unwrap();
     assert_eq!(d.task_state("j1-t2"), "done");
@@ -12252,9 +12267,7 @@ fn verdict_rejects_every_bad_shape() {
     .unwrap();
 
     // Not in review → rejected.
-    assert!(d
-        .job_verdict("j1-t2", SHA_A, "pass", Some("rev"), None)
-        .is_err());
+    assert!(d.job_verdict("j1-t2", SHA_A, "pass").is_err());
 
     let r = d.job_dispatch("j1-t2", json!({})).unwrap();
     let kickoff = r["message"].as_str().unwrap().to_string();
@@ -12262,49 +12275,45 @@ fn verdict_rejects_every_bad_shape() {
     d.wait_task("j1-t2", "review", 15);
 
     // Wrong sha → rejected.
-    let e = d
-        .job_verdict("j1-t2", SHA_B, "pass", Some("rev"), None)
-        .unwrap_err();
+    let e = d.job_verdict("j1-t2", SHA_B, "pass").unwrap_err();
     assert!(e.to_string().contains("does not match"), "{e}");
     // Malformed sha → rejected.
-    assert!(d
-        .job_verdict("j1-t2", "abc123", "pass", Some("rev"), None)
-        .is_err());
-    // reviewer == assignee → rejected.
-    let e = d
-        .job_verdict("j1-t2", SHA_A, "pass", Some("w1"), None)
-        .unwrap_err();
-    assert!(e.to_string().contains("assignee"), "{e}");
-    // Pane rules: --reviewer inside a pane → rejected; operator inside a
-    // pane → rejected; pane alias wins the verdict when legal.
-    assert!(d
-        .job_verdict("j1-t2", SHA_A, "pass", Some("rev"), Some("rev-pane"))
-        .is_err());
-    assert!(d
-        .job_verdict("j1-t2", SHA_A, "pass", None, Some("operator"))
-        .is_err());
-    // Outside a pane, --reviewer is required.
-    assert!(d.job_verdict("j1-t2", SHA_A, "pass", None, None).is_err());
+    assert!(d.job_verdict("j1-t2", "abc123", "pass").is_err());
+    // A claimed reviewer or pane is refused, not read (CAD-372) — even
+    // from the operator, and even when it names the operator.
+    for (field, claim) in [
+        ("reviewer", "rev"),
+        ("pane", "rev-pane"),
+        ("reviewer", "operator"),
+    ] {
+        let e = d
+            .operator_rpc(
+                "task_verdict",
+                json!({"task": "j1-t2", "sha": SHA_A, "verdict": "pass", field: claim}),
+            )
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains(&format!("'{field}' is not accepted")),
+            "{field}: {e}"
+        );
+    }
     // Stale revision → rejected.
     assert!(d
-        .rpc(
+        .operator_rpc(
             "task_verdict",
-            json!({"task": "j1-t2", "sha": SHA_A, "verdict": "pass",
-                   "reviewer": "rev", "revision": 7}),
+            json!({"task": "j1-t2", "sha": SHA_A, "verdict": "pass", "revision": 7}),
         )
         .is_err());
     // Bad verdict word → rejected.
-    assert!(d
-        .job_verdict("j1-t2", SHA_A, "maybe", Some("rev"), None)
-        .is_err());
+    assert!(d.job_verdict("j1-t2", SHA_A, "maybe").is_err());
 
     // The good verdict lands — reviewer recorded, pane flag false.
-    d.job_verdict("j1-t2", SHA_A, "pass", Some("rev"), None)
-        .unwrap();
+    d.job_verdict("j1-t2", SHA_A, "pass").unwrap();
     let t = d.rpc("task_show", json!({"task": "j1-t2"})).unwrap()["task"].clone();
     assert_eq!(t["state"], "verified");
     let v = &t["verdicts"][0];
-    assert_eq!(v["reviewer"], "rev");
+    assert_eq!(v["reviewer"], "operator");
     assert_eq!(v["sha"], SHA_A);
     assert_eq!(v["revision"], 1);
     assert_eq!(v["pane"], Value::Null);
@@ -12344,9 +12353,7 @@ fn verdict_rejects_null_sha_until_repaired() {
     );
 
     // Verdict rejected naming the fix.
-    let e = d
-        .job_verdict("j1-t2", SHA_A, "pass", Some("rev"), None)
-        .unwrap_err();
+    let e = d.job_verdict("j1-t2", SHA_A, "pass").unwrap_err();
     assert!(e.to_string().contains("job task sha"), "{e}");
 
     // `job task sha` repairs it — recorded as an event, verdict proceeds.
@@ -12367,8 +12374,7 @@ fn verdict_rejects_null_sha_until_repaired() {
             json!({"task": "j1-t2", "sha": SHA_B, "by": "pm"})
         )
         .is_err());
-    d.job_verdict("j1-t2", SHA_A, "pass", Some("rev"), None)
-        .unwrap();
+    d.job_verdict("j1-t2", SHA_A, "pass").unwrap();
     assert_eq!(d.task_state("j1-t2"), "verified");
     let ev = d.events("pm");
     assert!(ev.iter().any(|e| e["kind"] == "task_sha_recorded"));
@@ -12399,8 +12405,7 @@ fn max_revisions_escalates_to_blocked_once() {
     let k = r["message"].as_str().unwrap().to_string();
     d.wait_message("w1", &k, &["completed"], 15);
     d.wait_task("j1-t2", "review", 15);
-    d.job_verdict("j1-t2", SHA_A, "revise", Some("rev"), None)
-        .unwrap();
+    d.job_verdict("j1-t2", SHA_A, "revise").unwrap();
     assert_eq!(d.task_state("j1-t2"), "revising");
 
     // r2 → review → revise at the cap → blocked, PM notified once.
@@ -12408,17 +12413,14 @@ fn max_revisions_escalates_to_blocked_once() {
     let k = r["message"].as_str().unwrap().to_string();
     d.wait_message("w1", &k, &["completed"], 15);
     d.wait_task("j1-t2", "review", 15);
-    d.job_verdict("j1-t2", SHA_A, "revise", Some("rev"), None)
-        .unwrap();
+    d.job_verdict("j1-t2", SHA_A, "revise").unwrap();
     assert_eq!(d.task_state("j1-t2"), "blocked");
 
     // The loop cannot continue: dispatch without --to names reopen.
     let e = d.job_dispatch("j1-t2", json!({})).unwrap_err();
     assert!(e.to_string().contains("reopen"), "{e}");
     // A verdict lands only on review — blocked task rejects.
-    assert!(d
-        .job_verdict("j1-t2", SHA_A, "pass", Some("rev"), None)
-        .is_err());
+    assert!(d.job_verdict("j1-t2", SHA_A, "pass").is_err());
 
     // Exactly one blocked notification to the PM.
     let pm_msgs = d.rpc("agent_show", json!({"alias": "pm"})).unwrap()["messages"]
@@ -12434,7 +12436,7 @@ fn max_revisions_escalates_to_blocked_once() {
     assert_eq!(blocked.len(), 1, "{pm_msgs:?}");
 
     // Operator reopen re-scopes: draft, revision 0, dispatch works.
-    d.rpc("task_reopen", json!({"task": "j1-t2", "by": "operator"}))
+    d.operator_rpc("task_reopen", json!({"task": "j1-t2"}))
         .unwrap();
     assert_eq!(d.task_state("j1-t2"), "draft");
     let r = d.job_dispatch("j1-t2", json!({})).unwrap();
@@ -12552,8 +12554,7 @@ fn dispatch_dedupes_live_kickoff_and_reassign_bumps() {
     d.rpc("agent_resume", json!({"alias": "w1"})).unwrap();
     d.wait_message("w1", &k1, &["completed"], 15);
     d.wait_task("j1-t2", "review", 15);
-    d.job_verdict("j1-t2", SHA_A, "revise", Some("rev"), None)
-        .unwrap();
+    d.job_verdict("j1-t2", SHA_A, "revise").unwrap();
     assert_eq!(d.task_state("j1-t2"), "revising");
     let r = d.job_dispatch("j1-t2", json!({"to": "w2"})).unwrap();
     assert_eq!(r["task"]["revision"], 2, "{r}");
@@ -12855,16 +12856,13 @@ fn message_result_sha_flag_on_pty_path() {
     d.wait_task("j1-t2", "review", 15);
     // operator reconcile of a completed message isn't the path — the
     // edge is task_on_completed reading result.sha; cover via verdict.
-    assert!(d
-        .job_verdict("j1-t2", SHA_A, "pass", Some("rev"), None)
-        .is_err()); // NULL head_sha — never inferred
+    assert!(d.job_verdict("j1-t2", SHA_A, "pass").is_err()); // NULL head_sha — never inferred
     d.rpc(
         "task_sha",
         json!({"task": "j1-t2", "sha": SHA_A, "by": "pm"}),
     )
     .unwrap();
-    d.job_verdict("j1-t2", SHA_A, "pass", Some("rev"), None)
-        .unwrap();
+    d.job_verdict("j1-t2", SHA_A, "pass").unwrap();
     assert_eq!(d.task_state("j1-t2"), "verified");
 }
 
@@ -15247,7 +15245,7 @@ fn long_reconcile_note_survives_store_and_route() {
     .unwrap();
     d.wait_message("w1", "u1", &["unknown"], 15);
     let note = "n".repeat(40_000);
-    d.rpc(
+    d.operator_rpc(
         "message_reconcile",
         json!({"message": "u1", "status": "completed", "note": note}),
     )
@@ -15689,8 +15687,6 @@ fn verdict_args(task: &str, sha: &str, flag: &str) -> Vec<String> {
         "--sha".to_string(),
         sha.to_string(),
         flag.to_string(),
-        "--reviewer".to_string(),
-        "operator".to_string(),
     ]
 }
 
@@ -15704,10 +15700,34 @@ fn cli_verdict(
 ) -> (bool, Value) {
     let mut args: Vec<String> = verdict_args(task, sha, flag);
     args.extend(extra.iter().map(|s| s.to_string()));
-    cadence_cli(
-        &d.state,
-        &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        envs,
+    // The reviewer is the verified connection (CAD-372): the CLI runs
+    // in a reviewer pane, `qa-cli`, planted for this call.
+    let home = TempDir::new().unwrap();
+    let mut qa = LaneShell::spawn(home.path());
+    plant_pane(d, "qa-cli", qa.pid());
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let bin_dir = Path::new(bin).parent().unwrap().display().to_string();
+    let quote = |v: &str| format!("'{}'", v.replace('\'', "'\\''"));
+    let mut env = format!("PATH={}:\"$PATH\"", quote(&bin_dir));
+    for (k, v) in envs {
+        env.push_str(&format!(" {k}={}", quote(v)));
+    }
+    let err = qa.dir.path().join("verdict.err");
+    let (rc, out) = qa.run(&format!(
+        "env -u CADENCE_ALIAS {env} {} --state-dir {} {} 2>{}",
+        quote(bin),
+        quote(&d.state.display().to_string()),
+        args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" "),
+        quote(&err.display().to_string())
+    ));
+    let text = if out.trim().is_empty() {
+        std::fs::read_to_string(&err).unwrap_or_default()
+    } else {
+        out
+    };
+    (
+        rc == 0,
+        serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
     )
 }
 
@@ -16616,7 +16636,7 @@ fn fake_silent_turn_stalls_and_brokered_wait_does_not() {
     );
     let requests = d.rpc("agent_requests", json!({"alias": "w1"})).unwrap();
     let handle = requests["requests"][0]["request"].as_str().unwrap();
-    d.rpc(
+    d.operator_rpc(
         "agent_respond",
         json!({"alias": "w1", "request": handle, "decision": "accept"}),
     )
@@ -27453,7 +27473,7 @@ fn monitor_persists_coverage_heartbeats_and_deduplicates_alerts() {
     assert_eq!(restored["coverage"], json!(["mjob-watch"]));
     let after_restart = d2.rpc("monitor_alerts", json!({"monitor": "m1"})).unwrap();
     assert_eq!(after_restart["alerts"].as_array().unwrap().len(), 1);
-    let _ = d2.rpc("monitor_stop", json!({"monitor": "m1"}));
+    let _ = d2.operator_rpc("monitor_stop", json!({"monitor": "m1"}));
 }
 
 #[test]
@@ -27725,7 +27745,7 @@ fn monitor_alerts_task_unknown_outcome_is_scoped_and_restart_safe() {
     assert_eq!(restored_task["revision"], 1, "{restored_task}");
     assert!(restored_task["head_sha"].is_null(), "{restored_task}");
     d2.wait_agent("w1", "attention", 5);
-    let _ = d2.rpc("monitor_stop", json!({"monitor": "unknown-monitor"}));
+    let _ = d2.operator_rpc("monitor_stop", json!({"monitor": "unknown-monitor"}));
 }
 
 #[test]
@@ -27781,7 +27801,7 @@ fn monitor_dispatch_requires_explicit_safe_eligibility() {
     );
 
     let result = d
-        .rpc(
+        .operator_rpc(
             "monitor_dispatch",
             json!({"monitor": "dm", "task": "djob-ready"}),
         )
@@ -27800,7 +27820,7 @@ fn monitor_dispatch_requires_explicit_safe_eligibility() {
         .unwrap();
     assert!(!existing_duplicate);
     let duplicate = d
-        .rpc(
+        .operator_rpc(
             "monitor_dispatch",
             json!({"monitor": "dm", "task": "djob-repeat"}),
         )
@@ -28063,7 +28083,7 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
     // The pre-existing kickoff is reused after a monitor tick and restart;
     // no second job_dispatch message appears for the stopped worker.
     let duplicate = d
-        .rpc(
+        .operator_rpc(
             "monitor_dispatch",
             json!({"monitor": "auto", "task": "ajob-duplicate"}),
         )
@@ -28109,7 +28129,7 @@ fn automatic_monitor_dispatch_is_separate_guarded_and_restart_safe() {
         .unwrap()
         .iter()
         .any(|alert| { alert["seq"] == blocked_seq && alert["kind"] == "dispatch_blocked" }));
-    let _ = d2.rpc("monitor_stop", json!({"monitor": "auto"}));
+    let _ = d2.operator_rpc("monitor_stop", json!({"monitor": "auto"}));
 }
 
 #[test]
@@ -33729,6 +33749,385 @@ fn model_defaults_set_is_operator_only() {
     assert_eq!(audit["transport"], "operator-connection", "{audit}");
 }
 
+/// The wire frame is a refusal whose message names `verb` and `rule`.
+fn assert_refused(frame: &Value, verb: &str, rule: &str, what: &str) {
+    assert_eq!(frame["ok"], false, "{what}: {frame}");
+    let msg = frame["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains(verb) && msg.contains(rule),
+        "{what}: expected '{verb}' + '{rule}' in {frame}"
+    );
+}
+
+/// A pane's claimed identity, in every field a caller could forge.
+const FORGED_IDENTITY: &[(&str, &str)] = &[
+    ("pane", "operator"),
+    ("by", "operator"),
+    ("reviewer", "operator"),
+    ("owner", "operator"),
+];
+
+/// `params` with `field` claiming `value`.
+fn forged(params: &Value, field: &str, value: &str) -> Value {
+    let mut p = params.clone();
+    p[field] = json!(value);
+    p
+}
+
+/// CAD-373 / CAD-374: `job task reopen`, `monitor stop`, `monitor
+/// dispatch`, `message reconcile` and `agent unfence` are operator
+/// actions decided by the CONNECTION (`operator_connection`), never by
+/// a `pane`/`by` field the caller controls. A pane agent speaking the
+/// socket directly — even the fenced worker's own PM, even forging
+/// `by:"operator"` or an empty `pane` — and a managed endpoint are
+/// refused naming the verb and the rule; nothing lands. The proven
+/// operator still succeeds, and reconcile records `by:"operator"`.
+#[test]
+fn operator_verbs_refuse_agents_whatever_they_claim() {
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    // `lead` is a PM pane: w2 is its member, fenced by an unknown.
+    let mut lead = LaneShell::spawn(home.path());
+    plant_pane(&d, "lead", lead.pid());
+    d.register_member("w2", "lead");
+    d.wait_agent("w2", "idle", 10);
+    fence_agent(&d, "w2", "x9");
+    let mut wk = ManagedWorker::start(&d, "wk");
+
+    // A blocked task (reopen) and a monitor over it (stop, dispatch).
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.wait_agent("w1", "idle", 10);
+    let (spec, sha) = d.spec_file("spec.md", "gated verbs");
+    let project = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "job_new",
+        json!({"pm": "pm", "job": "j1", "spec": spec, "spec_sha256": sha,
+               "repo": project}),
+    )
+    .unwrap();
+    d.rpc(
+        "task_new",
+        json!({"job": "j1", "task": "j1-t", "assignee": "w1",
+               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
+    )
+    .unwrap();
+    d.job_dispatch("j1-t", json!({})).unwrap();
+    d.wait_task("j1-t", "review", 15);
+    d.job_verdict("j1-t", SHA_A, "blocked").unwrap();
+    assert_eq!(d.task_state("j1-t"), "blocked");
+    d.rpc(
+        "monitor_register",
+        json!({"monitor": "m1", "project": project, "owner": "operator",
+               "tasks": ["j1-t"], "interval_secs": 60, "dispatch_enabled": true}),
+    )
+    .unwrap();
+
+    let calls = [
+        ("task_reopen", "job task reopen", json!({"task": "j1-t"})),
+        ("monitor_stop", "monitor stop", json!({"monitor": "m1"})),
+        (
+            "monitor_dispatch",
+            "monitor dispatch",
+            json!({"monitor": "m1", "task": "j1-t"}),
+        ),
+        (
+            "message_reconcile",
+            "message reconcile",
+            json!({"message": "x9", "status": "completed", "sha": SHA_B}),
+        ),
+        (
+            "agent_unfence",
+            "agent unfence",
+            json!({"alias": "w2", "status": "completed"}),
+        ),
+    ];
+    for (method, verb, params) in &calls {
+        let r = lead.rpc(&d.state, method, params.clone());
+        assert_refused(&r, verb, "is an operator action", &format!("pane {method}"));
+        assert!(
+            r["error"]["message"].as_str().unwrap().contains("'lead'"),
+            "{method}: {r}"
+        );
+        for (field, value) in FORGED_IDENTITY {
+            let r = lead.rpc(&d.state, method, forged(params, field, value));
+            assert_eq!(r["ok"], false, "pane {method} forging {field}: {r}");
+            assert!(
+                r["error"]["message"].as_str().unwrap().contains(verb),
+                "pane {method} forging {field}: {r}"
+            );
+        }
+        let r = wk.rpc("self", method, params.clone());
+        assert_refused(
+            &r,
+            verb,
+            "is an operator action",
+            &format!("managed {method}"),
+        );
+    }
+    // Nothing a refused caller sent landed.
+    assert_eq!(d.task_state("j1-t"), "blocked");
+    wait_monitor_state(&d, "m1", "active", 5);
+    assert_eq!(d.message_state("w2", "x9"), "unknown");
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "w2"})).unwrap()["unknown"],
+        1
+    );
+
+    // The proven operator still acts, and is who the record names.
+    d.operator_rpc("task_reopen", json!({"task": "j1-t"}))
+        .unwrap();
+    assert_eq!(d.task_state("j1-t"), "draft");
+    d.operator_rpc("monitor_stop", json!({"monitor": "m1"}))
+        .unwrap();
+    let r = d
+        .operator_rpc(
+            "message_reconcile",
+            json!({"message": "x9", "status": "interrupted"}),
+        )
+        .unwrap();
+    assert_eq!(r["message"]["state"], "interrupted", "{r}");
+    let rec = d
+        .events("w2")
+        .into_iter()
+        .find(|e| e["kind"] == "reconciled")
+        .expect("reconciled event");
+    assert_eq!(rec["payload"]["by"], "operator", "{rec}");
+}
+
+/// CAD-372: the verdict's reviewer is the verified connection. The
+/// assignee's own pane cannot pass its task — not bare, not claiming
+/// `reviewer:"operator"` or another agent, not naming a `pane` — and a
+/// distinct agent's pane passes it, recorded as that agent.
+#[test]
+fn verdict_reviewer_is_the_verified_caller() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.wait_agent("w1", "idle", 10);
+    let (spec, sha) = d.spec_file("spec.md", "self review");
+    d.job_new("pm", "j1", &spec, &sha);
+    d.rpc(
+        "task_new",
+        json!({"job": "j1", "task": "j1-t", "assignee": "w1",
+               "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
+    )
+    .unwrap();
+    d.job_dispatch("j1-t", json!({})).unwrap();
+    d.wait_task("j1-t", "review", 15);
+    // The worker's pane from here on: its own processes derive `w1`.
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+    let home = TempDir::new().unwrap();
+    let mut worker = LaneShell::spawn(home.path());
+    plant_pane(&d, "w1", worker.pid());
+    let mut qa = LaneShell::spawn(home.path());
+    plant_pane(&d, "qa", qa.pid());
+
+    let pass = json!({"task": "j1-t", "sha": SHA_A, "verdict": "pass"});
+    let r = worker.rpc(&d.state, "task_verdict", pass.clone());
+    assert_refused(&r, "job verdict", "assignee", "assignee bare");
+    for (field, value) in [
+        ("reviewer", "operator"),
+        ("reviewer", "qa"),
+        ("pane", "qa"),
+        ("by", "qa"),
+    ] {
+        let r = worker.rpc(&d.state, "task_verdict", forged(&pass, field, value));
+        assert_refused(
+            &r,
+            "job verdict",
+            "caller identity is connection-bound",
+            &format!("assignee claiming {field}={value}"),
+        );
+    }
+    // The CLI from the worker's pane: same refusal, nothing recorded.
+    let (rc, out) = worker.cadence(
+        &d.state,
+        &format!("job verdict j1-t --sha {SHA_A} --pass --no-verify-worktree --no-status"),
+    );
+    assert_ne!(rc, 0, "{out}");
+    assert!(out.contains("assignee"), "{out}");
+    assert_eq!(d.task_state("j1-t"), "review");
+    assert_eq!(task_verdicts(&d, "j1-t"), json!([]));
+
+    // A distinct verified reviewer passes it, and is who is recorded.
+    let r = qa.rpc(&d.state, "task_verdict", pass);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(d.task_state("j1-t"), "verified");
+    let verdicts = task_verdicts(&d, "j1-t");
+    assert_eq!(verdicts[0]["reviewer"], "qa", "{verdicts}");
+    let recorded = d
+        .events("pm")
+        .into_iter()
+        .find(|e| e["kind"] == "verdict_recorded")
+        .expect("verdict_recorded");
+    assert_eq!(recorded["payload"]["reviewer"], "qa", "{recorded}");
+    assert_eq!(recorded["payload"]["pane"], "qa", "{recorded}");
+}
+
+/// CAD-370: a brokered request is answered by the operator or the
+/// requester's own PM — never by the requesting agent itself (that
+/// would defeat the broker), never by a peer, whatever it claims. A
+/// refused answer leaves the request pending.
+#[test]
+fn agent_respond_refuses_the_requester_and_its_peers() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut pm = LaneShell::spawn(home.path());
+    plant_pane(&d, "lead", pm.pid());
+    let mut worker = LaneShell::spawn(home.path());
+    plant_pane(&d, "wr", worker.pid());
+    let mut peer = LaneShell::spawn(home.path());
+    plant_pane(&d, "wp", peer.pid());
+    let brokered = json!({"upstream": "lead", "broker_approvals": true}).to_string();
+    for alias in ["wr", "wp"] {
+        cad162_sql(
+            &d,
+            "UPDATE agents SET params=?1 WHERE alias=?2",
+            &[&brokered, alias],
+        );
+    }
+    let open = |handle: &str| {
+        d.rpc(
+            "request_open",
+            json!({"alias": "wr", "tool": "Bash", "input_summary": "rm -rf /tmp/x",
+                   "request": handle}),
+        )
+        .unwrap();
+    };
+    open("h1");
+    let accept = json!({"alias": "wr", "request": "h1", "decision": "accept"});
+
+    let r = worker.rpc(&d.state, "agent_respond", accept.clone());
+    assert_refused(
+        &r,
+        "agent respond",
+        "cannot answer its own request",
+        "requester",
+    );
+    for (field, value) in FORGED_IDENTITY {
+        let r = worker.rpc(&d.state, "agent_respond", forged(&accept, field, value));
+        assert_eq!(r["ok"], false, "requester forging {field}: {r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("agent respond"),
+            "requester forging {field}: {r}"
+        );
+    }
+    let r = peer.rpc(&d.state, "agent_respond", accept.clone());
+    assert_refused(
+        &r,
+        "agent respond",
+        "cannot answer another agent's request",
+        "peer",
+    );
+    let pending = d.rpc("agent_requests", json!({"alias": "wr"})).unwrap();
+    assert_eq!(pending["requests"][0]["request"], "h1", "{pending}");
+
+    // The requester's PM answers; so does the operator.
+    let r = pm.rpc(&d.state, "agent_respond", accept);
+    assert_eq!(r["ok"], true, "{r}");
+    open("h2");
+    d.operator_rpc(
+        "agent_respond",
+        json!({"alias": "wr", "request": "h2", "decision": "decline"}),
+    )
+    .unwrap();
+    let pending = d.rpc("agent_requests", json!({"alias": "wr"})).unwrap();
+    assert_eq!(pending["requests"], json!([]), "{pending}");
+}
+
+/// CAD-375: a running turn's token is `message_report`'s credential, so
+/// the daemon shows it only to the connection that derives the owning
+/// agent. A peer's (and the operator's) `agent_show`, `agent_list` and
+/// `agent_events` of the agent carry no token anywhere; the agent's own
+/// `cadence self` prints it and its `message ack`/`result` still work.
+#[test]
+fn turn_tokens_are_shown_only_to_the_owning_connection() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut owner = LaneShell::spawn(home.path());
+    plant_pane(&d, "wa", owner.pid());
+    let mut peer = LaneShell::spawn(home.path());
+    plant_pane(&d, "wb", peer.pid());
+    // A pty worker's delivered turn, awaiting its report.
+    cad162_sql(
+        &d,
+        "UPDATE agents SET provider='devin' WHERE alias IN ('wa','wb')",
+        &[],
+    );
+    let token = "pty-planted-cad375token";
+    let now = format!(
+        "{}",
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    );
+    cad162_sql(
+        &d,
+        "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,result,created,started)
+         VALUES('m-a','wa','task',NULL,'user','running',?1,
+                '{\"status\":\"submitted\",\"ack\":null}',CAST(?2 AS REAL),CAST(?2 AS REAL))",
+        &[token, &now],
+    );
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let state = d.state.display().to_string();
+
+    // The owner acks through its own pane — the token works for it.
+    let (rc, out) = owner.run(&format!(
+        "{bin} --state-dir {state} message ack m-a --token {token}"
+    ));
+    assert_eq!(rc, 0, "{out}");
+
+    // Every read path a peer has: no token anywhere in the answer.
+    let reads = [
+        ("agent_show", json!({"alias": "wa"})),
+        ("agent_list", json!({})),
+        ("agent_events", json!({"alias": "wa"})),
+    ];
+    for (method, params) in &reads {
+        let r = peer.rpc(&d.state, method, params.clone());
+        assert_eq!(r["ok"], true, "{method}: {r}");
+        assert!(!r.to_string().contains(token), "peer {method}: {r}");
+        let r = d.rpc(method, params.clone()).unwrap();
+        assert!(!r.to_string().contains(token), "operator {method}: {r}");
+    }
+    let show = peer.rpc(&d.state, "agent_show", json!({"alias": "wa"}));
+    assert!(
+        show["result"]["agent"]["awaiting_report"]["message"] == "m-a",
+        "{show}"
+    );
+    assert!(
+        show["result"]["agent"]["awaiting_report"]["turn_id"].is_null(),
+        "{show}"
+    );
+    // `cadence self` naming wa from the peer's pane: refused, no token.
+    let (rc, out) = peer.run(&format!("CADENCE_ALIAS=wa {bin} --state-dir {state} self"));
+    assert_ne!(rc, 0, "{out}");
+    assert!(out.contains("shown only to that agent's own pane"), "{out}");
+    assert!(!out.contains(token), "{out}");
+
+    // The owner still reads its own token, on every path.
+    for (method, params) in &reads {
+        let r = owner.rpc(&d.state, method, params.clone());
+        assert!(r.to_string().contains(token), "owner {method}: {r}");
+    }
+    let (rc, out) = owner.run(&format!("CADENCE_ALIAS=wa {bin} --state-dir {state} self"));
+    assert_eq!(rc, 0, "{out}");
+    let me: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(me["running"][0]["id"], "m-a", "{me}");
+    assert_eq!(me["running"][0]["turn_id"], token, "{me}");
+    let (rc, out) = owner.run(&format!(
+        "{bin} --state-dir {state} message result m-a --token {token} --text done"
+    ));
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(d.message_state("wa", "m-a"), "completed");
+}
+
 /// Run the built CLI against `d`'s state dir.
 fn launch_cli(d: &TestDaemon, args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
@@ -37467,7 +37866,7 @@ fn plan_gate_refuses_job_dispatch_until_approved() {
     .unwrap();
     wait_monitor_state(d, "manual", "active", 5);
     let err = d
-        .rpc(
+        .operator_rpc(
             "monitor_dispatch",
             json!({"monitor": "manual", "task": "jp-t"}),
         )
@@ -37501,7 +37900,8 @@ fn plan_gate_refuses_job_dispatch_until_approved() {
         "the automatic path dispatched nothing"
     );
     for monitor in ["manual", "auto"] {
-        d.rpc("monitor_stop", json!({"monitor": monitor})).unwrap();
+        d.operator_rpc("monitor_stop", json!({"monitor": monitor}))
+            .unwrap();
     }
 
     d.job_dispatch("jl-t", json!({})).unwrap();
