@@ -31,6 +31,7 @@ pub mod runner;
 pub mod sandbox;
 pub mod secret;
 pub mod session;
+pub mod setup;
 pub mod skill;
 pub mod slots;
 pub mod store;
