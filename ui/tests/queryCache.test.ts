@@ -124,22 +124,122 @@ async function main() {
     equal(s.calls(), 1, "and goes stale like a fetch");
   }
 
-  // Cache invalidation reaches loaded stores of a key or a family only.
+  // A local write during a fetch wins: the older answer is dropped and one
+  // trailing request confirms against the server.
   {
-    const cache = new QueryCache();
-    const hits: string[] = [];
-    const make = (key: string) => cache.resource(key, () => {
-      hits.push(key);
-      return Promise.resolve(key);
-    });
-    await make("issue:CAD-1").refresh();
-    await make("issue:CAD-2").refresh();
-    make("issue:CAD-3"); // never loaded
-    await make("issues").refresh();
-    hits.length = 0;
+    const s = scripted<string>();
+    const r = new Resource(s.fetcher);
+    const p = r.refresh();
+    r.write(() => "v2");
+    s.resolve("v1");
+    await p;
+    equal(r.get().data, "v2", "late fetch does not overwrite a write");
+    equal(s.calls(), 2, "one trailing request after the dropped answer");
+    s.resolve("v3");
+    await flush();
+    await flush();
+    equal(r.get().data, "v3", "the trailing answer lands");
+    equal(r.get().inFlight, false, "settled");
+  }
+
+  // The drawer case: save (write), a stream frame (write), then the reload
+  // joins the in-flight fetch — the saved detail must survive.
+  {
+    const s = scripted<{ rev: number }>();
+    const r = new Resource(s.fetcher);
+    let p = r.refresh();
+    s.resolve({ rev: 1 });
+    await p;
+    p = r.refresh(); // poll in flight, answered from before the save
+    r.write(() => ({ rev: 2 })); // write response
+    r.write((d) => ({ rev: (d?.rev ?? 0) + 1 })); // stream frame
+    void r.invalidate(); // loadDetail joins the old request
+    s.resolve({ rev: 1 });
+    await p;
+    equal(r.get().data, { rev: 3 }, "no revert to the pre-save payload");
+    s.resolve({ rev: 3 }); // the one trailing request
+    await flush();
+    await flush();
+    equal(s.calls(), 3, "joined reload + dropped answer → one trailing request");
+    // A failure of a request older than a write does not mark it stale.
+    p = r.refresh();
+    r.write(() => ({ rev: 4 }));
+    s.reject(new Error("late 503"));
+    await p;
+    equal(r.get().status, "ok", "an older failure does not stale fresh data");
+    equal(r.get().error, null, "and records no error");
+    equal(s.calls(), 4, "a failed older request queues nothing");
+  }
+
+  // Same for an optimistic mutate (a card drag) during a poll.
+  {
+    const s = scripted<number[]>();
+    const r = new Resource(s.fetcher);
+    let p = r.refresh();
+    s.resolve([1]);
+    await p;
+    p = r.refresh();
+    r.mutate((d) => [...d, 2]);
+    s.resolve([1]);
+    await p;
+    equal(r.get().data, [1, 2], "optimistic change kept over an older answer");
+  }
+
+  // Invalidation refetches only stores someone watches; the others refetch
+  // when a screen revalidates them. Request counts stay bounded.
+  {
+    const cache = new QueryCache({ maxIdle: 100 });
+    let hits = 0;
+    const issue = cache.family(
+      "issue",
+      (id: string) => {
+        hits += 1;
+        return Promise.resolve(id);
+      },
+      { freshMs: 60_000 },
+    );
+    for (let n = 0; n < 50; n++) await issue(`CAD-${n}`).refresh();
+    const off = issue("CAD-7").subscribe(() => {});
+    hits = 0;
+    cache.invalidate("issue");
+    cache.invalidate("issue");
     cache.invalidate("issue");
     await flush();
-    equal(hits.sort(), ["issue:CAD-1", "issue:CAD-2"], "loaded family members only");
+    await flush();
+    equal(hits <= 2, true, `three invalidations of 50 stores cost ${hits} requests`);
+    equal(hits >= 1, true, "the watched store refetched");
+    hits = 0;
+    await issue("CAD-3").revalidate();
+    equal(hits, 1, "a marked store refetches when shown again");
+    await issue("CAD-4").revalidate();
+    await issue("CAD-4").revalidate();
+    equal(hits, 2, "and only once");
+    off();
+    // A plain key is invalidated the same way.
+    let plain = 0;
+    const list = cache.resource("issues", () => Promise.resolve(++plain), { freshMs: 60_000 });
+    await list.refresh();
+    cache.invalidate("issues");
+    await flush();
+    equal(plain, 1, "unwatched list is only marked");
+  }
+
+  // Idle family stores are evicted beyond maxIdle, oldest first; watched
+  // stores and plain keys stay.
+  {
+    const cache = new QueryCache({ maxIdle: 3 });
+    const issue = cache.family("issue", (id: string) => Promise.resolve(id));
+    const pinned = cache.resource("issues", () => Promise.resolve([]));
+    const watched = issue("CAD-0");
+    const off = watched.subscribe(() => {});
+    for (let n = 1; n <= 10; n++) issue(`CAD-${n}`);
+    equal(cache.peek("issue:CAD-1"), null, "oldest idle store evicted");
+    equal(cache.peek("issue:CAD-10") !== null, true, "newest kept");
+    equal(cache.peek("issue:CAD-8") !== null, true, "within the cap kept");
+    equal(cache.peek("issue:CAD-7"), null, "beyond the cap evicted");
+    equal(cache.peek("issue:CAD-0") === watched, true, "watched store kept");
+    equal(cache.peek("issues") === pinned, true, "plain key kept");
+    off();
   }
 
   console.log("query cache checks passed");

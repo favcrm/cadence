@@ -99,6 +99,33 @@ async function main() {
     sub.close();
   }
 
+  // A frame that lands while a fetch is in flight is not reverted by it.
+  {
+    let answer: (v: string[]) => void = () => {};
+    let calls = 0;
+    const r = new Resource<string[]>(() => {
+      calls += 1;
+      return new Promise((resolve) => (answer = resolve));
+    });
+    let source: FakeSource | null = null;
+    const sub = streamInto(r, (data, e) => [...(data ?? []), e.data], {
+      url: "/s",
+      events: ["entry"],
+      open: (url) => (source = new FakeSource(url)),
+    });
+    const p = r.refresh();
+    source!.emit("entry", "live", "1");
+    answer([]); // the page fetched before the frame
+    await p;
+    equal(r.get().data, ["live"], "stream frame survives the older fetch");
+    equal(calls, 2, "one trailing fetch confirms");
+    answer(["live"]);
+    await flush();
+    await flush();
+    equal(r.get().data, ["live"], "trailing answer agrees");
+    sub.close();
+  }
+
   console.log("sse checks passed");
 }
 

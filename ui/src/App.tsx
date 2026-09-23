@@ -156,7 +156,7 @@ export default function App() {
   openIdRef.current = openId;
   const loadDetail = useCallback(() => {
     const id = openIdRef.current;
-    if (id) void resources.issue(id).refresh();
+    if (id) void resources.issue(id).invalidate();
   }, []);
   useEffect(() => {
     if (openId) void resources.issue(openId).revalidate();

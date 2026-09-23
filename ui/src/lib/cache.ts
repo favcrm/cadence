@@ -22,6 +22,11 @@
  * data younger than `freshMs` is not refetched at all — so returning to a
  * slow screen (`/api/overview` takes seconds) paints at once.
  *
+ * Local writes win over older fetches: `write` and `mutate` bump the
+ * store's generation, and a request started before the bump is dropped
+ * when it lands (with one trailing request queued) — so a drawer save or
+ * a stream frame is never reverted by a fetch that predates it.
+ *
  * `QueryCache` keys the stores: `cache.resource(key, fetcher)` hands every
  * caller of one key the same store, so two components asking for the same
  * key share one request and one state.
@@ -68,6 +73,10 @@ export class Resource<T> {
   };
   private inflight: Promise<void> | null = null;
   private trailing = false;
+  /** Bumped by every local write; a fetch from an older one is dropped. */
+  private generation = 0;
+  /** Invalidated while nobody watched: the next `revalidate` fetches. */
+  private invalid = false;
   private readonly listeners = new Set<() => void>();
   private readonly fetcher: () => Promise<T>;
   private readonly isEmpty: (data: T) => boolean;
@@ -91,9 +100,14 @@ export class Resource<T> {
     };
   };
 
+  /** Whether any component is subscribed. */
+  observed = (): boolean => this.listeners.size > 0;
+
   /** Fetch now, or join the request already in flight. */
   refresh = (): Promise<void> => {
     if (this.inflight) return this.inflight;
+    this.invalid = false;
+    const started = this.generation;
     this.set({
       inFlight: true,
       // With nothing loaded a retry is a load, not a standing failure.
@@ -101,6 +115,12 @@ export class Resource<T> {
     });
     const run = this.fetcher().then(
       (data) => {
+        if (this.generation !== started) {
+          // A local write landed while this was in flight: its data is
+          // newer than this answer. Drop it and ask again.
+          this.trailing = true;
+          return;
+        }
         this.set({
           data,
           status: this.isEmpty(data) ? "empty" : "ok",
@@ -109,6 +129,9 @@ export class Resource<T> {
         });
       },
       (e: unknown) => {
+        // A local write since the request started is fresher than any
+        // failure of it.
+        if (this.generation !== started) return;
         this.set({
           status: this.state.data === null ? "failed" : "stale",
           error: message(e),
@@ -126,6 +149,14 @@ export class Resource<T> {
       }
     });
     return this.inflight;
+  };
+
+  /**
+   * The data changed on the server but nobody is looking: fetch on the
+   * next `revalidate` (when a screen shows it) instead of now.
+   */
+  markInvalid = (): void => {
+    this.invalid = true;
   };
 
   /**
@@ -148,7 +179,12 @@ export class Resource<T> {
   revalidate = (): Promise<void> => {
     if (this.inflight) return this.inflight;
     const { asOf } = this.state;
-    if (asOf !== null && this.state.status !== "stale" && this.now() - asOf < this.freshMs) {
+    if (
+      !this.invalid &&
+      asOf !== null &&
+      this.state.status !== "stale" &&
+      this.now() - asOf < this.freshMs
+    ) {
       return Promise.resolve();
     }
     return this.refresh();
@@ -161,6 +197,7 @@ export class Resource<T> {
    */
   write = (fn: (data: T | null) => T): void => {
     const data = fn(this.state.data);
+    this.generation += 1;
     this.set({
       data,
       status: this.isEmpty(data) ? "empty" : "ok",
@@ -176,6 +213,7 @@ export class Resource<T> {
   mutate = (fn: (data: T) => T): void => {
     if (this.state.data === null) return;
     const data = fn(this.state.data);
+    this.generation += 1;
     // Loaded data means ok, empty or stale; a write does not clear stale.
     const status = this.isEmpty(data)
       ? "empty"
@@ -198,13 +236,23 @@ export class Resource<T> {
  */
 export class QueryCache {
   private readonly entries = new Map<string, Resource<unknown>>();
+  /** Family keys — per-argument stores that may be evicted when idle. */
+  private readonly evictable = new Set<string>();
+  private readonly maxIdle: number;
+
+  /** `maxIdle`: family stores kept while nobody subscribes (oldest go first). */
+  constructor(opts: { maxIdle?: number } = {}) {
+    this.maxIdle = opts.maxIdle ?? 32;
+  }
 
   resource<T>(key: string, fetcher: () => Promise<T>, opts?: ResourceOptions<T>): Resource<T> {
     let entry = this.entries.get(key) as Resource<T> | undefined;
     if (!entry) {
       entry = new Resource(fetcher, opts);
-      this.entries.set(key, entry as Resource<unknown>);
     }
+    // Map order is recency order: re-insert on every use.
+    this.entries.delete(key);
+    this.entries.set(key, entry as Resource<unknown>);
     return entry;
   }
 
@@ -214,7 +262,13 @@ export class QueryCache {
     fetcher: (arg: A) => Promise<T>,
     opts?: ResourceOptions<T>,
   ): (arg: A) => Resource<T> {
-    return (arg) => this.resource(`${prefix}:${arg}`, () => fetcher(arg), opts);
+    return (arg) => {
+      const key = `${prefix}:${arg}`;
+      const entry = this.resource(key, () => fetcher(arg), opts);
+      this.evictable.add(key);
+      this.evict();
+      return entry;
+    };
   }
 
   /** The store for `key` if anything created it, else null. */
@@ -223,14 +277,31 @@ export class QueryCache {
   }
 
   /**
-   * Invalidate every loaded store whose key is `key` or starts with
-   * `key:`. Stores nothing has loaded stay idle until a screen asks.
+   * The data behind `key` (or every `key:…` family member) changed. Stores
+   * a component is subscribed to refetch now; the others are only marked,
+   * and refetch when a screen revalidates them — so invalidating a family
+   * costs one request per store on screen, not one per id ever loaded.
    */
   invalidate(key: string): void {
     for (const [k, entry] of this.entries) {
-      if ((k === key || k.startsWith(`${key}:`)) && entry.get().asOf !== null) {
-        void entry.invalidate();
-      }
+      if (k !== key && !k.startsWith(`${key}:`)) continue;
+      if (entry.observed()) void entry.invalidate();
+      else entry.markInvalid();
+    }
+  }
+
+  /** Drop the least recently used idle family stores beyond `maxIdle`. */
+  private evict(): void {
+    const idle = [...this.evictable].filter((k) => {
+      const entry = this.entries.get(k);
+      return entry && !entry.observed() && !entry.get().inFlight;
+    });
+    // `idle` follows Set insertion order; order it by recency instead.
+    const order = [...this.entries.keys()];
+    idle.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+    for (const k of idle.slice(0, Math.max(0, idle.length - this.maxIdle))) {
+      this.entries.delete(k);
+      this.evictable.delete(k);
     }
   }
 }
