@@ -45,10 +45,20 @@
 //! Only the `daemon run` process enables this. In-process test daemons
 //! (`daemon::serve_with` inside a test binary) do not: a test binary
 //! spawns children outside this registry, so a reaper there could steal.
+//! A process that never enabled it (every CLI, `cadence ui`) registers
+//! nothing — there is no reaper to prune the registry, so it would only
+//! grow.
+//!
+//! **Visibility.** An orphan no longer sees `getppid() == 1`, so a helper
+//! that polls for that to exit when orphaned now lives on as a live
+//! daemon child. [`adopted_report`] counts live children that are not
+//! registered (what `health` shows as `adopted_live`) — nothing kills
+//! them.
 
 use std::collections::HashMap;
 use std::io;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
@@ -61,6 +71,13 @@ static GATE: RwLock<()> = RwLock::new(());
 /// is provably not our child.
 static OWNED: Mutex<Option<HashMap<u32, Option<u64>>>> = Mutex::new(None);
 
+/// Set once, by [`arm`], before any child is spawned; registration and
+/// reaping happen only in a process where it is set.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Adopted children reaped since [`enable`].
+static REAPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// How often the reaper looks for exited orphans.
 const REAP_TICK: Duration = Duration::from_secs(1);
 
@@ -70,6 +87,9 @@ const REAP_TICK: Duration = Duration::from_secs(1);
 pub fn spawn(cmd: &mut Command) -> io::Result<Child> {
     let _gate = GATE.read().unwrap_or_else(|e| e.into_inner());
     let child = cmd.spawn()?;
+    if !ENABLED.load(Ordering::SeqCst) {
+        return Ok(child);
+    }
     let pid = child.id();
     // The child is unreaped here: its owner has not got it back yet and
     // no reaper pass can run, so its stat (live or zombie) is its own.
@@ -102,10 +122,7 @@ pub fn status(cmd: &mut Command) -> io::Result<ExitStatus> {
 /// before any child is spawned. An `Err` means the kernel refused the
 /// flag — the daemon must not run without it.
 pub fn enable() -> io::Result<()> {
-    // SAFETY: plain prctl with integer arguments.
-    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    arm()?;
     std::thread::Builder::new()
         .name("subreaper".into())
         .spawn(|| loop {
@@ -120,6 +137,65 @@ pub fn enable() -> io::Result<()> {
     Ok(())
 }
 
+/// Turn registration on, then mark the process child subreaper — both
+/// before any child exists, so every child it ever has is registered.
+fn arm() -> io::Result<()> {
+    ENABLED.store(true, Ordering::SeqCst);
+    // SAFETY: plain prctl with integer arguments.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// One adopted live child, for [`adopted_report`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adopted {
+    pub pid: u32,
+    pub comm: String,
+    pub age_secs: u64,
+}
+
+/// What the subreaper holds: live children this process did NOT spawn
+/// (adopted orphans still running — a `getppid() == 1` watcher that no
+/// longer fires, the tmux server it started), the oldest `limit` of
+/// them, and how many adopted children it has reaped. All zero when the
+/// reaper is not enabled.
+pub fn adopted_report(limit: usize) -> (usize, Vec<Adopted>, u64) {
+    if !ENABLED.load(Ordering::SeqCst) {
+        return (0, Vec::new(), 0);
+    }
+    // Exclusive, so no child is caught between spawn and registration.
+    let _gate = GATE.write().unwrap_or_else(|e| e.into_inner());
+    let guard = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+    let clk = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    let uptime_ticks = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|u| u.split_whitespace().next()?.parse::<f64>().ok())
+        .map_or(0, |secs| (secs * clk as f64) as u64);
+    let mut live: Vec<Adopted> = children()
+        .into_iter()
+        .filter(|pid| !guard.as_ref().is_some_and(|m| m.contains_key(pid)))
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (head, rest) = stat.rsplit_once(')')?;
+            if rest.trim_start().starts_with('Z') {
+                return None;
+            }
+            let start: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
+            Some(Adopted {
+                pid,
+                comm: head.split_once('(').map_or("", |(_, c)| c).to_string(),
+                age_secs: uptime_ticks.saturating_sub(start) / clk,
+            })
+        })
+        .collect();
+    let count = live.len();
+    live.sort_by(|a, b| b.age_secs.cmp(&a.age_secs).then(a.pid.cmp(&b.pid)));
+    live.truncate(limit);
+    (count, live, REAPED_TOTAL.load(Ordering::SeqCst))
+}
+
 /// Whether this process is marked child subreaper (`PR_GET_CHILD_SUBREAPER`).
 pub fn is_subreaper() -> bool {
     let mut flag: libc::c_int = 0;
@@ -131,6 +207,15 @@ pub fn is_subreaper() -> bool {
 /// One reaper pass (see the module doc). Returns how many adopted
 /// children it reaped.
 pub fn reap_adopted() -> usize {
+    if !ENABLED.load(Ordering::SeqCst) {
+        return 0;
+    }
+    let reaped = reap_pass();
+    REAPED_TOTAL.fetch_add(reaped as u64, Ordering::SeqCst);
+    reaped
+}
+
+fn reap_pass() -> usize {
     let _gate = GATE.write().unwrap_or_else(|e| e.into_inner());
     let mut guard = OWNED.lock().unwrap_or_else(|e| e.into_inner());
     let owned = guard.get_or_insert_with(HashMap::new);
@@ -249,19 +334,28 @@ fn proc_starttime(pid: u32) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// A spawned child is registered with its own start time, and a
-    /// registration outlives nothing: once its owner has reaped it the
-    /// pid is not our child, so the registration is dropped.
+    /// A process that never enabled the reaper (this test binary, every
+    /// CLI, `cadence ui`) registers nothing however much it spawns —
+    /// nothing would ever prune it — and reaps and reports nothing.
     #[test]
-    fn spawn_registers_until_the_owner_reaps() {
+    fn a_process_that_never_enabled_registers_nothing() {
+        assert!(!ENABLED.load(Ordering::SeqCst));
+        for _ in 0..25 {
+            assert!(status(&mut Command::new("true")).unwrap().success());
+        }
+        let owned = OWNED.lock().unwrap().as_ref().map_or(0, HashMap::len);
+        assert_eq!(owned, 0);
+        assert_eq!(reap_adopted(), 0);
+        assert_eq!(adopted_report(5), (0, Vec::new(), 0));
+    }
+
+    /// A registration outlives nothing: once its owner has reaped the
+    /// child, the pid is not our child and the registration drops.
+    #[test]
+    fn a_registration_ends_when_the_owner_reaps() {
         let mut child = spawn(Command::new("true").stdout(Stdio::null())).unwrap();
         let pid = child.id();
-        let start = OWNED
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|m| m.get(&pid).copied())
-            .expect("registered at spawn");
+        let start = proc_starttime(pid);
         assert!(start.is_some(), "start time read while unreaped");
         assert!(still_owned(pid, start), "unreaped: still ours");
         assert!(child.wait().unwrap().success());
@@ -371,11 +465,64 @@ mod tests {
         if std::env::var_os("CADENCE_REAPER_PROOF").is_none() {
             return;
         }
-        assert_eq!(
-            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
-            0
-        );
+        arm().unwrap();
         assert!(is_subreaper());
+        // Registered at spawn, with its own start time.
+        let mut probe = spawn(&mut Command::new("true")).unwrap();
+        let registered = OWNED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&probe.id()).copied());
+        assert!(matches!(registered, Some(Some(_))), "{registered:?}");
+        assert!(probe.wait().unwrap().success());
+        // A live adopted orphan is counted, never killed; owned children
+        // are not counted.
+        let orphan_dir = tempfile::tempdir().unwrap();
+        let pidf = orphan_dir.path().join("live-orphan.pid");
+        let script = format!(
+            "setsid -f sh -c 'echo $$ > {f}; exec sleep 30' </dev/null >/dev/null 2>&1",
+            f = pidf.display()
+        );
+        assert!(status(Command::new("sh").args(["-c", &script]))
+            .unwrap()
+            .success());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let live: u32 = loop {
+            let pid = std::fs::read_to_string(&pidf)
+                .ok()
+                .and_then(|t| t.trim().parse().ok());
+            if let Some(pid) = pid.filter(|p| children().contains(p)) {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no live orphan adopted"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut owned_sleeper = spawn(Command::new("sleep").arg("30")).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let (count, oldest, reaped) = loop {
+            let report = adopted_report(5);
+            if report.1.first().is_some_and(|a| a.comm == "sleep") {
+                break report;
+            }
+            assert!(std::time::Instant::now() < deadline, "{report:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!((count, reaped), (1, 0), "{oldest:?}");
+        assert_eq!(oldest[0].pid, live);
+        unsafe { libc::kill(live as libc::pid_t, libc::SIGKILL) };
+        owned_sleeper.kill().unwrap();
+        assert!(owned_sleeper.wait().is_ok());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !zombie(live) {
+            assert!(std::time::Instant::now() < deadline, "orphan never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(reap_adopted(), 1, "the killed orphan");
+        assert_eq!(adopted_report(5), (0, Vec::new(), 1));
         let dir = tempfile::tempdir().unwrap();
         let mut owned: Vec<(Child, i32)> = (0..5)
             .map(|i| {
@@ -417,6 +564,7 @@ mod tests {
         assert_eq!(reap_adopted(), 0);
         let adopted = adopt_exited_orphans(dir.path(), "round-2", 6);
         assert_eq!(reap_adopted(), adopted.len());
+        assert_eq!(REAPED_TOTAL.load(Ordering::SeqCst), 1 + 8 + 6);
         assert!(children().iter().all(|&p| !zombie(p)), "{:?}", children());
     }
 

@@ -30976,6 +30976,42 @@ fn wait_reaped(pid: u32, what: &str) {
     }
 }
 
+/// Wait until the daemon has no zombie child left (bounded).
+fn wait_no_daemon_zombies(daemon_pid: u64) {
+    let zombies = || -> Vec<u32> {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{daemon_pid}/task")) else {
+            return Vec::new();
+        };
+        tasks
+            .flatten()
+            .filter_map(|t| std::fs::read_to_string(t.path().join("children")).ok())
+            .flat_map(|c| {
+                c.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+                    s.rsplit_once(')')
+                        .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+                })
+            })
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let left = zombies();
+        if left.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "zombie children of the daemon linger: {left:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// The `daemon run` process's pid, and that it is the child subreaper.
 fn subreaper_daemon_pid(d: &TestDaemon) -> u64 {
     let health = d.rpc("health", json!({})).unwrap();
@@ -31177,6 +31213,47 @@ fn slot_reconcile_refuses_a_managed_tools_setsid_detach() {
     );
 }
 
+/// CAD-308: a managed endpoint under the active reaper starts, runs
+/// tool subprocesses and stops as it always did. Its provider is the
+/// adapter's own child: the adapter collects it on stop (no `/proc`
+/// entry left, no `ECHILD` anywhere), the agent reads `stopped` with no
+/// error, no zombie child of the daemon lingers, and nothing the daemon
+/// spawned itself is counted as adopted.
+#[test]
+fn subreaper_managed_endpoint_starts_and_stops_cleanly() {
+    let dir = TempDir::new().unwrap();
+    // A hermetic tracker dir for the daemon (no host pm.yaml).
+    let (_proj, _repo) = runner_project(&sh_recipe("ok", "echo ok", &[]));
+    let mock = ManagedWorker::install(dir.path(), dir.path(), "wk");
+    let d = TestDaemon::start_process_in(dir);
+    let _reaper = DaemonReaper::new(&d.state);
+    let daemon_pid = subreaper_daemon_pid(&d);
+    let mut wk = mock.enroll(&d, "wk");
+    let root = wk.pid;
+    for code in [0, 3] {
+        let r = wk.exec(&["sh", "-c", &format!("exit {code}")]);
+        assert_eq!(r["rc"], code, "{r}");
+    }
+    let health = d.rpc("health", json!({})).unwrap();
+    assert_eq!(health["adopted_live"], 0, "the provider is owned: {health}");
+    d.rpc("agent_stop", json!({"alias": "wk"})).unwrap();
+    let agent = d.wait_agent("wk", "stopped", 20);
+    assert!(agent["error"].is_null(), "{agent}");
+    wait_reaped(root, "the managed provider, collected by its adapter");
+    wait_no_daemon_zombies(daemon_pid);
+    let health = d.rpc("health", json!({})).unwrap();
+    assert_eq!(health["adopted_live"], 0, "{health}");
+    let events = d
+        .events("wk")
+        .iter()
+        .map(Value::to_string)
+        .collect::<String>();
+    let log = std::fs::read_to_string(d.dir.path().join("daemon-process.log")).unwrap();
+    for text in [&events, &log] {
+        assert!(!text.contains("No child processes"), "{text}");
+    }
+}
+
 /// CAD-308: the reaper never takes an owned child's exit status. Under
 /// `daemon run`, recipes that each leave a burst of detached children
 /// exiting at once — orphans the daemon adopts and must reap — still
@@ -31224,38 +31301,12 @@ fn subreaper_reaps_orphans_while_owners_keep_their_exit_statuses() {
     }
     // Every child of the daemon that is a zombie now must be gone soon:
     // nothing owns the adopted orphans but the reaper.
-    let zombies = || -> Vec<u32> {
-        let Ok(tasks) = std::fs::read_dir(format!("/proc/{daemon_pid}/task")) else {
-            return Vec::new();
-        };
-        tasks
-            .flatten()
-            .filter_map(|t| std::fs::read_to_string(t.path().join("children")).ok())
-            .flat_map(|c| {
-                c.split_whitespace()
-                    .filter_map(|p| p.parse::<u32>().ok())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|pid| {
-                std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
-                    s.rsplit_once(')')
-                        .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
-                })
-            })
-            .collect()
-    };
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let left = zombies();
-        if left.is_empty() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "zombie children of the daemon linger: {left:?}"
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
+    wait_no_daemon_zombies(daemon_pid);
+    let health = d.rpc("health", json!({})).unwrap();
+    assert!(
+        health["adopted_reaped_total"].as_u64().unwrap() >= 6 * 40,
+        "every flooded orphan was adopted and reaped: {health}"
+    );
     let log = std::fs::read_to_string(d.dir.path().join("daemon-process.log")).unwrap();
     assert_eq!(
         log.matches(&format!("subreaper: pid {daemon_pid} "))

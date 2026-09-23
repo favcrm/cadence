@@ -1640,7 +1640,10 @@ impl Shared {
         match method {
             // `pid` is the singleton-lock holder: `daemon start` tells
             // the child it spawned from a daemon that already ran.
-            "health" => Ok(json!({
+            "health" => Ok({
+                let (adopted_live, adopted_oldest, adopted_reaped_total) =
+                    crate::reaper::adopted_report(5);
+                json!({
                 "state": "ready",
                 "pid": std::process::id(),
                 "protocol": proto::PROTOCOL_VERSION,
@@ -1650,7 +1653,16 @@ impl Shared {
                 // CAD-308: whether orphans of what this daemon launched
                 // re-parent to it (true for `daemon run`).
                 "child_subreaper": crate::reaper::is_subreaper(),
-            })),
+                // Adopted orphans still running (never killed) and the
+                // adopted children reaped so far — CAD-308.
+                "adopted_live": adopted_live,
+                "adopted_oldest": adopted_oldest
+                    .iter()
+                    .map(|a| json!({"pid": a.pid, "comm": a.comm, "age_secs": a.age_secs}))
+                    .collect::<Vec<_>>(),
+                "adopted_reaped_total": adopted_reaped_total,
+                })
+            }),
             // Build identity + process start — the deploy-drift check
             // measures merged commits against *this* binary's commit.
             "daemon_info" => Ok(json!({

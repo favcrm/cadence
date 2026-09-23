@@ -36,7 +36,7 @@ Error kinds:
 
 | Method | Params | Result |
 |---|---|---|
-| `health` | — | `{state:"ready", protocol:1, capabilities:[...], agent_gc_timer:{enabled, older_than_secs, ...}, agent_auto_stop:{enabled, idle_secs, by_provider, last_stopped, last_kept, ...}, child_subreaper}` — `child_subreaper` is true when the daemon process is the child subreaper of what it launches (`daemon run`, CAD-308) |
+| `health` | — | `{state:"ready", protocol:1, capabilities:[...], agent_gc_timer:{enabled, older_than_secs, ...}, agent_auto_stop:{enabled, idle_secs, by_provider, last_stopped, last_kept, ...}, child_subreaper}` — `child_subreaper` is true when the daemon process is the child subreaper of what it launches (`daemon run`, CAD-308); `adopted_live` counts live children the daemon did not spawn (adopted orphans still running), `adopted_oldest` lists the oldest five as `{pid, comm, age_secs}`, `adopted_reaped_total` counts adopted children reaped since start — all zero when the reaper is not enabled |
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded), writes the clean-stop marker, then exits |
 | `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?, team_role?, model_policy?` | `{alias,state:"starting"|"idle",provider}`. `team_role` is model-lookup metadata (`ops` normalizes to `devops`); it does not change runtime `role`. `model_policy` is `inherit` (default) or `provider_default` |
 | `agent_list` | — | `{agents:[Agent+tasks+capabilities]}` — `tasks` names the alias's non-terminal task assignments; `capabilities` is the registry descriptor |
@@ -1678,7 +1678,27 @@ a child that is not registered; when an owned zombie heads the queue it
 sweeps the other children from `/proc/self/task/*/children`. Adapters,
 runner threads and `git` calls keep collecting their own children's
 statuses. In-process daemons (a test binary's `daemon::serve_with`)
-never enable any of this.
+never enable any of this, and a process that never enabled it (every
+CLI, `cadence ui`) registers nothing — there is no reaper to prune its
+registry.
+
+Limits of the reaper: the sweep reads `/proc/<pid>/task/*/children`,
+which needs `CONFIG_PROC_CHILDREN` (Ubuntu and common distribution
+kernels have it). Without it, adopted zombies queued behind an owned
+zombie wait until its owner collects it — the reaper still never takes
+an owned status; it only reaps later. A `Child` its owner drops without
+waiting stays registered and its zombie stays unreaped (as before
+CAD-308), and while it heads the queue each pass sweeps `/proc` once a
+second.
+
+**Behaviour change — orphans no longer see `getppid() == 1`.** An
+orphan of a daemon-launched tree has the daemon as its parent, so a
+helper that polls `getppid() == 1` to exit once orphaned (some Node MCP
+or language servers under a managed provider) no longer notices and
+keeps running as a live daemon child. The daemon never kills adopted
+processes; `health.adopted_live` / `adopted_oldest` (shown by `cadence
+daemon status`) make accumulation visible. Helpers that watch stdin EOF
+or `PR_SET_PDEATHSIG` are unaffected.
 
 **Residual (CAD-280):** the subreaper covers trees the *daemon
 instance* launched. A process that asks a long-lived process OUTSIDE
