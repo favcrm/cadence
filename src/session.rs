@@ -39,6 +39,7 @@ use crate::error::{Error, Result};
 use crate::issue::{self, board, project, time as itime};
 use crate::overview;
 use crate::ui;
+use crate::worktree::layout;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Sev {
@@ -901,7 +902,7 @@ fn gh_open(
 fn worktree_dirs(repos: &[(String, Option<String>, PathBuf)]) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     for (_, _, root) in repos {
-        let wt = root.join(".cadence").join("wt");
+        let wt = layout::worktrees_dir(root);
         let Ok(entries) = std::fs::read_dir(&wt) else {
             continue;
         };
@@ -1760,23 +1761,26 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                 let Some(head) = pr["headRefName"].as_str() else {
                     continue;
                 };
-                let Some(name) = head.strip_prefix("cadence/") else {
+                let Some(name) = layout::name_of_branch(head) else {
                     continue;
                 };
-                if !root.join(".cadence").join("wt").join(name).exists() {
+                if !layout::worktree_dir(root, name).exists() {
                     let n = pr["number"].as_i64().unwrap_or(0);
                     recon.push(Finding::new(
                         format!("pr:{slug}#{n}"),
                         Some(key.clone()),
                         Sev::Warn,
-                        format!("PR #{n} branch {head} — no .cadence/wt/{name} locally"),
+                        format!(
+                            "PR #{n} branch {head} — no {} locally",
+                            layout::rel_dir(name)
+                        ),
                     ));
                 }
             }
         }
         // `.cadence/wt/*` with neither an open PR nor an open issue.
         for (root, name) in worktree_dirs(&sc.repos) {
-            let branch = format!("cadence/{name}");
+            let branch = layout::branch(&name);
             let has_pr = pr_branches.contains(&branch);
             let open_issue = issue_stem(&name)
                 .and_then(|id| sc.issue_status.get(&id))
@@ -1787,13 +1791,14 @@ pub fn run_start(opts: &StartOptions) -> Result<i32> {
                     .iter()
                     .find(|(_, _, r)| *r == root)
                     .map(|(k, _, _)| k.clone());
+                let rel = layout::rel_dir(&name);
                 recon.push(Finding::new(
-                    format!("worktree:{}/.cadence/wt/{name}", root.display()),
+                    format!("worktree:{}/{rel}", root.display()),
                     project,
                     Sev::Warn,
                     format!(
-                        "orphan worktree {}/.cadence/wt/{name} — no open PR or issue; \
-                         inspect, then `git -C {} worktree remove .cadence/wt/{name}`",
+                        "orphan worktree {}/{rel} — no open PR or issue; \
+                         inspect, then `git -C {} worktree remove {rel}`",
                         root.display(),
                         root.display()
                     ),
