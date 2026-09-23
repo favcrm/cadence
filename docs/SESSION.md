@@ -355,11 +355,25 @@ counts, the three-way failure compare, pairwise conflicts with other
 open PRs, a schema-migration flag, and a `suggested_verdict` of
 `pass|needs-hands-on|blocked` with reasons — also the process exit
 code (0/1/2). It never posts a status, never merges, never pushes.
-Every step command runs like GitHub CI, with no git identity (CAD-301):
-a scratch `HOME`, no system config, `user.useConfigOnly=true`, and the
-identity variables unset. A test that commits without `-c user.name=…
--c user.email=…` therefore fails the review, not just CI. `CARGO_HOME`,
-`RUSTUP_HOME` and `XDG_DATA_HOME` keep their real paths.
+Every step command runs like GitHub CI, with no git identity (CAD-301,
+CAD-307). A test that commits without `-c user.name=… -c user.email=…`
+therefore fails the review, not just CI. Besides its own context
+variables (`CADENCE_REVIEW_PR`, `_HEAD`, `_BASE`, `_MERGE_BASE`,
+`_TREE`, `_ROOT`) and the suite-slot ones below, the review sets:
+
+- `HOME`: a scratch directory, mode 0700 whatever the umask, removed
+  when the review ends.
+- `GIT_CONFIG_NOSYSTEM=1`.
+- `user.useConfigOnly=true`, appended through `GIT_CONFIG_COUNT` /
+  `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`. The caller's own
+  entries are kept, renumbered, except identity keys.
+- `CARGO_HOME`, `RUSTUP_HOME` and `XDG_DATA_HOME`: the caller's real
+  paths. When unset they derive from the real home (`HOME`, else the
+  passwd entry, as cargo and rustup resolve it).
+
+It unsets `EMAIL`, `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`,
+`GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`, `GIT_CONFIG_PARAMETERS`,
+`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `XDG_CONFIG_HOME`.
 
 Safety edges the tool owns: it refuses to reuse an existing
 `.cadence/wt/review-<pr>` checkout (a `--keep` leftover or a
