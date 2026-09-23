@@ -5460,7 +5460,7 @@ impl Store {
     /// unread, newest arrival, and the last `inbox_read` completion —
     /// the inputs to [`crate::inbox::health`].
     pub fn inbox_consumer(&self, alias: &str) -> Result<Value> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let (unread, oldest, newest, last_read): (i64, Option<f64>, Option<f64>, Option<f64>) =
             conn.query_row(
                 "SELECT COALESCE(SUM(state='queued'),0),
@@ -5483,7 +5483,7 @@ impl Store {
 
     /// When `kind` last fired on `alias`'s event stream, if ever.
     pub fn last_event_at(&self, alias: &str, kind: &str) -> Result<Option<f64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         Ok(conn.query_row(
             "SELECT MAX(at) FROM events WHERE alias=? AND kind=?",
             params![alias, kind],
