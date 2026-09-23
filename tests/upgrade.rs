@@ -1002,3 +1002,46 @@ fn cli_requires_exactly_one_target() {
         stderr(&both)
     );
 }
+
+/// CAD-314: `cadence upgrade` takes `cadence backup` before it installs
+/// anything; when that backup fails the upgrade stops there — no
+/// download, no release dir, no link.
+#[test]
+fn upgrade_refuses_before_installing_when_the_pre_upgrade_backup_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("s");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("cadence.sqlite3"),
+        b"not a sqlite database at all",
+    )
+    .unwrap();
+    let link = tmp.path().join("bin/cadence");
+    let releases = tmp.path().join("releases");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args([
+            "upgrade",
+            "--sha",
+            &"a".repeat(40),
+            "--repo",
+            "invalid/none",
+        ])
+        .arg("--link")
+        .arg(&link)
+        .arg("--releases-dir")
+        .arg(&releases)
+        .env("PATH", "/nonexistent")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("pre-upgrade backup failed"), "{text}");
+    assert!(!releases.exists());
+    assert!(std::fs::symlink_metadata(&link).is_err());
+}

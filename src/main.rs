@@ -1003,9 +1003,12 @@ enum Commands {
     },
     /// Write a portable tar bundle: a verified database copy, its
     /// manifest, `repo-map.json` (project -> remote + local path from the
-    /// tracker's project.yaml files) and the briefings dir. Every text
-    /// member is secret-scanned; a blocking finding refuses the export and
-    /// nothing is written. Provider logs are never included.
+    /// tracker's project.yaml files) and the briefings dir. The text
+    /// members and the database's free-text columns (message history,
+    /// event payloads, instructions) are secret-scanned; a blocking
+    /// finding refuses the export and nothing is written. Provider logs
+    /// are never included. The manifest sha256 detects corruption, not
+    /// tampering: restore only bundles you trust.
     Export {
         /// The bundle to create (refused if it exists).
         #[arg(long)]
@@ -1013,6 +1016,11 @@ enum Commands {
         /// Tracker directory for the repo map [default: $CADENCE_PM_DIR, else ~/pm].
         #[arg(long)]
         pm_dir: Option<PathBuf>,
+        /// Copy the database as-is without scanning it. It may then hold
+        /// credentials from message history: keep the bundle as private
+        /// as the live database.
+        #[arg(long)]
+        allow_unscanned_db: bool,
     },
     /// Restore a bundle from `cadence export` or a backup manifest from
     /// `cadence backup` into --state-dir. Refuses a running daemon, an
@@ -5383,13 +5391,20 @@ fn run() -> Result<i32> {
             )?);
             Ok(0)
         }
-        Commands::Export { bundle, pm_dir } => {
+        Commands::Export {
+            bundle,
+            pm_dir,
+            allow_unscanned_db,
+        } => {
             let pm_dir = match pm_dir {
                 Some(dir) => dir,
                 None => cadence_agent::issue::default_dir()?,
             };
             print_json(&cadence_agent::backup::export(
-                &state_dir, &bundle, &pm_dir,
+                &state_dir,
+                &bundle,
+                &pm_dir,
+                allow_unscanned_db,
             )?);
             Ok(0)
         }
