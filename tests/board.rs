@@ -2246,6 +2246,95 @@ fn ui_write_caller_derives_from_pane_ancestry() {
     assert_eq!(commits(pm.path()), commits_before);
 }
 
+/// CAD-263: a `setsid`'d child of a registered pane has no pane on its
+/// `/proc` ancestry, but it still carries the pane's `CADENCE_ALIAS` —
+/// the daemon's caller rule ties it to that agent, and the board shares
+/// the rule, so the write is the agent's, never `operator`'s. The
+/// client double-forks (`setsid -f`) and connects only once the pane is
+/// provably off its ancestry, so the ancestry signal cannot carry it.
+#[test]
+fn ui_write_caller_attributes_a_setsid_child_of_a_pane() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let out_dir = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    let body = r#"{"body":"from a detached child"}"#;
+    let request = format!(
+        "POST /api/issues/CAD-3/comments HTTP/1.0\r\nHost: {host}\r\n\
+         Content-Type: application/json\r\nX-Cadence-Board: 1\r\n\
+         Origin: http://{host}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let out = out_dir.path().join("response");
+    // The client waits until the pane pid is off its ancestry (the
+    // `setsid -f` intermediate has exited and it was reparented), then
+    // writes over bash's /dev/tcp and lands the reply atomically.
+    let client = r#"
+        on_pane_lineage() {
+            p=$$
+            while [ "$p" -gt 1 ]; do
+                [ "$p" = "$PANE" ] && return 0
+                p=$(awk '/^PPid:/{print $2}' "/proc/$p/status") || return 0
+                [ -n "$p" ] || return 0
+            done
+            return 1
+        }
+        while on_pane_lineage; do sleep 0.02; done
+        exec 3<>"/dev/tcp/127.0.0.1/$PORT"
+        printf '%s' "$REQ" >&3
+        cat <&3 >"$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+    "#;
+    // The pane: detaches the client, then stays alive (its row is a
+    // live registered pane) until the test closes its stdin.
+    let mut pane = Command::new("bash")
+        .args([
+            "-c",
+            r#"read -r _; PANE=$$ setsid -f bash -c "$CLIENT" </dev/null >/dev/null 2>&1; read -r _; true"#,
+        ])
+        .env("CADENCE_ALIAS", "pane-s")
+        .env("CLIENT", client)
+        .env("PORT", port.to_string())
+        .env("REQ", &request)
+        .env("OUT", &out)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    plant_pane(&d, "pane-s", pane.id());
+    let mut stdin = pane.stdin.take().unwrap();
+    stdin.write_all(b"go\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !out.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the detached client never answered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    drop(stdin);
+    assert!(pane.wait().unwrap().success());
+    let response = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
+        "{response}"
+    );
+    let json_body = response.split_once("\r\n\r\n").unwrap().1;
+    let v: Value = serde_json::from_str(json_body).unwrap();
+    let comment = v["issue"]["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["body"] == "from a detached child")
+        .unwrap()
+        .clone();
+    assert_eq!(comment["author"], "pane-s", "{comment}");
+    let (_, last) = git(pm.path(), &["log", "-1", "--format=%B"]);
+    assert!(last.contains("Actor: pane-s"), "{last}");
+    assert!(!last.contains("operator"), "{last}");
+}
+
 /// Seed the tracker and daemon-side world for the binding tests:
 /// pm + wk fake agents, a job bound to `issue`, one task for `wk`
 /// dispatched so the task is live. Returns (job_id, task_id).

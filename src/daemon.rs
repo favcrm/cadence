@@ -31,6 +31,7 @@ use crate::adapter::{
 use crate::client;
 use crate::error::{Error, Result};
 use crate::memory::{self, IdentityProof, NativeIdentity};
+use crate::peer::{unmatched_caller, PeerTies};
 use crate::proto;
 use crate::slots::{SlotConfig, SlotKind, Slots};
 use crate::store::{self, Agent, Message, Store, Take};
@@ -2279,9 +2280,11 @@ impl Shared {
     /// from an agent's pane root IS that agent), the pane's own
     /// `CADENCE_ALIAS` env the peer still carries (a `setsid` detach
     /// keeps it), and a shared controlling pty via fd targets (detach
-    /// keeps stdio). A pane must never act on its own pane state: a
-    /// worker that can reach the socket could otherwise self-sanction
-    /// the very decision the menu exists to gate.
+    /// keeps stdio). The signals are [`PeerTies`] — the one rule the
+    /// board's write identity shares (CAD-263). A pane must never act
+    /// on its own pane state: a worker that can reach the socket could
+    /// otherwise self-sanction the very decision the menu exists to
+    /// gate.
     ///
     /// Deterministic: the target's pane is checked first — self-refusal
     /// never loses to map order — then the others sorted by alias.
@@ -2302,34 +2305,28 @@ impl Shared {
         verb: &str,
     ) -> Result<(String, &'static str)> {
         let facts = self.store.pty_endpoint_facts()?;
-        let chain = proc_ancestors(peer_pid);
-        let env_alias = caller_env_alias(peer_pid);
-        let member = |pane_pid: u32| -> bool {
-            chain.as_deref().is_some_and(|c| c.contains(&pane_pid))
-                || holds_pane_tty(peer_pid, pane_pid)
-        };
+        let peer = PeerTies::probe(peer_pid);
         if let Some((_, pane_pid, _)) = facts.get(alias) {
-            if member(*pane_pid) || env_alias.as_deref() == Some(alias) {
+            if peer.tied_to(alias, *pane_pid) {
                 return Err(Error::rejected(format!(
                     "a pane cannot {verb} its own pane — the caller is tied \
                      to the target's pane process",
                 )));
             }
         }
-        let mut others: Vec<(&String, &(String, u32, String))> =
-            facts.iter().filter(|(a, _)| a.as_str() != alias).collect();
-        others.sort_by_key(|(a, _)| *a);
-        for (a, (_, pane_pid, _)) in others {
-            if member(*pane_pid) || env_alias.as_deref() == Some(a.as_str()) {
-                return Ok((a.clone(), "agent"));
-            }
+        let others = facts
+            .iter()
+            .filter(|(a, _)| a.as_str() != alias)
+            .map(|(a, (_, pane_pid, _))| (a.as_str(), *pane_pid));
+        if let Some(agent) = peer.agents(others).into_iter().next() {
+            return Ok((agent, "agent"));
         }
         // `/proc/<pid>` is a directory — `read_link` on it is always
         // EINVAL, so liveness is a `metadata` existence check.
         let target_alive = facts
             .get(alias)
             .is_some_and(|(_, pid, _)| std::fs::metadata(format!("/proc/{pid}")).is_ok());
-        unmatched_caller(chain.is_some(), target_alive, peer_on_tty(peer_pid), verb)
+        unmatched_caller(peer.walked(), target_alive, peer.on_tty(), verb)
     }
 
     /// `agent answer`: one menu-choice keystroke to a pane currently
@@ -4917,94 +4914,6 @@ fn process_start_identity(pid: u32) -> Result<u64> {
         .get(19)
         .and_then(|v| v.parse::<u64>().ok())
         .ok_or_else(|| Error::rejected(format!("Missing process start for pid {pid}")))
-}
-
-/// The peer's ancestor chain (peer first, up to pid 1) — `None` when
-/// any `/proc` read fails mid-walk: an incomplete chain proves neither
-/// membership nor its absence, so callers must treat it as unverifiable
-/// rather than outside.
-fn proc_ancestors(mut pid: u32) -> Option<Vec<u32>> {
-    let mut chain = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    while pid > 1 && seen.insert(pid) {
-        chain.push(pid);
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        pid = status
-            .lines()
-            .find_map(|l| l.strip_prefix("PPid:"))
-            .and_then(|v| v.trim().parse().ok())?;
-    }
-    Some(chain)
-}
-
-/// The `CADENCE_ALIAS` the socket peer carries — pane env survives
-/// `setsid`, so a detached pane process still names its agent. An
-/// alias this daemon never registered means nothing (a stale or
-/// foreign daemon's env) — only registered panes match.
-fn caller_env_alias(peer_pid: u32) -> Option<String> {
-    let env = std::fs::read(format!("/proc/{peer_pid}/environ")).ok()?;
-    env.split(|b| *b == 0)
-        .filter_map(|kv| std::str::from_utf8(kv).ok())
-        .find_map(|kv| kv.strip_prefix("CADENCE_ALIAS="))
-        .filter(|a| !a.is_empty())
-        .map(str::to_string)
-}
-
-/// Does `peer_pid` hold the pane's pty? A detached pane process loses
-/// its ancestry and controlling terminal but keeps stdio — the fd
-/// targets still name the pane's pts device. Redirected stdio is the
-/// documented residual (a maximal-effort detach), accepted because the
-/// same actor could `tmux send-keys` its own pane directly.
-fn holds_pane_tty(peer_pid: u32, pane_pid: u32) -> bool {
-    let pane_tty = (0..=2)
-        .filter_map(|fd| std::fs::read_link(format!("/proc/{pane_pid}/fd/{fd}")).ok())
-        .find(|p| p.to_string_lossy().starts_with("/dev/pts/"));
-    let Some(tty) = pane_tty else {
-        return false;
-    };
-    (0..=2)
-        .any(|fd| std::fs::read_link(format!("/proc/{peer_pid}/fd/{fd}")).is_ok_and(|p| p == tty))
-}
-
-/// Does the peer hold a pty at all? Called only after every pane
-/// membership check fails, so any pts fd is foreign by definition —
-/// positive evidence of an interactive terminal, which is what
-/// `operator` means. A detached caller (`setsid … </dev/null >&2`)
-/// holds none.
-fn peer_on_tty(peer_pid: u32) -> bool {
-    (0..=2).any(|fd| {
-        std::fs::read_link(format!("/proc/{peer_pid}/fd/{fd}"))
-            .is_ok_and(|p| p.to_string_lossy().starts_with("/dev/pts/"))
-    })
-}
-
-/// The caller matched no pane — place it honestly. A broken `/proc`
-/// walk (`walked == false`) proves neither membership nor its
-/// absence: a refusal while the target pane is alive, `unknown` once
-/// it is gone. A clean walk with no match is `operator` only with
-/// positive terminal evidence (`foreign_tty`); a detached caller is
-/// `unknown`, never `operator`.
-fn unmatched_caller(
-    walked: bool,
-    target_alive: bool,
-    foreign_tty: bool,
-    verb: &str,
-) -> Result<(String, &'static str)> {
-    if !walked {
-        if target_alive {
-            return Err(Error::rejected(format!(
-                "cannot derive the caller for `{verb}` — /proc could \
-                 not be walked while the target pane is alive; run it \
-                 from a shell attached to a pane or outside all panes",
-            )));
-        }
-        return Ok(("unknown".to_string(), "unknown"));
-    }
-    if foreign_tty {
-        Ok(("operator".to_string(), "operator"))
-    } else {
-        Ok(("unknown".to_string(), "unknown"))
-    }
 }
 
 fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
