@@ -841,7 +841,11 @@ forces), then stops every agent idle past `--idle-secs` (default 1800)
 that has nothing queued, no running message and no busy pane —
 re-checking each one live immediately before the stop so an agent
 that claimed work mid-sweep is skipped, never killed mid-turn. It then
-runs `agent gc --older-than 1h`, reports orphan test processes and
+runs `agent gc --older-than 1h` — under the caller rule (CAD-149):
+the operator sweeps every dead agent, a PM only its own members, and
+the dead agents this caller may not sweep are listed on the gc row as
+a warning (`--dry-run` marks them from the daemon's `agent_gc_plan`),
+never silently skipped — reports orphan test processes and
 disk state (never kills; process argv is never printed — orphans show
 the executable name and argument count), and writes the
 handoff note to `<state>/sessions/<YYYYMMDDTHHMMSSZ>-end.md` —

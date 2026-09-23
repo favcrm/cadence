@@ -1816,7 +1816,7 @@ impl Shared {
                 self.begin_closing();
                 Ok(json!({"state": "stopping"}))
             }
-            "agent_register" => self.rpc_register(params),
+            "agent_register" => self.rpc_register(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
             "model_defaults_set" => self.rpc_model_defaults_set(params),
             "agent_list" => {
@@ -2041,24 +2041,11 @@ impl Shared {
                 let caller = self.agent_caller(peer_pid, "agent gc")?;
                 let audit = caller_audit(&caller);
                 let older_than = params.get("older_than").and_then(Value::as_f64);
-                let candidates = self.store.gc_candidates(older_than)?;
+                let (candidates, not_permitted) = self.gc_partition(&caller, older_than)?;
                 let mut removed = Vec::new();
-                let mut not_permitted = Vec::new();
                 {
                     let lc = self.lifecycle.lock().unwrap();
                     for agent in candidates {
-                        if crate::peer::may_mutate_agent(
-                            &caller,
-                            &agent.alias,
-                            agent_upstream(&agent),
-                            AgentMutation::Controlled,
-                            "agent gc",
-                        )
-                        .is_err()
-                        {
-                            not_permitted.push(agent.alias);
-                            continue;
-                        }
                         // Skip an alias owned mid-transition rather than
                         // failing the whole sweep.
                         if lc.owned(&agent.alias) {
@@ -2087,6 +2074,17 @@ impl Shared {
                     out["not_permitted"] = json!(not_permitted);
                 }
                 Ok(out)
+            }
+            "agent_gc_plan" => {
+                // Read-only: what `agent gc` would sweep for THIS caller
+                // and what the caller rule keeps it from sweeping —
+                // `session end --dry-run` renders it.
+                reject_identity_fields(params, "agent gc")?;
+                let caller = self.agent_caller(peer_pid, "agent gc")?;
+                let older_than = params.get("older_than").and_then(Value::as_f64);
+                let (candidates, not_permitted) = self.gc_partition(&caller, older_than)?;
+                let candidates: Vec<String> = candidates.into_iter().map(|a| a.alias).collect();
+                Ok(json!({"candidates": candidates, "not_permitted": not_permitted}))
             }
             "agent_resume" => {
                 let alias = self.resolve_alias(required_str(params, "alias")?)?;
@@ -2755,15 +2753,117 @@ impl Shared {
     ) -> Result<AgentCaller> {
         reject_identity_fields(params, verb)?;
         let caller = self.agent_caller(peer_pid, verb)?;
-        crate::peer::may_mutate_agent(
-            &caller,
-            &target.alias,
-            agent_upstream(target),
-            mutation,
-            verb,
-        )
-        .map_err(Error::rejected)?;
+        let pm = self.effective_pm(target)?;
+        crate::peer::may_mutate_agent(&caller, &target.alias, pm.as_deref(), mutation, verb)
+            .map_err(Error::rejected)?;
         Ok(caller)
+    }
+
+    /// Registration is a mutation of the new agent by its caller
+    /// (CAD-149 review F3): an agent the daemon can attribute the
+    /// connection to may register only its OWN member — the new row's
+    /// `params.upstream` must name the caller — and only when the
+    /// caller is a group root (no upstream of its own; groups are one
+    /// level deep). So a worker can neither mint an agent that carries
+    /// trust-bearing params it may not set on itself, nor make itself
+    /// (or a peer) a PM, nor create a root only the operator controls;
+    /// a PM's `join` into its own group works unchanged, with any
+    /// params. An alias that already exists is left to the store's
+    /// duplicate refusal — registration changes nothing then, and the
+    /// launch verbs' reopen path keys off that error.
+    ///
+    /// A connection attributed to no agent is not required to prove
+    /// it is the operator here (unlike `agent set`/`remove`): every
+    /// operator script, launch verb and test harness registers that
+    /// way, including from a shell whose ancestry carries an agent's
+    /// environment. The price is the F1 residual in a wider form — a
+    /// detached worker process registers unchecked — which CAD-280
+    /// (operator by positive proof) closes for both.
+    fn authorize_register(&self, alias: &str, params: &Value, peer_pid: u32) -> Result<()> {
+        if self.store.agent_opt(alias)?.is_some() {
+            return Ok(());
+        }
+        self.revalidate_enrollments()?;
+        let Some(who) = self.slot_identity(peer_pid)? else {
+            return Ok(());
+        };
+        let caller = who.lane();
+        let upstream = params
+            .get("upstream")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty());
+        let caller_pm = match self.store.agent_opt(caller)? {
+            Some(row) => agent_upstream(&row).map(str::to_string),
+            None => {
+                return Err(Error::rejected(format!(
+                    "agent register refused: caller pid {peer_pid} descends from \
+                     pane '{caller}', which names no registered agent"
+                )))
+            }
+        };
+        if upstream == Some(caller) && caller_pm.is_none() {
+            return Ok(());
+        }
+        let why = match (&caller_pm, upstream) {
+            (Some(pm), _) => format!("'{caller}' is a worker in '{pm}''s group"),
+            (None, Some(u)) => format!("the new agent would answer to '{u}', not to '{caller}'"),
+            (None, None) => "the new agent would be a group root".to_string(),
+        };
+        Err(Error::rejected(format!(
+            "agent register refused: agent '{caller}' may register only its own \
+             members (params.upstream = '{caller}') and only as a group root — \
+             {why}. Ask your PM or the operator to register '{alias}' \
+             (caller rule, CAD-149)"
+        )))
+    }
+
+    /// The target's PM for the caller rule: its `params.upstream`, but
+    /// only while the agent registered under that alias predates the
+    /// target (CAD-149 review F2). PM authority is bound to the PM's
+    /// registration, never to the name: a PM that was removed and whose
+    /// alias was registered again — by anyone — gains nothing over the
+    /// members the old PM left behind; they answer to the operator
+    /// until re-homed. `join` resolves the PM before registering the
+    /// member, so a real PM is always older. Timestamps are the store's
+    /// sub-second wall clock; a backwards clock step between a PM's
+    /// removal and its alias's re-registration is the residual.
+    fn effective_pm(&self, target: &Agent) -> Result<Option<String>> {
+        let Some(pm) = agent_upstream(target) else {
+            return Ok(None);
+        };
+        Ok(self
+            .store
+            .agent_opt(pm)?
+            .filter(|row| row.created <= target.created)
+            .map(|row| row.alias))
+    }
+
+    /// The `agent gc` candidates split by the caller rule: `(permitted,
+    /// not_permitted)` — the same decision `agent remove` makes.
+    fn gc_partition(
+        &self,
+        caller: &AgentCaller,
+        older_than: Option<f64>,
+    ) -> Result<(Vec<Agent>, Vec<String>)> {
+        let mut permitted = Vec::new();
+        let mut not_permitted = Vec::new();
+        for agent in self.store.gc_candidates(older_than)? {
+            let pm = self.effective_pm(&agent)?;
+            let allowed = crate::peer::may_mutate_agent(
+                caller,
+                &agent.alias,
+                pm.as_deref(),
+                AgentMutation::Controlled,
+                "agent gc",
+            )
+            .is_ok();
+            if allowed {
+                permitted.push(agent);
+            } else {
+                not_permitted.push(agent.alias);
+            }
+        }
+        Ok((permitted, not_permitted))
     }
 
     /// `slot_reconcile` — the one mutating operator path over a strict
@@ -3365,7 +3465,7 @@ impl Shared {
         Ok(out)
     }
 
-    fn rpc_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    fn rpc_register(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let alias = required_str(params, "alias")?;
         let provider = required_str(params, "provider")?;
         let endpoint =
@@ -3393,11 +3493,16 @@ impl Shared {
         // Enumerated launch params are validated at the door — a bad
         // value rejected here never lands on the agent row to be
         // replayed into a provider argv on every resume.
-        if let Some(raw) = agent_params {
-            let parsed: Value = serde_json::from_str(raw)
-                .map_err(|_| Error::rejected("'params' must be a JSON object"))?;
-            registry::validate_launch_params(provider, endpoint, &parsed)?;
-        }
+        let parsed = match agent_params {
+            Some(raw) => {
+                let parsed: Value = serde_json::from_str(raw)
+                    .map_err(|_| Error::rejected("'params' must be a JSON object"))?;
+                registry::validate_launch_params(provider, endpoint, &parsed)?;
+                parsed
+            }
+            None => Value::Null,
+        };
+        self.authorize_register(alias, &parsed, peer_pid)?;
         self.store.register_agent(&crate::store::NewAgent {
             alias,
             provider,

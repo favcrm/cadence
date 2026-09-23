@@ -29939,6 +29939,279 @@ fn agent_remove_and_gc_caller_rule_per_caller_kind() {
     assert_eq!(removals, want);
 }
 
+/// CAD-149 review F2, the reproduced sequence: the operator removes a
+/// PM whose members survive, and the PM's alias is registered again.
+/// The worker's attempt is refused outright (F3); and even a PM alias
+/// the operator re-registers gains no authority over the members the
+/// old PM left behind — PM authority is bound to a registration older
+/// than the member, not to the name.
+#[test]
+fn reregistered_pm_alias_inherits_no_authority() {
+    let d = TestDaemon::start();
+    let mut p = guard_panes(&d);
+    d.register_member("w2", "pm");
+    d.wait_agent("w2", "idle", 10);
+    let stall = |secs: &str| json!({"alias": "w2", "patch": {"stall_secs": secs}});
+    // The real PM governs its member.
+    let r = p.pm.rpc(&d.state, "agent_set", stall("600"));
+    assert_eq!(r["ok"], true, "{r}");
+
+    // The PM stops (its planted row is otherwise "live"), and the
+    // operator removes it while its members survive.
+    rusqlite::Connection::open(d.state.join("cadence.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE agents SET endpoint=NULL, state='stopped' WHERE alias='pm'",
+            [],
+        )
+        .unwrap();
+    d.operator_rpc("agent_remove", json!({"alias": "pm"}))
+        .unwrap();
+    // The worker tries to take the PM's alias from its own pane.
+    let r = p.w1.rpc(
+        &d.state,
+        "agent_register",
+        json!({"alias": "pm", "provider": "inbox", "endpoint_kind": "inbox",
+               "cwd": d.dir.path().to_str().unwrap()}),
+    );
+    assert!(
+        frame_err(&r).contains("agent 'w1' may register only its own members"),
+        "{r}"
+    );
+    assert!(d.rpc("agent_show", json!({"alias": "pm"})).is_err());
+    // Re-registered (here by the operator) behind a new pane: no
+    // authority over the orphaned member.
+    let home = TempDir::new().unwrap();
+    let mut pm_new = LaneShell::spawn(home.path());
+    plant_member_pane(&d, "pm", "inbox", None, pm_new.pid());
+    for (method, params) in [
+        ("agent_set", stall("0")),
+        ("agent_remove", json!({"alias": "w2", "force": true})),
+    ] {
+        let r = pm_new.rpc(&d.state, method, params);
+        let e = frame_err(&r);
+        assert!(
+            e.contains("agent 'pm' cannot change another agent")
+                && e.contains("the operator (it has no PM)"),
+            "{r}"
+        );
+    }
+    let r = pm_new.rpc(&d.state, "agent_gc", json!({}));
+    assert_eq!(r["result"]["removed"], json!([]), "{r}");
+    assert_eq!(
+        d.rpc("agent_show", json!({"alias": "w2"})).unwrap()["agent"]["params"]["stall_secs"],
+        "600"
+    );
+    // A member joined AFTER the new registration is the new PM's.
+    let r = pm_new.rpc(
+        &d.state,
+        "agent_register",
+        json!({"alias": "w3", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": d.dir.path().to_str().unwrap(),
+               "params": json!({"upstream": "pm"}).to_string()}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    d.wait_agent("w3", "idle", 10);
+    let r = pm_new.rpc(
+        &d.state,
+        "agent_set",
+        json!({"alias": "w3", "patch": {"stall_secs": "600"}}),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+}
+
+/// CAD-149 review F3: registration is a mutation of the new agent by
+/// its caller. A worker's pane may register nothing — not an agent it
+/// would own with trust-bearing params, not a member of its PM's group,
+/// not a root; another group's PM may not register into this group;
+/// a PM registers its own members (raw RPC and `cadence join` from its
+/// pane), and the operator shell joins as before.
+#[test]
+fn agent_register_caller_rule() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_codex("ok");
+    let mut p = guard_panes(&d);
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    let codex = |alias: &str, params: Value| {
+        json!({"alias": alias, "provider": "codex", "endpoint_kind": "managed",
+               "cwd": cwd, "params": params.to_string()})
+    };
+    // The reproduced case: a worker mints an agent it would be PM of,
+    // carrying a key it may not set on itself.
+    let r = p.w1.rpc(
+        &d.state,
+        "agent_register",
+        codex("wx", json!({"upstream": "w1", "approval_policy": "never"})),
+    );
+    let e = frame_err(&r);
+    assert!(
+        e.contains("agent 'w1' may register only its own members")
+            && e.contains("'w1' is a worker in 'pm''s group"),
+        "{r}"
+    );
+    for params in [json!({"upstream": "pm"}), json!({})] {
+        let r = p.w1.rpc(&d.state, "agent_register", codex("wx", params));
+        assert!(
+            frame_err(&r).contains("may register only its own members"),
+            "{r}"
+        );
+    }
+    // Through the CLI too.
+    let (rc, out) = p.w1.cadence(&d.state, "join w1 fake --alias wy --detach");
+    assert_ne!(rc, 0, "{out}");
+    assert!(out.contains("may register only its own members"), "{out}");
+    // Another group's PM cannot register into pm's group, nor a root.
+    let r = p.pm2.rpc(
+        &d.state,
+        "agent_register",
+        codex("wx", json!({"upstream": "pm"})),
+    );
+    assert!(
+        frame_err(&r).contains("would answer to 'pm', not to 'pm2'"),
+        "{r}"
+    );
+    let r = p
+        .pm2
+        .rpc(&d.state, "agent_register", codex("wx", json!({})));
+    assert!(frame_err(&r).contains("would be a group root"), "{r}");
+    for alias in ["wx", "wy"] {
+        assert!(d.rpc("agent_show", json!({"alias": alias})).is_err());
+    }
+    // An existing alias is the store's duplicate refusal — nothing to
+    // authorize, and the launch verbs' reopen path keys off it.
+    let r = p.w1.rpc(
+        &d.state,
+        "agent_register",
+        json!({"alias": "pm2", "provider": "inbox", "endpoint_kind": "inbox",
+               "cwd": cwd}),
+    );
+    assert!(!frame_err(&r).contains("caller rule"), "{r}");
+    assert!(r["ok"] != true, "{r}");
+
+    // The PM registers its own member — trust-bearing params included.
+    let r = p.pm.rpc(
+        &d.state,
+        "agent_register",
+        codex("wp", json!({"upstream": "pm", "approval_policy": "never"})),
+    );
+    assert_eq!(r["ok"], true, "{r}");
+    d.wait_agent("wp", "idle", 15);
+    let (rc, out) = p.pm.cadence(&d.state, "join pm fake --alias wj --detach");
+    assert_eq!(rc, 0, "{out}");
+    d.wait_agent("wj", "idle", 15);
+    let (ok, _, err) = d.operator_cadence(&["join", "pm", "fake", "--alias", "wo", "--detach"]);
+    assert!(ok, "{err}");
+    d.wait_agent("wo", "idle", 15);
+    for alias in ["wj", "wo", "wp"] {
+        let show = d.rpc("agent_show", json!({"alias": alias})).unwrap();
+        assert_eq!(show["agent"]["params"]["upstream"], "pm", "{show}");
+    }
+}
+
+/// CAD-304 S4 / review F4, operator ruling: `--force` unassigns the
+/// removed alias's open tasks in the same transaction — state, revision
+/// and history kept, the PM told — so an agent registered again under
+/// the alias inherits nothing, and dispatch refuses until the task is
+/// reassigned, naming the remedy.
+#[test]
+fn agent_remove_force_unassigns_open_tasks() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.register_member("w2", "pm");
+    for a in ["pm", "w1", "w2"] {
+        d.wait_agent(a, "idle", 10);
+    }
+    let (spec, sha) = d.spec_file("spec.md", "unassign on force");
+    d.job_new("pm", "j1", &spec, &sha);
+    d.rpc(
+        "task_new",
+        json!({"job": "j1", "task": "t1", "assignee": "w1",
+               "acceptance": format!("tests pass REPORT_SHA:{SHA_A}")}),
+    )
+    .unwrap();
+    d.rpc(
+        "task_new",
+        json!({"job": "j1", "task": "t2", "assignee": "w1",
+               "acceptance": "later"}),
+    )
+    .unwrap();
+    let kickoff = d.job_dispatch("t1", json!({})).unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    d.wait_message("w1", &kickoff, &["completed"], 15);
+    d.wait_task("t1", "review", 15);
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+
+    d.operator_rpc("agent_remove", json!({"alias": "w1", "force": true}))
+        .unwrap();
+    let forced = forced_removals(&d);
+    assert_eq!(forced.len(), 1, "{forced:?}");
+    assert_eq!(forced[0]["payload"]["unassigned"], json!(["t1", "t2"]));
+    let job = d.rpc("job_show", json!({"job": "j1"})).unwrap()["job"].clone();
+    let task = |id: &str| {
+        job["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert!(task("t1")["assignee"].is_null(), "{job}");
+    assert_eq!(task("t1")["state"], "review", "{job}");
+    assert_eq!(task("t1")["kickoff"]["id"], kickoff.as_str(), "{job}");
+    assert!(task("t2")["assignee"].is_null(), "{job}");
+    assert_eq!(task("t2")["state"], "draft", "{job}");
+    // The PM hears which tasks to reassign.
+    let pm_notes: Vec<String> = d.rpc("agent_show", json!({"alias": "pm"})).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["source"] == "job_event")
+        .filter_map(|m| m["body"].as_str().map(str::to_string))
+        .filter(|b| b.contains("is unassigned"))
+        .collect();
+    assert_eq!(pm_notes.len(), 2, "{pm_notes:?}");
+    assert!(
+        pm_notes.iter().all(|b| b.contains("--to <worker>")),
+        "{pm_notes:?}"
+    );
+
+    // Re-registered: nothing attaches to the new agent.
+    d.register_member("w1", "pm");
+    d.wait_agent("w1", "idle", 10);
+    let list = d.rpc("agent_list", json!({})).unwrap();
+    let w1 = list["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "w1")
+        .unwrap()
+        .clone();
+    assert_eq!(w1["tasks"], json!([]), "{w1}");
+    // Dispatch refuses the unassigned task until it is reassigned.
+    let err = d.job_dispatch("t2", json!({})).unwrap_err().to_string();
+    assert!(
+        err.contains("has no assignee") && err.contains("--to <worker>"),
+        "{err}"
+    );
+    // Reassigned, it dispatches — to the new w1 as well: no
+    // "unfinished task work" inherited from the old one.
+    d.job_dispatch("t2", json!({"to": "w1"})).unwrap();
+    assert_ne!(d.task_state("t2"), "draft");
+    // And a plain removal of the new agent meets only its own work.
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+    let err = d
+        .operator_rpc("agent_remove", json!({"alias": "w1"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("task t2") && !err.contains("task t1"), "{err}");
+}
+
 /// CAD-304 S2: a forced removal cancels queued work through the normal
 /// cancel path — the `reply_to` hears it, and the forced event names
 /// who was notified and by whom.

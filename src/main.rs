@@ -582,7 +582,9 @@ enum Commands {
     /// terminal attaches once the endpoint is open, same rules as
     /// `cadence devin`. `--cloud` (provider devin) opens a Devin Cloud
     /// session; `--cloud-params` is the same semicolon-separated
-    /// `key=value` list as `cadence devin --cloud-params`.
+    /// `key=value` list as `cadence devin --cloud-params`. From inside
+    /// an agent's pane only a group root (no upstream) may join, and
+    /// only into its own group (CAD-149).
     Join {
         /// Group handle — the PM agent's alias or native session id.
         group: String,
@@ -1849,7 +1851,10 @@ enum AgentAction {
     /// from a name: the operator and the agent's own PM may set any
     /// allowed key; an agent may set only its own `--next-launch`
     /// model/effort; a peer is refused. Each change is recorded as
-    /// `params_updated` with the caller and old/new values.
+    /// `params_updated` with the caller and old/new values. Residual
+    /// (CAD-280): a process detached from every pane (`setsid -f env
+    /// -i …`) passes the operator check, so `by: "operator"` is not
+    /// proof the operator acted.
     Set {
         alias: String,
         /// key=value pairs; a bare `key` (no `=`) removes it.
@@ -1873,7 +1878,10 @@ enum AgentAction {
         /// `agent_remove_forced` event on the daemon stream. Never
         /// deletes or decides an `unknown` message: refused while one
         /// exists — reconcile it first (`message reconcile`, or `agent
-        /// unfence --no-resume` for a fencing one).
+        /// unfence --no-resume` for a fencing one). Non-terminal tasks
+        /// assigned to the alias are unassigned (state and history
+        /// kept; the job's PM is told to `job dispatch <task> --to
+        /// <worker>`), so a later agent under the alias inherits none.
         #[arg(long)]
         force: bool,
     },
