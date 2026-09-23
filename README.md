@@ -157,8 +157,14 @@ cadence backup                  # verified online copy of cadence.sqlite3 (VACUU
                                 #  our newest 7 (--dest DIR, --keep N); `cadence
                                 #  upgrade` takes one before every install
 cadence export --bundle b.tar   # portable tar: verified copy + manifest +
-                                #  repo-map.json + briefings; secret-scanned,
-                                #  no provider logs (--pm-dir for the repo map)
+                                #  repo-map.json + briefings; text members AND
+                                #  the db's free-text columns (message history,
+                                #  event payloads) are secret-scanned; no
+                                #  provider logs (--pm-dir for the repo map;
+                                #  --allow-unscanned-db copies the db as-is —
+                                #  then treat the bundle like the live db).
+                                #  sha256 catches corruption, not tampering:
+                                #  restore only bundles you trust
 cadence restore b.tar --state-dir DIR  # into an empty state dir only (refuses
                                 #  a running daemon, an existing db, a bad
                                 #  checksum or a newer schema); prints the

@@ -715,21 +715,35 @@ backup --dest <dir outside the state dir>`, then `cadence rollout backup
 of a hand-made `sqlite3 .backup`.
 
 **Backup, export, restore.** `cadence backup [--dest DIR] [--keep N]`
-snapshots the live database with SQLite `VACUUM INTO`, reopens the copy
+snapshots the live database with SQLite `VACUUM INTO` into a 0600 file,
+reopens the copy
 read-only, requires `PRAGMA integrity_check` = ok and the source schema,
 and writes `<copy>.manifest.json` (schema, sha256, build commit,
 created_at, source). Pruning removes only copies one of our manifests
-names. `cadence export --bundle FILE` writes one tar with a verified
+names, ages them by the UTC stamp in the file name (then mtime), and
+never removes the copy it just wrote. `cadence export --bundle FILE` writes one tar with a verified
 copy, `manifest.json`, `repo-map.json` (project → remote + local path
-from the tracker's project.yaml files) and `briefings/`; every text
-member goes through the secret scanner and a blocking finding refuses
-the export with nothing written. Provider logs are never bundled.
+from the tracker's project.yaml files) and `briefings/`. Every text
+member (16 MiB cap each) and every free-text column of the database
+copy (`messages.body/result/error`, `events.payload`,
+`agents.instructions/params/error`, job/task/verdict/monitor text) goes
+through the secret scanner; a blocking finding refuses the export with
+nothing written and names the member or `table.column rowid`. The
+operator allowlist applies. `--allow-unscanned-db` skips the database
+scan and the report then lists `secret_scan.unscanned:
+["cadence.sqlite3"]`: that database is copied as-is and may hold
+credentials from message history, so treat the bundle like the live
+database. Provider logs are never bundled. The export never overwrites
+an existing file. The manifest sha256 detects corruption, not tampering:
+restore only bundles you trust.
 `cadence restore FILE --state-dir DIR` takes a bundle or a backup
 manifest, refuses a running daemon or any existing `cadence.sqlite3`
 (-wal/-shm) there — there is no force flag; restore into an empty dir or
 move the old database aside — then checks sha256, schema (a newer schema
-than the binary refuses) and integrity, installs the database without
-clobbering, restores briefings that do not exist yet, and prints
+than the binary refuses) and integrity, installs the database (mode 0600)
+without clobbering, restores briefings that do not exist yet (a
+symlinked or non-directory path under the state dir refuses the restore
+before the database is installed), and prints
 `repo_remap`: each remote with the recorded local path when that checkout
 still has the same origin, else `choose folder`. It never touches the
 tracker repo.
