@@ -821,11 +821,25 @@ payload at read time — nothing is stored; `cadence overview [--json]
 | 60 | `pr_no_verdict` — open PR with no `qa-verdict` status | `gh pr view <n> --repo <slug>` |
 | 70 | `review_no_pr` — issue in `review` with no open `pr` ref and no `cadence/<id>-…` PR branch | `cadence issue show <id>` |
 | 80 | `blocked_ready` — every `blocked_by` target is `done` | `cadence issue set <id> status=ready` |
-| 90 | `ci_red` — default-branch commit status failing | `gh run list --repo <slug>` |
+| 90 | `ci_red` — the newest default-branch SHA with a `ci.yml` verdict failed (`failure`, `timed_out`, `startup_failure`); pending and cancelled SHAs neither raise nor clear it | `gh run view <run> --repo <slug>` |
+| 92 | `ci_unverified` — a default-branch SHA whose `ci.yml` push run was cancelled (or never ran) and no later SHA's own run has passed; clears once one does, while the SHA keeps its label | `gh run rerun <run> --repo <slug>` (cancelled), else `gh run list --repo <slug> --workflow ci.yml --branch <branch>` |
 | 100 | `inbox_unread` — unread messages on an `inbox` endpoint | `cadence inbox <a>` |
 | 110 | `tracker_behind` — tracker repo behind `@{upstream}` | `cadence issue sync` |
 
-GitHub data (open PRs, default-branch CI) comes from `gh` behind a
+Both CI rows share one subject, `ci:<slug>@<branch>`, so a red and
+unverified main is one row with two causes. They come from the
+branch's `ci.yml` push runs (`actions/workflows/ci.yml/runs`), never
+the legacy commit-status API — Actions writes check runs, so that API
+reads `pending, total_count: 0` on a red main. Each of the last 20
+first-parent SHAs (`git log --first-parent` in the declared clone,
+local refs only) is `passed`, `failed`, `pending`, `cancelled` or
+`missing`, judged only by its own run: another workflow (Handover), a
+later SHA or an absent run never makes a SHA `passed`. A cancelled or
+missing SHA shows `covered by <sha>` once a later SHA's own run passes.
+The payload carries the classification as `main_ci[]`; a repo without a
+`ci.yml` workflow has no block.
+
+GitHub data (open PRs, default-branch CI runs) comes from `gh` behind a
 60-second cache in the state dir (`overview-gh.json`, keyed by the
 slug set, written temp-then-rename); an outage serves the last good
 body as `github.state: "stale"` — or `"unavailable"` when there is no

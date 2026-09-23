@@ -1,4 +1,4 @@
-import { agentsEmptyCopy, needGroupKey, needLabel, notesStatusSentence } from "./uxCopy";
+import { agentsEmptyCopy, needGroupKey, needLabel, notesStatusSentence, shaCiLabel } from "./uxCopy";
 
 function equal(actual: unknown, expected: unknown): void {
   if (actual !== expected) {
@@ -22,6 +22,22 @@ equal(needGroupKey("approval_menu"), "team");
 equal(needGroupKey("approval"), "decision");
 equal(needGroupKey("not_a_kind"), "team");
 equal(needLabel("inbox_stale"), "stale inbox");
+
+// CAD-267: main CI labels never launder a cancelled or missing SHA.
+equal(needLabel("ci_unverified"), "ci unverified");
+equal(needGroupKey("ci_unverified"), "team");
+const covered = "3".repeat(40);
+equal(shaCiLabel({ state: "passed" }), "passed");
+equal(shaCiLabel({ state: "cancelled", covered_by: covered }), "cancelled — covered by 3333333");
+equal(shaCiLabel({ state: "cancelled", covered_by: null }), "cancelled — not yet covered");
+equal(shaCiLabel({ state: "missing", covered_by: covered }), "no ci run — covered by 3333333");
+equal(shaCiLabel({ state: "cancelled", conclusion: "skipped" }), "skipped — not yet covered");
+equal(shaCiLabel({ state: "failed", conclusion: "timed_out" }), "failed (timed_out)");
+for (const state of ["cancelled", "missing", "pending", "failed"]) {
+  if (shaCiLabel({ state, covered_by: covered }).includes("passed")) {
+    throw new Error(`${state} SHA read as passed`);
+  }
+}
 
 const notes = notesStatusSentence("notes", "qa", "doing");
 if (notes == null || !notes.includes("bound job")) {

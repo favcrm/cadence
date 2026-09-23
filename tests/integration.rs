@@ -5677,15 +5677,13 @@ fn pty_routed_result_body_is_single_line() {
         "routed body is not pty-safe: {body:?}"
     );
     assert!(body.contains("j1"));
-    // Gated delivery, not a bypass: it waits queued for an operator
-    // claim, then pastes like any send (running = validation passed).
-    thread::sleep(Duration::from_millis(400));
-    let mid = d.message_state("pm", routed["id"].as_str().unwrap());
-    assert!(matches!(mid.as_str(), "queued" | "submitting"), "{mid}");
-    // A routed notification is fire-and-forget on a pty endpoint: once
-    // the paste succeeds the message completes with a delivery receipt
-    // — the receiving PM is not expected to `message result` it.
-    d.rpc("agent_ready", json!({"alias": "pm"})).unwrap();
+    // Since CAD-245 a routed notice pastes into an idle pane without an
+    // operator claim (pty_routed_notice_delivers_idle_without_claim pins
+    // the gate). Claiming here as well raced that paste: the claim's
+    // probe could see the notice's text still in the input line and
+    // refuse (CAD-266). A routed notification is fire-and-forget on a
+    // pty endpoint: once the paste succeeds the message completes with
+    // a delivery receipt — the PM is not expected to `message result` it.
     let done = d.wait_message("pm", routed["id"].as_str().unwrap(), &["completed"], 15);
     assert_eq!(
         done["result"]["via"].as_str(),
@@ -8710,13 +8708,17 @@ fn agent_set_opts_live_agent_into_auto_ready() {
     let _mock = d.mock_devin();
     d.register_devin("dv", None);
     d.wait_agent("dv", "idle", 20);
-    // Without opt-in the queue still waits on a human claim.
+    // Without opt-in the queue still waits on a human claim. Since
+    // CAD-245 the actor wakes on the send at once, so a fixed sleep can
+    // land mid-attempt (`submitting` while the gate probes). Wait for
+    // the recorded refusal; the requeued message then sits out the
+    // gate back-off (CAD-266).
     d.rpc(
         "agent_send",
         json!({"alias": "dv", "text": "gated", "message": "m1"}),
     )
     .unwrap();
-    thread::sleep(Duration::from_millis(400));
+    d.wait_event("dv", "gate_wait", 20);
     assert_eq!(d.message_state("dv", "m1"), "queued");
     // Retrofit via agent_set — the running actor reads params per send.
     d.rpc(
@@ -13949,13 +13951,17 @@ fn job_verdict_worktree_verify_skips_and_opt_out() {
 /// A fake `gh` that logs each invocation to $FAKE_GH_LOG (one
 /// tab-joined line) and answers from the environment — same pattern
 /// as tests/scripts/test_qa_verdict.py. FAKE_GH_FAIL forces exit N.
+/// FAKE_GH_RUNS answers the `ci.yml` runs listing (CAD-267).
 const FAKE_GH: &str = r#"#!/usr/bin/env bash
 (IFS=$'\t'; printf '%s\n' "$*") >> "$FAKE_GH_LOG"
 if [ -n "${FAKE_GH_FAIL:-}" ]; then echo "fake gh: forced failure" >&2; exit "$FAKE_GH_FAIL"; fi
+no_runs='{"total_count": 0, "workflow_runs": []}'
 case "$1 ${2:-}" in
   "pr list") printf '%s\n' "${FAKE_GH_PRS:-[]}" ;;
   "pr view") printf '{"number": %s, "headRefOid": "%s"}\n' "${FAKE_GH_PR_NUM:-9}" "${FAKE_GH_HEAD:-}" ;;
   "api --method") echo '{}' ;;
+  "api repos/"*"/actions/workflows/ci.yml/runs?"*) printf '%s\n' "${FAKE_GH_RUNS:-$no_runs}" ;;
+  "api repos/"*) printf '{"default_branch": "%s"}\n' "${FAKE_GH_DEFAULT_BRANCH:-main}" ;;
   *) echo "fake gh: unexpected call: $*" >&2; exit 64 ;;
 esac
 "#;
@@ -20150,6 +20156,125 @@ fn overview_drift_reports_commits_after_build() {
         .find(|n| n["kind"] == "drift")
         .expect("drift row");
     assert_eq!(row["command"], "cadence daemon restart --when-idle --ui");
+}
+
+/// CAD-267: `cadence overview --json` reads the default branch's
+/// `ci.yml` push runs through `gh` — never the legacy commit-status
+/// API. Newest run failed → `ci_red`; the cancelled middle SHA has no
+/// later pass → `ci_unverified` on the same subject, and it stays
+/// labelled cancelled.
+#[test]
+fn overview_main_ci_red_and_unverified_from_actions_runs() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let pm = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    git_at(repo.path(), &["init", "-q", "-b", "main"]);
+    git_at(repo.path(), &["config", "user.email", "t@t"]);
+    git_at(repo.path(), &["config", "user.name", "t"]);
+    git_at(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widgets.git",
+        ],
+    );
+    let mut shas = Vec::new();
+    for i in 0..3 {
+        std::fs::write(repo.path().join("f"), format!("{i}")).unwrap();
+        git_at(repo.path(), &["add", "f"]);
+        git_at(repo.path(), &["commit", "-qm", &format!("push {i}")]);
+        shas.push(git_at(repo.path(), &["rev-parse", "HEAD"]));
+    }
+    let repo_s = repo.path().to_str().unwrap().to_string();
+    issue_cli(home.path(), state.path(), pm.path(), &["issue", "init"]);
+    issue_cli(
+        home.path(),
+        state.path(),
+        pm.path(),
+        &[
+            "issue", "project", "add", "cadence", "--prefix", "CAD", "--repo", &repo_s,
+        ],
+    );
+    let run = |id: u64, sha: &str, workflow: &str, conclusion: &str| {
+        json!({
+            "id": id, "name": workflow, "head_sha": sha, "head_branch": "main",
+            "event": "push", "status": "completed", "conclusion": conclusion,
+            "path": format!(".github/workflows/{workflow}.yml"),
+            "html_url": format!("https://github.com/acme/widgets/actions/runs/{id}"),
+            "created_at": format!("2026-09-23T01:{:02}:00Z", id),
+        })
+    };
+    let runs = json!({"total_count": 4, "workflow_runs": [
+        run(30, &shas[2], "ci", "failure"),
+        // Handover passing on the cancelled SHA never counts.
+        run(21, &shas[1], "handover", "success"),
+        run(20, &shas[1], "ci", "cancelled"),
+        run(10, &shas[0], "ci", "success"),
+    ]});
+    let gh = fake_gh();
+    let envs = gh.envs(&[("FAKE_GH_RUNS".to_string(), runs.to_string())]);
+    let envs: Vec<(&str, String)> = envs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let view = overview_at(home.path(), state.path(), Some(pm.path()), &envs);
+
+    let block = &view["main_ci"][0];
+    assert_eq!(block["slug"], "acme/widgets", "{view}");
+    assert_eq!(block["branch"], "main", "{view}");
+    assert_eq!(block["order"], "first_parent", "{view}");
+    let got: Vec<(String, String)> = block["shas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["sha"].as_str().unwrap().to_string(),
+                s["state"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let want: Vec<(String, String)> = [(2, "failed"), (1, "cancelled"), (0, "passed")]
+        .iter()
+        .map(|(i, st)| (shas[*i].clone(), st.to_string()))
+        .collect();
+    assert_eq!(got, want, "{view}");
+    assert!(block["shas"][1]["covered_by"].is_null(), "{view}");
+
+    let row = view["needs_me"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "ci_red")
+        .unwrap_or_else(|| panic!("no ci_red row: {view}"));
+    assert_eq!(
+        row["subject"],
+        json!({"kind": "ci", "id": "acme/widgets@main"})
+    );
+    assert_eq!(row["project"], "cadence");
+    assert_eq!(row["command"], "gh run view 30 --repo acme/widgets");
+    assert!(
+        row["title"].as_str().unwrap().contains(&shas[2][..7]),
+        "{row}"
+    );
+    let causes: Vec<&str> = row["causes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["cause"].as_str().unwrap())
+        .collect();
+    assert_eq!(causes, ["ci_red", "ci_unverified"], "{row}");
+
+    let calls = gh.calls();
+    assert!(
+        calls.iter().any(|c| c
+            == "api\trepos/acme/widgets/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=30"),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| c.contains("/status")),
+        "legacy status API read: {calls:?}"
+    );
 }
 
 /// `cadence overview` with extra args — the raw output, success or not.
