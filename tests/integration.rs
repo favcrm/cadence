@@ -21020,6 +21020,122 @@ test_command = "true {test}"
     let md = std::fs::read_to_string(r["report_md"].as_str().unwrap()).unwrap();
     assert!(md.contains("changed by this PR: **yes**"), "{md}");
 }
+
+/// CAD-301: GitHub CI has no git identity, so a test that commits
+/// without `-c user.name/-c user.email` fails there with "Author
+/// identity unknown". The review must fail it too, however the caller's
+/// host supplies an identity: a global `~/.gitconfig`, `GIT_CONFIG_*`
+/// entries, `EMAIL` / `GIT_AUTHOR_*` / `GIT_COMMITTER_*`, or git's own
+/// user@hostname guess.
+#[test]
+fn review_verb_gates_run_without_a_git_identity() {
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    let caller_home = base.path().join("caller-home");
+    std::fs::create_dir_all(&caller_home).unwrap();
+    std::fs::write(
+        caller_home.join(".gitconfig"),
+        "[user]\n\tname = host\n\temail = host@example.com\n",
+    )
+    .unwrap();
+    // The base config gates and suites with a probe that records the
+    // env it sees, then commits in a scratch repo with no identity.
+    std::fs::write(
+        f.repo.join("cadence-review.toml"),
+        r#"prepare = []
+gates = ["sh commit_probe.sh gate"]
+full_suite = "sh commit_probe.sh suite"
+test_globs = ["tests/**"]
+test_command = "sh one_test.sh {test}"
+stress_pattern = ["wait_"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        f.repo.join("commit_probe.sh"),
+        "set -e\n\
+         probe=$(git config --get cadence.probe || true)\n\
+         echo \"$1|$HOME|$CARGO_HOME|$RUSTUP_HOME|$XDG_DATA_HOME|$probe\" >> \"$GATE_LOG\"\n\
+         d=$(mktemp -d)\n\
+         trap 'rm -rf \"$d\"' EXIT\n\
+         git -C \"$d\" init -q\n\
+         git -C \"$d\" commit -q --allow-empty -m \"$1\"\n\
+         echo \"committed-$1\" >> \"$GATE_LOG\"\n",
+    )
+    .unwrap();
+    review_git(&f.repo, &["add", "-A"]);
+    review_git(
+        &f.repo,
+        &["commit", "-qm", "base config: commit without an identity"],
+    );
+    review_git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    let out = review_cmd(&f)
+        .arg("7")
+        .env("HOME", &caller_home)
+        .env("CARGO_HOME", "/caller/cargo")
+        .env_remove("RUSTUP_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "user.email")
+        .env("GIT_CONFIG_VALUE_0", "cfg@example.com")
+        .env("GIT_CONFIG_KEY_1", "cadence.probe")
+        .env("GIT_CONFIG_VALUE_1", "kept")
+        .env("EMAIL", "env@example.com")
+        .env("GIT_AUTHOR_NAME", "a")
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", "c")
+        .env("GIT_COMMITTER_EMAIL", "c@example.com")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let r = review_report(&f, 7);
+    let gates = r["gates"].as_array().unwrap();
+    assert_eq!(gates[0]["outcome"], json!("fail"), "{gates:?}");
+    let identity_error = |tail: &Value| {
+        tail.as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap_or("").contains("Author identity unknown"))
+    };
+    assert!(identity_error(&gates[0]["tail"]), "{:?}", gates[0]["tail"]);
+    assert_eq!(
+        r["full_suite"]["outcome"],
+        json!("fail"),
+        "{:?}",
+        r["full_suite"]
+    );
+    assert_eq!(r["suggested_verdict"], json!("blocked"));
+
+    // Neither commit landed; both commands saw the same scratch HOME,
+    // the caller's real tool homes, and the caller's non-identity
+    // GIT_CONFIG entry.
+    let log = std::fs::read_to_string(&f.gate_log).unwrap();
+    assert!(!log.contains("committed-"), "{log}");
+    let rows: Vec<Vec<&str>> = log.lines().map(|l| l.split('|').collect()).collect();
+    assert_eq!(rows.len(), 2, "{log}");
+    assert_eq!(rows[0][0], "gate");
+    assert_eq!(rows[1][0], "suite");
+    let gate_home = rows[0][1];
+    assert_eq!(rows[1][1], gate_home, "{log}");
+    assert_ne!(Path::new(gate_home), caller_home.as_path(), "{log}");
+    assert!(!gate_home.is_empty(), "{log}");
+    let caller = caller_home.display();
+    for row in &rows {
+        assert_eq!(row[2], "/caller/cargo", "{log}");
+        assert_eq!(row[3], format!("{caller}/.rustup"), "{log}");
+        assert_eq!(row[4], format!("{caller}/.local/share"), "{log}");
+        assert_eq!(row[5], "kept", "{log}");
+    }
+    // The scratch HOME is removed with the review.
+    assert!(!Path::new(gate_home).exists(), "{gate_home} left behind");
+}
 // ==== CAD-83: `cadence overview` — daemon-dependent rows ====
 
 /// `cadence overview --json` against a scratch daemon's state dir;

@@ -970,6 +970,97 @@ impl Step {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The gate environment — CI's identity-less git (CAD-301)
+// ---------------------------------------------------------------------------
+
+/// Variables that hand git an identity (or a config file that may hold
+/// one) ahead of `HOME`. GitHub CI sets none of them, so every step
+/// command runs with them removed; `HOME` then decides alone.
+const GATE_ENV_UNSET: &[&str] = &[
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "EMAIL",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "XDG_CONFIG_HOME",
+];
+
+/// Config keys that name an identity. A caller's `GIT_CONFIG_KEY_<n>`
+/// entry for one of these is dropped; every other entry is kept.
+const IDENTITY_KEYS: &[&str] = &[
+    "user.name",
+    "user.email",
+    "author.name",
+    "author.email",
+    "committer.name",
+    "committer.email",
+    "user.useconfigonly",
+];
+
+/// CAD-301: the env every step command runs under — prepare, gates,
+/// the full suite, stress runs and isolated reruns, on the gated tree
+/// and the base tree alike. GitHub CI runners have no git identity, so
+/// a test or tool that runs `git commit` without `-c user.name=… -c
+/// user.email=…` fails there with "Author identity unknown"; this host
+/// would otherwise lend it a global `~/.gitconfig` or git's own
+/// user@hostname guess, and the review would pass what CI then fails.
+///
+/// - `HOME` is `home`, a fresh empty directory the review removes when
+///   it ends: no `~/.gitconfig`, no `~/.config/git/config`
+///   ([`GATE_ENV_UNSET`] clears the variables that would point past it).
+/// - `GIT_CONFIG_NOSYSTEM=1`: no `/etc/gitconfig`.
+/// - `user.useConfigOnly=true`, appended through `GIT_CONFIG_COUNT`:
+///   git stops guessing an identity, so only an explicit one works — as
+///   on CI. A caller's own `GIT_CONFIG_*` entries are kept (renumbered)
+///   except identity keys.
+/// - `CARGO_HOME`, `RUSTUP_HOME` and `XDG_DATA_HOME` stay at the
+///   caller's real locations (derived from the real `HOME` when unset):
+///   cargo's registry, rustup's toolchains and the pinned nextest under
+///   `$XDG_DATA_HOME/cadence/tools` (`scripts/cadence-nextest`) still
+///   resolve.
+///
+/// The review's own git calls (fetch, merge, worktree, merge-tree and
+/// commit-tree) never take this env: fetch keeps the real `HOME` for its
+/// credential helper, and commit-tree names its identity explicitly.
+fn gate_env(home: &Path, caller: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    let caller = |k: &str| caller(k).filter(|v| !v.is_empty());
+    let real_home = caller("HOME");
+    let mut env = Vec::new();
+    for (var, under_home) in [
+        ("CARGO_HOME", ".cargo"),
+        ("RUSTUP_HOME", ".rustup"),
+        ("XDG_DATA_HOME", ".local/share"),
+    ] {
+        let real = caller(var).or_else(|| real_home.as_ref().map(|h| format!("{h}/{under_home}")));
+        if let Some(real) = real {
+            env.push((var.to_string(), real));
+        }
+    }
+    env.push(("HOME".into(), home.to_string_lossy().into_owned()));
+    env.push(("GIT_CONFIG_NOSYSTEM".into(), "1".into()));
+
+    let count = caller("GIT_CONFIG_COUNT")
+        .and_then(|c| c.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut entries: Vec<(String, String)> = (0..count)
+        .filter_map(|i| {
+            let key = caller(&format!("GIT_CONFIG_KEY_{i}"))?;
+            let value = caller(&format!("GIT_CONFIG_VALUE_{i}")).unwrap_or_default();
+            (!IDENTITY_KEYS.contains(&key.to_ascii_lowercase().as_str())).then_some((key, value))
+        })
+        .collect();
+    entries.push(("user.useConfigOnly".into(), "true".into()));
+    env.push(("GIT_CONFIG_COUNT".into(), entries.len().to_string()));
+    for (i, (key, value)) in entries.into_iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), key));
+        env.push((format!("GIT_CONFIG_VALUE_{i}"), value));
+    }
+    env
+}
+
 /// Run `sh -c <cmd>` in `cwd` with the review's env, timing it.
 fn run_step(
     name: &str,
@@ -1007,6 +1098,9 @@ fn run_step_with_result(
     let started = Instant::now();
     let mut sh = Command::new("sh");
     sh.arg("-c").arg(cmd).current_dir(cwd);
+    for k in GATE_ENV_UNSET {
+        sh.env_remove(k);
+    }
     for (k, v) in env {
         sh.env(k, v);
     }
@@ -1781,9 +1875,15 @@ pub fn run(opts: &Options) -> Result<i32> {
     let wt_name = format!("review-{}", pr.number);
     let mut tree = ReviewTree::checkout(&root, &wt_name, &head_sha, opts.keep, t.git_secs)?;
 
-    // Env every step command sees.
+    // Env every step command sees: the review's own variables plus
+    // CI's identity-less git (`gate_env`) under a scratch HOME that
+    // lives exactly as long as this run.
+    let gate_home = tempfile::Builder::new()
+        .prefix("cadence-review-home-")
+        .tempdir()?;
+    let gate_env = gate_env(gate_home.path(), |k| std::env::var(k).ok());
     let env = |tree_kind: &str| -> Vec<(String, String)> {
-        vec![
+        let mut env = vec![
             ("CADENCE_REVIEW_PR".into(), pr.number.to_string()),
             ("CADENCE_REVIEW_HEAD".into(), head_sha.clone()),
             ("CADENCE_REVIEW_BASE".into(), base_sha.clone()),
@@ -1793,7 +1893,9 @@ pub fn run(opts: &Options) -> Result<i32> {
                 "CADENCE_REVIEW_ROOT".into(),
                 root.to_string_lossy().into_owned(),
             ),
-        ]
+        ];
+        env.extend(gate_env.iter().cloned());
+        env
     };
 
     // When the base moved, gate the merge result instead of the bare
@@ -3371,6 +3473,71 @@ result_path = "target/nextest/cadence/junit.xml"
         assert_eq!(owned[0], ("BASE".to_string(), "1".to_string()));
         assert!(owned.contains(&("CADENCE_SUITE_LOCK".into(), String::new())));
         assert!(owned.contains(&("CADENCE_REVIEW_SUITE_LOCK_HELD".into(), "1".into())));
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    fn lookup<'a>(env: &'a [(String, String)], k: &str) -> Option<&'a str> {
+        env.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn gate_env_scrubs_identity_and_keeps_tool_homes() {
+        // Bare caller: tool homes derive from the real HOME, and
+        // useConfigOnly is the only config entry.
+        let env = gate_env(Path::new("/scratch"), env_of(&[("HOME", "/real")]));
+        assert_eq!(lookup(&env, "HOME"), Some("/scratch"));
+        assert_eq!(lookup(&env, "CARGO_HOME"), Some("/real/.cargo"));
+        assert_eq!(lookup(&env, "RUSTUP_HOME"), Some("/real/.rustup"));
+        assert_eq!(lookup(&env, "XDG_DATA_HOME"), Some("/real/.local/share"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_NOSYSTEM"), Some("1"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_COUNT"), Some("1"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_KEY_0"), Some("user.useConfigOnly"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_VALUE_0"), Some("true"));
+
+        // Explicit tool homes win; the caller's GIT_CONFIG entries are
+        // appended to, minus identity keys (any case), renumbered.
+        let env = gate_env(
+            Path::new("/scratch"),
+            env_of(&[
+                ("HOME", "/real"),
+                ("CARGO_HOME", "/opt/cargo"),
+                ("RUSTUP_HOME", "/opt/rustup"),
+                ("XDG_DATA_HOME", "/opt/data"),
+                ("GIT_CONFIG_COUNT", "4"),
+                ("GIT_CONFIG_KEY_0", "safe.directory"),
+                ("GIT_CONFIG_VALUE_0", "*"),
+                ("GIT_CONFIG_KEY_1", "User.Email"),
+                ("GIT_CONFIG_VALUE_1", "x@example.com"),
+                ("GIT_CONFIG_KEY_2", "user.useConfigOnly"),
+                ("GIT_CONFIG_VALUE_2", "false"),
+                ("GIT_CONFIG_KEY_3", "core.autocrlf"),
+                ("GIT_CONFIG_VALUE_3", ""),
+            ]),
+        );
+        assert_eq!(lookup(&env, "CARGO_HOME"), Some("/opt/cargo"));
+        assert_eq!(lookup(&env, "RUSTUP_HOME"), Some("/opt/rustup"));
+        assert_eq!(lookup(&env, "XDG_DATA_HOME"), Some("/opt/data"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_COUNT"), Some("3"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_KEY_0"), Some("safe.directory"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_VALUE_0"), Some("*"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_KEY_1"), Some("core.autocrlf"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_VALUE_1"), Some(""));
+        assert_eq!(lookup(&env, "GIT_CONFIG_KEY_2"), Some("user.useConfigOnly"));
+        assert_eq!(lookup(&env, "GIT_CONFIG_VALUE_2"), Some("true"));
+
+        // A malformed count is git's own error; the review starts over.
+        let env = gate_env(Path::new("/s"), env_of(&[("GIT_CONFIG_COUNT", "x")]));
+        assert_eq!(lookup(&env, "GIT_CONFIG_COUNT"), Some("1"));
+        assert_eq!(lookup(&env, "CARGO_HOME"), None);
     }
 
     #[test]
