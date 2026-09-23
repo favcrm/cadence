@@ -66,6 +66,9 @@ struct Fake {
     test_conclusion: &'static str,
     artifact: ArtifactState,
     attestation_ok: bool,
+    /// `compare(resolved, linked)` answers `ahead`: the resolved sha is
+    /// older than the linked one.
+    backwards: bool,
     calls: RefCell<Vec<String>>,
 }
 
@@ -78,6 +81,7 @@ impl Fake {
             test_conclusion: "success",
             artifact: ArtifactState::Present,
             attestation_ok: true,
+            backwards: false,
             calls: RefCell::new(Vec::new()),
         }
     }
@@ -123,6 +127,10 @@ impl ReleaseSource for Fake {
         self.log("on_main");
         Ok(self.on_main.clone())
     }
+    fn compare(&self, _base: &str, _head: &str) -> Result<Option<String>> {
+        self.log("compare");
+        Ok(Some(if self.backwards { "ahead" } else { "behind" }.into()))
+    }
     fn main_runs(&self, sha: &str) -> Result<Vec<Run>> {
         self.log("runs");
         Ok(vec![run_for(sha)])
@@ -144,7 +152,10 @@ impl ReleaseSource for Fake {
     }
     fn artifact(&self, _run_id: u64, name: &str) -> Result<ArtifactState> {
         self.log("artifact");
-        assert_eq!(name, upgrade::artifact_name(SHA));
+        // CI only ever built SHA; any other sha has no artifact.
+        if name != upgrade::artifact_name(SHA) {
+            return Ok(ArtifactState::Missing);
+        }
         Ok(self.artifact.clone())
     }
     fn download(&self, _run_id: u64, _name: &str, dest: &Path) -> Result<()> {
@@ -157,8 +168,10 @@ impl ReleaseSource for Fake {
     }
     fn verify_attestation(&self, binary: &Path, sha: &str) -> Result<String> {
         self.log("attest");
-        assert!(binary.is_file());
-        if self.attestation_ok {
+        // Only the bytes CI built for SHA carry an attestation; a
+        // hand-built or planted binary does not.
+        let ci_build = fs::read(self.artifact_dir.join("cadence")).ok();
+        if self.attestation_ok && sha == SHA && ci_build == Some(fs::read(binary).unwrap()) {
             Ok(format!("verified {sha}"))
         } else {
             Err(Error::rejected(
@@ -198,7 +211,19 @@ fn env() -> Env {
 }
 
 fn req(target: Target, dry_run: bool) -> Request {
-    Request { target, dry_run }
+    Request {
+        target,
+        dry_run,
+        allow_unattested: false,
+    }
+}
+
+fn req_unattested(sha: &str) -> Request {
+    Request {
+        target: Target::Sha(sha.into()),
+        dry_run: false,
+        allow_unattested: true,
+    }
 }
 
 fn link_target(layout: &Layout) -> PathBuf {
@@ -255,6 +280,8 @@ fn installs_verified_artifact_and_repoints_link() {
     assert_eq!(report["from_sha"], OLD);
     assert_eq!(report["to_sha"], SHA);
     assert_eq!(report["source"], "ci-artifact");
+    assert_eq!(report["trust"], "attested CI build");
+    assert!(report.get("warning").is_none());
     assert_eq!(report["installed"], true);
     assert_eq!(report["repointed"], true);
     assert_eq!(report["restarted"], false);
@@ -519,41 +546,199 @@ fn dry_run_verifies_and_changes_nothing() {
 }
 
 #[test]
-fn rollback_to_installed_release_needs_no_download() {
+fn explicit_rollback_attests_installed_releases_without_download() {
     let e = env();
     let fake = Fake::new(&e.artifact);
     upgrade::run(&fake, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
     assert_eq!(link_target(&e.layout), e.layout.binary(SHA));
 
-    // Roll back to the hand-installed OLD release: no manifest recorded.
-    let offline = Fake::new(Path::new("/nonexistent"));
-    let report = upgrade::run(&offline, &e.layout, &req(Target::Sha(OLD.into()), false)).unwrap();
-    assert!(
-        offline.calls.borrow().is_empty(),
-        "rollback must not reach GitHub: {:?}",
-        offline.calls.borrow()
-    );
+    // OLD was built by hand: no attestation, and CI has no artifact for
+    // it. A plain rollback refuses and names the explicit opt-in.
+    let msg = refusal(upgrade::run(
+        &fake,
+        &e.layout,
+        &req(Target::Sha(OLD.into()), false),
+    ));
+    assert!(msg.contains("--allow-unattested"), "{msg}");
+    assert!(msg.contains("not an attested CI build"), "{msg}");
+    assert_eq!(link_target(&e.layout), e.layout.binary(SHA));
+
+    // With the opt-in it rolls back, labelled, without a download.
+    fake.calls.borrow_mut().clear();
+    let report = upgrade::run(&fake, &e.layout, &req_unattested(OLD)).unwrap();
+    assert!(!fake.called("download"));
     assert_eq!(report["source"], "installed-release");
-    assert_eq!(report["from_sha"], SHA);
-    assert_eq!(report["to_sha"], OLD);
-    assert_eq!(report["installed"], false);
-    assert_eq!(report["repointed"], true);
+    assert_eq!(report["trust"], "unattested local release");
+    assert!(report["warning"].as_str().unwrap().contains("NOT verified"));
+    assert!(report["verified"]["attestation"]
+        .as_str()
+        .unwrap()
+        .starts_with("failed:"));
     assert!(report["verified"]["manifest"]
         .as_str()
         .unwrap()
         .starts_with("absent"));
+    assert_eq!(report["from_sha"], SHA);
+    assert_eq!(report["to_sha"], OLD);
     assert_eq!(link_target(&e.layout), e.layout.binary(OLD));
 
-    // Forward again to SHA: its recorded checksum and manifest are
-    // re-verified, still offline.
-    let report = upgrade::run(&offline, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
-    assert!(offline.calls.borrow().is_empty());
+    // Forward again to SHA: recorded checksum and manifest, then the
+    // attestation on the installed copy — still no download.
+    fake.calls.borrow_mut().clear();
+    let report = upgrade::run(&fake, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
+    assert!(fake.called("attest"));
+    assert!(!fake.called("download"));
+    assert_eq!(report["source"], "installed-release");
+    assert_eq!(report["trust"], "attested CI build");
+    assert_eq!(report["verified"]["attestation"], format!("verified {SHA}"));
     assert_eq!(report["verified"]["manifest_source_sha"], SHA);
     assert_eq!(link_target(&e.layout), e.layout.binary(SHA));
 
     // Re-running on the current release is a no-op for the link.
-    let report = upgrade::run(&offline, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
+    let report = upgrade::run(&fake, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
     assert_eq!(report["repointed"], false);
+}
+
+#[test]
+fn offline_rollback_is_labelled_unattested() {
+    let e = env();
+    let mut fake = Fake::new(&e.artifact);
+    fake.auth_ok = false;
+    let report = upgrade::run(&fake, &e.layout, &req(Target::Sha(OLD.into()), false)).unwrap();
+    assert!(!fake.called("attest"));
+    assert!(!fake.called("download"));
+    assert_eq!(report["trust"], "unattested local release");
+    assert!(report["warning"].as_str().unwrap().contains("NOT verified"));
+    assert!(report["verified"]["attestation"]
+        .as_str()
+        .unwrap()
+        .starts_with("skipped: offline"));
+    assert_eq!(link_target(&e.layout), e.layout.binary(OLD));
+}
+
+/// The reviewer's probe: a non-CI script planted at the release path,
+/// claiming `+<sha>`, with no recorded files. `--latest-main` must not
+/// trust (or even run) it; it downloads, attests and replaces it.
+#[test]
+fn latest_main_replaces_a_planted_local_release() {
+    let e = env();
+    let marker = e.layout.releases.join("planted-ran");
+    let planted = e.layout.release_dir(SHA);
+    fs::create_dir_all(&planted).unwrap();
+    fs::write(
+        planted.join("cadence"),
+        format!(
+            "#!/bin/sh\ntouch '{}'\necho \"cadence 0.1.0+{SHA}\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(planted.join("cadence"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fake = Fake::new(&e.artifact);
+    let report = upgrade::run(&fake, &e.layout, &req(Target::LatestMain, false)).unwrap();
+    assert!(fake.called("download"));
+    assert!(fake.called("attest"));
+    assert_eq!(report["source"], "ci-artifact");
+    assert_eq!(report["trust"], "attested CI build");
+    assert!(report["verified"]["local_release"]
+        .as_str()
+        .unwrap()
+        .contains("no CI manifest"));
+    assert_eq!(fs::read(e.layout.binary(SHA)).unwrap(), fake_binary(SHA));
+    assert!(e.layout.release_dir(SHA).join("manifest.json").is_file());
+    assert_eq!(link_target(&e.layout), e.layout.binary(SHA));
+    assert!(!marker.exists(), "the planted binary was executed");
+}
+
+/// Recorded files copied from CI do not help a swapped binary: with a
+/// CI manifest but no attestation, `--latest-main` still replaces it.
+#[test]
+fn latest_main_replaces_a_local_release_that_fails_attestation() {
+    let e = env();
+    let fake = Fake::new(&e.artifact);
+    upgrade::run(&fake, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
+    // Rewrite binary + checksum + manifest digest consistently, keeping
+    // the CI run_id: only the attestation can tell.
+    let dir = e.layout.release_dir(SHA);
+    let forged = format!("#!/bin/sh\n# forged\necho \"cadence 0.1.0+{SHA}\"\n").into_bytes();
+    fs::write(dir.join("cadence"), &forged).unwrap();
+    fs::write(
+        dir.join("cadence.sha256"),
+        format!("{}  cadence\n", hex(&forged)),
+    )
+    .unwrap();
+    let mut m: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    m["sha256"] = serde_json::json!(hex(&forged));
+    fs::write(dir.join("manifest.json"), m.to_string()).unwrap();
+
+    fake.calls.borrow_mut().clear();
+    let report = upgrade::run(&fake, &e.layout, &req(Target::LatestMain, false)).unwrap();
+    assert!(fake.called("download"));
+    assert_eq!(report["source"], "ci-artifact");
+    assert!(report["verified"]["local_release"]
+        .as_str()
+        .unwrap()
+        .contains("attestation did not verify"));
+    assert_eq!(fs::read(e.layout.binary(SHA)).unwrap(), fake_binary(SHA));
+}
+
+#[test]
+fn latest_main_reuses_an_attested_ci_release() {
+    let e = env();
+    let fake = Fake::new(&e.artifact);
+    upgrade::run(&fake, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
+    upgrade::repoint(&e.layout.link, &e.layout.binary(OLD)).unwrap();
+    fake.calls.borrow_mut().clear();
+    let report = upgrade::run(&fake, &e.layout, &req(Target::LatestMain, false)).unwrap();
+    assert!(fake.called("attest"));
+    assert!(!fake.called("download"));
+    assert_eq!(report["source"], "installed-release");
+    assert_eq!(report["trust"], "attested CI build");
+    assert_eq!(link_target(&e.layout), e.layout.binary(SHA));
+}
+
+#[test]
+fn latest_main_refuses_to_move_backwards() {
+    let e = env();
+    let mut fake = Fake::new(&e.artifact);
+    // The linked OLD descends from the newest green SHA.
+    fake.backwards = true;
+    let msg = refusal(upgrade::run(
+        &fake,
+        &e.layout,
+        &req(Target::LatestMain, false),
+    ));
+    assert!(msg.contains("refusing to move backwards"), "{msg}");
+    assert!(msg.contains(&format!("--sha {SHA}")), "{msg}");
+    assert!(!fake.called("download"));
+    assert_untouched(&e);
+    // An explicit --sha is the deliberate downgrade.
+    upgrade::run(&fake, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
+    assert_eq!(link_target(&e.layout), e.layout.binary(SHA));
+}
+
+#[test]
+fn confirm_link_points_back_when_bytes_differ() {
+    let root = TempDir::new().unwrap();
+    let (a, b) = (root.path().join("a"), root.path().join("b"));
+    fs::write(&a, b"previous").unwrap();
+    fs::write(&b, b"not what was verified").unwrap();
+    let link = root.path().join("cadence");
+    upgrade::repoint(&link, &b).unwrap();
+    let verified = hex(b"verified bytes");
+    let msg = upgrade::confirm_link(&link, &verified, Some(&a))
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("pointed back"), "{msg}");
+    assert_eq!(fs::read_link(&link).unwrap(), a);
+    // Matching bytes pass untouched.
+    upgrade::confirm_link(&link, &hex(b"previous"), None).unwrap();
+    // No previous link: the bad one is removed.
+    upgrade::repoint(&link, &b).unwrap();
+    upgrade::confirm_link(&link, &verified, None).unwrap_err();
+    assert!(fs::symlink_metadata(&link).is_err());
 }
 
 #[test]
@@ -561,7 +746,7 @@ fn rollback_refuses_a_modified_installed_release() {
     let e = env();
     let fake = Fake::new(&e.artifact);
     upgrade::run(&fake, &e.layout, &req(Target::Sha(SHA.into()), false)).unwrap();
-    upgrade::run(&fake, &e.layout, &req(Target::Sha(OLD.into()), false)).unwrap();
+    upgrade::run(&fake, &e.layout, &req_unattested(OLD)).unwrap();
     // Someone rewrote the installed binary after it was recorded.
     let bin = e.layout.binary(SHA);
     fs::write(&bin, fake_binary(OLD)).unwrap();
@@ -772,7 +957,7 @@ fn cli_restart_without_identity_refuses_before_installing() {
 
 #[test]
 fn cli_rollback_prints_restart_command_and_never_restarts() {
-    // gh must not be reached for an installed release.
+    // gh is unusable (every call fails): an offline rollback, labelled.
     let cli = cli_env("#!/bin/sh\necho reached >&2\nexit 9\n");
     // Pretend a newer release is live, then roll back to OLD.
     let newer = cli.layout.release_dir(SHA);
@@ -787,6 +972,11 @@ fn cli_rollback_prints_restart_command_and_never_restarts() {
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["from_sha"], SHA);
     assert_eq!(report["to_sha"], OLD);
+    assert_eq!(report["trust"], "unattested local release");
+    assert!(report["verified"]["attestation"]
+        .as_str()
+        .unwrap()
+        .starts_with("skipped: offline"));
     assert_eq!(report["restarted"], false);
     assert_eq!(
         report["restart_command"],

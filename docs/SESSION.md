@@ -603,10 +603,15 @@ In this order:
 
 A build is installed from CI, never compiled on the host. On every push
 to `main`, once `fmt`, `clippy`, `test`, `build` and `ui` have passed on
-that sha, CI's `release-artifact` job (ubuntu-24.04) builds
-`cargo build --release --locked --features ui` after `pnpm build`, checks
-that `cadence --version` ends in `+<sha>`, and uploads the artifact
-`cadence-<sha>-x86_64-linux` (kept 90 days) with three files:
+that sha, CI's `release-artifact` job (ubuntu-24.04, `contents: read`
+only) builds `cargo build --release --locked --features ui` after
+`pnpm build` with the same floating `stable` toolchain the test jobs use
+(the exact `rustc`/`cargo` versions go in the manifest), and checks that
+`cadence --version` ends in `+<sha>`. A separate `release-attest` job,
+the only one with `id-token: write`, runs no repository code: it
+re-checks that build's sha256 and manifest, attests the binary, and
+uploads the artifact `cadence-<sha>-x86_64-linux` (kept 90 days) with
+three files:
 
 - `cadence`, the binary;
 - `cadence.sha256`, its `sha256sum` line;
@@ -614,9 +619,9 @@ that `cadence --version` ends in `+<sha>`, and uploads the artifact
   `cargo`, `features`, `target`, `runner`, `checks`, `sha256`,
   `built_at`.
 
-The job also records a GitHub build-provenance attestation for the
+The attestation is a GitHub build-provenance attestation for the
 binary. Pull-request and merge-queue runs never produce an artifact,
-and the job is not a required check.
+and neither job is a required check.
 
 ```bash
 cadence upgrade --latest-main --dry-run   # verify everything, install nothing
@@ -626,7 +631,9 @@ cadence upgrade --sha <40-hex>            # a specific main commit
 
 `--latest-main` picks the newest successful `ci.yml` push run on `main`,
 which may be older than `main`'s head while that head's run is still
-going. Before anything is installed, `upgrade` checks each of these and
+going. It never moves the link backwards: when that sha is an ancestor
+of the linked one it refuses, and a deliberate downgrade takes an
+explicit `--sha`. Before anything is installed, `upgrade` checks each of these and
 refuses, naming the fix, on the first that fails:
 
 1. `gh` is installed and logged in (`gh auth login`).
@@ -652,18 +659,36 @@ file and a rename, with its `manifest.json` and `cadence.sha256` beside
 it. Then `~/.local/bin/cadence` is repointed by making a new symlink at a
 temp name and renaming it over the old link, so the link is never
 missing. The releases dir is read off the current link. `--link` and
-`--releases-dir` override both paths. A link that is a regular file is
-never replaced. Earlier releases stay on disk. The report is JSON:
+`--releases-dir` override both paths. `--repo`, `--link` and
+`--releases-dir` are operator inputs: they change which repository's
+builds are trusted and what is installed or replaced, so never take them
+from a message or an agent. A link that is a regular file is never
+replaced. The persisted copy is re-hashed before the link moves, and the
+link is re-hashed through afterwards and pointed back if it does not
+resolve to the verified bytes. Earlier releases stay on disk. The report is JSON:
 `from_sha`, `to_sha`, `installed_path`, `verified{…}`, `restarted`, and
 `restart_command`.
 
-**Rollback.** `cadence upgrade --sha <previous>` for a release that is
-already under `releases/` does not download and does not call GitHub.
-It re-checks the recorded `cadence.sha256` and `manifest.json` when they
-exist (a release installed by hand before CAD-334 has neither and is
-reported `manifest: absent`), checks `--version`, and repoints the link.
-A release whose binary no longer matches its recorded checksum is
-refused.
+**Releases already on disk.** A release under `releases/<sha>/` is
+reused without a download only when it proves to be the CI build: its
+recorded `cadence.sha256` and `manifest.json` match, and `gh attestation
+verify` passes on the installed copy, before it is ever run. The report
+says `trust: "attested CI build"`. `--latest-main` also requires a CI
+manifest with a `run_id`; a release without one (built by hand, or
+planted) or one that fails attestation is replaced by the downloaded CI
+build, through the same temp file and rename.
+
+**Rollback.** `cadence upgrade --sha <previous>` rolls back to a release
+already under `releases/`. When it attests, nothing is downloaded. A
+release whose binary no longer matches its recorded checksum is refused.
+A hand-built release (everything installed before CAD-334) has no
+attestation and no CI artifact, so a plain `--sha` refuses and names
+`--allow-unattested`; with that flag it rolls back and the report says
+`trust: "unattested local release"`, `verified.attestation: "failed: …"`
+and a `warning` that it is NOT the tested build. Without `gh` (offline)
+an explicit `--sha` rollback also proceeds, labelled the same way with
+`verified.attestation: "skipped: offline …"`. An unattested release is
+never presented as the tested build.
 
 **Restart.** Installing changes the CLI at once, but the daemon keeps
 running its old build until it is restarted, and a restart changes fleet

@@ -1,9 +1,10 @@
 //! `cadence upgrade` (CAD-334): install the exact build CI tested on main.
 //!
-//! CI's `release-artifact` job runs only on a push to `main`, after every
-//! gate passed on that sha. It uploads `cadence-<sha>-x86_64-linux`
-//! holding the binary, `cadence.sha256` and `manifest.json`, and a
-//! build-provenance attestation over the binary.
+//! On a push to `main`, after every gate passed on that sha, CI's
+//! `release-artifact` job builds (with `contents: read` only) and
+//! `release-attest` attests the binary and uploads
+//! `cadence-<sha>-x86_64-linux`: the binary, `cadence.sha256` and
+//! `manifest.json`.
 //!
 //! Before anything is installed, this module proves, in order:
 //! 1. the sha is on `main` (GitHub compare: `identical` or `ahead`);
@@ -16,11 +17,19 @@
 //! 7. only then is the binary run: `--version` must end in `+<sha>`.
 //!
 //! The install writes `<releases>/<sha>/cadence` (0755) through a temp
-//! file and a rename, then repoints the `cadence` symlink by creating a
-//! new link at a temp name and renaming it over the old one. `rename(2)`
-//! replaces the name atomically, so the link never goes missing. Earlier
-//! releases are kept: `--sha <previous>` for a release that is already on
-//! disk verifies it locally and only repoints the link — no download.
+//! file and a rename, re-hashes the persisted copy, then repoints the
+//! `cadence` symlink by creating a new link at a temp name and renaming it
+//! over the old one. `rename(2)` replaces the name atomically, so the link
+//! never goes missing; the link is re-hashed through and pointed back if
+//! it does not resolve to the verified bytes.
+//!
+//! A release already on disk is reused only when it is proven to be the
+//! CI build (recorded checksum/manifest, then the attestation, before it
+//! is ever run); `--latest-main` also requires its CI manifest, and
+//! otherwise downloads and replaces it. `--latest-main` never moves the
+//! link backwards. An explicit `--sha` rollback to an unattested release
+//! works offline or with `allow_unattested`, and is labelled
+//! [`TRUST_UNATTESTED`].
 //!
 //! Restarting the daemon is never automatic. GitHub access sits behind
 //! [`ReleaseSource`] so tests run against a fake and never call GitHub.
@@ -126,6 +135,10 @@ pub trait ReleaseSource {
     /// Newest successful push run of the workflow on `main`.
     fn latest_green_main(&self) -> Result<Option<Run>>;
     fn on_main(&self, sha: &str) -> Result<OnMain>;
+    /// GitHub compare `base...head`: `ahead` when `head` descends from
+    /// `base`, `behind` when `base` descends from `head`, `identical`,
+    /// `diverged`; `None` when GitHub does not know one of them.
+    fn compare(&self, base: &str, head: &str) -> Result<Option<String>>;
     /// Push runs of the workflow on `main` for exactly this sha.
     fn main_runs(&self, sha: &str) -> Result<Vec<Run>>;
     fn jobs(&self, run_id: u64) -> Result<Vec<Job>>;
@@ -283,18 +296,24 @@ impl ReleaseSource for Gh {
     }
 
     fn on_main(&self, sha: &str) -> Result<OnMain> {
-        let path = format!("repos/{}/compare/{sha}...{MAIN}", self.repo);
+        Ok(match self.compare(sha, MAIN)? {
+            Some(status) if matches!(status.as_str(), "identical" | "ahead") => OnMain::Yes,
+            Some(status) => OnMain::No(status),
+            None => OnMain::Unknown,
+        })
+    }
+
+    fn compare(&self, base: &str, head: &str) -> Result<Option<String>> {
+        let path = format!("repos/{}/compare/{base}...{head}", self.repo);
         let out = self.run(&["api", &path, "--jq", ".status"], GH_TIMEOUT)?;
         if out.status.success() {
-            let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            return Ok(match status.as_str() {
-                "identical" | "ahead" => OnMain::Yes,
-                _ => OnMain::No(status),
-            });
+            return Ok(Some(
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            ));
         }
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("404") || err.contains("Not Found") || err.contains("No common ancestor") {
-            return Ok(OnMain::Unknown);
+            return Ok(None);
         }
         Err(Error::internal(format!(
             "gh api {path} failed: {}",
@@ -497,10 +516,26 @@ pub enum Target {
 pub struct Request {
     pub target: Target,
     pub dry_run: bool,
+    /// Explicit `--sha` only: accept a release already on disk whose
+    /// attestation does not verify (a hand-built release) as a rollback
+    /// target. It is reported as an unattested local release.
+    pub allow_unattested: bool,
 }
+
+/// `trust` in the report: what the installed binary is known to be.
+pub const TRUST_ATTESTED: &str = "attested CI build";
+pub const TRUST_UNATTESTED: &str = "unattested local release";
 
 /// Resolve, verify, and (unless `dry_run`) install and repoint. Returns
 /// the JSON report; restarting is the caller's separate, explicit step.
+///
+/// A release already under `releases/` is reused only when it proves to
+/// be the CI build: recorded checksum and manifest match, and the
+/// attestation verifies. `--latest-main` also needs a CI manifest (with
+/// `run_id`); anything less is replaced by a fresh download. An explicit
+/// `--sha` rollback may still use an unattested release when `gh` is
+/// unavailable (offline) or with `allow_unattested`, and the report then
+/// says [`TRUST_UNATTESTED`], never the tested build.
 pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Value> {
     if let Target::Sha(sha) = &req.target {
         if !is_full_sha(sha) {
@@ -529,11 +564,8 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
     };
 
     let mut verified = serde_json::Map::new();
-    let mut run_id = None;
-    let (sha, source) = match &req.target {
-        // Rollback / reinstall: already on disk → no network at all.
-        Target::Sha(sha) if layout.binary(sha).is_file() => (sha.clone(), "installed-release"),
-        Target::Sha(sha) => (sha.clone(), "ci-artifact"),
+    let (sha, explicit, online) = match &req.target {
+        Target::Sha(sha) => (sha.clone(), true, src.check_auth()),
         Target::LatestMain => {
             src.check_auth()?;
             let run = src.latest_green_main()?.ok_or_else(|| {
@@ -556,33 +588,79 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
                     run.id, run.head_sha
                 )),
             );
-            let source = if layout.binary(&run.head_sha).is_file() {
-                "installed-release"
-            } else {
-                "ci-artifact"
-            };
-            (run.head_sha, source)
+            refuse_backwards(src, from_sha.as_deref(), &run.head_sha)?;
+            (run.head_sha, false, Ok(()))
         }
     };
 
     let installed_path = layout.binary(&sha);
+    let mut trust = TRUST_ATTESTED;
+    let mut digest = None;
+    // Why an on-disk release was not reused, when it was not.
+    let mut local_rejected: Option<String> = None;
+    if installed_path.is_file() {
+        match local_release(src, layout, &sha, explicit, &online, req, &mut verified)? {
+            Local::Use {
+                digest: d,
+                trust: t,
+            } => {
+                digest = Some(d);
+                trust = t;
+            }
+            Local::Replace(reason) => {
+                verified.insert(
+                    "local_release".into(),
+                    json!(format!(
+                        "not reused ({reason}); the CI build is downloaded to replace it"
+                    )),
+                );
+                local_rejected = Some(reason);
+            }
+        }
+    }
+
+    let source = if digest.is_some() {
+        "installed-release"
+    } else {
+        "ci-artifact"
+    };
+    let mut run_id = None;
     // Holds the downloaded files until they are installed or dropped.
     let mut staged: Option<tempfile::TempDir> = None;
-    if source == "installed-release" {
-        verify_local(layout, &sha, &mut verified)?;
-    } else {
-        if req.target != Target::LatestMain {
-            src.check_auth()?;
-        }
-        let id = verify_ci(src, &sha, &mut verified)?;
+    if digest.is_none() {
+        let fetched = online
+            .map_err(|e| Error::rejected(e.to_string()))
+            .and_then(|()| {
+                let id = verify_ci(src, &sha, &mut verified)?;
+                let tmp = tempfile::Builder::new()
+                    .prefix("cadence-upgrade-")
+                    .tempdir()?;
+                src.download(id, &artifact_name(&sha), tmp.path())?;
+                let d = verify_download(src, tmp.path(), &sha, &mut verified)?;
+                Ok((id, tmp, d))
+            });
+        let (id, tmp, d) = match (fetched, &local_rejected) {
+            (Ok(v), _) => v,
+            (Err(e), Some(reason)) if explicit => {
+                return Err(Error::rejected(format!(
+                    "{e}. The release already at {} is not an attested CI build ({reason}). \
+                     To roll back to it anyway, rerun with --allow-unattested; it will be \
+                     reported as an {TRUST_UNATTESTED}",
+                    installed_path.display()
+                )));
+            }
+            (Err(e), _) => return Err(e),
+        };
         run_id = Some(id);
-        let tmp = tempfile::Builder::new()
-            .prefix("cadence-upgrade-")
-            .tempdir()?;
-        let name = artifact_name(&sha);
-        src.download(id, &name, tmp.path())?;
-        verify_download(src, tmp.path(), &sha, &mut verified)?;
+        digest = Some(d);
         staged = Some(tmp);
+    }
+    let digest = digest.expect("set by the local or the CI path");
+    if trust == TRUST_UNATTESTED {
+        verified.insert(
+            "download".into(),
+            json!("skipped — release already installed"),
+        );
     }
 
     let link_changed = from_target.as_deref() != Some(installed_path.as_path());
@@ -592,17 +670,29 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
         if let Some(tmp) = &staged {
             install_files(tmp.path(), &layout.release_dir(&sha))?;
             installed = true;
+            // The persisted copy, not just the staged one, must be the
+            // verified bytes before the link moves to it.
+            let persisted = sha256_file(&installed_path)?;
+            if persisted != digest {
+                return Err(Error::rejected(format!(
+                    "installed copy {} hashes to {persisted}, not the verified {digest} — \
+                     the link was not moved; remove that file and rerun",
+                    installed_path.display()
+                )));
+            }
         }
         repointed = repoint(&layout.link, &installed_path)?;
+        confirm_link(&layout.link, &digest, from_target.as_deref())?;
     }
 
-    Ok(json!({
+    let mut report = json!({
         "dry_run": req.dry_run,
         "repo": src.repo(),
         "from_sha": from_sha,
         "from_target": from_target,
         "to_sha": sha,
         "source": source,
+        "trust": trust,
         "run_id": run_id,
         "artifact": (source == "ci-artifact").then(|| artifact_name(&sha)),
         "installed_path": installed_path,
@@ -613,7 +703,97 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
         "would_repoint": req.dry_run && link_changed,
         "verified": Value::Object(verified),
         "restarted": false,
-    }))
+    });
+    if trust == TRUST_UNATTESTED {
+        report["warning"] = json!(format!(
+            "{TRUST_UNATTESTED}: {sha} is NOT verified as the tested CI build — \
+             its build-provenance attestation was not checked or did not verify"
+        ));
+    }
+    Ok(report)
+}
+
+/// `--latest-main` never moves the link backwards: when the resolved sha
+/// is an ancestor of the currently linked one, refuse and point at an
+/// explicit `--sha` for a deliberate downgrade.
+fn refuse_backwards(src: &dyn ReleaseSource, from: Option<&str>, to: &str) -> Result<()> {
+    let Some(from) = from.filter(|f| *f != to) else {
+        return Ok(());
+    };
+    if src.compare(to, from)?.as_deref() == Some("ahead") {
+        return Err(Error::rejected(format!(
+            "--latest-main resolved {to}, which is older than the linked {from} (an \
+             ancestor on {MAIN}) — refusing to move backwards. The newest green run may \
+             still be pending for newer commits; to downgrade on purpose, pass \
+             --sha {to} explicitly"
+        )));
+    }
+    Ok(())
+}
+
+enum Local {
+    /// Reuse the on-disk release: its digest and how far it is trusted.
+    Use { digest: String, trust: &'static str },
+    /// Not proven to be the CI build — download and replace it.
+    Replace(String),
+}
+
+/// Decide whether the release already at `<releases>/<sha>/cadence` can be
+/// reused. Recorded checksum and manifest are checked first; the binary is
+/// attested before it is ever executed.
+fn local_release(
+    src: &dyn ReleaseSource,
+    layout: &Layout,
+    sha: &str,
+    explicit: bool,
+    online: &Result<()>,
+    req: &Request,
+    verified: &mut serde_json::Map<String, Value>,
+) -> Result<Local> {
+    let mut found = serde_json::Map::new();
+    let (digest, ci_manifest) = match local_records(layout, sha, &mut found) {
+        Ok(v) => v,
+        // A recorded checksum or manifest that no longer matches is
+        // tampering; a named rollback stops, --latest-main replaces it.
+        Err(e) if explicit => return Err(e),
+        Err(e) => return Ok(Local::Replace(e.to_string())),
+    };
+    if !explicit && !ci_manifest {
+        return Ok(Local::Replace(
+            "no CI manifest with a run_id — not installed from CI".into(),
+        ));
+    }
+    let binary = layout.binary(sha);
+    let trust = match online {
+        Err(why) => {
+            // Only reachable for an explicit --sha: --latest-main needs gh.
+            found.insert(
+                "attestation".into(),
+                json!(format!("skipped: offline ({why})")),
+            );
+            TRUST_UNATTESTED
+        }
+        Ok(()) => match src.verify_attestation(&binary, sha) {
+            Ok(desc) => {
+                found.insert("attestation".into(), json!(desc));
+                TRUST_ATTESTED
+            }
+            Err(e) if explicit && req.allow_unattested => {
+                found.insert("attestation".into(), json!(format!("failed: {e}")));
+                TRUST_UNATTESTED
+            }
+            Err(e) => return Ok(Local::Replace(format!("attestation did not verify: {e}"))),
+        },
+    };
+    found.insert("version".into(), json!(check_version(&binary, sha)?));
+    verified.extend(found);
+    if trust == TRUST_ATTESTED {
+        verified.insert(
+            "download".into(),
+            json!("skipped — attested release already installed"),
+        );
+    }
+    Ok(Local::Use { digest, trust })
 }
 
 /// Steps 1–3: on main, `test` passed on that exact sha, artifact present.
@@ -696,8 +876,9 @@ fn verify_ci(
         }
         ArtifactState::Missing => {
             return Err(Error::rejected(format!(
-                "run {} has no artifact {name} — the `release-artifact` job did not run or \
-                 did not finish (builds before CAD-334 have none); check `gh run view {}`",
+                "run {} has no artifact {name} — the `release-artifact`/`release-attest` jobs \
+                 did not run or did not finish (builds before CAD-334 have none); check \
+                 `gh run view {}`",
                 run.id, run.id
             )));
         }
@@ -711,7 +892,7 @@ fn verify_download(
     dir: &Path,
     sha: &str,
     verified: &mut serde_json::Map<String, Value>,
-) -> Result<()> {
+) -> Result<String> {
     for file in [BINARY, SHA_FILE, MANIFEST] {
         if !dir.join(file).is_file() {
             return Err(Error::rejected(format!(
@@ -732,17 +913,18 @@ fn verify_download(
     verified.insert("attestation".into(), json!(attestation));
     // Only an attested binary is ever executed.
     verified.insert("version".into(), json!(check_version(&binary, sha)?));
-    Ok(())
+    Ok(digest)
 }
 
-/// An installed release: its recorded checksum and manifest when present,
-/// then `--version`. Older, hand-installed releases have neither file;
-/// they are reported as unrecorded rather than silently "verified".
-fn verify_local(
+/// An installed release's recorded checksum and manifest, when present.
+/// Returns its digest and whether a CI manifest (with `run_id`) was
+/// recorded. Older, hand-installed releases have neither file; they are
+/// reported as unrecorded rather than silently "verified". Never runs it.
+fn local_records(
     layout: &Layout,
     sha: &str,
     verified: &mut serde_json::Map<String, Value>,
-) -> Result<()> {
+) -> Result<(String, bool)> {
     let dir = layout.release_dir(sha);
     let binary = dir.join(BINARY);
     let sha_file = dir.join(SHA_FILE);
@@ -759,21 +941,41 @@ fn verify_local(
         digest
     };
     let manifest = dir.join(MANIFEST);
-    if manifest.is_file() {
-        verified.insert("manifest".into(), check_manifest(&manifest, sha, &digest)?);
+    let ci_manifest = if manifest.is_file() {
+        let m = check_manifest(&manifest, sha, &digest)?;
+        let from_ci = m["run_id"].as_u64().is_some();
+        verified.insert("manifest".into(), m);
         verified.insert("manifest_source_sha".into(), json!(sha));
+        from_ci
     } else {
-        verified.insert(
-            "manifest".into(),
-            json!("absent — installed before CAD-334"),
-        );
+        verified.insert("manifest".into(), json!("absent — not installed from CI"));
+        false
+    };
+    Ok((digest, ci_manifest))
+}
+
+/// After the swap, the link must resolve to the verified bytes. If it does
+/// not, point it back at `previous` (or remove it when there was none) and
+/// refuse.
+pub fn confirm_link(link: &Path, digest: &str, previous: Option<&Path>) -> Result<()> {
+    let actual = sha256_file(link)?;
+    if actual == digest {
+        return Ok(());
     }
-    verified.insert(
-        "download".into(),
-        json!("skipped — release already installed"),
-    );
-    verified.insert("version".into(), json!(check_version(&binary, sha)?));
-    Ok(())
+    let restored = match previous {
+        Some(prev) => repoint(link, prev).map(|_| format!("pointed back at {}", prev.display())),
+        None => fs::remove_file(link)
+            .map(|()| "removed".to_string())
+            .map_err(Error::from),
+    };
+    Err(Error::rejected(format!(
+        "{} resolves to bytes hashing {actual}, not the verified {digest} — the link was {}",
+        link.display(),
+        match restored {
+            Ok(what) => what,
+            Err(e) => format!("NOT restored ({e}); fix it by hand"),
+        }
+    )))
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {

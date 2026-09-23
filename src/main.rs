@@ -955,14 +955,23 @@ enum Commands {
         /// Rollout identity for `--restart` outside a cadence pane.
         #[arg(long = "as", requires = "restart")]
         as_identity: Option<String>,
+        /// With --sha: roll back to a release already on disk even though
+        /// its attestation does not verify (a hand-built release). The
+        /// report labels it an unattested local release.
+        #[arg(long, requires = "sha")]
+        allow_unattested: bool,
         /// GitHub repository whose CI built and attested the binary.
+        /// An operator input: it decides which repository's builds are
+        /// trusted.
         #[arg(long, default_value = cadence_agent::upgrade::DEFAULT_REPO)]
         repo: String,
         /// Symlink that puts cadence on PATH [default: ~/.local/bin/cadence].
+        /// An operator input: it decides what gets replaced.
         #[arg(long)]
         link: Option<PathBuf>,
         /// Releases directory [default: read off the current link, else
-        /// $XDG_DATA_HOME/cadence/releases].
+        /// $XDG_DATA_HOME/cadence/releases]. An operator input: releases
+        /// found there are candidates for reuse.
         #[arg(long)]
         releases_dir: Option<PathBuf>,
     },
@@ -5295,6 +5304,7 @@ fn run() -> Result<i32> {
             dry_run,
             restart,
             as_identity,
+            allow_unattested,
             repo,
             link,
             releases_dir,
@@ -5306,6 +5316,7 @@ fn run() -> Result<i32> {
                 dry_run,
                 restart,
                 as_identity,
+                allow_unattested,
                 repo,
                 link,
                 releases_dir,
@@ -5321,6 +5332,7 @@ struct UpgradeArgs {
     dry_run: bool,
     restart: bool,
     as_identity: Option<String>,
+    allow_unattested: bool,
     repo: String,
     link: Option<PathBuf>,
     releases_dir: Option<PathBuf>,
@@ -5357,6 +5369,7 @@ fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
         &upgrade::Request {
             target,
             dry_run: args.dry_run,
+            allow_unattested: args.allow_unattested,
         },
     )?;
     let command = upgrade::restart_command(args.as_identity.as_deref());
