@@ -75,11 +75,12 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(60);
 /// scrubbed then the real pair (`CADENCE_ALIAS`, `CADENCE_STATE_DIR`) is
 /// re-injected per agent — test overrides like `CADENCE_CLAUDE_COMMAND`
 /// never reach the child.
-fn claude_env_scrub() -> EnvScrub {
+pub(crate) fn claude_env_scrub() -> EnvScrub {
     EnvScrub::prefixes(
         &["CLAUDE_", "CLAUDECODE", "CODEX_", "CADENCE_"],
         &["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"],
     )
+    .and_names(super::CLOUD_SECRET_ENV)
 }
 
 /// Provider binary; `CADENCE_CLAUDE_COMMAND` overrides it (test/mock).

@@ -1804,6 +1804,45 @@ impl Store {
         Ok(())
     }
 
+    /// One alert after held-recovery gives up. The agent stays unfenced
+    /// and the held message is not replayed. A second call is a no-op.
+    pub fn escalate_cloud_hold(&self, message: &Message, reason: &str) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let already: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM events WHERE alias=?1 AND kind='cloud_recover_escalated' \
+             AND json_extract(payload,'$.message')=?2",
+            params![&message.alias, &message.id],
+            |row| row.get(0),
+        )?;
+        if already == 0 {
+            Self::event(
+                &tx,
+                &message.alias,
+                "cloud_recover_escalated",
+                json!({
+                    "reason": reason,
+                    "fenced": false,
+                    "message": message.id,
+                }),
+            )?;
+            self.route_notice(
+                &tx,
+                message,
+                "cloud_recover_escalated",
+                &json!({
+                    "status": "unknown",
+                    "text": "",
+                    "held": true,
+                    "escalated": true,
+                    "error": reason,
+                }),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Standalone event insert for runtime/daemon bookkeeping.
     pub fn event_public(&self, alias: &str, kind: &str, payload: Value) -> Result<()> {
         let conn = self.conn();
@@ -2873,6 +2912,9 @@ impl Store {
         // slot free for the operator's later verdict (completed/failed)
         // or the interrupted notice.
         if status == "unknown" {
+            // A held cloud poll keeps the live session. The PM still
+            // hears about it, but the notice must not say the worker
+            // is fenced.
             self.route_notice(tx, message, "unknown", result)?;
         } else {
             self.route_result(tx, message, result)?;
@@ -3030,22 +3072,54 @@ impl Store {
             "message": message.id, "notice": kind,
             "result": routed, "worker": message.alias,
         });
-        let prompt = match kind {
-            "interrupted" => format!(
-                "An operator closed a managed worker's turn as interrupted — the outcome was \
+        let held = kind == "unknown" && result.get("held").and_then(Value::as_bool) == Some(true);
+        let prompt = if held || kind == "cloud_recover_escalated" {
+            let session: Option<String> = tx
+                .query_row(
+                    "SELECT endpoint FROM agents WHERE alias=?",
+                    [&message.alias],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let session = session
+                .filter(|url| !url.is_empty())
+                .unwrap_or_else(|| format!("shown by `cadence agent show {}`", message.alias));
+            let exit = cloud_hold_exit(&message.id, &message.alias, &session);
+            if held {
+                format!(
+                    "A Devin cloud worker's turn is held: the poll outcome was not learned and \
+                     the session may still be working. The worker is not fenced yet: it keeps \
+                     polling, and a later poll can still settle the turn. {exit} This is an \
+                     informational notice, not a result; do not treat it as worker output. \
+                     {payload}"
+                )
+            } else {
+                format!(
+                    "A Devin cloud worker stopped polling a held turn after repeated failures. \
+                     The worker is not fenced and the held message was not replayed. {exit} \
+                     This is an informational notice, not a result; do not treat it as worker \
+                     output. {payload}"
+                )
+            }
+        } else {
+            match kind {
+                "interrupted" => format!(
+                    "An operator closed a managed worker's turn as interrupted — the outcome was \
                  never learned. This is an informational notice, not a result; do not treat it \
                  as worker output. {payload}"
-            ),
-            "cancelled" => format!(
-                "A managed worker's queued message was cancelled before delivery — nothing \
+                ),
+                "cancelled" => format!(
+                    "A managed worker's queued message was cancelled before delivery — nothing \
                  ran. This is an informational notice, not a result; do not treat it as \
                  worker output. {payload}"
-            ),
-            _ => format!(
-                "A managed worker's turn outcome is unknown — the worker is fenced and an \
+                ),
+                _ => format!(
+                    "A managed worker's turn outcome is unknown — the worker is fenced and an \
                  operator reconcile is pending. This is an informational notice, not a result; \
                  do not treat it as worker output. {payload}"
-            ),
+                ),
+            }
         } + &pointer;
         tx.execute(
             "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
@@ -4655,6 +4729,8 @@ impl Store {
                 | "turn_silent_end"
                 | "approval_menu"
                 | "draft_pending"
+                | "cloud_hold"
+                | "cloud_recover_escalated"
         )
     }
 
@@ -6380,6 +6456,181 @@ fn last_sha_line(text: &str) -> Option<String> {
 /// other field is shared boilerplate. A fixed 32-hex digest (not the
 /// raw id) keeps the suffix bounded for `--message` override ids of
 /// arbitrary length; the same id always mints the same suffix.
+fn flatten_controls(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+fn path_boundary(prev: Option<u8>) -> bool {
+    matches!(
+        prev,
+        None | Some(b' ' | b'\n' | b'\t' | b'\r' | b'`' | b'"' | b'(')
+    )
+}
+
+/// A path is machine-local when it is `~/...` or an absolute path whose
+/// first segment is not an API version (`/v3/...`, `/v3beta1/...`).
+/// That drops `/home`, `/tmp`, `/var`, `/etc`, and other host paths
+/// such as `/secret/...`, and keeps a backticked Devin API path.
+fn local_path(token: &str) -> bool {
+    if token.starts_with("~/") || token == "~" {
+        return true;
+    }
+    if !token.starts_with('/') {
+        return false;
+    }
+    let segment = token[1..].split(['/', '?', '#']).next().unwrap_or("");
+    let api = segment.len() >= 2
+        && segment.as_bytes()[0] == b'v'
+        && segment.as_bytes()[1].is_ascii_digit();
+    !api
+}
+
+/// Drop machine-local paths so a cloud session is not pointed at a host
+/// file. Paths after a space, newline, backtick, quote, or `(` are
+/// included. API paths (`/v3/organizations/...`) and `https://` URLs
+/// stay.
+pub fn omit_host_paths(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'/' {
+            let ch = text[index..].chars().next().unwrap_or('\u{fffd}');
+            out.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+        let prev = if index == 0 {
+            None
+        } else {
+            Some(bytes[index - 1])
+        };
+        let tilde = prev == Some(b'~')
+            && path_boundary(if index >= 2 {
+                Some(bytes[index - 2])
+            } else {
+                None
+            });
+        let url = prev == Some(b':');
+        let start = if tilde { index - 1 } else { index };
+        let token = text[start..]
+            .split_whitespace()
+            .next()
+            .unwrap_or(&text[start..]);
+        if (tilde || (path_boundary(prev) && !url)) && local_path(token) {
+            if tilde {
+                out.pop();
+            }
+            out.push_str("(omitted)");
+            index = start + token.len();
+        } else {
+            out.push('/');
+            index += 1;
+        }
+    }
+    out
+}
+
+/// Enqueue rejects a body over 48_000 bytes. The inlined spec is cut in
+/// bytes, on a char boundary, so a multibyte spec cannot blow that limit.
+const ENQUEUE_BYTES: usize = 48_000;
+const SPEC_NOTE: &str = "… (spec text truncated; the inlined copy is incomplete)";
+
+fn take_bytes(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// The report contract. Reserved before any cut so a long acceptance
+/// or spec cannot chop this suffix.
+const SHA_TRAILER: &str = " Report when done: end your final answer with a one-line summary \
+followed by a last line `SHA: <40-hex>` naming the commit you produced — the daemon reads \
+that line as the reported revision. Do not report a SHA you have not committed.";
+
+/// Cloud sessions cannot read the host spec path or run `cadence self`.
+/// The spec text is inlined and the `SHA:` trailer stays the report contract.
+/// The operator exit for a held Devin cloud turn. The held message
+/// stays `unknown`: a daemon restart or `agent stop` during the hold
+/// fences the worker (resume is refused), and a stop does not archive
+/// the session.
+fn cloud_hold_exit(message: &str, alias: &str, session: &str) -> String {
+    format!(
+        "The held message `{message}` stays unknown. If the daemon restarts or the agent \
+         is stopped before a poll settles it, that message fences the worker until it is \
+         reconciled; the session is not archived and nothing is replayed. To settle it by \
+         hand, inspect the Devin session ({session}), then run `cadence message reconcile {message} \
+         --status <completed|failed|interrupted>` (add `--sha <40-hex>` for a completed \
+         commit) or, after a restart or stop has fenced the worker, `cadence agent unfence \
+         {alias} --status <completed|failed|interrupted>`, choosing the status from what the session shows. \
+         `cadence agent resume {alias}` is refused while the message is unknown."
+    )
+}
+
+fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> String {
+    let spec = task.spec_path.as_deref().unwrap_or(job.spec_path.as_str());
+    let raw = std::fs::read_to_string(spec)
+        .unwrap_or_else(|_| "(spec text was not available to inline)".to_string());
+    let cleaned = omit_host_paths(&flatten_controls(&raw));
+    let mut scope = String::new();
+    if let Some(branch) = &task.branch {
+        scope.push_str(&format!(" branch {}", flatten_controls(branch)));
+    }
+    if let Some(base) = &task.base_sha {
+        scope.push_str(&format!(" base {}", flatten_controls(base)));
+    }
+    if !scope.is_empty() {
+        scope = format!(" Scope:{scope}.");
+    }
+    let acceptance = task
+        .acceptance
+        .as_deref()
+        .map(|text| format!(" Acceptance: {}.", flatten_controls(text)))
+        .unwrap_or_default();
+    let issue = job
+        .issue_id
+        .as_deref()
+        .map(|id| format!(" This job tracks issue {id}."))
+        .unwrap_or_default();
+    let head = format!(
+        "Cadence task {} (job {}, revision {}). You are a Devin cloud session and cannot \
+         read host paths or invoke the cadence CLI. Spec text follows. ",
+        task.id, job.id, revision
+    );
+    let bridge = format!(".{scope}{issue}");
+    let fixed = head.len() + bridge.len() + SHA_TRAILER.len();
+    let budget = ENQUEUE_BYTES.saturating_sub(fixed);
+    let spec_len = cleaned.len();
+    let (spec_text, accept_text) = if spec_len + acceptance.len() <= budget {
+        (cleaned, acceptance)
+    } else if spec_len <= budget {
+        let accept_text = take_bytes(&acceptance, budget - spec_len);
+        (cleaned, accept_text)
+    } else {
+        let mut spec_text = take_bytes(&cleaned, budget.saturating_sub(SPEC_NOTE.len()));
+        spec_text.push_str(SPEC_NOTE);
+        (spec_text, String::new())
+    };
+    let mut body = format!("{head}{spec_text}{bridge}{accept_text}{SHA_TRAILER}");
+    // Scope and issue text can already exceed the enqueue limit. Drop
+    // the spec, say so, and keep the SHA trailer inside 48_000 bytes.
+    if body.len() > ENQUEUE_BYTES {
+        const OMITTED: &str = "… (spec text omitted; the prompt was cut to fit)";
+        let tail = format!("{OMITTED}{SHA_TRAILER}");
+        let room = ENQUEUE_BYTES.saturating_sub(tail.len());
+        let prefix = take_bytes(&format!("{head}{bridge}"), room);
+        body = format!("{prefix}{tail}");
+    }
+    body
+}
+
 fn kickoff_correlation(message_id: &str) -> String {
     let digest = format!("{:x}", Sha256::digest(message_id.as_bytes()));
     format!(" Correlation: {}.", &digest[..32])
@@ -6397,6 +6648,9 @@ fn kickoff_body(
     message_id: &str,
     assignee: &Agent,
 ) -> String {
+    if assignee.provider == "devin" && assignee.endpoint_kind == "cloud" {
+        return cloud_kickoff_body(job, task, revision);
+    }
     let spec = task.spec_path.as_deref().unwrap_or(&job.spec_path);
     let clean = |s: &str| -> String {
         s.chars()
@@ -7699,6 +7953,21 @@ mod tests {
         let t = s.task("t1").unwrap();
         assert_eq!(t.head_sha.as_deref(), Some(SHA40_A), "{t:?}");
 
+        // A pull-request URL after the trailer must not steal the sha.
+        s.create_task("j1", "t-pr", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        let (_, kick_pr, ..) = s.dispatch_task("t-pr", None, None, "test").unwrap();
+        let m_pr = run_kickoff(&s, &kick_pr);
+        let trailed = format!("SHA: {SHA40_B}\nhttps://github.com/favcrm/cadence/pull/9");
+        s.finish(
+            &m_pr,
+            "completed",
+            &json!({"status": "completed", "text": trailed}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.task("t-pr").unwrap().head_sha.as_deref(), Some(SHA40_B));
+
         // Second task: no sha anywhere → review with NULL, task sha repairs.
         s.create_task("j1", "t2", None, Some("w1"), None, None, None, None, None)
             .unwrap();
@@ -7746,6 +8015,358 @@ mod tests {
         let t = s.task("t1").unwrap();
         assert_eq!(t.state, "review");
         assert_eq!(t.head_sha.as_deref(), Some(SHA40_A));
+    }
+
+    #[test]
+    fn held_unknown_routes_a_live_notice() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "w1", &cwd);
+        reg(&s, "pm", &cwd);
+        s.enqueue("w1", "work", Some("pm"), "m-held", "user")
+            .unwrap();
+        let held = run_kickoff(&s, "m-held");
+        s.finish(
+            &held,
+            "unknown",
+            &json!({"status": "unknown", "text": "", "error": "poll held", "held": true}),
+            Some("poll held"),
+        )
+        .unwrap();
+        assert!(s
+            .events("w1", 0, 40)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "notice_routed"));
+        let notices = s.messages("pm").unwrap();
+        assert!(
+            notices.iter().any(|message| {
+                message.body.contains("held") && message.body.contains("not fenced")
+            }),
+            "{notices:?}"
+        );
+        assert!(notices
+            .iter()
+            .all(|message| !message.body.contains("the worker is fenced")));
+        s.enqueue("w1", "again", Some("pm"), "m-fence", "user")
+            .unwrap();
+        let fenced = run_kickoff(&s, "m-fence");
+        s.finish(
+            &fenced,
+            "unknown",
+            &json!({"status": "unknown", "text": "", "error": "lost"}),
+            Some("lost"),
+        )
+        .unwrap();
+        assert!(s
+            .messages("pm")
+            .unwrap()
+            .iter()
+            .any(|message| message.body.contains("the worker is fenced")));
+    }
+
+    #[test]
+    fn cloud_hold_is_a_monitor_alert() {
+        assert!(Store::monitor_alert_kind("cloud_hold"));
+        assert!(Store::monitor_alert_kind("cloud_recover_escalated"));
+    }
+
+    #[test]
+    fn cloud_kickoff_inlines_spec_without_a_host_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "Implement the cloud task from this text.").unwrap();
+        let worktree = dir.path().join("wt");
+        let job = Job {
+            id: "j1".into(),
+            title: None,
+            spec_path: spec.display().to_string(),
+            spec_sha256: None,
+            pm_alias: "pm".into(),
+            issue_id: None,
+            repo: None,
+            base_ref: None,
+            state: "open".into(),
+            max_revisions: 2,
+            stall_secs: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let task = Task {
+            id: "t1".into(),
+            job_id: "j1".into(),
+            title: None,
+            role: "worker".into(),
+            assignee: Some("cloud-1".into()),
+            spec_path: Some(spec.display().to_string()),
+            acceptance: Some("the task is done".into()),
+            worktree: Some(worktree.display().to_string()),
+            branch: Some("cadence/cloud".into()),
+            base_sha: Some("abc".into()),
+            head_sha: None,
+            state: "draft".into(),
+            revision: 0,
+            dispatch_message: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let assignee = Agent {
+            alias: "cloud-1".into(),
+            provider: "devin".into(),
+            endpoint_kind: "cloud".into(),
+            role: "worker".into(),
+            team_role: None,
+            cwd: worktree.display().to_string(),
+            sandbox: "read-only".into(),
+            instructions: None,
+            thread_id: None,
+            session_id: None,
+            model: None,
+            effort: None,
+            pid: None,
+            endpoint: None,
+            params: None,
+            model_selection: None,
+            quota: None,
+            generation: None,
+            state: "starting".into(),
+            enabled: true,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let body = kickoff_body(&job, &task, 1, "m1", &assignee);
+        assert!(
+            body.contains("Implement the cloud task from this text."),
+            "{body}"
+        );
+        assert!(body.contains("SHA:"), "{body}");
+        assert!(!body.contains(&spec.display().to_string()), "{body}");
+        assert!(!body.contains(&worktree.display().to_string()), "{body}");
+        assert!(!body.contains("cadence self"), "{body}");
+    }
+
+    #[test]
+    fn cloud_kickoff_states_when_the_spec_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        let mut raw = "你".repeat(20_000);
+        raw.push_str("UNIQUE_TAIL_MARKER");
+        std::fs::write(&spec, &raw).unwrap();
+        let job = Job {
+            id: "j1".into(),
+            title: None,
+            spec_path: spec.display().to_string(),
+            spec_sha256: None,
+            pm_alias: "pm".into(),
+            issue_id: None,
+            repo: None,
+            base_ref: None,
+            state: "open".into(),
+            max_revisions: 2,
+            stall_secs: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let task = Task {
+            id: "t1".into(),
+            job_id: "j1".into(),
+            title: None,
+            role: "worker".into(),
+            assignee: Some("cloud-1".into()),
+            spec_path: Some(spec.display().to_string()),
+            acceptance: None,
+            worktree: None,
+            branch: None,
+            base_sha: None,
+            head_sha: None,
+            state: "draft".into(),
+            revision: 0,
+            dispatch_message: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let body = cloud_kickoff_body(&job, &task, 1);
+        assert!(
+            body.contains("spec text truncated; the inlined copy is incomplete"),
+            "{body}"
+        );
+        assert!(!body.contains("UNIQUE_TAIL_MARKER"), "{body}");
+        assert!(body.contains("SHA:"), "{body}");
+        assert!(body.len() <= 48_000, "kickoff is {} bytes", body.len());
+        assert!(!body.contains(&spec.display().to_string()), "{body}");
+    }
+
+    #[test]
+    fn cloud_kickoff_keeps_the_sha_trailer_when_acceptance_is_long() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "Keep this short spec sentence.").unwrap();
+        let job = Job {
+            id: "j1".into(),
+            title: None,
+            spec_path: spec.display().to_string(),
+            spec_sha256: None,
+            pm_alias: "pm".into(),
+            issue_id: None,
+            repo: None,
+            base_ref: None,
+            state: "open".into(),
+            max_revisions: 2,
+            stall_secs: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let task = Task {
+            id: "t1".into(),
+            job_id: "j1".into(),
+            title: None,
+            role: "worker".into(),
+            assignee: Some("cloud-1".into()),
+            spec_path: Some(spec.display().to_string()),
+            acceptance: Some("A".repeat(60_000)),
+            worktree: None,
+            branch: None,
+            base_sha: None,
+            head_sha: None,
+            state: "draft".into(),
+            revision: 0,
+            dispatch_message: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let body = cloud_kickoff_body(&job, &task, 1);
+        assert!(body.len() <= 48_000, "kickoff is {} bytes", body.len());
+        assert!(body.contains("Keep this short spec sentence."), "{body}");
+        assert!(
+            body.ends_with("Do not report a SHA you have not committed."),
+            "{body}"
+        );
+        assert!(body.contains("`SHA: <40-hex>`"), "{body}");
+    }
+
+    #[test]
+    fn cloud_kickoff_omits_the_spec_when_the_issue_alone_exceeds_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "UNIQUE_SPEC_BODY must not survive").unwrap();
+        let job = Job {
+            id: "j1".into(),
+            title: None,
+            spec_path: spec.display().to_string(),
+            spec_sha256: None,
+            pm_alias: "pm".into(),
+            issue_id: Some("i".repeat(50_000)),
+            repo: None,
+            base_ref: None,
+            state: "open".into(),
+            max_revisions: 2,
+            stall_secs: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let task = Task {
+            id: "t1".into(),
+            job_id: "j1".into(),
+            title: None,
+            role: "worker".into(),
+            assignee: Some("cloud-1".into()),
+            spec_path: Some(spec.display().to_string()),
+            acceptance: None,
+            worktree: None,
+            branch: None,
+            base_sha: None,
+            head_sha: None,
+            state: "draft".into(),
+            revision: 0,
+            dispatch_message: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let body = cloud_kickoff_body(&job, &task, 1);
+        assert!(body.len() <= 48_000, "kickoff is {} bytes", body.len());
+        assert!(
+            body.ends_with("Do not report a SHA you have not committed."),
+            "{body}"
+        );
+        assert!(
+            body.contains("spec text omitted"),
+            "oversized issue did not drop the spec: {body}"
+        );
+        assert!(!body.contains("UNIQUE_SPEC_BODY"), "{body}");
+    }
+
+    #[test]
+    fn cloud_omit_host_paths_strips_a_backticked_path() {
+        let text = "see `/home/ubuntu/secret` and \"/tmp/x\" and (~/notes/a) plus ~/bare and https://example.com/a";
+        let out = omit_host_paths(text);
+        assert!(!out.contains("/home/ubuntu/secret"), "{out}");
+        assert!(!out.contains("/tmp/x"), "{out}");
+        assert!(!out.contains("~/notes"), "{out}");
+        assert!(!out.contains("~/bare"), "{out}");
+        assert!(out.contains("https://example.com/a"), "{out}");
+        assert!(out.contains("see"), "{out}");
+    }
+
+    #[test]
+    fn cloud_omit_host_paths_keeps_a_versioned_api_path() {
+        let text = "call `/v3/organizations/acme/sessions` and `/v3beta1/organizations/acme/repositories` but not `/var/www/notes` or `/etc/hosts`";
+        let out = omit_host_paths(text);
+        assert!(out.contains("/v3/organizations/acme/sessions"), "{out}");
+        assert!(
+            out.contains("/v3beta1/organizations/acme/repositories"),
+            "{out}"
+        );
+        assert!(!out.contains("/var/www/notes"), "{out}");
+        assert!(!out.contains("/etc/hosts"), "{out}");
+    }
+
+    #[test]
+    fn cloud_two_holds_on_one_agent_escalate_twice() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "w1", &cwd);
+        reg(&s, "pm", &cwd);
+        s.enqueue("w1", "one", Some("pm"), "m1", "user").unwrap();
+        s.enqueue("w1", "two", Some("pm"), "m2", "user").unwrap();
+        let first = s.message("m1").unwrap().unwrap();
+        let second = s.message("m2").unwrap().unwrap();
+        s.escalate_cloud_hold(&first, "budget").unwrap();
+        s.escalate_cloud_hold(&first, "budget").unwrap();
+        s.escalate_cloud_hold(&second, "budget").unwrap();
+        let escalations = s
+            .events("w1", 0, 40)
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "cloud_recover_escalated")
+            .count();
+        assert_eq!(escalations, 2);
+        let notices: Vec<_> = s
+            .messages("pm")
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.body.contains("stopped polling"))
+            .collect();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().all(|message| {
+            message.body.contains("`cadence message reconcile ")
+                && message
+                    .body
+                    .contains(" --status <completed|failed|interrupted>` (add `--sha <40-hex>`")
+                && message
+                    .body
+                    .contains("`cadence agent unfence w1 --status <completed|failed|interrupted>`")
+                && message.body.contains("not fenced")
+                && !message.body.contains("cadence agent stop")
+        }));
     }
 
     #[test]

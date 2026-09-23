@@ -6,6 +6,29 @@
 //! review rather than replaying potentially executed work.
 
 pub mod claude;
+pub mod cloud;
+
+/// Environment names a spawned worker must not inherit. Devin cloud
+/// credentials stay on the daemon.
+pub const CLOUD_SECRET_ENV: &[&str] = &[
+    "DEVIN_API_KEY",
+    "DEVIN_ORG_ID",
+    "CADENCE_DEVIN_API_KEY",
+    "CADENCE_DEVIN_ORG_ID",
+    "CADENCE_DEVIN_API_BASE",
+    "CADENCE_DEVIN_POLL_INTERVAL_MS",
+    "CADENCE_DEVIN_POLL_BUDGET_MS",
+    "CADENCE_DEVIN_RECOVER_BUDGET_MS",
+];
+
+/// `env -u` arguments that drop [`CLOUD_SECRET_ENV`] before a pane command.
+pub fn cloud_secret_env_prefix() -> String {
+    CLOUD_SECRET_ENV
+        .iter()
+        .map(|name| format!("-u {name}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 pub mod codex;
 pub mod fake;
 pub mod link;
@@ -54,6 +77,13 @@ impl ProviderEnv {
             .collect()
     }
 
+    /// Value set on this daemon only. Does not consult the process
+    /// environment, so a blank override cannot fall through to a real
+    /// credential that happens to be exported.
+    pub fn own(&self, name: &str) -> Option<String> {
+        self.0.read().unwrap().get(name).cloned()
+    }
+
     /// This daemon's value for `name`, else the environment's.
     pub fn var(&self, name: &str) -> Option<String> {
         let own = self.0.read().unwrap().get(name).cloned();
@@ -99,6 +129,15 @@ pub struct TurnResult {
     pub text: String,
     pub stop_reason: Option<String>,
     pub error: Option<String>,
+}
+
+/// Outcome of one held-recovery poll.
+pub enum SettledPoll {
+    /// The remote session reached a terminal outcome for this turn.
+    Ready(TurnResult),
+    /// Still working, or the poll could not be learned. `transient` is a
+    /// 429, 5xx, or transport error; the caller backs off.
+    Pending { transient: bool },
 }
 
 /// Screen-probe verdict for terminal endpoints: what the pane shows
@@ -172,10 +211,31 @@ pub trait ProviderAdapter: Send + Sync {
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult>;
+    /// One poll after a held cloud turn. `Pending` means keep waiting.
+    /// `transient` is a 429, 5xx, or transport error. The default never
+    /// settles.
+    fn poll_settled(&self) -> Result<SettledPoll> {
+        Ok(SettledPoll::Pending { transient: false })
+    }
+    /// Minimum gap between held-recovery polls. Cloud uses its poll interval.
+    fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+    /// How long held-recovery may keep polling before it escalates once
+    /// and stops. Cloud reads `CADENCE_DEVIN_RECOVER_BUDGET_MS`.
+    fn recover_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(30 * 60)
+    }
     /// Answer a pending provider request (approval/user input).
     fn respond(&self, request_id: &Value, result: Value) -> Result<()>;
     /// Best-effort cancellation of an active turn.
     fn interrupt(&self);
+    /// What `agent stop` does before it waits. Defaults to [`interrupt`].
+    /// Devin cloud overrides this: `interrupt` terminates the remote
+    /// session, while stop must archive it via [`close`] instead.
+    fn release_for_stop(&self) {
+        self.interrupt();
+    }
     /// Transport is gone; any outstanding turn is ambiguous.
     fn disconnected(&self) -> bool;
     /// Release the provider process/connection and any owned resources.
@@ -307,6 +367,12 @@ pub fn build(
                 "No managed-ws adapter for provider '{other}' (implemented: codex)"
             ))),
         },
+        "cloud" => match agent.provider.as_str() {
+            "devin" => Ok(Box::new(cloud::DevinCloudAdapter::new(hooks, env))),
+            other => Err(crate::error::Error::rejected(format!(
+                "No cloud adapter for provider '{other}' (implemented: devin)"
+            ))),
+        },
         "pty" => match agent.provider.as_str() {
             "devin" => Ok(Box::new(pty::PtyAdapter::new(
                 hooks,
@@ -353,7 +419,59 @@ pub fn build(
         "fake" => Ok(Box::new(fake::FakeAdapter::new(hooks))),
         other => Err(crate::error::Error::rejected(format!(
             "Endpoint kind '{other}' is not implemented \
-             (implemented: managed, managed-ws, pty, fake)"
+             (implemented: managed, managed-ws, pty, cloud, fake)"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use super::*;
+
+    fn assert_child_lacks_secrets(command: &mut Command) {
+        let output = command.output().expect("spawn env");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !text.contains("cog_test_secret_value"),
+            "spawned env contained a devin cloud secret:\n{text}"
+        );
+        for name in CLOUD_SECRET_ENV {
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{name}="))),
+                "{name} leaked into a spawned worker:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawned_worker_env_drops_devin_cloud_secrets() {
+        let mut pane = Command::new("env");
+        for name in CLOUD_SECRET_ENV {
+            pane.env(name, "cog_test_secret_value");
+        }
+        pane.args(cloud_secret_env_prefix().split_whitespace());
+        assert_child_lacks_secrets(&mut pane);
+
+        let claude = claude::claude_env_scrub();
+        let mut managed = Command::new("env");
+        for name in CLOUD_SECRET_ENV {
+            assert!(claude.removes_name(name), "claude scrub missed {name}");
+            managed.env(name, "cog_test_secret_value");
+            managed.env_remove(name);
+        }
+        assert_child_lacks_secrets(&mut managed);
+
+        let codex = codex::scrub_names();
+        let mut app = Command::new("env");
+        for name in CLOUD_SECRET_ENV {
+            assert!(codex.contains(name), "codex scrub missed {name}");
+            app.env(name, "cog_test_secret_value");
+            app.env_remove(name);
+        }
+        assert_child_lacks_secrets(&mut app);
     }
 }

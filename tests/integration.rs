@@ -11991,6 +11991,11 @@ fn agent_capabilities_match_the_registry_table() {
     ] {
         test_env().set(name, "false");
     }
+    // A blank override must not fall through to a real Devin key, and
+    // the API base must not be the live host if a test does open.
+    test_env().set("CADENCE_DEVIN_API_KEY", "");
+    test_env().set("CADENCE_DEVIN_ORG_ID", "");
+    test_env().set("CADENCE_DEVIN_API_BASE", "http://127.0.0.1:9");
     let d = TestDaemon::start();
     let cwd = d.dir.path().to_str().unwrap().to_string();
     for spec in registry::SPECS {

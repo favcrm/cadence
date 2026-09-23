@@ -493,7 +493,7 @@ fn scrubbed_env_names() -> Vec<String> {
         "CADENCE_ALIAS",
         "CADENCE_STATE_DIR",
     ];
-    std::env::vars()
+    let mut names: Vec<String> = std::env::vars()
         .map(|(k, _)| k)
         .filter(|k| {
             (k.starts_with("CLAUDE_")
@@ -502,7 +502,13 @@ fn scrubbed_env_names() -> Vec<String> {
                 || k.starts_with("CADENCE_"))
                 && !KEEP.contains(&k.as_str())
         })
-        .collect()
+        .collect();
+    for name in crate::adapter::CLOUD_SECRET_ENV {
+        if !names.iter().any(|have| have == name) {
+            names.push((*name).to_string());
+        }
+    }
+    names
 }
 
 /// `--settings` JSON wiring a Stop hook: when the TUI finishes a turn
