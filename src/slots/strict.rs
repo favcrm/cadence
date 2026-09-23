@@ -72,6 +72,13 @@ enum Read {
         starttime: u64,
         /// Real and effective uid from `status`.
         uid: (u32, u32),
+        /// `stat` field 3 — `Z` (zombie) or `X` (dead) is a process
+        /// that has already exited and is only waiting to be reaped.
+        exited: bool,
+        /// `status` `Threads:` — a zombie thread-group leader whose
+        /// other threads still run (`pthread_exit` from main) is NOT a
+        /// finished process. Absent when the line is missing.
+        threads: Option<u32>,
     },
     /// No such pid — the process is gone.
     Gone,
@@ -128,7 +135,8 @@ impl ProcFs {
             Some((_, after)) => after.split_whitespace().collect(),
             None => return Read::Unreadable(format!("/proc/{pid}/stat: malformed")),
         };
-        let (Some(ppid), Some(starttime)) = (
+        let (Some(state), Some(ppid), Some(starttime)) = (
+            fields.first(),
             fields.get(1).and_then(|v| v.parse::<u32>().ok()),
             fields.get(19).and_then(|v| v.parse::<u64>().ok()),
         ) else {
@@ -145,17 +153,25 @@ impl ProcFs {
         let Some(uid) = uid else {
             return Read::Unreadable(format!("/proc/{pid}/status: no Uid line"));
         };
+        let threads = status.lines().find_map(|l| {
+            l.strip_prefix("Threads:")
+                .and_then(|n| n.trim().parse::<u32>().ok())
+        });
         Read::Found {
             ppid,
             starttime,
             uid,
+            exited: matches!(*state, "Z" | "X"),
+            threads,
         }
     }
 
     /// The live identity of `pid` now. A process whose real and
-    /// effective uid differ has no single identity — refused.
+    /// effective uid differ has no single identity — refused; so is one
+    /// that has already exited (a zombie is no live identity).
     pub fn identity(&self, pid: u32) -> Result<ProcIdentity, String> {
         match self.read(pid) {
+            Read::Found { exited: true, .. } => Err(format!("pid {pid} has exited")),
             Read::Found {
                 starttime,
                 uid: (real, effective),
@@ -178,14 +194,30 @@ impl ProcFs {
     }
 
     /// Is the recorded process still that same process? A missing pid
-    /// or a different starttime proves it gone; an unreadable entry or
-    /// a changed uid proves nothing either way.
+    /// or a different starttime proves it gone, and so does a zombie of
+    /// the recorded process whose thread group is down to itself — it
+    /// has exited, only its parent has not reaped it yet (CAD-230b: an
+    /// exec-bound hold ends with the command, not with its parent's
+    /// `wait`). A zombie leader with live threads, an unreadable entry
+    /// or a changed uid proves nothing either way (`unknown`).
     pub fn liveness(&self, id: &ProcIdentity) -> (Liveness, &'static str) {
         match self.read(id.pid) {
             Read::Gone => (Liveness::Dead, "holder died"),
             Read::Found { starttime, .. } if starttime != id.starttime => {
                 (Liveness::Dead, "pid recycled")
             }
+            // A zombie whose thread group is provably down to itself has
+            // exited; one with live threads, or no readable count, is not
+            // proof of death.
+            Read::Found {
+                exited: true,
+                threads: Some(n),
+                ..
+            } if n <= 1 => (Liveness::Dead, "holder exited"),
+            Read::Found { exited: true, .. } => (
+                Liveness::Unknown,
+                "zombie leader with live or unreadable threads",
+            ),
             Read::Found { uid, .. } if uid != (id.uid, id.uid) => {
                 (Liveness::Unknown, "holder uid changed")
             }
@@ -228,6 +260,7 @@ impl ProcFs {
                     ppid,
                     starttime,
                     uid,
+                    ..
                 } => (ppid, starttime, uid),
                 Read::Gone => {
                     return Err(format!(
@@ -303,13 +336,24 @@ impl AuthState {
 }
 
 /// A daemon-minted strict enrollment. `worker` equals `root` for a
-/// managed provider (the provider process itself); the field exists so
-/// a later runner (CAD-236) can record one direct child.
+/// managed provider (the provider process itself) and for a
+/// daemon-launched runner (the process the daemon spawned, which execs
+/// the recipe — CAD-230b); the field exists so a later runner could
+/// record one direct child.
 #[derive(Clone, Debug)]
 pub struct Enrollment {
     pub id: String,
+    /// The lane the enrollment's holds are accounted to — the managed
+    /// endpoint's alias, or the requester a runner was launched for.
     pub owner_actor: String,
+    /// A managed endpoint's owner-row generation, revalidated on every
+    /// call; for a runner `runner:<runner_id>:<intent digest>` — the
+    /// launch intent bound to the runner id before spawn.
     pub owner_generation: String,
+    /// `Some(runner_id)` for a daemon-launched runner (CAD-230b): its
+    /// owner is the daemon's own runner record, never an agent row, so
+    /// owner revalidation and endpoint supersession never touch it.
+    pub runner: Option<String>,
     pub root: ProcIdentity,
     pub worker: ProcIdentity,
     pub issued_epoch: f64,
@@ -335,6 +379,9 @@ impl Enrollment {
         if let AuthState::Revoked(reason) = &self.auth {
             j["revoked_reason"] = json!(reason);
         }
+        if let Some(runner) = &self.runner {
+            j["runner_id"] = json!(runner);
+        }
         j
     }
 
@@ -357,6 +404,10 @@ impl Enrollment {
             id: v["enrollment_id"].as_str()?.to_string(),
             owner_actor: v["owner_actor"].as_str()?.to_string(),
             owner_generation: v["owner_generation"].as_str()?.to_string(),
+            runner: match v.get("runner_id") {
+                None => None,
+                Some(r) => Some(r.as_str()?.to_string()),
+            },
             root: ProcIdentity::from_json(&v["root"])?,
             worker: ProcIdentity::from_json(&v["worker"])?,
             issued_epoch: v["issued_epoch"].as_f64()?,

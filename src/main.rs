@@ -1467,6 +1467,40 @@ enum BuildSlotAction {
         #[arg(long)]
         pid: Option<u32>,
     },
+    /// Have the daemon run one of the project's RECIPES under a build
+    /// slot (CAD-230b) — the admitted path for a caller with no pane of
+    /// its own. Recipes (argv, repo-relative cwd, env allowlist, slot
+    /// kind) come only from `build.recipes` in the project's
+    /// project.yaml; nothing here names a command. The daemon queues,
+    /// runs the recipe as its own exec-bound slot holder, logs its
+    /// output under the state dir and writes an exit receipt. This
+    /// waits, streams the log, and exits with the recipe's exit code.
+    Launch {
+        /// The recipe name under `build.recipes`.
+        recipe: String,
+        /// The project (default: the cwd's project, as `issue` resolves it).
+        #[arg(long)]
+        project: Option<String>,
+        /// A checkout of one of the project's registered repos to run in
+        /// (default: the cwd when the project was resolved from it, else
+        /// the project's main checkout).
+        #[arg(long)]
+        worktree: Option<PathBuf>,
+        /// Give up after <secs> queued for the slot (the recipe then
+        /// never starts).
+        #[arg(long, default_value_t = 600)]
+        wait_secs: u64,
+        /// Print the runner id and return at once; `build-slot runner
+        /// <id>` shows the receipt later.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// One launched runner's receipt: recipe, launch digest, source
+    /// HEAD, state, exit code and log path.
+    Runner {
+        /// The runner id `launch` printed.
+        runner_id: String,
+    },
     /// Free a managed endpoint's strict hold whose holder is gone —
     /// the one operator path over a strict hold (CAD-230). Run it
     /// outside every pane and managed endpoint. The daemon re-reads
@@ -2965,17 +2999,18 @@ fn slot_acquire_loop(
     pid: u32,
     request_id: &str,
     wait_secs: u64,
+    exec: bool,
 ) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
     let probe = wait_secs == 0;
     let mut announced = false;
     loop {
-        let r = client::rpc(
-            state_dir,
-            "slot_acquire",
-            json!({"kind": kind, "lane": lane, "pid": pid,
-                   "request_id": request_id, "probe": probe}),
-        )?;
+        let mut params = json!({"kind": kind, "lane": lane, "pid": pid,
+                                "request_id": request_id, "probe": probe});
+        if exec {
+            params["exec"] = json!(true);
+        }
+        let r = client::rpc(state_dir, "slot_acquire", params)?;
         if r["granted"].as_bool().unwrap_or(false) {
             return Ok(r);
         }
@@ -3019,7 +3054,7 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
                 .unwrap_or_else(cadence_agent::slots::default_lane);
             let pid = *pid;
             let request_id = Uuid::new_v4().simple().to_string();
-            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs)?;
+            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs, false)?;
             if *json_out {
                 print_json(&json!({"token": r["token"],
                     "kind": parsed.as_str(),
@@ -3043,7 +3078,9 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
             // lives exactly as long as the work and dies with it.
             let pid = std::process::id();
             let request_id = Uuid::new_v4().simple().to_string();
-            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs)?;
+            // `exec`: the daemon verifies this requester IS the holder
+            // it records (CAD-230b) — never an ancestor.
+            let r = slot_acquire_loop(state_dir, kind, &lane, pid, &request_id, *wait_secs, true)?;
             let token = r["token"].as_str().unwrap_or_default().to_string();
             eprintln!(
                 "slot {token} acquired ({kind}, pid {pid}) — running {}",
@@ -3069,6 +3106,28 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
                 json!({"token": token, "lane": lane, "pid": pid}),
             )?;
             println!("released {}", r["token"].as_str().unwrap_or(token));
+            Ok(0)
+        }
+        BuildSlotAction::Launch {
+            recipe,
+            project,
+            worktree,
+            wait_secs,
+            detach,
+        } => run_build_slot_launch(
+            state_dir,
+            recipe,
+            project.as_deref(),
+            worktree.as_deref(),
+            *wait_secs,
+            *detach,
+        ),
+        BuildSlotAction::Runner { runner_id } => {
+            print_json(&client::rpc(
+                state_dir,
+                "slot_runner",
+                json!({"runner_id": runner_id}),
+            )?);
             Ok(0)
         }
         BuildSlotAction::Reconcile {
@@ -3102,6 +3161,103 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
             }
             Ok(0)
         }
+    }
+}
+
+/// `cadence build-slot launch` (CAD-230b): the daemon resolves and runs
+/// the recipe; this only names it, then follows the receipt and the log.
+fn run_build_slot_launch(
+    state_dir: &Path,
+    recipe: &str,
+    project: Option<&str>,
+    worktree: Option<&Path>,
+    wait_secs: u64,
+    detach: bool,
+) -> Result<i32> {
+    let cwd = std::env::current_dir()?;
+    let pm_dir = cadence_agent::issue::default_dir()?;
+    let key = cadence_agent::issue::project::resolve(&pm_dir, project, &cwd)?.key;
+    // The cwd is the checkout only when the project came from it.
+    let from_cwd =
+        project.is_none() && std::env::var("CADENCE_PROJECT").map_or(true, |p| p.is_empty());
+    let worktree = match worktree {
+        Some(w) => Some(std::path::absolute(w)?),
+        None if from_cwd => Some(cwd.clone()),
+        None => None,
+    };
+    let mut params = json!({"recipe": recipe, "project": key, "wait_secs": wait_secs});
+    if let Some(w) = &worktree {
+        params["worktree"] = json!(w.display().to_string());
+    }
+    let r = client::rpc(state_dir, "slot_launch", params)?;
+    let id = r["runner_id"].as_str().unwrap_or_default().to_string();
+    let short = |k: &str| {
+        r[k].as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(12)
+            .collect::<String>()
+    };
+    eprintln!(
+        "runner {id} queued — {key}/{recipe} ({}) at {}, intent {} — log {}",
+        r["kind"].as_str().unwrap_or("?"),
+        short("head_sha"),
+        short("digest"),
+        r["log_path"].as_str().unwrap_or("?")
+    );
+    if detach {
+        println!("{id}");
+        return Ok(0);
+    }
+    let log = PathBuf::from(r["log_path"].as_str().unwrap_or_default());
+    let mut offset = 0u64;
+    let stream = |offset: &mut u64| {
+        use std::io::{Seek, SeekFrom, Write};
+        let Ok(mut f) = std::fs::File::open(&log) else {
+            return;
+        };
+        if f.seek(SeekFrom::Start(*offset)).is_err() {
+            return;
+        }
+        let mut buf = Vec::new();
+        if let Ok(n) = f.read_to_end(&mut buf) {
+            *offset += n as u64;
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(&buf);
+            let _ = out.flush();
+        }
+    };
+    loop {
+        let receipt = client::rpc(state_dir, "slot_runner", json!({"runner_id": id}))?;
+        stream(&mut offset);
+        let state = receipt["state"].as_str().unwrap_or_default();
+        if ["pending", "queued", "running"].contains(&state) {
+            std::thread::sleep(Duration::from_millis(300));
+            continue;
+        }
+        let reason = receipt["reason"].as_str().unwrap_or_default();
+        return match (
+            state,
+            receipt["exit_code"].as_i64(),
+            receipt["signal"].as_i64(),
+        ) {
+            ("exited", Some(code), _) => {
+                eprintln!("runner {id} exited {code}");
+                Ok(code as i32)
+            }
+            ("exited", None, Some(sig)) => {
+                eprintln!("runner {id} killed by signal {sig}");
+                Ok(128 + sig as i32)
+            }
+            _ => Err(Error::rejected(format!(
+                "runner {id} ended '{state}'{}",
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {reason}")
+                }
+            ))),
+        };
     }
 }
 
