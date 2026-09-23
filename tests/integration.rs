@@ -13020,9 +13020,11 @@ fn cli_join_refuses_different_provider_managed() {
     assert_provider_refused(&out, "wx", "claude");
     let after = d.rpc("agent_show", json!({"alias": "wx"})).unwrap();
     assert_eq!(after, before);
-    // A live alias is not silently reused under the wrong provider either.
+    // A live alias is not silently reused under the wrong provider
+    // either — and the refusal leaves it exactly as it was (CAD-305).
     d.register("wl");
     d.wait_agent("wl", "idle", 10);
+    let before = d.rpc("agent_show", json!({"alias": "wl"})).unwrap();
     let out = std::process::Command::new(bin)
         .arg("--state-dir")
         .arg(&d.state)
@@ -13030,6 +13032,8 @@ fn cli_join_refuses_different_provider_managed() {
         .output()
         .unwrap();
     assert_provider_refused(&out, "wl", "codex");
+    let after = d.rpc("agent_show", json!({"alias": "wl"})).unwrap();
+    assert_eq!(after, before);
 }
 
 /// CAD-283 guard: a same-provider join onto a stopped alias still
@@ -13052,6 +13056,162 @@ fn cli_join_same_provider_resumes_stopped_alias() {
     let agent = d.wait_agent("wx", "idle", 15);
     assert_eq!(agent["provider"], "fake");
     assert_eq!(agent["params"], before["agent"]["params"]);
+}
+
+/// A launch onto an alias registered under the same provider but another
+/// endpoint kind is refused, naming both kinds and the remove-then-launch
+/// remedy.
+fn assert_kind_refused(out: &std::process::Output, alias: &str, registered: &str, asked: &str) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    for want in [
+        format!("'{alias}' is already registered as a {registered} agent, not {asked}"),
+        format!("cadence agent remove {alias}"),
+    ] {
+        assert!(stderr.contains(&want), "missing {want:?}: {stderr}");
+    }
+}
+
+/// CAD-305: an alias registered as managed claude, relaunched with
+/// `--tui` (standalone or `join`, with or without `--worktree`), is
+/// refused rather than silently reopened as the managed agent — no row,
+/// param or worktree changes.
+#[test]
+fn cli_launch_refuses_endpoint_kind_change_claude() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    let pm_repo = d.dir.path().join("pmrepo");
+    git_repo(&pm_repo);
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": pm_repo}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 10);
+    d.register_claude("cm", Value::Null);
+    d.wait_agent("cm", "idle", 15);
+    d.rpc("agent_stop", json!({"alias": "cm"})).unwrap();
+    d.wait_agent("cm", "stopped", 10);
+    let before = d.rpc("agent_show", json!({"alias": "cm"})).unwrap();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let launches: [&[&str]; 3] = [
+        &[
+            "claude",
+            "--tui",
+            "--alias",
+            "cm",
+            "--detach",
+            "--no-bootstrap",
+        ],
+        &["join", "pm", "claude", "--tui", "--alias", "cm", "--detach"],
+        &[
+            "join",
+            "pm",
+            "claude",
+            "--tui",
+            "--alias",
+            "cm",
+            "--detach",
+            "--worktree",
+            "feat-k",
+        ],
+    ];
+    for args in launches {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_kind_refused(&out, "cm", "claude managed", "claude pty");
+    }
+    let after = d.rpc("agent_show", json!({"alias": "cm"})).unwrap();
+    assert_eq!(after, before);
+    assert!(!pm_repo.join(".cadence/wt/feat-k").exists());
+}
+
+/// CAD-305: Devin pty and Devin Cloud share provider `devin` — a stopped
+/// pty alias relaunched with `--cloud` is not resumed as pty (cloud
+/// params dropped), and a cloud alias relaunched without `--cloud` is
+/// not a silent no-op. Both refuse and leave the row untouched.
+#[test]
+fn cli_launch_refuses_endpoint_kind_change_devin() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    // A blank key keeps the cloud adapter from ever reaching the network:
+    // its open refuses before any HTTP.
+    test_env().set("CADENCE_DEVIN_API_KEY", "");
+    d.register_devin("dvx", None);
+    d.wait_agent("dvx", "idle", 20);
+    d.rpc("agent_stop", json!({"alias": "dvx"})).unwrap();
+    d.wait_agent("dvx", "stopped", 10);
+    let before = d.rpc("agent_show", json!({"alias": "dvx"})).unwrap();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "devin",
+            "--cloud",
+            "--cloud-params",
+            "repo=o/r",
+            "--alias",
+            "dvx",
+        ])
+        .args(["--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert_kind_refused(&out, "dvx", "devin pty", "devin cloud");
+    let after = d.rpc("agent_show", json!({"alias": "dvx"})).unwrap();
+    assert_eq!(after, before);
+
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "dvc", "provider": "devin", "endpoint_kind": "cloud",
+               "cwd": cwd, "params": json!({"repos": ["o/r"]}).to_string()}),
+    )
+    .unwrap();
+    // With no key the cloud open refuses and parks the agent in
+    // `attention` — a settled row to compare against.
+    d.wait_agent("dvc", "attention", 10);
+    let before = d.rpc("agent_show", json!({"alias": "dvc"})).unwrap();
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["devin", "--alias", "dvc", "--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert_kind_refused(&out, "dvc", "devin cloud", "devin pty");
+    let after = d.rpc("agent_show", json!({"alias": "dvc"})).unwrap();
+    assert_eq!(after, before);
+    assert!(!d.pane_file(&mock, "dvc", "argv").exists());
+}
+
+/// CAD-305: the alias lookup fails closed — an `agent_show` error other
+/// than not-found (here: no daemon answering) is never read as "not
+/// registered", so `--worktree` creates no checkout before the launch
+/// fails.
+#[test]
+fn cli_launch_fails_closed_when_alias_lookup_errors() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let repo = dir.path().join("repo");
+    git_repo(&repo);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["claude", "--alias", "wz", "--worktree", "feat-z", "--cwd"])
+        .arg(&repo)
+        .args(["--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("Daemon is not reachable"), "{stderr}");
+    assert!(!repo.join(".cadence/wt/feat-z").exists(), "{stderr}");
 }
 
 /// `join <pm> codex` records the worker's sandbox on the agent row and
