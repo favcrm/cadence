@@ -654,6 +654,8 @@ export default function Agents({
   state,
   issues: issuesState,
   project,
+  open,
+  onOpenAgent: setOpen,
   onOpenIssue,
   onRetry,
 }: {
@@ -661,10 +663,12 @@ export default function Agents({
   /** Project binding joins agents to these cards (scope.ts). */
   issues: ResourceState<IssueCard[]>;
   project: string;
+  /** The agent whose drawer is open — the route's `/agents/:alias`. */
+  open: string | null;
+  onOpenAgent: (alias: string | null) => void;
   onOpenIssue: (id: string) => void;
   onRetry: () => void;
 }) {
-  const [open, setOpen] = useState<string | null>(null);
   const payload = state.data;
   const issues = issuesState.data ?? [];
   const issueProjects = issueIndex(issues);

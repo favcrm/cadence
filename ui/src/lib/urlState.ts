@@ -1,4 +1,4 @@
-import { readFilters, writeFilters, type BoardFilters } from "./filters";
+import { readFilters, type BoardFilters } from "./filters";
 
 export const APP_TABS = ["overview", "board", "plan", "agents", "memory", "settings"] as const;
 export type AppTab = (typeof APP_TABS)[number];
@@ -60,9 +60,10 @@ export function persistBrowserProjectView(view: ProjectView): void {
 }
 
 /**
- * Read the shareable app state. A view parameter is a legacy Projects link,
- * so it selects the Projects tab even when no tab parameter is present.
- * A project-only URL deliberately remains the Overview workspace.
+ * Read a pre-router URL (`/?tab=board&view=list&project=cadence`), which
+ * lib/router.ts redirects to its route. A view parameter is a legacy
+ * Projects link, so it selects the Projects tab even when no tab parameter
+ * is present. A project-only URL deliberately remains the Overview.
  */
 export function readAppUrlState(search: string, storedView?: ProjectView): AppUrlState {
   const q = new URLSearchParams(search);
@@ -75,22 +76,4 @@ export function readAppUrlState(search: string, storedView?: ProjectView): AppUr
     openId: q.get("issue"),
     filters: readFilters(q),
   };
-}
-
-/** Serialize app-owned state while retaining unknown query parameters. */
-export function serializeAppUrlState(
-  search: string,
-  state: Pick<AppUrlState, "tab" | "view" | "project" | "openId" | "filters">,
-): string {
-  const q = new URLSearchParams(search);
-  q.delete("tab");
-  q.delete("view");
-  q.delete("project");
-  q.delete("issue");
-  if (state.tab !== "overview") q.set("tab", state.tab);
-  if (state.tab === "board") q.set("view", state.view);
-  if (state.project !== "all") q.set("project", state.project);
-  if (state.openId) q.set("issue", state.openId);
-  writeFilters(q, state.filters);
-  return q.toString();
 }

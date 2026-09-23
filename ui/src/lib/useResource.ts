@@ -17,3 +17,11 @@ export function useQuery<T>(resource: Resource<T>): ResourceState<T> {
   }, [resource]);
   return useResource(resource);
 }
+
+const noSubscribe = () => () => {};
+const noState = () => null;
+
+/** `useResource` for a store that may not exist (no drawer open). */
+export function useMaybeResource<T>(resource: Resource<T> | null): ResourceState<T> | null {
+  return useSyncExternalStore(resource ? resource.subscribe : noSubscribe, resource ? resource.get : noState);
+}
