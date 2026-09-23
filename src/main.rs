@@ -4774,13 +4774,14 @@ fn run() -> Result<i32> {
                 no_lessons,
                 force,
             };
-            print_json(&cadence_agent::issue::dispatch::run(
-                &pm,
-                issue.as_str(),
-                &args,
-                "",
-                &state_dir,
-            )?);
+            let out =
+                cadence_agent::issue::dispatch::run(&pm, issue.as_str(), &args, "", &state_dir)?;
+            // CAD-159: an issue with no acceptance items still
+            // dispatches, but the operator sees why it should not.
+            if let Some(warning) = out["acceptance"]["warning"].as_str() {
+                eprintln!("warning: {warning}");
+            }
+            print_json(&out);
             Ok(0)
         }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),

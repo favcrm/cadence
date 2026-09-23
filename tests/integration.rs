@@ -11003,6 +11003,7 @@ fn restart_fences_task_kickoff_and_job_show_reports_drift() {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -11142,6 +11143,7 @@ fn job_event_parks_on_unrendered_pty_pm() {
             None,
             None,
             2,
+            None,
             None,
             None,
             None,
@@ -30465,4 +30467,256 @@ fn auto_stop_keeps_pty_pane_with_attached_client_then_stops_it() {
     .unwrap();
     assert!(calls.contains("list-clients -t =s1"), "{calls}");
     assert!(calls.contains("kill-session -t s1"), "{calls}");
+}
+
+/// CAD-159 (ADR-0002 phase 1, PM decision 2026-09-23): `dispatch` on
+/// an issue whose `## Acceptance` section has no checklist items warns
+/// — on stderr, in the JSON `acceptance` block and once on the
+/// dispatch comment — and still dispatches, on both the plain and the
+/// `--job` path. A bare `- [ ]` stub is not an item. An issue with
+/// items dispatches with no warning and its kickoff lists them (the
+/// CAD-238 section-scoped readback).
+#[test]
+fn dispatch_warns_on_empty_acceptance() {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path().to_path_buf();
+    {
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        let cwd = state.to_str().unwrap().to_string();
+        let member = Some("{\"upstream\":\"pm\"}");
+        for (alias, params, kind) in [
+            ("pm", None, "fake"),
+            ("w1", member, "inbox"),
+            ("j1", member, "inbox"),
+            ("j2", member, "inbox"),
+            ("j3", member, "inbox"),
+        ] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: kind,
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+        }
+    }
+    let d = TestDaemon::start_on(state);
+    let tmp = TempDir::new().unwrap();
+    let (pm_dir, repo, home) = (
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("home"),
+    );
+    for dir in [&pm_dir, &repo, &home] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let git = |dir: &Path, args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+    std::fs::write(repo.join("f"), "x").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_cadence"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    // (success, stdout JSON — or the stderr error JSON, stderr text)
+    let cli = |args: &[&str]| -> (bool, Value, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .env("CADENCE_PM_DIR", &pm_dir)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let text = if out.stdout.is_empty() {
+            stderr.clone()
+        } else {
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        (
+            out.status.success(),
+            serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("not json: {text}")),
+            stderr,
+        )
+    };
+    assert!(cli(&["issue", "init"]).0);
+    let repo_s = repo.canonicalize().unwrap().to_str().unwrap().to_string();
+    assert!(cli(&["issue", "project", "add", "demo", "--prefix", "D", "--repo", &repo_s]).0);
+    // D-1/D-4 empty (the heading `issue new` writes), D-2/D-5 stub-only,
+    // D-3/D-6 populated through the CAD-238 authoring command.
+    for title in ["Empty", "Stub", "Full", "Jempty", "Jstub", "Jfull"] {
+        assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
+    }
+    for id in ["D-2", "D-5"] {
+        let path = pm_dir.join("demo").join(id).join("issue.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("## Acceptance"), "{text}");
+        std::fs::write(&path, format!("{text}- [ ]\n- [x]   \n")).unwrap();
+    }
+    git(&pm_dir, &["commit", "-qam", "stub acceptance"]);
+    let criteria = tmp.path().join("acceptance.md");
+    std::fs::write(&criteria, "- [ ] first criterion\n- [x] second is done\n").unwrap();
+    let criteria_s = criteria.to_str().unwrap();
+    for id in ["D-3", "D-6"] {
+        let (ok, out, _) = cli(&["issue", "acceptance", id, "--from", criteria_s]);
+        assert!(ok, "{out}");
+    }
+    let note = tmp.path().join("kickoff.md");
+    std::fs::write(&note, "# kickoff").unwrap();
+    let note_s = note.canonicalize().unwrap().to_str().unwrap().to_string();
+    let (spec, _sha) = d.spec_file("spec.md", "acceptance warning spec");
+    let listed = "[ ] first criterion; [x] second is done";
+
+    for (id, worker, job, populated) in [
+        ("D-1", "w1", false, false),
+        ("D-2", "w1", false, false),
+        ("D-3", "w1", false, true),
+        ("D-4", "j1", true, false),
+        ("D-5", "j2", true, false),
+        ("D-6", "j3", true, true),
+    ] {
+        let mut args = vec![
+            "dispatch",
+            id,
+            "--to",
+            worker,
+            "--note",
+            &note_s,
+            "--reply-to",
+            "pm",
+        ];
+        if job {
+            args.extend(["--job", "--spec", &spec]);
+        }
+        let (ok, out, stderr) = cli(&args);
+        assert!(ok, "{id}: {out} {stderr}");
+        assert_eq!(out["dispatched"], true, "{id}: {out}");
+        let acc = &out["acceptance"];
+        let msg_id = out["message"].as_str().unwrap().to_string();
+        let show = d.rpc("agent_show", json!({"alias": worker})).unwrap();
+        let body = show["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == msg_id.as_str())
+            .and_then(|m| m["body"].as_str())
+            .unwrap_or_else(|| panic!("{id}: kickoff {msg_id} not found: {show}"))
+            .to_string();
+        let issue = cli(&["issue", "show", id, "--json"]).1;
+        let comments: Vec<&str> = issue["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["body"].as_str())
+            .collect();
+        let warned = comments
+            .iter()
+            .filter(|c| c.contains("Acceptance warning"))
+            .count();
+        if populated {
+            assert_eq!(acc["items"], 2, "{id}: {out}");
+            assert_eq!(acc["warning"], Value::Null, "{id}: {out}");
+            assert_eq!(acc["criteria"][0]["text"], "first criterion", "{id}: {out}");
+            assert_eq!(acc["criteria"][1]["done"], true, "{id}: {out}");
+            assert!(!stderr.contains("warning"), "{id}: {stderr}");
+            assert_eq!(warned, 0, "{id}: {comments:?}");
+            assert!(
+                body.contains(&format!("Acceptance: {listed}.")),
+                "{id}: {body}"
+            );
+            if job {
+                let job = d.rpc("job_show", json!({"job": out["job"]})).unwrap();
+                assert_eq!(job["job"]["tasks"][0]["acceptance"], listed, "{id}: {job}");
+            }
+        } else {
+            assert_eq!(acc["items"], 0, "{id}: {out}");
+            assert_eq!(acc["criteria"], json!([]), "{id}: {out}");
+            let warning = acc["warning"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{id}: no warning: {out}"));
+            let how = format!("cadence issue acceptance {id} --from <file>");
+            assert!(
+                warning.contains(id) && warning.contains(&how),
+                "{id}: {warning}"
+            );
+            assert!(
+                stderr.contains("warning") && stderr.contains(&how),
+                "{id}: {stderr}"
+            );
+            // Recorded exactly once, on the dispatch's tracker comment.
+            assert_eq!(warned, 1, "{id}: {comments:?}");
+            assert!(
+                comments
+                    .iter()
+                    .any(|c| c.contains("Dispatched to") && c.contains("Acceptance warning")),
+                "{id}: {comments:?}"
+            );
+            assert!(!body.contains("Acceptance:"), "{id}: {body}");
+        }
+        assert!(
+            body.len() <= 4000 && !body.contains('\n'),
+            "{id}: kickoff stays one line: {body}"
+        );
+    }
+
+    // A re-run while the kickoff is live is a duplicate: it still
+    // reports the acceptance block but records nothing new.
+    let (ok, out, _) = cli(&[
+        "dispatch",
+        "D-1",
+        "--to",
+        "w1",
+        "--note",
+        &note_s,
+        "--reply-to",
+        "pm",
+    ]);
+    assert!(ok && out["duplicate"] == true, "{out}");
+    assert_eq!(out["acceptance"]["items"], 0, "{out}");
+    let issue = cli(&["issue", "show", "D-1", "--json"]).1;
+    let warned = issue["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| {
+            c["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Acceptance warning")
+        })
+        .count();
+    assert_eq!(warned, 1, "{issue}");
 }

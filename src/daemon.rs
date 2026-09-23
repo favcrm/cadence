@@ -3091,6 +3091,7 @@ impl Shared {
             optional_str(params, "task_branch"),
             optional_str(params, "task_base_sha"),
             optional_str(params, "task_assignee"),
+            optional_str(params, "task_acceptance"),
         )?;
         self.wake();
         Ok(json!({"job": job.to_json(), "duplicate": duplicate}))

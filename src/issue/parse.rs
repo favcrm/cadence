@@ -63,6 +63,19 @@ pub struct AcceptanceItem {
     pub checked: bool,
 }
 
+impl AcceptanceItem {
+    /// The readback shape `issue show --json`, `issue acceptance` and
+    /// `dispatch` all report: `done` mirrors `checked` for readers
+    /// that speak in completion rather than checkbox terms.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "text": self.text,
+            "checked": self.checked,
+            "done": self.checked,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LineRange {
     start: usize,

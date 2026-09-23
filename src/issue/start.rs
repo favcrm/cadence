@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::client;
 use crate::error::{Error, Result};
 use crate::issue::model::{Front, Ref};
-use crate::issue::{git, project, write, Pm};
+use crate::issue::{git, parse, project, write, Pm};
 use crate::{proto, worktree};
 
 /// Optional M3 job creation: `--job --pm <alias> --spec <file>
@@ -568,6 +568,13 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         "slot_env": slot_env,
     });
     if let (Some(job), Some((state_dir, spec, spec_sha256))) = (&args.job, job_probe) {
+        // CAD-159: the issue's acceptance items ride the scoped task,
+        // so the daemon's `job dispatch` kickoff lists them.
+        let task_acceptance = crate::issue::dispatch::acceptance_listing(
+            &front.id,
+            &parse::acceptance_items(&body),
+            crate::issue::dispatch::JOB_ACCEPTANCE_BUDGET,
+        );
         let created_job = client::rpc(
             &state_dir,
             "job_new",
@@ -576,7 +583,8 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
                    "repo": root, "base_ref": base_sha,
                    "task_worktree": wt_name, "task_branch": branch,
                    "task_base_sha": base_sha,
-                   "task_assignee": job.assignee}),
+                   "task_assignee": job.assignee,
+                   "task_acceptance": task_acceptance}),
         )?;
         let job_id = created_job["job"]["id"]
             .as_str()
