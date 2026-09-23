@@ -9,6 +9,9 @@ on:
     types: [checks_requested]
   push:
     branches: [main, 'feat/**']
+    # CAD-311: a `v*` tag runs every gate on the tagged commit, then the
+    # release-* jobs below publish it to GitHub Releases.
+    tags: ['v*']
 
 # Concurrency policy (CAD-228; docs/SESSION.md "Post-merge CI on main"):
 # - pull_request: one group per PR number; a new head cancels the running
@@ -246,6 +249,258 @@ jobs:
           retention-days: 90
           # A re-run of this job re-attests the same sha in the same run.
           overwrite: true
+
+  # CAD-311: a `v*` tag publishes a GitHub Release that install.sh
+  # installs. Same shape as release-artifact/release-attest above: the
+  # builds run with `contents: read` only; release-publish runs no repo
+  # code (it only reads install.sh) and is the one job that can attest
+  # and write the release. Every leg needs all five gates on the tagged
+  # commit, and release-gate refuses a tag that is not on main or does
+  # not match Cargo.toml's version.
+  #
+  # Assets, per target (x86_64-linux, aarch64-linux, aarch64-macos):
+  #   cadence-<tag>-<target>.tar.gz         cadence, cadence.sha256,
+  #                                         manifest.json at the root;
+  #                                         the UI is embedded (--features ui)
+  #   cadence-<tag>-<target>.tar.gz.sha256  its `sha256sum` line
+  # plus scripts/install.sh as `install.sh`. The tarball's three files are the ones `cadence
+  # upgrade` keeps in a release dir. Linux builds on 22.04 runners so the
+  # binary needs glibc 2.35, not 2.39.
+  release-gate:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [fmt, clippy, test, build, ui]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Tag names this version and is on main
+        env:
+          TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "tag '$TAG' is not v<version>" >&2; exit 1 ;;
+          esac
+          case "$TAG" in
+            *[!0-9A-Za-z.+_-]*) echo "tag '$TAG' has characters install.sh refuses" >&2; exit 1 ;;
+          esac
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "cadence-agent") | .version')
+          if [ "v$version" != "$TAG" ]; then
+            echo "tag $TAG does not match Cargo.toml version $version — bump it first" >&2
+            exit 1
+          fi
+          # The same rule `cadence upgrade` applies: only commits on main.
+          status=$(gh api "repos/$REPO/compare/$SOURCE_SHA...main" --jq .status)
+          case "$status" in
+            identical | ahead) ;;
+            *) echo "$SOURCE_SHA is not on main (compare: $status)" >&2; exit 1 ;;
+          esac
+
+  release-build:
+    needs: [release-gate]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-linux
+            runner: ubuntu-22.04
+          - target: aarch64-linux
+            runner: ubuntu-22.04-arm
+          - target: aarch64-macos
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: rustup toolchain install stable --profile minimal
+      - run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - run: pnpm build
+        working-directory: ui
+      - run: cargo build --release --locked --features ui
+      - name: Assemble tarball, sha256 and manifest
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          RUNNER: ${{ matrix.runner }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          # macOS tar would add AppleDouble `._*` entries.
+          COPYFILE_DISABLE: 1
+        run: |
+          set -euo pipefail
+          # shasum ships on both Linux and macOS runners; sha256sum does not.
+          sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+          mkdir -p stage dist
+          cp target/release/cadence stage/cadence
+          chmod 0755 stage/cadence
+          # The binary must report this version and commit.
+          version=$(stage/cadence --version)
+          if [ "$version" != "cadence ${TAG#v}+$SOURCE_SHA" ]; then
+            echo "binary reports '$version', expected 'cadence ${TAG#v}+$SOURCE_SHA'" >&2
+            exit 1
+          fi
+          digest=$(sha256 stage/cadence)
+          printf '%s  cadence\n' "$digest" > stage/cadence.sha256
+          jq -n \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg version "$TAG" \
+            --argjson run_id "$RUN_ID" \
+            --argjson run_attempt "$RUN_ATTEMPT" \
+            --arg rustc "$(rustc --version)" \
+            --arg cargo "$(cargo --version)" \
+            --arg target "$TARGET" \
+            --arg runner "$RUNNER" \
+            --arg sha256 "$digest" \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{source_sha: $source_sha, version: $version, run_id: $run_id,
+              run_attempt: $run_attempt, rustc: $rustc, cargo: $cargo,
+              features: ["ui"], target: $target, runner: $runner,
+              checks: ["fmt", "clippy", "test", "build", "ui"],
+              sha256: $sha256, built_at: $built_at}' > stage/manifest.json
+          asset="cadence-$TAG-$TARGET.tar.gz"
+          tar -czf "dist/$asset" -C stage cadence cadence.sha256 manifest.json
+          (cd dist && printf '%s  %s\n' "$(sha256 "$asset")" "$asset" > "$asset.sha256")
+          cat stage/manifest.json "dist/$asset.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ github.ref_name }}-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  release-publish:
+    needs: [release-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # A `v*` tag runs the ci.yml OF THE TAGGED COMMIT, so a tag on an
+    # unmerged commit could drop release-gate. Repo settings close that:
+    # the `release` environment needs a reviewer and admits only `v*`
+    # tags, the "release tags" ruleset (23893821) makes v* tags admin-only,
+    # and releases are immutable once published. Consumers verify the
+    # attestation's --source-ref and --signer-workflow (INSTALL-AGENT.md).
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      # install.sh is published as a release asset; nothing else from the
+      # repo is read, and nothing from it runs.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: scripts/install.sh
+          sparse-checkout-cone-mode: false
+          path: src
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-${{ github.ref_name }}-*
+          path: dist
+          merge-multiple: true
+      - name: Re-check every tarball's sha256 and contents
+        working-directory: dist
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for target in x86_64-linux aarch64-linux aarch64-macos; do
+            asset="cadence-$TAG-$target.tar.gz"
+            sha256sum -c "$asset.sha256"
+            listing=$(tar -tzf "$asset" | sort | tr '\n' ' ')
+            test "$listing" = "cadence cadence.sha256 manifest.json "
+          done
+          cp ../src/scripts/install.sh install.sh
+          ls -l
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/install.sh
+      # Published bytes never change under a tag (and immutable releases
+      # refuse uploads once published). A new release is created as a
+      # draft with every asset, then published last. A draft left by a
+      # failed run was never public, so its assets may be replaced. For a
+      # published release nothing is uploaded: its assets must be
+      # byte-identical to this run's (a no-op re-run), or the job fails.
+      - name: Publish the GitHub Release
+        working-directory: dist
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          assets=(./*.tar.gz ./*.sha256 install.sh)
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" = true ]; then
+              gh release upload "$TAG" --clobber "${assets[@]}"
+              gh release edit "$TAG" --draft=false
+              exit 0
+            fi
+            mkdir ../published
+            gh release download "$TAG" --dir ../published
+            (cd ../published && find . -maxdepth 1 -type f -printf '%f\n' | sort) > ../published.list
+            printf '%s\n' "${assets[@]#./}" | sort > ../ours.list
+            if ! diff ../ours.list ../published.list; then
+              echo "release $TAG is already published with a different asset list" >&2
+              exit 1
+            fi
+            for f in "${assets[@]#./}"; do
+              if ! cmp -s "$f" "../published/$f"; then
+                echo "release $TAG is already published and $f differs — refusing to replace it" >&2
+                exit 1
+              fi
+            done
+            echo "release $TAG is already published with identical assets"
+            exit 0
+          fi
+          pre=()
+          case "$TAG" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$TAG" --draft --verify-tag --title "cadence $TAG" \
+            --generate-notes "${pre[@]}" "${assets[@]}"
+          gh release edit "$TAG" --draft=false
+
+  # CAD-311: prove the non-x86_64 builds on every PR and queue entry, not
+  # first at a tag. Plain `cargo build` (no UI embed): what differs per
+  # target is the Rust code under cfg gates and the C/linker toolchain.
+  # macOS minutes are free for this public repo.
+  cross-build:
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux
+            runner: ubuntu-22.04-arm
+          - target: aarch64-macos
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo build --locked
+      - run: target/debug/cadence --version
 
   # CAD-109 backstop: gitleaks, an implementation independent of cadence's
   # in-process scanner, runs over the PR's own commits (base..head) with its
