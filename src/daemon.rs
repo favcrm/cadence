@@ -1786,6 +1786,14 @@ impl Shared {
                              run `cadence agent stop {alias}` first"
                         )));
                     }
+                    // Re-checks endpoint/state and refuses open work
+                    // (unless `force`) inside its transaction — before
+                    // any kill, so a refusal leaves the pane alone.
+                    let force = params
+                        .get("force")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    self.store.remove_agent(&alias, force)?;
                     // A fenced pty pane may still be alive — remove is
                     // the explicit kill; never leave an orphan session
                     // on the private socket behind a dropped row.
@@ -1793,8 +1801,6 @@ impl Shared {
                         adapter::pty::kill_pane(&self.state_dir, &alias, &self.provider_env);
                     }
                     self.open_attach.lock().unwrap().remove(&alias);
-                    // Re-checks endpoint/state inside its transaction.
-                    self.store.remove_agent(&alias)?;
                 }
                 self.wake();
                 Ok(json!({"alias": alias, "state": "removed"}))
@@ -1811,17 +1817,18 @@ impl Shared {
                         if lc.owned(&agent.alias) {
                             continue;
                         }
-                        // A fenced pty pane may still be alive — gc is
-                        // the explicit kill; no orphan sessions behind
-                        // dropped rows.
-                        if agent.endpoint_kind == "pty" {
-                            adapter::pty::kill_pane(
-                                &self.state_dir,
-                                &agent.alias,
-                                &self.provider_env,
-                            );
-                        }
-                        if self.store.remove_agent(&agent.alias).is_ok() {
+                        // Open work refuses (CAD-284): skip, never force.
+                        if self.store.remove_agent(&agent.alias, false).is_ok() {
+                            // A fenced pty pane may still be alive — gc is
+                            // the explicit kill; no orphan sessions behind
+                            // dropped rows.
+                            if agent.endpoint_kind == "pty" {
+                                adapter::pty::kill_pane(
+                                    &self.state_dir,
+                                    &agent.alias,
+                                    &self.provider_env,
+                                );
+                            }
                             self.open_attach.lock().unwrap().remove(&agent.alias);
                             removed.push(agent.alias);
                         }
