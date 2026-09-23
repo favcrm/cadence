@@ -582,7 +582,7 @@ fn memory_context(pm: &Pm, selected: &project::Project, paths: &[String]) -> Val
                 "kind": memory.front.kind,
                 "confidence": memory.front.confidence,
                 "verified_at": memory::last_verified(memory),
-                "evidence": memory::evidence_label(memory),
+                "evidence": matched.label(memory),
             })
         })
         .collect();
@@ -1129,6 +1129,7 @@ mod tests {
         let (lessons, slugs) = memory::render_lessons(&memory::Matched {
             lessons: memories,
             withheld: Vec::new(),
+            fresh: memory::Freshness::for_project(None),
         });
         assert!(slugs.len() <= memory::LESSON_MAX_ENTRIES);
         assert!(lessons.len() <= memory::LESSON_MAX_BYTES);

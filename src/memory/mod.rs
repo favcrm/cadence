@@ -16,9 +16,10 @@
 //!
 //! Only accepted memories with a valid quorum match a dispatch:
 //! `scope.project` or any of components/path-globs/tags/providers intersecting
-//! the dispatch context. A match whose evidence is stale is withheld with a
-//! recorded reason; a never-verified one is injected labelled `unverified`
-//! (see `stale_reason`). `cadence dispatch` renders the top matches into a
+//! the dispatch context. A match whose evidence is explicitly marked stale
+//! is withheld with a recorded reason; one never verified, or last verified
+//! outside the project's window, is injected labelled `unverified` (see
+//! `stale_reason`, `evidence_label`). `cadence dispatch` renders the top matches into a
 //! lessons file and names it in the kickoff; the briefing lists eligible
 //! project-wide `rule`s.
 
@@ -1467,12 +1468,12 @@ fn confidence_rank(confidence: &str) -> u8 {
     }
 }
 
-/// Default evidence staleness window in days. A project overrides it
+/// Default evidence freshness window in days. A project overrides it
 /// with `memory: {stale_days: N}` in its project.yaml.
 pub const DEFAULT_STALE_DAYS: u64 = 30;
 
-/// Retrieval-time freshness policy: the staleness window and the clock
-/// it is measured against (explicit so tests can pin time).
+/// Retrieval-time freshness policy: the window a verify stays current
+/// and the clock it is measured against (explicit so tests can pin time).
 #[derive(Clone, Copy, Debug)]
 pub struct Freshness {
     pub window_days: u64,
@@ -1496,6 +1497,14 @@ impl Freshness {
         let projects = project::list(pm_dir).unwrap_or_default();
         Freshness::for_project(projects.iter().find(|p| p.key == key))
     }
+
+    /// Whether a verify at `at` is still inside the window. An unreadable
+    /// time is not current — it can only decay the label, never withhold.
+    fn current(&self, at: &str) -> bool {
+        iso_epoch(at).is_some_and(|epoch| {
+            self.now.saturating_sub(epoch) <= (self.window_days as i64).saturating_mul(86400)
+        })
+    }
 }
 
 /// When the lesson's evidence was last re-checked: the PM finalization
@@ -1513,62 +1522,71 @@ pub fn last_verified(mem: &Memory) -> Option<&str> {
         .map(|r| r.finalized_at.as_str())
 }
 
-/// The evidence label an injected lesson carries: `verified <date>` or
-/// `unverified` — never presented as verified without a verify cycle.
-pub fn evidence_label(mem: &Memory) -> String {
+/// The last verify, only while it is inside the freshness window.
+fn current_verify<'a>(mem: &'a Memory, fresh: &Freshness) -> Option<&'a str> {
+    last_verified(mem).filter(|at| fresh.current(at))
+}
+
+/// The evidence label an injected lesson carries — never presented as
+/// verified without a current verify cycle: `verified <date>` inside the
+/// window, `unverified (last verified <date>)` once it has decayed past
+/// it, `unverified` when it was never verified.
+pub fn evidence_label(mem: &Memory, fresh: &Freshness) -> String {
+    let day = |at: &str| at.get(..10).unwrap_or(at).to_string();
     match last_verified(mem) {
-        Some(at) => format!("verified {}", at.get(..10).unwrap_or(at)),
+        Some(at) if fresh.current(at) => format!("verified {}", day(at)),
+        Some(at) => format!("unverified (last verified {})", day(at)),
         None => "unverified".to_string(),
     }
 }
 
-/// Why a lesson's evidence is stale — explicitly marked, or last
-/// verified outside the window — or None when it may be injected. An
-/// unreadable verification time fails closed. Never-verified lessons
-/// are not stale: they are injected with the `unverified` label.
-pub fn stale_reason(mem: &Memory, fresh: &Freshness) -> Option<String> {
-    if let Some(why) = &mem.front.stale {
-        let why = why.trim();
-        return Some(if why.is_empty() {
-            "evidence marked stale".to_string()
-        } else {
-            format!("evidence marked stale: {why}")
-        });
-    }
-    let at = last_verified(mem)?;
-    let Some(epoch) = iso_epoch(at) else {
-        return Some(format!("evidence verification time '{at}' is unreadable"));
-    };
-    let window = fresh.window_days;
-    let age = fresh.now.saturating_sub(epoch);
-    (age > (window as i64).saturating_mul(86400)).then(|| {
-        format!(
-            "evidence last verified {at} ({} days ago), outside the {window}-day staleness window",
-            age / 86400
-        )
+/// Why a lesson is withheld: its evidence is explicitly marked stale
+/// (the `stale:` mark; later the CAD-111 citation re-check). Age alone
+/// never withholds — a lesson past the window decays to `unverified` and
+/// is still injected, labelled (`evidence_label`).
+pub fn stale_reason(mem: &Memory) -> Option<String> {
+    let why = mem.front.stale.as_deref()?.trim();
+    Some(if why.is_empty() {
+        "evidence marked stale".to_string()
+    } else {
+        format!("evidence marked stale: {why}")
     })
 }
 
-/// A match result: what may be injected and what was withheld.
-#[derive(Clone, Debug, Default)]
+/// A match result: what may be injected and what was withheld, plus the
+/// freshness policy that labels the injected lessons.
+#[derive(Clone, Debug)]
 pub struct Matched {
     /// Injectable lessons, ranked.
     pub lessons: Vec<Memory>,
     /// Review-eligible lessons in scope but withheld for stale evidence,
     /// each with its reason — "why did I not get this?".
     pub withheld: Vec<(Memory, String)>,
+    pub fresh: Freshness,
+}
+
+impl Matched {
+    /// The evidence label for one of `lessons`.
+    pub fn label(&self, mem: &Memory) -> String {
+        evidence_label(mem, &self.fresh)
+    }
 }
 
 /// Accepted memories that apply to `ctx`, ranked: type
 /// (rule>gotcha>recipe>decision), confidence (high first), most recently
-/// verified first (unverified last). Stale ones are withheld with a reason.
+/// verified first (unverified and decayed last). Explicitly stale ones
+/// are withheld with a reason.
 pub fn match_memories(memories: &[Memory], ctx: &MatchCtx, fresh: &Freshness) -> Matched {
-    let mut out = Matched::default();
+    let mut out = Matched {
+        lessons: Vec::new(),
+        withheld: Vec::new(),
+        fresh: *fresh,
+    };
     for m in memories {
         if m.front.status != "accepted" || !retrieval_status(m).0 || !applies(&m.front.scope, ctx) {
             continue;
         }
-        match stale_reason(m, fresh) {
+        match stale_reason(m) {
             Some(reason) => out.withheld.push((m.clone(), reason)),
             None => out.lessons.push(m.clone()),
         }
@@ -1577,13 +1595,13 @@ pub fn match_memories(memories: &[Memory], ctx: &MatchCtx, fresh: &Freshness) ->
         (
             type_rank(&a.front.kind),
             confidence_rank(&a.front.confidence),
-            last_verified(b).unwrap_or_default(),
+            current_verify(b, fresh).unwrap_or_default(),
             &a.front.id,
         )
             .cmp(&(
                 type_rank(&b.front.kind),
                 confidence_rank(&b.front.confidence),
-                last_verified(a).unwrap_or_default(),
+                current_verify(a, fresh).unwrap_or_default(),
                 &b.front.id,
             ))
     });
@@ -1710,7 +1728,7 @@ pub fn render_lessons(matched: &Matched) -> (String, Vec<String>) {
             "- `{}` ({}, {}): {}\n  apply: {}\n",
             m.front.id,
             m.front.kind,
-            evidence_label(m),
+            matched.label(m),
             fact,
             how
         );
@@ -1744,11 +1762,10 @@ pub fn render_lessons(matched: &Matched) -> (String, Vec<String>) {
 }
 
 /// Accepted project-wide `rule`s — the briefing's memory section.
-/// Stale ones are withheld as at dispatch. Broken files are skipped,
-/// not fatal; callers surface the errors.
+/// Explicitly stale ones are withheld as at dispatch. Broken files are
+/// skipped, not fatal; callers surface the errors.
 pub fn project_rules(pm: &Pm, key: &str) -> (Vec<Memory>, Vec<String>) {
     let (mems, errors) = load_project_report(&pm.dir, key);
-    let fresh = Freshness::for_key(&pm.dir, key);
     let mut rules: Vec<Memory> = mems
         .into_iter()
         .filter(|m| {
@@ -1756,7 +1773,7 @@ pub fn project_rules(pm: &Pm, key: &str) -> (Vec<Memory>, Vec<String>) {
                 && retrieval_status(m).0
                 && m.front.scope.project
                 && m.front.kind == "rule"
-                && stale_reason(m, &fresh).is_none()
+                && stale_reason(m).is_none()
         })
         .collect();
     rules.sort_by(|a, b| a.front.id.cmp(&b.front.id));
@@ -1996,7 +2013,6 @@ pub fn card_json(m: &Memory) -> Value {
         "created": m.front.created,
         "verified_at": m.front.verified_at,
         "last_verified": last_verified(m),
-        "evidence": evidence_label(m),
         "stale": m.front.stale,
         "supersedes": m.front.supersedes,
         "revision_digest": digest,
@@ -2235,7 +2251,10 @@ mod tests {
         // evidence — only verify writes verified_at.
         assert_eq!(accepted.front.verified_at, None);
         assert_eq!(last_verified(&accepted), None);
-        assert_eq!(evidence_label(&accepted), "unverified");
+        assert_eq!(
+            evidence_label(&accepted, &Freshness::for_project(None)),
+            "unverified"
+        );
 
         let bytes_after_accept = std::fs::read(&accepted.path).unwrap();
         let repeated =
@@ -2269,7 +2288,7 @@ mod tests {
         assert!(retrieval_status(&verified).0);
         let stamped = verified.front.verified_at.clone().expect("verify stamps");
         assert_eq!(last_verified(&verified), Some(stamped.as_str()));
-        assert!(evidence_label(&verified).starts_with("verified "));
+        assert!(evidence_label(&verified, &Freshness::for_project(None)).starts_with("verified "));
 
         let bytes_after_verify = std::fs::read(&verified.path).unwrap();
         let repeated =
@@ -2819,52 +2838,84 @@ mod tests {
     }
 
     #[test]
-    fn stale_lesson_is_withheld_with_the_recorded_reason() {
+    fn explicitly_stale_lesson_is_withheld_with_the_recorded_reason() {
+        let mut marked = finalized("marked", Some("2026-02-28T00:00:00Z"));
+        marked.front.stale = Some("CAD-1 reverted the fix it cites".to_string());
+        let pool = [marked, finalized("fresh", Some("2026-02-20T00:00:00Z"))];
+        // Inside the window: the mark alone withholds.
+        let matched = match_memories(
+            &pool,
+            &MatchCtx::default(),
+            &fresh_at("2026-03-01T00:00:00Z"),
+        );
+        assert_eq!(slugs(&matched.lessons), vec!["fresh"]);
+        assert_eq!(matched.withheld.len(), 1);
+        let (withheld, reason) = &matched.withheld[0];
+        assert_eq!(withheld.front.id, "marked");
+        assert_eq!(
+            reason,
+            "evidence marked stale: CAD-1 reverted the fix it cites"
+        );
+        // The dispatch lessons file names the withheld lesson and why.
+        let (text, injected) = render_lessons(&matched);
+        assert_eq!(injected, vec!["fresh"]);
+        assert!(
+            text.contains("- `marked`: evidence marked stale: CAD-1 reverted the fix it cites"),
+            "{text}"
+        );
+        // An empty mark still withholds, with a generic reason.
+        let mut bare = finalized("bare", None);
+        bare.front.stale = Some(String::new());
+        let matched = match_memories(
+            &[bare],
+            &MatchCtx::default(),
+            &fresh_at("2026-03-01T00:00:00Z"),
+        );
+        assert!(matched.lessons.is_empty());
+        assert_eq!(matched.withheld[0].1, "evidence marked stale");
+    }
+
+    #[test]
+    fn past_window_lesson_is_injected_with_its_decayed_label() {
         let pool = [
             finalized("aged", Some("2026-01-10T00:00:00Z")),
             finalized("fresh", Some("2026-02-20T00:00:00Z")),
         ];
         // 50 days after verification: outside the default 30-day window.
+        // Age alone never withholds — it decays to unverified, labelled.
         let now = fresh_at("2026-03-01T00:00:00Z");
         let matched = match_memories(&pool, &MatchCtx::default(), &now);
-        assert_eq!(slugs(&matched.lessons), vec!["fresh"]);
-        assert_eq!(matched.withheld.len(), 1);
-        let (withheld, reason) = &matched.withheld[0];
-        assert_eq!(withheld.front.id, "aged");
-        assert_eq!(
-            reason,
-            "evidence last verified 2026-01-10T00:00:00Z (50 days ago), outside the 30-day staleness window"
-        );
-        // The dispatch lessons file names the withheld lesson and why.
+        assert_eq!(slugs(&matched.lessons), vec!["fresh", "aged"]);
+        assert!(matched.withheld.is_empty());
         let (text, injected) = render_lessons(&matched);
-        assert_eq!(injected, vec!["fresh"]);
-        assert!(text.contains(&format!("- `aged`: {reason}")), "{text}");
+        assert_eq!(injected, vec!["fresh", "aged"]);
+        assert!(
+            text.contains("- `aged` (rule, unverified (last verified 2026-01-10)): fact"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- `fresh` (rule, verified 2026-02-20): fact"),
+            "{text}"
+        );
+        assert!(!text.contains("Withheld"), "{text}");
 
-        // The window is the project's: a 90-day project still injects it.
+        // The window is the project's: inside a 90-day window it is
+        // still verified.
         let wide = Freshness {
             window_days: 90,
             ..now
         };
-        let matched = match_memories(&pool, &MatchCtx::default(), &wide);
-        assert_eq!(slugs(&matched.lessons), vec!["fresh", "aged"]);
-        assert!(matched.withheld.is_empty());
+        assert_eq!(evidence_label(&pool[0], &wide), "verified 2026-01-10");
 
-        // An explicit stale mark withholds even inside the window.
-        let mut marked = finalized("marked", Some("2026-02-28T00:00:00Z"));
-        marked.front.stale = Some("CAD-1 reverted the fix it cites".to_string());
-        let matched = match_memories(&[marked], &MatchCtx::default(), &now);
-        assert!(matched.lessons.is_empty());
-        assert_eq!(
-            matched.withheld[0].1,
-            "evidence marked stale: CAD-1 reverted the fix it cites"
-        );
-
-        // An unreadable verification time fails closed.
+        // An unreadable verify time is never presented as verified.
         let mut garbled = finalized("garbled", Some("2026-02-28T00:00:00Z"));
         garbled.front.finalizations[1].finalized_at = "yesterday".to_string();
         let matched = match_memories(&[garbled], &MatchCtx::default(), &now);
-        assert!(matched.lessons.is_empty());
-        assert!(matched.withheld[0].1.contains("unreadable"));
+        assert!(matched.withheld.is_empty());
+        assert_eq!(
+            matched.label(&matched.lessons[0]),
+            "unverified (last verified yesterday)"
+        );
     }
 
     #[test]

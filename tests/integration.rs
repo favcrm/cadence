@@ -20090,8 +20090,10 @@ fn dispatch_injects_project_memory_lessons() {
         },
         "claude provider rule",
     );
-    // CAD-203: a project-wide rule whose last verify is years old is
-    // stale — withheld from the lessons and the briefing, with a reason.
+    // CAD-203: a project-wide rule whose last verify is years old decays
+    // to unverified — still injected, labelled — while one explicitly
+    // marked stale is withheld from the lessons and the briefing, with
+    // its reason.
     let aged = write_reviewed_memory(
         &pm_dir,
         "demo",
@@ -20104,6 +20106,25 @@ fn dispatch_injects_project_memory_lessons() {
         "aged rule nobody re-checked",
     );
     mark_memory_verified(&aged, "2020-01-01T00:00:00Z");
+    let marked = write_reviewed_memory(
+        &pm_dir,
+        "demo",
+        "marked-rule",
+        "rule",
+        Scope {
+            project: true,
+            ..Scope::default()
+        },
+        "rule whose cited fix was reverted",
+    );
+    let text = std::fs::read_to_string(&marked).unwrap();
+    let (mut front, body) = memory::parse_memory(&text).unwrap();
+    front.stale = Some("D-9 reverted the cited fix".to_string());
+    std::fs::write(
+        &marked,
+        cadence_agent::issue::parse::render(&front, &body).unwrap(),
+    )
+    .unwrap();
     // A still-proposed memory never injects. It intentionally has no
     // authenticated proof, so it also documents legacy/proposed withholding.
     let pending = pm_dir.join("demo/memory/pending-one.md");
@@ -20129,14 +20150,14 @@ fn dispatch_injects_project_memory_lessons() {
         "pm",
     ]);
     assert!(ok && out["dispatched"] == true, "{out}");
-    assert_eq!(out["lessons"], json!(["always-drain"]), "{out}");
-    let withheld = out["lessons_withheld"].as_array().unwrap();
-    assert_eq!(withheld.len(), 1, "{out}");
-    assert_eq!(withheld[0]["slug"], "aged-rule", "{out}");
-    let aged_reason = withheld[0]["reason"].as_str().unwrap().to_string();
-    assert!(
-        aged_reason.starts_with("evidence last verified 2020-01-01T00:00:00Z")
-            && aged_reason.ends_with("outside the 30-day staleness window"),
+    assert_eq!(
+        out["lessons"],
+        json!(["aged-rule", "always-drain"]),
+        "{out}"
+    );
+    assert_eq!(
+        out["lessons_withheld"],
+        json!([{"slug": "marked-rule", "reason": "evidence marked stale: D-9 reverted the cited fix"}]),
         "{out}"
     );
     let lessons_path = PathBuf::from(out["lessons_file"].as_str().unwrap());
@@ -20149,11 +20170,23 @@ fn dispatch_injects_project_memory_lessons() {
     );
     let text = std::fs::read_to_string(&lessons_path).unwrap();
     assert!(text.contains("always drain the pipe before send"), "{text}");
-    assert!(text.contains("(rule, unverified)"), "{text}");
-    assert!(!text.contains("daemon-only gotcha"), "{text}");
-    assert!(!text.contains("aged rule nobody re-checked"), "{text}");
     assert!(
-        text.contains(&format!("- `aged-rule`: {aged_reason}")),
+        text.contains("- `always-drain` (rule, unverified):"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "- `aged-rule` (rule, unverified (last verified 2020-01-01)): aged rule nobody re-checked"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("daemon-only gotcha"), "{text}");
+    assert!(
+        !text.contains("rule whose cited fix was reverted"),
+        "{text}"
+    );
+    assert!(
+        text.contains("- `marked-rule`: evidence marked stale: D-9 reverted the cited fix"),
         "{text}"
     );
     assert!(text.len() <= 4096);
@@ -20172,16 +20205,15 @@ fn dispatch_injects_project_memory_lessons() {
             c["body"]
                 .as_str()
                 .unwrap()
-                .contains("Lessons injected: always-drain")
+                .contains("Lessons injected: aged-rule, always-drain")
         }),
         "{issue}"
     );
     assert!(
         issue["comments"].as_array().unwrap().iter().any(|c| {
-            c["body"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("Lessons withheld: aged-rule ({aged_reason})"))
+            c["body"].as_str().unwrap().contains(
+                "Lessons withheld: marked-rule (evidence marked stale: D-9 reverted the cited fix)",
+            )
         }),
         "{issue}"
     );
@@ -20240,7 +20272,11 @@ fn dispatch_injects_project_memory_lessons() {
     assert!(text.contains("`always-drain` (unverified)"), "{text}");
     assert!(!text.contains("pending-one"), "{text}");
     assert!(!text.contains("claude-only"), "{text}");
-    assert!(!text.contains("aged-rule"), "{text}");
+    assert!(
+        text.contains("`aged-rule` (unverified (last verified 2020-01-01))"),
+        "{text}"
+    );
+    assert!(!text.contains("marked-rule"), "{text}");
 }
 
 /// Explicit-axis matching resolves the current project from cwd and never

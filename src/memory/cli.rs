@@ -493,7 +493,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                         "type": m.front.kind,
                         "confidence": m.front.confidence,
                         "verified_at": memory::last_verified(m),
-                        "evidence": memory::evidence_label(m),
+                        "evidence": mems.label(m),
                         "fact": memory::fact_line(&m.body),
                     })).collect::<Vec<_>>(),
                     "withheld": mems.withheld.iter().map(|(m, reason)| json!({
@@ -517,7 +517,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                         m.project,
                         m.front.id,
                         m.front.kind,
-                        memory::evidence_label(m),
+                        mems.label(m),
                         memory::fact_line(&m.body),
                     );
                 }

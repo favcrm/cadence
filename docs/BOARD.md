@@ -665,30 +665,33 @@ matched against the issue's recorded-commit paths), `--scope-tag`
 (issue `tags:`), `--scope-provider` (the target worker's provider).
 `match --issue` prints the ranked list: `rule` > `gotcha` > `recipe` >
 `decision`, then confidence, then most recently verified (unverified
-last), each with its evidence label, followed by withheld entries and
-their reasons (`--json`: `matched[].evidence`, `withheld[]`).
+and decayed last), each with its evidence label, followed by withheld
+entries and their reasons (`--json`: `matched[].evidence`,
+`withheld[]`).
 
 Evidence freshness (CAD-203) is separate from review status. Accepting
 a lesson records the review; it does not re-check the evidence, so only
 a PM-finalized `verify` cycle stamps `verified_at` and clears `stale`.
-Retrieval reads the verify finalization receipt itself: an accepted
-lesson with no finalized verify cycle is **unverified** — injected, but
-labelled `unverified` everywhere it appears (older records whose
-`verified_at` was stamped at accept time read the same way; the files
-are not rewritten). An accepted, in-scope lesson is **withheld** when its
-evidence is stale:
+Retrieval reads the verify finalization receipt itself, and every
+injected lesson carries an evidence label:
 
-- `stale: <why>` is set in its frontmatter (a revalidation check or a
-  curator marks it; the next finalized verify clears it), or
-- its last finalized verify is older than the project's staleness
-  window — `memory: {stale_days: N}` in `project.yaml`, default 30
-  days. An unreadable verify time fails closed.
+- `verified <date>` — last finalized verify is inside the project's
+  freshness window: `memory: {stale_days: N}` in `project.yaml`,
+  default 30 days;
+- `unverified (last verified <date>)` — the verify has aged past the
+  window. Age alone never withholds: the lesson decays and is still
+  injected;
+- `unverified` — never verified. Older records whose `verified_at` was
+  stamped at accept time read the same way; the files are not rewritten.
 
-A withheld lesson is recorded with its reason so "why did I not get
-this?" is answerable: in the lessons file (`## Withheld` section), the
-dispatch comment (`Lessons withheld: <slug> (<reason>)`), the dispatch
-JSON (`lessons_withheld`), `memory match` and the `issue context`
-memory manifest. Contradiction is not a withholding reason here.
+A lesson is **withheld** only when its evidence is explicitly stale —
+`stale: <why>` in its frontmatter (set by a curator today, by CAD-111's
+citation re-check later; the next finalized verify clears it). The
+withholding is recorded with its reason so "why did I not get this?" is
+answerable: in the lessons file (`## Withheld` section), the dispatch
+comment (`Lessons withheld: <slug> (<reason>)`), the dispatch JSON
+(`lessons_withheld`), `memory match` and the `issue context` memory
+manifest. Contradiction is not a withholding reason here.
 
 Injection happens in two places:
 
@@ -707,10 +710,10 @@ Injection happens in two places:
   write never leaves a partial artifact.
 - `agent bootstrap`/`join` briefings gain a
   `## Project memory — accepted rules (<project>)` section listing the
-  project's accepted, non-stale `rule`s (each with its evidence label)
-  for the worker's cwd — ≤ 8 entries and
-  ≤ 4 KiB, same bound as the dispatch lessons file. An over-budget
-  rule is skipped, not a stop; omitted rules are counted.
+  project's accepted `rule`s not marked stale (each with its evidence
+  label) for the worker's cwd — ≤ 8 entries and ≤ 4 KiB, same bound
+  as the dispatch lessons file. An over-budget rule is skipped, not a
+  stop; omitted rules are counted.
 
 Memory readers skip files that fail to load and report them: `ls`,
 `ls --stale` and `match` warn once on stderr and include `load_errors`
@@ -723,7 +726,7 @@ error before it can reach matching.
 Staleness: `ls --stale` flags an accepted memory not verified within
 the `--days` window (30 default), or whose path globs match files
 changed in a project repo after `verified_at` — informational only;
-`verify` is the refresh. Retrieval applies its own window as above.
+`verify` is the refresh. Retrieval labels by its own window as above.
 
 ## `cadence ui` — the reader
 
