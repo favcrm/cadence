@@ -915,6 +915,7 @@ pub fn add_ref(
     actor: &str,
 ) -> Result<Value> {
     model::check_ref_kind(kind)?;
+    model::check_ref_value(target)?;
     let (_project, dir) = issue_dir(pm, id)?;
     let _lock = pm.lock()?;
     if let Some(conflict) = check_rev(&dir, if_rev)? {

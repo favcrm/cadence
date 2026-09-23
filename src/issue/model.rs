@@ -264,6 +264,20 @@ pub fn check_ref_kind(kind: &str) -> Result<()> {
     }
 }
 
+/// A ref value git would parse as an option (`-x`,
+/// `--upload-pack=<cmd>`) when it is passed as an argument. Tracker
+/// files are plain markdown any agent can write, so this runs where refs
+/// are written and again where `issue finish` reads them (CAD-144).
+pub fn check_ref_value(value: &str) -> Result<()> {
+    if value.starts_with('-') {
+        Err(Error::rejected(format!(
+            "Ref value '{value}' begins with '-' — git would read it as an option"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

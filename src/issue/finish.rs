@@ -14,7 +14,8 @@
 //! patch-equivalent commits, a squash merge, or a merged PR, or
 //! pushed. A busy owner working ELSEWHERE is not a reason. `--force`
 //! overrides each and is recorded as a `Forced:` trailer on the
-//! finish commit. Refs are kept as history, marked `closed: true`;
+//! finish commit. Refs are kept as history, marked `closed: true`
+//! (a branch finish leaves standing keeps its ref open, CAD-145);
 //! the issue's status is untouched — status follows the job or the
 //! PM. An issue with several open worktree refs needs `--worktree
 //! <path>` to name one (CAD-274); a named directory already gone only
@@ -35,7 +36,7 @@ use tempfile::TempDir;
 use crate::adapter::pty;
 use crate::client;
 use crate::error::{Error, Result};
-use crate::issue::model::{Front, Ref};
+use crate::issue::model::{self, Front, Ref};
 use crate::issue::{board, project, start, write, Pm};
 use crate::proc::{run_bounded, BoundedError};
 
@@ -356,6 +357,12 @@ fn resolve(pm: &Pm, id: &str, pick: Option<&Path>) -> Result<Resolve> {
             .unwrap_or_default(),
         None => open_branch(None).unwrap_or_default(),
     };
+    // Tracker values reach git below — refuse one it would read as an
+    // option, however it got into the file (CAD-144).
+    model::check_ref_value(&branch)?;
+    if let Some(d) = &open_wt {
+        model::check_ref_value(&d.to_string_lossy())?;
+    }
     if open_wt.is_none() && branch.is_empty() {
         if front
             .refs
@@ -818,7 +825,12 @@ fn evidence(t: &Target, remote: bool) -> Evidence {
     let (remote_tip, remote_cmp, remote_note) = if t.branch.is_empty() {
         (None, false, None)
     } else if remote {
-        match git_out(&t.root, &["fetch", "origin", &t.branch], &[]) {
+        // An explicit refspec, not a bare branch name: the tracking ref
+        // updates even when `remote.origin.fetch` does not map it (a
+        // single-branch clone), so the gate and the lease never read a
+        // stale tip. `--` ends option parsing before any tracker value.
+        let refspec = format!("+refs/heads/{0}:refs/remotes/origin/{0}", t.branch);
+        match git_out(&t.root, &["fetch", "--", "origin", &refspec], &[]) {
             Ok(o) if o.status.success() => (tracking_tip(&t.root, &t.branch), true, None),
             Ok(o) if String::from_utf8_lossy(&o.stderr).contains("couldn't find remote ref") => (
                 None,
@@ -952,6 +964,7 @@ fn remote_delete(root: &Path, branch: &str, expect: &str) -> Result<()> {
         &[
             "push",
             &format!("--force-with-lease=refs/heads/{branch}:{expect}"),
+            "--",
             "origin",
             &format!(":refs/heads/{branch}"),
         ],
@@ -1590,6 +1603,7 @@ pub(crate) fn run(
         if force {
             args.push("--force");
         }
+        args.push("--");
         args.push(&target);
         git(&root, &args).map_err(|e| {
             Error::rejected(format!("git worktree remove {} failed: {e}", d.display()))
@@ -1640,13 +1654,21 @@ pub(crate) fn run(
             }
         }
     }
-    // One tracker commit marks both refs closed — kept as history.
+    // One tracker commit marks the refs closed — kept as history. A
+    // branch this finish left standing (`--keep-branch`, kept for its
+    // remote, an uncovered or moved tip) keeps its ref open, so the
+    // surviving work stays on the board and finishable (CAD-145). The
+    // refs-only close of a gone dir closes both (CAD-274).
+    let branch_kept = !refs_only && !deleted_branch && branch_tip(&root, &branch).is_some();
     for r in &mut t.front.refs {
         if (r.kind == "worktree"
             && wt_dir
                 .as_deref()
                 .is_some_and(|d| r.path.as_deref() == Some(d.to_string_lossy().as_ref())))
-            || (r.kind == "branch" && !branch.is_empty() && r.path.as_deref() == Some(&branch))
+            || (r.kind == "branch"
+                && !branch.is_empty()
+                && !branch_kept
+                && r.path.as_deref() == Some(&branch))
         {
             r.closed = Some(true);
         }
@@ -2155,6 +2177,52 @@ mod tests {
             ahead,
             "the unseen commits must still be on the remote"
         );
+    }
+
+    /// CAD-144: a single-branch clone's configured refspec does not map
+    /// the lane, so a bare `fetch origin <b>` leaves the tracking ref
+    /// stale. The explicit refspec must refresh it — the coverage gate
+    /// and the lease read the server's current tip.
+    #[test]
+    fn remote_fetch_refreshes_tracking_on_a_single_branch_clone() {
+        let (tmp, _bare) = repo_with_origin();
+        let r = tmp.path();
+        let stale = git(r, &["rev-parse", "side"]).unwrap();
+        std::fs::write(r.join("f"), "ahead").unwrap();
+        git(r, &["commit", "-qam", "ahead"]).unwrap();
+        let ahead = git(r, &["rev-parse", "main"]).unwrap();
+        git(r, &["push", "-q", "origin", "main:side"]).unwrap();
+        git(
+            r,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+        )
+        .unwrap();
+        git(r, &["update-ref", "refs/remotes/origin/side", &stale]).unwrap();
+        let mut t = target("CAD-1");
+        t.root = r.to_path_buf();
+        let ev = evidence(&t, true);
+        assert!(ev.remote_cmp, "{:?}", ev.remote_note);
+        assert_eq!(ev.remote_tip.as_deref(), Some(ahead.as_str()));
+    }
+
+    /// CAD-144: a branch value shaped like an option never reaches git
+    /// as one — even past `resolve`'s refusal, the fetch passes it only
+    /// inside a refspec after `--`.
+    #[test]
+    fn remote_fetch_never_passes_the_branch_as_an_option() {
+        let (tmp, _bare) = repo_with_origin();
+        let r = tmp.path();
+        let marker = r.join("upload-pack-ran");
+        let mut t = target("CAD-1");
+        t.root = r.to_path_buf();
+        t.branch = format!("--upload-pack=touch {}", marker.display());
+        let ev = evidence(&t, true);
+        assert!(!marker.exists(), "--upload-pack ran: {:?}", ev.remote_note);
+        assert!(!ev.remote_cmp && ev.remote_tip.is_none());
     }
 
     #[test]
