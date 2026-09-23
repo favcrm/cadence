@@ -4131,12 +4131,18 @@ fn run() -> Result<i32> {
                 // Every daemon start re-syncs the vendored skill: a
                 // rebuilt binary propagates changes. stderr lands in
                 // daemon.log for the detached child — stdout stays silent.
-                match home_dir().map(|h| cadence_agent::skill::sync(&h, false)) {
-                    Ok(Ok(report)) if report["wrote"].as_bool().unwrap_or(false) => {
-                        eprintln!("skill: refreshed {}", report["installed"])
+                // A sandbox shares $HOME with production, so it never
+                // writes the skill there.
+                if cadence_agent::sandbox::profile().is_some() {
+                    eprintln!("skill: skipped (sandbox profile)");
+                } else {
+                    match home_dir().map(|h| cadence_agent::skill::sync(&h, false)) {
+                        Ok(Ok(report)) if report["wrote"].as_bool().unwrap_or(false) => {
+                            eprintln!("skill: refreshed {}", report["installed"])
+                        }
+                        Ok(Err(e)) => eprintln!("skill: refresh failed: {e}"),
+                        _ => {}
                     }
-                    Ok(Err(e)) => eprintln!("skill: refresh failed: {e}"),
-                    _ => {}
                 }
                 cadence_agent::daemon::serve(&state_dir)?;
                 Ok(0)

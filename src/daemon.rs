@@ -1643,6 +1643,7 @@ impl Shared {
             "health" => Ok(json!({
                 "state": "ready",
                 "pid": std::process::id(),
+                "sandbox": crate::sandbox::profile(),
                 "protocol": proto::PROTOCOL_VERSION,
                 "capabilities": proto::capabilities(),
                 "agent_gc_timer": self.agent_gc.status(),
@@ -5204,7 +5205,8 @@ impl Shared {
     /// One pass: thresholds re-read each tick so a `pm.yaml` edit
     /// applies without a restart; the busy-provider set comes from
     /// the live store. `[host] wal_checkpoint: false` opts the whole
-    /// watcher out; `wal_dry_run: true` records intent, never writes.
+    /// watcher out; `wal_dry_run: true` — or a sandbox profile, since
+    /// provider stores are the host's — records intent, never writes.
     fn wal_tick(&self, watch: &mut WalWatch) {
         let Some(home) = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -5243,7 +5245,7 @@ impl Shared {
             &busy,
             t.wal_max_bytes,
             WAL_QUIET_SECS,
-            t.wal_dry_run,
+            wal_observe_only(t.wal_dry_run, crate::sandbox::profile().as_deref()),
             &self.store,
             watch,
         );
@@ -5968,6 +5970,13 @@ fn checkpoint_wal(db: &Path) -> Checkpoint {
 /// store idle — the gate against writers cadence cannot see
 /// (interactive terminals, another daemon, provider background jobs).
 const WAL_QUIET_SECS: u64 = 60;
+
+/// The watcher's dry-run switch: `[host] wal_dry_run`, forced on under
+/// a sandbox profile — a sandbox never checkpoints the host's provider
+/// stores (CAD-310).
+fn wal_observe_only(configured: bool, sandbox: Option<&str>) -> bool {
+    configured || sandbox.is_some()
+}
 
 /// Keep this many `daemon` events — the stream has no agents row, so
 /// agent-removal pruning never reaches it; unbounded growth in a
@@ -9119,6 +9128,38 @@ mod tests {
             .filter(|e| e.kind == "wal_checkpoint_pending")
             .count();
         assert_eq!(n, 1, "still one — under the limit emitted nothing");
+    }
+
+    /// CAD-310: a sandbox profile forces the watcher observe-only even
+    /// with `wal_dry_run` off — intent recorded, the WAL never touched.
+    #[test]
+    fn wal_pass_under_a_sandbox_profile_is_observe_only() {
+        assert!(!wal_observe_only(false, None));
+        assert!(wal_observe_only(true, None));
+        let (dir, shared) = shared();
+        let root = dir.path().join("devin");
+        std::fs::create_dir_all(&root).unwrap();
+        let (db, _writer) = wal_db(&root, "sessions.db");
+        let before = wal_size(&db);
+        let roots = [crate::doctor::host::WalRoot {
+            provider: "devin",
+            label: "devin store",
+            root,
+        }];
+        let mut watch = WalWatch::default();
+        wal_pass(
+            &roots,
+            &HashSet::new(),
+            1,
+            0,
+            wal_observe_only(false, Some("x")),
+            &shared.store,
+            &mut watch,
+        );
+        assert_eq!(wal_size(&db), before, "a sandbox never checkpoints");
+        let events = shared.store.events_tail(DAEMON_ALIAS, 10).unwrap();
+        assert!(events.iter().any(|e| e.kind == "wal_checkpoint_pending"));
+        assert!(events.iter().all(|e| e.kind != "wal_checkpointed"));
     }
 
     /// The daemon stream is bounded: more than DAEMON_EVENTS_KEEP

@@ -690,6 +690,17 @@ impl CursorProfile {
     /// `allow` is malformed the same way. A `.bak` of the original
     /// bytes is written before every modification.
     fn ensure_cadence_allowlist(&self) -> Result<()> {
+        // A sandbox shares $HOME with production: the real ~/.cursor
+        // config is the host's, so merging there needs the operator's
+        // opt-in (CAD-310). A relocated root (`CADENCE_CURSOR_CHATS`)
+        // is the caller's own.
+        if std::env::var_os("HOME")
+            .is_some_and(|home| self.chats_dir == Path::new(&home).join(".cursor/chats"))
+        {
+            crate::sandbox::refuse_global_unless_allowed(
+                "the Cursor `Shell(cadence)` merge into ~/.cursor/cli-config.json",
+            )?;
+        }
         let path = self.cli_config_path();
         // A symlinked config must be written through, never replaced:
         // resolve the link so `.bak` and the temp+rename land beside
