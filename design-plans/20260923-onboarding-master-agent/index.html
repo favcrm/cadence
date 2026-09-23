@@ -386,7 +386,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 <div class="chrome">
   <div class="brand">
     <svg width="22" height="22" viewBox="0 0 1024 1024" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0B0B0C"/><path d="M232 336 416 512 232 688" fill="none" stroke="#2DD4BF" stroke-opacity=".55" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><path d="M408 336 592 512 408 688" fill="none" stroke="#2DD4BF" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><rect x="656" y="656" width="160" height="64" rx="32" fill="#2DD4BF" fill-opacity=".7"/></svg>
-    <span class="bname">Cadence</span> <small>· plan, roadmap, research &amp; prototype — v5</small>
+    <span class="bname">Cadence</span> <small>· plan, roadmap, research &amp; prototype — v6</small>
   </div>
   <div class="seg" role="group" aria-label="View" id="tabseg">
     <button data-act="tab" data-v="plan" aria-pressed="true">Plan</button>
@@ -410,9 +410,9 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 <div class="doc">
   <nav class="toc" aria-label="Plan contents">
     <div class="k">Plan</div>
-    <a href="#p-org">One company, many teams</a>
+    <a href="#p-org">One master, many projects</a>
     <a href="#p-learn">How the team learns</a>
-    <a href="#p-roles">Roles</a>
+    <a href="#p-roles">Agents</a>
     <a href="#p-rules">Operating rules</a>
     <a href="#p-ms">Milestones</a>
     <a href="#p-dec">Decisions</a>
@@ -420,36 +420,36 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
   </nav>
   <article>
     <section class="hero">
-      <div class="kicker">Consolidated plan · v5 · 2026-09-23 · Markdown source: design-plans/…/PLAN.md</div>
+      <div class="kicker">Consolidated plan · v6 · 2026-09-23 · Markdown source: design-plans/…/PLAN.md</div>
       <h1>An autonomous dev team that learns — on your machine.</h1>
-      <p class="lede">One <b>master assistant</b> talks with you. It staffs <b>teams</b> — one PM each, with developers, QA and DevOps from the agents you already pay for — using a company <b>role catalog</b>. Every finished job, question or blocker produces a <b>report</b>; a <b>verifier</b> (deterministic checks plus a curator from a different vendor) turns reports into <b>verified memory</b> in a git <b>company vault</b>; every agent starts its next task with a small, cited <b>context pack</b> instead of re-reading. You approve what matters.</p>
+      <p class="lede">One <b>master assistant</b> talks with you. It runs <b>projects</b> — a PM session per project, plus developer, QA and DevOps <b>sessions</b> of agents defined once as Markdown folders (<code>agents/&lt;slug&gt;/</code> SOUL.md, AGENT.md, MEMORY.md). Every finished job, question or blocker produces a <b>report</b>; a <b>verifier</b> (deterministic checks plus a curator from a different vendor) turns reports into <b>verified memory</b> in a git <b>company vault</b>; every agent starts its next task with a small, cited <b>context pack</b> instead of re-reading. You approve what matters.</p>
       <p style="margin-top:14px"><button class="btn pri" data-act="tab" data-v="proto">Clickable prototype →</button> <button class="btn" data-act="tab" data-v="roadmap">Milestones &amp; tickets →</button> <button class="btn" data-act="tab" data-v="research">State of the art →</button></p>
     </section>
 
-    <h2 id="p-org"><span class="n">01</span>One company, many teams</h2>
+    <h2 id="p-org"><span class="n">01</span>One master, many projects</h2>
     <div class="diagram" role="img" aria-label="Org: you direct the master; the master staffs teams (PM plus dev, QA, DevOps); teams report up; the curator verifies reports into the vault; the vault sends context packs down.">
       <svg viewBox="0 0 980 360" font-family="IBM Plex Sans" font-size="12">
         <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="var(--mute)"/></marker>
         <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="var(--accent)"/></marker></defs>
         <rect x="20" y="145" width="120" height="64" rx="10" fill="var(--panel2)" stroke="var(--line2)"/><text x="36" y="172" fill="var(--strong)" font-weight="600">You</text><text x="36" y="190" fill="var(--mute)">goals · approvals</text>
-        <rect x="180" y="135" width="198" height="84" rx="10" fill="var(--accent-dim)" stroke="var(--accent)"/><text x="194" y="160" fill="var(--strong)" font-weight="600">Master · assistant</text><text x="194" y="178" fill="var(--soft)">staffs teams, routes questions</text><text x="194" y="196" fill="var(--mute)">never implements</text>
+        <rect x="180" y="135" width="198" height="84" rx="10" fill="var(--accent-dim)" stroke="var(--accent)"/><text x="194" y="160" fill="var(--strong)" font-weight="600">Master · assistant</text><text x="194" y="178" fill="var(--soft)">staffs projects, routes questions</text><text x="194" y="196" fill="var(--mute)">never implements</text>
         <line x1="140" y1="177" x2="178" y2="177" stroke="var(--mute)" marker-end="url(#ar2)"/>
         <rect x="410" y="24" width="330" height="140" rx="10" fill="var(--panel2)" stroke="var(--line2)"/>
-        <text x="426" y="48" fill="var(--strong)" font-weight="600">Reminders team</text><text x="560" y="48" fill="var(--mute)">approve-plans</text>
+        <text x="426" y="48" fill="var(--strong)" font-weight="600">Project · reminders</text><text x="560" y="48" fill="var(--mute)">approve-plans</text>
         <rect x="426" y="60" width="298" height="30" rx="7" fill="var(--panel)" stroke="var(--line2)"/><text x="438" y="80" fill="var(--strong)">PM</text><text x="470" y="80" fill="var(--mute)">plan · dispatch · collect reports · escalate</text>
         <g font-size="11.5"><rect x="426" y="100" width="92" height="26" rx="6" fill="var(--panel)" stroke="var(--line2)"/><text x="438" y="118" fill="var(--soft)">Dev × 4</text>
         <rect x="528" y="100" width="92" height="26" rx="6" fill="var(--panel)" stroke="var(--line2)"/><text x="540" y="118" fill="var(--soft)">QA</text>
         <rect x="630" y="100" width="94" height="26" rx="6" fill="var(--panel)" stroke="var(--line2)"/><text x="642" y="118" fill="var(--soft)">DevOps</text></g>
         <text x="426" y="152" fill="var(--mute)" font-size="11">one writer per code area · fresh-context QA</text>
         <rect x="410" y="196" width="330" height="110" rx="10" fill="var(--panel2)" stroke="var(--line2)"/>
-        <text x="426" y="220" fill="var(--strong)" font-weight="600">Storefront team</text><text x="560" y="220" fill="var(--mute)">ask-for-everything</text>
-        <rect x="426" y="232" width="298" height="30" rx="7" fill="var(--panel)" stroke="var(--line2)"/><text x="438" y="252" fill="var(--strong)">PM</text><text x="470" y="252" fill="var(--mute)">… same roles from the catalog</text>
-        <text x="426" y="290" fill="var(--mute)" font-size="11">teams never share worktrees or project memory</text>
+        <text x="426" y="220" fill="var(--strong)" font-weight="600">Project · storefront</text><text x="560" y="220" fill="var(--mute)">ask-for-everything</text>
+        <rect x="426" y="232" width="298" height="30" rx="7" fill="var(--panel)" stroke="var(--line2)"/><text x="438" y="252" fill="var(--strong)">PM</text><text x="470" y="252" fill="var(--mute)">… sessions of the same agents</text>
+        <text x="426" y="290" fill="var(--mute)" font-size="11">projects never share worktrees or project memory</text>
         <line x1="378" y1="160" x2="408" y2="100" stroke="var(--mute)" marker-end="url(#ar2)"/>
         <line x1="378" y1="195" x2="408" y2="245" stroke="var(--mute)" marker-end="url(#ar2)"/>
         <path d="M410 132 C 395 134, 388 140, 380 148" fill="none" stroke="var(--info)" stroke-dasharray="4 3" marker-end="url(#ar2)"/>
         <text x="296" y="118" fill="var(--info)" font-size="10.5">reports · questions ↑</text>
-        <rect x="800" y="40" width="160" height="120" rx="10" fill="var(--accent-dim)" stroke="var(--accent)"/><text x="816" y="64" fill="var(--strong)" font-weight="600">Company vault</text><text x="816" y="84" fill="var(--soft)">handbook · roles</text><text x="816" y="100" fill="var(--soft)">lessons · decisions</text><text x="816" y="116" fill="var(--soft)">playbooks · FAQ</text><text x="816" y="140" fill="var(--mute)">git · ~/pm/vault</text>
+        <rect x="800" y="40" width="160" height="120" rx="10" fill="var(--accent-dim)" stroke="var(--accent)"/><text x="816" y="64" fill="var(--strong)" font-weight="600">Company vault</text><text x="816" y="84" fill="var(--soft)">handbook · agents</text><text x="816" y="100" fill="var(--soft)">lessons · decisions</text><text x="816" y="116" fill="var(--soft)">playbooks · FAQ</text><text x="816" y="140" fill="var(--mute)">git · ~/pm/vault</text>
         <rect x="800" y="210" width="160" height="80" rx="10" fill="var(--panel2)" stroke="var(--line2)"/><text x="816" y="234" fill="var(--strong)" font-weight="600">Curator</text><text x="816" y="252" fill="var(--soft)">checks + verdict</text><text x="816" y="270" fill="var(--mute)">≠ proposer's vendor</text>
         <line x1="740" y1="250" x2="798" y2="250" stroke="var(--info)" stroke-dasharray="4 3" marker-end="url(#ar2)"/><text x="744" y="242" fill="var(--info)" font-size="10.5">reports</text>
         <line x1="880" y1="210" x2="880" y2="162" stroke="var(--mute)" marker-end="url(#ar2)"/><text x="886" y="190" fill="var(--mute)" font-size="10.5">verified</text>
@@ -458,7 +458,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
       </svg>
     </div>
     <div class="cards">
-      <div class="card"><h4>Responsibility down</h4><p>The master creates a team with a plan; you approve both. The PM owns the plan and dispatches inside it. One writer per code area; research and review run in parallel.</p></div>
+      <div class="card"><h4>Responsibility down</h4><p>The master proposes a plan and its staffing (agents × sessions); you approve. The PM session owns the plan and dispatches inside it. One writer per code area; research and review run in parallel.</p></div>
       <div class="card"><h4>Reports up</h4><p>Every job, question or blocker files a typed report: the six-field reflection, evidence, constraints copied verbatim, and feedback on the context it was given.</p></div>
       <div class="card"><h4>Questions climb, then stop</h4><p>Worker → PM → master → you. The vault is checked first; a question stops at the first level that can answer it, and every answer becomes a decision nobody asks twice.</p></div>
     </div>
@@ -481,19 +481,19 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
       <tr><td>8 · Measure</td><td>A/B with and without packs on matched tasks: reuse, helpful and harm rates, stale rate, reads avoided, tokens and time, merges without rework.</td><td>Copilot's A/B, VibeMemBench</td></tr>
     </table></div>
 
-    <h2 id="p-roles"><span class="n">03</span>Roles — defined once, staffed per team</h2>
+    <h2 id="p-roles"><span class="n">03</span>Agents — defined once, run as many sessions</h2>
     <p class="sub">Every agent is a folder of Markdown in the vault — <code>agents/&lt;slug&gt;/SOUL.md</code> (who it is), <code>AGENT.md</code> (what it does: role, provider, model, effort, permissions), <code>MEMORY.md</code> (what it knows) — built from role templates in <code>roles/&lt;role&gt;/</code> and staffed by <code>teams/&lt;team&gt;/TEAM.md</code>. Design record: <code>docs/design/AGENT-FILESYSTEM.md</code>.</p>
     <div class="tblwrap"><table class="tbl">
-      <tr><th>Role</th><th>Mandate</th><th>Preferred</th><th>Fallback</th><th>Staffing</th></tr>
-      <tr><td>Master · assistant</td><td>Talks with you; creates teams and plans; routes questions; daily digest. Never implements.</td><td class="mono">claude · opus · high</td><td class="mono muted">codex · gpt-5.5 · high</td><td>1 per install</td></tr>
-      <tr><td>PM</td><td>Owns one team's plan; writes testable acceptance before code; dispatches inside the plan; collects reports.</td><td class="mono">codex · gpt-5.5 · medium</td><td class="mono muted">claude · sonnet · medium</td><td>1 per team</td></tr>
-      <tr><td>Developer</td><td>One issue, own worktree, tests, PR with SHA, report.</td><td class="mono">codex · gpt-5.5-codex · high</td><td class="mono muted">claude · sonnet · high</td><td>1–4 per team</td></tr>
-      <tr><td>QA reviewer</td><td>Fresh-context review of the exact commit against the contract; verdict pinned to SHA.</td><td class="mono">claude · opus · high</td><td class="mono muted">codex · gpt-5.5 · high</td><td>1 per team</td></tr>
-      <tr><td>DevOps</td><td>Merge queue with PASS on head; deploys and sends as effects; host health.</td><td class="mono">claude · sonnet · medium</td><td class="mono muted">pi · glm-5.3-flash · low</td><td>1 per team</td></tr>
+      <tr><th>Agent</th><th>Mandate</th><th>Preferred</th><th>Fallback</th><th>Sessions</th></tr>
+      <tr><td>Master · assistant</td><td>Talks with you; creates projects and plans; routes questions; daily digest. Never implements.</td><td class="mono">claude · opus · high</td><td class="mono muted">codex · gpt-5.5 · high</td><td>1</td></tr>
+      <tr><td>PM</td><td>Owns one project's plan; writes testable acceptance before code; dispatches inside the plan; collects reports.</td><td class="mono">codex · gpt-5.5 · medium</td><td class="mono muted">claude · sonnet · medium</td><td>per project</td></tr>
+      <tr><td>Developer</td><td>One issue, own worktree, tests, PR with SHA, report.</td><td class="mono">codex · gpt-5.5-codex · high</td><td class="mono muted">claude · sonnet · high</td><td>up to 4</td></tr>
+      <tr><td>QA reviewer</td><td>Fresh-context review of the exact commit against the contract; verdict pinned to SHA.</td><td class="mono">claude · opus · high</td><td class="mono muted">codex · gpt-5.5 · high</td><td>per project</td></tr>
+      <tr><td>DevOps</td><td>Merge queue with PASS on head; deploys and sends as effects; host health.</td><td class="mono">claude · sonnet · medium</td><td class="mono muted">pi · glm-5.3-flash · low</td><td>per project</td></tr>
       <tr><td>Researcher</td><td>Spikes, specs, ADR drafts with sources.</td><td class="mono">claude · opus · high</td><td class="mono muted">codex · gpt-5.5 · high</td><td>on demand</td></tr>
-      <tr><td>Curator</td><td>Verifies candidates, merges duplicates, retires stale items, drafts skills.</td><td class="mono">codex · gpt-5.5 · medium</td><td class="mono muted">claude · sonnet · medium</td><td>1 per company</td></tr>
+      <tr><td>Curator</td><td>Verifies candidates, merges duplicates, retires stale items, drafts skills.</td><td class="mono">codex · gpt-5.5 · medium</td><td class="mono muted">claude · sonnet · medium</td><td>1</td></tr>
     </table></div>
-    <p class="muted" style="font-size:12.5px">Defaults are illustrative and editable in Teams → Roles. Model names follow each CLI's own aliases.</p>
+    <p class="muted" style="font-size:12.5px">Defaults are illustrative and editable in Agents → Definitions. Model names follow each CLI's own aliases.</p>
 
     <h2 id="p-rules"><span class="n">04</span>Operating rules (enforced by the daemon, not the prompt)</h2>
     <div class="cards">
@@ -511,9 +511,9 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
       <tr><th>Milestone</th><th>Outcome</th><th>Exit test</th></tr>
       <tr><td>M0 · Safe foundation</td><td>Sandbox, real backups, event roll-up</td><td>Backup → restore round-trip in a sandbox; production untouched</td></tr>
       <tr><td>M1 · First conversation</td><td>Install → wizard → chat with a master that remembers</td><td>Clean box to chat in &lt; 5 min; kill the session mid-plan → it resumes</td></tr>
-      <tr><td>M2 · One governed team</td><td>Master → one team (PM, dev, QA, DevOps) from the role catalog; plans, gate, reviews, reports</td><td>A 3-issue plan lands with fresh-context verdicts, typed reports, and a question answered at the lowest level</td></tr>
+      <tr><td>M2 · One governed project</td><td>Master → one project staffed from agent files (PM, dev, QA, DevOps sessions); plans, gate, reviews, reports</td><td>A 3-issue plan lands with fresh-context verdicts, typed reports, and a question answered at the lowest level</td></tr>
       <tr><td>M3 · The team learns</td><td>Verified memory, company vault, context packs, metrics</td><td>A lesson from one worker is verified by another vendor and reused by a different worker with measured savings; a stale item is withheld; a planted poisoned item is rejected</td></tr>
-      <tr><td>M4 · Many teams</td><td>Several teams under one master; capacity, quota, digest</td><td>Two teams run concurrently with no cross-team leakage</td></tr>
+      <tr><td>M4 · Many projects</td><td>Several projects under one master; capacity, quota, digest</td><td>Two projects run concurrently with no cross-project leakage</td></tr>
       <tr><td>M5 · Ships</td><td>Connected platforms and effects</td><td>Preview deploys auto; production and sends only on your press; agents never see credentials</td></tr>
       <tr><td>M6 · Autonomy dial</td><td>Routine merges automatic per project</td><td>Only after the unattended acceptance check (CAD-225) passes</td></tr>
       <tr><td>GTM</td><td>Design partners after M1 · public beta after M3 · GA after M5</td><td>Legal review of provider terms before beta</td></tr>
@@ -522,8 +522,8 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
     <h2 id="p-dec"><span class="n">06</span>Decisions — defaults you can change</h2>
     <div class="tblwrap"><table class="tbl">
       <tr><th>Topic</th><th>Default</th><th>Status</th></tr>
-      <tr><td>Organization</td><td>One master; one PM per team; dev, QA, DevOps (researcher on demand); curator at company level</td><td><span class="chip ok">your direction</span></td></tr>
-      <tr><td>#1 Agent files</td><td>Agents are folders <code>agents/&lt;slug&gt;/</code> with SOUL.md, AGENT.md, MEMORY.md; roles are templates; TEAM.md replaces team.yaml; all Markdown (CAD-338)</td><td><span class="chip ok">your direction</span></td></tr>
+      <tr><td>Organization</td><td>One master; a PM session per project; dev, QA, DevOps sessions (researcher on demand); curator at company level; no roles, no teams for now</td><td><span class="chip ok">your direction</span></td></tr>
+      <tr><td>#1 Agent files</td><td>Agents are folders <code>agents/&lt;slug&gt;/</code> with SOUL.md, AGENT.md, MEMORY.md and run many sessions; staffing in PROJECT.md; project artifacts in <code>projects/&lt;slug&gt;/</code>; all Markdown (CAD-338)</td><td><span class="chip ok">your direction</span></td></tr>
       <tr><td>#2 Memory policy</td><td>Logic checks + cross-vendor curator for project/role scope; two-review quorum kept for company scope; external content quarantined (CAD-347)</td><td><span class="chip ok">approved</span></td></tr>
       <tr><td>#3 Unblock memory</td><td>Separate who proposed from whether it is true: one daemon identity check for every agent (CAD-381); trust matrix provenance × evidence; the 11 stuck lessons go through checks → curator → your queue (CAD-382)</td><td><span class="chip ok">confirmed</span></td></tr>
       <tr><td>Vault location</td><td><code>~/pm/vault</code> in the tracker repo; project memory stays in <code>&lt;pm&gt;/&lt;project&gt;/memory</code>; agent notes move into git (CAD-355)</td><td><span class="chip">default</span></td></tr>
@@ -549,9 +549,9 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
     <div class="k">Roadmap</div>
     <a href="#rm-m0-safe">M0 · Safe foundation</a>
     <a href="#rm-m1-first-chat">M1 · First conversation</a>
-    <a href="#rm-m2-one-team">M2 · One governed team</a>
+    <a href="#rm-m2-one-team">M2 · One governed project</a>
     <a href="#rm-m3-team-learns">M3 · The team learns</a>
-    <a href="#rm-m4-many-teams">M4 · Many teams</a>
+    <a href="#rm-m4-many-teams">M4 · Many projects</a>
     <a href="#rm-m5-ships">M5 · Ships</a>
     <a href="#rm-m6-autonomy">M6 · Autonomy dial</a>
     <a href="#rm-gtm">Go-to-market</a>
@@ -601,8 +601,8 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 <tr><td class="mono">CAD-328</td><td>Chat-first Home: thread, plan/permission/effect cards, Needs-you rail, since-you-left</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
 </table></div>
 
-    <h2 id="rm-m2-one-team"><span class="n">TEAM</span>M2 · One governed team</h2>
-    <p class="sub">Master → one team (PM, dev, QA, DevOps) from the role catalog; plans, dispatch gate, fresh-context reviews, typed reports, questions that climb. <span class="chip">tag m2-one-team</span> <span class="chip">0/27 done</span></p>
+    <h2 id="rm-m2-one-team"><span class="n">TEAM</span>M2 · One governed project</h2>
+    <p class="sub">Master → one project staffed from agent files (PM, dev, QA, DevOps sessions); plans, dispatch gate, fresh-context reviews, typed reports, questions that climb. <span class="chip">tag m2-one-team</span> <span class="chip">0/27 done</span></p>
     <div class="callout acc" style="max-width:none"><b>Exit test:</b> A 3-issue plan lands with verdicts pinned to each head, a report per job, and one question answered at the lowest level. <span class="muted">· depends on: M1 for the UI; daemon work can start now</span></div>
     <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th>Priority</th><th></th></tr>
 <tr><td class="mono">CAD-77</td><td>Multi-level groups: upstream chains, results one level up, escalation that bubbles when unanswered</td><td><span class="chip ">dropped</span></td><td class="num">P2</td><td><span class="chip">existing</span></td></tr>
@@ -661,9 +661,9 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 <tr><td class="mono">CAD-357</td><td>Vault UI: overview, company docs, lessons, verification queue, context-pack preview</td><td><span class="chip ">backlog</span></td><td class="num">P2</td><td><span class="chip acc">new</span></td></tr>
 </table></div>
 
-    <h2 id="rm-m4-many-teams"><span class="n">TEAM</span>M4 · Many teams</h2>
-    <p class="sub">Several teams under one master: capacity, quota, isolation, digest. <span class="chip">tag m4-many-teams</span> <span class="chip">0/6 done</span></p>
-    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Two teams on different projects run concurrently with no cross-team leakage. <span class="muted">· depends on: M2</span></div>
+    <h2 id="rm-m4-many-teams"><span class="n">TEAM</span>M4 · Many projects</h2>
+    <p class="sub">Several projects under one master: capacity, quota, isolation, digest. <span class="chip">tag m4-many-teams</span> <span class="chip">0/6 done</span></p>
+    <div class="callout acc" style="max-width:none"><b>Exit test:</b> Two projects run concurrently with no cross-project leakage. <span class="muted">· depends on: M2</span></div>
     <div class="tblwrap"><table class="tbl"><tr><th>Ticket</th><th>Title</th><th>Status</th><th>Priority</th><th></th></tr>
 <tr><td class="mono">CAD-80</td><td>Budgets per level: tokens, quota and wall-clock per role and per epic, with quota-aware routing</td><td><span class="chip ">backlog</span></td><td class="num">P3</td><td><span class="chip">existing</span></td></tr>
 <tr><td class="mono">CAD-82</td><td>Overview dashboard: one screen across all projects for what needs me, who is doing what, what is in flight,…</td><td><span class="chip ">backlog</span></td><td class="num">P1</td><td><span class="chip">existing</span></td></tr>
@@ -879,7 +879,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
     </div>
 
     <h2 id="d-position"><span class="n">02</span>Positioning</h2>
-    <div class="callout acc" style="font-size:15px;max-width:none"><b>Cadence is the open-source control plane that turns the coding agents you already pay for into a governed team that learns.</b> One master plans with you, team PMs run the work, workers from any vendor deliver, an independent reviewer checks every commit, verified lessons make the next task cheaper, and nothing merges, sends or deploys without your approval. It runs on your machine.</div>
+    <div class="callout acc" style="font-size:15px;max-width:none"><b>Cadence is the open-source control plane that turns the coding agents you already pay for into a governed team that learns.</b> One master plans with you, PM sessions run each project, workers from any vendor deliver, an independent reviewer checks every commit, verified lessons make the next task cheaper, and nothing merges, sends or deploys without your approval. It runs on your machine.</div>
     <div class="tblwrap"><table class="tbl">
       <tr><th>Wedge</th><th>Why it is defensible</th><th>Proof we can show</th></tr>
       <tr><td>Cross-vendor review</td><td>No vendor will ship "our rival grades our output". Fresh-context reviewers, pairings chosen by measured precision (a 2026 study found it helps one way and hurts the other), verdict pinned to the SHA.</td><td>Stats from our own verdict store: defects caught per reviewer/author pair</td></tr>
@@ -1008,7 +1008,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
     <a href="#s-trust">Identity &amp; trust</a>
     <a href="#s-store">Data store &amp; continuity</a>
     <a href="#s-master">Master agent</a>
-    <a href="#s-team">Teams &amp; memory (tech)</a>
+    <a href="#s-team">Agents &amp; memory (tech)</a>
     <a href="#s-platforms">Connected platforms</a>
     <a href="#s-loop">Autonomous loop</a>
     <a href="#s-ui">UI revamp</a>
@@ -1186,13 +1186,13 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
       <tr><td>Native feel</td><td>Real TUI</td><td>None</td><td>Browser terminal (xterm.js over <code>tmux -C</code>) as a view; Codex TUI can attach to the same thread</td></tr>
     </table></div>
 
-        <h2 id="s-team"><span class="n">08b</span>Teams, reports and memory — technical</h2>
+        <h2 id="s-team"><span class="n">08b</span>Agents, sessions, reports and memory — technical</h2>
     <p class="sub">Builds on ADR-0001 (roles, team.yaml), the existing memory store (typed, git-backed, quorum-reviewed) and <code>cadence report</code> / <code>issue retro</code>. Tickets: CAD-338–CAD-357, CAD-378.</p>
-    <h3>Role file — <code>vault/company/roles/qa.md</code></h3>
+    <h3>Agent file — <code>agents/qa/AGENT.md</code> (sessions qa#1…qa#3 share it)</h3>
     <pre class="pre">---
-role: qa
-title: QA reviewer
-level: team                  # company | team
+name: qa
+description: Fresh-context QA reviewer; verdicts pinned to the SHA.
+sessions: {max_concurrent: 3}
 staffing: 1 per team
 preferred: {provider: claude, model: opus, effort: high}
 fallbacks: [{provider: codex, model: gpt-5.5, effort: high}]
@@ -1206,13 +1206,14 @@ reports: [done, question, blocked]
 ---
 Reviews the exact commit against the contract, runs the gates, records a verdict pinned to the SHA.
 ## May …   ## Never …</pre>
-    <h3>Team — <code>~/pm/&lt;project&gt;/team.yaml</code> (ADR-0001)</h3>
-    <pre class="pre">team: reminders
-pm: pm-rmd
-roster: {dev: 2..4, qa: 1, devops: 1, research: 0..1}
-overrides: {dev: {effort: medium}}      # drift from the registry is reported, never auto-fixed
+    <h3>Project staffing — <code>projects/&lt;slug&gt;/PROJECT.md</code> (no teams for now)</h3>
+    <pre class="pre">---
+project: reminders
+repos: [{remote: github.com/harbor-bakery/reminders, path: ~/code/reminders}]
+agents: {pm: 1, dev: 4, qa: 1, devops: 1}   # max concurrent sessions per agent
 autonomy: approve-plans
-write_leases: per-issue planned paths</pre>
+write_leases: per-issue planned paths
+---</pre>
     <h3>Report — <code>cadence.report/2</code></h3>
     <pre class="pre">{ "kind": "done | question | blocked", "task": "RMD-1", "agent": "w1", "sha": "3f9c2e1…",
   "reflection": { "expected": "…", "evidence": "…", "cause": "…", "correction": "…",
@@ -1408,8 +1409,8 @@ function toggleTheme(){
 })();
 
 /* ---------- data ---------- */
-const SCREENS=[['install','Install'],['setup','Setup wizard'],['home','Home · chat'],['projects','Projects'],['teams','Teams & roles'],['vault','Company vault'],['services','Platforms'],['settings','Settings']];
-const STEPS=[['Start','fresh · restore · import'],['Environment','checks & fixes'],['Platforms','optional services'],['Master agent','provider & model'],['Workspace','tracker & first project'],['Team & autonomy','starter team, dial'],['Launch','review & start']];
+const SCREENS=[['install','Install'],['setup','Setup wizard'],['home','Home · chat'],['projects','Projects'],['teams','Agents'],['vault','Company vault'],['services','Platforms'],['settings','Settings']];
+const STEPS=[['Start','fresh · restore · import'],['Environment','checks & fixes'],['Platforms','optional services'],['Master agent','provider & model'],['Workspace','tracker & first project'],['Staffing & autonomy','agents × sessions, dial'],['Launch','review & start']];
 const CHECKS=[
  {n:'git',d:'2.47.1',s:'ok'},{n:'tmux',d:'3.5a · needed for Devin/Cursor panes',s:'ok'},{n:'gh',d:'2.63 · signed in as @harbor-dev',s:'ok'},
  {n:'claude',d:'signed in · Claude Max',s:'ok'},{n:'codex',d:'signed in · ChatGPT Pro',s:'ok'},
@@ -1434,31 +1435,31 @@ const PL={claude:'Cl',codex:'Cx',pi:'Pi',devin:'Dv',cursor:'Cu'};
 const av=(p,t)=>`<span class="av ${p}" title="${p}">${t||PL[p]||'?'}</span>`;
 /* ---------- teams, roles, reports, vault (v4) ---------- */
 const ROLES=[
- {k:'master',t:'Master · assistant',lvl:'company',n:'1 per install',p:'claude',m:'opus',e:'high',fb:['codex','gpt-5.5','high'],
+ {k:'master',t:'Master · assistant',lvl:'company',n:'1 session',p:'claude',m:'opus',e:'high',fb:['codex','gpt-5.5','high'],
   d:'Talks with you, turns goals into projects and teams, staffs them from these roles, answers escalations and sends a daily digest. Never implements.',
   may:['Create projects and teams','Propose plans','Answer or route questions'],never:['Write code','Approve its own plans','Merge or press effects'],
   skills:['cadence','vault-search','plan-propose'],scopes:['company','every team (read)'],perm:'Broker approvals · cadence CLI'},
- {k:'pm',t:'PM',lvl:'team',n:'1 per team',p:'codex',m:'gpt-5.5',e:'medium',fb:['claude','sonnet','medium'],
-  d:"Owns one team's plan: turns goals into issues with acceptance, dispatches, tracks, collects reflections and escalates to the master.",
-  may:['Break plans into issues','Dispatch inside approved plans','Answer team questions'],never:['Implement','Review','Merge'],
-  skills:['cadence','issue-plan'],scopes:['company','team','project'],perm:'accept-edits · cadence CLI'},
- {k:'dev',t:'Developer',lvl:'team',n:'1–4 per team',p:'codex',m:'gpt-5.5-codex',e:'high',fb:['claude','sonnet','high'],
+ {k:'pm',t:'PM',lvl:'project',n:'1 session per project',p:'codex',m:'gpt-5.5',e:'medium',fb:['claude','sonnet','medium'],
+  d:"Owns one project's plan: turns goals into issues with acceptance, dispatches, tracks, collects reflections and escalates to the master.",
+  may:['Break plans into issues','Dispatch inside approved plans','Answer project questions'],never:['Implement','Review','Merge'],
+  skills:['cadence','issue-plan'],scopes:['company','project'],perm:'accept-edits · cadence CLI'},
+ {k:'dev',t:'Developer',lvl:'project',n:'up to 4 sessions',p:'codex',m:'gpt-5.5-codex',e:'high',fb:['claude','sonnet','high'],
   d:'Implements one issue in its own worktree, tests it, opens a PR with the exact SHA, then reflects.',
   may:['Edit its own worktree','Run tests','Open pull requests'],never:['Review or merge its own work','Press effects'],
   skills:['cadence','repo-map','test-isolation'],scopes:['company','project','role:dev','paths it touches'],perm:'accept-edits · cargo/git/gh'},
- {k:'qa',t:'QA reviewer',lvl:'team',n:'1 per team',p:'claude',m:'opus',e:'high',fb:['codex','gpt-5.5','high'],rule:"Fresh context; a different vendor from the author by default — pairing follows measured precision",
+ {k:'qa',t:'QA reviewer',lvl:'project',n:'up to 3 sessions',p:'claude',m:'opus',e:'high',fb:['codex','gpt-5.5','high'],rule:"Fresh context; a different vendor from the author by default — pairing follows measured precision",
   d:'Reviews the exact commit against acceptance, runs the gates and records a verdict pinned to the SHA.',
   may:['Check out any commit','Run gates','Record verdicts'],never:["Edit the author's branch",'Merge'],
   skills:['cadence-review','secret-scan'],scopes:['company','project','role:qa'],perm:'read-only · test runner'},
- {k:'devops',t:'DevOps',lvl:'team',n:'1 per team',p:'claude',m:'sonnet',e:'medium',fb:['pi','glm-5.3-flash','low'],
+ {k:'devops',t:'DevOps',lvl:'project',n:'1 session per project',p:'claude',m:'sonnet',e:'medium',fb:['pi','glm-5.3-flash','low'],
   d:'Lands verified PRs through the merge queue, prepares releases and deploys as effects, watches host health.',
   may:['Queue merges with a PASS on head','Request deploy effects','Clean up worktrees'],never:['Merge without a verdict on head','Press its own effects'],
   skills:['merge-queue','cloudflare-deploy'],scopes:['company','project','role:devops'],perm:'gh · wrangler (preview only)'},
- {k:'research',t:'Researcher',lvl:'team',n:'on demand',p:'claude',m:'opus',e:'high',fb:['codex','gpt-5.5','high'],
+ {k:'research',t:'Researcher',lvl:'project',n:'on demand',p:'claude',m:'opus',e:'high',fb:['codex','gpt-5.5','high'],
   d:'Runs spikes and writes specs and ADR drafts with sources. Hired by the master or a PM when a plan needs it.',
   may:['Read anything in scope','Write specs and ADR drafts'],never:['Merge','Dispatch'],
   skills:['research','adr-draft'],scopes:['company','project'],perm:'read-only · web'},
- {k:'curator',t:'Curator',lvl:'company',n:'1 per company',p:'codex',m:'gpt-5.5',e:'medium',fb:['claude','sonnet','medium'],rule:"Provider must differ from the proposer's",
+ {k:'curator',t:'Curator',lvl:'company',n:'1 session',p:'codex',m:'gpt-5.5',e:'medium',fb:['claude','sonnet','medium'],rule:"Provider must differ from the proposer's",
   d:'Verifies lesson candidates against their evidence, merges duplicates, retires stale memory and promotes repeated lessons into playbooks.',
   may:['Accept, merge or reject candidates','Run read-only repro commands'],never:['Accept its own proposals','Write code'],
   skills:['vault-curate'],scopes:['company (write)'],perm:'read-only · vault'}];
@@ -1506,12 +1507,12 @@ const PACKS={
    out:[['Author\'s reflection','kept out so the review stays independent']],tok:'2.3k of 6k',saved:'no re-derivation of the gates'},
  devops:{task:'ops-rmd · merge PR #12, deploy preview',items:[['Autonomy & approvals policy','role:devops','280'],['Merge-queue runbook','role:devops','210'],['L-12 cron triggers in wrangler.toml','path match','60'],['PB-7 cloudflare-deploy (skill)','task','30 + 800 on use']],
    out:[['L-3','retired (wrangler publish)']],tok:'0.6k of 4k',saved:'the deploy steps, not re-read from docs'},
- pm:{task:'pm-rmd · track plan P-1',items:[['Plan P-1 + dependency graph','team','420'],['Team charter · Reminders','team','160'],['L-21 SHA or it is a claim','role:pm','35'],['Open questions: 1 (R-14, waiting on you)','team','60']],
+ pm:{task:'pm-rmd · track plan P-1',items:[['Plan P-1 + dependency graph','project','420'],['PROJECT.md · staffing and autonomy','project','160'],['L-21 SHA or it is a claim','role:pm','35'],['Open questions: 1 (R-14, waiting on you)','team','60']],
    out:[['Code maps','not needed for planning']],tok:'0.7k of 6k',saved:'status gathering across 6 agents'}};
 
 function repList(){const r=[];if(S.planApproved)r.push('R-11');if(S.ff)r.push('R-12','R-13','R-14');return r}
 function teams(){
-  const tabs=[['org','Org'],['roles','Roles'],['agents','Agents'],['reports','Reports']];
+  const tabs=[['org','Overview'],['roles','Definitions'],['agents','Sessions'],['reports','Reports']];
   const n=repList().length;
   const head=`<div class="ptabs"><div class="seg">${tabs.map(([k,l])=>`<button data-act="teamtab" data-v="${k}" aria-pressed="${S.teamTab===k}">${l}${k==='reports'&&n?` <span class="num muted">${n}</span>`:''}</button>`).join('')}</div></div>`;
   return head+({org:orgView,roles:rolesView,agents,reports:reportsView})[S.teamTab]();
@@ -1519,33 +1520,33 @@ function teams(){
 function orgView(){
   const R=S.roles;
   const card=t=>{const pending=t.k==='reminders'&&!S.planApproved;
-    return `<div class="box" style="${pending?'opacity:.7':''}"><div class="hd"><div><h5>${t.n} team</h5><div class="muted mono" style="font-size:11.5px">${t.proj} · ${t.goal}</div></div><span class="chip ${pending?'warn':t.k==='storefront'?'':'acc'}">${pending?'proposed with P-1':t.auto}</span></div>
+    return `<div class="box" style="${pending?'opacity:.7':''}"><div class="hd"><div><h5>${t.n} · PROJECT.md</h5><div class="muted mono" style="font-size:11.5px">${t.proj} · ${t.goal}</div></div><span class="chip ${pending?'warn':t.k==='storefront'?'':'acc'}">${pending?'proposed with P-1':t.auto}</span></div>
      ${t.m.map(([role,alias,p,m,st,warn])=>`<div class="mrow">${av(p)}<div><div class="strong">${alias} <span class="chip" style="margin-left:4px">${role}</span></div><div class="muted" style="font-size:11.5px">${p} · ${m}${st&&!pending?' · '+st:''}</div>${warn?`<div style="font-size:11.5px;color:var(--warn)">⚠ ${warn}</div>`:''}</div></div>`).join('')}
-     <div class="bd muted" style="font-size:12px;border-top:1px solid var(--line)">${pending?'Staffed from your roles when you approve plan P-1.':t.k==='reminders'?`${S.ff?4:1} reports today · 1 question answered from the vault`:'Paused by you · no agents running'}</div></div>`};
+     <div class="bd muted" style="font-size:12px;border-top:1px solid var(--line)">${pending?'Sessions start from agent files when you approve plan P-1.':t.k==='reminders'?`${S.ff?4:1} reports today · 1 question answered from the vault`:'Paused by you · no agents running'}</div></div>`};
   return `<div class="pane stack" style="gap:14px">
    <div class="orgtop">
     <div class="box"><div class="bd row">${av('op','Yo')}<div><b class="strong">You</b><div class="muted" style="font-size:12px">goals · approvals · vault policy</div></div></div></div><span class="orgarrow">→</span>
     <div class="box" style="border-color:var(--accent)"><div class="bd row">${av(R.master.p)}<div><b class="strong">Master</b> <span class="chip acc">assistant</span><div class="muted" style="font-size:12px">${R.master.p} · ${R.master.m} · ${R.master.e} · chatting</div></div></div></div><span class="orgarrow">+</span>
     <div class="box"><div class="bd row">${av(R.curator.p)}<div><b class="strong">Curator</b> <span class="chip">company</span><div class="muted" style="font-size:12px">${R.curator.p} · ${R.curator.m} · ${S.ff?QUEUE.filter(q=>!S.ver[q.id]).length+' in queue':'idle'}</div></div></div></div>
    </div>
-   <div class="teams">${TEAMS.map(card).join('')}<button class="box newteam" data-act="newteam">+ New team<span class="muted">The master proposes a team together with a plan; you approve both.</span></button></div>
-   <div class="callout acc" style="max-width:none">Responsibility flows down; reports flow up. Workers report to their PM, PMs to the master, the master to you. A question climbs one level at a time and stops at the first level — or vault entry — that can answer it. One writer per code area; reviews and research run in parallel.</div></div>`;
+   <div class="teams">${TEAMS.map(card).join('')}<button class="box newteam" data-act="newteam">+ New project<span class="muted">The master proposes a plan and its staffing (agents × sessions); you approve.</span></button></div>
+   <div class="callout acc" style="max-width:none">Responsibility flows down; reports flow up. Sessions report to the project's PM, PMs to the master, the master to you. A question climbs one level at a time and stops at the first level — or vault entry — that can answer it. One writer per code area; reviews and research run in parallel.</div></div>`;
 }
 function rolesView(){
-  return `<div class="pane"><div class="between" style="margin-bottom:10px;flex-wrap:wrap;gap:8px"><div><b class="strong">Roles</b> <span class="muted" style="font-size:12.5px">role templates in <code>vault/roles/&lt;role&gt;/AGENT.md</code> · each agent is a folder <code>vault/agents/&lt;slug&gt;/</code> with SOUL.md, AGENT.md, MEMORY.md · every change is a commit</span></div><button class="btn sm" data-act="toast" data-v="Describe the role in chat, or add vault/roles/<name>/AGENT.md">+ Role</button></div>
-  <div class="tblwrap"><table class="tbl"><tr><th>Role</th><th>Description</th><th>Preferred</th><th>Fallback</th><th>Staffing</th><th></th></tr>
+  return `<div class="pane"><div class="between" style="margin-bottom:10px;flex-wrap:wrap;gap:8px"><div><b class="strong">Agent definitions</b> <span class="muted" style="font-size:12.5px">each agent is a folder <code>agents/&lt;slug&gt;/</code> with SOUL.md, AGENT.md, MEMORY.md · an agent runs many sessions · every change is a commit</span></div><button class="btn sm" data-act="toast" data-v="Describe the role in chat, or add vault/roles/<name>/AGENT.md">+ Role</button></div>
+  <div class="tblwrap"><table class="tbl"><tr><th>Agent</th><th>Description</th><th>Preferred</th><th>Fallback</th><th>Sessions</th><th></th></tr>
   ${ROLES.map(r0=>{const r=S.roles[r0.k];return `<tr><td><div class="row">${av(r.p)}<div>${r0.t}<div class="muted" style="font-size:11px;font-weight:400">${r0.lvl}</div></div></div></td><td style="min-width:260px;color:var(--soft)">${r0.d}${r0.rule?`<div style="margin-top:5px"><span class="chip warn">${r0.rule}</span></div>`:''}</td><td class="mono" style="white-space:nowrap">${r.p} · ${r.m} · ${r.e}</td><td class="mono muted" style="white-space:nowrap">${r0.fb.join(' · ')}</td><td>${r0.n}</td><td><button class="btn sm" data-act="role" data-v="${r0.k}">Edit</button></td></tr>`}).join('')}</table></div>
   <div class="cards" style="margin-top:14px">
    <div class="card"><h4>Independent by rule</h4><p>QA reviews in a fresh context, from a different vendor by default — pairings follow measured review precision. The curator never shares a vendor with the proposer. A collision launches the fallback and says why.</p></div>
-   <div class="card"><h4>Desired vs running</h4><p>Edits apply at each agent's next start. Running agents show "restart to apply" — never a silent switch mid-task.</p></div>
+   <div class="card"><h4>Desired vs running</h4><p>Edits apply at each session's next start. Running agents show "restart to apply" — never a silent switch mid-task.</p></div>
    <div class="card"><h4>Availability</h4><p>A missing CLI, signed-out provider or exhausted quota falls back to the next choice, with the reason recorded.</p></div></div></div>`;
 }
 function roleDrawer(k){
   const r0=ROLES.find(x=>x.k===k),r=S.roles[k],provs=['claude','codex','pi','cursor','devin'];
   return `<div class="scrim" data-act="close" style="place-items:stretch end;padding:0;background:rgba(0,0,0,.35)"><div class="drawer" role="dialog" aria-label="Role ${r0.t}">
-   <div class="dh"><div class="between"><span class="num muted">vault/roles/${k}/AGENT.md</span><button class="btn sm ghost" data-act="close" aria-label="Close">✕</button></div><h3 style="margin:6px 0 6px;font-size:18px">${r0.t}</h3><div class="row"><span class="chip">${r0.lvl}</span><span class="chip">${r0.n}</span></div></div>
+   <div class="dh"><div class="between"><span class="num muted">agents/${k}/ · SOUL.md · AGENT.md · MEMORY.md</span><button class="btn sm ghost" data-act="close" aria-label="Close">✕</button></div><h3 style="margin:6px 0 6px;font-size:18px">${r0.t}</h3><div class="row"><span class="chip">${r0.lvl}</span><span class="chip">${r0.n}</span></div></div>
    <div class="db">
-    <label class="field"><span>Description — what agents in this role are told</span><textarea class="input" rows="4">${esc(r0.d)}</textarea></label>
+    <label class="field"><span>Description — what every session of this agent is told</span><textarea class="input" rows="4">${esc(r0.d)}</textarea></label>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
      <label class="field"><span>Preferred provider</span><select class="input" data-act="rolefield" data-k="${k}" data-f="p">${provs.map(p=>`<option value="${p}" ${p===r.p?'selected':''} ${p==='devin'?'disabled':''}>${p}${p==='devin'?' (not installed)':''}</option>`).join('')}</select></label>
      <label class="field"><span>Model</span><select class="input" data-act="rolefield" data-k="${k}" data-f="m">${(MODELS[r.p]||[]).map(m=>`<option ${m===r.m?'selected':''}>${m}</option>`).join('')}</select></label>
@@ -1559,7 +1560,7 @@ function roleDrawer(k){
     <div class="slabel" style="margin-top:14px">Memory scopes in its context pack</div><div class="row" style="flex-wrap:wrap;margin-top:6px">${r0.scopes.map(s=>`<span class="chip">${s}</span>`).join('')}</div>
     <div class="slabel" style="margin-top:14px">Permissions</div><div style="font-size:13px;margin-top:4px">${r0.perm}</div>
     <div class="slabel" style="margin-top:14px">Reports</div><div style="font-size:13px;margin-top:4px">On done, question or blocked: the six-field reflection plus feedback on the context it was given.</div></div>
-   <div style="padding:12px 18px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end"><button class="btn" data-act="close">Cancel</button><button class="btn pri" data-act="rolesave" data-v="${k}">Save role</button></div></div></div>`;
+   <div style="padding:12px 18px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end"><button class="btn" data-act="close">Cancel</button><button class="btn pri" data-act="rolesave" data-v="${k}">Save agent</button></div></div></div>`;
 }
 function reportsView(){
   const list=repList();
@@ -1582,7 +1583,7 @@ function repCard(id){
 }
 
 function vault(){
-  const tabs=[['overview','Overview'],['company','Company'],['projects','Teams & projects'],['playbooks','Playbooks'],['lessons','Lessons'],['decisions','Decisions'],['faq','FAQ'],['queue','Verification queue'],['packs','Context packs']];
+  const tabs=[['overview','Overview'],['company','Company'],['projects','Projects'],['playbooks','Playbooks'],['lessons','Lessons'],['decisions','Decisions'],['faq','FAQ'],['queue','Verification queue'],['packs','Context packs']];
   const pend=S.ff?QUEUE.filter(q=>!S.ver[q.id]).length:0;
   return `<div class="vhead"><div><b class="strong" style="font-size:16px">Company vault</b> <span class="muted" style="font-size:12.5px">Harbor Bakery</span><div class="muted mono" style="font-size:11.5px">git · ~/pm/vault · 214 notes · last commit 3 min ago${S.aos?' · company docs synced to AgenticOS knowledge':''}</div></div><div class="spacer"></div><input class="input" placeholder="Search the vault…" aria-label="Search the vault" style="max-width:280px"></div>
   <div class="set vault"><div class="sn">${tabs.map(([k,l])=>`<button data-act="vaulttab" data-v="${k}" aria-current="${S.vaultTab===k}">${l}${k==='queue'&&pend?`<span class="vbadge">${pend}</span>`:''}</button>`).join('')}</div><div class="sb">${VV[S.vaultTab]()}</div></div>`;
@@ -1609,11 +1610,11 @@ playbooks/      skills (SKILL.md), loaded on demand
 lessons/        verified memory · scope · evidence · confidence
 decisions/  faq/  inbox/ (candidates awaiting the curator)</div>`,
  company:()=>`<h3>Company</h3><p class="muted">Owned by you. Every role's pack starts from the relevant excerpt.</p><div class="tblwrap"><table class="tbl"><tr><th>Document</th><th>Given to</th><th>Updated</th></tr>${[['Mission & product','every role','2 d ago'],['Engineering standards','dev, qa','5 d ago'],['Security & secrets policy','every role','Sep 19'],['Review policy (cross-vendor)','qa, devops','Sep 21'],['Autonomy & approvals','master, pm, devops','Sep 23'],['Brand voice (en, zh-HK)','research, dev','Sep 02'],['Glossary','every role','1 d ago'],['USER.md — your preferences','master','today']].map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td class="muted">${r[2]}</td></tr>`).join('')}</table></div>`,
- projects:()=>`<h3>Teams &amp; projects</h3><div class="cards">${[['reminders','Reminders team','Context manifest · 2 ADRs · 3 runbooks','Code map: 6 of 6 modules fresh at 3f9c2e1'],['storefront','Storefront team','Context manifest · 5 ADRs · 1 runbook','Code map: 38 of 41 fresh · 3 stale after the last merge']].map(([k,t,a,c])=>`<div class="card"><h4>${k}</h4><p>${t}</p><p style="margin-top:6px">${a}</p><p style="margin-top:6px"><span class="chip ${c.includes('stale')?'warn':'ok'}">${c}</span></p></div>`).join('')}</div>
+ projects:()=>`<h3>Projects</h3><div class="cards">${[['reminders','Reminders · PROJECT.md','Context manifest · 2 ADRs · 3 runbooks','Code map: 6 of 6 modules fresh at 3f9c2e1'],['storefront','Storefront · PROJECT.md','Context manifest · 5 ADRs · 1 runbook','Code map: 38 of 41 fresh · 3 stale after the last merge']].map(([k,t,a,c])=>`<div class="card"><h4>${k}</h4><p>${t}</p><p style="margin-top:6px">${a}</p><p style="margin-top:6px"><span class="chip ${c.includes('stale')?'warn':'ok'}">${c}</span></p></div>`).join('')}</div>
   <p class="muted" style="font-size:12.5px">Code maps are module summaries keyed to a commit. A merge invalidates only the modules it touched, so agents stop re-reading unchanged code.</p>`,
  playbooks:()=>`<h3>Playbooks</h3><p class="muted">Procedural memory in the open Agent Skills format. Only the name and one line sit in context until an agent loads one.</p><div class="tblwrap"><table class="tbl"><tr><th>Playbook</th><th>Version</th><th>Built from</th><th>Success</th></tr>${[['PB-3 cloudflare-worker-cron','v4','5 lessons','8 / 9'],['PB-7 cloudflare-deploy','v2','3 lessons','4 / 4'],['PB-5 whatsapp-template-send','v2','4 lessons','3 / 3'],['PB-1 cadence-review','v7','12 lessons','41 / 43'],['PB-8 rust-test-isolation','v3','9 lessons','17 / 19']].map(r=>`<tr><td class="mono">${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td class="num">${r[3]}</td></tr>`).join('')}</table></div>`,
  lessons:()=>`<h3>Lessons</h3><div class="tblwrap"><table class="tbl"><tr><th>ID</th><th>Lesson</th><th>Scope</th><th>Confidence</th><th>Used / helped</th><th>Status</th></tr>${LESSONS.map(l=>`<tr style="cursor:pointer" data-act="lesson" data-v="${l.id}"><td class="mono">${l.id}</td><td style="min-width:240px">${l.c}</td><td class="muted">${l.scope}</td><td class="num">${l.conf?Math.round(l.conf*100)+'%':'—'}</td><td class="num">${l.uses} / ${l.help}</td><td><span class="chip ${l.st==='verified'?'ok':l.st==='retired'?'':'warn'}">${l.st}</span></td></tr>`).join('')}</table></div>`,
- decisions:()=>`<h3>Decisions</h3><p class="muted">Approvals and answers are memory too — nobody asks twice.</p><div class="tblwrap"><table class="tbl"><tr><th>ID</th><th>Decision</th><th>By</th><th>When</th></tr>${[S.answer?['D-42','Production cron runs '+S.answer,'you','now']:null,S.planApproved?['D-41','Plan P-1 approved (4 issues, Reminders team)','you','09:16']:null,['D-40','ADR-0004 connected-platform contract accepted','you','Sep 22'],['D-38','QA must be a different vendor from the author','you','Sep 21']].filter(Boolean).map(r=>`<tr><td class="mono">${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td class="muted">${r[3]}</td></tr>`).join('')}</table></div>`,
+ decisions:()=>`<h3>Decisions</h3><p class="muted">Approvals and answers are memory too — nobody asks twice.</p><div class="tblwrap"><table class="tbl"><tr><th>ID</th><th>Decision</th><th>By</th><th>When</th></tr>${[S.answer?['D-42','Production cron runs '+S.answer,'you','now']:null,S.planApproved?['D-41','Plan P-1 approved (4 issues; pm 1 · dev 4 · qa 1 · devops 1)','you','09:16']:null,['D-40','ADR-0004 connected-platform contract accepted','you','Sep 22'],['D-38','QA must be a different vendor from the author','you','Sep 21']].filter(Boolean).map(r=>`<tr><td class="mono">${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td class="muted">${r[3]}</td></tr>`).join('')}</table></div>`,
  faq:()=>`<h3>FAQ</h3><div class="tblwrap"><table class="tbl"><tr><th>ID</th><th>Question</th><th>Answer</th><th>Reused</th></tr>${[['F-4','Which time zone decides reminder timing?','The branch time zone','6×'],['F-7','Where do Worker secrets live?','wrangler secret put — never in code or the vault','11×'],['F-9','Can a PM merge a PR?','No. DevOps merges after a PASS on the head commit','9×']].map(r=>`<tr><td class="mono">${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td class="num">${r[3]}</td></tr>`).join('')}</table></div>`,
  queue:()=>{if(!S.ff) return `<h3>Verification queue</h3><div class="empty" style="padding:30px 10px"><div><b class="strong">Nothing to verify yet</b><p>Candidates arrive from reports as the team finishes work.</p></div></div>`;
   return `<h3>Verification queue</h3><p class="muted">Logic checks run first; then a curator from a different vendor than the proposer gives a verdict. You only see what needs a human.</p>
@@ -1670,7 +1671,7 @@ function frame(){
 }
 function nav(){
   const needs=needCount();
-  const it=[['home','⌂','Home',needs?`<span class="badge">${needs}</span>`:''],['projects','▦','Projects',''],['teams','◉','Teams',''],['vault','▤','Vault',S.ff&&QUEUE.some(q=>!S.ver[q.id])?`<span class="badge">${QUEUE.filter(q=>!S.ver[q.id]).length}</span>`:''],['services','◆','Platforms',S.aos||S.cf?'':'<span class="badge" style="background:var(--gold-dim);color:var(--gold)">off</span>'],['settings','⚙','Settings','']];
+  const it=[['home','⌂','Home',needs?`<span class="badge">${needs}</span>`:''],['projects','▦','Projects',''],['teams','◉','Agents',''],['vault','▤','Vault',S.ff&&QUEUE.some(q=>!S.ver[q.id])?`<span class="badge">${QUEUE.filter(q=>!S.ver[q.id]).length}</span>`:''],['services','◆','Platforms',S.aos||S.cf?'':'<span class="badge" style="background:var(--gold-dim);color:var(--gold)">off</span>'],['settings','⚙','Settings','']];
   return `<nav class="nav" aria-label="Main">
     <div class="logo"><svg width="20" height="20" viewBox="0 0 1024 1024"><rect width="1024" height="1024" rx="224" fill="#0B0B0C"/><path d="M232 336 416 512 232 688" fill="none" stroke="#2DD4BF" stroke-opacity=".55" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><path d="M408 336 592 512 408 688" fill="none" stroke="#2DD4BF" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/></svg>Cadence</div>
     ${it.map(([k,ic,l,b])=>`<button data-act="go" data-v="${k}" aria-current="${S.screen===k?'page':'false'}"><span aria-hidden="true">${ic}</span><span class="lbl2">${l}</span>${b}</button>`).join('')}
@@ -1681,7 +1682,7 @@ function nav(){
   </nav>`;
 }
 function topbar(){
-  const t={home:['Home','Master'],projects:['Projects','reminders'],teams:['Teams',{org:'Org',roles:'Roles',agents:S.agent,reports:'Reports'}[S.teamTab]],vault:['Vault',S.vaultTab],services:['Platforms',{aos:'AgenticOS v2',cf:'Cloudflare',add:'Add'}[S.platTab]],settings:['Settings',S.setTab]}[S.screen];
+  const t={home:['Home','Master'],projects:['Projects','reminders'],teams:['Agents',{org:'Overview',roles:'Definitions',agents:S.agent,reports:'Reports'}[S.teamTab]],vault:['Vault',S.vaultTab],services:['Platforms',{aos:'AgenticOS v2',cf:'Cloudflare',add:'Add'}[S.platTab]],settings:['Settings',S.setTab]}[S.screen];
   return `<div class="topbar"><div class="crumb">${t[0]} / <b>${t[1]}</b></div><div class="spacer"></div>
    ${S.screen==='home'?`<button class="btn sm railtoggle" data-act="rail">${S.showRail?'← Chat':'Needs you ('+needCount()+')'}</button>`:''}
    <span class="chip ${S.sim==='offline'?'fail':'ok'} hide-n"><span class="dot"></span>${S.sim==='offline'?'daemon offline':'daemon live'}</span>
@@ -1823,10 +1824,10 @@ function stepWork(){
 }
 function stepTeam(){
   const dl=[['Ask for everything','You approve each plan, dispatch, merge and deploy.'],['Approve plans','Recommended. Workers start once you approve a plan; merges and deploys ask.'],['Routine merges auto','Locked until the unattended acceptance check passes on this machine.']];
-  return `<h3>Team &amp; autonomy</h3><p class="muted">Which agents the master may hire, how many at once, and how much it can do without asking.</p>
-  <div class="slabel" style="margin:14px 0 8px">Starter team for this project</div>
-  <div class="tblwrap"><table class="tbl"><tr><th>Role</th><th>Count</th><th>Preferred provider · model · effort</th></tr>${['pm','dev','qa','devops'].map(k=>{const r=S.roles[k],r0=ROLES.find(x=>x.k===k);return `<tr><td>${r0.t}</td><td class="num">${k==='dev'?2:1}</td><td class="mono">${r.p} · ${r.m} · ${r.e}</td></tr>`}).join('')}</table></div>
-  <p class="muted" style="font-size:12px;margin:6px 0 0">Roles are defined once for the company in Teams → Roles. The master adds developers or a researcher when a plan needs them.</p>
+  return `<h3>Staffing &amp; autonomy</h3><p class="muted">Which agents work on this project, how many sessions of each, and how much the master can do without asking. Saved in PROJECT.md.</p>
+  <div class="slabel" style="margin:14px 0 8px">Staffing for this project (PROJECT.md)</div>
+  <div class="tblwrap"><table class="tbl"><tr><th>Agent</th><th>Sessions</th><th>Preferred provider · model · effort</th></tr>${['pm','dev','qa','devops'].map(k=>{const r=S.roles[k],r0=ROLES.find(x=>x.k===k);return `<tr><td>${r0.t}</td><td class="num">${k==='dev'?2:1}</td><td class="mono">${r.p} · ${r.m} · ${r.e}</td></tr>`}).join('')}</table></div>
+  <p class="muted" style="font-size:12px;margin:6px 0 0">Agents are defined once in agents/<slug>/. The master adds sessions or a researcher when a plan needs them.</p>
   <div class="slabel" style="margin:14px 0 8px">Providers agents may use</div>
   <div class="row" style="flex-wrap:wrap">${['claude','codex','pi','cursor','devin'].map(p=>`<label class="chip" style="padding:6px 10px;cursor:pointer;${p==='devin'?'opacity:.5':''}"><input type="checkbox" ${S.workers[p]?'checked':''} ${p==='devin'?'disabled':''}> ${av(p)} ${p}${p==='devin'?' · not installed':''}</label>`).join('')}</div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px">
@@ -1869,16 +1870,16 @@ function thread(){
    <div class="tool"><span class="aos-ns">agenticos</span> crm.bookings.search {window:"48h"} ${S.aos?'<span class="ok">✓ 38 upcoming</span>':'<span class="muted">not connected · using repo fixtures</span>'}</div>
    <div class="tool"><span class="aos-ns">agenticos</span> inbox.templates.list {channel:"whatsapp"} ${S.aos?'<span class="ok">✓ 2 approved</span>':'<span class="muted">not connected · skipped</span>'}</div>
    <div class="tool"><span class="ns">cadence</span> vault search "workers cron whatsapp reminders" <span class="ok">✓ 3 lessons · 1 playbook · 1 FAQ</span></div>
-   <div class="txt" style="margin-top:6px">Bookings carry <code>starts_at</code> and a phone number; template <code>booking_reminder_v2</code> takes name, time and branch. I'd split it into four issues and staff a Reminders team from your roles — a PM, developers, QA and DevOps. Sending is the only step that touches customers, so it's marked for your review.</div>
+   <div class="txt" style="margin-top:6px">Bookings carry <code>starts_at</code> and a phone number; template <code>booking_reminder_v2</code> takes name, time and branch. I'd split it into four issues and staff the project from your agents — a PM session plus developer, QA and DevOps sessions. Sending is the only step that touches customers, so it's marked for your review.</div>
    ${planCard()}</div></div>`;
   h+=`<div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 09:15</div><div class="txt">One more thing: the repo has no GitHub Actions yet. I'd like to check what's there.</div>
    ${permCard()}</div></div>`;
   if(S.planApproved){
     h+=`<div class="sys"><span class="line"></span>Plan P-1 approved by you · 4 issues → ready · commit <span class="num">a41c9e0</span></div>
-    <div class="sys"><span class="line"></span>Reminders team staffed from roles · pm-rmd (PM · codex) · w1–w4 (dev) · qa-rmd (QA · claude) · ops-rmd (DevOps · claude)</div>
+    <div class="sys"><span class="line"></span>Sessions started from agent files · pm#1 (codex) · dev#1–#4 · qa#1 (claude) · devops#1 (claude) · staffing in PROJECT.md</div>
     <div class="sys"><span class="line"></span>pm-rmd dispatched RMD-1 → w1 and RMD-2 → w2 · each with a context pack (3 lessons, 1 playbook)</div>
     <div class="sys"><span class="line"></span>09:48 · w2 asked which time zone applies · answered from the vault (FAQ F-4) · no one interrupted</div>
-    <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 09:17</div><div class="txt">The Reminders team is on it; its PM runs the day-to-day. RMD-3 waits for RMD-2's CRM reader and RMD-4 starts when RMD-1 lands. I'll bring you merges, sends and deploys — nothing reaches customers without your click.</div></div></div>`;
+    <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 09:17</div><div class="txt">The project is staffed; its PM session runs the day-to-day. RMD-3 waits for RMD-2's CRM reader and RMD-4 starts when RMD-1 lands. I'll bring you merges, sends and deploys — nothing reaches customers without your click.</div></div></div>`;
   }
   if(S.ff){
     h+=`<div class="sys"><span class="line"></span>10:48 · w1 filed report R-12 · 1 lesson candidate → curator (claude, because w1 is codex)</div>
@@ -1903,7 +1904,7 @@ function planCard(){
    ${ISSUES.map(i=>`<div class="it"><span class="num muted">${i.id}</span><div><div class="strong">${i.t}</div><div class="muted" style="font-size:11.5px">${i.acc} acceptance checks${i.dep?' · after '+i.dep:''}</div></div>
      <div class="row">${av(i.p)}<span class="chip ${i.risk==='human'?'warn':''}">${i.risk}</span></div></div>`).join('')}
    <div class="pf">${S.planApproved?`<span class="muted" style="font-size:12.5px">Approved 09:16 · workers may start within this plan only.</span>`:
-     `<button class="btn pri sm" data-act="approve">Approve plan</button><button class="btn sm" data-act="changes">Request changes</button><button class="btn sm ghost">Open in Projects</button><span class="muted" style="font-size:12px;margin-left:auto">Team: PM · 4 dev · QA · DevOps · context: 3 lessons, 1 playbook</span>`}</div></div>`;
+     `<button class="btn pri sm" data-act="approve">Approve plan</button><button class="btn sm" data-act="changes">Request changes</button><button class="btn sm ghost">Open in Projects</button><span class="muted" style="font-size:12px;margin-left:auto">Staffing: pm 1 · dev 4 · qa 1 · devops 1 · context: 3 lessons, 1 playbook</span>`}</div></div>`;
 }
 function permCard(){
   if(S.perm) return `<div class="req done"><div class="between"><span class="mono" style="font-size:12.5px">Bash · gh api repos/harbor-bakery/reminders/actions/workflows</span><span class="chip ${S.perm==='allow'?'ok':'fail'}">${S.perm==='allow'?'allowed once':'denied'}</span></div></div>`;
@@ -2116,10 +2117,10 @@ document.addEventListener('click',e=>{
     case 'teamtab':S.teamTab=v;break;
     case 'vaulttab':S.vaultTab=v;break;
     case 'role':overlay='role:'+v;break;
-    case 'rolesave':overlay=null;toast('Role saved · vault/roles/'+v+'/AGENT.md committed');return;
+    case 'rolesave':overlay=null;toast('Saved · agents/'+v+'/AGENT.md committed');return;
     case 'lesson':overlay='lesson:'+v;break;
     case 'packrole':S.pack=v;break;
-    case 'newteam':toast('Ask the master to start a team — it proposes staffing together with a plan');return;
+    case 'newteam':toast('Ask the master to start a project — it proposes a plan and staffing');return;
     case 'answer':S.answer=v;toast('Answered · decision D-42 · FAQ candidate for the curator');return;
     case 'ver':{const [id,act]=v.split(':');S.ver[id]={merge:'merged into L-12',accept:'accepted',evidence:'evidence requested',reject:'rejected',promote:'promoted by you',discard:'discarded'}[act];toast(id+' · '+S.ver[id]);return;}
     case 'settab':S.setTab=v;break;

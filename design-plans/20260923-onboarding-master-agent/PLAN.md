@@ -110,9 +110,9 @@ Defaults are illustrative; model names follow each CLI's aliases.
 |---|---|---|
 | M0 Safe foundation | Sandbox, real backups, event roll-up | Backup → restore round-trip in a sandbox; production untouched |
 | M1 First conversation | Install → wizard → chat with a master that remembers | Clean box to chat in < 5 min; kill the session mid-plan → it resumes |
-| M2 One governed team | Master → one team from agent files; plans, gate, reviews, reports | A 3-issue plan lands with fresh-context verdicts, typed reports, and a question answered at the lowest level |
+| M2 One governed project | Master → one project staffed from agent files; plans, gate, reviews, reports | A 3-issue plan lands with fresh-context verdicts, typed reports, and a question answered at the lowest level |
 | M3 The team learns | Verified memory, Markdown vault, packs, metrics | A lesson from one worker is verified by another vendor and reused by a different worker with measured savings; a stale item is withheld; a planted poisoned item is rejected |
-| M4 Many teams | Several teams under one master | Two teams run concurrently with no cross-team leakage |
+| M4 Many projects | Several projects under one master | Two projects run concurrently with no cross-project leakage |
 | M5 Ships | Connected platforms and effects | Preview deploys auto; production and sends only on the operator's press |
 | M6 Autonomy dial | Routine merges automatic per project | Only after CAD-225 passes |
 | GTM | Partners after M1 · beta after M3 · GA after M5 | Legal review of provider terms before beta |
