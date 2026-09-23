@@ -12,6 +12,7 @@ const KIND_LABEL: Record<string, string> = {
   ci_red: "ci red",
   silent_end: "silent end",
   inbox_unread: "inbox",
+  inbox_stale: "stale inbox",
   tracker_behind: "behind",
 };
 
@@ -40,6 +41,7 @@ const NEED_GROUP: Record<string, "decision" | "team" | "dependency" | "info"> = 
   // A sampled menu is not an operator approval.
   approval_menu: "team",
   drift: "dependency",
+  inbox_stale: "team",
   inbox_unread: "info",
   tracker_behind: "info",
 };

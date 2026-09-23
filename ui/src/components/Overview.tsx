@@ -20,6 +20,7 @@ const KIND_CHIP: Record<string, string> = {
   ci_red: "bg-fail/10 text-fail",
   silent_end: "bg-warn/10 text-warn",
   inbox_unread: "bg-warn/10 text-warn",
+  inbox_stale: "bg-warn/10 text-warn",
   tracker_behind: "bg-ink-800 text-ink-400",
 };
 
@@ -87,6 +88,16 @@ function NeedRows({ rows }: { rows: Overview["needs_me"] }) {
                 <span className={`chip ${KIND_CHIP[n.kind] ?? "bg-ink-800 text-ink-400"}`}>
                   {needLabel(n.kind)}
                 </span>
+                {/* One row per subject: the further causes ride along. */}
+                {(n.causes ?? []).slice(1).map((c) => (
+                  <span
+                    key={c.cause}
+                    className={`chip ${KIND_CHIP[c.cause] ?? "bg-ink-800 text-ink-400"}`}
+                    title={c.title}
+                  >
+                    + {needLabel(c.cause)}
+                  </span>
+                ))}
                 <span className="num text-label text-ink-500 w-9 shrink-0">
                   {age(n.age)}
                 </span>
@@ -423,9 +434,12 @@ export default function OverviewView({
     return (
       <div className="px-4 lg:px-8 pt-4 pb-10 space-y-5 max-w-[68rem]">
         <div className="text-label text-ink-500">
-          {loading
-            ? "building the overview — daemon and GitHub probes can take several seconds"
-            : "overview unavailable — the board server could not build the view"}
+          {/* "unavailable" only once a request actually failed with
+              nothing ever loaded; before the first answer — or while a
+              retry is in flight — this is a load, not a failure. */}
+          {stale && !loading
+            ? "overview unavailable — the board server could not build the view"
+            : "building the overview — daemon and GitHub probes can take several seconds"}
         </div>
         {project !== "all" && (
           <ProjectScope
@@ -463,7 +477,9 @@ export default function OverviewView({
           </span>
         )}
       </header>
-      {(data.github.state === "unavailable" || !data.daemon.reachable) && (
+      {(data.github.state === "unavailable" ||
+        !data.daemon.reachable ||
+        (data.degraded ?? []).length > 0) && (
         <div className="card border-warn/40 px-4 py-3 text-secondary text-warn">
           {data.github.state === "unavailable" && (
             <div>github unavailable — PR and CI rows are missing</div>
@@ -471,6 +487,12 @@ export default function OverviewView({
           {!data.daemon.reachable && (
             <div>daemon unreachable — agent, approval and drift rows are missing</div>
           )}
+          {(data.degraded ?? []).map((d, i) => (
+            <div key={i}>
+              degraded · {d.source}
+              {d.subject ? ` ${d.subject}` : ""} — {d.detail}
+            </div>
+          ))}
         </div>
       )}
 

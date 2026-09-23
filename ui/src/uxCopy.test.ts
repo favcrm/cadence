@@ -21,6 +21,7 @@ equal(needLabel("approval"), "approval");
 equal(needGroupKey("approval_menu"), "team");
 equal(needGroupKey("approval"), "decision");
 equal(needGroupKey("not_a_kind"), "team");
+equal(needLabel("inbox_stale"), "stale inbox");
 
 const notes = notesStatusSentence("notes", "qa", "doing");
 if (notes == null || !notes.includes("bound job")) {
