@@ -254,9 +254,10 @@ fn sandbox_up_isolates_state_tracker_and_port_then_down_stops_it() {
 }
 
 /// Production is off limits: port 3010, a root whose tracker is
-/// HOME/pm, a state dir symlinked onto production's, and a caller
-/// shell exported at the sandbox's dirs all refuse before anything is
-/// created or started.
+/// HOME/pm, a state dir symlinked onto production's, a `..` base, a
+/// root at production's HOME-default state dir, an unreadable root and
+/// a caller shell exported at the sandbox's dirs all refuse before
+/// anything is created or started.
 #[test]
 fn sandbox_up_refuses_production_dirs_and_port_3010() {
     let host = Host::new();
@@ -296,6 +297,31 @@ fn sandbox_up_refuses_production_dirs_and_port_3010() {
     );
     refused(&out, "Unix socket limit");
     assert!(!deep.exists());
+
+    // A `..` in the base would land the sandbox inside production's
+    // state dir: refused before anything is created.
+    let dotdot = format!("{}/missing/../xdg", host.tmp.path().display());
+    let out = host.run(
+        &["sandbox", "up", "cadence"],
+        &[("CADENCE_SANDBOX_ROOT", &dotdot)],
+    );
+    refused(&out, "no `.` or `..`");
+    assert!(!host.tmp.path().join("missing").exists());
+    assert_eq!(std::fs::read_dir(&prod).unwrap().count(), 0);
+
+    // Production's HOME-default state dir counts even with
+    // XDG_STATE_HOME set.
+    let home_state = host.home().join(".local/state");
+    let out = host.run(
+        &["sandbox", "up", "cadence"],
+        &[("CADENCE_SANDBOX_ROOT", home_state.to_str().unwrap())],
+    );
+    refused(&out, "overlaps the production state dir");
+    assert!(!home_state.join("cadence").exists());
+
+    // A root that cannot be read is refused, not treated as empty.
+    std::fs::write(host.base().join("afile"), "x").unwrap();
+    refused(&host.run(&["sandbox", "up", "afile"], &[]), "cannot read");
 
     // A shell exported at a live cadence that is this sandbox's dir.
     let exported = host.base().join("exp/state");

@@ -11,7 +11,7 @@
 //! dir (and so its socket) or tracker.
 
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -128,28 +128,35 @@ fn global_gate(profile: Option<&str>, allowed: Option<bool>, what: &str) -> Resu
 
 /// Where sandbox roots live: `$CADENCE_SANDBOX_ROOT`, else
 /// `$XDG_STATE_HOME/cadence-sandbox`, else
-/// `~/.local/state/cadence-sandbox`.
+/// `~/.local/state/cadence-sandbox`. Always a plain absolute path: a
+/// relative one follows the cwd, and a `..` would land somewhere other
+/// than the path the production guard compares.
 pub fn base_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("CADENCE_SANDBOX_ROOT").filter(|d| !d.is_empty()) {
-        let dir = PathBuf::from(dir);
-        if !dir.is_absolute() {
-            return Err(Error::rejected(format!(
-                "CADENCE_SANDBOX_ROOT '{}' is relative — export an absolute path",
-                dir.display()
-            )));
-        }
-        return Ok(dir);
+    let var = |name| std::env::var_os(name).filter(|d| !d.is_empty());
+    let (source, base) = if let Some(dir) = var("CADENCE_SANDBOX_ROOT") {
+        ("CADENCE_SANDBOX_ROOT", PathBuf::from(dir))
+    } else if let Some(dir) = var("XDG_STATE_HOME") {
+        ("XDG_STATE_HOME", PathBuf::from(dir).join("cadence-sandbox"))
+    } else {
+        let home = var("HOME")
+            .ok_or_else(|| Error::rejected("HOME is not set — export CADENCE_SANDBOX_ROOT"))?;
+        (
+            "HOME",
+            PathBuf::from(home).join(".local/state/cadence-sandbox"),
+        )
+    };
+    let plain = base.is_absolute()
+        && !base
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir));
+    if !plain {
+        return Err(Error::rejected(format!(
+            "sandbox base {} (from {source}) must be an absolute path with no \
+             `.` or `..` — export CADENCE_SANDBOX_ROOT as one",
+            base.display()
+        )));
     }
-    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
-        return Ok(PathBuf::from(dir).join("cadence-sandbox"));
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .ok_or_else(|| {
-            Error::rejected("HOME is not set to an absolute path — export CADENCE_SANDBOX_ROOT")
-        })?;
-    Ok(home.join(".local/state/cadence-sandbox"))
+    Ok(base)
 }
 
 struct Sandbox {
@@ -205,24 +212,36 @@ fn validate_name(name: &str) -> Result<()> {
 
 // ---------- production guard ----------
 
-/// `path` with symlinks resolved as far as it exists; the missing tail
-/// is appended as written, so a not-yet-created dir under a symlinked
-/// parent compares by where it would land.
+/// Where `path` lands: made absolute, each existing prefix
+/// canonicalized (symlinks followed) and a `..` popping the component
+/// before it — lexically once the path stops existing, which is where
+/// creating it would land too. No spelling of a dir compares
+/// differently from the dir itself.
 fn resolved(path: &Path) -> PathBuf {
-    let mut tail = Vec::new();
-    let mut cur = path.to_path_buf();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(&cur) {
-            return tail.iter().rev().fold(real, |acc, c| acc.join(c));
-        }
-        match (cur.file_name().map(|n| n.to_os_string()), cur.parent()) {
-            (Some(name), Some(parent)) => {
-                tail.push(name);
-                cur = parent.to_path_buf();
+    let path = if path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
             }
-            _ => return path.to_path_buf(),
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                out.push(part);
+                if let Ok(real) = std::fs::canonicalize(&out) {
+                    out = real;
+                }
+            }
+            root => out.push(root.as_os_str()),
         }
     }
+    out
 }
 
 /// The live dirs a sandbox must never overlap, labelled for the
@@ -235,6 +254,14 @@ fn production_dirs(sb: &Sandbox) -> Result<Vec<(&'static str, PathBuf)>> {
         ("the production state dir", client::default_state_dir()?),
         ("the production tracker", crate::issue::home_default_dir()?),
     ];
+    // A daemon started without XDG_STATE_HOME lives here even when this
+    // shell sets it.
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        dirs.push((
+            "the production state dir",
+            PathBuf::from(home).join(".local/state/cadence"),
+        ));
+    }
     if profile().as_deref() != Some(sb.name.as_str()) {
         if let Some(d) = std::env::var_os("CADENCE_STATE_DIR") {
             dirs.push(("the exported CADENCE_STATE_DIR", PathBuf::from(d)));
@@ -278,7 +305,13 @@ fn read_marker(sb: &Sandbox) -> Result<Option<Value>> {
     let path = sb.marker();
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "cannot read {} ({e}) — {} is not a sandbox root; pick another name",
+                path.display(),
+                sb.root.display()
+            )))
+        }
         Ok(meta) if !meta.file_type().is_file() => {
             return Err(Error::rejected(format!(
                 "{} is not a regular file — {} is not a sandbox root; \
@@ -506,13 +539,22 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
         )));
     }
     let existing = read_marker(sb)?;
-    if existing.is_none()
-        && std::fs::read_dir(&sb.root).is_ok_and(|mut entries| entries.next().is_some())
-    {
-        return Err(Error::rejected(format!(
-            "{} exists and holds no sandbox marker — pick another name",
-            sb.root.display()
-        )));
+    match std::fs::read_dir(&sb.root) {
+        Ok(mut entries) => {
+            if existing.is_none() && entries.next().is_some() {
+                return Err(Error::rejected(format!(
+                    "{} exists and holds no sandbox marker — pick another name",
+                    sb.root.display()
+                )));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "cannot read {} ({e}) — refusing; pick another name",
+                sb.root.display()
+            )))
+        }
     }
     let port = choose_port(sb, wanted_port)?;
     let exe = std::env::current_exe()?;
@@ -719,6 +761,19 @@ mod tests {
         assert!(err.to_string().contains("ungated"), "{err}");
         std::fs::write(root.join(MARKER), "not json").unwrap();
         assert!(owner_of(&root.join("state")).is_err());
+    }
+
+    #[test]
+    fn resolved_pops_dotdot_where_the_filesystem_would() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::os::unix::fs::symlink(real.join("sub"), dir.path().join("link")).unwrap();
+        let canon = std::fs::canonicalize(&real).unwrap();
+        // A `..` after a missing component pops it, as a create would.
+        assert_eq!(resolved(&real.join("missing/../x")), canon.join("x"));
+        // A `..` after a symlink leaves its target, not the link.
+        assert_eq!(resolved(&dir.path().join("link/../y")), canon.join("y"));
     }
 
     #[test]
