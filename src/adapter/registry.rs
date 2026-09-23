@@ -252,6 +252,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "silent_end_secs",
             "auto_stop",
             "auto_stop_idle_secs",
+            "report_timeout_secs",
         ],
         launch_params: &[
             "model",
@@ -263,6 +264,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "upstream",
             "auto_ready",
             "silent_end_secs",
+            "report_timeout_secs",
             "agents_md",
             "stall_secs",
         ],
@@ -294,12 +296,14 @@ pub static SPECS: &[EndpointSpec] = &[
             "silent_end_secs",
             "auto_stop",
             "auto_stop_idle_secs",
+            "report_timeout_secs",
         ],
         launch_params: &[
             "session",
             "upstream",
             "auto_ready",
             "silent_end_secs",
+            "report_timeout_secs",
             "permission_mode",
             "bypass",
             "agents_md",
@@ -333,6 +337,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "silent_end_secs",
             "auto_stop",
             "auto_stop_idle_secs",
+            "report_timeout_secs",
         ],
         launch_params: &[
             "model",
@@ -342,6 +347,7 @@ pub static SPECS: &[EndpointSpec] = &[
             "upstream",
             "auto_ready",
             "silent_end_secs",
+            "report_timeout_secs",
             "agents_md",
             "stall_secs",
         ],
@@ -373,12 +379,14 @@ pub static SPECS: &[EndpointSpec] = &[
             "silent_end_secs",
             "auto_stop",
             "auto_stop_idle_secs",
+            "report_timeout_secs",
         ],
         launch_params: &[
             "session",
             "upstream",
             "auto_ready",
             "silent_end_secs",
+            "report_timeout_secs",
             "agents_md",
             "stall_secs",
         ],
@@ -768,6 +776,7 @@ pub fn validate_live_param(provider: &str, kind: &str, key: &str, value: &Value)
             }
             Ok(())
         }
+        "report_timeout_secs" => check_report_timeout(provider, kind, value),
         // CAD-251: unconsumed-inbox warning thresholds.
         "inbox_warn_unread" | "inbox_warn_idle_secs" => {
             if has_actor(provider, kind) {
@@ -812,8 +821,9 @@ pub fn validate_live_param(provider: &str, kind: &str, key: &str, value: &Value)
             "'{other}' is not live-settable — allowed keys: auto_ready \
              (pty only), stall_secs, silent_end_secs (pty only), \
              auto_stop=off, auto_stop_idle_secs, \
-             inbox_warn_unread, inbox_warn_idle_secs (inbox only). \
-             Recreate the agent to change wiring params like upstream \
+             report_timeout_secs (pty only), inbox_warn_unread, \
+             inbox_warn_idle_secs (inbox only). Recreate the agent to \
+             change wiring params like upstream \
              or session"
         ))),
     }
@@ -947,6 +957,24 @@ fn check_stall_secs(value: &Value) -> bool {
         || value.as_str().is_some_and(|s| s.parse::<u64>().is_ok())
 }
 
+/// CAD-250: `report_timeout_secs` bounds a delivered pty turn's wait on
+/// its explicit report — only a pasted turn owes one.
+fn check_report_timeout(provider: &str, kind: &str, value: &Value) -> Result<()> {
+    if !screen_probe(provider, kind) {
+        return Err(Error::rejected(
+            "'report_timeout_secs' only applies to pty endpoints — only a \
+             pasted turn waits on an explicit report",
+        ));
+    }
+    if !check_stall_secs(value) {
+        return Err(Error::rejected(
+            "'report_timeout_secs' must be a non-negative integer (0 \
+             disables the report bound) or a bare key removal",
+        ));
+    }
+    Ok(())
+}
+
 /// Register-time validation for enumerated launch params. Params not
 /// named here keep their historical pass-through (claude's modes are
 /// provider-validated — its own CLI rejects bad values on spawn).
@@ -978,6 +1006,9 @@ pub fn validate_launch_params(provider: &str, kind: &str, params: &Value) -> Res
                  disables silent-end detection) or a bare key removal",
             ));
         }
+    }
+    if let Some(v) = params.get("report_timeout_secs") {
+        check_report_timeout(provider, kind, v)?;
     }
     if provider == "devin" && kind == "pty" {
         if let Some(v) = params.get("permission_mode") {

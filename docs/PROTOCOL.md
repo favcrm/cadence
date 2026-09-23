@@ -40,10 +40,10 @@ Error kinds:
 | `shutdown` | — | `{state:"stopping"}`; daemon stops actors (bounded), writes the clean-stop marker, then exits |
 | `agent_register` | `alias, provider, cwd?, endpoint_kind?, role?, sandbox?, instructions?, params?, team_role?, model_policy?` | `{alias,state:"starting"|"idle",provider}`. `team_role` is model-lookup metadata (`ops` normalizes to `devops`); it does not change runtime `role`. `model_policy` is `inherit` (default) or `provider_default` |
 | `agent_list` | — | `{agents:[Agent+tasks+capabilities]}` — `tasks` names the alias's non-terminal task assignments; `capabilities` is the registry descriptor |
-| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown, inbox?}` — `unknown` counts unreconciled unknowns fencing the agent; passive `inbox` evidence includes queued count, oldest age, last receipt/progress, and `semantic_completion:"external_consumer_required"`; it is never a drain or completion claim. `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_effective`, `model_source` (`configured` or `provider default`), `effort_configured`, `effort_reported`, `effort_effective` and legacy `effort` — also on every `agent_list` row. `team_role`, `model_lookup_role`, and `model_selection` (`source`, `lookup_role`, `revision`, `model`) record how a launch model was chosen. Unsupported endpoints leave `model_selection` null. Existing rows without stored provenance are labeled `legacy_configured` or `legacy_provider_default` at read time |
+| `agent_show` | `alias` | `{agent, messages, event_cursor, queued, unknown, inbox?}` — `unknown` counts unreconciled unknowns fencing the agent; `agent.awaiting_report` (also on `agent_list` rows) is `{message, turn_id, task_id, since_secs, acked, report_timeout_secs, remaining_secs, count, queued_behind}` while a delivered pty turn awaits its report (null otherwise; `remaining_secs` null when the bound is disabled), and that message's row carries `awaiting_report: true`; passive `inbox` evidence includes queued count, oldest age, last receipt/progress, and `semantic_completion:"external_consumer_required"`; it is never a drain or completion claim. `agent.capabilities` is the registry descriptor; `agent.model_reported` is the model the provider reports running (claude: the stream's `system/init` model) beside `model_configured`, `model_effective`, `model_source` (`configured` or `provider default`), `effort_configured`, `effort_reported`, `effort_effective` and legacy `effort` — also on every `agent_list` row. `team_role`, `model_lookup_role`, and `model_selection` (`source`, `lookup_role`, `revision`, `model`) record how a launch model was chosen. Unsupported endpoints leave `model_selection` null. Existing rows without stored provenance are labeled `legacy_configured` or `legacy_provider_default` at read time |
 | `model_defaults_get` | — | `{revision, config, providers, roles}` — daemon-wide provider baselines and team-role overrides. Suggestions are previously observed model ids, not a catalog. Does not start provider processes |
 | `model_defaults_set` | `document` (raw JSON string `{expected_revision, config}`), `attribution?` | the same snapshot as get, after an atomic revision bump. Mismatched `expected_revision` is `kind:"conflict"`, `code:"revision_conflict"`, with `revision` set to the current value and no write. Omitted attribution is transport `local` / actor `local`; a present attribution is transport `board` |
-| `agent_send` | `alias, text, message?, reply_to?, source?, task?` | `{message,state,duplicate,warning?}` — `task` attaches the delivery to a task for indexing; `warning` names a stale inbox target (queued anyway — see inbox endpoints) |
+| `agent_send` | `alias, text, message?, reply_to?, source?, task?, nudge?` | `{message,state,duplicate,warning?}` — `task` attaches the delivery to a task for indexing; `nudge: true` (CLI `send --nudge` / `message send --nudge`, pty only, no `reply_to`, not with `--ready`) records a turnless `source: "nudge"` delivery — see the CAD-250 section; `warning` names a stale inbox target (queued anyway — see inbox endpoints) |
 | `agent_ask` | `alias, text, message?, reply_to?, wait?` | the `Message` row; state may be non-terminal if `wait` expired |
 | `agent_events` | `alias, after?, wait(<=30), tail?` | `{events:[Event], cursor, has_older}` — `tail:true` returns the newest page (50) in ascending order instead of paging forward from `after` |
 | `agent_requests` | `alias` | `{requests:[{request,method,params}]}` |
@@ -55,7 +55,7 @@ Error kinds:
 | `agent_capture` | `alias` | `{capture}` — current pane contents (pty) |
 | `agent_probe` | `alias` | `{probe:{idle,reason,...}}` — analyzed pane state without claiming (pty) |
 | `agent_answer` | `alias, choice, by?, note?` | `{state:"answered"}` — sends one menu-choice keystroke to a `pty` pane probing `approval_menu` (CLI: `cadence agent answer <alias> <choice> [--reason <text>]`); re-probes and refuses any other detected pane state. Detection uses terminal text: CAD-220 tracks the residual ambiguity of a quoted menu directly adjoining the busy frame, so this is not an authoritative provider approval signal. `choice` is the option's index in the whole printed option block (top to bottom, independent of the highlighted row); the profile's keymap turns it into tmux keys — numbered menus take the digit, hotkeyed options their suffix, unnumbered selects arrows + Enter relative to the highlight. The answerer is derived from the socket peer's pid — `/proc` ancestry into the pane roots plus the pane `CADENCE_ALIAS` env and the pane's pty fds (a `setsid` detach keeps both) — a caller inside or tied to the target's own pane is refused, inside another agent's pane stamps `by_kind:"agent"`, an ancestry walk that cannot complete refuses while the target pane is alive (never a derivation-failure `operator`), and a caller that matches no pane is `operator` only when it holds a terminal no pane owns — a fully detached caller is honestly `unknown`; a supplied `by` that disagrees is kept only as `claimed_by`. Records `approval_answered` with `by`/`by_kind`/`caller_pid`/`choice`/`line`/`note` and wakes the agent's delivery loop |
-| `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`, `silent_end_secs` (pty only); `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; Codex model/effort are checked against `model/list`; null clears to the provider default) or `approval_policy` (codex; `never|on-request|on-failure|untrusted`, null clears) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
+| `agent_set` | `alias, patch, next_launch?` | merges an allowlisted param into the live agent — `auto_ready` (`"verified"` or null-removal, pty only), `stall_secs`, `silent_end_secs` (pty only), `report_timeout_secs` (pty only); `{state:"updated"}`. With `next_launch: true` it instead stores launch params `model`/`effort` (claude; Codex model/effort are checked against `model/list`; null clears to the provider default) or `approval_policy` (codex; `never|on-request|on-failure|untrusted`, null clears) for the next open without touching the live process; `{state:"updated", applies:"next launch"}` |
 | `agent_inbox` | `alias, after?, wait?` | drains queued inbox messages, completing each `via=inbox_read`; `{messages, cursor}` |
 | `message_report` | `message, token, kind: ack|result, text?, sha?` | `{state:"reported"}` — explicit PTY ack/result; `sha` names the produced commit for task-attached kickoffs |
 | `message_reconcile` | `message, status: interrupted|completed|failed, note?, by?, sha?` | `{state:"reconciled", message}` — operator-only exit from `unknown`; no turn token. `completed`/`failed` route `reply_to` as a result; `interrupted` routes an informational notice. A `sha` on `completed` binds like a worker `--sha` |
@@ -731,6 +731,84 @@ additionally wires a `Stop` hook through `--settings` that runs
 — an acknowledgement of turn-end only; the agent's own
 `message result` remains the completing report.
 
+**One report-owing turn per actor (CAD-250).** A pty pane serializes
+turns, and the store says so: while an agent holds a `running` message
+that is not a routed notification, its actor claims only routed
+notifications (`worker_result`, `worker_notice`, `job_event` —
+fire-and-forget, complete at paste). Every other delivery — a second
+task, a `--task` follow-up, a `send --ready` message — is accepted
+`queued` and stays there, never refused and never pasted, until the
+held turn is reported, reconciled or bounded to `unknown`; a `message
+result` wakes the actor so the next one is claimed at once.
+
+**Nudges — mid-turn steering.** `cadence send <alias> --nudge --text
+…` (or `message send --nudge`, RPC `agent_send nudge: true`) is the
+one way to reach a pane that holds a turn. A nudge is a durable
+message with `source: "nudge"` (`nudge: true` on its row) that owns no
+turn: like a routed notification it passes the hold and needs no
+ready claim — though, like a routed notice, it consumes a stacked
+operator `agent ready` claim if one is waiting — and it still waits for
+the screen probe to read the pane idle and menu-free. It is accepted
+only for an agent with a live pane (an actor and an endpoint, state
+`idle`/`busy`); otherwise `send` refuses with `agent <a> has no live
+pane`. It never becomes `running` or `awaiting_report`,
+owes no report, takes no `reply_to` (and no upstream default), and
+completes at its confirmed paste (`result.via: "pty_nudge"`). An
+unconfirmed paste ends `unknown` with a `nudge_unconfirmed` event —
+never retried, and an unknown nudge fences nothing (it is excluded
+from the agent's `unknown` count and from `agent unfence`; reconcile
+it with `message reconcile` if you want it closed). Delivered at most
+once and never replayed: whenever the agent's actor ends — stop,
+fence or daemon shutdown — its queued nudges are `cancelled`
+(`result.via: "stop_cancelled"` / `"fence_cancelled"` /
+`"shutdown_cancelled"`); after a crash the next start does the same
+(`"restart_cancelled"`), and one caught mid-paste goes non-fencing
+`unknown`. A nudge still queued 15 minutes after it was sent (a pane
+that stayed busy) is cancelled too (`"ttl_cancelled"`). Every one of
+these emits a `nudge_cancelled` event `{message, was, state, reason}`;
+nudges are never recorded for hot-restart adoption. pty endpoints only — a managed, inbox or cloud agent refuses
+`--nudge` naming its provider/kind; `--nudge` with `--ready` is a CLI
+error, and so is `--nudge` with `--task` (steering, not task work);
+the body is at most 500 characters and follows the pty rules (one
+line, no control characters, no forbidden leading character). A nudge caller needs no
+authority a plain `send` lacks. The held
+turn is **`awaiting_report`** — derived, never stored: `running` with
+the `submitted` marker (an ack keeps it). `agent_show`/`agent_list`
+carry the `awaiting_report` block (wait, bound, remaining, queued
+behind it), the message row `awaiting_report: true`, `status` flags
+the agent `awaiting_report`, and the overview adds a needs-me row
+(`kind: awaiting_report`, remedy `cadence agent show <alias>`) once
+work is queued behind it — a healthy turn in progress with nothing
+waiting is not a row.
+
+**Report bound.** A delivered turn waits at most `report_timeout_secs`
+(agent param, launch or live `agent set <alias> report_timeout_secs=<n>`;
+default 7200 = 2h; `0` disables — and with it the WAL watch's bound
+too: a stale unreported row on a live actor then keeps deferring that
+provider's checkpoints) for its result. The bound covers every row that
+holds the turn — `running` and not a routed notice or nudge, exactly
+what the hold matches — including one adopted before its `submitted`
+marker landed, so no row can hold the queue unbounded. The clock starts
+at delivery and restarts on each valid ack — an ack is the worker's own
+report that it holds the turn. When it runs out the actor moves the
+turn to `unknown` with `result.via: "report_timeout"` and one
+`report_timeout` event `{message, turn_id, waited_secs,
+report_timeout_secs}`, then fences like any other uncertain outcome
+(`attention`, pane detached, never relaunched): the `unknown` finish
+routes exactly one `worker_notice` to `reply_to` (which `send` defaults
+to the agent's upstream; a kickoff's is the job PM, whose scoped
+`turn_unknown` also raises the monitor alert) — never a result, never
+a completion, never a replay. Both writes are guarded: the expiry and
+a `message result` each check `running` inside the transaction that
+writes, so whichever commits first wins and the other is judged
+against the row as it now stands (the report is refused `not awaiting
+a report (state unknown)`) — the PM never receives both a notice and a
+result for one turn. Other unreported turns on the same actor — only
+rows that accumulated before this rule — go `unknown` with it, since
+the pane they ran on is detached. The operator exits the fence the
+usual way (`message reconcile` / `agent unfence`); what queued behind
+the turn then delivers in order.
+
 A pane that dies after a possible paste leaves submitted messages
 `unknown` (fence, never replay); a pane that dies before the paste
 fails the message. `agent_respond` is `rejected` for pty — provider
@@ -1000,7 +1078,12 @@ provider outcome needs human review; the actor will not relaunch itself.
 ## Messages
 
 States: `queued → submitting → running → completed | failed | interrupted
-| unknown | cancelled`. `unknown` is durable and fences its actor. Any ambiguous
+| unknown | cancelled`. A `source: "nudge"` delivery skips `running`:
+`queued → submitting → completed | unknown | failed | cancelled`, and
+its `unknown` fences nothing (CAD-250). `awaiting_report` is a derived phase of
+`running` — a delivered pty turn whose result report is still owed —
+visible in the views and bounded by `report_timeout_secs` (see the pty
+section); it is never a stored state. `unknown` is durable and fences its actor. Any ambiguous
 post-submission outcome lands there — transport loss mid-turn, a turn
 deadline, an acknowledged `turn/start` that cannot be correlated to a
 turn id, an unclassifiable completion status, or a forced close while a
@@ -1200,12 +1283,16 @@ fences, cancels, or replays anything it observes.
   the wait — emits `{message, age_secs, last_activity, probe}` once
   per message: the provider ended without reporting. The flag is
   evidence, not resolution — the message stays `running` until an
-  explicit report or reconcile. `agent_list`/`agent_show` expose
+  explicit report, reconcile, or the report bound. `agent_list`/`agent_show` expose
   `silent_ended` + `ended_secs` (the idle streak's age), `status`
   renders `ended?: <age>` beside an idle pane on a running message,
   and the overview needs-me row (`kind: silent_end`) gives the remedy
-  `cadence send <alias> --ready --text "continue …"` — a ready-gated
-  follow-up that claims the provably-idle pane and pastes in one step.
+  `cadence send <alias> --nudge --text "finish and report …"` — a
+  turnless nudge that pastes past the unreported turn (a plain
+  follow-up `send` would queue behind it, one report-owing turn per
+  actor, CAD-250); `cadence agent attach <alias>` is the manual
+  alternative. Left alone, the turn goes `unknown` when
+  `report_timeout_secs` runs out.
 - **Budget resolution.** `jobs.stall_secs` (set at `job new
   --stall-secs`) wins for task-attached deliveries; otherwise the
   agent's `params.stall_secs` (launch param or live `agent set alias
@@ -1651,6 +1738,19 @@ provider process dies with the daemon either way, so a managed
 in-flight turn stays `unknown` across any restart. `daemon restart`'s
 before/after table reports the outcome per agent under `TURN`:
 `kept`, `fenced`, or `-` — a fenced turn exits non-zero.
+
+**Stale running rows (CAD-250 reconcile path).** Stores written before
+one-turn-per-actor can hold many `running` pty rows per alias (the
+2026-09-22 audit measured 91 on one Devin PM), none ever reported.
+Nothing migrates or deletes them. On the next daemon start they take
+the ordinary paths above: a crash start turns them `unknown`; a hot
+restart adopts them (they are proven turns on a surviving pane), they
+read `awaiting_report`, and the actor's first pass retires every one
+whose `report_timeout_secs` has run out to `unknown` — one
+`report_timeout` event and one `turn_finished` each, one notice where a
+`reply_to` exists — and fences the agent. Every transition is an event
+on the agent's stream; the rows and their history stay until an
+operator reconciles them (`agent unfence`).
 
 ## Agent skill
 

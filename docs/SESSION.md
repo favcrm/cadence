@@ -149,9 +149,12 @@ codex `*.sqlite`, claude projects) whose `-wal` exceeds
 safety gates, honestly scoped: the WAL must be **quiet** (unwritten
 for ~60s — this is what excludes writers cadence cannot see, like an
 interactive `claude`/`devin` in a terminal), owned by the daemon's
-uid, not a symlink, and its provider must have no in-flight *cadence*
-turn (`submitting`/`running` in cadence's own store — a courtesy
-gate, since SQLite's locking is what actually protects the data).
+uid, not a symlink, and its provider must have no *live* in-flight
+cadence turn (`submitting`/`running` in cadence's own store on an
+alias whose actor is alive, and — for a pty turn awaiting its report —
+still inside `report_timeout_secs`; a stale row never defers, CAD-250 —
+a courtesy gate, since SQLite's locking is what actually protects the
+data).
 TRUNCATE cannot lose committed frames; a busy or failed attempt just
 defers to the next tick. Successes record `wal_checkpointed` on the
 `daemon` event stream (`cadence events daemon`) with before/after

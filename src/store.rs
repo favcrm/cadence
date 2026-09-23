@@ -582,7 +582,9 @@ pub struct Store {
     conn: Mutex<Connection>,
     /// Adoption candidates that survived `recover()`'s store-level
     /// checks, keyed by alias — an agent may hold more than one
-    /// in-flight turn, so every qualifying entry is kept; each list is
+    /// in-flight turn (routed notifications beside its one report-owing
+    /// turn, or rows that accumulated before CAD-250, which the report
+    /// bound then retires), so every qualifying entry is kept; each list is
     /// consumed exactly once by the agent's actor at open
     /// (`take_adoption`).
     adoptions: Mutex<std::collections::HashMap<String, Vec<AdoptEntry>>>,
@@ -829,8 +831,68 @@ impl Message {
         )
     }
 
+    /// CAD-250: an operator/PM `send --nudge` — steering pasted into a
+    /// live pty pane without owning a turn. Fire-and-forget like a routed
+    /// notification: it passes the one-turn hold, never becomes `running`
+    /// or `awaiting_report`, owes no report, and its `unknown` (an
+    /// unconfirmed paste) never fences the agent.
+    pub fn is_nudge(&self) -> bool {
+        self.source == NUDGE_SOURCE
+    }
+
+    /// CAD-250: a report-owing turn whose paste was delivered and that
+    /// has no result report yet — `running` with the pty `submitted`
+    /// marker (an ack keeps the marker). Derived, never stored: routed
+    /// notifications complete at paste, and managed turns never carry
+    /// the marker, so only a pty turn waiting on `message result` is
+    /// ever `awaiting_report`.
+    pub fn awaiting_report(&self) -> bool {
+        self.state == "running"
+            && !self.is_routed()
+            && self
+                .result
+                .as_ref()
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str)
+                == Some("submitted")
+    }
+
+    /// CAD-250: the row holds its actor's one turn — `running` and not a
+    /// turnless delivery (routed notice or nudge). Exactly what
+    /// `take_queued`'s hold matches, and what the report bound covers, so
+    /// no row can hold the queue without a bound — including a pty row
+    /// adopted before its `submitted` marker landed.
+    pub fn holds_turn(&self) -> bool {
+        self.state == "running" && !self.is_routed() && !self.is_nudge()
+    }
+
+    /// When the report bound's clock started for a turn-holding row: the
+    /// delivery (`started`, else `created`), restarted by the latest valid
+    /// ack — an ack is the worker's own report that it holds the turn.
+    /// `None` for any other row.
+    pub fn report_clock(&self) -> Option<f64> {
+        if !self.holds_turn() {
+            return None;
+        }
+        let delivered = self.started.unwrap_or(self.created);
+        let acked = self
+            .result
+            .as_ref()
+            .and_then(|r| r.pointer("/ack/at"))
+            .and_then(Value::as_f64);
+        Some(acked.map_or(delivered, |at| at.max(delivered)))
+    }
+
+    /// The report bound has run out at `now` — `bound == 0` disables it.
+    pub fn report_overdue(&self, bound: u64, now: f64) -> bool {
+        bound > 0
+            && self
+                .report_clock()
+                .is_some_and(|clock| now - clock >= bound as f64)
+    }
+
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut j = json!({
             "seq": self.seq, "id": self.id, "alias": self.alias,
             "body": self.body, "reply_to": self.reply_to, "source": self.source,
             "state": self.state, "turn_id": self.turn_id,
@@ -838,9 +900,45 @@ impl Message {
             "task_id": self.task_id,
             "created": self.created, "started": self.started,
             "completed": self.completed,
-        })
+        });
+        // Derived and additive: present only on a delivered, unreported
+        // pty turn, so every existing reader of `state` is unchanged.
+        if self.awaiting_report() {
+            j["awaiting_report"] = json!(true);
+        }
+        if self.is_nudge() {
+            j["nudge"] = json!(true);
+        }
+        j
     }
 }
+
+/// CAD-250: how long a delivered pty turn may wait on its report before
+/// it goes `unknown` (agent param `report_timeout_secs`; `0` disables).
+pub const DEFAULT_REPORT_TIMEOUT_SECS: u64 = 7200;
+
+/// The agent's report bound: `params.report_timeout_secs` (an integer or
+/// a digit string, as `agent set` stores it), else the default.
+pub fn report_timeout_secs(params: Option<&Value>) -> u64 {
+    params
+        .and_then(|p| p.get("report_timeout_secs"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(DEFAULT_REPORT_TIMEOUT_SECS)
+}
+
+/// The `source` of a `send --nudge` delivery ([`Message::is_nudge`]).
+pub const NUDGE_SOURCE: &str = "nudge";
+
+/// Sources that never own a turn — [`Message::is_routed`] plus
+/// [`Message::is_nudge`]; they pass the one-turn hold and never hold it.
+const TURNLESS_SOURCES_SQL: &str = "('worker_result','worker_notice','job_event','nudge')";
+
+/// The `unknown` rows that fence an agent: every one except a nudge's,
+/// whose unconfirmed paste belongs to no turn (CAD-250).
+const FENCING_UNKNOWN_SQL: &str = "state='unknown' AND source != 'nudge'";
 
 impl Event {
     pub fn to_json(&self) -> Value {
@@ -1415,6 +1513,9 @@ impl Store {
                     .push((*e).clone());
             }
         }
+        // CAD-250: a nudge is steering for the moment it was sent — it is
+        // never replayed into a later daemon's pane.
+        Self::cancel_nudges_in(&tx, None, "restart", None)?;
         // Dynamic NOT IN for the protected message ids — one UPDATE
         // either way, never string-interpolated values.
         let kept_ids: Vec<String> = kept.iter().map(|e| e.message_id.clone()).collect();
@@ -1504,8 +1605,10 @@ impl Store {
             Some(_) => {
                 let unknown: i64 = tx
                     .query_row(
-                        "SELECT COUNT(*) FROM messages
-                         WHERE alias=? AND state='unknown'",
+                        &format!(
+                            "SELECT COUNT(*) FROM messages
+                             WHERE alias=? AND {FENCING_UNKNOWN_SQL}"
+                        ),
                         [&e.alias],
                         |r| r.get(0),
                     )
@@ -1587,7 +1690,7 @@ impl Store {
         let tx = conn.unchecked_transaction()?;
         let mut stmt = tx.prepare(
             "SELECT alias, id, turn_id, state FROM messages
-             WHERE state IN ('running','submitting')",
+             WHERE state IN ('running','submitting') AND source != 'nudge'",
         )?;
         let inflight = stmt
             .query_map([], |r| {
@@ -2386,15 +2489,32 @@ impl Store {
         if !agent.enabled {
             return Ok(Take::Stop);
         }
+        // CAD-250: the actor serializes report-owing turns. While one is
+        // `running` (delivered, its report still owed), only routed
+        // notifications and nudges — fire-and-forget, complete at paste —
+        // may be claimed; every other delivery stays `queued`, never refused,
+        // until that turn is reported, reconciled or bounded to
+        // `unknown`.
+        let holding: bool = tx.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE alias=?
+                 AND state='running' AND source NOT IN {TURNLESS_SOURCES_SQL})"
+            ),
+            [alias],
+            |r| r.get(0),
+        )?;
+        let next_sql = if holding {
+            format!(
+                "SELECT * FROM messages WHERE alias=? AND state='queued'
+                 AND source IN {TURNLESS_SOURCES_SQL} ORDER BY seq LIMIT 1"
+            )
+        } else {
+            "SELECT * FROM messages WHERE alias=? AND state='queued'
+             ORDER BY seq LIMIT 1"
+                .to_string()
+        };
         loop {
-            let next = tx
-                .query_row(
-                    "SELECT * FROM messages WHERE alias=? AND state='queued'
-                     ORDER BY seq LIMIT 1",
-                    [alias],
-                    row_message,
-                )
-                .ok();
+            let next = tx.query_row(&next_sql, [alias], row_message).ok();
             let Some(message) = next else {
                 // A prior routed row in this same transaction may have
                 // been failed as unresolved before the queue became empty.
@@ -2545,13 +2665,164 @@ impl Store {
         result: &Value,
         error: Option<&str>,
     ) -> Result<()> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        self.finish_in(&tx, message, status, result, error)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// CAD-250: a nudge never outlives the pane it was aimed at. Cancel the
+    /// matching queued nudges (one caught mid-paste may have landed, so it
+    /// goes non-fencing `unknown`), each with a `nudge_cancelled` event
+    /// naming `reason`. `alias` scopes to one agent (its actor stopped);
+    /// `older_than` limits to rows created before that epoch (the TTL).
+    /// Returns the `(id, alias)` pairs it closed.
+    fn cancel_nudges_in(
+        tx: &Connection,
+        alias: Option<&str>,
+        reason: &str,
+        older_than: Option<f64>,
+    ) -> Result<Vec<(String, String)>> {
+        // The TTL only ever takes a nudge still waiting in the queue — a
+        // paste in flight finishes or fails on its own.
+        let states = if older_than.is_some() {
+            "('queued')"
+        } else {
+            "('queued','submitting')"
+        };
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id, alias, state FROM messages
+             WHERE source='nudge' AND state IN {states}
+               AND (?1 IS NULL OR alias=?1) AND (?2 IS NULL OR created < ?2)"
+        ))?;
+        let stale = stmt
+            .query_map(params![alias, older_than], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut closed = Vec::new();
+        for (id, alias, state) in stale {
+            let (to, why) = if state == "queued" {
+                ("cancelled", format!("{reason}_cancelled"))
+            } else {
+                ("unknown", format!("{reason}_unconfirmed"))
+            };
+            let result = json!({"status": to, "via": why,
+                                "reason": format!("{reason} — a nudge is never replayed")});
+            let n = tx.execute(
+                "UPDATE messages SET state=?,result=?,completed=? WHERE id=? AND state=?",
+                params![to, result.to_string(), now(), id, state],
+            )?;
+            if n == 1 {
+                Self::event(
+                    tx,
+                    &alias,
+                    "nudge_cancelled",
+                    json!({"message": id, "was": state, "state": to, "reason": reason}),
+                )?;
+                closed.push((id, alias));
+            }
+        }
+        Ok(closed)
+    }
+
+    /// CAD-250 N2: the alias's actor stopped (stop, fence, shutdown, any
+    /// exit) — its queued nudges are cancelled, never pasted later.
+    pub fn cancel_nudges_for(&self, alias: &str, reason: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let closed = Self::cancel_nudges_in(&tx, Some(alias), reason, None)?;
+        tx.commit()?;
+        Ok(closed)
+    }
+
+    /// CAD-250 N3: a nudge still queued `ttl` seconds after it was created
+    /// (a pane that stayed busy) is stale steering — cancelled at `now`.
+    pub fn expire_queued_nudges(&self, now: f64, ttl: f64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let closed = Self::cancel_nudges_in(&tx, None, "ttl", Some(now - ttl))?;
+        tx.commit()?;
+        Ok(closed)
+    }
+
+    /// CAD-250: finish a turn from its worker's `message result` — only
+    /// while it is still `running`, checked in the same transaction as the
+    /// write. `Ok(None)` when it is not (the report bound or a reconcile
+    /// got there first): nothing written, and the caller refuses or
+    /// dedupes against the returned current row. The report and the
+    /// expiry can never both win.
+    pub fn finish_running(
+        &self,
+        message_id: &str,
+        status: &str,
+        result: &Value,
+        error: Option<&str>,
+    ) -> Result<std::result::Result<Message, Option<Message>>> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let current = self.message_in(&tx, message_id)?;
+        let Some(current) = current.filter(|m| m.state == "running") else {
+            return Ok(Err(self.message_in(&tx, message_id)?));
+        };
+        self.finish_in(&tx, &current, status, result, error)?;
+        tx.commit()?;
+        Ok(Ok(current))
+    }
+
+    /// CAD-250: move a delivered, unreported pty turn to `unknown` —
+    /// the report bound ran out, or a sibling's did and the actor fences.
+    /// Guarded in one transaction: a report or ack that landed after the
+    /// caller's read wins (`Ok(false)`, nothing written). `bound` is
+    /// `Some((secs, now))` when the row itself must still be overdue.
+    /// Otherwise the `unknown` finish is [`Store::finish`]'s:
+    /// `turn_finished`, the scoped `turn_unknown`, and exactly one
+    /// `worker_notice` to `reply_to` under its deterministic id —
+    /// never a result, never a replay.
+    pub fn expire_awaiting_report(
+        &self,
+        message_id: &str,
+        bound: Option<(u64, f64)>,
+        reason: &str,
+    ) -> Result<bool> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let Some(current) = self.message_in(&tx, message_id)? else {
+            return Ok(false);
+        };
+        let due = match bound {
+            Some((secs, now)) => current.report_overdue(secs, now),
+            None => current.holds_turn(),
+        };
+        if !due {
+            return Ok(false);
+        }
+        let stored = json!({"status": "unknown", "text": "", "error": reason,
+                            "via": "report_timeout", "turn_id": current.turn_id});
+        self.finish_in(&tx, &current, "unknown", &stored, Some(reason))?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn finish_in(
+        &self,
+        tx: &Connection,
+        message: &Message,
+        status: &str,
+        result: &Value,
+        error: Option<&str>,
+    ) -> Result<()> {
         if !matches!(status, "completed" | "failed" | "interrupted" | "unknown") {
             return Err(Error::internal(format!(
                 "Unexpected provider completion status: {status}"
             )));
         }
-        let conn = self.conn();
-        let tx = conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE messages SET state=?,result=?,error=?,completed=? WHERE id=?",
             params![status, result.to_string(), error, now(), message.id],
@@ -2561,7 +2832,7 @@ impl Store {
             params![now(), message.alias],
         )?;
         Self::event(
-            &tx,
+            tx,
             &message.alias,
             "turn_finished",
             json!({"message": message.id, "result": result}),
@@ -2580,7 +2851,7 @@ impl Store {
                     .optional()?;
                 if let Some(job_id) = job_id {
                     Self::event_scoped(
-                        &tx,
+                        tx,
                         &message.alias,
                         "turn_unknown",
                         json!({
@@ -2602,17 +2873,16 @@ impl Store {
         // slot free for the operator's later verdict (completed/failed)
         // or the interrupted notice.
         if status == "unknown" {
-            self.route_notice(&tx, message, "unknown", result)?;
+            self.route_notice(tx, message, "unknown", result)?;
         } else {
-            self.route_result(&tx, message, result)?;
+            self.route_result(tx, message, result)?;
         }
         // Task edge: normal completion of a task-attached kickoff moves
         // the task to review and binds head_sha to the reported commit.
         // Any other terminal leaves the task flagged where it stands.
         if status == "completed" {
-            self.task_on_completed(&tx, message, result)?;
+            self.task_on_completed(tx, message, result)?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -2854,7 +3124,7 @@ impl Store {
     pub fn has_unknown(&self, alias: &str) -> Result<bool> {
         let conn = self.conn();
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE alias=? AND state='unknown'",
+            &format!("SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL}"),
             [alias],
             |r| r.get(0),
         )?;
@@ -2871,8 +3141,9 @@ impl Store {
     pub fn preferred_unknown_error(&self, alias: &str) -> Result<Option<String>> {
         let conn = self.conn();
         match conn.query_row(
-            "SELECT error FROM messages
-             WHERE alias=? AND state='unknown' AND error IS NOT NULL
+            &format!(
+                "SELECT error FROM messages
+             WHERE alias=? AND {FENCING_UNKNOWN_SQL} AND error IS NOT NULL
              ORDER BY
                CASE error
                  WHEN 'Uncertain provider outcome requires review' THEN 3
@@ -2881,7 +3152,8 @@ impl Store {
                  ELSE 0
                END,
                seq DESC
-             LIMIT 1",
+             LIMIT 1"
+            ),
             [alias],
             |row| row.get(0),
         ) {
@@ -2891,12 +3163,14 @@ impl Store {
         }
     }
 
-    /// Ids of the alias's `unknown` messages, oldest first — what
-    /// `agent unfence` reconciles in one call.
+    /// Ids of the alias's fencing `unknown` messages, oldest first — what
+    /// `agent unfence` reconciles in one call. An unconfirmed nudge is
+    /// `unknown` too but fences nothing, so it is not listed (CAD-250).
     pub fn unknown_messages(&self, alias: &str) -> Result<Vec<String>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT id FROM messages WHERE alias=? AND state='unknown' ORDER BY seq")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL} ORDER BY seq"
+        ))?;
         let ids = stmt
             .query_map([alias], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -2987,11 +3261,12 @@ impl Store {
         // operator stop: a restart must not relaunch a worker the
         // operator never resumed. `agent resume` is the next move.
         let remaining: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM messages WHERE alias=? AND state='unknown'",
+            &format!("SELECT COUNT(*) FROM messages WHERE alias=? AND {FENCING_UNKNOWN_SQL}"),
             [&message.alias],
             |r| r.get(0),
         )?;
-        if remaining == 0 {
+        // A nudge's unknown never fenced, so reconciling it lifts nothing.
+        if remaining == 0 && !message.is_nudge() {
             tx.execute(
                 "UPDATE agents SET state='stopped',enabled=0,updated=? \
                  WHERE alias=? AND state='attention'",
@@ -3762,9 +4037,11 @@ impl Store {
         self.message_in(&conn, id)
     }
 
-    /// The agent's in-flight turn, if any — at most one message per
-    /// alias is `running` at a time (the actor loop is serial). The
-    /// stall watch and the view surfaces both read this.
+    /// The agent's in-flight turn, if any — the actor loop is serial and
+    /// holds one report-owing turn at a time (CAD-250); a routed
+    /// notification is `running` only for its paste. The newest row wins
+    /// when legacy rows overlap. The stall watch and the view surfaces
+    /// both read this.
     pub fn running_message(&self, alias: &str) -> Result<Option<Message>> {
         let conn = self.conn();
         match conn.query_row(
@@ -3779,17 +4056,82 @@ impl Store {
         }
     }
 
-    /// Providers with at least one in-flight turn — the WAL watcher
-    /// refuses to checkpoint a store whose provider is mid-turn.
-    pub fn busy_providers(&self) -> Result<std::collections::HashSet<String>> {
+    /// CAD-250: the agent's delivered, unreported pty turns, oldest
+    /// first. One at most once `take_queued` holds the line; more only
+    /// for rows that accumulated before it did (adopted on a hot
+    /// restart), which the report bound then retires.
+    pub fn awaiting_reports(&self, alias: &str) -> Result<Vec<Message>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT * FROM messages WHERE alias=? AND state='running' ORDER BY seq")?;
+        let rows = stmt.query_map([alias], row_message)?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter(Message::awaiting_report).collect())
+    }
+
+    /// CAD-250: every row holding the alias's turn ([`Message::holds_turn`]),
+    /// oldest first — marked `awaiting_report` or not. The report bound
+    /// walks these.
+    pub fn held_turns(&self, alias: &str) -> Result<Vec<Message>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT * FROM messages WHERE alias=? AND state='running' ORDER BY seq")?;
+        let rows = stmt.query_map([alias], row_message)?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter(Message::holds_turn).collect())
+    }
+
+    /// Queued deliveries that are turns of their own — what an
+    /// unreported turn holds back (routed notifications still pass).
+    pub fn queued_turns(&self, alias: &str) -> Result<i64> {
+        let conn = self.conn();
+        Ok(conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND state='queued'
+                 AND source NOT IN {TURNLESS_SOURCES_SQL}"
+            ),
+            [alias],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Providers with at least one *live* in-flight turn — the WAL
+    /// watcher refuses to checkpoint a store whose provider is mid-turn.
+    /// Live (CAD-250) means the alias has an actor (`live`, the daemon's
+    /// owned set) and, for a delivered pty turn awaiting its report, the
+    /// report bound has not run out at `now`: a stale row on a dead actor
+    /// or an overdue one never defers a checkpoint.
+    pub fn busy_providers(&self, live: &HashSet<String>, now: f64) -> Result<HashSet<String>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT a.provider FROM agents a
-             JOIN messages m ON m.alias = a.alias
+            "SELECT a.provider AS agent_provider, a.params AS agent_params,
+                    a.endpoint_kind AS agent_kind, m.*
+             FROM agents a JOIN messages m ON m.alias = a.alias
              WHERE m.state IN ('submitting','running')",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
+        let rows = stmt.query_map([], |r| {
+            let params: Option<String> = r.get("agent_params")?;
+            Ok((
+                r.get::<_, String>("agent_provider")?,
+                params.and_then(|p| serde_json::from_str::<Value>(&p).ok()),
+                r.get::<_, String>("agent_kind")? == "pty",
+                row_message(r)?,
+            ))
+        })?;
+        let mut busy = HashSet::new();
+        for row in rows {
+            let (provider, params, pty, message) = row?;
+            if !live.contains(&message.alias) {
+                continue;
+            }
+            // The report bound is a pty rule: a managed turn is live
+            // while its provider call runs, however long.
+            if pty && message.report_overdue(report_timeout_secs(params.as_ref()), now) {
+                continue;
+            }
+            busy.insert(provider);
+        }
+        Ok(busy)
     }
 
     /// Bound a non-agent event stream to its newest `keep` rows — the
@@ -6396,6 +6738,298 @@ mod tests {
             _ => panic!("expected a message"),
         }
         assert!(matches!(s.take_queued("a1").unwrap(), Take::Empty));
+    }
+
+    /// CAD-250: while a delivered turn awaits its report, the actor's
+    /// next claim is held — the second turn stays `queued` (never
+    /// refused) while routed notifications still pass. The bound moves
+    /// the overdue turn to `unknown` exactly once, with one notice to
+    /// its `reply_to`; an ack restarts the clock; a report that already
+    /// landed wins over the expiry.
+    #[test]
+    fn unreported_turn_holds_the_queue_until_bounded() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "pm", &cwd);
+        reg(&s, "w2", &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "one", Some("pm"), "m1", "user").unwrap();
+        s.enqueue("w1", "two", Some("pm"), "m2", "user").unwrap();
+        let Take::Message(m1) = s.take_queued("w1").unwrap() else {
+            panic!("m1 must be claimed");
+        };
+        s.mark_running(&m1.id, "pty-g-m1").unwrap();
+        let m1 = s.message("m1").unwrap().unwrap();
+        // Between turn start and the submitted marker the row is
+        // `running` but not yet `awaiting_report` — it still holds.
+        assert!(!m1.awaiting_report());
+        assert!(matches!(s.take_queued("w1").unwrap(), Take::Empty));
+        s.mark_submitted(&m1).unwrap();
+        let m1 = s.message("m1").unwrap().unwrap();
+        assert!(m1.awaiting_report());
+        assert_eq!(m1.to_json()["awaiting_report"], true);
+        assert!(matches!(s.take_queued("w1").unwrap(), Take::Empty));
+        assert_eq!(s.message("m2").unwrap().unwrap().state, "queued");
+        assert_eq!(s.queued_turns("w1").unwrap(), 1);
+        assert_eq!(
+            s.awaiting_reports("w1")
+                .unwrap()
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1"]
+        );
+
+        // A routed notification overtakes the held turn.
+        s.enqueue("w2", "side", Some("w1"), "x1", "user").unwrap();
+        let Take::Message(x1) = s.take_queued("w2").unwrap() else {
+            panic!("x1 must be claimed");
+        };
+        s.finish(
+            &x1,
+            "completed",
+            &json!({"status": "completed", "text": "ok"}),
+            None,
+        )
+        .unwrap();
+        let Take::Message(routed) = s.take_queued("w1").unwrap() else {
+            panic!("the routed result must pass the hold");
+        };
+        assert_eq!(routed.source, "worker_result");
+        assert_eq!(s.message("m2").unwrap().unwrap().state, "queued");
+
+        // An ack restarts the clock; the bound counts from it.
+        let delivered = m1.report_clock().unwrap();
+        s.mark_ack(&m1, Some("on it")).unwrap();
+        let m1 = s.message("m1").unwrap().unwrap();
+        let acked = m1.report_clock().unwrap();
+        assert!(acked >= delivered);
+        assert!(m1.awaiting_report(), "an ack does not finish the turn");
+        assert!(!m1.report_overdue(0, acked + 1e9), "0 disables the bound");
+        assert!(!s
+            .expire_awaiting_report("m1", Some((10, acked + 5.0)), "r")
+            .unwrap());
+        assert_eq!(s.message("m1").unwrap().unwrap().state, "running");
+
+        // Past the bound: unknown, one notice, never a result.
+        assert!(s
+            .expire_awaiting_report("m1", Some((10, acked + 11.0)), "bound ran out")
+            .unwrap());
+        let m1 = s.message("m1").unwrap().unwrap();
+        assert_eq!(m1.state, "unknown");
+        assert_eq!(m1.result.as_ref().unwrap()["via"], "report_timeout");
+        assert!(!s
+            .expire_awaiting_report("m1", Some((10, acked + 99.0)), "again")
+            .unwrap());
+        let notices: Vec<Message> = s
+            .messages("pm")
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.source == "worker_notice" && m.body.contains("\"m1\""))
+            .collect();
+        assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+        assert!(!s
+            .messages("pm")
+            .unwrap()
+            .iter()
+            .any(|m| m.source == "worker_result" && m.body.contains("\"m1\"")));
+
+        // The hold lifts once the owed turn is resolved.
+        let Take::Message(next) = s.take_queued("w1").unwrap() else {
+            panic!("m2 must be claimed once m1 resolved");
+        };
+        assert_eq!(next.id, "m2");
+
+        // A report that lands before the expiry wins.
+        s.mark_running("m2", "pty-g-m2").unwrap();
+        let m2 = s.message("m2").unwrap().unwrap();
+        s.mark_submitted(&m2).unwrap();
+        let m2 = s.message("m2").unwrap().unwrap();
+        s.finish(
+            &m2,
+            "completed",
+            &json!({"status": "completed", "text": "done"}),
+            None,
+        )
+        .unwrap();
+        assert!(!s
+            .expire_awaiting_report("m2", Some((1, m2.report_clock().unwrap() + 9.0)), "late")
+            .unwrap());
+        assert!(!s.expire_awaiting_report("m2", None, "late").unwrap());
+        assert_eq!(s.message("m2").unwrap().unwrap().state, "completed");
+    }
+
+    /// CAD-250 nudges: claimed past a held turn, never holding it; an
+    /// unconfirmed nudge's `unknown` fences nothing; a nudge still queued
+    /// at restart is cancelled with an event, never replayed.
+    #[test]
+    fn nudge_passes_the_hold_never_fences_and_never_replays() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "task", None, "t1", "user").unwrap();
+        s.enqueue("w1", "next", None, "t2", "user").unwrap();
+        s.enqueue("w1", "steer", None, "n1", NUDGE_SOURCE).unwrap();
+        s.enqueue("w1", "steer again", None, "n2", NUDGE_SOURCE)
+            .unwrap();
+        let Take::Message(t1) = s.take_queued("w1").unwrap() else {
+            panic!("t1 must be claimed");
+        };
+        s.mark_running(&t1.id, "pty-g-t1").unwrap();
+        let Take::Message(n1) = s.take_queued("w1").unwrap() else {
+            panic!("the nudge must pass the held turn");
+        };
+        assert_eq!(n1.id, "n1");
+        assert!(n1.is_nudge() && n1.to_json()["nudge"] == true);
+        // An unconfirmed nudge: unknown, yet no fence and no unfence item.
+        s.finish(
+            &n1,
+            "unknown",
+            &json!({"status": "unknown"}),
+            Some("unconfirmed"),
+        )
+        .unwrap();
+        assert!(!s.has_unknown("w1").unwrap());
+        assert!(s.unknown_messages("w1").unwrap().is_empty());
+        assert_eq!(s.message("t2").unwrap().unwrap().state, "queued");
+        // Restart: n2 (still queued) is cancelled with an event; t2 stays.
+        drop(s);
+        let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
+        let n2 = s.message("n2").unwrap().unwrap();
+        assert_eq!(n2.state, "cancelled");
+        assert_eq!(n2.result.as_ref().unwrap()["via"], "restart_cancelled");
+        assert_eq!(s.message("t2").unwrap().unwrap().state, "queued");
+        assert!(s
+            .events("w1", 0, 500)
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "nudge_cancelled" && e.payload["message"] == "n2"));
+        // The crash path fences the held turn — and only it: the
+        // unconfirmed nudge is still no unfence item.
+        assert_eq!(s.unknown_messages("w1").unwrap(), ["t1"]);
+    }
+
+    /// CAD-250 F1: a worker's report reads `running`, the report bound's
+    /// expiry commits `unknown` (+ one notice) before the report writes —
+    /// the report's guarded finish then refuses: the row stays `unknown`
+    /// and exactly one routed message (the notice) exists, no result.
+    #[test]
+    fn report_racing_the_expiry_never_both_win() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "pm", &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "task", Some("pm"), "m1", "user").unwrap();
+        let Take::Message(m1) = s.take_queued("w1").unwrap() else {
+            panic!("m1 must be claimed");
+        };
+        s.mark_running(&m1.id, "pty-g-m1").unwrap();
+        let m1 = s.message("m1").unwrap().unwrap();
+        s.mark_submitted(&m1).unwrap();
+        // The report's read: `running`.
+        let seen = s.message("m1").unwrap().unwrap();
+        assert_eq!(seen.state, "running");
+        // The expiry commits in between.
+        let clock = seen.report_clock().unwrap();
+        assert!(s
+            .expire_awaiting_report("m1", Some((10, clock + 11.0)), "bound ran out")
+            .unwrap());
+        // The report's write: refused, judged against the current row.
+        let stored = json!({"status": "completed", "text": "done", "via": "pty_report"});
+        let outcome = s.finish_running("m1", "completed", &stored, None).unwrap();
+        let current = outcome.expect_err("the report must not win after the expiry");
+        assert_eq!(current.unwrap().state, "unknown");
+        assert_eq!(s.message("m1").unwrap().unwrap().state, "unknown");
+        let routed: Vec<String> = s
+            .messages("pm")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.source)
+            .collect();
+        assert_eq!(routed, ["worker_notice"], "one notice, no result");
+        // And the other order: a report first wins, the expiry refuses.
+        s.enqueue("w1", "task 2", Some("pm"), "m2", "user").unwrap();
+        let Take::Message(m2) = s.take_queued("w1").unwrap() else {
+            panic!("m2 must be claimed");
+        };
+        s.mark_running(&m2.id, "pty-g-m2").unwrap();
+        assert!(s
+            .finish_running("m2", "completed", &stored, None)
+            .unwrap()
+            .is_ok());
+        assert!(!s.expire_awaiting_report("m2", None, "late").unwrap());
+        assert_eq!(s.message("m2").unwrap().unwrap().state, "completed");
+    }
+
+    /// CAD-250 F2: a pty row that holds the turn without the `submitted`
+    /// marker (adopted between `mark_running` and `mark_submitted`) is
+    /// bounded from `started` like any other — the hold and the bound
+    /// share one predicate — and stops deferring checkpoints past it.
+    #[test]
+    fn unmarked_running_row_is_bounded_too() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "task", None, "m1", "user").unwrap();
+        s.enqueue("w1", "next", None, "m2", "user").unwrap();
+        let Take::Message(m1) = s.take_queued("w1").unwrap() else {
+            panic!("m1 must be claimed");
+        };
+        s.mark_running(&m1.id, "pty-g-m1").unwrap();
+        let m1 = s.message("m1").unwrap().unwrap();
+        assert!(!m1.awaiting_report() && m1.holds_turn());
+        assert!(matches!(s.take_queued("w1").unwrap(), Take::Empty));
+        let started = m1.report_clock().unwrap();
+        assert_eq!(Some(started), m1.started);
+        assert_eq!(s.held_turns("w1").unwrap().len(), 1);
+        let live: HashSet<String> = ["w1".to_string()].into();
+        assert!(!s.busy_providers(&live, started + 60.0).unwrap().is_empty());
+        let past = started + DEFAULT_REPORT_TIMEOUT_SECS as f64 + 1.0;
+        assert!(s.busy_providers(&live, past).unwrap().is_empty());
+        assert!(!s
+            .expire_awaiting_report(
+                "m1",
+                Some((DEFAULT_REPORT_TIMEOUT_SECS, started + 60.0)),
+                "r"
+            )
+            .unwrap());
+        assert!(s
+            .expire_awaiting_report("m1", Some((DEFAULT_REPORT_TIMEOUT_SECS, past)), "r")
+            .unwrap());
+        assert_eq!(s.message("m1").unwrap().unwrap().state, "unknown");
+    }
+
+    /// CAD-250 N3: a nudge still queued past its TTL is cancelled with a
+    /// `nudge_cancelled` event (reason `ttl`); a younger one and a
+    /// non-nudge are untouched. The clock is injected — no sleeps.
+    #[test]
+    fn queued_nudge_expires_after_its_ttl() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "steer", None, "n1", NUDGE_SOURCE).unwrap();
+        s.enqueue("w1", "task", None, "t1", "user").unwrap();
+        let created = s.message("n1").unwrap().unwrap().created;
+        assert!(s
+            .expire_queued_nudges(created + 899.0, 900.0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(s.message("n1").unwrap().unwrap().state, "queued");
+        let closed = s.expire_queued_nudges(created + 901.0, 900.0).unwrap();
+        assert_eq!(closed, [("n1".to_string(), "w1".to_string())]);
+        let n1 = s.message("n1").unwrap().unwrap();
+        assert_eq!(n1.state, "cancelled");
+        assert_eq!(n1.result.as_ref().unwrap()["via"], "ttl_cancelled");
+        assert_eq!(s.message("t1").unwrap().unwrap().state, "queued");
+        let ev = s
+            .last_event_of("w1", &["nudge_cancelled"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.payload["reason"], "ttl");
+        assert!(s
+            .expire_queued_nudges(created + 9e9, 900.0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -436,6 +436,13 @@ enum Commands {
         /// Force the ready claim past a busy probe verdict.
         #[arg(long, requires = "ready")]
         force: bool,
+        /// Mid-turn steering (pty only): paste into the live pane without
+        /// owning a turn — passes the one-running-turn hold, owes no
+        /// report, completes when the paste is confirmed, never replayed
+        /// after a daemon restart. Live pane only; at most 500 chars;
+        /// takes no `--reply-to` or `--task`.
+        #[arg(long, conflicts_with_all = ["ready", "reply_to", "task"])]
+        nudge: bool,
     },
     /// One-step issue dispatch: `issue start` (idempotent, owner =
     /// the worker) then exactly one templated kickoff message, a
@@ -1801,6 +1808,13 @@ enum MessageAction {
         /// Force the ready claim past a busy probe verdict.
         #[arg(long, requires = "ready")]
         force: bool,
+        /// Mid-turn steering (pty only): paste into the live pane without
+        /// owning a turn — passes the one-running-turn hold, owes no
+        /// report, completes when the paste is confirmed, never replayed
+        /// after a daemon restart. Live pane only; at most 500 chars;
+        /// takes no `--reply-to` or `--task`.
+        #[arg(long, conflicts_with_all = ["ready", "reply_to", "task"])]
+        nudge: bool,
     },
     /// Send and wait for the turn's terminal state.
     Ask {
@@ -2012,6 +2026,7 @@ fn send_message(
     ready: bool,
     force: bool,
     task: Option<String>,
+    nudge: bool,
 ) -> Result<(Value, bool)> {
     let body = read_body(text, file)?;
     // --ready IS the operator's explicit claim — and the claim probes
@@ -2038,7 +2053,7 @@ fn send_message(
         "agent_send",
         json!({"alias": alias, "text": body,
                "message": message, "reply_to": reply_to,
-               "task": task}),
+               "task": task, "nudge": nudge}),
     )?;
     // CAD-251: a stale mailbox still accepted the message — say so on
     // stderr so stdout stays the JSON receipt.
@@ -2549,8 +2564,11 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
                     .chars()
                     .take(50)
                     .collect::<String>();
+                // CAD-250: a delivered pty turn still owed its report is
+                // named as such, not as an ordinary running turn.
                 json!({"id": m["id"], "age_secs": (now - started).max(0.0) as u64,
-                       "text": head})
+                       "text": head,
+                       "awaiting_report": m["awaiting_report"].as_bool().unwrap_or(false)})
             });
         // One probe per pty agent per invocation — and only for an
         // agent that actually has a pane (a live endpoint); a stopped
@@ -2596,6 +2614,9 @@ fn status_view(state_dir: &Path, group: Option<&str>) -> Result<Value> {
             "dead": a["dead"].as_bool().unwrap_or(false),
             "resumable": a["resumable"].as_bool().unwrap_or(false),
             "running": running,
+            // CAD-250: the daemon's `awaiting_report` view (wait, bound,
+            // queued behind it) — null when no turn awaits a report.
+            "awaiting_report": a["awaiting_report"].clone(),
             "queued": queued,
             "unknown": unknown,
             "pane": pane,
@@ -2658,6 +2679,9 @@ fn print_status_table(view: &Value) {
             }
             if a["cwd_deleted"].as_bool().unwrap_or(false) {
                 flags.push("cwd_deleted");
+            }
+            if a["awaiting_report"].is_object() {
+                flags.push("awaiting_report");
             }
             let pane = a["pane"]["verdict"].as_str().unwrap_or("-").to_string();
             let issues = a["issues"]
@@ -4490,11 +4514,12 @@ fn run() -> Result<i32> {
             task,
             ready,
             force,
+            nudge,
         } => {
             // Identical path to `message send` — the verb form is sugar,
             // not a second implementation.
             let (result, _) = send_message(
-                &state_dir, &alias, text, file, message, reply_to, ready, force, task,
+                &state_dir, &alias, text, file, message, reply_to, ready, force, task, nudge,
             )?;
             print_json(&result);
             Ok(0)
@@ -4585,8 +4610,9 @@ fn run() -> Result<i32> {
                     task,
                     ready,
                     force,
+                    nudge,
                 } => send_message(
-                    &state_dir, &alias, text, file, message, reply_to, ready, force, task,
+                    &state_dir, &alias, text, file, message, reply_to, ready, force, task, nudge,
                 )?,
                 MessageAction::Ack {
                     message,

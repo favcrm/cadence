@@ -885,7 +885,8 @@ payload at read time — nothing is stored; `cadence overview [--json]
 | 20 | `approval_menu` — a sampled pty approval menu | team | the agent's PM (`params.upstream`) | `cadence agent answer <a> <choice>` |
 | 30 | `fenced` — agent in `attention` | team | the agent's PM | `cadence agent unfence <a>` |
 | 40 | `stalled` — turn silent past the fence threshold | team | the agent's PM | `cadence agent show <a>` |
-| 40 | `silent_end` — turn ended at an idle pane, never reported | team | the agent's PM | `cadence send <a> --ready --text "continue …"` |
+| 40 | `silent_end` — turn ended at an idle pane, never reported | team | the agent's PM | `cadence send <a> --nudge --text "finish and report …"` (a nudge owns no turn, so it pastes past the unreported one; `cadence agent attach <a>` is the manual alternative — CAD-250) |
+| 40 | `awaiting_report` — a delivered pty turn still owes its report while other turns queue behind it (CAD-250) | team | the agent's PM | `cadence agent show <a>` |
 | 50 | `drift` — merged commits not running while every pane is idle | dependency | — | `cadence daemon restart --when-idle --ui` |
 | 60 | `pr_no_verdict` — open PR with no `qa-verdict` status | team | the issue owner | `gh pr view <n> --repo <slug>` |
 | 70 | `review_no_pr` — issue in `review` with no open `pr` ref and no `cadence/<id>-…` PR branch | team | the issue owner | `cadence issue show <id>` |
@@ -931,6 +932,7 @@ minutes):
 | `blocked_ready` | the newest of its blockers' status clocks (when the last one reached done) |
 | `fenced` | the earliest `completed` of the agent's `unknown` messages; a fence without one (a disconnect while idle, a restart mismatch) uses the row's `updated` — every write that enters `attention` stamps it, so it is a lower bound on time fenced |
 | `stalled` / `silent_end` | `now − silent_secs` / `now − ended_secs` from the daemon's stall view |
+| `awaiting_report` | `now − awaiting_report.since_secs` — delivery, or the latest ack |
 | `inbox_stale` | `now − oldest_unread_age_secs` |
 | `merge` | the latest check completion or status post on the head's rollup (merge-ready since) |
 | `pr_no_verdict` | the earliest check start on the head's rollup — a head with no checks has none |
