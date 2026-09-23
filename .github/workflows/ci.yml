@@ -263,7 +263,7 @@ jobs:
   #                                         manifest.json at the root;
   #                                         the UI is embedded (--features ui)
   #   cadence-<tag>-<target>.tar.gz.sha256  its `sha256sum` line
-  # plus install.sh. The tarball's three files are the ones `cadence
+  # plus scripts/install.sh as `install.sh`. The tarball's three files are the ones `cadence
   # upgrade` keeps in a release dir. Linux builds on 22.04 runners so the
   # binary needs glibc 2.35, not 2.39.
   release-gate:
@@ -343,6 +343,8 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          # macOS tar would add AppleDouble `._*` entries.
+          COPYFILE_DISABLE: 1
         run: |
           set -euo pipefail
           # shasum ships on both Linux and macOS runners; sha256sum does not.
@@ -390,6 +392,13 @@ jobs:
     needs: [release-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # A `v*` tag runs the ci.yml OF THE TAGGED COMMIT, so a tag on an
+    # unmerged commit could drop release-gate. Repo settings close that:
+    # the `release` environment needs a reviewer and admits only `v*`
+    # tags, the "release tags" ruleset (23893821) makes v* tags admin-only,
+    # and releases are immutable once published. Consumers verify the
+    # attestation's --source-ref and --signer-workflow (INSTALL-AGENT.md).
+    environment: release
     permissions:
       contents: write
       id-token: write
@@ -399,9 +408,10 @@ jobs:
       # repo is read, and nothing from it runs.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          sparse-checkout: install.sh
+          sparse-checkout: scripts/install.sh
           sparse-checkout-cone-mode: false
           path: src
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-${{ github.ref_name }}-*
@@ -419,12 +429,20 @@ jobs:
             listing=$(tar -tzf "$asset" | sort | tr '\n' ' ')
             test "$listing" = "cadence cadence.sha256 manifest.json "
           done
-          cp ../src/install.sh install.sh
+          cp ../src/scripts/install.sh install.sh
           ls -l
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/*.tar.gz
-      - name: Create or update the GitHub Release
+          subject-path: |
+            dist/*.tar.gz
+            dist/install.sh
+      # Published bytes never change under a tag (and immutable releases
+      # refuse uploads once published). A new release is created as a
+      # draft with every asset, then published last. A draft left by a
+      # failed run was never public, so its assets may be replaced. For a
+      # published release nothing is uploaded: its assets must be
+      # byte-identical to this run's (a no-op re-run), or the job fails.
+      - name: Publish the GitHub Release
         working-directory: dist
         env:
           TAG: ${{ github.ref_name }}
@@ -432,15 +450,57 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            # A re-run replaces the assets of the same tag.
-            gh release upload "$TAG" --clobber ./*.tar.gz ./*.sha256 install.sh
-          else
-            pre=()
-            case "$TAG" in *-*) pre=(--prerelease) ;; esac
-            gh release create "$TAG" --verify-tag --title "cadence $TAG" \
-              --generate-notes "${pre[@]}" ./*.tar.gz ./*.sha256 install.sh
+          assets=(./*.tar.gz ./*.sha256 install.sh)
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" = true ]; then
+              gh release upload "$TAG" --clobber "${assets[@]}"
+              gh release edit "$TAG" --draft=false
+              exit 0
+            fi
+            mkdir ../published
+            gh release download "$TAG" --dir ../published
+            (cd ../published && find . -maxdepth 1 -type f -printf '%f\n' | sort) > ../published.list
+            printf '%s\n' "${assets[@]#./}" | sort > ../ours.list
+            if ! diff ../ours.list ../published.list; then
+              echo "release $TAG is already published with a different asset list" >&2
+              exit 1
+            fi
+            for f in "${assets[@]#./}"; do
+              if ! cmp -s "$f" "../published/$f"; then
+                echo "release $TAG is already published and $f differs — refusing to replace it" >&2
+                exit 1
+              fi
+            done
+            echo "release $TAG is already published with identical assets"
+            exit 0
           fi
+          pre=()
+          case "$TAG" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$TAG" --draft --verify-tag --title "cadence $TAG" \
+            --generate-notes "${pre[@]}" "${assets[@]}"
+          gh release edit "$TAG" --draft=false
+
+  # CAD-311: prove the non-x86_64 builds on every PR and queue entry, not
+  # first at a tag. Plain `cargo build` (no UI embed): what differs per
+  # target is the Rust code under cfg gates and the C/linker toolchain.
+  # macOS minutes are free for this public repo.
+  cross-build:
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux
+            runner: ubuntu-22.04-arm
+          - target: aarch64-macos
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo build --locked
+      - run: target/debug/cadence --version
 
   # CAD-109 backstop: gitleaks, an implementation independent of cadence's
   # in-process scanner, runs over the PR's own commits (base..head) with its
