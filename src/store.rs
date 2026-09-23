@@ -3373,6 +3373,27 @@ impl Store {
         Ok(events)
     }
 
+    /// The newest event of any of `kinds` for `alias` — the pty lane
+    /// reads its recorded pane-root identity and whether that tree was
+    /// already reaped this way (CAD-201). Events outlive the endpoint
+    /// fields `set_state_detached` clears, so a fenced pane's identity
+    /// is still here when `agent stop` comes.
+    pub fn last_event_of(&self, alias: &str, kinds: &[&str]) -> Result<Option<Event>> {
+        let conn = self.conn();
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT seq,alias,kind,payload,job_id,task_id,at FROM events
+             WHERE alias=? AND kind IN ({placeholders}) ORDER BY seq DESC LIMIT 1"
+        );
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&alias];
+        args.extend(kinds.iter().map(|k| k as &dyn rusqlite::ToSql));
+        match conn.query_row(&sql, args.as_slice(), row_event) {
+            Ok(event) => Ok(Some(event)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(other) => Err(other.into()),
+        }
+    }
+
     /// The newest `limit` events in the job view, oldest first —
     /// `events_tail` for the `job events` stream.
     pub fn job_events_tail(&self, job_id: &str, limit: i64) -> Result<Vec<Event>> {

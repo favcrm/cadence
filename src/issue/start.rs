@@ -22,6 +22,9 @@ pub struct JobArgs {
     pub pm: String,
     pub spec: PathBuf,
     pub assignee: Option<String>,
+    /// CAD-202 `--force`: bind an assignee whose pty pane cwd is
+    /// outside the project's repos; the override is recorded.
+    pub force: bool,
 }
 
 pub struct StartArgs {
@@ -71,7 +74,7 @@ pub(crate) fn names(id: &str, title: &str, name: Option<&str>) -> Result<(String
 }
 
 /// The project's declared repo roots, canonicalized.
-fn declared_repos(project: &project::Project) -> Vec<PathBuf> {
+pub(crate) fn declared_repos(project: &project::Project) -> Vec<PathBuf> {
     project
         .repos
         .iter()
@@ -212,6 +215,19 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         None => None,
     };
     let (project, dir) = write::issue_dir(pm, id)?;
+    // CAD-202: a pty assignee whose pane cwd is deleted or outside the
+    // project's repos refuses here, before anything is created.
+    let cwd_override = match &args.job {
+        Some(JobArgs {
+            assignee: Some(assignee),
+            force,
+            ..
+        }) => {
+            let show = client::rpc(state_dir, "agent_show", json!({"alias": assignee}))?;
+            crate::issue::dispatch::check_lane_cwd(&project, assignee, &show["agent"], *force)?
+        }
+        _ => None,
+    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = resolve_repo(&project, args.repo.as_deref(), &cwd)?;
     let (base, base_sha) = resolve_base(&root, args.base.as_deref())?;
@@ -452,6 +468,11 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         out["job"] = json!(job_id.clone());
         // `job_new` mints exactly one task — `<job>-t1` — scoped above.
         out["task"] = json!(format!("{job_id}-t1"));
+    }
+    if let Some(note) = cwd_override {
+        // The override is part of the issue's record, not just output.
+        write::add_comment(pm, id, &note, None, Some("dispatch"), None, actor)?;
+        out["cwd_override"] = json!(note);
     }
     Ok(out)
 }

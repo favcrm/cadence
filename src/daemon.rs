@@ -1211,6 +1211,9 @@ impl Shared {
                 if let Some(view) = self.stall_view(&alias) {
                     view.apply(&mut agent_json);
                 }
+                if agent.endpoint_kind == "pty" {
+                    self.pty_lane_facts(&agent, &mut agent_json);
+                }
                 // The briefing lives under the state dir — actors read
                 // it there, never inside their cwd repository. The path
                 // is advertised only while the file exists; a missing
@@ -3482,6 +3485,10 @@ impl Shared {
         if self.store.agent(&alias)?.state != "attention" {
             self.store.set_agent_state(&alias, "stopping", None)?;
         }
+        // CAD-201: the pane root identity is read while the agent row
+        // still names its live generation — the actor's exit clears it.
+        let pane_tree =
+            (agent.endpoint_kind == "pty").then(|| self.owned_pane_root(&alias, &agent));
         if let Some(ctl) = ctl {
             self.stop_ctls(&[ctl]);
         }
@@ -3490,6 +3497,25 @@ impl Shared {
         // actor's own close() already ran, so this is a no-op for it.
         if agent.endpoint_kind == "pty" {
             adapter::pty::kill_pane(&self.state_dir, &alias, &self.provider_env);
+        }
+        match pane_tree {
+            Some(Ok(Some(root))) => {
+                // The drain is bounded but long (60s by default) — it
+                // runs on its own thread, never in this RPC or an actor.
+                let shared = Arc::clone(self);
+                let owned = alias.clone();
+                thread::spawn(move || shared.reap_pane_tree(&owned, &root));
+            }
+            Some(Err(reason)) => {
+                let _ = self.store.event_public(
+                    &alias,
+                    "pane_tree_unowned",
+                    json!({"reason": reason,
+                           "note": "no process was signalled beyond the pane itself"}),
+                );
+            }
+            // Not pty, or this tree was already reaped.
+            Some(Ok(None)) | None => {}
         }
         // The actor writes its own terminal state on exit; do not mask a
         // fence it may have raised while finishing.
@@ -3503,6 +3529,143 @@ impl Shared {
         };
         self.wake();
         Ok(json!({"alias": alias, "state": state}))
+    }
+
+    /// CAD-201: the pane-root identity `agent stop` may reap by —
+    /// the newest `pane_root` record, provided it belongs to the
+    /// endpoint generation the agent row still names (when it names
+    /// one). `Ok(None)`: the newest record is already a reap result,
+    /// so a repeated stop signals nothing. `Err`: the tree is unowned
+    /// — nothing recorded (an agent opened before CAD-201), an
+    /// unreadable root, or a stale generation — and nothing is
+    /// signalled.
+    fn owned_pane_root(
+        &self,
+        alias: &str,
+        agent: &Agent,
+    ) -> std::result::Result<Option<adapter::pty::lane::PaneRoot>, String> {
+        let latest = self
+            .store
+            .last_event_of(alias, PANE_TREE_KINDS)
+            .map_err(|e| format!("pane root record unreadable: {e}"))?;
+        let Some(event) = latest else {
+            return Err("no pane root identity was recorded for this agent \
+                        (its pane was opened before CAD-201)"
+                .to_string());
+        };
+        match event.kind.as_str() {
+            "pane_root" => {}
+            "pane_root_unrecorded" => {
+                return Err("the pane root's identity was unreadable at open".to_string())
+            }
+            _ => return Ok(None),
+        }
+        let root = adapter::pty::lane::PaneRoot::from_json(&event.payload)
+            .ok_or_else(|| "the recorded pane root identity is malformed".to_string())?;
+        if let Some(current) = agent.generation.as_deref() {
+            if current != root.generation {
+                return Err(format!(
+                    "the recorded pane root belongs to generation {}, the endpoint \
+                     is at {current}",
+                    root.generation
+                ));
+            }
+        }
+        Ok(Some(root))
+    }
+
+    /// CAD-201: reap what is left of a stopped pane's session — off
+    /// the actor loop and the RPC thread. Intent, result and residue
+    /// land as `pane_tree_reap_intent` / `pane_tree_reaped` (or
+    /// `pane_tree_reap_refused`) events on the agent's stream. The
+    /// action-time check re-reads the newest pane record: a reopen
+    /// whose root sits on the recorded session id stops the reap.
+    fn reap_pane_tree(&self, alias: &str, root: &adapter::pty::lane::PaneRoot) {
+        use adapter::pty::lane;
+        let drain = self
+            .provider_env
+            .var("CADENCE_PTY_DRAIN_SECS")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s >= 0.0)
+            .map(Duration::from_secs_f64)
+            .unwrap_or(lane::DEFAULT_DRAIN);
+        let opts = lane::ReapOptions {
+            drain,
+            ..lane::ReapOptions::default()
+        };
+        let still_ours = || -> std::result::Result<(), String> {
+            let latest = self
+                .store
+                .last_event_of(alias, &["pane_root"])
+                .map_err(|e| format!("pane root record unreadable at action time: {e}"))?;
+            match latest.and_then(|e| lane::PaneRoot::from_json(&e.payload)) {
+                Some(newer) if newer != *root && newer.sid == root.sid => Err(format!(
+                    "a newer endpoint (generation {}) recorded a pane root on the \
+                     same session id {}",
+                    newer.generation, root.sid
+                )),
+                _ => Ok(()),
+            }
+        };
+        let on_intent = |members: &[lane::Member]| {
+            let members: Vec<Value> = members
+                .iter()
+                .map(|m| json!({"pid": m.pid, "start_time": m.start_time}))
+                .collect();
+            let _ = self.store.event_public(
+                alias,
+                "pane_tree_reap_intent",
+                json!({"root": root.to_json(), "members": members,
+                       "drain_secs": opts.drain.as_secs_f64()}),
+            );
+        };
+        let report = lane::reap_session(root, &opts, &still_ours, &on_intent);
+        let kind = if report.refused.is_some() {
+            "pane_tree_reap_refused"
+        } else {
+            "pane_tree_reaped"
+        };
+        let mut payload = report.to_json();
+        payload["root"] = root.to_json();
+        let _ = self.store.event_public(alias, kind, payload);
+    }
+
+    /// CAD-201/CAD-202 facts for `agent show`: the recorded pane root
+    /// (and whether it is the live generation's), and — while the
+    /// endpoint is live — the pane's cwd with `cwd_deleted`. The cwd
+    /// is read only when the row's pid is still the recorded root
+    /// process (same start time), never from a reused pid.
+    fn pty_lane_facts(&self, agent: &Agent, j: &mut Value) {
+        use adapter::pty::lane;
+        let root = self
+            .store
+            .last_event_of(&agent.alias, &["pane_root"])
+            .ok()
+            .flatten()
+            .and_then(|e| lane::PaneRoot::from_json(&e.payload));
+        j["pane_root"] = match &root {
+            Some(r) => {
+                let mut v = r.to_json();
+                v["current"] = json!(agent.generation.as_deref() == Some(r.generation.as_str()));
+                v
+            }
+            None => Value::Null,
+        };
+        let live_pid = agent
+            .pid
+            .filter(|_| agent.endpoint.is_some())
+            .and_then(|p| u32::try_from(p).ok());
+        let cwd = live_pid.and_then(|pid| {
+            let proven = match &root {
+                Some(r) if r.pid == pid => r.check() == lane::RootState::Same,
+                // No record for this pid (older open): the row's pid is
+                // the live pane the actor verified — read-only use.
+                _ => true,
+            };
+            proven.then(|| lane::pane_cwd(pid)).flatten()
+        });
+        j["cwd_deleted"] = json!(cwd.as_ref().is_some_and(|c| c.deleted));
+        j["pane_cwd"] = cwd.map(|c| c.to_json()).unwrap_or(Value::Null);
     }
 
     /// Interrupt every actor, wait one bounded grace, force-close the
@@ -4640,6 +4803,15 @@ fn wal_pass(
     }
     let _ = store.prune_stream(DAEMON_ALIAS, DAEMON_EVENTS_KEEP);
 }
+
+/// Event kinds that settle a pty lane's tree ownership (CAD-201): the
+/// newest of these decides what `agent stop` may reap.
+const PANE_TREE_KINDS: &[&str] = &[
+    "pane_root",
+    "pane_root_unrecorded",
+    "pane_tree_reaped",
+    "pane_tree_reap_refused",
+];
 
 fn ctl_finished(ctl: &AgentCtl) -> bool {
     ctl.thread

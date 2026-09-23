@@ -174,6 +174,11 @@ pub enum IssueAction {
         /// Assignee for the worktree-scoped task.
         #[arg(long, requires = "job")]
         assignee: Option<String>,
+        /// Bind the task even when the assignee's pty pane cwd lies
+        /// outside every repo of the issue's project (CAD-202). The
+        /// override is recorded as an issue comment.
+        #[arg(long, requires = "assignee")]
+        force: bool,
     },
     /// Finish an issue's worktree: refuse while the worktree is in use
     /// (a live message recorded against it, a pane tree or any process
@@ -612,6 +617,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             pm,
             spec,
             assignee,
+            force,
         } => {
             let pm_dir = open_pm()?;
             let args = start::StartArgs {
@@ -624,6 +630,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                         pm: pm.clone().unwrap_or_default(),
                         spec: spec.clone().unwrap_or_default(),
                         assignee: assignee.clone(),
+                        force: *force,
                     })
                 } else {
                     None

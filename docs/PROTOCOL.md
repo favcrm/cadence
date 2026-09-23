@@ -418,6 +418,70 @@ file's mode, never born world-readable. In every permission mode a
 worker's `cadence self`/`message result` then runs without an
 approval menu.
 
+**Process tree (CAD-201) — what `agent stop` promises for pane
+children.** tmux starts each pane's command as a session leader, so
+the pane root's pid is the session id every descendant inherits —
+including MCP servers that move to their own process group and so
+outlive a `kill-session`. At every open (and hot-restart adoption)
+the adapter records the root's identity as a `pane_root` event:
+`{pid, start_time, sid, session_leader, generation}`, with
+`start_time` from `/proc/<pid>/stat` field 22. `agent show` reports it
+as `pane_root` (`current: true` when it belongs to the live
+generation). On `agent stop`, after the pane is killed, a background
+thread (never the actor loop or the RPC) reaps what is left of that
+session:
+
+1. The identity is read while the agent row still names its
+   generation; a record from another generation is refused.
+2. Members are the live, non-zombie processes whose session id equals
+   the recorded `sid` and that started no earlier than the root. If
+   the root pid now belongs to a different process (start time
+   differs — pid reuse), nothing is signalled.
+3. `pane_tree_reap_intent` records the members; each gets SIGTERM
+   only after its pid + start time + session are re-verified (pinned
+   through a pidfd, so the check and the signal hit the same process).
+4. A bounded drain — 60s by default, the time ops measured MCP
+   children take to exit after stdin EOF (`CADENCE_PTY_DRAIN_SECS`
+   overrides it) — re-samples every 250ms.
+5. Survivors whose identity still matches are SIGKILLed, after the
+   generation/reopen check runs again. `pane_tree_reaped` records
+   `terminated`, `exited`, `killed` and `residue` (anything still in
+   the session at the final sample, e.g. a process forked during the
+   drain, which is never signalled). A refusal is
+   `pane_tree_reap_refused` with its reason.
+
+Limits: a process that calls `setsid` itself leaves the pane's
+session and is not found — cadence does not promise its cleanup.
+Nothing is ever signalled by pid alone, nothing outside the recorded
+session is touched, and a daemon running inside the pane's own
+session refuses to reap. An agent whose pane was opened before this
+record existed (or whose root was unreadable at open) gets
+`pane_tree_unowned` on stop and no signal beyond the pane's own
+`kill-session`. A repeated stop reaps nothing: the newest record is
+already the reap result. `agent remove`/`agent gc` kill a fenced pane
+but do not reap its session — `agent stop` it first. Daemon shutdown
+detaches panes and reaps nothing.
+
+**Working directory (CAD-202).** While the endpoint is live, `agent
+show` reports `pane_cwd` `{path, deleted, pid}` — read from
+`/proc/<pid>/cwd` of the terminal's foreground group leader when it is
+in the pane's session (tmux's `pane_current_path`), else of the pane
+root — and `cwd_deleted`; `cadence status` carries `cwd_deleted` and
+flags the row. A pane whose cwd was deleted (its worktree removed
+under it) refuses every delivery at the gate with `cwd_deleted: …`:
+the message stays `queued` (a `gate_wait` event, like any gate
+refusal), never failed. `cadence dispatch` and `issue start --job
+--assignee` refuse a pty worker whose live pane cwd is deleted
+(`cwd_deleted`, not overridable) or outside every declared repo of
+the issue's project (`cwd_outside_project`; a linked worktree under
+the repo counts as inside). `--force` overrides the project check and
+records the override as an issue comment (`Dispatch override
+(--force, cwd_outside_project): …`) and as `cwd_override` in the
+output. Plain `cadence send` is not project-checked, nor is a worker
+with no live pane (it opens in its registered cwd); `cadence job
+dispatch` of an existing task is not project-checked either. The
+delivery gate's deleted-cwd refusal applies to every path.
+
 **Submission gates.** `run_turn` requires all of: pane alive,
 `pane_dead=0`, `pane_in_mode=0`, native ownership still held, a screen
 probe showing no approval menu, and a fresh unconsumed claim — either
@@ -981,7 +1045,8 @@ approval_menu, approval_answered, turn_silent_end,
 turn_stalled, turn_resumed, monitor_registered, monitor_alert,
 monitor_alert_ack, monitor_degraded, monitor_dispatch,
 monitor_dispatch_blocked, monitor_dispatch_resolved, monitor_off,
-stop_requested`. `wait>0` long-polls
+stop_requested, pane_root, pane_root_unrecorded, pane_tree_reap_intent,
+pane_tree_reaped, pane_tree_reap_refused, pane_tree_unowned`. `wait>0` long-polls
 up to 30s.
 
 Two page shapes. Forward paging sends `after` — rows above the cursor,
