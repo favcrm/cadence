@@ -35,6 +35,10 @@ export CADENCE_SUITE_LOCK="$HOME/.local/state/cadence/suite.lock"   # one path p
 cadence session start         # the gate below as one verb — exit 0 go / 1 warnings / 2 no-go
 cadence session start --fix   # same, plus the reversible fixes only:
                               #  daemon start, ui start, ui tailscale start
+cadence session start --all   # judge every project, not just the cwd repo's
+cadence session ack <key> --reason "<why>" --expires 3d
+                              # park a known item: it warns, not fails, until expiry
+cadence session ack --list    # every acknowledgement, expired ones marked expired
 ```
 
 `session start` runs, in order: `host` (`doctor --host`), `binary`
@@ -46,9 +50,39 @@ live owner, open PRs on `cadence/` branches with no local worktree,
 `.cadence/wt/*` dirs with neither an open PR nor an open issue) and
 `inbox` (unread mailbox queues). Every line prints `ok`/`warn`/`fail`
 with a one-line remedy; `--fix` only ever starts things, never
-restarts a running daemon, never removes anything. `--project <key>`
-scopes the tracker reads and repo scans to one project — an unknown
-key is an error, same as `issue ls --project`.
+restarts a running daemon, never removes anything.
+
+**Scope.** The gate judges one project: the one whose declared repo
+holds the cwd (the same remote-then-path match `issue` uses, minus
+`CADENCE_PROJECT` — an ambient variable never narrows the gate), or
+`--project <key>` (an unknown key is an error, same as `issue ls
+--project`). Reconcile and inbox findings that belong to other
+projects collapse into one `others` line — item count and worst
+severity per project — which never raises the exit above `1`.
+`--all` restores the fleet-wide gate. Run outside every known project
+repo, the gate judges every project, as `--all`, and its `scope:` line
+says so. A finding is attributed from its issue's project, its repo
+checkout, or its agent (cwd under a declared checkout, else the one
+project whose open issues it owns); a finding nothing attributes stays
+in scope. Host checks are machine-wide and always in scope.
+
+**Acknowledgements.** Every finding prints a key in brackets —
+`[reconcile:<message-id>]`, `[fenced:<alias>]`, `[doing:<ISSUE>]`,
+`[worktree:<path>]`, `[inbox:<alias>]`, `[host:<check>]`. `cadence
+session ack <key> --reason <text> --expires <90m|12h|3d|YYYY-MM-DDTHH:MM:SSZ>`
+records who, why and until when in `<state>/sessions/acks.json`; the
+expiry may be at most 14 days out. While an ack is live the finding
+downgrades from `fail` to `warn` and still prints, with `(acknowledged
+until …: reason)`; after expiry it fails again and prints
+`(acknowledgement expired …)`. Records are appended, never pruned:
+`--list` shows expired ones as expired. An unreadable ack store adds
+an `acks` warn row and applies no acknowledgement.
+
+**Kill remedies.** Where a host check suggests signalling processes
+(orphans, the biggest FIFO holders), the remedy is one line per pid
+naming what it is, read from `/proc` at report time — `kill 456663  #
+node  cwd=/…/.cadence/wt/x (deleted)  age=17h`. A pid that exited
+before the report is omitted. `doctor --host` prints the same lines.
 
 Then bring the workers back:
 
@@ -587,8 +621,11 @@ cwd lives under its repo checkouts — the rest are reported and left
 alone), and `agent gc` is skipped outright because it is fleet-wide —
 the row says so. The host sweep is a report, not a gate: its findings
 cap at `warn` and never set exit 2 — a full disk is `session start`'s
-job to refuse. Only the run's own failures (a sweep RPC error, an
-unwritable handoff) exit 2. Both verbs accept a hidden `--host-report
+job to refuse. It prints the same `[host:<check>]` keys, ack notes
+and named kill lines as `session start`; `session end` runs no
+reconcile or inbox checks, so the cwd scope does not apply to it.
+Only the run's own failures (a sweep RPC error, an unwritable
+handoff) exit 2. Both verbs accept a hidden `--host-report
 <path>` that reads a saved `doctor --host` JSON report instead of
 scanning — tests and debug only; the run is labelled `fixture <path>
 — real host not scanned` in text and `host_source` in `--json`, an

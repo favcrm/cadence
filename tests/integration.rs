@@ -26446,3 +26446,271 @@ fn issue_comment_and_report_refuse_credential_shaped_text() {
     assert_eq!(v["secret_warnings"][0]["rule"], "generic-api-key", "{v}");
     assert_eq!(count(), 1);
 }
+
+// ---- CAD-257: session gate scope, expiring acks ----
+
+/// `cadence session start` stdout+stderr and exit code.
+fn session_text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// An idle agent holding one `unknown` message — a reconcile `fail`
+/// keyed `reconcile:<id>`.
+fn unknown_msg_agent(alias: &str, id: &str) -> StubAgent {
+    stub_agent(
+        alias,
+        "fake",
+        "fake",
+        "idle",
+        60,
+        (
+            vec![json!({"id": id, "state": "unknown", "body": "lost turn"})],
+            0,
+            1,
+        ),
+    )
+}
+
+/// An acknowledged item warns until its expiry and fails after it —
+/// the expired record is written straight into the store (no sleeps),
+/// and `ack --list` keeps it, marked expired.
+#[test]
+fn session_start_ack_downgrades_until_expiry() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+    );
+    seed_pm(&pm, &repo, &tmp.path().join("notes"));
+    seed_repo(&repo);
+    let _sd = stub_daemon(
+        &state,
+        cadence_agent::overview::BUILD_COMMIT,
+        vec![unknown_msg_agent("w1", "m-unk")],
+    );
+    let host = clean_host(tmp.path());
+    let start = || run_session_host(&state, &pm, &repo, &["session", "start"], &host, &[]);
+
+    let out = start();
+    let text = session_text(&out);
+    assert_eq!(out.status.code(), Some(2), "unacked fails:\n{text}");
+    assert!(text.contains("[reconcile:m-unk]"), "key printed:\n{text}");
+    assert!(text.contains("cadence session ack <key>"), "hint:\n{text}");
+
+    // A credential-shaped reason is refused by CAD-109's scan before
+    // the store is written. The synthetic token is assembled at run
+    // time so no credential-shaped literal is committed.
+    let token = ["gh", "p_", "0123456789abcdefghij", "ABCDEFGHIJ012345"].concat();
+    let reason = format!("token {token}");
+    let out = run_session(
+        &state,
+        &pm,
+        &repo,
+        &[
+            "session",
+            "ack",
+            "reconcile:m-unk",
+            "--reason",
+            &reason,
+            "--expires",
+            "1d",
+        ],
+    );
+    let text = session_text(&out);
+    assert!(!out.status.success(), "secret reason accepted:\n{text}");
+    assert!(
+        text.contains("credential-shaped") && !text.contains(&token),
+        "{text}"
+    );
+
+    // Refusals: past the 14-day cap, in the past, no reason.
+    for args in [
+        vec![
+            "session",
+            "ack",
+            "reconcile:m-unk",
+            "--reason",
+            "x",
+            "--expires",
+            "15d",
+        ],
+        vec![
+            "session",
+            "ack",
+            "reconcile:m-unk",
+            "--reason",
+            "x",
+            "--expires",
+            "2020-01-01T00:00:00Z",
+        ],
+        vec![
+            "session",
+            "ack",
+            "reconcile:m-unk",
+            "--reason",
+            " ",
+            "--expires",
+            "1d",
+        ],
+    ] {
+        let out = run_session(&state, &pm, &repo, &args);
+        assert!(
+            !out.status.success(),
+            "{args:?} accepted:\n{}",
+            session_text(&out)
+        );
+    }
+    assert!(
+        !state.join("sessions/acks.json").exists(),
+        "a refusal wrote the store"
+    );
+
+    let out = run_session(
+        &state,
+        &pm,
+        &repo,
+        &[
+            "session",
+            "ack",
+            "reconcile:m-unk",
+            "--reason",
+            "known lost turn",
+            "--expires",
+            "2d",
+        ],
+    );
+    assert!(out.status.success(), "{}", session_text(&out));
+    let out = start();
+    let text = session_text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "acked fail downgrades to warn:\n{text}"
+    );
+    assert!(
+        text.contains("[reconcile:m-unk]"),
+        "an ack never hides the item:\n{text}"
+    );
+    assert!(
+        text.contains("(acknowledged until") && text.contains("known lost turn"),
+        "ack reason shown:\n{text}"
+    );
+
+    // Expired: the same record with an expiry already past.
+    let store = state.join("sessions/acks.json");
+    let mut acks: Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+    assert_eq!(acks["acks"][0]["key"], "reconcile:m-unk");
+    assert!(acks["acks"][0]["actor"]
+        .as_str()
+        .is_some_and(|a| !a.is_empty()));
+    acks["acks"][0]["expires"] = json!("2026-01-01T00:00:00Z");
+    std::fs::write(&store, acks.to_string()).unwrap();
+    let out = start();
+    let text = session_text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expired ack fails again:\n{text}"
+    );
+    assert!(
+        text.contains("(acknowledgement expired 2026-01-01T00:00:00Z"),
+        "{text}"
+    );
+
+    let out = run_session(&state, &pm, &repo, &["session", "ack", "--list", "--json"]);
+    let list: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list["acks"].as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list["acks"][0]["state"], "expired", "{list}");
+}
+
+/// Default scope is the cwd repo's project: another project's failing
+/// item collapses to the `others` summary and cannot no-go the gate;
+/// `--all` judges it again, and a cwd outside every project repo
+/// behaves as `--all` and says so.
+#[test]
+fn session_start_scopes_to_cwd_project() {
+    let tmp = TempDir::new().unwrap();
+    let (state, pm, repo, other) = (
+        tmp.path().join("state"),
+        tmp.path().join("pm"),
+        tmp.path().join("repo"),
+        tmp.path().join("other-repo"),
+    );
+    seed_pm(&pm, &repo, &tmp.path().join("notes"));
+    seed_repo(&repo);
+    std::fs::create_dir_all(pm.join("oth")).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        pm.join("oth/project.yaml"),
+        format!(
+            "key: oth\nprefix: OTH\nrepos:\n- path: {}\n",
+            other.display()
+        ),
+    )
+    .unwrap();
+    let _sd = stub_daemon(
+        &state,
+        cadence_agent::overview::BUILD_COMMIT,
+        vec![unknown_msg_agent("ow", "m-oth").with_cwd(&other)],
+    );
+    let host = clean_host(tmp.path());
+
+    let out = run_session_host(&state, &pm, &repo, &["session", "start"], &host, &[]);
+    let text = session_text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "other project's fail capped at warn:\n{text}"
+    );
+    assert!(text.contains("scope: project tst"), "{text}");
+    assert!(text.contains("others"), "summary row:\n{text}");
+    assert!(
+        text.contains("oth 1 (worst fail)"),
+        "per-project count:\n{text}"
+    );
+    assert!(
+        !text.contains("[reconcile:m-oth]"),
+        "collapsed, not listed:\n{text}"
+    );
+    // The cwd project's own findings are still judged and listed.
+    assert!(text.contains("tst-88-ghost"), "{text}");
+
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--all"],
+        &host,
+        &[],
+    );
+    let text = session_text(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--all judges every project:\n{text}"
+    );
+    assert!(text.contains("[reconcile:m-oth]"), "{text}");
+
+    let out = run_session_host(
+        &state,
+        &pm,
+        &repo,
+        &["session", "start", "--project", "oth", "--json"],
+        &host,
+        &[],
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{v}");
+    assert_eq!(v["scope"]["project"], "oth");
+
+    // Outside any project repo: fleet-wide, with the reason printed.
+    let out = run_session_host(&state, &pm, tmp.path(), &["session", "start"], &host, &[]);
+    let text = session_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("not inside a known project repo"), "{text}");
+}
