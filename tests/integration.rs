@@ -6710,6 +6710,309 @@ fn agent_remove_and_gc_sweep() {
     d.rpc("agent_show", json!({"alias": "dv1"})).unwrap();
 }
 
+/// `agent_remove_forced` events on the daemon stream.
+fn forced_removals(d: &TestDaemon) -> Vec<Value> {
+    d.rpc("agent_events", json!({"alias": "daemon", "after": 0}))
+        .unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "agent_remove_forced")
+        .cloned()
+        .collect()
+}
+
+/// CAD-284: a queued message refuses removal and is named; `--force`
+/// removes anyway and records it.
+#[test]
+fn agent_remove_refuses_queued_message_and_force_overrides() {
+    let d = TestDaemon::start();
+    d.register("w1");
+    d.wait_agent("w1", "idle", 10);
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "later", "message": "m-queued"}),
+    )
+    .unwrap();
+    assert_eq!(d.message_state("w1", "m-queued"), "queued");
+
+    let err = d
+        .rpc("agent_remove", json!({"alias": "w1"}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("message m-queued (queued)") && err.contains("--force"),
+        "{err}"
+    );
+    assert_eq!(d.message_state("w1", "m-queued"), "queued");
+    assert!(forced_removals(&d).is_empty());
+
+    d.rpc("agent_remove", json!({"alias": "w1", "force": true}))
+        .unwrap();
+    assert!(d.rpc("agent_show", json!({"alias": "w1"})).is_err());
+    let forced = forced_removals(&d);
+    assert_eq!(forced.len(), 1, "{forced:?}");
+    assert_eq!(forced[0]["payload"]["alias"], "w1");
+    assert_eq!(
+        forced[0]["payload"]["messages"],
+        json!([["m-queued", "queued"]])
+    );
+}
+
+/// CAD-284: a non-terminal task assigned to the alias refuses removal
+/// (through the CLI); `agent remove --force` overrides and records it.
+#[test]
+fn agent_remove_refuses_non_terminal_task_and_cli_force_overrides() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.wait_agent("w1", "idle", 10);
+    let (spec, sha) = d.spec_file("spec.md", "open task");
+    d.job_new("pm", "j1", &spec, &sha);
+    d.rpc(
+        "task_new",
+        json!({"job": "j1", "task": "j1-fix", "assignee": "w1"}),
+    )
+    .unwrap();
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+
+    let remove = |extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(["agent", "remove", "w1"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let out = remove(&[]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "removal with an open task succeeded");
+    assert!(
+        err.contains("task j1-fix (draft)") && err.contains("--force"),
+        "{err}"
+    );
+    d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert!(forced_removals(&d).is_empty());
+
+    let out = remove(&["--force"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(d.rpc("agent_show", json!({"alias": "w1"})).is_err());
+    let forced = forced_removals(&d);
+    assert_eq!(forced.len(), 1, "{forced:?}");
+    assert_eq!(forced[0]["payload"]["tasks"], json!([["j1-fix", "draft"]]));
+    // The task itself is untouched — reassign with `job dispatch --to`.
+    assert_eq!(d.task_state("j1-fix"), "draft");
+}
+
+/// CAD-284: removing a finished worker and its reviewer keeps the job
+/// history they carried — kickoff, verdict message and job-scoped
+/// events — while unreferenced history is still pruned. Re-joining the
+/// same aliases (the provider-change path) never redelivers it.
+#[test]
+fn agent_remove_keeps_job_history() {
+    let d = TestDaemon::start();
+    d.register("pm");
+    d.register_member("w1", "pm");
+    d.register("qa");
+    d.wait_agent("w1", "idle", 10);
+    d.wait_agent("qa", "idle", 10);
+    let (spec, sha) = d.spec_file("spec.md", "keep history");
+    d.job_new("pm", "j1", &spec, &sha);
+    d.rpc(
+        "task_new",
+        json!({"job": "j1", "task": "j1-fix", "assignee": "w1",
+               "acceptance": format!("tests pass REPORT_SHA:{SHA_A}")}),
+    )
+    .unwrap();
+
+    // Unreferenced history: prunable, as before.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "chat", "message": "chat-1"}),
+    )
+    .unwrap();
+    d.wait_message("w1", "chat-1", &["completed"], 15);
+
+    let kickoff = d.job_dispatch("j1-fix", json!({})).unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    d.wait_message("w1", &kickoff, &["completed"], 15);
+    d.wait_task("j1-fix", "review", 15);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "qa", "text": "review j1-fix", "message": "qa-report"}),
+    )
+    .unwrap();
+    d.wait_message("qa", "qa-report", &["completed"], 15);
+    d.rpc(
+        "task_verdict",
+        json!({"task": "j1-fix", "sha": SHA_A, "verdict": "pass",
+               "reviewer": "qa", "message": "qa-report"}),
+    )
+    .unwrap();
+    assert_eq!(d.task_state("j1-fix"), "verified");
+
+    for alias in ["w1", "qa"] {
+        d.rpc("agent_stop", json!({"alias": alias})).unwrap();
+        d.wait_agent(alias, "stopped", 15);
+        d.rpc("agent_remove", json!({"alias": alias})).unwrap();
+    }
+
+    let task = d.rpc("job_show", json!({"job": "j1"})).unwrap()["job"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "j1-fix")
+        .unwrap()
+        .clone();
+    assert!(task.get("attention").is_none(), "{task}");
+    assert_eq!(task["kickoff"]["id"], kickoff.as_str(), "{task}");
+    assert_eq!(task["kickoff"]["state"], "completed", "{task}");
+    assert_eq!(task["latest_verdict"]["message"], "qa-report", "{task}");
+    let shown = d.rpc("task_show", json!({"task": "j1-fix"})).unwrap();
+    let ids: Vec<&str> = shown["task"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(ids.contains(&kickoff.as_str()), "{ids:?}");
+    let kinds: Vec<String> = d.rpc("job_events", json!({"job": "j1"})).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["kind"].as_str().map(str::to_string))
+        .collect();
+    for k in ["task_running", "task_reported", "verdict_recorded"] {
+        assert!(
+            kinds.iter().any(|have| have == k),
+            "missing {k} in {kinds:?}"
+        );
+    }
+
+    // Re-join under the same aliases: the kept rows resolve, the
+    // unreferenced chat is gone, nothing is redelivered.
+    d.register_member("w1", "pm");
+    d.register("qa");
+    d.wait_agent("w1", "idle", 10);
+    d.wait_agent("qa", "idle", 10);
+    let messages = |alias: &str| -> Vec<(String, String)> {
+        d.rpc("agent_show", json!({"alias": alias})).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["id"].as_str().unwrap().to_string(),
+                    m["state"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(messages("w1"), vec![(kickoff.clone(), "completed".into())]);
+    assert_eq!(
+        messages("qa"),
+        vec![("qa-report".into(), "completed".into())]
+    );
+}
+
+/// CAD-284 train finding with CAD-250: a job kickoff whose pty turn
+/// was never reported ends `unknown`. `--force` refuses to decide or
+/// discard that outcome; once reconciled it removes the agent, and the
+/// same alias re-registered starts idle and unfenced while `job show`
+/// still resolves the old kickoff.
+#[test]
+fn agent_remove_force_refuses_unknown_kickoff_and_rejoin_is_unfenced() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_stub();
+    d.register("pm");
+    d.wait_agent("pm", "idle", 10);
+    let params = json!({"auto_ready": "verified", "upstream": "pm"});
+    d.register_stub("w1", params.clone());
+    d.wait_agent("w1", "idle", 20);
+    let (spec, sha) = d.spec_file("spec.md", "unknown kickoff");
+    d.job_new("pm", "j1", &spec, &sha);
+    d.rpc(
+        "task_new",
+        json!({"job": "j1", "task": "j1-fix", "assignee": "w1"}),
+    )
+    .unwrap();
+    let kickoff = d.job_dispatch("j1-fix", json!({})).unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    pty_token(&d, "w1", &kickoff);
+    d.rpc(
+        "agent_set",
+        json!({"alias": "w1", "patch": {"report_timeout_secs": "1"}}),
+    )
+    .unwrap();
+    d.wait_message("w1", &kickoff, &["unknown"], 20);
+    d.wait_agent("w1", "attention", 20);
+
+    let err = d
+        .rpc("agent_remove", json!({"alias": "w1"}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("message {kickoff} (unknown)")),
+        "{err}"
+    );
+    let err = d
+        .rpc("agent_remove", json!({"alias": "w1", "force": true}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("message reconcile {kickoff}")),
+        "{err}"
+    );
+    assert_eq!(d.message_state("w1", &kickoff), "unknown");
+    assert!(forced_removals(&d).is_empty());
+
+    d.rpc(
+        "message_reconcile",
+        json!({"message": kickoff, "status": "interrupted"}),
+    )
+    .unwrap();
+    // The task is still open, so removal still needs --force.
+    d.rpc("agent_remove", json!({"alias": "w1", "force": true}))
+        .unwrap();
+    let forced = forced_removals(&d);
+    assert_eq!(forced.len(), 1, "{forced:?}");
+    assert_eq!(forced[0]["payload"]["messages"], json!([]), "{forced:?}");
+
+    d.register_stub("w1", params);
+    d.wait_agent("w1", "idle", 20);
+    let show = d.rpc("agent_show", json!({"alias": "w1"})).unwrap();
+    assert_eq!(show["unknown"], 0, "{show}");
+    assert_eq!(show["queued"], 0, "{show}");
+    let task = d.rpc("job_show", json!({"job": "j1"})).unwrap()["job"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "j1-fix")
+        .unwrap()
+        .clone();
+    assert_eq!(task["kickoff"]["id"], kickoff.as_str(), "{task}");
+    assert_eq!(task["kickoff"]["state"], "interrupted", "{task}");
+    // The new incarnation takes new work — nothing old fences it.
+    d.rpc(
+        "agent_send",
+        json!({"alias": "w1", "text": "fresh", "message": "fresh-1"}),
+    )
+    .unwrap();
+    pty_token(&d, "w1", "fresh-1");
+}
+
 #[test]
 fn fenced_agent_resume_hint() {
     let d = TestDaemon::start();
@@ -8720,11 +9023,44 @@ fn pty_stop_remove_gc_kill_surviving_panes() {
     // `agent stop` on a fenced agent is the explicit kill.
     d.rpc("agent_stop", json!({"alias": "dv-stop"})).unwrap();
     wait_pid_gone(&d.pane_file(&mock, "dv-stop", "pid"), 10);
-    // `agent remove` kills the pane before dropping the row.
+    // The fence's `unknown` message is open work (CAD-284): `agent
+    // remove` — even `--force` — refuses and leaves the pane alone;
+    // once reconciled, remove drops the row and kills the pane.
+    let err = d
+        .rpc("agent_remove", json!({"alias": "dv-rm"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("message m-dv-rm (unknown)"), "{err}");
+    let err = d
+        .rpc("agent_remove", json!({"alias": "dv-rm", "force": true}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("message reconcile m-dv-rm"), "{err}");
+    assert!(pid_alive(&d.pane_file(&mock, "dv-rm", "pid")));
+    d.rpc(
+        "message_reconcile",
+        json!({"message": "m-dv-rm", "status": "interrupted"}),
+    )
+    .unwrap();
     d.rpc("agent_remove", json!({"alias": "dv-rm"})).unwrap();
     wait_pid_gone(&d.pane_file(&mock, "dv-rm", "pid"), 10);
     assert!(d.rpc("agent_show", json!({"alias": "dv-rm"})).is_err());
-    // `agent gc` kills the dead agent's pane before dropping the row.
+    // `agent gc` never forces: it skips the fenced agent until its
+    // unknown is reconciled, then kills the pane with the row.
+    let swept = d.rpc("agent_gc", json!({})).unwrap();
+    assert!(
+        !swept["removed"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("dv-gc")),
+        "{swept}"
+    );
+    assert!(pid_alive(&d.pane_file(&mock, "dv-gc", "pid")));
+    d.rpc(
+        "message_reconcile",
+        json!({"message": "m-dv-gc", "status": "interrupted"}),
+    )
+    .unwrap();
     let swept = d.rpc("agent_gc", json!({})).unwrap();
     assert!(
         swept["removed"]

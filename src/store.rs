@@ -3907,12 +3907,22 @@ impl Store {
         Ok(())
     }
 
-    /// Explicit removal of a dead agent: the registry row plus its whole
-    /// message/event history drop in one transaction. A live endpoint
-    /// refuses — `agent stop` first — as does any state that could still
-    /// own or start a turn. Callers must hold the lifecycle check (the
-    /// daemon rejects removal of an owned alias before reaching here).
-    pub fn remove_agent(&self, alias: &str) -> Result<Agent> {
+    /// Explicit removal of a dead agent: the registry row plus the
+    /// history no job needs drop in one transaction (see
+    /// [`Store::prune_agent_history`]). A live endpoint refuses — `agent
+    /// stop` first — as does any state that could still own or start a
+    /// turn. Open work also refuses, naming it: a message not yet
+    /// completed/failed/interrupted/cancelled, or a non-terminal task
+    /// assigned to the alias (CAD-284). `force` overrides that check
+    /// only: queued/submitting messages are cancelled, running ones
+    /// interrupted, and one `agent_remove_forced` event on the daemon
+    /// stream names what was overridden. An `unknown` message refuses
+    /// even `force` until it is reconciled, so removal never deletes an
+    /// unknown row and never leaves one behind to fence a re-registered
+    /// alias. Callers must hold the lifecycle
+    /// check (the daemon rejects removal of an owned alias before
+    /// reaching here).
+    pub fn remove_agent(&self, alias: &str, force: bool) -> Result<Agent> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         let agent = self.agent_in(&tx, alias)?;
@@ -3933,11 +3943,94 @@ impl Store {
                 )));
             }
         }
-        tx.execute("DELETE FROM messages WHERE alias=?", [alias])?;
-        tx.execute("DELETE FROM events WHERE alias=?", [alias])?;
+        let open_messages: Vec<(String, String)> = tx
+            .prepare(
+                "SELECT id,state FROM messages WHERE alias=? AND state NOT IN
+                 ('completed','failed','interrupted','cancelled') ORDER BY seq",
+            )?
+            .query_map([alias], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let open_tasks: Vec<(String, String)> = tx
+            .prepare(
+                "SELECT id,state FROM tasks WHERE assignee=? AND state NOT IN
+                 ('verified','done','cancelled','failed') ORDER BY created",
+            )?
+            .query_map([alias], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !open_messages.is_empty() || !open_tasks.is_empty() {
+            let named = |kind: &str, rows: &[(String, String)]| {
+                rows.iter()
+                    .map(|(id, state)| format!("{kind} {id} ({state})"))
+                    .collect::<Vec<_>>()
+            };
+            let work = [named("message", &open_messages), named("task", &open_tasks)].concat();
+            if !force {
+                return Err(Error::rejected(format!(
+                    "Agent '{alias}' still has open work: {} — finish, cancel \
+                     or reassign it, or pass --force to remove anyway",
+                    work.join(", ")
+                )));
+            }
+            // An `unknown` outcome is never decided or discarded here:
+            // closing it would claim an outcome nobody learned, keeping
+            // it would fence a re-registered alias, deleting it would
+            // lose the evidence (CAD-284/CAD-304 S1). Reconcile first.
+            let unknown: Vec<&str> = open_messages
+                .iter()
+                .filter(|(_, state)| state == "unknown")
+                .map(|(id, _)| id.as_str())
+                .collect();
+            if let Some(first) = unknown.first() {
+                return Err(Error::rejected(format!(
+                    "--force cannot remove '{alias}' while message(s) {} are \
+                     unknown — reconcile the outcome first: `cadence message \
+                     reconcile {first} --status interrupted|completed|failed` \
+                     or `cadence agent unfence {alias} --no-resume`",
+                    unknown.join(", ")
+                )));
+            }
+            let error = format!("agent '{alias}' removed with --force");
+            tx.execute(
+                "UPDATE messages SET state='cancelled',error=?,completed=?
+                 WHERE alias=? AND state IN ('queued','submitting')",
+                params![error, now(), alias],
+            )?;
+            tx.execute(
+                "UPDATE messages SET state='interrupted',error=?,completed=?
+                 WHERE alias=? AND state='running'",
+                params![error, now(), alias],
+            )?;
+            Self::event(
+                &tx,
+                Self::DAEMON_STREAM,
+                "agent_remove_forced",
+                json!({"alias": alias, "messages": open_messages, "tasks": open_tasks}),
+            )?;
+        }
+        Self::prune_agent_history(&tx, alias)?;
         tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
         tx.commit()?;
         Ok(agent)
+    }
+
+    /// Drops a removed alias's message/event history except what job
+    /// history still resolves (CAD-284): messages attached to a task or
+    /// named as a task's `dispatch_message` or a verdict's `message`,
+    /// and job-scoped events. Those stay in place under the old alias so
+    /// `job show`/`job events`/`task show` read them unchanged.
+    fn prune_agent_history(tx: &Connection, alias: &str) -> Result<()> {
+        tx.execute(
+            "DELETE FROM messages WHERE alias=?1 AND task_id IS NULL
+             AND id NOT IN (SELECT dispatch_message FROM tasks
+                            WHERE dispatch_message IS NOT NULL)
+             AND id NOT IN (SELECT message FROM verdicts WHERE message IS NOT NULL)",
+            [alias],
+        )?;
+        tx.execute(
+            "DELETE FROM events WHERE alias=? AND job_id IS NULL",
+            [alias],
+        )?;
+        Ok(())
     }
 
     /// Agents eligible for an explicit `agent gc` sweep: dead endpoint
@@ -6226,7 +6319,8 @@ impl Store {
     /// enabled, and no message in any state but completed, failed,
     /// interrupted or cancelled (so queued, submitting, running,
     /// `unknown` and any state added later all keep the row) — then
-    /// deletes the row with its message/event history and records one
+    /// deletes the row, prunes its history as `remove_agent` does (job
+    /// history stays, CAD-284) and records one
     /// `agent_gc_removed` event on the daemon stream in the same commit.
     /// `Ok(None)`: no longer eligible (resumed, messaged or touched since
     /// it was listed). Records only — frees no memory and no disk, and
@@ -6256,8 +6350,7 @@ impl Store {
         if !eligible {
             return Ok(None);
         }
-        tx.execute("DELETE FROM messages WHERE alias=?", [alias])?;
-        tx.execute("DELETE FROM events WHERE alias=?", [alias])?;
+        Self::prune_agent_history(&tx, alias)?;
         tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
         Self::event(
             &tx,
@@ -7390,7 +7483,7 @@ mod tests {
         let m = run_kickoff(&s, &kickoff);
 
         s.set_state_detached("pm", "stopped", None).unwrap();
-        s.remove_agent("pm").unwrap();
+        s.remove_agent("pm", false).unwrap();
         let result = json!({"status": "completed", "text": "done", "sha": SHA40_A});
         s.finish(&m, "completed", &result, None).unwrap();
         // A repeated completion is an idempotent replay: it must not add a
@@ -7431,7 +7524,7 @@ mod tests {
         let m = run_kickoff(&s, &kickoff);
 
         s.set_state_detached("pm", "stopped", None).unwrap();
-        s.remove_agent("pm").unwrap();
+        s.remove_agent("pm", false).unwrap();
         reg(&s, "pm", &cwd);
         s.finish(
             &m,
@@ -7524,7 +7617,7 @@ mod tests {
         let cwd = dir.path().join("w");
         let _kickoff = seeded_task(&s, &cwd);
         s.set_state_detached("pm", "stopped", None).unwrap();
-        s.remove_agent("pm").unwrap();
+        s.remove_agent("pm", false).unwrap();
 
         s.job_notice("t1", "running", "stall:1", "worker is quiet")
             .unwrap();
@@ -9331,6 +9424,48 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .unwrap();
         assert_eq!(timeout, 5000);
+    }
+
+    /// CAD-284: the timer prunes like `agent remove` — the kickoff a
+    /// task references and job-scoped events outlive the row, an
+    /// unattached completed message does not.
+    #[test]
+    fn timer_gc_remove_keeps_job_history() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let kickoff = seeded_task(&s, &cwd);
+        let m = run_kickoff(&s, &kickoff);
+        s.finish(
+            &m,
+            "completed",
+            &json!({"status": "completed", "text": "done", "sha": SHA40_A}),
+            None,
+        )
+        .unwrap();
+        s.enqueue("w1", "chat", None, "m-chat", "user").unwrap();
+        s.conn()
+            .execute(
+                "UPDATE messages SET state='completed' WHERE id='m-chat'",
+                [],
+            )
+            .unwrap();
+        s.conn()
+            .execute(
+                "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
+                 updated=? WHERE alias='w1'",
+                params![now() - 30.0 * 86_400.0],
+            )
+            .unwrap();
+
+        assert!(s.timer_gc_remove("w1", 86_400.0).unwrap().is_some());
+        assert!(s.agent_opt("w1").unwrap().is_none());
+        assert_eq!(s.message(&kickoff).unwrap().unwrap().state, "completed");
+        assert!(s.message("m-chat").unwrap().is_none());
+        assert!(s
+            .job_events("j1", 0, 100)
+            .unwrap()
+            .iter()
+            .any(|e| e.alias == "w1" && e.kind == "task_running"));
     }
 
     /// CAD-199: the timer's guarded removal — the manual candidate rule
