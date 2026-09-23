@@ -32665,7 +32665,7 @@ fn model_defaults_register_resume_and_mock_argv() {
         .any(|cap| cap == "model_defaults"));
     let cwd = d.dir.path().to_str().unwrap();
     let doc_a = r#"{"expected_revision":0,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"baseline-a"},"roles":{"qa":{"mode":"model","model":"qa-model"},"dev":{"mode":"provider_default"}}}}}}"#;
-    d.rpc("model_defaults_set", json!({"document": doc_a}))
+    d.operator_rpc("model_defaults_set", json!({"document": doc_a}))
         .unwrap();
 
     let conflict = cadence_bin(
@@ -32796,7 +32796,7 @@ fn model_defaults_register_resume_and_mock_argv() {
     assert!(shown["agent"]["model_selection"]["revision"].is_null());
 
     let doc_b = r#"{"expected_revision":1,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"baseline-b"},"roles":{}}}}}"#;
-    d.rpc("model_defaults_set", json!({"document": doc_b}))
+    d.operator_rpc("model_defaults_set", json!({"document": doc_b}))
         .unwrap();
     d.rpc("agent_stop", json!({"alias": "qa-cli"})).unwrap();
     d.rpc("agent_resume", json!({"alias": "qa-cli"})).unwrap();
@@ -32869,6 +32869,72 @@ fn model_defaults_register_resume_and_mock_argv() {
         d.rpc("agent_show", json!({"alias": "qa-cli"})).unwrap()["agent"]["params"]["model"],
         "qa-model"
     );
+}
+
+/// CAD-337: model defaults decide the model every agent launches with,
+/// so `model_defaults_set` is operator authority on POSITIVE proof, the
+/// same gate as `slot_reconcile` and approval evidence. A pane and a
+/// managed agent's own process are refused naming the rule; the audit
+/// attribution is the verified connection's, and a request that tries
+/// to supply one is refused rather than read. Nothing refused lands.
+#[test]
+fn model_defaults_set_is_operator_only() {
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&d, "pane-1", pane.pid());
+    let mut wk = ManagedWorker::start(&d, "wk");
+    let doc = r#"{"expected_revision":0,"config":{"schema":1,"providers":{"claude":{"default":{"mode":"model","model":"forged-model"},"roles":{}}}}}"#;
+    let params = json!({"document": doc});
+    let refused = |r: &Value, route: &str, who: &str| {
+        assert_eq!(r["ok"], false, "{route}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("model defaults set is an operator action") && msg.contains(who),
+            "{route}: {r}"
+        );
+    };
+
+    let r = pane.rpc(&d.state, "model_defaults_set", params.clone());
+    refused(&r, "pane", "pane-1");
+    let r = wk.rpc("self", "model_defaults_set", params.clone());
+    refused(&r, "managed agent", "wk");
+    // Deriving no agent identity is not operator proof: a detach off
+    // the managed tool still carries its alias.
+    let r = wk.rpc("detached", "model_defaults_set", params.clone());
+    refused(&r, "managed detach", "not provably the operator");
+
+    // Attribution is connection-bound: even the operator cannot name
+    // who made the change.
+    for field in ["attribution", "by", "actor"] {
+        let mut forged = params.clone();
+        forged[field] = json!("somebody-else");
+        let err = d.operator_rpc("model_defaults_set", forged).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("'{field}'")),
+            "{field}: {err}"
+        );
+    }
+    let snap = d.rpc("model_defaults_get", json!({})).unwrap();
+    assert_eq!(
+        snap["revision"], 0,
+        "no refused caller changed defaults: {snap}"
+    );
+
+    let snap = d.operator_rpc("model_defaults_set", params).unwrap();
+    assert_eq!(snap["revision"], 1, "{snap}");
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let payloads: Vec<String> = conn
+        .prepare("SELECT payload FROM events WHERE kind='model_defaults_updated'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(payloads.len(), 1, "{payloads:?}");
+    let audit: Value = serde_json::from_str(&payloads[0]).unwrap();
+    assert_eq!(audit["attribution"], "operator", "{audit}");
+    assert_eq!(audit["transport"], "operator-connection", "{audit}");
 }
 
 /// Run the built CLI against `d`'s state dir.
