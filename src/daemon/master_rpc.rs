@@ -439,7 +439,11 @@ impl Shared {
         let thread = self.store.ensure_thread(ALIAS)?;
         if let Err(e) = self.launch_actor(ALIAS) {
             // No half-started master: the row goes with its launch.
-            let _ = self.store.remove_agent(ALIAS, true);
+            let _ = self.store.remove_agent(
+                ALIAS,
+                true,
+                &json!({"by": "operator", "by_kind": "operator"}),
+            );
             return Err(e);
         }
         let body = if briefing.len() <= BOOTSTRAP_INLINE_MAX {
