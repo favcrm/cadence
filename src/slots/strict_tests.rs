@@ -1437,3 +1437,53 @@ fn restart_revokes_runner_enrollments_but_keeps_their_holds() {
     s.reap_strict_holds(2.0);
     assert!(s.held.is_empty());
 }
+
+/// CAD-381: the caller identity verifier sees EVERY enrolled root on a
+/// chain (nested endpoints are an ambiguous caller), and only an
+/// unrevoked endpoint enrollment vouches for an agent — an expired one
+/// still does, a revoked one or a recycled root pid never does.
+#[test]
+fn enrolled_roots_on_counts_every_root_and_only_unrevoked_vouches() {
+    let p = tree();
+    // A second provider nested under the first one's shell.
+    p.spawn(600, 300, 90).spawn(610, 600, 91);
+    let mut s = strict_slots(&p, 2);
+    let outer = enroll(&mut s, "wk", "g1", 200);
+    assert_eq!(s.enrolled_roots_on(&[400, 300, 200, 100]), vec![2]);
+    assert!(s.enrolled_roots_on(&[500, 100]).is_empty());
+    let inner = enroll(&mut s, "wk2", "g1", 600);
+    assert_eq!(s.enrolled_roots_on(&[610, 600, 300, 200, 100]), vec![1, 3]);
+    assert_eq!(s.nearest_enrolled_root(&[610, 600, 300, 200, 100]), Some(1));
+
+    // Past the TTL the enrollment is `expired` — no new build work —
+    // but it still vouches for the endpoint's identity.
+    held_json(&mut s, ENROLLMENT_TTL_SECS + 1.0);
+    assert_eq!(s.enrollments[0].auth, AuthState::Expired);
+    // An expired owner is still revalidated: unchanged keeps it, even
+    // with another owner in the set.
+    assert_eq!(
+        s.enrolled_owners(),
+        vec!["wk".to_string(), "wk2".to_string()]
+    );
+    let same = HashMap::from([
+        ("wk".to_string(), Some("g1".to_string())),
+        ("wk2".to_string(), Some("g1".to_string())),
+    ]);
+    assert!(s.revalidate_owners(&same).is_empty());
+    assert_eq!(s.enrollments[0].auth, AuthState::Expired);
+    assert_eq!(
+        s.endpoint_enrollment(&outer)
+            .map(|e| e.owner_actor.as_str()),
+        Some("wk")
+    );
+    // Revoked never vouches.
+    s.revoke_owner("wk", "endpoint closed");
+    assert!(s.endpoint_enrollment(&outer).is_none());
+    assert!(s.endpoint_enrollment(&inner).is_some());
+    assert!(s.endpoint_enrollment("enr-unknown").is_none());
+
+    // The root pid recycled into another process: no longer a root.
+    p.kill(600);
+    p.spawn(600, 300, 95);
+    assert_eq!(s.enrolled_roots_on(&[610, 600, 300, 200, 100]), vec![3]);
+}

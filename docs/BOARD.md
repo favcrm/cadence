@@ -539,10 +539,16 @@ cadence memory lint [--project k]
 ```
 
 Every authority-bearing proposal/review/finalization is a daemon RPC.
-The daemon derives one live native PTY endpoint from the Unix socket
-peer, current adapter ownership, endpoint generation, registration
-incarnation and process start identity. Request aliases, `CADENCE_ALIAS`,
-operator UI labels and external/headless identities cannot create proof.
+The daemon derives exactly one live agent endpoint from the Unix socket
+peer through its one caller-identity verifier (CAD-381): a pty pane by
+current adapter ownership, endpoint generation and process start, or a
+managed (headless claude/codex) endpoint by its daemon-minted CAD-230
+enrollment (provider pid + start time + uid + owner generation), plus the
+registration incarnation. A caller outside every agent tree has no agent
+identity and is refused — which is not operator proof: operator authority
+needs its own positive proof (CAD-276, CAD-313). Two endpoints on one
+ancestry are ambiguous and refused. Request aliases, `CADENCE_ALIAS`,
+operator UI labels and external identities cannot create proof.
 Two distinct non-author PM/worker endpoint identities, displayed with
 unique aliases, must pass the same semantic SHA-256 revision (claim/body,
 trusted author/contributors, type, source, confidence, scope and supersede
