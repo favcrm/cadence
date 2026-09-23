@@ -1426,7 +1426,8 @@ impl Shared {
     /// Fail-closed: an unreadable ancestry or no match refuses the
     /// call — there is no `operator` fallback; a caller detached from
     /// every pane and endpoint holds no lane at all. `Ok(None)` is the
-    /// clean "no identity" answer [`Self::rpc_slot_reconcile`] needs.
+    /// clean "no identity" answer — for [`Self::rpc_slot_reconcile`] a
+    /// precondition of operator authority, never proof of it.
     fn slot_identity(&self, peer_pid: u32) -> Result<Option<SlotWho>> {
         let chain = adapter::pty::caller_chain(peer_pid).ok_or_else(|| {
             Error::rejected(format!(
@@ -1802,12 +1803,49 @@ impl Shared {
         Ok(status)
     }
 
+    /// Operator authority for `slot_reconcile` on POSITIVE proof only
+    /// (CAD-276): deriving no slot identity is not enough — a detached
+    /// child of a pane or managed tool derives none. See
+    /// [`crate::peer::operator_proof`] for the checks; anything
+    /// unreadable or ambiguous refuses.
+    fn reconcile_operator(&self, peer_pid: u32) -> Result<()> {
+        let panes: HashMap<u32, String> = self
+            .store
+            .pty_endpoint_facts()
+            .map_err(|e| {
+                Error::rejected(format!(
+                    "slot reconcile is an operator action — the registered panes \
+                     cannot be read to prove this connection is not one ({e})"
+                ))
+            })?
+            .into_iter()
+            .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
+            .collect();
+        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        crate::peer::operator_proof(
+            peer_pid,
+            unsafe { libc::geteuid() },
+            std::process::id(),
+            &panes,
+            |pid| slots.nearest_enrolled_root(&[pid]).is_some(),
+        )
+        .map_err(|why| {
+            Error::rejected(format!(
+                "slot reconcile is an operator action — this connection is not \
+                 provably the operator: {why}; run it from an attached operator \
+                 shell outside every pane and managed endpoint"
+            ))
+        })
+    }
+
     /// `slot_reconcile` — the one mutating operator path over a strict
     /// hold (CAD-230). Operator authority is the connection's: a caller
     /// that derives ANY slot identity (a pane or an enrolled endpoint)
-    /// is an agent and is refused, and identity-shaped request fields
-    /// are refused rather than read. The daemon frees the hold only on
-    /// its own proof of the holder's death; see [`Slots::reconcile`].
+    /// is an agent and is refused, and so is one that is not PROVABLY
+    /// the operator ([`Self::reconcile_operator`], CAD-276);
+    /// identity-shaped request fields are refused rather than read. The
+    /// daemon frees the hold only on its own proof of the holder's
+    /// death; see [`Slots::reconcile`].
     fn rpc_slot_reconcile(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         for field in ["by", "operator", "actor", "alias", "lane", "pid"] {
             if params.get(field).is_some() {
@@ -1824,6 +1862,7 @@ impl Shared {
                 who.lane()
             )));
         }
+        self.reconcile_operator(peer_pid)?;
         let enrollment = required_str(params, "enrollment_id")?;
         let token = required_str(params, "token")?;
         let evidence = params
@@ -2429,12 +2468,14 @@ impl Shared {
     }
 
     /// The caller's derived identity for pane-attention verbs
-    /// (`answer`), from three signals a client cannot choose:
-    /// `/proc` ancestry from the `SO_PEERCRED` pid (a pid that descends
-    /// from an agent's pane root IS that agent), the pane's own
+    /// (`answer`), from three signals: `/proc` ancestry from the
+    /// `SO_PEERCRED` pid (a pid that descends from an agent's pane root
+    /// IS that agent — the one unforgeable signal), the pane's own
     /// `CADENCE_ALIAS` env the peer still carries (a `setsid` detach
-    /// keeps it), and a shared controlling pty via fd targets (detach
-    /// keeps stdio). The signals are [`PeerTies`] — the one rule the
+    /// keeps it), and a shared pty via fd targets (detach keeps stdio).
+    /// The last two are caller-choosable, which is safe here because
+    /// they only narrow (see `src/peer.rs`, CAD-276). The signals are
+    /// [`PeerTies`] — the one rule the
     /// board's write identity shares (CAD-263). A pane must never act
     /// on its own pane state: a worker that can reach the socket could
     /// otherwise self-sanction the very decision the menu exists to

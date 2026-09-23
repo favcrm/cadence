@@ -2414,6 +2414,67 @@ fn ui_write_caller_ignores_an_uncorroborated_env_alias() {
     assert!(!last.contains("pane-b"), "{last}");
 }
 
+/// CAD-276 PINS AN ACCEPTED RESIDUAL — see the PM decision on CAD-276
+/// and the `src/peer.rs` module doc. The pty-on-stdio tie is
+/// caller-choosable: a same-uid process on NO pane's ancestry (a child
+/// of this test, no `CADENCE_ALIAS`) opens a registered pane's
+/// `/dev/pts/N` onto its stderr and is attributed as that pane's agent
+/// — lateral authorship forgery, no privilege over `operator (ui)`.
+/// The tie stays because dropping it sends `setsid` children of panes
+/// back to `operator (ui)` (an escalation). A future fix
+/// (operator-by-positive-proof, or a second signal) must flip this
+/// test DELIBERATELY: the expected author then stops being `pane-v`.
+#[test]
+fn ui_write_caller_pty_tie_is_forgeable_residual_pinned() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    // The victim pane: a bash whose stdio is a real pty, idling.
+    let mut pane = Command::new("python3")
+        .args(["-c", PTY_PANE_PY, "read -r _; true"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(pane.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    let pane_pid: u32 = first.trim().parse().unwrap();
+    plant_pane(&d, "pane-v", pane_pid);
+    let pts = std::fs::read_link(format!("/proc/{pane_pid}/fd/0")).unwrap();
+    assert!(pts.to_string_lossy().starts_with("/dev/pts/"), "{pts:?}");
+    // The forger: this test's child — never on the pane's ancestry —
+    // with the pane's pts opened onto its stderr, nothing else.
+    let client = Command::new("bash")
+        .args([
+            "-c",
+            r#"exec 2>"$PTS"; exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; cat <&3"#,
+        ])
+        .env_remove("CADENCE_ALIAS")
+        .env("PTS", &pts)
+        .env("PORT", port.to_string())
+        .env("REQ", comment_request(&host, "forged via pty"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let mut stdin = pane.stdin.take().unwrap();
+    stdin.write_all(b"done\n").unwrap();
+    drop(stdin);
+    let _ = pane.wait();
+    let response = String::from_utf8(client.stdout).unwrap();
+    let comment = replied_comment(&response, "forged via pty");
+    assert_eq!(
+        comment["author"], "pane-v",
+        "CAD-276 residual changed — if deliberate, flip this pin: {comment}"
+    );
+    let (_, last) = git(pm.path(), &["log", "-1", "--format=%B"]);
+    assert!(last.contains("Actor: pane-v"), "{last}");
+}
+
 /// Seed the tracker and daemon-side world for the binding tests:
 /// pm + wk fake agents, a job bound to `issue`, one task for `wk`
 /// dispatched so the task is live. Returns (job_id, task_id).

@@ -351,7 +351,13 @@ fn revoke_and_expiry_filter_waiters_but_never_free_a_live_hold() {
     // Past the hold bound: still held, now pending reconcile.
     let h = held_json(&mut s, 150.0)[0].clone();
     assert_eq!(h["accounting"], "expired_pending_reconcile");
-    assert_eq!(h["reconcile_required"], true);
+    // CAD-276: reconcile cannot free a live holder, so it is not
+    // required — the remedy that works is named instead.
+    assert_eq!(h["reconcile_required"], false);
+    assert_eq!(
+        h["remedy"],
+        "holder alive — release from the holder or stop it"
+    );
     // Proven death frees it — and only it.
     p.kill(300);
     let (status, events) = s.status(
@@ -667,7 +673,12 @@ fn restart_validates_enrollments_before_holds() {
     let held = held_json(&mut s, 1.0);
     let unknown = held.iter().find(|h| h["pid"] == 320).unwrap();
     assert_eq!(unknown["liveness"], "unknown");
-    assert_eq!(unknown["reconcile_required"], true);
+    // CAD-276: reconcile refuses an unknown holder — the remedy says so.
+    assert_eq!(unknown["reconcile_required"], false);
+    assert_eq!(
+        unknown["remedy"],
+        "liveness unknown — restart the daemon after verifying"
+    );
     // Unknown stays accounted: one slot of three is free, not two.
     let q = acquire_as(&mut s, 400, 400, "r9", 2.0).unwrap();
     assert_eq!(q["granted"], true);
@@ -822,4 +833,302 @@ fn malformed_v1_envelope_is_kept_and_blocks_strict() {
         s.restore(clk(0.0));
         assert!(s.strict_available(), "{text}");
     }
+}
+
+/// A v2 envelope over `enrollments` (no holds) — the restore fixtures
+/// of the CAD-276 duplicate-root tests.
+fn envelope_of(enrollments: Value) -> String {
+    json!({"format": "cadence-slots", "version": 2, "state_generation": "3",
+           "enrollments": enrollments, "holds": [], "legacy_holds": []})
+    .to_string()
+}
+
+/// One persisted enrollment on the standard tree's root 200.
+fn enrollment_row(id: &str, owner: &str, issued: f64, auth: &str) -> Value {
+    json!({
+        "enrollment_id": id, "owner_actor": owner, "owner_generation": "g",
+        "root": {"pid": 200, "starttime": 50, "uid": UID},
+        "worker": {"pid": 200, "starttime": 50, "uid": UID},
+        "issued_epoch": issued, "expires_epoch": 9e9, "auth_state": auth,
+    })
+}
+
+/// Restore `text` into fresh slots over `p`; answers the slots and the
+/// state file's path.
+fn restored(p: &FakeProc, text: &str) -> (Slots, tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slots.json");
+    std::fs::write(&path, text).unwrap();
+    let mut s = strict_slots(p, 2);
+    s.persist_to(path.clone());
+    s.restore(clk(0.0));
+    (s, dir, path)
+}
+
+/// CAD-276 item 3: two enrollments sharing a root never make restore
+/// reject the file — not two live ones across owners (the reviewer's
+/// review140_restore_two_active_same_root_different_owner probe), not
+/// a live one beside its own owner's tombstone — and `strict_caller`
+/// chooses between them deterministically: live first (active before
+/// expired before revoked), then the most recently issued, then the
+/// enrollment id — whatever order the file lists them in.
+#[test]
+fn shared_root_enrollments_restore_and_resolve_deterministically() {
+    let cases: [(&str, [Value; 2], &str); 4] = [
+        (
+            "two active across owners: newest issue wins",
+            [
+                enrollment_row("enr-a", "wk", 1.0, "active"),
+                enrollment_row("enr-b", "wk2", 5.0, "active"),
+            ],
+            "enr-b",
+        ),
+        (
+            "active beats a newer tombstone of its own owner",
+            [
+                enrollment_row("enr-a", "wk", 1.0, "active"),
+                enrollment_row("enr-b", "wk", 5.0, "revoked"),
+            ],
+            "enr-a",
+        ),
+        (
+            "active beats a newer expired record",
+            [
+                enrollment_row("enr-a", "wk", 1.0, "active"),
+                enrollment_row("enr-b", "wk2", 5.0, "expired"),
+            ],
+            "enr-a",
+        ),
+        (
+            "an issue-time tie falls to the id",
+            [
+                enrollment_row("enr-b", "wk2", 5.0, "active"),
+                enrollment_row("enr-a", "wk", 5.0, "active"),
+            ],
+            "enr-a",
+        ),
+    ];
+    for (name, [first, second], want) in cases {
+        for order in [
+            json!([first.clone(), second.clone()]),
+            json!([second.clone(), first.clone()]),
+        ] {
+            let p = tree();
+            let (s, _dir, _) = restored(&p, &envelope_of(order));
+            assert!(s.strict_available(), "{name}: restore rejected the file");
+            assert_eq!(s.enrollments.len(), 2, "{name}");
+            let caller = s.strict_caller(400, 200).unwrap();
+            assert_eq!(caller.enrollment_id, want, "{name}");
+        }
+    }
+}
+
+/// CAD-276 item 3: a revoked+live same-root pair must share an owner —
+/// the same-root supersession tombstone only ever names its own owner.
+/// Across owners the pair is invalid: strict is blocked and the file
+/// is kept byte-identical as evidence, like every other malformed
+/// state. (Two revoked records across owners carry no live claim and
+/// load.)
+#[test]
+fn restore_rejects_a_cross_owner_revoked_live_same_root_pair() {
+    for auth in ["active", "expired"] {
+        let p = tree();
+        let text = envelope_of(json!([
+            enrollment_row("enr-a", "wk", 1.0, "revoked"),
+            enrollment_row("enr-b", "wk2", 5.0, auth),
+        ]));
+        let (mut s, _dir, path) = restored(&p, &text);
+        assert!(!s.strict_available(), "{auth}");
+        assert!(s.strict_caller(400, 200).is_err(), "{auth}");
+        let (g, _) = s
+            .acquire(
+                SlotKind::Build,
+                "pane-1",
+                std::process::id(),
+                "r",
+                false,
+                clk(1.0),
+            )
+            .unwrap();
+        assert_eq!(g["granted"], true, "{auth}: legacy still works");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{auth}");
+    }
+    let p = tree();
+    let (s, _dir, _) = restored(
+        &p,
+        &envelope_of(json!([
+            enrollment_row("enr-a", "wk", 1.0, "revoked"),
+            enrollment_row("enr-b", "wk2", 5.0, "revoked"),
+        ])),
+    );
+    assert!(s.strict_available());
+}
+
+/// CAD-276 item 3 (write side): the daemon never mints the state its
+/// own restore rejects — one exact provider process enrolled for one
+/// owner is never enrolled for another.
+#[test]
+fn one_process_is_never_enrolled_for_two_owners() {
+    let p = tree();
+    let mut s = strict_slots(&p, 2);
+    let id = enroll(&mut s, "wk", "g1", 200);
+    let err = s.enroll("wk2", "h1", 200, clk(1.0)).unwrap_err();
+    assert!(
+        err.to_string().contains("already enrolled for 'wk'"),
+        "{err}"
+    );
+    assert_eq!(s.enrollments.len(), 1);
+    assert_eq!(s.enrollments[0].id, id);
+    // A recycled pid is a different process: it may enroll afresh.
+    p.spawn(200, 100, 55);
+    enroll(&mut s, "wk2", "h1", 200);
+}
+
+/// CAD-276 item 4: a strict holder is the connection peer or one of its
+/// verified NON-ROOT ancestors. A manual `acquire --pid <provider
+/// root>` from a tool subprocess is refused — the root lives as long as
+/// the endpoint — while binding the peer itself (what `build-slot run`
+/// does) or its shell (`--pid $$`) is admitted. The root may still hold
+/// for itself when it is the peer.
+#[test]
+fn strict_holders_exclude_the_provider_root() {
+    let p = tree();
+    let mut s = strict_slots(&p, 4);
+    enroll(&mut s, "wk", "g1", 200);
+    let err = acquire_as(&mut s, 400, 200, "root", 0.0).unwrap_err();
+    assert!(err.to_string().contains("enrolled provider root"), "{err}");
+    let err = acquire_as(&mut s, 300, 200, "root-2", 0.0).unwrap_err();
+    assert!(err.to_string().contains("enrolled provider root"), "{err}");
+    assert!(s.held.is_empty() && s.waiting.is_empty());
+    // `build-slot run`: the CLI binds its own pid.
+    let g = acquire_as(&mut s, 400, 400, "run", 0.0).unwrap();
+    assert_eq!(g["granted"], true, "{g}");
+    // `acquire --pid $$`: the invoking shell, a non-root ancestor.
+    let g = acquire_as(&mut s, 400, 300, "shell", 0.0).unwrap();
+    assert_eq!(g["granted"], true, "{g}");
+    // The root as its own peer.
+    let g = acquire_as(&mut s, 200, 200, "self", 0.0).unwrap();
+    assert_eq!(g["granted"], true, "{g}");
+    let pids: Vec<u32> = s.held.iter().map(|h| h.pid).collect();
+    assert_eq!(pids, vec![400, 300, 200]);
+}
+
+/// CAD-276 item 5 (the reviewer's
+/// review140_old_holder_release_after_same_root_supersession): hold
+/// under E1 (root 200, generation g1), re-enroll the SAME root as E2 —
+/// the caller now verifies as E2, yet the old holder releases its E1
+/// hold (release runs as the root's enrollment whose id matches the
+/// hold). The exact-holder rule still binds, and nothing is granted
+/// twice: while the E1 hold occupies the only slot, the same process
+/// re-asking under E2 queues.
+#[test]
+fn old_holder_releases_after_same_root_supersession() {
+    let p = tree();
+    let mut s = strict_slots(&p, 1);
+    let e1 = enroll(&mut s, "wk", "g1", 200);
+    let g = acquire_as(&mut s, 300, 300, "r1", 0.0).unwrap();
+    let token = g["token"].as_str().unwrap().to_string();
+    let e2 = enroll(&mut s, "wk", "g2", 200);
+    assert_ne!(e1, e2);
+    let caller = s.strict_caller(300, 200).unwrap();
+    assert_eq!(caller.enrollment_id, e2, "the live enrollment is preferred");
+    // No double grant: the same process and request under E2 queues.
+    let q = acquire_as(&mut s, 300, 300, "r1", 1.0).unwrap();
+    assert_eq!(q["granted"], false, "{q}");
+    assert_eq!(s.held.len(), 1);
+    // Another process of the agent is still not the holder.
+    let other = s.strict_caller(400, 200).unwrap();
+    let err = s.release_strict(&token, &other, 400, 1.0).unwrap_err();
+    assert!(err.to_string().contains("another caller"), "{err}");
+    // The exact old holder releases its E1 hold.
+    let (r, events) = s.release_strict(&token, &caller, 300, 2.0).unwrap();
+    assert_eq!(r["released"], true, "{r}");
+    assert!(events.iter().any(|e| e.2["reason"] == "released"));
+    assert!(s.held.is_empty());
+    // The queued E2 request is served next — exactly one hold.
+    let g = acquire_as(&mut s, 300, 300, "r1", 3.0).unwrap();
+    assert_eq!(g["granted"], true, "{g}");
+    assert_eq!(s.held.len(), 1);
+    assert_eq!(s.held[0].enrollment_id(), Some(e2.as_str()));
+}
+
+/// CAD-276 item 2: `reconcile_required` marks only a hold reconcile can
+/// free — a holder proven dead whose free has not landed, while the
+/// strict writer works. Live, unknown and unwritable holds name the
+/// remedy that does work instead; an ordinary live hold names nothing.
+#[test]
+fn reconcile_required_only_where_reconcile_can_act() {
+    let p = tree();
+    let mut s = strict_slots(&p, 3);
+    s.config.max_hold_secs = 100;
+    enroll(&mut s, "wk", "g1", 200);
+    for (peer, req) in [(300, "a"), (310, "b"), (320, "c")] {
+        acquire_as(&mut s, peer, peer, req, 0.0).unwrap();
+    }
+    let view = |s: &Slots, now: f64| -> Vec<Value> {
+        s.status_json(
+            SlotCaller {
+                lane: "",
+                pids: &[],
+            },
+            now,
+        )["pools"]["build"]["held"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    for h in view(&s, 1.0) {
+        assert_eq!(h["reconcile_required"], false, "{h}");
+        assert!(h.get("remedy").is_none(), "an ordinary hold: {h}");
+    }
+    // Past the bound, alive: release or stop the holder.
+    let h = view(&s, 150.0)[0].clone();
+    assert_eq!(h["accounting"], "expired_pending_reconcile");
+    assert_eq!(h["reconcile_required"], false);
+    assert_eq!(
+        h["remedy"],
+        "holder alive — release from the holder or stop it"
+    );
+    // Proven dead but not yet freed, writer available: reconcile acts.
+    s.held[1].strict.as_mut().unwrap().liveness = Liveness::Dead;
+    s.held[2].strict.as_mut().unwrap().liveness = Liveness::Unknown;
+    let held = view(&s, 1.0);
+    assert_eq!(held[1]["reconcile_required"], true, "{}", held[1]);
+    assert!(held[1].get("remedy").is_none());
+    assert_eq!(held[2]["reconcile_required"], false);
+    assert_eq!(
+        held[2]["remedy"],
+        "liveness unknown — restart the daemon after verifying"
+    );
+    // A dead holder whose free could not be written: the writer is
+    // blocked, so reconcile (which frees through it) cannot act either.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slots.json");
+    s.persist_to(path.clone());
+    std::fs::create_dir(path.with_extension("tmp")).unwrap();
+    p.kill(310);
+    let (status, _) = s.status(
+        SlotCaller {
+            lane: "",
+            pids: &[],
+        },
+        2.0,
+    );
+    assert!(!s.strict_available());
+    let dead = status["pools"]["build"]["held"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["pid"] == 310)
+        .cloned()
+        .expect("the unwritable free keeps the hold accounted");
+    assert_eq!(dead["liveness"], "dead");
+    assert_eq!(dead["reconcile_required"], false, "{dead}");
+    assert!(
+        dead["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("strict state is unwritable"),
+        "{dead}"
+    );
 }
