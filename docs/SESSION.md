@@ -355,6 +355,11 @@ counts, the three-way failure compare, pairwise conflicts with other
 open PRs, a schema-migration flag, and a `suggested_verdict` of
 `pass|needs-hands-on|blocked` with reasons — also the process exit
 code (0/1/2). It never posts a status, never merges, never pushes.
+Every step command runs like GitHub CI, with no git identity (CAD-301):
+a scratch `HOME`, no system config, `user.useConfigOnly=true`, and the
+identity variables unset. A test that commits without `-c user.name=…
+-c user.email=…` therefore fails the review, not just CI. `CARGO_HOME`,
+`RUSTUP_HOME` and `XDG_DATA_HOME` keep their real paths.
 
 Safety edges the tool owns: it refuses to reuse an existing
 `.cadence/wt/review-<pr>` checkout (a `--keep` leftover or a

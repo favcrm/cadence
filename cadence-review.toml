@@ -1,6 +1,13 @@
 # cadence-review.toml — the steps `cadence review <PR>` runs, as data.
 # Required keys: prepare, gates, full_suite, test_globs, test_command,
 # stress_pattern. Optional: [timeouts] *_secs overrides.
+#
+# Every command below runs like GitHub CI, with no git identity (CAD-301):
+# HOME is a scratch dir the review deletes afterwards, GIT_CONFIG_NOSYSTEM=1,
+# user.useConfigOnly=true, and EMAIL/GIT_AUTHOR_*/GIT_COMMITTER_* unset.
+# CARGO_HOME, RUSTUP_HOME and XDG_DATA_HOME keep their real locations.
+# A test or tool that commits must pass `-c user.name=… -c user.email=…`
+# (see gate_env in src/review.rs).
 
 # Run once in the review checkout before gating. The clippy gate needs
 # the UI built (the `ui` cargo feature embeds ui/dist); node_modules is
