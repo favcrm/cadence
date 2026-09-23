@@ -837,10 +837,16 @@ enum Commands {
     },
     /// Reconstruct every merge on the default branch from stored
     /// data — verdict notes, commit statuses, tracker folders, daemon
-    /// events — and flag `reviewer==merger` and merges with no passing
-    /// verdict on the exact landed head. Read-only; exits non-zero
-    /// when any row is flagged. See docs/AUDIT.md.
+    /// events, operator approval records — and flag merges with no
+    /// passing verdict on the exact landed head, human-class merges with
+    /// no operator approval for that head, and `reviewer==merger` where
+    /// the fleet's identities differ. Read-only; exits non-zero when any
+    /// row is flagged. `audit approve`/`audit revoke` record operator
+    /// approval evidence (operator connection only). See docs/AUDIT.md.
+    #[command(args_conflicts_with_subcommands = true)]
     Audit {
+        #[command(subcommand)]
+        action: Option<AuditAction>,
         /// Drop merges older than this: 24h, 7d, YYYY-MM-DD or epoch.
         #[arg(long)]
         since: Option<String>,
@@ -1879,6 +1885,50 @@ enum MessageAction {
         /// Why — recorded on the event, result and the routed notice.
         #[arg(long)]
         reason: Option<String>,
+    },
+}
+
+/// Operator approval evidence for `cadence audit` (CAD-217). Both
+/// verbs go through the daemon, which refuses any agent connection;
+/// the records grant nothing — `cadence audit` binds them to merges.
+#[derive(Subcommand)]
+enum AuditAction {
+    /// Record that the operator approved `--action` (default merge) on
+    /// the exact full `--head` of PR `--pr`.
+    Approve {
+        /// PR number the approval covers.
+        #[arg(long)]
+        pr: u64,
+        /// Full 40-hex head SHA the approval names — an approval never
+        /// carries over to a later head.
+        #[arg(long)]
+        head: String,
+        /// Who approved and where (e.g. "chris in chat 22:33Z"). A claim
+        /// the record carries; never `user` or `daemon`.
+        #[arg(long)]
+        source: String,
+        /// `owner/name` (default: the cwd checkout's github.com origin).
+        #[arg(long)]
+        repo: Option<String>,
+        /// The approved action.
+        #[arg(long, default_value = "merge")]
+        action: String,
+        /// Stable id for retries and a later revoke (default
+        /// `<action>-pr<N>-<head[..12]>`, then `-2`, `-3`, … once an
+        /// earlier default was revoked). A revoked id is never reused.
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// Withdraw an approval id. Cancelling a message never does this.
+    Revoke {
+        /// The approval id `audit approve` recorded.
+        id: String,
+        /// Who revoked and where.
+        #[arg(long)]
+        source: String,
+        /// Why the approval no longer holds.
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -2995,6 +3045,49 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// `cadence audit approve|revoke` — the operator's approval-evidence
+/// writers (CAD-217). The daemon decides authority from the connection;
+/// nothing here names the caller.
+fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Result<i32> {
+    let result = match action {
+        AuditAction::Approve {
+            pr,
+            head,
+            source,
+            repo,
+            action,
+            id,
+        } => {
+            let head = head.trim().to_ascii_lowercase();
+            let repo = match repo {
+                Some(r) => r,
+                None => cadence_agent::audit::origin_slug(&std::env::current_dir()?).ok_or_else(
+                    || {
+                        Error::rejected(
+                            "no github.com origin remote in the cwd — pass --repo owner/name",
+                        )
+                    },
+                )?,
+            };
+            // No `--id`: the daemon picks the default, counting past a
+            // revoked one so a re-approval is a fresh record.
+            let mut params = json!({"source": source, "action": action,
+                                    "head": head, "repo": repo, "pr": pr});
+            if let Some(id) = id {
+                params["id"] = json!(id);
+            }
+            client::rpc(state_dir, "approval_record", params)?
+        }
+        AuditAction::Revoke { id, source, reason } => client::rpc(
+            state_dir,
+            "approval_revoke",
+            json!({"id": id, "source": source, "reason": reason}),
+        )?,
+    };
+    print_json(&result);
+    Ok(0)
 }
 
 /// `cadence overview` — the needs-me list, deploy drift and per-project
@@ -4873,6 +4966,11 @@ fn run() -> Result<i32> {
             }),
         },
         Commands::Audit {
+            action: Some(action),
+            ..
+        } => run_audit_evidence(&state_dir, action),
+        Commands::Audit {
+            action: None,
             since,
             class,
             project,
@@ -6876,6 +6974,48 @@ mod tests {
             "--permission-mode",
             "auto",
             "--bypass"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn audit_approve_and_revoke_parse() {
+        let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let cli = Cli::try_parse_from([
+            "cadence", "audit", "approve", "--pr", "84", "--head", head, "--source", "op",
+        ])
+        .unwrap();
+        let Commands::Audit {
+            action:
+                Some(AuditAction::Approve {
+                    pr,
+                    action,
+                    id,
+                    repo,
+                    ..
+                }),
+            ..
+        } = cli.command
+        else {
+            panic!("audit approve must parse to AuditAction::Approve");
+        };
+        assert_eq!((pr, action.as_str(), id, repo), (84, "merge", None, None));
+        assert!(
+            Cli::try_parse_from(["cadence", "audit", "revoke", "ap-1", "--source", "op"]).is_err()
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["cadence", "audit", "--json"])
+                .unwrap()
+                .command,
+            Commands::Audit {
+                action: None,
+                json: true,
+                ..
+            }
+        ));
+        // Report flags and evidence verbs never mix.
+        assert!(Cli::try_parse_from([
+            "cadence", "audit", "--json", "approve", "--pr", "1", "--head", head, "--source", "op",
         ])
         .is_err());
     }
