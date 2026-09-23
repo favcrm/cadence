@@ -1,86 +1,84 @@
-# Agent filesystem: agents, roles and teams as Markdown
+# Agent filesystem: agents, sessions and projects as Markdown
 
 Date: 2026-09-23. Status: **proposed** design record. Operator direction
-(decision #1, 2026-09-23): "we use the filesystem for the system" — each agent is
-a folder `agents/<slug>/` with `SOUL.md`, `AGENT.md` and `MEMORY.md`, and all
-information is written in Markdown (as in AgenticOS v2's docs). Amends
-[ADR-0001](../adr/0001-role-profiles.md): Markdown files replace `team.yaml`;
-the registry stays the runtime truth and drift is reported, never silently
-reconciled. Tickets: CAD-338 (this record → ADR), CAD-343, CAD-346, CAD-351;
-answers the CAD-116 question.
+(2026-09-23): the system is a filesystem and all information is Markdown (as in
+AgenticOS v2's docs); each agent is a folder `agents/<slug>/` with `SOUL.md`,
+`AGENT.md` and `MEMORY.md`; there is **no separate role layer** — an agent is the
+definition, and **an agent can run many sessions**; **no teams for now** —
+staffing lives in each project's `PROJECT.md`. Amends
+[ADR-0001](../adr/0001-role-profiles.md): Markdown files replace `team.yaml`; the
+runtime registry stays the truth for sessions, and drift from the files is
+reported, never silently reconciled. Tickets: CAD-338 (this record → ADR),
+CAD-343, CAD-346, CAD-351; answers the CAD-116 question.
+
+## Model
+
+| Concept | What it is | Where |
+|---|---|---|
+| **Agent** | A durable definition: who it is, what it does, what it knows. Company-wide; one folder. | `agents/<slug>/` |
+| **Session** | One running instance of an agent on one provider, for one task at a time. Disposable. Many can run at once. | runtime registry (SQLite), id `<slug>#<n>` |
+| **Project** | Repos, context, which agents work on it and how many sessions of each, autonomy, tickets and artifacts. | `projects/<slug>/PROJECT.md` and folders |
+
+Examples: `agents/master`, `agents/pm`, `agents/dev`, `agents/qa`, `agents/devops`,
+`agents/research`, `agents/curator`. When a
+project needs a genuinely different agent — another mandate, soul or memory — it
+gets its own slug (e.g. `agents/dev-mobile`), not an override file. There is nothing to inherit from.
 
 ## Why files
 
-- **Durable and portable.** Agent identity, role and memory live in git next to
-  the tracker (`~/pm/vault`), so they survive restarts, provider switches,
-  reinstalls and new machines, and every change has an author and a diff.
-- **Readable by humans and agents.** The company brain opens in any editor or
-  Markdown vault app; agents read the same files they are defined by.
+- **Durable and portable.** Definitions and memory live in git (`~/pm`), so they
+  survive restarts, provider switches, reinstalls and new machines, and every
+  change has an author and a diff.
+- **Readable by humans and agents**, in any editor or Markdown vault app.
 - **Provider-neutral.** One definition compiles to each vendor's native format at
-  launch (Claude subagent frontmatter, Codex agent config, Pi flags, pane briefing).
+  every session launch (Claude subagent frontmatter, Codex agent TOML, Pi flags,
+  pane briefing).
 
 ## Layout
 
 ```text
-~/pm/vault/
-  company/
-    HANDBOOK.md  STANDARDS.md  POLICIES.md  GLOSSARY.md
-    USER.md                      # the operator: preferences the master honours
-  roles/<role>/                  # templates — what a role is
-    AGENT.md                     # defaults: mandate, may/never, provider/model/effort
-    SOUL.md                      # default working style for the role
-  agents/<slug>/                 # instances — who an agent is (stable slug)
-    SOUL.md                      # identity, voice, values, working style
-    AGENT.md                     # role, team, contract, provider/model/effort, permissions
-    MEMORY.md                    # index of what this agent knows (≤ 200 lines)
-    memory/<id>.md               # verified items scoped to this agent
-    memory/inbox/<id>.md         # its proposals, awaiting verification
-    journal/<date>-<task>.md     # its reports (append-only)
-  teams/<team>/TEAM.md           # staffing, autonomy, write-lease policy
-  projects/<key>/CONTEXT.md      # links to the project's context manifest
-  lessons/  decisions/  faq/  inbox/
+~/pm/                                   # the system filesystem (git)
+  company/  HANDBOOK.md  STANDARDS.md  POLICIES.md  GLOSSARY.md  USER.md
+  agents/<slug>/
+    SOUL.md                             # who it is: voice, values, working norms
+    AGENT.md                            # what it does: contract, provider/model/effort, permissions
+    MEMORY.md                           # index of what it knows (≤ 200 lines)
+    memory/<id>.md                      # verified items scoped to this agent
+    memory/inbox/<id>.md                # proposals from its sessions, awaiting verification
+    journal/INDEX.md                    # links to reports its sessions filed (in tickets)
+  projects/<slug>/                      # see "Project filesystem"
+  lessons/  decisions/  faq/  inbox/    # company-scope knowledge
 ```
 
-Slugs are stable names such as `master`, `pm-reminders`, `qa-reminders`,
-`dev-reminders-1`. Sessions are disposable; the agent is not. A worker reused
-across tasks accumulates its own memory; a one-off worker gets a folder from the
-role template and its journal is kept.
-
-## The three files
+## The three agent files
 
 ### `SOUL.md` — who the agent is
 
-Short (≤ 60 lines, ≤ 4,000 characters), operator-owned, changes rarely. It absorbs
-OpenClaw's `IDENTITY.md` (name, short description) as frontmatter. Name, voice with the
-operator, values and working norms that matter for the work: *ask before
-guessing*, *evidence over claims*, *say what you did not check*. The master's
-`SOUL.md` sets how it talks with the operator (e.g. concise, English and written
-zh-HK). Persona text is not expected to raise accuracy; its job is consistent
-behaviour and tone across sessions and providers. Evidence: persona prompts did not
-improve accuracy (Zheng et al. 2023; Wharton 2025), and irrelevant persona details
-cost up to ~30 points (Araujo et al. 2025) — keep it to tone, boundaries and norms.
+Short (≤ 4,000 characters), operator-owned, changes rarely; name and one-line
+description as frontmatter (absorbs OpenClaw's `IDENTITY.md`). Voice, values and
+working norms that matter for the work: *ask before guessing*, *evidence over
+claims*, *say what you did not check*. Persona prompts did not improve accuracy
+(Zheng et al. 2023; Wharton 2025) and irrelevant persona details cost up to ~30
+points (Araujo et al. 2025) — keep it to tone, boundaries and norms.
 
 ### `AGENT.md` — what the agent does
 
-Frontmatter is the machine contract; the body is the mandate the agent reads.
-
 ```markdown
 ---
-name: qa-reminders               # required by Claude Code, Codex, Copilot
-description: Fresh-context QA reviewer for the Reminders team; verdicts pinned to the SHA.
-role: qa                         # extends roles/qa/AGENT.md
-team: reminders
+name: qa                          # required by Claude Code, Codex, Copilot
+description: Fresh-context QA reviewer; verdicts pinned to the exact SHA.
 preferred: {provider: claude, model: opus, effort: high}
 fallbacks: [{provider: codex, model: gpt-5.5, effort: high}]
 constraints: [fresh_context, vendor_differs_from: author]
-permissions: read-only           # compiled per vendor
+permissions: read-only            # compiled per vendor
 skills: [cadence-review, secret-scan]
-memory_scopes: [company, team:reminders, project:reminders, role:qa, agent:qa-reminders]
+memory_scopes: [company, project, agent]
+sessions: {max_concurrent: 3}
 budget: {turns: 60}
 escalate_on: [ambiguity, missing_access, scope_change, destructive_op, two_failed_attempts]
 reports: [done, question, blocked]
 ---
-# QA reviewer — Reminders team
+# QA reviewer
 Review the exact commit against the contract, run the gates, record a verdict
 pinned to the SHA.
 ## May
@@ -88,15 +86,78 @@ pinned to the SHA.
 ```
 
 `AGENT.md` is not the repository's `AGENTS.md`: that file stays the project's
-shared rules for every agent working in the repo; `AGENT.md` defines one agent.
+shared rules for anyone working in the repo; `AGENT.md` defines one agent.
 
 ### `MEMORY.md` — what the agent knows
 
-An index, not a dump (≤ 200 lines, like Claude Code's memory index): one line
-per item with its id, claim, scope and "verified at SHA", linking to
-`memory/<id>.md` or to shared items in `lessons/`. Generated by the vault writer
-from verified items; the agent's own working notes are proposals in
-`memory/inbox/` until verified. See [LEARNING-LOOP.md](LEARNING-LOOP.md).
+An index, not a dump (≤ 200 lines / 25 KB, what Claude Code preloads): one line
+per item with id, claim, scope and "verified at SHA", linking to `memory/<id>.md`
+or to shared items. Written by the vault writer from verified items; sessions
+propose into `memory/inbox/`. See [LEARNING-LOOP.md](LEARNING-LOOP.md).
+
+## Sessions
+
+- A session is started from an agent: `cadence session start qa --project reminders
+  --task RMD-1` (or by the PM's dispatch). Its registry row records the agent slug,
+  session number, provider/model/effort actually used, worktree and task.
+- **All sessions of an agent share its `SOUL.md`, `AGENT.md` and `MEMORY.md`.**
+  What one session learns reaches the others only after verification.
+- Each session picks its provider from `preferred`/`fallbacks` by availability,
+  quota and the cross-vendor rule — two concurrent `qa` sessions may run on
+  different providers.
+- Sessions are bounded by `sessions.max_concurrent` in `AGENT.md`, the project's
+  counts in `PROJECT.md` and the host ceiling; write leases keep one writer per code
+  area across all sessions.
+- **Separation of duties is by agent, not session:** two sessions of the same
+  agent never review, merge or accept each other's work or lessons.
+- Identity: the daemon's launch record (CAD-381) maps a caller to its session and
+  agent; agents never self-assert who they are.
+- Reports are filed in the ticket (`projects/<slug>/tickets/<ID>/reports/`) with
+  the session id; the agent's `journal/INDEX.md` links them.
+
+## `PROJECT.md` (replaces `team.yaml`; no teams for now)
+
+```markdown
+---
+project: reminders
+repos: [{remote: github.com/harbor-bakery/reminders, path: ~/code/reminders}]
+agents: {pm: 1, dev: 4, qa: 1, devops: 1}      # max concurrent sessions per agent
+autonomy: approve-plans
+write_leases: per-issue planned paths
+---
+# Reminders
+Goal, non-goals, context links (architecture, ADRs, runbooks).
+```
+
+Teams can come back later as a grouping of projects if several projects share
+staffing; nothing in this layout depends on them.
+
+## Project filesystem
+
+```text
+projects/<slug>/
+  PROJECT.md                     # goal, repos, agents × sessions, autonomy, links
+  shared/                        # long-lived, cross-ticket artifacts
+    plans/ designs/ research/ reports/ decisions/ runbooks/ brand/
+    INDEX.md                     # generated: file, kind, owner, date, source ticket
+  memory/                        # verified project lessons (exists today)
+  tickets/<ID>/
+    issue.md  comments/          # exist today
+    artifacts/                   # images, previews, verdicts, evidence
+    reports/                     # session reports (done / question / blocked)
+    plan.md                      # when the ticket is an epic or has a plan
+    ARTIFACTS.md                 # generated index with provenance
+```
+
+Rules: an artifact lives with its narrowest owner (the ticket; an epic's plan in
+the epic); `shared/` holds only cross-ticket or long-lived material, promoted by
+move + link, never copy; every file has an index entry (author, date, sha, kind,
+source task); binaries over ~1 MB go to a content-addressed blob store
+(`.blobs/sha256/…`, syncable to R2 or AgenticOS files) with only the entry in git;
+all writes go through one writer (`cadence issue attach`, `cadence report`);
+code-coupled docs (ADRs, API specs) stay in the product repo and are linked.
+Migration of today's `~/pm/<project>/<ID>/` to `projects/<slug>/tickets/<ID>/` is
+recommended while there are six projects (pending operator choice).
 
 ## Size caps
 
@@ -109,83 +170,58 @@ from verified items; the agent's own working notes are proposals in
 
 The vault lint (CAD-346) refuses files over their cap.
 
+## Who may write what
+
+| Path | Operator | Master | PM | Curator | The agent's own sessions |
+|---|---|---|---|---|---|
+| `company/` | write | propose | — | propose | — |
+| `agents/<slug>/SOUL.md`, `AGENT.md` | write | propose (new agents) | propose | — | **never** |
+| `agents/<slug>/MEMORY.md`, `memory/` | review | — | — | write (verified) | — |
+| `agents/<slug>/memory/inbox/` | — | — | — | read | write |
+| `projects/<slug>/tickets/<ID>/` | write | write | write | read | attach / report |
+| `lessons/`, `decisions/`, `faq/` | write | propose | propose | write | propose |
+
+All writes go through one writer (the pattern of `src/issue/write.rs`): one commit
+per change with an `Actor:` trailer, refusal outside the caller's column. A session
+can never edit its agent's contract, permissions or soul — privilege escalation by
+self-edit — and prompt-injected text can at most land in the inbox, where logic
+checks and the curator see it. (OpenClaw's templates invite agents to rewrite
+`SOUL.md`; the Cloud Security Alliance's OpenClaw hardening guide, 2026-03, says the
+agent "should not be able to write to it at runtime".)
+
 ## Compatibility
 
 | Ecosystem | Their file | How ours maps |
 |---|---|---|
-| Claude Code | `.claude/agents/<name>.md` (name, description, model, effort, permissionMode, skills, memory; body = system prompt) | `AGENT.md` frontmatter compiles 1:1; `SOUL.md` + body become the prompt |
-| Codex | `.codex/agents/<name>.toml` (name, description, developer_instructions, model, model_reasoning_effort, sandbox_mode) | Generated TOML at launch |
+| Claude Code | `.claude/agents/<name>.md` (name, description, model, effort, permissionMode, skills, memory; body = prompt) | `AGENT.md` frontmatter compiles 1:1; `SOUL.md` + body become the prompt |
+| Codex | `.codex/agents/<name>.toml` (name, description, developer_instructions, model, model_reasoning_effort, sandbox_mode) | Generated TOML per session |
 | GitHub Copilot | `.github/agents/*.agent.md` | Same frontmatter subset |
-| Agent Skills | `<name>/SKILL.md` | Playbooks keep this format unchanged |
-| OpenClaw | workspace `AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`, `memory/YYYY-MM-DD.md` | Same names except `AGENT.md` (singular, to stay distinct from repo `AGENTS.md`) and `IDENTITY.md` folded into `SOUL.md`; `journal/` plays the role of dated memory notes |
+| Agent Skills | `<name>/SKILL.md` | Playbooks keep this format |
+| OpenClaw | workspace `AGENTS.md`, `SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`, `memory/YYYY-MM-DD.md` | Same names except `AGENT.md` (singular, distinct from repo `AGENTS.md`); `IDENTITY.md` folded into `SOUL.md`; dated notes are ticket reports |
 
-Generated provider files are written to the agent's launch area in the state dir,
-never into the product repository, and are regenerated from the vault on every
-launch. One deliberate difference from OpenClaw: its templates invite the agent to
-rewrite its own `SOUL.md`; the Cloud Security Alliance's OpenClaw hardening guide
-(2026-03) says the agent "should not be able to write to it at runtime", and a
-published injection attack rewrote `SOUL.md` on a schedule — here the soul and
-contract are operator-owned.
-
-## `TEAM.md` (replaces `team.yaml`)
-
-```markdown
----
-team: reminders
-project: reminders
-pm: pm-reminders
-roster: {dev: [dev-reminders-1, dev-reminders-2], qa: [qa-reminders], devops: [ops-reminders]}
-autonomy: approve-plans
-write_leases: per-issue planned paths
----
-# Reminders team
-Goal, rituals and anything team-specific.
-```
-
-## Who may write what
-
-| Path | Operator | Master | PM | Curator | The agent itself |
-|---|---|---|---|---|---|
-| `company/`, `roles/` | write | propose | — | propose | — |
-| `agents/<slug>/SOUL.md`, `AGENT.md` | write | propose (new agents, staffing) | propose (own team) | — | **never** |
-| `agents/<slug>/MEMORY.md`, `memory/` | review | — | — | write (verified items) | — |
-| `agents/<slug>/memory/inbox/` | — | — | — | read | write |
-| `agents/<slug>/journal/` | read | read | read | read | append |
-| `teams/<team>/TEAM.md` | write | propose | propose | — | — |
-| `lessons/`, `decisions/`, `faq/` | write | propose | propose | write | propose |
-
-All writes go through one vault writer (the pattern of `src/issue/write.rs`):
-one commit per change with an `Actor:` trailer, refusal outside the caller's
-column. An agent can never edit its own contract, permissions or soul — that
-would be privilege escalation by self-edit — and prompt-injected text can at
-most land in its own inbox, where logic checks and the curator see it.
+Generated provider files are written to the session's launch area in the state
+dir, never into the product repository, and regenerated on every launch.
 
 ## Launch
 
-1. The registry row (runtime truth) names the slug; `cadence agent new <slug>
-   --role qa --team reminders` creates the folder from the role template.
-2. At launch Cadence resolves `AGENT.md` over `roles/<role>/AGENT.md`, picks the
-   provider by preference, availability and the cross-vendor rule, and compiles
-   the contract to the provider's native form.
-3. The context pack puts `SOUL.md` and the `AGENT.md` body first (byte-stable, so
-   prompts cache), then the `MEMORY.md` index and the task's verified items.
-4. Drift between `AGENT.md` and the running agent (model, effort, permissions) is
+1. Resolve the agent's `AGENT.md`; pick provider by preference, availability,
+   quota and the cross-vendor rule; compile to the provider's native form.
+2. Context pack: `SOUL.md` and the `AGENT.md` body first (byte-stable, so prompts
+   cache), then the `MEMORY.md` index and the task's verified items.
+3. Drift between `AGENT.md` and a running session (model, effort, permissions) is
    reported as "restart to apply", never switched mid-task.
 
 ## Migration
 
 - `docs/roles/*.md` and `~/.local/state/cadence/roles/` become
-  `vault/roles/<role>/AGENT.md`.
-- Settings model defaults (per provider and team role) become the `preferred`
-  fields of role templates; the Settings screen edits the files.
-- `--role` accepts catalog roles and derives pm/worker authority; `--team-role`
-  stays as an alias. One role vocabulary (`devops`, not `ops`) across the context
-  API, docs and code (CAD-345).
-- Existing agents get folders on first launch after the change; their briefings
-  (`BRIEFING-<alias>.md`) are generated from the files.
+  `agents/<slug>/AGENT.md` (pm, dev, qa, devops, research, architect, curator).
+- Settings model defaults per provider and team role become the `preferred`
+  fields of those agents; the Settings screen edits the files.
+- Today's registry aliases (e.g. `qa-1`, `ops-1`) become sessions of agents
+  (`qa#1`, `devops#1`); `--team-role` maps to the agent slug; `--role pm|worker`
+  authority derives from the agent (CAD-345 unifies the vocabulary).
 
 ## Open questions
 
-- Should `USER.md` hold one operator or several (team mode, later)?
-- Do provider-specific lessons (e.g. a Cursor pane quirk) live in the agent's
-  memory or in `roles/` with a `provider:` scope?
+- One `USER.md` or one per operator (team mode, later)?
+- Should provider-specific quirks live in agent memory with a `provider:` scope?

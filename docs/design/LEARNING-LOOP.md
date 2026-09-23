@@ -35,13 +35,15 @@ flowchart LR
 ## 1. Reports (CAD-341)
 
 Every finished job, question or blocker files a Markdown report in
-`vault/agents/<slug>/journal/<date>-<task>.md` with frontmatter:
+`projects/<slug>/tickets/<ID>/reports/<date>-<session>.md` (the agent's
+`journal/INDEX.md` links it) with frontmatter:
 
 ```markdown
 ---
 kind: done            # done | question | blocked
 task: RMD-1
-agent: w1
+agent: dev
+session: dev#1
 sha: 3f9c2e1…
 constraints: ["copied verbatim from the kickoff"]
 context_feedback:
@@ -102,8 +104,8 @@ Company-scope items keep the two-review quorum of the current store.
 
 ## 4. The vault (CAD-346)
 
-All Markdown with frontmatter in `~/pm/vault` (the tracker repo, so it syncs with
-its remote). One item per file; itemized delta updates only. Layout and the
+All Markdown with frontmatter in `~/pm` (the tracker repo, so it syncs with its
+remote). One item per file; itemized delta updates only. Layout and the
 per-agent files are in [AGENT-FILESYSTEM.md](AGENT-FILESYSTEM.md).
 
 ```markdown
@@ -114,7 +116,7 @@ status: verified       # candidate | verified | needs-revalidation | invalidated
 scope: {role: dev, paths: [wrangler.toml], project: reminders}
 evidence: [{kind: commit, ref: 3f9c2e1}, {kind: test, ref: scheduled.spec.ts, rerun: pass}]
 provenance: agent-verified   # operator | agent-verified | agent-claimed | external
-proposer: w1 (codex)
+proposer: dev#1 (codex)
 curator: claude (sonnet)
 valid_from: 3f9c2e1
 invalidated_at: null
@@ -137,13 +139,13 @@ Built at task start, same builder for issue dispatch, `--job` dispatch and
 continuity:
 
 1. Static first (byte-stable, caches): the agent's `SOUL.md` and `AGENT.md`
-   body, the role's handbook excerpt.
+   body, the company handbook excerpt.
 2. The contract: acceptance, constraints and non-goals verbatim.
-3. The agent's `MEMORY.md` index, then lessons by path, similarity, role; FAQ;
+3. The agent's `MEMORY.md` index, then lessons by path, similarity, agent; FAQ;
    skills by name only.
 4. Re-check each lesson's citations against HEAD; withhold stale or contradicted
    items with the reason (CAD-203).
-5. Rank by confidence × helpful rate × recency; cap to the role's budget; render
+5. Rank by confidence × helpful rate × recency; cap to the agent's budget; render
    "verified at SHA" with the citation; log included ids for feedback.
 
 ## 6. Feedback, consolidation and measurement
