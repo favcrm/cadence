@@ -1026,8 +1026,7 @@ fn flock_holder(path: &Path) -> Result<Option<u32>> {
         ))
     })?;
     let dev = meta.dev();
-    let major = libc::major(dev);
-    let minor = libc::minor(dev);
+    let (major, minor) = dev_major_minor(dev);
     let inode = meta.ino();
     let text = std::fs::read_to_string("/proc/locks").map_err(|error| {
         Error::rejected(format!(
@@ -1068,6 +1067,21 @@ fn flock_holder(path: &Path) -> Result<Option<u32>> {
         "rollout release --force: {} is locked but its holder is not in /proc/locks",
         path.display()
     )))
+}
+
+/// A device id as `/proc/locks` prints it (`major:minor`).
+#[cfg(target_os = "linux")]
+fn dev_major_minor(dev: u64) -> (u32, u32) {
+    (libc::major(dev), libc::minor(dev))
+}
+
+/// Off Linux `dev_t` is 32-bit and there is no `/proc/locks` to match,
+/// so `flock_holder` refuses when it cannot read it; this only has to
+/// compile to the same shape.
+#[cfg(not(target_os = "linux"))]
+fn dev_major_minor(dev: u64) -> (u32, u32) {
+    let dev = dev as libc::dev_t;
+    (libc::major(dev) as u32, libc::minor(dev) as u32)
 }
 
 pub fn handoff(state_dir: &Path, caller: &Caller, to: &str) -> Result<Value> {

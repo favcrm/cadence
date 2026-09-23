@@ -425,7 +425,8 @@ impl Layout {
     /// Explicit paths win. Otherwise the link is `$HOME/.local/bin/cadence`,
     /// and the releases dir is read off the link's current target when it
     /// has the `<dir>/<40-hex>/cadence` shape (the layout the live install
-    /// already uses), else `$XDG_DATA_HOME/cadence/releases`, else
+    /// already uses) or the `<dir>/v<version>/cadence` shape `install.sh`
+    /// writes (CAD-311), else `$XDG_DATA_HOME/cadence/releases`, else
     /// `$HOME/.local/share/cadence/releases`.
     pub fn detect(link: Option<PathBuf>, releases: Option<PathBuf>) -> Result<Self> {
         let home = || {
@@ -440,8 +441,8 @@ impl Layout {
         };
         let releases = match releases {
             Some(dir) => dir,
-            None => match fs::read_link(&link).ok().and_then(|t| release_of(&t)) {
-                Some((dir, _)) => dir,
+            None => match fs::read_link(&link).ok().and_then(|t| releases_dir_of(&t)) {
+                Some(dir) => dir,
                 None => match std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
                     Some(data) => PathBuf::from(data).join("cadence/releases"),
                     None => home()?.join(".local/share/cadence/releases"),
@@ -471,6 +472,32 @@ fn release_of(target: &Path) -> Option<(PathBuf, String)> {
         return None;
     }
     Some((sha_dir.parent()?.to_path_buf(), sha.to_string()))
+}
+
+/// A release tag as `install.sh` names its directory: `v` and a version
+/// made of ASCII alphanumerics and `.+_-`, starting with a digit.
+pub fn is_version_tag(s: &str) -> bool {
+    s.strip_prefix('v').is_some_and(|v| {
+        v.starts_with(|c: char| c.is_ascii_digit())
+            && v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'_' | b'-'))
+    })
+}
+
+/// The releases dir holding a link target: `<dir>/<40-hex>/cadence` (an
+/// upgrade) or `<dir>/v<version>/cadence` (an `install.sh` release).
+fn releases_dir_of(target: &Path) -> Option<PathBuf> {
+    if let Some((dir, _)) = release_of(target) {
+        return Some(dir);
+    }
+    if target.file_name()? != BINARY {
+        return None;
+    }
+    let tag_dir = target.parent()?;
+    if !is_version_tag(tag_dir.file_name()?.to_str()?) {
+        return None;
+    }
+    Some(tag_dir.parent()?.to_path_buf())
 }
 
 /// What the link points at now.
