@@ -226,6 +226,13 @@ pub trait ProviderAdapter: Send + Sync {
     fn recover_budget(&self) -> std::time::Duration {
         std::time::Duration::from_secs(30 * 60)
     }
+    /// Small pre-post marker for a held Devin cloud turn. Other
+    /// providers have nothing to restore.
+    fn cloud_turn_marker(&self) -> Option<serde_json::Value> {
+        None
+    }
+    /// Rebuild a held turn's baseline after a daemon restart.
+    fn restore_cloud_marker(&self, _marker: &serde_json::Value) {}
     /// Answer a pending provider request (approval/user input).
     fn respond(&self, request_id: &Value, result: Value) -> Result<()>;
     /// Best-effort cancellation of an active turn.

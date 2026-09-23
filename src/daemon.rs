@@ -951,6 +951,23 @@ impl Shared {
         let mut recover_started: Option<Instant> = None;
         let mut recover_escalated = false;
         let mut recover_failures: u32 = 0;
+        // A restart drops the in-memory turn. The held row carries a
+        // small pre-post marker so recovery can rebuild the baseline
+        // instead of treating every old Devin message as fresh.
+        if hold_cloud {
+            if let Some(pending) = self.store.held_unknown(alias)? {
+                if let Some(marker) = pending
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("cloud_marker"))
+                {
+                    adapter.restore_cloud_marker(marker);
+                }
+                recover_delay = adapter.poll_interval().max(Duration::from_millis(1));
+                recover_started = Some(Instant::now());
+                cloud_held = Some(Box::new(pending));
+            }
+        }
         loop {
             if self.closing.load(Ordering::SeqCst) {
                 return Ok(());
@@ -1216,17 +1233,17 @@ impl Shared {
                         }
                         Err(Error::OutcomeUnknown(error)) => {
                             if hold_cloud {
-                                self.store.finish(
-                                    &message,
-                                    "unknown",
-                                    &json!({
-                                        "status": "unknown",
-                                        "text": "",
-                                        "error": error,
-                                        "held": true,
-                                    }),
-                                    Some(&error),
-                                )?;
+                                let mut held = json!({
+                                    "status": "unknown",
+                                    "text": "",
+                                    "error": error,
+                                    "held": true,
+                                });
+                                if let Some(marker) = adapter.cloud_turn_marker() {
+                                    held["cloud_marker"] = marker;
+                                }
+                                self.store
+                                    .finish(&message, "unknown", &held, Some(&error))?;
                                 let _ = self.store.event_public(
                                     alias,
                                     "cloud_hold",
@@ -7424,6 +7441,305 @@ mod tests {
         }
         stop.store(true, Ordering::SeqCst);
         let _ = thread.join();
+    }
+
+    fn stop_cloud(shared: &Shared, stop: &AtomicBool, thread: thread::JoinHandle<()>) {
+        shared.store.set_enabled("cloud-1", false).unwrap();
+        shared.begin_closing();
+        let handle = {
+            let lc = shared.lifecycle.lock().unwrap();
+            lc.agents
+                .get("cloud-1")
+                .and_then(|ctl| ctl.thread.lock().unwrap().take())
+        };
+        if let Some(ctl) = shared.lifecycle.lock().unwrap().agents.get("cloud-1") {
+            ctl.wake.notify_all();
+        }
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = thread.join();
+    }
+
+    #[test]
+    fn cloud_prewrite_fails_the_message_without_recovery() {
+        use std::sync::atomic::AtomicUsize;
+
+        let posts = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let posts_t = Arc::clone(&posts);
+        let stop_t = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !stop_t.load(Ordering::SeqCst) {
+                let mut req = match server.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Some(req)) => req,
+                    _ => continue,
+                };
+                let path = req.url().to_string();
+                let method = req.method().as_str().to_string();
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let (status, payload): (u16, String) = if path.contains("/repositories") {
+                    (
+                        200,
+                        json!({"repositories": [{"name": "cadence", "owner": "favcrm"}]})
+                            .to_string(),
+                    )
+                } else if method == "POST" && path.ends_with("/sessions") {
+                    (
+                        200,
+                        json!({
+                            "session_id": "devin-created",
+                            "status": "running",
+                            "status_detail": "working",
+                            "url": "https://app.devin.ai/sessions/devin-created"
+                        })
+                        .to_string(),
+                    )
+                } else if method == "POST" && path.contains("/messages") {
+                    posts_t.fetch_add(1, Ordering::SeqCst);
+                    (200, json!({"ok": true}).to_string())
+                } else if method == "GET" && path.contains("/messages") {
+                    (429, json!({"error": "slow"}).to_string())
+                } else if method == "GET" && path.contains("/sessions/") {
+                    (
+                        200,
+                        json!({
+                            "session_id": "devin-created",
+                            "status": "running",
+                            "status_detail": "working",
+                            "url": "https://app.devin.ai/sessions/devin-created",
+                            "pull_requests": [],
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (200, json!({"ok": true}).to_string())
+                };
+                let _ =
+                    req.respond(tiny_http::Response::from_string(payload).with_status_code(status));
+            }
+        });
+        let (dir, shared) = shared();
+        let base = format!("http://{addr}");
+        shared.provider_env.set("CADENCE_DEVIN_API_BASE", &base);
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_API_KEY", "cog_test_secret_value");
+        shared.provider_env.set("CADENCE_DEVIN_ORG_ID", "org-test");
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_POLL_INTERVAL_MS", "20");
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_POLL_BUDGET_MS", "200");
+        let cwd = dir.path().to_str().unwrap();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "cloud-1",
+                provider: "devin",
+                endpoint_kind: "cloud",
+                role: "worker",
+                cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: Some(r#"{"repos":["favcrm/cadence"]}"#),
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .enqueue("cloud-1", "do the task", None, "prewrite-1", "user")
+            .unwrap();
+        shared.launch_actor("cloud-1").unwrap();
+        let started = Instant::now();
+        loop {
+            if started.elapsed() > Duration::from_secs(8) {
+                panic!(
+                    "prewrite did not fail the message: {:?}",
+                    shared.store.message("prewrite-1").ok()
+                );
+            }
+            if shared.store.message("prewrite-1").unwrap().unwrap().state == "failed" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let message = shared.store.message("prewrite-1").unwrap().unwrap();
+        assert_eq!(message.state, "failed");
+        let blob = format!(
+            "{} {}",
+            message.result.unwrap_or(json!({})),
+            message.error.unwrap_or_default()
+        );
+        assert!(!blob.contains("unknown"), "{blob}");
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        let events = shared.store.events("cloud-1", 0, 40).unwrap();
+        assert!(events.iter().all(|event| event.kind != "cloud_hold"));
+        assert!(events
+            .iter()
+            .all(|event| event.kind != "cloud_recover_escalated"));
+        stop_cloud(&shared, &stop, thread);
+    }
+
+    #[test]
+    fn cloud_restart_recovery_does_not_bind_a_pre_post_sha() {
+        use std::sync::atomic::AtomicUsize;
+
+        const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let posts = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let posts_t = Arc::clone(&posts);
+        let stop_t = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !stop_t.load(Ordering::SeqCst) {
+                let mut req = match server.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Some(req)) => req,
+                    _ => continue,
+                };
+                let path = req.url().to_string();
+                let method = req.method().as_str().to_string();
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let (status, payload): (u16, String) = if path.contains("/repositories") {
+                    (
+                        200,
+                        json!({"repositories": [{"name": "cadence", "owner": "favcrm"}]})
+                            .to_string(),
+                    )
+                } else if method == "POST" && path.ends_with("/sessions") {
+                    (
+                        200,
+                        json!({
+                            "session_id": "devin-created",
+                            "status": "running",
+                            "status_detail": "working",
+                            "url": "https://app.devin.ai/sessions/devin-created"
+                        })
+                        .to_string(),
+                    )
+                } else if method == "POST" && path.contains("/messages") {
+                    posts_t.fetch_add(1, Ordering::SeqCst);
+                    (200, json!({"ok": true}).to_string())
+                } else if method == "GET" && path.contains("/messages") {
+                    let items = json!([{
+                        "event_id": "evt-old",
+                        "source": "devin",
+                        "message": format!("SHA: {OLD}"),
+                        "created_at": 1
+                    }]);
+                    (
+                        200,
+                        json!({"items": items, "has_next_page": false, "end_cursor": null, "total": 1})
+                            .to_string(),
+                    )
+                } else if method == "GET" && path.contains("/sessions/") {
+                    (
+                        200,
+                        json!({
+                            "session_id": "devin-created",
+                            "status": "running",
+                            "status_detail": "finished",
+                            "url": "https://app.devin.ai/sessions/devin-created",
+                            "pull_requests": [],
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (200, json!({"ok": true}).to_string())
+                };
+                let _ =
+                    req.respond(tiny_http::Response::from_string(payload).with_status_code(status));
+            }
+        });
+        let (dir, shared) = shared();
+        let base = format!("http://{addr}");
+        shared.provider_env.set("CADENCE_DEVIN_API_BASE", &base);
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_API_KEY", "cog_test_secret_value");
+        shared.provider_env.set("CADENCE_DEVIN_ORG_ID", "org-test");
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_POLL_INTERVAL_MS", "20");
+        shared
+            .provider_env
+            .set("CADENCE_DEVIN_RECOVER_BUDGET_MS", "400");
+        let cwd = dir.path().to_str().unwrap();
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias: "cloud-1",
+                provider: "devin",
+                endpoint_kind: "cloud",
+                role: "worker",
+                cwd,
+                sandbox: "read-only",
+                instructions: None,
+                params: Some(r#"{"repos":["favcrm/cadence"]}"#),
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .enqueue("cloud-1", "do the task", None, "held-1", "user")
+            .unwrap();
+        let pending = shared.store.message("held-1").unwrap().unwrap();
+        shared
+            .store
+            .finish(
+                &pending,
+                "unknown",
+                &json!({
+                    "status": "unknown",
+                    "text": "",
+                    "error": "held",
+                    "held": true,
+                    "cloud_marker": {
+                        "last_event_id": "evt-old",
+                        "post_status": "running",
+                        "post_detail": "working"
+                    }
+                }),
+                Some("held"),
+            )
+            .unwrap();
+        shared.launch_actor("cloud-1").unwrap();
+        let started = Instant::now();
+        loop {
+            if started.elapsed() > Duration::from_secs(4) {
+                break;
+            }
+            let state = shared.store.message("held-1").unwrap().unwrap().state;
+            if state == "completed" || state == "failed" || state == "interrupted" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let message = shared.store.message("held-1").unwrap().unwrap();
+        let blob = format!(
+            "{} {}",
+            message.result.clone().unwrap_or(json!({})),
+            message.error.clone().unwrap_or_default()
+        );
+        assert!(
+            !blob.contains(OLD),
+            "restart recovery bound a pre-post SHA: {blob}"
+        );
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            0,
+            "recovery posted a new turn"
+        );
+        stop_cloud(&shared, &stop, thread);
     }
 
     #[test]

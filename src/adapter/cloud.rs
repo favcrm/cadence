@@ -16,6 +16,7 @@
 //! focused task, not an open-ended session; operators override it with
 //! the launch param. No test here talks to `api.devin.ai`.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -39,9 +40,48 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 const DEFAULT_POLL_BUDGET_MS: u64 = 30 * 60 * 1000;
 const DEFAULT_RECOVER_BUDGET_MS: u64 = 30 * 60 * 1000;
 const MESSAGES_PAGE: usize = 100;
-/// Pages read per poll. The cursor is kept, so a later poll continues
-/// instead of stopping forever at 2,000 messages.
+/// Pages read per poll after a post. The pre-post catch-up has no cap:
+/// it pages until `has_next_page` is false.
 const MESSAGES_PAGES_PER_POLL: usize = 8;
+const MESSAGES_PAGE_GUARD: usize = 500;
+
+/// Messages read for one session. `known` is complete up to `cursor`
+/// only when `complete` is set, which happens after a walk sees
+/// `has_next_page == false`. A live last page omits `end_cursor`, so
+/// `cursor` stays the last non-empty one and the next read re-fetches
+/// that tail.
+#[derive(Default)]
+struct SessionLog {
+    cursor: Option<String>,
+    known: HashSet<String>,
+    /// First-seen order, so a restart can split the log at the pre-post id.
+    order: Vec<String>,
+    last_id: Option<String>,
+    complete: bool,
+}
+
+/// One in-flight turn. `baseline` is `known` at post time and is only
+/// taken when the log is complete. `devin_msgs` accumulates Devin text
+/// that was not in that baseline, across polls, in read order.
+struct TurnState {
+    baseline: HashSet<String>,
+    baseline_last: Option<String>,
+    devin_msgs: Vec<(String, String)>,
+    devin_ids: HashSet<String>,
+    posted: bool,
+    post_status: String,
+    post_detail: String,
+}
+
+/// A held turn's marker, restored after a daemon restart. The baseline
+/// is the pre-post event id, not the whole set.
+#[derive(Clone)]
+struct Rebuild {
+    last_event_id: String,
+    post_status: String,
+    post_detail: String,
+    sha: Option<String>,
+}
 
 #[derive(Default)]
 struct Session {
@@ -54,27 +94,10 @@ struct Session {
     limit: Option<f64>,
     wait_sent: bool,
     terminated: bool,
-    /// Every `event_id` read from a successful messages page. The post
-    /// marker copies this set; a failed capture falls back to it so an
-    /// older Devin `SHA:` is not this turn's result.
-    seen_ids: Vec<String>,
-    /// Last non-empty messages `end_cursor`. The next fetch asks for
-    /// `after` this cursor. A live last page omits `end_cursor`, so a
-    /// missing cursor keeps the previous one.
-    messages_cursor: Option<String>,
-    /// Set once any messages page has been read. Until then a failed
-    /// capture must not post.
-    messages_fetched: bool,
-    /// `event_id`s copied from `seen_ids` at post time. A Devin message
-    /// whose `event_id` is already here is not part of this turn.
-    marker_ids: Vec<String>,
-    /// Snapshot taken at post time. A terminal or waiting state that
-    /// still matches this snapshot is leftover from before the post.
-    post_marked: bool,
-    post_status: String,
-    post_detail: String,
-    /// Devin text whose `event_id` arrived after `marker_ids`.
-    turn_text: String,
+    pr_urls: Vec<String>,
+    log: SessionLog,
+    turn: Option<TurnState>,
+    rebuild: Option<Rebuild>,
 }
 
 enum CallErr {
@@ -162,7 +185,15 @@ impl DevinCloudAdapter {
     }
 
     fn turn_text(&self) -> String {
-        self.session.lock().unwrap().turn_text.clone()
+        let st = self.session.lock().unwrap();
+        let mut lines = Vec::new();
+        if let Some(turn) = &st.turn {
+            for (_, text) in &turn.devin_msgs {
+                lines.push(text.clone());
+            }
+        }
+        lines.extend(st.pr_urls.iter().cloned());
+        lines.join("\n")
     }
 
     fn note(&self, text: &str) {
@@ -452,7 +483,7 @@ impl DevinCloudAdapter {
             })?
             .to_string();
         let url = session_url(reply, &id);
-        self.remember(reply, &[], Some(id.clone()), Some(url.clone()));
+        self.remember(reply, Some(id.clone()), Some(url.clone()));
         (self.hooks.on_event)(
             "cadence/cloud_session",
             json!({"session_id": id, "endpoint": url, "status": reply.get("status")}),
@@ -473,7 +504,7 @@ impl DevinCloudAdapter {
                     return Err(mismatch(id, got));
                 }
                 let url = session_url(&reply, id);
-                self.remember(&reply, &[], Some(id.to_string()), Some(url.clone()));
+                self.remember(&reply, Some(id.to_string()), Some(url.clone()));
                 (self.hooks.on_event)(
                     "cadence/cloud_session",
                     json!({"session_id": id, "endpoint": url, "adopted": true}),
@@ -504,7 +535,7 @@ impl DevinCloudAdapter {
         }
     }
 
-    fn remember(&self, body: &Value, messages: &[Value], id: Option<String>, url: Option<String>) {
+    fn remember(&self, body: &Value, id: Option<String>, url: Option<String>) {
         let mut st = self.session.lock().unwrap();
         if let Some(id) = id {
             st.id = Some(id);
@@ -524,22 +555,33 @@ impl DevinCloudAdapter {
         if let Some(n) = body.get("max_acu_limit").and_then(Value::as_f64) {
             st.limit = Some(n);
         }
-        st.turn_text = transcript_after(messages, &st.marker_ids, body);
+        st.pr_urls = pull_request_urls(body);
     }
 
-    /// Read the messages tail. Items are oldest-first. A live read on
-    /// 2026-09-23 (`first=2` through the last page) showed `end_cursor`
-    /// only while `has_next_page` is true; the last page omits it and
-    /// `total` is null. The cursor kept here is the last non-empty
-    /// `end_cursor`, and the next poll requests `after` that cursor, so
-    /// a caught-up session costs one tail page instead of the whole
-    /// history. A transcript that fits in one page has no cursor, and
-    /// that single page is read again. `source == "devin"` is the
-    /// assistant; the session GET has no messages field.
-    fn fetch_messages(&self, org: &str, id: &str) -> std::result::Result<MessageList, CallErr> {
-        let mut after = self.session.lock().unwrap().messages_cursor.clone();
-        let mut items = Vec::new();
-        for _ in 0..MESSAGES_PAGES_PER_POLL {
+    /// Read messages into [`SessionLog`]. Items are oldest-first. A live
+    /// read on 2026-09-23 showed `end_cursor` only while `has_next_page`
+    /// is true; the last page omits it. The stored cursor is the last
+    /// non-empty one, and the next call re-reads that tail. `until_complete`
+    /// pages with no per-poll cap until `has_next_page` is false. A poll
+    /// stops after [`MESSAGES_PAGES_PER_POLL`] and keeps the cursor.
+    fn sync_messages(
+        &self,
+        org: &str,
+        id: &str,
+        until_complete: bool,
+    ) -> std::result::Result<(), CallErr> {
+        let mut pages = 0usize;
+        loop {
+            if !until_complete && pages >= MESSAGES_PAGES_PER_POLL {
+                break;
+            }
+            if pages >= MESSAGES_PAGE_GUARD {
+                return Err(CallErr::Transport(
+                    "devin messages walk exceeded its page guard".into(),
+                ));
+            }
+            pages += 1;
+            let after = self.session.lock().unwrap().log.cursor.clone();
             let mut rest = format!("/{}/messages?first={MESSAGES_PAGE}", encode(id));
             if let Some(cursor) = &after {
                 rest.push_str("&after=");
@@ -551,7 +593,6 @@ impl DevinCloudAdapter {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            items.extend(page.iter().cloned());
             let more = body
                 .get("has_next_page")
                 .and_then(Value::as_bool)
@@ -561,120 +602,127 @@ impl DevinCloudAdapter {
                 .and_then(Value::as_str)
                 .filter(|cursor| !cursor.is_empty())
                 .map(str::to_string);
-            // A terminal page often has no cursor. Keep the one that
-            // addressed this tail so the next poll does not start over.
             let persist = cursor.clone().or_else(|| after.clone());
-            self.note_seen(&page, persist);
+            self.absorb_page(&page, persist, more);
             if !more {
                 break;
             }
-            let Some(cursor) = cursor else { break };
+            let Some(cursor) = cursor else {
+                return Err(CallErr::Transport(
+                    "devin messages page had no end_cursor before the end".into(),
+                ));
+            };
             if after.as_ref() == Some(&cursor) {
-                break;
+                return Err(CallErr::Transport(
+                    "devin messages cursor did not advance".into(),
+                ));
             }
-            after = Some(cursor);
         }
-        Ok(MessageList { items })
+        Ok(())
     }
 
-    fn note_seen(&self, page: &[Value], cursor: Option<String>) {
+    fn absorb_page(&self, page: &[Value], cursor: Option<String>, more: bool) {
         let mut st = self.session.lock().unwrap();
-        for id in event_ids(page) {
-            if !st.seen_ids.iter().any(|seen| seen == &id) {
-                st.seen_ids.push(id);
+        if let Some(rebuild) = st.rebuild.clone() {
+            if rebuild.last_event_id.is_empty() && st.turn.is_none() {
+                install_rebuild(&mut st, &rebuild);
+            }
+        }
+        for item in page {
+            let Some(id) = item.get("event_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let id = id.to_string();
+            if st.log.known.insert(id.clone()) {
+                st.log.order.push(id.clone());
+            }
+            st.log.last_id = Some(id.clone());
+            if let Some(rebuild) = st.rebuild.clone() {
+                if st.turn.is_none() && rebuild.last_event_id == id {
+                    install_rebuild(&mut st, &rebuild);
+                }
+            }
+            if let Some(turn) = st.turn.as_mut() {
+                if turn.posted && !turn.baseline.contains(&id) && is_devin(item) {
+                    if let Some(text) = message_text(item) {
+                        if turn.devin_ids.insert(id.clone()) {
+                            turn.devin_msgs.push((id, text.to_string()));
+                        }
+                    }
+                }
             }
         }
         if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
-            st.messages_cursor = Some(cursor);
+            st.log.cursor = Some(cursor);
         }
-        st.messages_fetched = true;
+        st.log.complete = !more;
     }
 
-    fn apply_marker(&self, status: String, detail: String) {
+    fn snapshot_baseline(&self, status: String, detail: String) {
         let mut st = self.session.lock().unwrap();
         st.status = status.clone();
         st.detail = detail.clone();
-        st.marker_ids = st.seen_ids.clone();
-        st.post_status = status;
-        st.post_detail = detail;
-        st.post_marked = true;
-        st.turn_text.clear();
+        let baseline = st.log.known.clone();
+        let baseline_last = st.log.last_id.clone();
+        st.turn = Some(TurnState {
+            baseline,
+            baseline_last,
+            devin_msgs: Vec::new(),
+            devin_ids: HashSet::new(),
+            posted: false,
+            post_status: status,
+            post_detail: detail,
+        });
     }
 
-    fn apply_fallback_marker(&self) {
-        let mut st = self.session.lock().unwrap();
-        st.marker_ids = st.seen_ids.clone();
-        st.post_status = st.status.to_ascii_lowercase();
-        st.post_detail = st.detail.to_ascii_lowercase();
-        st.post_marked = true;
-        st.turn_text.clear();
-    }
-
-    /// One snapshot attempt. `Ok` means the post may proceed: either
-    /// this read succeeded, or a previous successful fetch supplied the
-    /// event ids. `Err` means nothing has been read yet.
-    fn try_capture(&self, org: &str, id: &str) -> std::result::Result<(), CallErr> {
-        let path = self.org_path(org, &format!("/{}", encode(id)));
-        let session = self.call("GET", &path, None);
-        let messages = self.fetch_messages(org, id);
-        let known = self.session.lock().unwrap().messages_fetched;
-        match (session, messages) {
-            (Ok(body), Ok(_)) => {
-                let (status, detail) = status_of(&body);
-                self.apply_marker(status, detail);
-                Ok(())
-            }
-            (Ok(body), Err(_)) if known => {
-                let (status, detail) = status_of(&body);
-                self.apply_marker(status, detail);
-                Ok(())
-            }
-            (Err(_), _) if known => {
-                self.apply_fallback_marker();
-                Ok(())
-            }
-            (Err(err), _) => Err(err),
-            (_, Err(err)) => Err(err),
-        }
-    }
-
-    /// Freeze the session as it stands at post time. When the capture
-    /// fails and no messages page has ever been read, retry inside the
-    /// turn budget and do not post. A later failure reuses the event
-    /// ids from the last successful fetch.
-    fn ensure_post_marker(&self, org: &str, id: &str) -> Result<()> {
+    /// Page until the log is complete, then snapshot that set as the
+    /// turn baseline. A failed walk that never reached the end is
+    /// [`Error::PreWrite`]: nothing is posted. A log that is already
+    /// complete keeps that baseline when a refresh fails.
+    fn prepare_baseline(&self, org: &str, id: &str) -> Result<()> {
         let deadline = Instant::now() + self.budget;
         let mut backoff = self.interval;
         loop {
-            match self.try_capture(org, id) {
-                Ok(()) => return Ok(()),
-                Err(err) if transient_call(&err) => {
-                    if Instant::now() >= deadline || self.pause(backoff) {
-                        if self.released() {
-                            return Err(Error::rejected("devin cloud post interrupted"));
-                        }
-                        return Err(self.held_before_post(&err));
+            let path = self.org_path(org, &format!("/{}", encode(id)));
+            let session = self.call("GET", &path, None);
+            let synced = self.sync_messages(org, id, true);
+            let complete = self.session.lock().unwrap().log.complete;
+            if complete {
+                let (status, detail) = match session {
+                    Ok(body) => status_of(&body),
+                    Err(_) => {
+                        let st = self.session.lock().unwrap();
+                        (
+                            st.status.to_ascii_lowercase(),
+                            st.detail.to_ascii_lowercase(),
+                        )
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
-                }
-                Err(err) => {
-                    let msg = call_text(&err);
-                    self.note(&msg);
-                    return Err(Error::provider(format!(
-                        "devin cloud message refused before post, nothing posted: {msg}"
-                    )));
-                }
+                };
+                self.snapshot_baseline(status, detail);
+                return Ok(());
             }
+            let err = match (session, synced) {
+                (Err(err), _) => err,
+                (_, Err(err)) => err,
+                (Ok(_), Ok(())) => CallErr::Transport(
+                    "devin messages walk stopped before has_next_page was false".into(),
+                ),
+            };
+            if self.released() {
+                return Err(Error::rejected("devin cloud post interrupted"));
+            }
+            if !transient_call(&err) || Instant::now() >= deadline || self.pause(backoff) {
+                if self.released() {
+                    return Err(Error::rejected("devin cloud post interrupted"));
+                }
+                let msg = call_text(&err);
+                self.note(&msg);
+                return Err(Error::pre_write(format!(
+                    "devin cloud message refused before post, nothing posted: {msg}"
+                )));
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(5));
         }
-    }
-
-    fn held_before_post(&self, err: &CallErr) -> Error {
-        let msg = call_text(err);
-        self.note(&msg);
-        Error::unknown(format!(
-            "devin cloud poll held last state ({}): {msg}",
-            self.last_state()
-        ))
     }
 
     fn post_message(&self, text: &str) -> Result<()> {
@@ -686,7 +734,13 @@ impl DevinCloudAdapter {
                 .ok_or_else(|| Error::rejected("devin cloud has no session to message"))?;
             (st.org.clone(), id)
         };
-        self.ensure_post_marker(&org, &id)?;
+        self.prepare_baseline(&org, &id)?;
+        {
+            let mut st = self.session.lock().unwrap();
+            if let Some(turn) = st.turn.as_mut() {
+                turn.posted = true;
+            }
+        }
         let path = self.org_path(&org, &format!("/{}/messages", encode(&id)));
         let body = json!({"message": text});
         match self.call("POST", &path, Some(&body)) {
@@ -721,25 +775,51 @@ impl DevinCloudAdapter {
             Ok(body) => body,
             Err(err) => return self.hold_poll(err),
         };
-        let list = match self.fetch_messages(&org, &id) {
-            Ok(list) => list,
-            Err(err) => return self.hold_poll(err),
+        if let Err(err) = self.sync_messages(&org, &id, false) {
+            return self.hold_poll(err);
+        }
+        self.finish_rebuild();
+        let (status, detail) = status_of(&body);
+        let (posted, complete, fresh_text, stale, failure) = {
+            let mut st = self.session.lock().unwrap();
+            st.status = status.clone();
+            st.detail = detail.clone();
+            if let Some(n) = body.get("acus_consumed").and_then(Value::as_f64) {
+                st.acus = Some(n);
+            }
+            if let Some(n) = body.get("max_acu_limit").and_then(Value::as_f64) {
+                st.limit = Some(n);
+            }
+            st.pr_urls = pull_request_urls(&body);
+            let posted = st.turn.as_ref().is_some_and(|turn| turn.posted);
+            let complete = st.log.complete;
+            let fresh_text = st
+                .turn
+                .as_ref()
+                .map(|turn| {
+                    turn.devin_msgs
+                        .iter()
+                        .map(|(_, text)| text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            let stale = st.turn.as_ref().is_some_and(|turn| {
+                turn.posted
+                    && turn.devin_msgs.is_empty()
+                    && status == turn.post_status
+                    && detail == turn.post_detail
+            });
+            let failure = failure_terminal(&status, &detail);
+            (posted, complete, fresh_text, stale, failure)
         };
-        let fresh = fresh_devin(&list.items, &self.session.lock().unwrap().marker_ids);
-        let fresh_text = fresh
-            .iter()
-            .filter_map(|message| message_text(message))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let stale = {
-            let st = self.session.lock().unwrap();
-            let (status, detail) = status_of(&body);
-            st.post_marked
-                && fresh.is_empty()
-                && status == st.post_status
-                && detail == st.post_detail
-        };
-        self.remember(&body, &list.items, None, None);
+        // No baseline (a restart that could not rebuild one) never
+        // settles, so an old Devin message cannot complete the turn.
+        // An incomplete walk also waits, unless the session has already
+        // failed and there is nothing new to read for.
+        if !posted || (!complete && !failure) {
+            return Ok(Phase::Running);
+        }
         let phase = phase_of(&body, stale, &fresh_text);
         if !matches!(phase, Phase::Wait) {
             self.session.lock().unwrap().wait_sent = false;
@@ -748,6 +828,77 @@ impl DevinCloudAdapter {
             self.emit_wait(&fresh_text);
         }
         Ok(phase)
+    }
+
+    fn finish_rebuild(&self) {
+        let mut st = self.session.lock().unwrap();
+        if !st.log.complete {
+            return;
+        }
+        let Some(rebuild) = st.rebuild.clone() else {
+            return;
+        };
+        if let Some(turn) = st.turn.as_mut() {
+            if let Some(sha) = rebuild.sha.clone() {
+                let have = turn.devin_msgs.iter().any(|(_, text)| text.contains(&sha));
+                if !have {
+                    turn.devin_msgs
+                        .push(("restored-sha".into(), format!("SHA: {sha}")));
+                }
+            }
+        }
+        st.rebuild = None;
+    }
+
+    fn export_turn_marker(&self) -> Option<Value> {
+        let st = self.session.lock().unwrap();
+        let turn = st.turn.as_ref()?;
+        if !turn.posted {
+            return None;
+        }
+        let sha = turn
+            .devin_msgs
+            .iter()
+            .rev()
+            .find_map(|(_, text)| sha_hex(text));
+        Some(json!({
+            "last_event_id": turn.baseline_last,
+            "count": turn.baseline.len(),
+            "cursor": st.log.cursor,
+            "post_status": turn.post_status,
+            "post_detail": turn.post_detail,
+            "sha": sha,
+        }))
+    }
+
+    fn import_turn_marker(&self, marker: &Value) {
+        let sha = marker
+            .get("sha")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        let rebuild = Rebuild {
+            last_event_id: marker
+                .get("last_event_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            post_status: marker
+                .get("post_status")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            post_detail: marker
+                .get("post_detail")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            sha,
+        };
+        let mut st = self.session.lock().unwrap();
+        st.log = SessionLog::default();
+        st.turn = None;
+        st.rebuild = Some(rebuild);
     }
 
     fn hold_poll(&self, err: CallErr) -> Result<Phase> {
@@ -1007,6 +1158,14 @@ impl ProviderAdapter for DevinCloudAdapter {
 
     fn recover_budget(&self) -> Duration {
         self.recover_budget
+    }
+
+    fn cloud_turn_marker(&self) -> Option<Value> {
+        self.export_turn_marker()
+    }
+
+    fn restore_cloud_marker(&self, marker: &Value) {
+        self.import_turn_marker(marker);
     }
 
     fn poll_settled(&self) -> Result<SettledPoll> {
@@ -1477,10 +1636,6 @@ fn create_claim(alias: &str) -> String {
     format!("cadence-agent:{alias}:{tick:x}-{n:x}")
 }
 
-struct MessageList {
-    items: Vec<Value>,
-}
-
 fn is_devin(message: &Value) -> bool {
     message.get("source").and_then(Value::as_str) == Some("devin")
 }
@@ -1492,51 +1647,56 @@ fn message_text(message: &Value) -> Option<&str> {
         .filter(|text| !text.is_empty())
 }
 
-fn event_ids(items: &[Value]) -> Vec<String> {
-    items
-        .iter()
-        .filter_map(|message| {
-            message
-                .get("event_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect()
+fn install_rebuild(st: &mut Session, rebuild: &Rebuild) {
+    let baseline = if rebuild.last_event_id.is_empty() {
+        HashSet::new()
+    } else {
+        st.log.order.iter().cloned().collect()
+    };
+    let baseline_last = if rebuild.last_event_id.is_empty() {
+        None
+    } else {
+        Some(rebuild.last_event_id.clone())
+    };
+    st.turn = Some(TurnState {
+        baseline,
+        baseline_last,
+        devin_msgs: Vec::new(),
+        devin_ids: HashSet::new(),
+        posted: true,
+        post_status: rebuild.post_status.clone(),
+        post_detail: rebuild.post_detail.clone(),
+    });
 }
 
-fn fresh_devin<'a>(items: &'a [Value], marker: &[String]) -> Vec<&'a Value> {
-    items
-        .iter()
-        .filter(|message| {
-            is_devin(message)
-                && message
-                    .get("event_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| !marker.iter().any(|seen| seen == id))
+fn pull_request_urls(session: &Value) -> Vec<String> {
+    session
+        .get("pull_requests")
+        .and_then(Value::as_array)
+        .map(|prs| {
+            prs.iter()
+                .filter_map(|pr| {
+                    pr.get("pr_url")
+                        .and_then(Value::as_str)
+                        .or_else(|| pr.get("url").and_then(Value::as_str))
+                        .or_else(|| pr.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
         })
-        .collect()
+        .unwrap_or_default()
 }
 
-fn transcript_after(messages: &[Value], marker: &[String], session: &Value) -> String {
-    let mut lines = Vec::new();
-    for message in fresh_devin(messages, marker) {
-        if let Some(text) = message_text(message) {
-            lines.push(text.to_string());
-        }
-    }
-    if let Some(prs) = session.get("pull_requests").and_then(Value::as_array) {
-        for pr in prs {
-            if let Some(url) = pr
-                .get("pr_url")
-                .and_then(Value::as_str)
-                .or_else(|| pr.get("url").and_then(Value::as_str))
-                .or_else(|| pr.as_str())
-            {
-                lines.push(url.to_string());
-            }
-        }
-    }
-    lines.join("\n")
+fn sha_hex(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let rest = line
+            .trim()
+            .strip_prefix("SHA:")
+            .or_else(|| line.trim().strip_prefix("sha:"))?;
+        let hex = rest.trim();
+        (hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| hex.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -1544,7 +1704,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -1601,6 +1761,9 @@ mod tests {
         MarkerMiss,
         CursorTail,
         DeepTail,
+        Straddle,
+        OldSha,
+        SyncFail,
     }
 
     struct Hit {
@@ -1959,6 +2122,89 @@ mod tests {
         message_page(&items, true, Some(&cursor), 2001)
     }
 
+    fn cursor_end(path: &str) -> usize {
+        path.split("after=c")
+            .nth(1)
+            .and_then(|rest| rest.split(['&', ' ']).next())
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// 195 messages at post time, cursor after message 100. The next
+    /// poll re-reads 101–201, including a SHA at 200, while the session
+    /// is still working. The page after that is 201+ and the session
+    /// is waiting. The SHA has to survive in the accumulated turn.
+    fn straddle_reply(path: &str, hits: &[Hit]) -> (u16, String) {
+        const SHA_X: &str = "abcdef0123456789abcdef0123456789abcdef01";
+        let posts = message_posts(hits);
+        if !path.contains("/messages") {
+            let waiting = hits.iter().any(|hit| hit.path.contains("after=c200"));
+            let detail = if waiting {
+                "waiting_for_user"
+            } else {
+                "working"
+            };
+            return (
+                200,
+                session_state("devin-created", "running", detail, false),
+            );
+        }
+        if posts == 0 {
+            if path.contains("after=") {
+                let items: Vec<Value> = (101..=195)
+                    .map(|n| devin_msg(&format!("m{n}"), "older"))
+                    .collect();
+                return (200, message_page(&items, false, None, 195));
+            }
+            let items: Vec<Value> = (1..=100)
+                .map(|n| devin_msg(&format!("m{n}"), "older"))
+                .collect();
+            return (200, message_page(&items, true, Some("c100"), 195));
+        }
+        if path.contains("after=c200") {
+            let items: Vec<Value> = (201..=205)
+                .map(|n| devin_msg(&format!("m{n}"), "later"))
+                .collect();
+            return (200, message_page(&items, false, None, 205));
+        }
+        let sha = format!("done\nSHA: {SHA_X}");
+        let items: Vec<Value> = (101..=201)
+            .map(|n| {
+                let text = if n == 200 { sha.as_str() } else { "older" };
+                devin_msg(&format!("m{n}"), text)
+            })
+            .collect();
+        (200, message_page(&items, true, Some("c200"), 205))
+    }
+
+    /// 900 pre-existing messages. Message 850 carries an old SHA, past
+    /// the old 800-message poll cap. Catch-up has to read all nine
+    /// pages before the post.
+    fn old_sha_reply(path: &str) -> (u16, String) {
+        if !path.contains("/messages") {
+            return (
+                200,
+                session_state("devin-created", "running", "waiting_for_user", false),
+            );
+        }
+        let start = cursor_end(path) + 1;
+        let end = (start + 99).min(900);
+        let has_next = end < 900;
+        let cursor = has_next.then(|| format!("c{end}"));
+        let sha = format!("SHA: {SHA}");
+        let items: Vec<Value> = (start..=end)
+            .map(|n| {
+                let text = if n == 850 {
+                    sha.clone()
+                } else {
+                    format!("older {n}")
+                };
+                devin_msg(&format!("m{n}"), &text)
+            })
+            .collect();
+        (200, message_page(&items, has_next, cursor.as_deref(), 900))
+    }
+
     fn deep_tail_reply(path: &str, hits: &[Hit]) -> (u16, String) {
         if path.contains("/messages") {
             if message_posts(hits) == 0 {
@@ -2020,11 +2266,22 @@ mod tests {
             return Some((200, json!({"ok": true}).to_string()));
         }
         if method == "GET" && path.contains("/sessions/") {
-            if matches!(script, Script::RateLimit) {
+            // A pre-post catch-up has to succeed. Rate limits and 5xx
+            // after the message is posted are held polls, not PreWrite.
+            if matches!(script, Script::RateLimit) && message_posts(hits) > 0 {
                 return Some((429, json!({"error": KEY}).to_string()));
             }
-            if matches!(script, Script::Poll500) {
+            if matches!(script, Script::Poll500) && message_posts(hits) > 0 {
                 return Some((500, json!({"error": KEY}).to_string()));
+            }
+            if matches!(script, Script::SyncFail) && path.contains("/messages") {
+                return Some((429, json!({"error": KEY}).to_string()));
+            }
+            if matches!(script, Script::Straddle) {
+                return Some(straddle_reply(path, hits));
+            }
+            if matches!(script, Script::OldSha) {
+                return Some(old_sha_reply(path));
             }
             if matches!(script, Script::Adopt404) {
                 return Some((404, json!({"error": "not found"}).to_string()));
@@ -2538,6 +2795,80 @@ mod tests {
     }
 
     #[test]
+    fn turn_text_accumulates_across_a_page_boundary() {
+        const SHA_X: &str = "abcdef0123456789abcdef0123456789abcdef01";
+        let Harness {
+            adapter,
+            requests,
+            mock: _mock,
+            ..
+        } = adapter_for(Script::Straddle);
+        adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        let turn = adapter.run_turn("do the task", "turn-1", &|_| {}).unwrap();
+        assert_eq!(turn.status, "completed");
+        assert!(
+            turn.text.contains(SHA_X),
+            "page boundary dropped the SHA: {}",
+            turn.text
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "straddle raised user_input instead of completing"
+        );
+    }
+
+    #[test]
+    fn catch_up_past_eight_hundred_does_not_bind_an_old_sha() {
+        let Harness { adapter, mock, .. } = adapter_for_timed(Script::OldSha, "10", "3000");
+        adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        let result = adapter.run_turn("do the task", "turn-1", &|_| {});
+        match &result {
+            Ok(turn) => assert!(
+                !turn.text.contains(SHA),
+                "turn completed with a pre-post SHA: {}",
+                turn.text
+            ),
+            Err(err) => assert!(!err.to_string().contains(SHA), "{err}"),
+        }
+        let hits = hits_of(&mock);
+        let posted = hits
+            .iter()
+            .position(|hit| hit.method == "POST" && hit.path.contains("/messages"))
+            .expect("catch-up completed, so the message was posted");
+        let pages = hits[..posted]
+            .iter()
+            .filter(|hit| hit.method == "GET" && hit.path.contains("/messages"))
+            .count();
+        assert!(
+            pages >= 9,
+            "catch-up posted after {pages} pages; message 850 must be in the baseline"
+        );
+    }
+
+    #[test]
+    fn marker_sync_failure_is_prewrite_and_posts_nothing() {
+        let Harness { adapter, mock, .. } = adapter_for_timed(Script::SyncFail, "10", "200");
+        adapter
+            .open(&agent(json!({"repos": ["favcrm/cadence"]})))
+            .unwrap();
+        let err = adapter
+            .run_turn("do the task", "turn-1", &|_| {})
+            .pipe_err();
+        assert_eq!(err.kind(), "rejected", "{err}");
+        assert!(matches!(err, crate::error::Error::PreWrite(_)), "{err}");
+        assert!(err.to_string().contains("nothing posted"), "{err}");
+        let posts = hits_of(&mock)
+            .iter()
+            .filter(|hit| hit.method == "POST" && hit.path.contains("/messages"))
+            .count();
+        assert_eq!(posts, 0);
+    }
+
+    #[test]
     fn leftover_waiting_for_user_does_not_raise_the_previous_message() {
         let Harness {
             adapter,
@@ -2840,11 +3171,13 @@ mod tests {
     #[test]
     fn poll_transport_reset_holds_without_deleting() {
         let hits = Arc::new(Mutex::new(Vec::new()));
+        let session_gets = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let hits_t = Arc::clone(&hits);
+        let gets_t = Arc::clone(&session_gets);
         let stop_t = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             while !stop_t.load(Ordering::SeqCst) {
@@ -2860,7 +3193,15 @@ mod tests {
                 let Ok((method, path, auth, body)) = read_http(&mut stream) else {
                     continue;
                 };
-                let reset = method == "GET" && path.contains("/sessions/");
+                let session_get = method == "GET" && path.contains("/sessions/");
+                let n = if session_get {
+                    gets_t.fetch_add(1, Ordering::SeqCst)
+                } else {
+                    0
+                };
+                // The pre-post session GET and its messages page succeed.
+                // Later session reads reset, which is a held poll.
+                let reset = session_get && n >= 2;
                 hits_t.lock().unwrap().push(Hit {
                     method,
                     path: path.clone(),
@@ -2875,6 +3216,10 @@ mod tests {
                     json!({"repositories": [{"name": "cadence", "owner": "favcrm"}]}).to_string()
                 } else if path.ends_with("/sessions") {
                     created_body("devin-created")
+                } else if path.contains("/messages") {
+                    message_page(&[], false, None, 0)
+                } else if path.contains("/sessions/") {
+                    session_state("devin-created", "running", "working", false)
                 } else {
                     json!({"ok": true}).to_string()
                 };

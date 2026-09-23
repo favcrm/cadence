@@ -3238,6 +3238,25 @@ impl Store {
         Ok(ids)
     }
 
+    /// The oldest held cloud turn for this alias, if the actor died
+    /// while a Devin session was still in flight.
+    pub fn held_unknown(&self, alias: &str) -> Result<Option<Message>> {
+        for id in self.unknown_messages(alias)? {
+            if let Some(message) = self.message(&id)? {
+                let held = message
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("held"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if held {
+                    return Ok(Some(message));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Operator reconcile — the only exit from `unknown` that keeps the
     /// agent's history. No turn token: `unknown` means the submission
     /// token is stale by definition, so this is an operator statement
@@ -6588,7 +6607,17 @@ fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> String {
         spec_text.push_str(SPEC_NOTE);
         (spec_text, String::new())
     };
-    format!("{head}{spec_text}{bridge}{accept_text}{SHA_TRAILER}")
+    let mut body = format!("{head}{spec_text}{bridge}{accept_text}{SHA_TRAILER}");
+    // Scope and issue text can already exceed the enqueue limit. Drop
+    // the spec, say so, and keep the SHA trailer inside 48_000 bytes.
+    if body.len() > ENQUEUE_BYTES {
+        const OMITTED: &str = "… (spec text omitted; the prompt was cut to fit)";
+        let tail = format!("{OMITTED}{SHA_TRAILER}");
+        let room = ENQUEUE_BYTES.saturating_sub(tail.len());
+        let prefix = take_bytes(&format!("{head}{bridge}"), room);
+        body = format!("{prefix}{tail}");
+    }
+    body
 }
 
 fn kickoff_correlation(message_id: &str) -> String {
@@ -8209,6 +8238,59 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("`SHA: <40-hex>`"), "{body}");
+    }
+
+    #[test]
+    fn cloud_kickoff_omits_the_spec_when_the_issue_alone_exceeds_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("spec.md");
+        std::fs::write(&spec, "UNIQUE_SPEC_BODY must not survive").unwrap();
+        let job = Job {
+            id: "j1".into(),
+            title: None,
+            spec_path: spec.display().to_string(),
+            spec_sha256: None,
+            pm_alias: "pm".into(),
+            issue_id: Some("i".repeat(50_000)),
+            repo: None,
+            base_ref: None,
+            state: "open".into(),
+            max_revisions: 2,
+            stall_secs: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let task = Task {
+            id: "t1".into(),
+            job_id: "j1".into(),
+            title: None,
+            role: "worker".into(),
+            assignee: Some("cloud-1".into()),
+            spec_path: Some(spec.display().to_string()),
+            acceptance: None,
+            worktree: None,
+            branch: None,
+            base_sha: None,
+            head_sha: None,
+            state: "draft".into(),
+            revision: 0,
+            dispatch_message: None,
+            error: None,
+            created: 0.0,
+            updated: 0.0,
+        };
+        let body = cloud_kickoff_body(&job, &task, 1);
+        assert!(body.len() <= 48_000, "kickoff is {} bytes", body.len());
+        assert!(
+            body.ends_with("Do not report a SHA you have not committed."),
+            "{body}"
+        );
+        assert!(
+            body.contains("spec text omitted"),
+            "oversized issue did not drop the spec: {body}"
+        );
+        assert!(!body.contains("UNIQUE_SPEC_BODY"), "{body}");
     }
 
     #[test]
