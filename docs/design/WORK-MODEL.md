@@ -90,6 +90,32 @@ milestones:
 ---
 ```
 
+## Plans (CAD-359/360, shipped)
+
+A plan is an epic proposed with its tickets and approved by the operator before any
+work starts (`cadence plan propose|approve|reject|show`). It is stored on the epic as
+`type: epic` plus `plan: {state, proposed_by, proposed_at, tickets, decided_by,
+decided_at, reason}`; each ticket carries `plan_epic: <epic>` and `parent: <epic>`.
+Until stages land, `plan.state` maps onto them without a migration:
+
+| `plan.state` | Stage | Meaning |
+|---|---|---|
+| `proposed` | `shape` (awaiting approval) | Goal and tickets written; nothing may start |
+| `approved` | `build` | Tickets moved to `ready`; dispatch allowed |
+| `rejected` | terminal | Recorded with a reason; its tickets never start |
+
+The dispatch gate (`issue start`, `dispatch`, job and monitor dispatch) decides
+membership by the epic's `plan.tickets` list, cross-checked with each ticket's
+`plan_epic`, and fails closed when either side is missing or unreadable. It is a
+**process guard, not a security boundary**: `~/pm` is a git repo any local agent can
+write, so the gate keeps honest work honest and the board truthful; it does not stop
+a determined same-uid process.
+
+**Rollout order.** Old binaries drop unknown frontmatter keys when they rewrite an
+issue. The two-sided markers make a one-sided rewrite fail closed (tickets refuse
+with `plan_missing`), but the reader must be on every host and session binary
+before the first `cadence plan propose`.
+
 ## Views
 
 - **Board** — tasks by status (today's board).

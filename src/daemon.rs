@@ -3005,6 +3005,27 @@ impl Shared {
         }))
     }
 
+    /// CAD-360: the plan gate for every daemon dispatch of a task —
+    /// `task_dispatch` and both monitor paths. A task whose job is bound
+    /// to a tracker issue dispatches only if [`crate::issue::plan::gate_id`]
+    /// passes. Fail closed: a task or job that cannot be read, or a
+    /// tracker dir that cannot be resolved, refuses; only a job with no
+    /// issue, or an issue no project holds, passes unchecked.
+    fn plan_gate_task(&self, task_id: &str) -> Result<()> {
+        let task = self.store.task(task_id)?;
+        let job = self.store.job(&task.job_id)?;
+        let Some(issue) = job.issue_id else {
+            return Ok(());
+        };
+        let pm_dir = self.pm_dir().map_err(|e| {
+            Error::invalid(
+                "plan_unreadable",
+                format!("tracker dir for {issue} cannot be resolved ({e}) — refused"),
+            )
+        })?;
+        crate::issue::plan::gate_id(&pm_dir, &issue)
+    }
+
     /// CAD-359 `plan_propose` — write a plan (epic + tickets, one
     /// tracker commit) and emit `plan_proposed` on the daemon stream for
     /// a UI's plan card. The proposer is the connection's: a pane or
@@ -4544,21 +4565,7 @@ impl Shared {
             .map(|a| self.resolve_alias(a))
             .transpose()?;
         let by = optional_str(params, "by").unwrap_or("operator");
-        // CAD-360: a job bound to a ticket of an unapproved plan does not
-        // dispatch. Jobs with no issue, or an issue the tracker does not
-        // hold, pass exactly as before.
-        let task_id = required_str(params, "task")?;
-        if let Some(issue) = self
-            .store
-            .task(task_id)
-            .and_then(|t| self.store.job(&t.job_id))
-            .ok()
-            .and_then(|j| j.issue_id)
-        {
-            if let Ok(pm_dir) = self.pm_dir() {
-                crate::issue::plan::gate_id(&pm_dir, &issue)?;
-            }
-        }
+        self.plan_gate_task(required_str(params, "task")?)?;
         let (task, message, duplicate, behind_dead) = self.store.dispatch_task(
             required_str(params, "task")?,
             to.as_deref(),
@@ -4807,6 +4814,7 @@ impl Shared {
         automatic: bool,
     ) -> Result<Value> {
         if automatic {
+            self.plan_gate_task(task_id)?;
             // Hold the pending-request mutex across the store transaction.
             // The snapshot contains every alias, while the transaction
             // re-reads the task's current assignee before applying it, so an
@@ -4864,6 +4872,7 @@ impl Shared {
         }
         let task = self.store.task(task_id)?;
         let job = self.store.job(&task.job_id)?;
+        self.plan_gate_task(task_id)?;
         if job.state != "open" || job.repo.as_deref() != Some(monitor.project.as_str()) {
             return Err(Error::rejected(format!(
                 "Task '{task_id}' is not in monitor project '{}' with an open job",

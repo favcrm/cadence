@@ -36061,7 +36061,9 @@ impl PlanFixture {
     fn start() -> PlanFixture {
         let tmp = TempDir::new().unwrap();
         let (pm_dir, repo) = (tmp.path().join("pm"), tmp.path().join("repo"));
-        std::fs::create_dir_all(tmp.path().join("home")).unwrap();
+        for sub in ["home", "tmp"] {
+            std::fs::create_dir_all(tmp.path().join(sub)).unwrap();
+        }
         std::fs::create_dir_all(&repo).unwrap();
         let git = |dir: &Path, args: &[&str]| {
             let o = std::process::Command::new("git")
@@ -36112,6 +36114,10 @@ impl PlanFixture {
             .args(args)
             .env("CADENCE_PM_DIR", &self.pm_dir)
             .env("HOME", self.tmp.path().join("home"))
+            .env("XDG_CONFIG_HOME", self.tmp.path().join("home/.config"))
+            .env("XDG_DATA_HOME", self.tmp.path().join("home/.local/share"))
+            .env("XDG_STATE_HOME", self.tmp.path().join("home/.local/state"))
+            .env("TMPDIR", self.tmp.path().join("tmp"))
             .env_remove("CADENCE_ALIAS")
             .output()
             .unwrap();
@@ -36148,6 +36154,34 @@ impl PlanFixture {
         let text =
             std::fs::read_to_string(self.pm_dir.join("demo").join(id).join("issue.md")).unwrap();
         cadence_agent::issue::parse::parse_issue(&text).unwrap().0
+    }
+
+    /// Rewrite an issue file directly — a hand edit, or what an older
+    /// binary that does not know a field writes back.
+    fn write_front(&self, id: &str, front: &cadence_agent::issue::model::Front) {
+        let path = self.pm_dir.join("demo").join(id).join("issue.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let body = cadence_agent::issue::parse::parse_issue(&text).unwrap().1;
+        std::fs::write(
+            &path,
+            cadence_agent::issue::parse::render(front, &body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Branches and worktrees `issue start` would have made in the repo.
+    fn lanes(&self) -> (String, bool) {
+        let repo = self.tmp.path().join("repo");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "cadence/*"])
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            repo.join(".cadence").join("wt").exists(),
+        )
     }
 
     fn propose(&self, text: &str) -> cadence_agent::Result<Value> {
@@ -36218,6 +36252,8 @@ fn plan_propose_approve_gate_and_progress() {
     let plan = epic.plan.clone().unwrap();
     assert_eq!(plan.state, "proposed");
     assert_eq!(plan.proposed_by, "operator");
+    assert_eq!(plan.tickets, vec!["D-3", "D-4", "D-5"]);
+    assert_eq!(epic.item_type.as_deref(), Some("epic"));
     let wizard = f.front("D-3");
     assert_eq!(
         (wizard.status.as_str(), wizard.parent.as_deref()),
@@ -36225,6 +36261,7 @@ fn plan_propose_approve_gate_and_progress() {
     );
     assert_eq!(wizard.size.as_deref(), Some("L"));
     assert_eq!(wizard.owner.as_deref(), Some("dev-1"));
+    assert_eq!(wizard.plan_epic.as_deref(), Some("D-2"));
     assert_eq!(f.front("D-4").blocked_by, vec!["D-3".to_string()]);
     let (ok, show) = f.cli(&["issue", "show", "D-3", "--json"]);
     assert!(ok, "{show}");
@@ -36244,6 +36281,19 @@ fn plan_propose_approve_gate_and_progress() {
         "{err}"
     );
     assert_eq!(f.front("D-3").status, "backlog");
+    assert_eq!(
+        f.lanes(),
+        (String::new(), false),
+        "a refused start leaves no branch or worktree"
+    );
+    // The board never shows unapproved work as ready or in flight.
+    let (ok, err) = f.cli(&["issue", "set", "D-3", "status=ready"]);
+    assert!(
+        !ok && err.to_string().contains("plan D-2 is proposed"),
+        "{err}"
+    );
+    let (ok, out) = f.cli(&["issue", "set", "D-3", "status=backlog"]);
+    assert!(ok, "{out}");
     // `dispatch` refuses at the same gate, before any other check.
     let (ok, err) = f.cli(&[
         "dispatch",
@@ -36403,15 +36453,18 @@ fn plan_gate_refuses_job_dispatch_until_approved() {
         .unwrap();
     assert_eq!(out["tickets"], json!(["D-3"]), "{out}");
     let (spec, sha) = d.spec_file("spec.md", "plan job");
+    let project = d.dir.path().to_str().unwrap().to_string();
     for (job, issue) in [("jp", "D-3"), ("jl", "D-1")] {
         d.rpc(
             "job_new",
-            json!({"pm": "pm", "job": job, "spec": spec, "spec_sha256": sha, "issue": issue}),
+            json!({"pm": "pm", "job": job, "spec": spec, "spec_sha256": sha,
+                   "issue": issue, "repo": project}),
         )
         .unwrap();
         d.rpc(
             "task_new",
-            json!({"job": job, "task": format!("{job}-t"), "assignee": "w1"}),
+            json!({"job": job, "task": format!("{job}-t"), "assignee": "w1",
+                   "acceptance": "the plan ticket's criterion"}),
         )
         .unwrap();
     }
@@ -36421,8 +36474,192 @@ fn plan_gate_refuses_job_dispatch_until_approved() {
         "{err}"
     );
     assert_eq!(d.task_state("jp-t"), "draft");
+
+    // Review C1: both monitor dispatch paths run the same gate.
+    d.rpc(
+        "monitor_register",
+        json!({"monitor": "manual", "project": project, "owner": "operator",
+               "tasks": ["jp-t"], "interval_secs": 1, "dispatch_enabled": true}),
+    )
+    .unwrap();
+    wait_monitor_state(d, "manual", "active", 5);
+    let err = d
+        .rpc(
+            "monitor_dispatch",
+            json!({"monitor": "manual", "task": "jp-t"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("plan D-2 is proposed"), "{err}");
+    d.rpc(
+        "monitor_register",
+        json!({"monitor": "auto", "project": project, "owner": "operator",
+               "tasks": ["jp-t"], "interval_secs": 1, "dispatch_enabled": true,
+               "auto_dispatch_enabled": true}),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let page = d.rpc("monitor_alerts", json!({"monitor": "auto"})).unwrap();
+        let blocked = page["alerts"].as_array().unwrap().iter().any(|a| {
+            a["kind"] == "dispatch_blocked"
+                && a["task"] == "jp-t"
+                && a.to_string().contains("plan D-2 is proposed")
+        });
+        if blocked {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no plan block alert: {page}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        d.task_state("jp-t"),
+        "draft",
+        "the automatic path dispatched nothing"
+    );
+    for monitor in ["manual", "auto"] {
+        d.rpc("monitor_stop", json!({"monitor": monitor})).unwrap();
+    }
+
     d.job_dispatch("jl-t", json!({})).unwrap();
     d.operator_rpc("plan_approve", json!({"epic": "D-2"}))
         .unwrap();
     d.job_dispatch("jp-t", json!({})).unwrap();
+}
+
+/// CAD-360 review I1: membership is the plan's approved ticket list,
+/// not the `parent` link. While the plan is not rejected a ticket's
+/// parent cannot be unlinked, and a hand edit that drops it still
+/// leaves the ticket gated. Nothing joins a plan by `issue new
+/// --parent`, `issue link parent`, or a hand-edited parent — the last
+/// is refused at start.
+#[test]
+fn plan_membership_is_the_list_not_the_link() {
+    let f = PlanFixture::start();
+    let out = f
+        .propose("---\ntitle: P\ngoal: g\n---\n## A\n### Acceptance\n- [ ] a\n")
+        .unwrap();
+    assert_eq!(
+        (out["epic"].as_str(), out["tickets"][0].as_str()),
+        (Some("D-1"), Some("D-2"))
+    );
+
+    let (ok, err) = f.cli(&["issue", "unlink", "D-2", "parent", "D-1"]);
+    assert!(
+        !ok && err.to_string().contains("parent link cannot change"),
+        "{err}"
+    );
+    let (ok, err) = f.cli(&[
+        "issue",
+        "new",
+        "Sneak",
+        "--project",
+        "demo",
+        "--parent",
+        "D-1",
+    ]);
+    assert!(!ok && err.to_string().contains("D-1 is a plan"), "{err}");
+    assert!(f.cli(&["issue", "new", "Loose", "--project", "demo"]).0);
+    let (ok, err) = f.cli(&["issue", "link", "D-3", "parent", "D-1"]);
+    assert!(!ok && err.to_string().contains("D-1 is a plan"), "{err}");
+
+    // Hand edit: the ticket loses both parent and marker — the epic's
+    // list still holds it.
+    let mut t = f.front("D-2");
+    t.parent = None;
+    t.plan_epic = None;
+    f.write_front("D-2", &t);
+    let (ok, err) = f.cli(&["issue", "start", "D-2"]);
+    assert!(
+        !ok && err.to_string().contains("plan D-1 is proposed"),
+        "{err}"
+    );
+
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+        .unwrap();
+    // After approval: a hand-parented issue is not an approved ticket.
+    let mut loose = f.front("D-3");
+    loose.parent = Some("D-1".into());
+    f.write_front("D-3", &loose);
+    let (ok, err) = f.cli(&["issue", "start", "D-3"]);
+    assert!(
+        !ok && err.to_string().contains("not one of its tickets"),
+        "{err}"
+    );
+    let (ok, out) = f.cli(&["issue", "start", "D-2"]);
+    assert!(ok, "the listed ticket starts: {out}");
+}
+
+/// CAD-360 review I2/I3: the gate fails closed. An epic that exists but
+/// does not parse refuses its tickets (`plan_unreadable`); an epic an
+/// older binary rewrote without `plan:` refuses the tickets that still
+/// carry `plan_epic` (`plan_missing`). An issue whose parent is truly
+/// absent is not in a plan and starts.
+#[test]
+fn plan_gate_fails_closed_on_unreadable_or_rewritten_epic() {
+    let f = PlanFixture::start();
+    f.propose("---\ntitle: P\ngoal: g\n---\n## A\n### Acceptance\n- [ ] a\n## B\n### Acceptance\n- [ ] b\n")
+        .unwrap();
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-1"}))
+        .unwrap();
+
+    // An older binary drops the unknown `plan:` from the epic.
+    let mut epic = f.front("D-1");
+    epic.plan = None;
+    f.write_front("D-1", &epic);
+    let (ok, err) = f.cli(&["issue", "start", "D-2"]);
+    let err = err.to_string();
+    assert!(!ok && err.contains("carries no plan"), "{err}");
+
+    // An epic that no longer parses.
+    let path = f.pm_dir.join("demo/D-1/issue.md");
+    std::fs::write(&path, "---\nid: [unterminated\n---\n").unwrap();
+    let (ok, err) = f.cli(&["issue", "start", "D-3"]);
+    assert!(!ok && err.to_string().contains("cannot be read"), "{err}");
+    assert_eq!(f.lanes(), (String::new(), false));
+
+    // A truly absent parent is not a plan: the gate passes. (Checked on
+    // the gate itself — the tracker's lint hook refuses to commit a
+    // dangling parent, so `issue start` could not record it.)
+    let mut orphan =
+        cadence_agent::issue::model::Front::new("D-9", "Orphan", "2026-01-01T00:00:00Z");
+    orphan.parent = Some("D-99".into());
+    cadence_agent::issue::plan::gate(&f.pm_dir, &orphan, "").unwrap();
+    // …while the same shape under the unreadable epic refuses.
+    orphan.parent = Some("D-1".into());
+    let err = cadence_agent::issue::plan::gate(&f.pm_dir, &orphan, "").unwrap_err();
+    assert!(err.to_string().contains("cannot be read"), "{err}");
+}
+
+/// Proposals are capped: at most 50 tickets and 256 KiB of text.
+#[test]
+fn plan_propose_caps_size() {
+    let f = PlanFixture::start();
+    let mut many = String::from("---\ntitle: Big\ngoal: g\n---\n");
+    for n in 0..51 {
+        many.push_str(&format!("## T{n}\n### Acceptance\n- [ ] a\n"));
+    }
+    let err = f.propose(&many).unwrap_err().to_string();
+    assert!(
+        err.contains("51 tickets") && err.contains("at most 50"),
+        "{err}"
+    );
+    let huge = format!(
+        "---\ntitle: Huge\ngoal: g\n---\n{}\n## A\n### Acceptance\n- [ ] a\n",
+        "word ".repeat(60_000)
+    );
+    // Past the socket frame the CLI would carry: checked on the library
+    // entry the daemon calls.
+    let pm = cadence_agent::issue::Pm::at(&f.pm_dir).unwrap();
+    let err = cadence_agent::issue::plan::propose(
+        &pm,
+        "demo",
+        &huge,
+        &cadence_agent::secret::Allowlist::default(),
+        "operator",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("at most 262144 bytes"), "{err}");
+    assert!(!f.pm_dir.join("demo/D-1").exists());
 }

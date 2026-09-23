@@ -99,6 +99,16 @@ pub struct Front {
     /// file (issue frontmatter is parsed leniently).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<Plan>,
+    /// CAD-360: on each ticket of a plan, the plan epic's id. With the
+    /// epic's `plan.tickets` list it makes membership two-sided, so a
+    /// rewrite that drops one side (an older binary, a hand edit, an
+    /// unlink) fails closed instead of ungating the ticket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_epic: Option<String>,
+    /// Work-model item type (`epic` on plan epics; WORK-MODEL.md).
+    /// Absent elsewhere — the implicit "has children" rule still holds.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<String>,
     /// Optional task size `S|M|L` — plan progress weights it 1|3|8,
     /// unsized counts as M (docs/design/WORK-MODEL.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,6 +139,8 @@ impl Front {
             tags: vec![],
             kind: None,
             plan: None,
+            plan_epic: None,
+            item_type: None,
             size: None,
             parent: None,
             blocked_by: vec![],
@@ -148,6 +160,10 @@ pub struct Plan {
     pub proposed_by: String,
     /// RFC 3339 UTC.
     pub proposed_at: String,
+    /// The ticket ids created with the plan — the operator approves
+    /// exactly these; membership is decided by this list.
+    #[serde(default)]
+    pub tickets: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -410,7 +410,10 @@ pub fn new_issue(
     }
     let body = format!("{title}\n\n## Acceptance\n\n");
     if let Some(parent) = parent {
-        front.parent = Some(model::check_id(parent)?);
+        model::check_id(parent)?;
+        // CAD-360: nothing new is parented to a plan epic.
+        crate::issue::plan::check_parent_change(&pm.dir, &front, Some(parent))?;
+        front.parent = Some(parent.to_string());
     }
     std::fs::create_dir_all(dir.join("comments"))?;
     std::fs::create_dir_all(dir.join("artifacts"))?;
@@ -463,7 +466,9 @@ pub fn create_plan(
         decided_by: None,
         decided_at: None,
         reason: None,
+        tickets: ids[1..].to_vec(),
     });
+    epic_front.item_type = Some("epic".to_string());
     let mut epic_body = format!("{}\n\n## Goal\n\n{}\n", doc.title, doc.goal);
     if !doc.non_goals.is_empty() {
         epic_body.push_str("\n## Non-goals\n\n");
@@ -479,6 +484,7 @@ pub fn create_plan(
         let id = &ids[n + 1];
         let mut front = Front::new(id, &ticket.title, &now);
         front.parent = Some(epic.clone());
+        front.plan_epic = Some(epic.clone());
         front.size = ticket.size.clone();
         front.owner = ticket.agent.clone();
         front.blocked_by = ticket
@@ -585,7 +591,7 @@ pub fn decide_plan(
     let mut writes = vec![(dir.clone(), front.clone(), body)];
     if approve {
         for kid in board::load_all(&pm.dir, Some(&project.key))? {
-            if kid.front.parent.as_deref() == Some(epic) && kid.front.status == "backlog" {
+            if decided.tickets.contains(&kid.front.id) && kid.front.status == "backlog" {
                 let mut f = kid.front.clone();
                 f.status = "ready".to_string();
                 ready.push(f.id.clone());
@@ -838,7 +844,12 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
     let _lock = pm.lock()?;
     let mut changed = Vec::new();
     let staged = stage(pm, ids, |project, front| {
+        let before = front.status.clone();
         changed = apply_pairs(project, front, pairs)?;
+        if front.status != before {
+            // CAD-360: an unapproved plan's tickets stay in backlog.
+            crate::issue::plan::check_status_write(&pm.dir, front, &front.status)?;
+        }
         Ok(true)
     })?;
     let ids = commit_staged(pm, &staged, &format!("set {}", changed.join(" ")), actor)?;
@@ -965,6 +976,7 @@ pub fn patch_issue(
     let mut changed = Vec::new();
     if let Some(v) = &patch.status {
         model::check_status(v)?;
+        crate::issue::plan::check_status_write(&pm.dir, &front, v)?;
         front.status = v.clone();
         changed.push(format!("status={v}"));
     }
@@ -1066,6 +1078,15 @@ pub fn link(
             }
         }
         "parent" | "duplicate_of" => {
+            if kind == "parent" {
+                // CAD-360: a plan ticket keeps its epic; nothing joins
+                // a plan by link.
+                crate::issue::plan::check_parent_change(
+                    &pm.dir,
+                    &front,
+                    (!unlink).then_some(target),
+                )?;
+            }
             let slot = if kind == "parent" {
                 &mut front.parent
             } else {

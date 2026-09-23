@@ -1503,6 +1503,8 @@ mod tests {
                 tags: vec!["intake".to_string(), "feedback".to_string()],
                 kind: Some("feedback".to_string()),
                 plan: None,
+                plan_epic: None,
+                item_type: None,
                 size: None,
                 parent: None,
                 blocked_by: vec![],
