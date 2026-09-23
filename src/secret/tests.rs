@@ -351,3 +351,46 @@ fn re2_literal_braces_are_escaped() {
     assert_eq!(re2_braces(r"[[:alnum:]{]{4}"), r"[[:alnum:]{]{4}");
     assert_eq!(re2_braces(r"\{\{[ \t]*}}"), r"\{\{[ \t]*\}\}");
 }
+
+/// CAD-319: `redact_text` replaces each span in place and keeps the
+/// surrounding text, multi-byte characters included; clean text is
+/// returned unchanged.
+#[test]
+fn redact_text_replaces_only_the_secret_spans() {
+    let a = token(&["gh", "p_"].concat(), "redact-a", 36);
+    let b = token(&["sk-", "ant-"].concat(), "redact-b", 40);
+    let text = format!("héllo {a} — ünd {b} ✓");
+    let out = redact_text(&text).unwrap();
+    assert!(!out.contains(&a) && !out.contains(&b), "{out}");
+    assert!(out.starts_with("héllo [redacted:"), "{out}");
+    assert!(out.contains(" — ünd [redacted:"), "{out}");
+    assert!(out.ends_with(" ✓"), "{out}");
+    assert_eq!(redact_text("nothing here ✓").unwrap(), "nothing here ✓");
+}
+
+/// CAD-319 review I1: a narrower blocking match inside a wider warn-only
+/// `generic-api-key` match, or one reaching past its neighbour, is
+/// redacted as the union — no part of either span survives.
+#[test]
+fn redact_text_covers_the_union_of_overlapping_spans() {
+    let pat = token(&["gh", "p_"].concat(), "overlap-pat", 36);
+    let head = noise("overlap-head", 20);
+    let tail = noise("overlap-tail", 24);
+    let keyed = format!("{{\"api_key\": \"{head}{pat}{tail}\"}}");
+    // The report still collapses to one finding per span.
+    assert!(!scan(&keyed, None).unwrap().is_empty());
+    let out = redact_text(&keyed).unwrap();
+    for part in [&head, &pat, &tail] {
+        assert!(!out.contains(part.as_str()), "{part} survived: {out}");
+    }
+    assert!(out.starts_with("{\"api_key\": \""), "{out}");
+    assert!(
+        out.contains("[redacted:github-pat]"),
+        "blocking rule names it: {out}"
+    );
+
+    let bare = format!("my secret: {pat}{tail}");
+    let out = redact_text(&bare).unwrap();
+    assert!(!out.contains(&pat) && !out.contains(&tail), "{out}");
+    assert!(out.starts_with("my secret: [redacted:"), "{out}");
+}

@@ -808,6 +808,8 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/memories/:project/:slug` | one memory: frontmatter + body; `404` on unknown slug, `400` on grammar |
 | `GET /api/overview` | the Overview screen payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
 | `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents`/`event: monitoring` on daemon state change; each frame's data names the board resources it invalidates (`{"resources":["agents","issue","overview"]}`); `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
+| `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `404` unknown alias, `501` a daemon without threads. Unscoped in the MVP: any caller that reaches the board reads any agent's thread, as with `/api/agents/<alias>`. A live turn token quoted in thread prose is only redacted at `export` |
+| `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each 15 s idle poll; `event: error` while the daemon is unreachable; `405` on HEAD |
 
 ### API — writes
 
@@ -829,6 +831,7 @@ exactly one git commit whose subject carries the actor:
 | `POST /api/issues/:id/artifacts?name=<base>` | raw bytes, create-only | `200` |
 | `POST /api/memories/:project/:slug/accept` | `{body?}` — guarded route shape, then refused because HTTP cannot prove a native agent endpoint; body edits are never accepted | `400` with an actionable refusal |
 | `POST /api/memories/:project/:slug/reject` | `{}` — refused for the same missing native endpoint proof | `400` with an actionable refusal |
+| `POST /api/threads/:alias/messages` | `{text, message?}` — the operator's chat message (CAD-319): starts the thread on first use and queues `text` to the agent like `cadence send`. Refused `403 caller_agent` when the caller is attributed to an agent (pane or managed endpoint tool process); the daemon refuses agent connections again. Tied to no agent is the operator by default, not positive proof (CAD-313) | `200` with the send receipt and `thread` |
 
 Success bodies are `{issue, card, warnings}` — the fresh payloads, so
 the UI needs no second fetch. `warnings` notes a `ready`/`doing`/`review`

@@ -606,6 +606,105 @@ fn line_col(text: &[u8], at: usize) -> (usize, usize) {
 /// one per secret span; where rules overlap, a blocking finding wins.
 /// The operator allowlist is not applied here — see [`Allowlist`].
 pub fn scan(text: &str, path: Option<&str>) -> Result<Vec<Finding>> {
+    Ok(scan_spans(text, path)?
+        .into_iter()
+        .map(|(_, _, f)| f)
+        .collect())
+}
+
+/// Replace every credential-shaped span in `text` (blocking and
+/// warn-only alike) with `[redacted:<rule>]`. For text cadence stores
+/// on its own initiative — thread entries, tool-call summaries — where
+/// refusing is not an option but the value must never land. The
+/// operator allowlist is deliberately not applied: redacting a false
+/// positive costs a few characters, storing a real one is a leak.
+///
+/// Redaction covers the UNION of every raw rule match: overlapping or
+/// adjacent spans merge (`end = max(end, next.end)`), so a narrower
+/// blocking match inside a wider warn-only one, or a match reaching past
+/// its neighbour, can never leave part of either in the text. The
+/// one-finding-per-span collapse is for [`scan`]'s report only. The
+/// marker names the first blocking rule in the merged span, else the
+/// first rule.
+pub fn redact_text(text: &str) -> Result<String> {
+    let mut hits = raw_hits(text, None)?;
+    if hits.is_empty() {
+        return Ok(text.to_string());
+    }
+    hits.sort_by_key(|(start, end, _)| (*start, std::cmp::Reverse(*end)));
+    // Merge into (start, end, label rule, label is blocking).
+    let mut merged: Vec<(usize, usize, String, bool)> = Vec::new();
+    for (start, end, finding) in hits {
+        // Spans are byte offsets from a UTF-8 `&str` scanned as bytes;
+        // widen to char boundaries so slicing never panics.
+        let start = floor_char_boundary(text, start);
+        let end = ceil_char_boundary(text, end);
+        if end <= start {
+            continue;
+        }
+        let block = finding.severity == Severity::Block;
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => {
+                last.1 = last.1.max(end);
+                if block && !last.3 {
+                    last.2 = finding.rule;
+                    last.3 = true;
+                }
+            }
+            _ => merged.push((start, end, finding.rule, block)),
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end, rule, _) in merged {
+        out.push_str(&text[at..start]);
+        out.push_str(&format!("[redacted:{rule}]"));
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    Ok(out)
+}
+
+fn floor_char_boundary(text: &str, mut i: usize) -> usize {
+    i = i.min(text.len());
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(text: &str, mut i: usize) -> usize {
+    i = i.min(text.len());
+    while !text.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// [`scan`] with each finding's byte span in `text`: [`raw_hits`]
+/// collapsed to one finding per secret span, for reporting.
+fn scan_spans(text: &str, path: Option<&str>) -> Result<Vec<(usize, usize, Finding)>> {
+    let mut hits = raw_hits(text, path)?;
+    // One finding per secret span: cadence rules come first in the rule
+    // order, then the first blocking rule replaces a warn-only one.
+    hits.sort_by_key(|(start, _, _)| *start);
+    let mut out: Vec<(usize, usize, Finding)> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        match out.last_mut() {
+            Some(last) if hit.0 < last.1 => {
+                if last.2.severity == Severity::Warn && hit.2.severity == Severity::Block {
+                    *last = hit;
+                }
+            }
+            _ => out.push(hit),
+        }
+    }
+    Ok(out)
+}
+
+/// Every rule match in `text` with its byte span, in rule order, before
+/// any overlap is collapsed.
+fn raw_hits(text: &str, path: Option<&str>) -> Result<Vec<(usize, usize, Finding)>> {
     let pack = pack()?;
     let bytes = text.as_bytes();
     let lower = text.to_ascii_lowercase();
@@ -667,21 +766,7 @@ pub fn scan(text: &str, path: Option<&str>) -> Result<Vec<Finding>> {
             ));
         }
     }
-    // One finding per secret span: cadence rules come first in the rule
-    // order, then the first blocking rule replaces a warn-only one.
-    hits.sort_by_key(|(start, _, _)| *start);
-    let mut out: Vec<(usize, usize, Finding)> = Vec::with_capacity(hits.len());
-    for hit in hits {
-        match out.last_mut() {
-            Some(last) if hit.0 < last.1 => {
-                if last.2.severity == Severity::Warn && hit.2.severity == Severity::Block {
-                    *last = hit;
-                }
-            }
-            _ => out.push(hit),
-        }
-    }
-    Ok(out.into_iter().map(|(_, _, f)| f).collect())
+    Ok(hits)
 }
 
 // ---------- operator allowlist ----------

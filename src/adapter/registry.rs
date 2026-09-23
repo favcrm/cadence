@@ -589,6 +589,8 @@ const DAEMON_FEATURES: &[&str] = &[
     "approval_brokering",
     "result_routing",
     MODEL_DEFAULTS_CAPABILITY,
+    // CAD-319: durable conversation threads (`thread_read`/`thread_send`).
+    "threads",
 ];
 
 /// Whether this endpoint accepts a launch `model` param. Test doubles
@@ -1558,12 +1560,13 @@ mod tests {
             "approval_brokering",
             "result_routing",
             "model_defaults",
+            "threads",
             "fake_provider_tests",
             "devin_cloud",
         ] {
             assert!(caps.contains(&name), "missing {name}");
         }
-        assert_eq!(caps.len(), 18);
+        assert_eq!(caps.len(), 19);
     }
 
     #[test]
