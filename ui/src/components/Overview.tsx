@@ -399,6 +399,7 @@ function ProjectScope({
 export default function OverviewView({
   data,
   loading,
+  stale,
   project,
   projects,
   context,
@@ -409,6 +410,7 @@ export default function OverviewView({
 }: {
   data: Overview | null;
   loading: boolean;
+  stale: boolean;
   project: string;
   projects: Project[];
   context: ProjectContext | null;
@@ -455,6 +457,11 @@ export default function OverviewView({
         <span className="kicker">
           exact project ownership · unresolved work stays visible
         </span>
+        {stale && (
+          <span className="chip bg-warn/10 text-warn" title="the last refresh failed — showing the previous payload">
+            refresh failed — stale
+          </span>
+        )}
       </header>
       {(data.github.state === "unavailable" || !data.daemon.reachable) && (
         <div className="card border-warn/40 px-4 py-3 text-secondary text-warn">

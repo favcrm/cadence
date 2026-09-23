@@ -56,6 +56,8 @@ export default function App() {
   const agentsLoaded = useRef(false);
   const [overview, setOverview] = useState<Overview | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(false);
+  // Set when a refresh fails over cached rows — cleared on the next success.
+  const [overviewStale, setOverviewStale] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [openId, setOpenId] = useState<string | null>(initial.openId);
@@ -145,8 +147,11 @@ export default function App() {
     setOverviewLoading(true);
     return api
       .overview()
-      .then(setOverview)
-      .catch(() => {})
+      .then((next) => {
+        setOverview(next);
+        setOverviewStale(false);
+      })
+      .catch(() => setOverviewStale(true))
       .finally(() => setOverviewLoading(false));
   }, []);
 
@@ -482,6 +487,7 @@ export default function App() {
           <OverviewView
             data={overview}
             loading={overviewLoading}
+            stale={overviewStale}
             project={project}
             projects={projects}
             context={visibleContext(project, projectContext)}

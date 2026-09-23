@@ -356,11 +356,15 @@ export default function Board({
           .sort(byPriority);
         // The Done column stays mounted as a drop target even while done
         // cards are hidden — collapsing it shows the count and a reveal.
+        // A typed search already surfaces done cards, so the hint only
+        // counts what the facet filters leave — matching every other
+        // column's count semantics.
         const doneHidden =
-          key === "done" && !filters.showDone
+          key === "done" && !filters.showDone && query === ""
             ? scope.filter(
                 (t) =>
                   t.status === "done" &&
+                  matches(filters, t) &&
                   (lane === "" ||
                     (lane === "none" ? !t.parent : t.parent === lane)),
               ).length
