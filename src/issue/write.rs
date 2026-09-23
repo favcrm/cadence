@@ -593,9 +593,19 @@ pub fn decide_plan(
             }
         }
     }
-    for (dir, front, body) in &writes {
-        save_front(dir, front, body)?;
-    }
+    // All or nothing: a failed write or commit restores every file.
+    let originals: Vec<(PathBuf, String)> = writes
+        .iter()
+        .map(|(dir, _, _)| {
+            let file = dir.join("issue.md");
+            std::fs::read_to_string(&file).map(|text| (file, text))
+        })
+        .collect::<std::io::Result<_>>()?;
+    let restore = || {
+        for (file, text) in &originals {
+            let _ = atomic_write(file, text);
+        }
+    };
     let mut ids: Vec<&str> = vec![epic];
     ids.extend(ready.iter().map(String::as_str));
     let subject = if approve {
@@ -606,7 +616,14 @@ pub fn decide_plan(
     } else {
         format!("{epic}: plan rejected by {by}")
     };
-    commit_who(pm, &subject, &ids, "", Some(by))?;
+    let written = writes
+        .iter()
+        .try_for_each(|(dir, front, body)| save_front(dir, front, body))
+        .and_then(|_| commit_who(pm, &subject, &ids, "", Some(by)));
+    if let Err(e) = written {
+        restore();
+        return Err(e);
+    }
     Ok(json!({
         "epic": epic,
         "project": project.key,
