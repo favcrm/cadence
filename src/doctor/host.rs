@@ -175,6 +175,13 @@ pub struct HostOverrides {
     pub load_warn_ratio: Option<f64>,
     pub io_stall_warn_pct: Option<f64>,
     pub io_stall_fail_pct: Option<f64>,
+    /// CAD-199 — read by the daemon's agent-gc timer, not by
+    /// `Thresholds`. Unset (the default) keeps the timer OFF; set, the
+    /// daemon sweeps dead agent registry rows idle longer than this
+    /// many seconds (raised to a 7-day floor) at most once an hour.
+    /// Records only: frees no memory and no disk, and a removed agent
+    /// can no longer be resumed.
+    pub agent_gc_older_than_secs: Option<u64>,
 }
 
 /// Every threshold in one place; `pm.yaml [host]` overrides any subset.

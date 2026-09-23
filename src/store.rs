@@ -3308,8 +3308,10 @@ impl Store {
 
     /// Agents eligible for an explicit `agent gc` sweep: dead endpoint
     /// and a terminal lifecycle state, optionally limited to rows not
-    /// updated within `older_than` seconds. Sweeping is always an
-    /// explicit command — nothing calls this on a timer.
+    /// updated within `older_than` seconds. `agent gc` sweeps these on
+    /// command; the daemon's agent-gc timer (CAD-199, off unless `[host]
+    /// agent_gc_older_than_secs` is set) narrows them further through
+    /// [`Store::timer_gc_remove`].
     pub fn gc_candidates(&self, older_than: Option<f64>) -> Result<Vec<Agent>> {
         let cutoff = older_than.map(|age| now() - age).unwrap_or(f64::MAX);
         let conn = self.conn();
@@ -5511,6 +5513,72 @@ impl Store {
             |row| row.get(0),
         )?)
     }
+
+    /// CAD-199: the opt-in agent-gc timer's removal of one
+    /// [`Store::gc_candidates`] row. Inside one transaction it re-checks
+    /// everything the timer requires — endpoint NULL, state `attention`
+    /// or `stopped`, not updated within `older_than` seconds, not
+    /// enabled, and no message in any state but completed, failed,
+    /// interrupted or cancelled (so queued, submitting, running,
+    /// `unknown` and any state added later all keep the row) — then
+    /// deletes the row with its message/event history and records one
+    /// `agent_gc_removed` event on the daemon stream in the same commit.
+    /// `Ok(None)`: no longer eligible (resumed, messaged or touched since
+    /// it was listed). Records only — frees no memory and no disk, and
+    /// the removed agent can no longer be resumed.
+    pub fn timer_gc_remove(&self, alias: &str, older_than: f64) -> Result<Option<Agent>> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let Some(agent) = tx
+            .query_row("SELECT * FROM agents WHERE alias=?", [alias], row_agent)
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let at = now();
+        let age = at - agent.updated;
+        let open_messages: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE alias=? AND state NOT IN
+             ('completed','failed','interrupted','cancelled')",
+            [alias],
+            |r| r.get(0),
+        )?;
+        let eligible = agent.endpoint.is_none()
+            && matches!(agent.state.as_str(), "attention" | "stopped")
+            && !agent.enabled
+            && age > older_than
+            && open_messages == 0;
+        if !eligible {
+            return Ok(None);
+        }
+        tx.execute("DELETE FROM messages WHERE alias=?", [alias])?;
+        tx.execute("DELETE FROM events WHERE alias=?", [alias])?;
+        tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
+        Self::event(
+            &tx,
+            Self::DAEMON_STREAM,
+            "agent_gc_removed",
+            json!({
+                "alias": agent.alias,
+                "provider": agent.provider,
+                "endpoint_kind": agent.endpoint_kind,
+                "state": agent.state,
+                "reason": format!(
+                    "agent-gc timer: no endpoint, state {}, no open or unknown \
+                     messages, idle {:.0}s > older_than {:.0}s",
+                    agent.state, age, older_than
+                ),
+                "age_secs": age.floor(),
+                "older_than_secs": older_than,
+                "thread_id": agent.thread_id,
+                "session_id": agent.session_id,
+                "records_only": true,
+                "note": crate::daemon::AGENT_GC_RECORDS_ONLY,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(Some(agent))
+    }
 }
 
 const UNKNOWN_EVENT_REASON_CHARS: usize = 512;
@@ -7480,5 +7548,93 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .unwrap();
         assert_eq!(timeout, 5000);
+    }
+
+    /// CAD-199: the timer's guarded removal — the manual candidate rule
+    /// plus not-enabled and no open-or-unknown message, re-checked in
+    /// the removing transaction, with one `agent_gc_removed` event per
+    /// removed row on the daemon stream and none for a kept row.
+    #[test]
+    fn timer_gc_remove_keeps_open_unknown_enabled_and_young_rows() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let week = 7.0 * 86_400.0;
+        let aged = now() - 30.0 * 86_400.0;
+        for alias in [
+            "old", "done", "queued", "running", "unknown", "future", "enabled", "young", "live",
+        ] {
+            reg(&s, alias, &cwd);
+            s.conn()
+                .execute(
+                    "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
+                     updated=? WHERE alias=?",
+                    params![aged, alias],
+                )
+                .unwrap();
+        }
+        // Terminal history does not keep a row; every other state does,
+        // including one the store has never heard of.
+        for (alias, id, state) in [
+            ("done", "m-done", "completed"),
+            ("queued", "m-q", "queued"),
+            ("running", "m-r", "running"),
+            ("unknown", "m-u", "unknown"),
+            ("future", "m-f", "awaiting_report"),
+        ] {
+            s.enqueue(alias, "work", None, id, "user").unwrap();
+            s.conn()
+                .execute("UPDATE messages SET state=? WHERE id=?", params![state, id])
+                .unwrap();
+        }
+        let c = s.conn();
+        c.execute("UPDATE agents SET enabled=1 WHERE alias='enabled'", [])
+            .unwrap();
+        c.execute(
+            "UPDATE agents SET updated=? WHERE alias='young'",
+            params![now() - 2.0 * 86_400.0],
+        )
+        .unwrap();
+        c.execute("UPDATE agents SET endpoint='sock' WHERE alias='live'", [])
+            .unwrap();
+        drop(c);
+
+        let mut removed = Vec::new();
+        for agent in s.gc_candidates(Some(week)).unwrap() {
+            if let Some(gone) = s.timer_gc_remove(&agent.alias, week).unwrap() {
+                removed.push(gone.alias);
+            }
+        }
+        removed.sort();
+        assert_eq!(removed, vec!["done", "old"]);
+        for kept in [
+            "queued", "running", "unknown", "future", "enabled", "young", "live",
+        ] {
+            assert!(s.agent_opt(kept).unwrap().is_some(), "{kept} was removed");
+        }
+        // An alias that is gone (or never existed) is simply not eligible.
+        assert!(s.timer_gc_remove("old", week).unwrap().is_none());
+
+        let events: Vec<Event> = s
+            .events(Store::DAEMON_STREAM, 0, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "agent_gc_removed")
+            .collect();
+        let mut aliases: Vec<&str> = events
+            .iter()
+            .map(|e| e.payload["alias"].as_str().unwrap())
+            .collect();
+        aliases.sort();
+        assert_eq!(aliases, vec!["done", "old"]);
+        for e in &events {
+            assert_eq!(e.payload["records_only"], true, "{}", e.payload);
+            assert_eq!(e.payload["older_than_secs"], week, "{}", e.payload);
+            assert!(e.payload["age_secs"].as_f64().unwrap() >= 30.0 * 86_400.0 - 60.0);
+            let reason = e.payload["reason"].as_str().unwrap();
+            assert!(reason.contains("state stopped"), "{reason}");
+            let note = e.payload["note"].as_str().unwrap();
+            assert!(note.contains("frees no memory and no disk"), "{note}");
+            assert!(note.contains("can no longer be resumed"), "{note}");
+        }
     }
 }
