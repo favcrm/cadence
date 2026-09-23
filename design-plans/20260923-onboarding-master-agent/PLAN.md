@@ -21,6 +21,40 @@ curator from a different vendor) turns reports into **verified memory**; every
 agent starts its next task with a small, cited **context pack** instead of
 re-reading. The operator approves what matters.
 
+## 0. Pragmatic core — build little, generically
+
+Principle (operator, 2026-09-23): add only what is necessary, and make it generic
+enough to extend. Everything in this plan reduces to **five building blocks**; the
+rest is configuration on top of them or is explicitly *later*.
+
+| Block | What it is | How it extends |
+|---|---|---|
+| **Files** | Markdown + frontmatter in one git home, written by one writer | A new concept is a new folder + schema |
+| **Agents & sessions** | `agents/<slug>/` definition + running sessions, behind the existing provider adapter | A new provider is an adapter; a new agent is a folder |
+| **Records** | One `report` (done / question / blocked) and one `decision` | A new kind is a frontmatter value, not a subsystem |
+| **Gate** | One policy check: action × actor × evidence → allow / ask / refuse | Plan approval, dispatch, merge, effects, memory acceptance and the autonomy dial are rows in one table |
+| **Pack** | One context builder: agent + task → bundle | A new knowledge source is one selector |
+
+**Core now** (tracker tag `core`, 30 tickets): M0 sandbox and backups; M1
+install/setup, operator auth, conversation store, continuity, read model, UI
+foundation, wizard, chat Home; M2 agent files, master, reports, plans, the gate,
+dispatch, review routing, decision cards; M3 identity, the stuck-lesson backlog,
+memory policy as gate rules, verification checks, curator, context packs, vault
+layout, stale-lesson withholding.
+
+**Work model** (CAD-405, [record](../../docs/design/WORK-MODEL.md)): explicit epic/task types,
+epic stages with exit criteria, computed size-weighted progress and health,
+milestones in `PROJECT.md` — all on the same issue files and gate.
+
+**Folded, not built separately:** cross-vendor QA/curator rules are gate rows
+(CAD-340 → CAD-360); question routing is a report + decision (CAD-342 → CAD-341,
+CAD-363); the verification queue is decision cards in Needs-you (CAD-357 later).
+
+**Later, only when evidence asks for it:** write leases (CAD-378), Pi adapter
+(CAD-322), nightly consolidation, skills promotion, learning dashboard, notes and
+code maps, dedicated Vault UI, home-directory migration (CAD-392), decision-model
+pilot (CAD-394), many projects (M4), platforms (M5), autonomy dial (M6).
+
 ## 1. Organization
 
 ```mermaid
