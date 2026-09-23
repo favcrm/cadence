@@ -929,6 +929,43 @@ enum Commands {
         #[arg(long)]
         group: Option<String>,
     },
+    /// Install the exact build CI tested on main (CAD-334). Downloads
+    /// the `cadence-<sha>-x86_64-linux` artifact through `gh` and refuses
+    /// unless the sha is on main, CI's `test` job passed on that exact sha,
+    /// the sha256 matches, the manifest names the sha, and the GitHub
+    /// build-provenance attestation verifies for this repo. Installs to
+    /// `<releases>/<sha>/cadence` and atomically repoints the `cadence`
+    /// symlink. A release already on disk is reinstalled without a
+    /// download (rollback). Never restarts the daemon unless `--restart`.
+    #[command(group(clap::ArgGroup::new("upgrade_target").required(true).args(["sha", "latest_main"])))]
+    Upgrade {
+        /// Full 40-hex commit on main to install (or roll back to).
+        #[arg(long)]
+        sha: Option<String>,
+        /// The newest main commit whose CI run succeeded.
+        #[arg(long)]
+        latest_main: bool,
+        /// Verify everything and print the plan; install nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// After installing, restart the daemon with the new binary
+        /// through `daemon restart --when-idle --ui` (rollout lease).
+        #[arg(long, conflicts_with = "dry_run")]
+        restart: bool,
+        /// Rollout identity for `--restart` outside a cadence pane.
+        #[arg(long = "as", requires = "restart")]
+        as_identity: Option<String>,
+        /// GitHub repository whose CI built and attested the binary.
+        #[arg(long, default_value = cadence_agent::upgrade::DEFAULT_REPO)]
+        repo: String,
+        /// Symlink that puts cadence on PATH [default: ~/.local/bin/cadence].
+        #[arg(long)]
+        link: Option<PathBuf>,
+        /// Releases directory [default: read off the current link, else
+        /// $XDG_DATA_HOME/cadence/releases].
+        #[arg(long)]
+        releases_dir: Option<PathBuf>,
+    },
     /// Stdio MCP server backing `--permission-prompt-tool` on a
     /// brokered managed claude — spawned by the provider CLI via the
     /// generated `--mcp-config`, never by hand.
@@ -5252,8 +5289,119 @@ fn run() -> Result<i32> {
             let scope = cadence_agent::overview::Scope { project, group };
             run_overview(&state_dir, json, watch, scope)
         }
+        Commands::Upgrade {
+            sha,
+            latest_main,
+            dry_run,
+            restart,
+            as_identity,
+            repo,
+            link,
+            releases_dir,
+        } => run_upgrade(
+            &state_dir,
+            UpgradeArgs {
+                sha,
+                latest_main,
+                dry_run,
+                restart,
+                as_identity,
+                repo,
+                link,
+                releases_dir,
+            },
+        ),
         Commands::McpPermission { timeout_secs } => cadence_agent::mcp::run(timeout_secs),
     }
+}
+
+struct UpgradeArgs {
+    sha: Option<String>,
+    latest_main: bool,
+    dry_run: bool,
+    restart: bool,
+    as_identity: Option<String>,
+    repo: String,
+    link: Option<PathBuf>,
+    releases_dir: Option<PathBuf>,
+}
+
+/// `cadence upgrade`: verify and install (see `cadence_agent::upgrade`),
+/// then either print the restart command or, with `--restart`, run the
+/// NEW binary's `daemon restart --when-idle --ui`. The restart must run
+/// from the installed binary: `daemon restart` respawns `current_exe()`,
+/// so restarting from this (old) process would bring the old build back.
+fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
+    use cadence_agent::upgrade;
+    // A restart without a rollout identity would fail after the install;
+    // refuse before touching anything instead.
+    if args.restart {
+        cadence_agent::rollout::resolve_caller(args.as_identity.as_deref()).map_err(|e| {
+            Error::rejected(format!("upgrade --restart refused before installing: {e}"))
+        })?;
+    }
+    let target = match (args.sha, args.latest_main) {
+        (Some(sha), false) => upgrade::Target::Sha(sha),
+        (None, true) => upgrade::Target::LatestMain,
+        _ => {
+            return Err(Error::rejected(
+                "pass exactly one of --sha <40-hex> or --latest-main",
+            ))
+        }
+    };
+    let layout = upgrade::Layout::detect(args.link, args.releases_dir)?;
+    let source = upgrade::Gh::new(&args.repo);
+    let mut report = upgrade::run(
+        &source,
+        &layout,
+        &upgrade::Request {
+            target,
+            dry_run: args.dry_run,
+        },
+    )?;
+    let command = upgrade::restart_command(args.as_identity.as_deref());
+    if !args.restart {
+        report["restart_command"] = json!(command);
+        report["next"] = json!(if args.dry_run {
+            "dry run: nothing installed; rerun without --dry-run to install".to_string()
+        } else {
+            format!("the daemon still runs its old build; when ready, run `{command}`")
+        });
+        print_json(&report);
+        return Ok(0);
+    }
+    let installed = PathBuf::from(report["installed_path"].as_str().unwrap_or_default());
+    let mut cmd = Command::new(&installed);
+    cmd.arg("--state-dir")
+        .arg(state_dir)
+        .args(upgrade::RESTART_ARGS);
+    if let Some(id) = &args.as_identity {
+        cmd.arg("--as").arg(id);
+    }
+    // stderr (the when-idle progress) streams through; the before/after
+    // table is captured into the report.
+    let out = cmd
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| Error::internal(format!("could not run {}: {e}", installed.display())))?;
+    let ok = out.status.success();
+    report["restarted"] = json!(ok);
+    report["restart"] = json!({
+        "command": format!("{} --state-dir {} {}{}", installed.display(), state_dir.display(),
+            upgrade::RESTART_ARGS.join(" "),
+            args.as_identity.as_deref().map(|id| format!(" --as {id}")).unwrap_or_default()),
+        "exit_code": out.status.code(),
+        "output": String::from_utf8_lossy(&out.stdout),
+    });
+    if !ok {
+        report["next"] = json!(format!(
+            "installed, but the restart did not complete cleanly — read restart.output; \
+             the daemon may still run its old build. Retry with `{command}` once resolved"
+        ));
+    }
+    print_json(&report);
+    Ok(if ok { 0 } else { 1 })
 }
 
 /// The `cadence monitor` tree — thin RPC wrappers. Monitor state and
@@ -8273,6 +8421,9 @@ mod tests {
             ov::cmd_issue_set_ready("CAD-5"),
             ov::CMD_ISSUE_SYNC.to_string(),
             ov::CMD_RESTART_WHEN_IDLE.to_string(),
+            ov::CMD_UPGRADE_LATEST_MAIN.to_string(),
+            cadence_agent::upgrade::restart_command(None),
+            cadence_agent::upgrade::restart_command(Some("operator:name")),
         ] {
             assert_parses(&cmd);
         }

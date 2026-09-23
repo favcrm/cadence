@@ -118,6 +118,83 @@ jobs:
       - run: cargo build --release --locked --features ui
         working-directory: ${{ github.workspace }}
 
+  # CAD-334: keep the exact tested main build. Runs only on a push to main
+  # (never pull_request or merge_group), and only after every other gate
+  # passed on this same sha, so the manifest's `checks` list is true.
+  # `cadence upgrade` downloads this artifact, checks the sha256, the
+  # manifest's source_sha and the build-provenance attestation, and only
+  # then installs it. Nothing here is a required check.
+  release-artifact:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [fmt, clippy, test, build, ui]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - run: rustup toolchain install stable --profile minimal
+      - run: pnpm install --frozen-lockfile
+        working-directory: ui
+      - run: pnpm build
+        working-directory: ui
+      - run: cargo build --release --locked --features ui
+      - name: Assemble binary, sha256 and manifest
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/cadence dist/cadence
+          chmod 0755 dist/cadence
+          # The binary must report the commit it was built from.
+          version=$(dist/cadence --version)
+          case "$version" in
+            *"+$SOURCE_SHA") ;;
+            *) echo "binary reports '$version', expected +$SOURCE_SHA" >&2; exit 1 ;;
+          esac
+          (cd dist && sha256sum cadence > cadence.sha256)
+          jq -n \
+            --arg source_sha "$SOURCE_SHA" \
+            --argjson run_id "$RUN_ID" \
+            --argjson run_attempt "$RUN_ATTEMPT" \
+            --arg rustc "$(rustc --version)" \
+            --arg cargo "$(cargo --version)" \
+            --arg sha256 "$(cut -d' ' -f1 dist/cadence.sha256)" \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{source_sha: $source_sha, run_id: $run_id, run_attempt: $run_attempt,
+              rustc: $rustc, cargo: $cargo, features: ["ui"],
+              target: "x86_64-linux", runner: "ubuntu-24.04",
+              checks: ["fmt", "clippy", "test", "build", "ui"],
+              sha256: $sha256, built_at: $built_at}' > dist/manifest.json
+          cat dist/manifest.json dist/cadence.sha256
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/cadence
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cadence-${{ github.sha }}-x86_64-linux
+          path: |
+            dist/cadence
+            dist/cadence.sha256
+            dist/manifest.json
+          if-no-files-found: error
+          retention-days: 90
+          # A re-run of this job rebuilds the same sha in the same run.
+          overwrite: true
+
   # CAD-109 backstop: gitleaks, an implementation independent of cadence's
   # in-process scanner, runs over the PR's own commits (base..head) with its
   # built-in rule pack, which is the same release cadence vendors. The binary
