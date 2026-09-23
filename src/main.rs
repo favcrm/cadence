@@ -5532,7 +5532,9 @@ fn run() -> Result<i32> {
         }
         Commands::Issue { action } => cadence_agent::issue::cli::run(&action, &state_dir),
         Commands::Plan { action } => run_plan(&state_dir, action),
-        Commands::Milestone { action } => cadence_agent::issue::cli::run_milestone(&action),
+        Commands::Milestone { action } => {
+            cadence_agent::issue::cli::run_milestone(&action, &state_dir)
+        }
         Commands::Report {
             kind,
             project,

@@ -2139,6 +2139,10 @@ impl Shared {
             "plan_approve" => self.rpc_plan_decide(params, peer_pid, true),
             "plan_reject" => self.rpc_plan_decide(params, peer_pid, false),
             "epic_stage" => self.rpc_epic_stage(params, peer_pid),
+            "project_work_approve" => self.rpc_project_work_approve(params, peer_pid),
+            "project_work_approvals" => Ok(json!({
+                "approvals": self.store.work_approvals()?,
+            })),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -3533,9 +3537,19 @@ impl Shared {
         let stage = required_str(params, "stage")?;
         let note = optional_str(params, "note");
         let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
-        let out = crate::issue::write::move_stage(&pm, epic, stage, note, |mv| {
+        let approvals: crate::issue::work::Approvals = self
+            .store
+            .work_approvals()?
+            .into_iter()
+            .filter_map(|(k, v)| v["digest"].as_str().map(|d| (k, d.to_string())))
+            .collect();
+        let out = crate::issue::write::move_stage(&pm, epic, stage, note, &approvals, |mv| {
             if mv.needs_operator {
-                self.approval_operator(&format!("stage move into '{}'", mv.to), params, peer_pid)?;
+                self.operator_connection(
+                    &format!("stage move into '{}'", mv.to),
+                    params,
+                    peer_pid,
+                )?;
                 return Ok("operator".to_string());
             }
             match self.slot_identity(peer_pid)? {
@@ -3556,6 +3570,39 @@ impl Shared {
             .event_public(DAEMON_ALIAS, "epic_stage_moved", out.clone());
         self.wake();
         Ok(out)
+    }
+
+    /// CAD-405 `project_work_approve` — the operator approves a
+    /// project's PROJECT.md gate keys (`stages`, `operator_stages`) as
+    /// they are now. The digest of the normalized keys is recorded in
+    /// the daemon store with who and when (never read from a tracker
+    /// commit, whose `git add -A` may sweep in an agent's edit); readers
+    /// and stage moves apply the keys only while the file still matches
+    /// it. Operator only, connection-bound like `plan approve`.
+    fn rpc_project_work_approve(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("project work approve", params, peer_pid)?;
+        let project = required_str(params, "project")?;
+        crate::issue::model::check_key(project)?;
+        let pm_dir = self.pm_dir()?;
+        if !crate::issue::project::list(&pm_dir)?
+            .iter()
+            .any(|p| p.key == project)
+        {
+            return Err(crate::issue::project::unknown_project(project, &pm_dir));
+        }
+        let cfg = crate::issue::work::load_config(&pm_dir, project)?;
+        let payload = json!({
+            "project": project,
+            "digest": crate::issue::work::gate_digest(&cfg),
+            "stages": cfg.stage_ids(),
+            "operator_stages": cfg.operator_stages,
+            "default": crate::issue::work::gates_default(&cfg),
+            "by": "operator",
+            "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
+        });
+        self.store.record_work_approval(payload.clone())?;
+        self.wake();
+        Ok(payload)
     }
 
     fn rpc_register(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {

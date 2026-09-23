@@ -9,9 +9,17 @@
 //! (strict, `deny_unknown_fields` — older binaries would refuse a new
 //! key there). A project without `PROJECT.md` gets the defaults.
 //!
+//! The gate keys — `stages` and `operator_stages` — decide who may
+//! move an epic where, so an edit to them takes effect only once the
+//! operator approves it (`project_work_approve`, recorded in the daemon
+//! store with who and when). Until then every reader and every stage
+//! move uses the default gates and reports `config_unapproved`;
+//! `milestones` and `stage_limit_days` stay freely editable.
+//!
 //! Progress reuses the plan's size weights ([`plan::progress`]). Health
 //! is `on_track`, `at_risk` (an open child is blocked, or the epic has
-//! sat in its stage longer than the limit) or `stalled` (2× the limit).
+//! sat in its stage longer than the limit) or `stalled` (in the stage
+//! for 2× the limit or more — time in stage, not child activity).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -262,12 +270,87 @@ pub fn load_config_or_default(pm_dir: &Path, key: &str) -> (WorkConfig, Option<S
     }
 }
 
+/// Project key → the gate digest the operator last approved.
+pub type Approvals = HashMap<String, String>;
+
+/// The normalized gate keys: the stage ids in order and the operator
+/// stages as a set. Milestones and the limit are not gates.
+pub fn gate_keys(cfg: &WorkConfig) -> String {
+    let mut ops = cfg.operator_stages.clone();
+    ops.sort();
+    ops.dedup();
+    format!(
+        "stages={}\noperator_stages={}",
+        cfg.stage_ids().join(","),
+        ops.join(",")
+    )
+}
+
+/// `sha256:<hex>` of [`gate_keys`] — what an approval records.
+pub fn gate_digest(cfg: &WorkConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(gate_keys(cfg).as_bytes());
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
+}
+
+/// The gates are the defaults — nothing to approve.
+pub fn gates_default(cfg: &WorkConfig) -> bool {
+    gate_keys(cfg) == gate_keys(&WorkConfig::default())
+}
+
+/// The config a reader or a stage move uses: the file's own when its
+/// gate keys are the defaults or match the operator's approved digest;
+/// else the default gates (keeping the file's milestones and limit)
+/// plus the `config_unapproved` note. An agent editing PROJECT.md can
+/// therefore never reorder, drop, rename or un-gate a stage.
+pub fn effective(
+    key: &str,
+    cfg: WorkConfig,
+    approved: Option<&str>,
+) -> (WorkConfig, Option<String>) {
+    if gates_default(&cfg) || approved == Some(gate_digest(&cfg).as_str()) {
+        return (cfg, None);
+    }
+    let d = WorkConfig::default();
+    let note = format!(
+        "config_unapproved: {key}/PROJECT.md stages/operator_stages differ from the defaults \
+         and are not operator-approved ({}) — the default stages apply until \
+         `cadence issue project approve-work {key}`",
+        gate_digest(&cfg)
+    );
+    (
+        WorkConfig {
+            stages: d.stages,
+            operator_stages: d.operator_stages,
+            ..cfg
+        },
+        Some(note),
+    )
+}
+
+/// Every project's approved gate digest, from the daemon. An
+/// unreachable daemon is no approvals — custom gates then read as the
+/// defaults, the fail-safe direction.
+pub fn fetch_approvals(state_dir: &Path) -> Approvals {
+    crate::client::rpc(state_dir, "project_work_approvals", json!({}))
+        .ok()
+        .and_then(|v| v["approvals"].as_object().cloned())
+        .map(|m| {
+            m.into_iter()
+                .filter_map(|(k, v)| v["digest"].as_str().map(|d| (k, d.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// An epic's effective stage and where it came from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StageState {
     pub id: String,
-    /// `field` (a recorded move), `plan` (mapped from the plan state)
-    /// or `default` (never moved — the first stage).
+    /// `field` (a recorded move), `plan` (mapped from the plan state),
+    /// `status` (a done epic never moved) or `default` (never moved —
+    /// the first stage).
     pub source: &'static str,
     /// When the epic entered the stage; `None` when unknown.
     pub since: Option<i64>,
@@ -278,12 +361,24 @@ pub struct StageState {
     pub terminal: bool,
 }
 
+/// The earliest stage an epic may be in: an approved plan owns the
+/// first stage (shaping is the plan's proposal), so it never goes back
+/// before the second — to reshape, reject or re-propose the plan.
+pub fn floor(front: &Front, cfg: &WorkConfig) -> usize {
+    match &front.plan {
+        Some(p) if p.state == "approved" => 1.min(cfg.stages.len() - 1),
+        _ => 0,
+    }
+}
+
 /// The stage of an epic. A plan's state bounds it: `proposed` is always
-/// the first stage (nothing may start), `rejected` is terminal; an
-/// approved plan without a recorded move is in the second stage. Else a
-/// recorded `stage`, else the first stage. A dropped `stage` (an older
-/// binary rewrote the file) therefore reads earlier, never later.
-pub fn stage_of(front: &Front, cfg: &WorkConfig) -> StageState {
+/// the first stage (nothing may start), `rejected` is terminal, and an
+/// approved plan is never before its [`floor`] (the second stage, where
+/// it reads when no move is recorded). Else a recorded `stage`, else
+/// the last stage for an epic whose status is `done` (`done`), else the
+/// first stage. A dropped `stage` (an older binary rewrote the file)
+/// therefore reads earlier, never later.
+pub fn stage_of(front: &Front, cfg: &WorkConfig, done: bool) -> StageState {
     let at = |s: Option<&str>| s.and_then(crate::issue::time::parse_iso);
     let last = cfg.stages.len() - 1;
     let at_index = |i: usize, source, since| StageState {
@@ -308,9 +403,12 @@ pub fn stage_of(front: &Front, cfg: &WorkConfig) -> StageState {
             _ => {}
         }
     }
+    let floor = floor(front, cfg);
+    let plan_at = || at(front.plan.as_ref().and_then(|p| p.decided_at.as_deref()));
     if let Some(stage) = front.stage.as_deref().filter(|s| !s.is_empty()) {
         let since = at(front.stage_at.as_deref());
         return match cfg.index(stage) {
+            Some(i) if i < floor => at_index(floor, "plan", plan_at()),
             Some(i) => at_index(i, "field", since),
             None => StageState {
                 id: stage.to_string(),
@@ -321,8 +419,11 @@ pub fn stage_of(front: &Front, cfg: &WorkConfig) -> StageState {
             },
         };
     }
-    if let Some(p) = front.plan.as_ref().filter(|p| p.state == "approved") {
-        return at_index(1.min(last), "plan", at(p.decided_at.as_deref()));
+    if floor > 0 {
+        return at_index(floor, "plan", plan_at());
+    }
+    if done {
+        return at_index(last, "status", None);
     }
     at_index(0, "default", None)
 }
@@ -342,15 +443,26 @@ pub struct Move {
 
 /// Decide whether `to` is a legal move from `cur`. Forward moves go one
 /// stage at a time (each exit criterion is a gate); backward moves —
-/// sending an epic back — may go to any earlier stage. From a stage the
-/// list does not know, only the first stage is reachable.
-pub fn check_move(cfg: &WorkConfig, cur: &StageState, to: &str) -> Result<Move> {
+/// sending an epic back — may go to any earlier stage down to `floor`
+/// ([`floor`]: an approved plan's first stage belongs to the plan). From
+/// a stage the list does not know, only the floor stage is reachable.
+pub fn check_move(cfg: &WorkConfig, cur: &StageState, to: &str, floor: usize) -> Result<Move> {
     let Some(target) = cfg.index(to) else {
         return Err(Error::rejected(format!(
             "Unknown stage '{to}' — one of {}",
             cfg.stage_ids().join(" ")
         )));
     };
+    if target < floor {
+        return Err(Error::invalid(
+            "plan_owns_stage",
+            format!(
+                "an approved plan's epic is never before '{}' — the plan owns '{to}'; \
+                 reject or re-propose the plan to reshape it",
+                cfg.stages[floor].id
+            ),
+        ));
+    }
     let forward = match cur.index {
         Some(i) if i == target => {
             return Err(Error::rejected(format!("already in stage '{to}'")));
@@ -364,11 +476,11 @@ pub fn check_move(cfg: &WorkConfig, cur: &StageState, to: &str) -> Result<Move> 
             )));
         }
         Some(_) => false,
-        None if target == 0 => false,
+        None if target == floor => false,
         None => {
             return Err(Error::rejected(format!(
                 "stage '{}' is not in this project's list — move it to '{}' first",
-                cur.id, cfg.stages[0].id
+                cur.id, cfg.stages[floor].id
             )));
         }
     };
@@ -385,22 +497,51 @@ pub fn check_move(cfg: &WorkConfig, cur: &StageState, to: &str) -> Result<Move> 
     })
 }
 
+/// One project's work settings as a render uses them.
+#[derive(Clone, Debug)]
+pub struct ProjectWork {
+    /// The effective config ([`effective`]).
+    pub cfg: WorkConfig,
+    /// PROJECT.md could not be read or parsed — the defaults apply.
+    pub error: Option<String>,
+    /// Its gate keys are not operator-approved — the default gates apply.
+    pub unapproved: Option<String>,
+}
+
+impl ProjectWork {
+    /// Load `key`'s PROJECT.md and apply the approvals.
+    pub fn load(pm_dir: &Path, key: &str, approvals: &Approvals) -> Self {
+        let (raw, error) = load_config_or_default(pm_dir, key);
+        let (cfg, unapproved) = effective(key, raw, approvals.get(key).map(String::as_str));
+        Self {
+            cfg,
+            error,
+            unapproved,
+        }
+    }
+}
+
 /// Everything a render needs once: the views by id, each project's
-/// work config (with its load error), and the clock.
+/// effective work config, and the clock.
 pub struct Ctx<'a> {
     pub by_id: &'a HashMap<String, &'a View>,
-    pub configs: HashMap<String, (WorkConfig, Option<String>)>,
+    pub configs: HashMap<String, ProjectWork>,
     pub now: i64,
 }
 
 impl<'a> Ctx<'a> {
-    pub fn new(pm_dir: &Path, by_id: &'a HashMap<String, &'a View>, now: i64) -> Self {
+    pub fn new(
+        pm_dir: &Path,
+        by_id: &'a HashMap<String, &'a View>,
+        now: i64,
+        approvals: &Approvals,
+    ) -> Self {
         let configs = project::list(pm_dir)
             .unwrap_or_default()
             .into_iter()
             .map(|p| {
-                let cfg = load_config_or_default(pm_dir, &p.key);
-                (p.key, cfg)
+                let work = ProjectWork::load(pm_dir, &p.key, approvals);
+                (p.key, work)
             })
             .collect();
         Self {
@@ -410,11 +551,15 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn config(&self, key: &str) -> (&WorkConfig, Option<&str>) {
+    fn work(&self, key: &str) -> Option<&ProjectWork> {
+        self.configs.get(key)
+    }
+
+    fn config(&self, key: &str) -> &WorkConfig {
         static DEFAULT: std::sync::OnceLock<WorkConfig> = std::sync::OnceLock::new();
         match self.configs.get(key) {
-            Some((cfg, err)) => (cfg, err.as_deref()),
-            None => (DEFAULT.get_or_init(WorkConfig::default), None),
+            Some(w) => &w.cfg,
+            None => DEFAULT.get_or_init(WorkConfig::default),
         }
     }
 
@@ -470,11 +615,12 @@ pub fn progress_json(items: &[&View]) -> Value {
     })
 }
 
-/// Health of an epic: `stalled` past 2× the stage limit, `at_risk` when
-/// an open child is blocked or the stage limit is passed, else
-/// `on_track`. Each reason names the owner and the next action. A
-/// terminal stage is never at risk; an unknown entry time skips the
-/// time check.
+/// Health of an epic: `stalled` once it has been in its stage for 2×
+/// the limit or more, `at_risk` when an open child is blocked or it has
+/// been in the stage longer than the limit, else `on_track`. "Stalled"
+/// is time in stage, not child activity. Each reason names the owner
+/// and the next action. A terminal stage is never at risk; an unknown
+/// entry time skips the time check.
 pub fn health_json(
     epic: &View,
     stage: &StageState,
@@ -482,37 +628,49 @@ pub fn health_json(
     kids: &[&View],
     now: i64,
 ) -> Value {
+    const DAY: i64 = 86_400;
     let limit = cfg.stage_limit_days;
-    let days = stage.since.map(|s| (now - s).max(0) / 86_400);
+    let elapsed = stage.since.map(|s| (now - s).max(0));
+    let days = elapsed.map(|e| e / DAY);
+    let f = &epic.issue.front;
     let mut reasons = vec![];
     let mut state = "on_track";
     if !stage.terminal {
         for k in kids.iter().filter(|k| k.blocked && is_open(k)) {
-            let f = &k.issue.front;
+            let kf = &k.issue.front;
             let waits = match k.blocked_reason {
                 Some(r) => r.to_string(),
-                None => format!("waits on {}", f.blocked_by.join(", ")),
+                None => format!("waits on {}", kf.blocked_by.join(", ")),
             };
             reasons.push(json!({
                 "cause": "blocked",
-                "issue": f.id,
-                "owner": f.owner,
-                "detail": format!("{} {waits}", f.id),
-                "next": format!("unblock {} or re-plan around it", f.id),
+                "issue": kf.id,
+                "owner": kf.owner,
+                "detail": format!("{} {waits}", kf.id),
+                "next": format!("unblock {} or re-plan around it", kf.id),
             }));
             state = "at_risk";
         }
-        if let Some(d) = days.filter(|d| *d as u64 > limit) {
-            let stalled = d as u64 > limit * 2;
-            reasons.push(json!({
-                "cause": if stalled { "stalled" } else { "stage_time" },
-                "issue": epic.issue.front.id,
-                "owner": epic.issue.front.owner,
-                "detail": format!("{d} days in '{}' (limit {limit})", stage.id),
-                "next": format!(
+        let limit_s = limit as i64 * DAY;
+        if let Some(e) = elapsed.filter(|e| *e > limit_s) {
+            let stalled = e >= 2 * limit_s;
+            let next = if f.plan.as_ref().is_some_and(|p| p.state == "proposed") {
+                format!(
+                    "approve the plan (`cadence plan approve {}`) or reject it",
+                    f.id
+                )
+            } else {
+                format!(
                     "meet the '{}' exit criterion and move the stage, or record why it waits",
                     stage.id
-                ),
+                )
+            };
+            reasons.push(json!({
+                "cause": if stalled { "stalled" } else { "stage_time" },
+                "issue": f.id,
+                "owner": f.owner,
+                "detail": format!("{} days in '{}' (limit {limit})", e / DAY, stage.id),
+                "next": next,
             }));
             state = if stalled { "stalled" } else { "at_risk" };
         }
@@ -530,7 +688,7 @@ pub fn health_json(
 /// issue; stage, progress and health for epics (`null` otherwise).
 pub fn item_json(ctx: &Ctx, view: &View) -> Value {
     let f = &view.issue.front;
-    let (cfg, cfg_err) = ctx.config(&view.issue.project);
+    let cfg = ctx.config(&view.issue.project);
     let kind = model::item_type(f, view.container);
     let milestone = model::milestone_of(f);
     let mut out = json!({
@@ -549,7 +707,7 @@ pub fn item_json(ctx: &Ctx, view: &View) -> Value {
         "health": Value::Null,
     });
     if kind == "epic" {
-        let stage = stage_of(f, cfg);
+        let stage = stage_of(f, cfg, view.status == "done");
         let kids = ctx.kids(view);
         let next = stage
             .index
@@ -568,10 +726,23 @@ pub fn item_json(ctx: &Ctx, view: &View) -> Value {
         out["progress"] = progress_json(&kids);
         out["health"] = health_json(view, &stage, cfg, &kids, ctx.now);
     }
-    if let Some(err) = cfg_err {
-        out["config_error"] = json!(err);
+    if let Some(w) = ctx.work(&view.issue.project) {
+        if let Some(err) = &w.error {
+            out["config_error"] = json!(err);
+        }
+        if let Some(note) = &w.unapproved {
+            out["config_unapproved"] = json!(note);
+        }
     }
     out
+}
+
+/// The drawer payload ([`board::detail_json`]) with its `work` block —
+/// `GET /api/issues/:id` and `issue show --json`.
+pub fn detail_json(pm_dir: &Path, ctx: &Ctx, view: &View) -> Value {
+    let mut detail = board::detail_json(pm_dir, view, ctx.by_id);
+    detail["work"] = item_json(ctx, view);
+    detail
 }
 
 /// A board card ([`board::card_json`]) with its `work` block — the
@@ -590,12 +761,13 @@ pub fn epics_json(
     views: &[View],
     project_key: Option<&str>,
     now: i64,
+    approvals: &Approvals,
 ) -> Vec<Value> {
     let by_id: HashMap<String, &View> = views
         .iter()
         .map(|v| (v.issue.front.id.clone(), v))
         .collect();
-    let ctx = Ctx::new(pm_dir, &by_id, now);
+    let ctx = Ctx::new(pm_dir, &by_id, now, approvals);
     views
         .iter()
         .filter(|v| project_key.is_none_or(|p| v.issue.project == p))
@@ -645,7 +817,7 @@ pub fn milestones_json(ctx: &Ctx, views: &[View], project_key: Option<&str>) -> 
         if project_key.is_some_and(|p| key != p) {
             continue;
         }
-        for m in &ctx.config(key).0.milestones {
+        for m in &ctx.config(key).milestones {
             keys.push((key.clone(), m.id.clone()));
         }
     }
@@ -666,7 +838,7 @@ fn natural(id: &str) -> (String, u64) {
 }
 
 fn milestone_row(ctx: &Ctx, key: &str, id: &str, members: Option<&Vec<&View>>) -> Value {
-    let (cfg, _) = ctx.config(key);
+    let cfg = ctx.config(key);
     let conf = cfg.milestones.iter().find(|m| m.id == id);
     let members: &[&View] = members.map(Vec::as_slice).unwrap_or(&[]);
     let mut items: Vec<&View> = vec![];
@@ -850,10 +1022,43 @@ mod tests {
     }
 
     #[test]
+    fn gate_keys_apply_only_when_approved() {
+        let d = WorkConfig::default();
+        assert!(gates_default(&d));
+        let (cfg, note) = effective("x", d.clone(), None);
+        assert_eq!((cfg, note), (d.clone(), None), "defaults need no approval");
+        // Milestones and the limit are not gates.
+        let mild = parse_config("---\nstage_limit_days: 2\nmilestones: [{id: m1}]\n---\n").unwrap();
+        assert!(gates_default(&mild));
+        for yaml in [
+            "stages: [shape, verify, build, release, done]",
+            "stages: [build, verify, release, done]",
+            "stages: [shape, construct, verify, ship, done]",
+            "operator_stages: []",
+        ] {
+            let raw = parse_config(&format!("---\n{yaml}\nstage_limit_days: 3\n---\n")).unwrap();
+            assert!(!gates_default(&raw), "{yaml}");
+            let (cfg, note) = effective("x", raw.clone(), None);
+            assert_eq!(cfg.stage_ids(), d.stage_ids(), "{yaml}");
+            assert_eq!(cfg.operator_stages, d.operator_stages, "{yaml}");
+            assert_eq!(cfg.stage_limit_days, 3, "{yaml}: the limit still applies");
+            assert!(note.unwrap().starts_with("config_unapproved"), "{yaml}");
+            let (cfg, note) = effective("x", raw.clone(), Some("sha256:stale"));
+            assert!(note.is_some() && cfg.stage_ids() == d.stage_ids(), "{yaml}");
+            let digest = gate_digest(&raw);
+            let (cfg, note) = effective("x", raw.clone(), Some(&digest));
+            assert_eq!((cfg, note), (raw, None), "{yaml}: approved");
+        }
+        // Operator-stage order is not a change.
+        let a = parse_config("---\noperator_stages: [release, build]\n---\n").unwrap();
+        assert!(gates_default(&a));
+    }
+
+    #[test]
     fn stage_resolution_and_plan_mapping() {
         let cfg = WorkConfig::default();
         let mut f = Front::new("CAD-1", "e", "2026-09-01T00:00:00Z");
-        let s = stage_of(&f, &cfg);
+        let s = stage_of(&f, &cfg, false);
         assert_eq!(
             (s.id.as_str(), s.source, s.since),
             ("shape", "default", None)
@@ -870,14 +1075,14 @@ mod tests {
         });
         // A proposed plan is in shape whatever a stage field claims.
         f.stage = Some("release".into());
-        assert_eq!(stage_of(&f, &cfg).id, "shape");
-        assert_eq!(stage_of(&f, &cfg).source, "plan");
+        assert_eq!(stage_of(&f, &cfg, false).id, "shape");
+        assert_eq!(stage_of(&f, &cfg, false).source, "plan");
 
         let plan = f.plan.as_mut().unwrap();
         plan.state = "approved".into();
         plan.decided_at = Some("2026-09-03T00:00:00Z".into());
         f.stage = None;
-        let s = stage_of(&f, &cfg);
+        let s = stage_of(&f, &cfg, false);
         assert_eq!((s.id.as_str(), s.source), ("build", "plan"));
         assert_eq!(
             s.since,
@@ -886,21 +1091,40 @@ mod tests {
 
         f.stage = Some("verify".into());
         f.stage_at = Some("2026-09-05T00:00:00Z".into());
-        let s = stage_of(&f, &cfg);
+        let s = stage_of(&f, &cfg, false);
         assert_eq!(
             (s.id.as_str(), s.source, s.index),
             ("verify", "field", Some(2))
         );
 
+        // An approved plan never reads before build — the plan owns shape,
+        // including a hand-edited or stale `stage: shape`.
+        f.stage = Some("shape".into());
+        let s = stage_of(&f, &cfg, false);
+        assert_eq!((s.id.as_str(), s.source), ("build", "plan"));
+        assert_eq!(floor(&f, &cfg), 1);
+        let err = check_move(&cfg, &stage_of(&f, &cfg, false), "shape", 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the plan owns 'shape'"), "{err}");
+
         f.plan.as_mut().unwrap().state = "rejected".into();
-        let s = stage_of(&f, &cfg);
+        let s = stage_of(&f, &cfg, false);
         assert!(s.terminal && s.id == "rejected");
 
         let mut g = Front::new("CAD-2", "e", "2026-09-01T00:00:00Z");
         g.stage = Some("done".into());
-        assert!(stage_of(&g, &cfg).terminal);
+        assert!(stage_of(&g, &cfg, false).terminal);
         g.stage = Some("limbo".into());
-        assert_eq!(stage_of(&g, &cfg).index, None);
+        assert_eq!(stage_of(&g, &cfg, false).index, None);
+        // Migration: a done epic never moved reads the last stage.
+        let h = Front::new("CAD-3", "e", "2026-09-01T00:00:00Z");
+        let s = stage_of(&h, &cfg, true);
+        assert_eq!(
+            (s.id.as_str(), s.source, s.terminal),
+            ("done", "status", true)
+        );
+        assert_eq!(stage_of(&h, &cfg, false).id, "shape");
     }
 
     #[test]
@@ -909,9 +1133,9 @@ mod tests {
         let at = |id: &str| {
             let mut f = Front::new("CAD-1", "e", "2026-09-01T00:00:00Z");
             f.stage = Some(id.to_string());
-            stage_of(&f, &cfg)
+            stage_of(&f, &cfg, false)
         };
-        let m = check_move(&cfg, &at("shape"), "build").unwrap();
+        let m = check_move(&cfg, &at("shape"), "build", 0).unwrap();
         assert!(
             m.forward && m.needs_operator,
             "shape → build is the operator's"
@@ -920,21 +1144,21 @@ mod tests {
             m.exit,
             "Goal, non-goals and acceptance written; tasks listed"
         );
-        let m = check_move(&cfg, &at("build"), "verify").unwrap();
+        let m = check_move(&cfg, &at("build"), "verify", 0).unwrap();
         assert!(m.forward && !m.needs_operator);
         assert!(
-            check_move(&cfg, &at("verify"), "release")
+            check_move(&cfg, &at("verify"), "release", 0)
                 .unwrap()
                 .needs_operator
         );
         assert!(
-            !check_move(&cfg, &at("release"), "done")
+            !check_move(&cfg, &at("release"), "done", 0)
                 .unwrap()
                 .needs_operator
         );
         // Back: any earlier stage, by anyone — re-entering forward later
         // needs the operator again.
-        let m = check_move(&cfg, &at("verify"), "shape").unwrap();
+        let m = check_move(&cfg, &at("verify"), "shape", 0).unwrap();
         assert!(!m.forward && !m.needs_operator);
         for (from, to, want) in [
             ("shape", "verify", "skips a stage"),
@@ -942,10 +1166,10 @@ mod tests {
             ("build", "ship", "Unknown stage"),
             ("limbo", "build", "move it to 'shape' first"),
         ] {
-            let err = check_move(&cfg, &at(from), to).unwrap_err().to_string();
+            let err = check_move(&cfg, &at(from), to, 0).unwrap_err().to_string();
             assert!(err.contains(want), "{from}→{to}: {err}");
         }
-        assert!(!check_move(&cfg, &at("limbo"), "shape").unwrap().forward);
+        assert!(!check_move(&cfg, &at("limbo"), "shape", 0).unwrap().forward);
     }
 
     #[test]
@@ -997,26 +1221,50 @@ mod tests {
     #[test]
     fn health_by_time_in_stage() {
         let cfg = WorkConfig::default();
-        let epic_at = |days: i64, stage: &str| {
+        let epic_at = |secs: i64, stage: &str| {
             let mut e = issue("CAD-1", "backlog");
             e.front.item_type = Some("epic".into());
             e.front.stage = Some(stage.into());
-            e.front.stage_at = Some(crate::issue::time::iso(NOW - days * DAY));
+            e.front.stage_at = Some(crate::issue::time::iso(NOW - secs));
             let vs = views(Path::new("/no-notes"), vec![e]);
             let v = &vs[0];
-            let s = stage_of(&v.issue.front, &cfg);
+            let s = stage_of(&v.issue.front, &cfg, false);
             health_json(v, &s, &cfg, &[], NOW)
         };
-        assert_eq!(epic_at(5, "build")["state"], "on_track");
-        assert_eq!(epic_at(6, "build")["state"], "at_risk");
-        assert_eq!(epic_at(6, "build")["reasons"][0]["cause"], "stage_time");
-        assert_eq!(epic_at(10, "build")["state"], "at_risk");
-        assert_eq!(epic_at(11, "build")["state"], "stalled");
-        assert_eq!(epic_at(40, "done")["state"], "on_track", "terminal");
+        // Seconds in the stage: at risk strictly after the 5-day limit,
+        // stalled from exactly 2× it.
+        assert_eq!(epic_at(5 * DAY, "build")["state"], "on_track");
+        assert_eq!(epic_at(5 * DAY + 1, "build")["state"], "at_risk");
+        assert_eq!(
+            epic_at(6 * DAY, "build")["reasons"][0]["cause"],
+            "stage_time"
+        );
+        assert_eq!(epic_at(10 * DAY - 1, "build")["state"], "at_risk");
+        assert_eq!(epic_at(10 * DAY, "build")["state"], "stalled");
+        assert_eq!(epic_at(40 * DAY, "done")["state"], "on_track", "terminal");
+        // A proposed plan waits on the operator, not on a stage move.
+        let mut e = issue("CAD-1", "backlog");
+        e.front.plan = Some(model::Plan {
+            state: "proposed".into(),
+            proposed_by: "pm".into(),
+            proposed_at: crate::issue::time::iso(NOW - 6 * DAY),
+            tickets: vec![],
+            decided_by: None,
+            decided_at: None,
+            reason: None,
+        });
+        let vs = views(Path::new("/no-notes"), vec![e]);
+        let s = stage_of(&vs[0].issue.front, &cfg, false);
+        let h = health_json(&vs[0], &s, &cfg, &[], NOW);
+        let next = h["reasons"][0]["next"].as_str().unwrap();
+        assert!(
+            next.starts_with("approve the plan (`cadence plan approve CAD-1`)"),
+            "{h}"
+        );
         // Unknown entry time (never moved) skips the time check.
         let e = issue("CAD-1", "backlog");
         let vs = views(Path::new("/no-notes"), vec![e]);
-        let s = stage_of(&vs[0].issue.front, &cfg);
+        let s = stage_of(&vs[0].issue.front, &cfg, false);
         let h = health_json(&vs[0], &s, &cfg, &[], NOW);
         assert_eq!(
             (h["state"].as_str(), h["days_in_stage"].is_null()),
@@ -1061,7 +1309,14 @@ mod tests {
             ],
             ..WorkConfig::default()
         };
-        ctx.configs.insert("cadence".into(), (cfg, None));
+        ctx.configs.insert(
+            "cadence".into(),
+            ProjectWork {
+                cfg,
+                error: None,
+                unapproved: None,
+            },
+        );
         let rows = milestones_json(&ctx, &vs, None);
         let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["m0", "m2", "m10"], "configured first, then found");

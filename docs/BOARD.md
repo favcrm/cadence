@@ -121,6 +121,9 @@ cadence issue epic stage CAD-38 verify [--note why]
                                             # CAD-405 stage move via the daemon: one
                                             # commit; one stage forward, any back;
                                             # forward into build/release = operator
+cadence issue project approve-work <key>    # CAD-405, operator only: PROJECT.md
+                                            # stages/operator_stages take effect
+                                            # only while they match this approval
 cadence milestone ls|show [m2] [--project p] [--json]
                                             # milestones (PROJECT.md, `milestone:`
                                             # or an m<n>-… tag) with rolled-up

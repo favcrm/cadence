@@ -468,6 +468,14 @@ pub enum ProjectAction {
     },
     /// List registered projects.
     Ls,
+    /// Approve the project's PROJECT.md gate keys (`stages`,
+    /// `operator_stages`) as they are now — operator only, through the
+    /// daemon. Until approved (and after any later edit), the default
+    /// stages and operator stages apply.
+    ApproveWork {
+        /// Project key.
+        key: String,
+    },
 }
 
 pub(crate) fn print_json(value: &Value) {
@@ -527,6 +535,15 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     owner.as_deref(),
                 )?;
                 print_json(&out);
+                Ok(0)
+            }
+            ProjectAction::ApproveWork { key } => {
+                model::check_key(key)?;
+                print_json(&crate::client::rpc(
+                    state_dir,
+                    "project_work_approve",
+                    json!({"project": key}),
+                )?);
                 Ok(0)
             }
             ProjectAction::Ls => {
@@ -645,7 +662,12 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 if at_meta.is_none() {
                     let by_id: std::collections::HashMap<String, &board::View> =
                         all.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
-                    let ctx = work::Ctx::new(&pm.dir, &by_id, crate::issue::time::now_epoch());
+                    let ctx = work::Ctx::new(
+                        &pm.dir,
+                        &by_id,
+                        crate::issue::time::now_epoch(),
+                        &work::fetch_approvals(state_dir),
+                    );
                     out["issues"] = views.iter().map(|v| work::card_json(&ctx, v)).collect();
                 }
                 if let Some(meta) = at_meta {
@@ -858,11 +880,16 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     "Unknown issue '{id}' — `cadence issue ls` lists what exists"
                 ))
             })?;
+            let ctx = work::Ctx::new(
+                &pm.dir,
+                &by_id,
+                crate::issue::time::now_epoch(),
+                &work::fetch_approvals(state_dir),
+            );
             if *json {
-                print_json(&board::detail_json(&pm.dir, view, &by_id));
+                print_json(&work::detail_json(&pm.dir, &ctx, view));
             } else {
                 print_show(view, &by_id);
-                let ctx = work::Ctx::new(&pm.dir, &by_id, crate::issue::time::now_epoch());
                 let w = work::item_json(&ctx, view);
                 let mut line = format!("type: {}", w["type"].as_str().unwrap_or("?"));
                 if let Some(m) = w["milestone"].as_str() {
@@ -949,7 +976,13 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             let now = crate::issue::time::now_epoch();
             match action {
                 EpicAction::Ls { json, .. } => {
-                    let epics = work::epics_json(&pm.dir, &views, project, now);
+                    let epics = work::epics_json(
+                        &pm.dir,
+                        &views,
+                        project,
+                        now,
+                        &work::fetch_approvals(state_dir),
+                    );
                     if *json {
                         print_json(&json!({"epics": epics}));
                     } else {
@@ -973,7 +1006,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                              `cadence issue new --epic {id} \"title\"` makes it an epic"
                         )));
                     }
-                    let ctx = work::Ctx::new(&pm.dir, &by_id, now);
+                    let ctx =
+                        work::Ctx::new(&pm.dir, &by_id, now, &work::fetch_approvals(state_dir));
                     let kids: Vec<&board::View> = epic
                         .children
                         .iter()
@@ -1083,7 +1117,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         }
         IssueAction::Lint { project } => {
             let pm = open_pm()?;
-            let report = lint::run(&pm, project.as_deref())?;
+            let approvals = work::fetch_approvals(state_dir);
+            let report = lint::run_with(&pm, project.as_deref(), Some(&approvals))?;
             if report["ok"].as_bool() == Some(true) {
                 print_json(&report);
                 Ok(0)
@@ -1285,7 +1320,7 @@ fn print_stage_and_health(w: &Value) {
 }
 
 /// `cadence milestone ls|show` — read-only.
-pub fn run_milestone(action: &MilestoneAction) -> Result<i32> {
+pub fn run_milestone(action: &MilestoneAction, state_dir: &std::path::Path) -> Result<i32> {
     let pm = open_pm()?;
     let wanted = match action {
         MilestoneAction::Ls { project, .. } | MilestoneAction::Show { project, .. } => {
@@ -1307,7 +1342,12 @@ pub fn run_milestone(action: &MilestoneAction) -> Result<i32> {
         .iter()
         .map(|v| (v.issue.front.id.clone(), v))
         .collect();
-    let ctx = work::Ctx::new(&pm.dir, &by_id, crate::issue::time::now_epoch());
+    let ctx = work::Ctx::new(
+        &pm.dir,
+        &by_id,
+        crate::issue::time::now_epoch(),
+        &work::fetch_approvals(state_dir),
+    );
     match action {
         MilestoneAction::Ls { json, .. } => {
             let rows = work::milestones_json(&ctx, &views, wanted);

@@ -24,6 +24,18 @@ impl Lint {
 }
 
 pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
+    run_with(pm, only_project, None)
+}
+
+/// [`run`] with the operator's work-gate approvals when the caller has
+/// them (`issue lint` asks the daemon). Without them (the commit hook,
+/// sync, doctor) custom gate keys are warned about as possibly
+/// unapproved and stages are checked against the file's own list.
+pub fn run_with(
+    pm: &Pm,
+    only_project: Option<&str>,
+    approvals: Option<&crate::issue::work::Approvals>,
+) -> Result<Value> {
     let mut lint = Lint {
         errors: vec![],
         warnings: vec![],
@@ -46,13 +58,38 @@ pub fn run(pm: &Pm, only_project: Option<&str>) -> Result<Value> {
     // to the default stages and stage moves refuse until it is fixed.
     let mut work_configs: HashMap<String, crate::issue::work::WorkConfig> = HashMap::new();
     for project in &projects {
-        let (cfg, err) = crate::issue::work::load_config_or_default(&pm.dir, &project.key);
+        use crate::issue::work;
+        let (raw, err) = work::load_config_or_default(&pm.dir, &project.key);
         if let Some(err) = err {
             lint.warn(format!(
                 "{}/PROJECT.md: {err} — the default stages apply",
                 project.key
             ));
         }
+        // Gate keys differing from the defaults take effect only once the
+        // operator approves them.
+        let cfg = match approvals {
+            Some(a) => {
+                let (cfg, note) =
+                    work::effective(&project.key, raw, a.get(&project.key).map(String::as_str));
+                if let Some(note) = note {
+                    lint.warn(note);
+                }
+                cfg
+            }
+            None => {
+                if !work::gates_default(&raw) {
+                    lint.warn(format!(
+                        "{}/PROJECT.md: stages/operator_stages differ from the defaults — they \
+                         apply only if the operator approved exactly these ({}); \
+                         `cadence issue lint` checks the approval",
+                        project.key,
+                        work::gate_digest(&raw)
+                    ));
+                }
+                raw
+            }
+        };
         work_configs.insert(project.key.clone(), cfg);
     }
     let mut fronts: HashMap<String, (String, model::Front, String)> = HashMap::new();

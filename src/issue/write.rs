@@ -877,6 +877,7 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
     let staged = stage(pm, ids, |project, front| {
         let before = front.status.clone();
         let milestone = front.milestone.clone();
+        let item_type = front.item_type.clone();
         changed = apply_pairs(project, front, pairs)?;
         if front.status != before {
             // CAD-360: an unapproved plan's tickets stay in backlog.
@@ -884,6 +885,9 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
         }
         if front.milestone != milestone {
             check_milestone(pm, project, front.milestone.as_deref())?;
+        }
+        if front.item_type != item_type {
+            check_type_change(pm, front)?;
         }
         Ok(true)
     })?;
@@ -913,6 +917,31 @@ pub fn set_fields(pm: &Pm, ids: &[String], pairs: &[String], actor: &str) -> Res
               "worktree_open": worktree_open, "committed": true}))
 }
 
+/// CAD-405: an issue with a plan or children is an epic — an explicit
+/// other type would silently drop it from every epic view.
+fn check_type_change(pm: &Pm, front: &Front) -> Result<()> {
+    let Some(t) = front.item_type.as_deref().filter(|t| *t != "epic") else {
+        return Ok(());
+    };
+    let id = front.id.as_str();
+    let why = if front.plan.is_some() {
+        Some("it carries a plan")
+    } else if board::load_all(&pm.dir, None)?
+        .iter()
+        .any(|i| i.front.parent.as_deref() == Some(id))
+    {
+        Some("it has children")
+    } else {
+        None
+    };
+    match why {
+        Some(why) => Err(Error::rejected(format!(
+            "{id} cannot be type '{t}' — {why}, so it is an epic"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// CAD-405: a milestone the project's `PROJECT.md` declares — any
 /// well-formed id when it declares none.
 fn check_milestone(pm: &Pm, project: &project::Project, milestone: Option<&str>) -> Result<()> {
@@ -939,13 +968,17 @@ fn check_milestone(pm: &Pm, project: &project::Project, milestone: Option<&str>)
 /// back), then `authorize` decides who may make it and returns the
 /// actor — the daemon demands the proven operator for a forward move
 /// into one of the project's `operator_stages`. A plan epic's first
-/// forward move is `cadence plan approve`, and a rejected plan never
-/// moves. A malformed `PROJECT.md` refuses: a gate never guesses.
+/// forward move is `cadence plan approve`, an approved plan never moves
+/// back before build (the plan owns shape), and a rejected plan never
+/// moves. The gate keys apply only as `approvals` allow
+/// ([`crate::issue::work::effective`]); a malformed `PROJECT.md`
+/// refuses: a gate never guesses.
 pub fn move_stage(
     pm: &Pm,
     epic: &str,
     to: &str,
     note: Option<&str>,
+    approvals: &crate::issue::work::Approvals,
     authorize: impl FnOnce(&crate::issue::work::Move) -> Result<String>,
 ) -> Result<Value> {
     use crate::issue::work;
@@ -959,11 +992,16 @@ pub fn move_stage(
     let (project, dir) = issue_dir(pm, epic)?;
     let _lock = pm.lock()?;
     let (mut front, body) = load_front(&dir)?;
-    let cfg = work::load_config(&pm.dir, &project.key)?;
-    let has_children = board::load_all(&pm.dir, None)?
-        .iter()
-        .any(|i| i.front.parent.as_deref() == Some(epic));
-    let kind = model::item_type(&front, has_children);
+    let (cfg, unapproved) = work::effective(
+        &project.key,
+        work::load_config(&pm.dir, &project.key)?,
+        approvals.get(&project.key).map(String::as_str),
+    );
+    let views = board::views(&pm.config.notes_dir(), board::load_all(&pm.dir, None)?);
+    let Some(view) = views.iter().find(|v| v.issue.front.id == epic) else {
+        return Err(Error::internal(format!("{epic} missing from reload")));
+    };
+    let kind = model::item_type(&front, view.container);
     if kind != "epic" {
         return Err(Error::rejected(format!(
             "{epic} is a {kind} — only epics have stages \
@@ -982,8 +1020,8 @@ pub fn move_stage(
             ));
         }
     }
-    let cur = work::stage_of(&front, &cfg);
-    let mv = work::check_move(&cfg, &cur, to)?;
+    let cur = work::stage_of(&front, &cfg, view.status == "done");
+    let mv = work::check_move(&cfg, &cur, to, work::floor(&front, &cfg))?;
     let by = authorize(&mv)?;
     let at = time::iso(time::now_epoch());
     front.stage = Some(mv.to.clone());
@@ -1012,6 +1050,7 @@ pub fn move_stage(
         "note": note,
         "by": by,
         "at": at,
+        "config_unapproved": unapproved,
         "committed": true,
     }))
 }

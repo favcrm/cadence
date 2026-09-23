@@ -89,11 +89,30 @@ goes through the daemon's `epic_stage` RPC and ends in one tracker commit
   lane — PM or master — or the operator) moves them. **Moves back** are open to any
   attributable caller; re-entering an operator stage forward asks the operator
   again. A project's autonomy is expressed by its `operator_stages` list (`[]` =
-  fully delegated).
+  fully delegated) — but see *gate approval* below.
+- **Gate approval.** `stages` and `operator_stages` decide who may move what, and
+  `PROJECT.md` is a file any agent can edit, so they take effect **only once the
+  operator approves them**: `cadence issue project approve-work <key>` (daemon RPC
+  `project_work_approve`, operator connection only) records the sha256 digest of
+  the normalized keys (stage ids in order; operator stages as a set) in the daemon
+  store's approval stream with who and when — never inferred from a tracker commit,
+  whose `git add -A` can sweep an agent's edit into an operator commit. While the
+  file's gate keys differ from the defaults and from the approved digest, every
+  reader and every stage move uses the **default** stages and operator stages and
+  reports `config_unapproved`; `issue lint` warns. So reordering, dropping or
+  renaming stages, or emptying `operator_stages`, gets an agent nothing, and a later
+  edit to approved keys falls back again. `milestones` and `stage_limit_days` are not
+  gates and stay agent-editable. An unreachable daemon reads as "no approvals"
+  (the fail-safe side).
 - **Plans.** A plan epic's stage follows the plan (table below): while `proposed`
   it is `shape` whatever `stage` says and cannot move (`cadence plan approve` is its
   shape → build); `rejected` is terminal and never moves; once `approved` it moves
-  like any epic.
+  like any epic except that **build is the earliest stage it can reach** — the plan
+  owns shape, so to reshape, reject or re-propose the plan. A recorded `stage: shape`
+  on an approved plan (a hand edit) reads as build, so plan state and stage agree.
+- **Migration.** An epic whose (derived) status is `done` and that has no recorded
+  stage reads the last stage (`done`, source `status`), so finished epics do not
+  show as shape.
 - A malformed `PROJECT.md` refuses every move; readers fall back to the defaults.
 - The exit criterion of the stage being left is shown with the move (and in
   `issue epic show`), not machine-checked; automatic routine moves are a later cut.
@@ -113,9 +132,13 @@ goes through the daemon's `epic_stage` RPC and ends in one tracker commit
 weights (`plan::progress`: S=1, M=3, L=8, unsized = M, dropped excluded) over an
 epic's children, with counts open (backlog + ready) · doing · review · blocked ·
 done · dropped. Health is `on_track`, `at_risk` (an open child is blocked, or more
-than `stage_limit_days` whole days in the current stage) or `stalled` (more than
-2 × the limit in the stage); each reason carries `cause`, `owner`, `detail` and
-`next`. Time in stage is measured from `stage_at` (or the plan's `proposed_at` /
+than `stage_limit_days` days in the current stage, measured in seconds: at risk
+strictly after the limit) or `stalled` (in the stage for 2 × the limit or more).
+**`stalled` is time in stage, not child activity** — an epic whose children keep
+moving but whose stage does not is still stalled; the next action is to meet the
+exit criterion and move the stage, or record why it waits. Each reason carries
+`cause`, `owner`, `detail` and `next` (for a proposed plan: approve or reject the
+plan). Time in stage is measured from `stage_at` (or the plan's `proposed_at` /
 `decided_at` for a plan-mapped stage); an epic never moved has no entry time and
 skips the time check, so existing epics are not flagged en masse. The terminal
 stage and a rejected plan are never at risk. A milestone's progress rolls up its
@@ -185,6 +208,7 @@ As implemented, one `work` block carries the model everywhere: `type` and
 `weight`, and for epics `stage` (`id`, `source` = `field` | `plan` | `default`,
 `since`, `exit`, `next`, `next_needs_operator`, `terminal`, `stages`), `progress`
 and `health` (`null` for non-epics), plus `config_error` when `PROJECT.md` is bad.
+`config_unapproved` appears when unapproved gate keys were replaced by the defaults.
 It is on every card of `GET /api/issues` and `issue ls --json`, on the detail of
 `GET /api/issues/:id` and `issue show --json`, and on each row of `GET /api/epics`,
 `issue epic ls|show --json`. The existing card fields (`done_ratio` is still the
@@ -221,9 +245,15 @@ children and `task` otherwise; `m0-safe`… tags map to `milestone: m0`….
   can never skip a gate. The move stays in git history (`issue log`, `issue blame`)
   to restore it from.
 - **A plan's state bounds its stage**: a rewrite or hand edit that sets `stage` on a
-  proposed plan does not advance it.
+  proposed plan does not advance it, and an approved plan never reads before build —
+  with `stage` dropped it reads build, never later than recorded.
+- **`type`** other than `epic` is refused on an issue with a plan or children, so an
+  epic cannot silently drop out of the epic views.
 - **Lint**: an unknown `type` or a malformed `milestone` is an error (like a bad
   status); a stage outside the project's list, an undeclared milestone, a bad
   `stage_at`, a stage on a non-epic, a non-epic type with children and a malformed
   `PROJECT.md` are warnings — `PROJECT.md` can change under existing issues, and a
-  warning never blocks tracker commits.
+  warning never blocks tracker commits. Unapproved gate keys are a warning too
+  (`config_unapproved` from `issue lint`, which asks the daemon; the commit hook,
+  `sync` and `doctor` cannot, so they warn whenever the gate keys differ from the
+  defaults).
