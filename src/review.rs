@@ -519,6 +519,67 @@ fn git(repo: &Path, args: &[&str], secs: u64) -> Result<String> {
 }
 
 /// `git` where a non-zero exit is data, not an error.
+/// Fetch `src` from origin straight into the local ref `dst` and return
+/// the commit it names. Never reads or writes `FETCH_HEAD`: that file
+/// is shared by every process fetching in this checkout, so a
+/// concurrent fetch between ours and a `rev-parse FETCH_HEAD` would
+/// resolve someone else's commit (CAD-261).
+fn fetch_ref(repo: &Path, src: &str, dst: &str, secs: u64) -> Result<String> {
+    git(
+        repo,
+        &[
+            "fetch",
+            "-q",
+            "--no-write-fetch-head",
+            "origin",
+            &format!("+{src}:{dst}"),
+        ],
+        secs,
+    )?;
+    git(
+        repo,
+        &["rev-parse", "--verify", &format!("{dst}^{{commit}}")],
+        secs,
+    )
+}
+
+/// The review's private ref namespace, `refs/cadence/review/<pr>/`,
+/// deleted when the run ends however it ends.
+struct ReviewRefs {
+    root: PathBuf,
+    prefix: String,
+    git_secs: u64,
+}
+
+impl ReviewRefs {
+    fn new(root: &Path, pr: i64, git_secs: u64) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            prefix: format!("refs/cadence/review/{pr}/"),
+            git_secs,
+        }
+    }
+
+    fn name(&self, leaf: &str) -> String {
+        format!("{}{leaf}", self.prefix)
+    }
+}
+
+impl Drop for ReviewRefs {
+    fn drop(&mut self) {
+        let Ok(list) = git(
+            &self.root,
+            &["for-each-ref", "--format=%(refname)", &self.prefix],
+            self.git_secs,
+        ) else {
+            return;
+        };
+        for r in list.lines().filter(|l| !l.is_empty()) {
+            let _ = git(&self.root, &["update-ref", "-d", r], self.git_secs);
+        }
+    }
+}
+
 fn git_status(repo: &Path, args: &[&str], secs: u64) -> Result<StepOut> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo).args(args);
@@ -1641,19 +1702,21 @@ pub fn run(opts: &Options) -> Result<i32> {
         )));
     }
 
-    // Fetch both ends into the main object store.
-    git(
+    // Fetch both ends into the main object store, each into this run's
+    // own ref — never through the shared FETCH_HEAD (CAD-261).
+    let refs = ReviewRefs::new(&root, pr.number, pre.git_secs);
+    let base_sha = fetch_ref(
         &root,
-        &["fetch", "-q", "origin", &pr.base_ref],
+        &format!("refs/heads/{}", pr.base_ref),
+        &refs.name("base"),
         pre.git_secs,
     )?;
-    let base_sha = git(&root, &["rev-parse", "FETCH_HEAD"], pre.git_secs)?;
-    git(
+    let head_sha = fetch_ref(
         &root,
-        &["fetch", "-q", "origin", &format!("pull/{}/head", pr.number)],
+        &format!("pull/{}/head", pr.number),
+        &refs.name("head"),
         pre.git_secs,
     )?;
-    let head_sha = git(&root, &["rev-parse", "FETCH_HEAD"], pre.git_secs)?;
     if head_sha != pr.head_sha {
         return Err(Error::rejected(format!(
             "PR #{} head moved while resolving: gh saw {}, fetch got {} \
@@ -2100,12 +2163,12 @@ pub fn run(opts: &Options) -> Result<i32> {
                 if num == pr.number {
                     continue;
                 }
-                let fetch = git(
+                let fetch = fetch_ref(
                     &root,
-                    &["fetch", "-q", "origin", &format!("pull/{num}/head")],
+                    &format!("pull/{num}/head"),
+                    &refs.name(&format!("other/{num}")),
                     t.git_secs,
-                )
-                .and_then(|_| git(&root, &["rev-parse", "FETCH_HEAD"], t.git_secs));
+                );
                 let Ok(theirs) = fetch else {
                     pr_conflicts.push(json!({"pr": num,
                         "title": other["title"],
