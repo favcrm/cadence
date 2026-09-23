@@ -1048,6 +1048,7 @@ fn restart_preserves_attention_fence_without_unknowns() {
         store.set_agent_state("healthy", "idle", None).unwrap();
     }
     let d = TestDaemon::start_on(state);
+    let _reaper = DaemonReaper::new(&d.state);
     // Healthy relaunched; the fenced agent kept its fence AND its
     // original error — recover cleared only the dead runtime fields.
     d.wait_agent("healthy", "idle", 15);
@@ -2577,6 +2578,7 @@ fn daemon_restart_reports_fenced_turn() {
     // stop — so the marker records it and the new daemon's pane proof
     // refuses it.
     let d = TestDaemon::start();
+    let _reaper = DaemonReaper::new(&d.state);
     let mock = d.mock_devin();
     d.register_devin("dv1", None);
     d.wait_agent("dv1", "idle", 20);
@@ -2616,6 +2618,7 @@ fn daemon_restart_reports_fenced_turn() {
 #[test]
 fn daemon_restart_reports_kept_turn() {
     let d = TestDaemon::start();
+    let _reaper = DaemonReaper::new(&d.state);
     let _mock = d.mock_devin();
     d.register_devin("dv", None);
     d.wait_agent("dv", "idle", 20);
@@ -6908,7 +6911,10 @@ fn skill_install_overwrites_stale_content() {
 #[test]
 fn daemon_run_refreshes_skill_on_start() {
     let home = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap().path().join("state");
+    // Bound, not a temporary: the parent must outlive the daemon.
+    let state_root = TempDir::new().unwrap();
+    let state = state_root.path().join("state");
+    let _reaper = DaemonReaper::new(&state);
     // Seed a stale copy so the refresh (not just install) is exercised.
     let file = home.path().join(".agents/skills/cadence/SKILL.md");
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -7374,6 +7380,7 @@ fn group_resume_orders_pm_first_and_skips_live() {
 #[test]
 fn resume_all_and_daemon_start_resume_sweep() {
     let d = TestDaemon::start();
+    let _reaper = DaemonReaper::new(&d.state);
     d.register("a1");
     d.register("a2");
     d.wait_agent("a1", "idle", 10);
@@ -19744,6 +19751,7 @@ fn restart_diag(d: &TestDaemon, alias: &str) -> String {
 #[test]
 fn daemon_restart_keeps_pane_pid_and_reports_table() {
     let d = TestDaemon::start();
+    let _reaper = DaemonReaper::new(&d.state);
     let _mock = d.mock_devin();
     d.register_devin("dv", None);
     d.register("w1");
@@ -19790,6 +19798,7 @@ fn daemon_restart_keeps_pane_pid_and_reports_table() {
 #[test]
 fn daemon_restart_when_idle_gates_and_proceeds() {
     let d = TestDaemon::start();
+    let _reaper = DaemonReaper::new(&d.state);
     let mock = d.mock_devin();
     d.register_devin("dv", None);
     d.wait_agent("dv", "idle", 20);
@@ -19854,7 +19863,10 @@ fn daemon_restart_when_idle_gates_and_proceeds() {
 #[test]
 fn daemon_stop_then_start_never_races_lock() {
     let home = TempDir::new().unwrap();
-    let state = TempDir::new().unwrap().path().join("state");
+    // Bound, not a temporary: the parent must outlive the daemon.
+    let state_root = TempDir::new().unwrap();
+    let state = state_root.path().join("state");
+    let _reaper = DaemonReaper::new(&state);
     let start = cadence_at(home.path(), &state, &["daemon", "start"]);
     assert!(
         start.status.success(),
@@ -22993,6 +23005,8 @@ fn session_start_reports_failures_and_fix_only_starts_ui() {
     suite_slot();
     let dir = TempDir::new().unwrap();
     let state = dir.path().join("state");
+    // `--fix` starts a daemon if the stub ever stops answering.
+    let _reaper = DaemonReaper::new(&state);
     let pm = dir.path().join("pm");
     let repo = dir.path().join("repo");
     seed_pm(&pm, &repo, &dir.path().join("notes"));
@@ -23587,6 +23601,8 @@ fn session_json_single_document_and_project_validation() {
         tmp.path().join("repo"),
         tmp.path().join("notes"),
     );
+    // `--fix` starts a daemon if the stub ever stops answering.
+    let _reaper = DaemonReaper::new(&state);
     for d in [&state, &pm, &repo] {
         std::fs::create_dir_all(d).unwrap();
     }
@@ -30540,6 +30556,7 @@ fn agent_gc_timer_unconfigured_never_removes() {
 fn daemon_restart_without_a_lease_leaves_the_pid_unchanged() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let _reaper = DaemonReaper::new(state.path());
     let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
     assert!(
         start.status.success(),
@@ -30576,6 +30593,7 @@ fn daemon_restart_without_a_lease_leaves_the_pid_unchanged() {
 fn daemon_start_refuses_a_different_build_without_a_lease() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let _reaper = DaemonReaper::new(state.path());
     let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
     assert!(
         start.status.success(),
@@ -30634,6 +30652,7 @@ fn daemon_start_refuses_a_different_build_without_a_lease() {
 #[test]
 fn restart_when_idle_aborts_when_the_lease_is_released() {
     let d = TestDaemon::start();
+    let _reaper = DaemonReaper::new(&d.state);
     let mock = d.mock_devin();
     d.register_devin("dv", None);
     d.wait_agent("dv", "idle", 20);
@@ -30718,6 +30737,7 @@ fn sqlite_family(state: &std::path::Path) -> Vec<(String, Option<Vec<u8>>)> {
 fn daemon_start_refuses_a_lower_schema_without_rewriting_the_file() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let _reaper = DaemonReaper::new(state.path());
     let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
     assert!(
         start.status.success(),
@@ -30770,6 +30790,7 @@ fn daemon_start_refuses_a_lower_schema_without_rewriting_the_file() {
 fn daemon_start_by_a_non_holder_does_not_migrate() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let _reaper = DaemonReaper::new(state.path());
     let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
     assert!(
         start.status.success(),
@@ -30861,6 +30882,7 @@ fn daemon_start_by_a_non_holder_does_not_migrate() {
 fn daemon_start_drops_the_forwarded_rollout_identity() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let _reaper = DaemonReaper::new(state.path());
     let start = cadence_at(
         home.path(),
         state.path(),
@@ -30912,6 +30934,103 @@ fn daemon_run_pids(state: &Path) -> Vec<u64> {
     pids
 }
 
+/// `daemon_run_pids`, narrowed to processes whose executable is this
+/// test build — a reaper must never signal anything else.
+fn own_daemon_run_pids(state: &Path) -> Vec<u64> {
+    let bin = Path::new(env!("CARGO_BIN_EXE_cadence"));
+    let bin = bin.canonicalize().unwrap_or_else(|_| bin.to_path_buf());
+    daemon_run_pids(state)
+        .into_iter()
+        .filter(|pid| {
+            std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| {
+                let exe = exe.to_string_lossy();
+                Path::new(exe.strip_suffix(" (deleted)").unwrap_or(&exe)) == bin
+            })
+        })
+        .collect()
+}
+
+/// Poll until no `daemon run` of this build serves `state`, or `within`
+/// passes. Returns the pids still alive.
+fn wait_daemons_gone(state: &Path, within: Duration) -> Vec<u64> {
+    let deadline = Instant::now() + within;
+    loop {
+        let pids = own_daemon_run_pids(state);
+        if pids.is_empty() || Instant::now() >= deadline {
+            return pids;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// CAD-306: reaps every `daemon run` a test's CLI calls started against
+/// `state`, on every exit path. `Drop` also runs while a failed
+/// assertion unwinds, so a test that panics before its own
+/// `daemon stop` no longer orphans a detached daemon to init.
+///
+/// Declare it right after the state dir's owner (`TempDir` or
+/// `TestDaemon`) so it drops first, while the directory still exists.
+/// It asks `daemon stop` (bounded), then SIGTERM, then SIGKILL — and
+/// only ever touches processes running this test build with this
+/// state dir on their command line, never the fleet daemon.
+struct DaemonReaper {
+    state: PathBuf,
+    /// HOME for the `daemon stop` call — never the operator's.
+    home: TempDir,
+}
+
+impl DaemonReaper {
+    fn new(state: &Path) -> Self {
+        Self {
+            state: state.to_path_buf(),
+            home: TempDir::new().unwrap(),
+        }
+    }
+}
+
+impl Drop for DaemonReaper {
+    fn drop(&mut self) {
+        if own_daemon_run_pids(&self.state).is_empty() {
+            return;
+        }
+        let stop = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&self.state)
+            .args(["daemon", "stop"])
+            .env("HOME", self.home.path())
+            .env_remove("CADENCE_ALIAS")
+            .env_remove("CADENCE_ROLLOUT_AS")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut stop) = stop {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while matches!(stop.try_wait(), Ok(None)) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let _ = stop.kill();
+            let _ = stop.wait();
+        }
+        let mut left = wait_daemons_gone(&self.state, Duration::from_secs(1));
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            if left.is_empty() {
+                return;
+            }
+            for pid in &left {
+                unsafe { libc::kill(*pid as libc::pid_t, signal) };
+            }
+            left = wait_daemons_gone(&self.state, Duration::from_secs(2));
+        }
+        if !left.is_empty() {
+            eprintln!(
+                "DaemonReaper: daemon run {left:?} for {} survived SIGKILL",
+                self.state.display()
+            );
+        }
+    }
+}
+
 /// CAD-302: `started` means the process this call spawned holds the
 /// singleton lock (health reports its pid); a second start against the
 /// live daemon reports `already_running` and leaves no second daemon.
@@ -30919,6 +31038,7 @@ fn daemon_run_pids(state: &Path) -> Vec<u64> {
 fn daemon_start_reports_started_for_its_child_and_already_running_after() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let _reaper = DaemonReaper::new(state.path());
     let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
     assert!(
         start.status.success(),
@@ -30959,6 +31079,7 @@ fn daemon_start_reports_started_for_its_child_and_already_running_after() {
 fn concurrent_daemon_starts_report_one_started_one_already_running() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let _reaper = DaemonReaper::new(state.path());
     let barrier = Arc::new(Barrier::new(2));
     let starts: Vec<_> = (0..2)
         .map(|_| {
@@ -31032,6 +31153,7 @@ fn restart_and_rollout_help_say_same_build_restart_is_lease_free() {
 fn direct_daemon_run_by_a_non_holder_keeps_the_hot_restart_marker() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let _reaper = DaemonReaper::new(state.path());
     let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
     assert!(
         start.status.success(),
@@ -31112,6 +31234,7 @@ fn direct_daemon_run_by_a_non_holder_keeps_the_hot_restart_marker() {
 fn holder_migrates_through_daemon_start_without_a_test_override() {
     let home = TempDir::new().unwrap();
     let state = TempDir::new().unwrap();
+    let _reaper = DaemonReaper::new(state.path());
     let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
     assert!(
         start.status.success(),
