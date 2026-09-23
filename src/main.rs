@@ -1904,7 +1904,8 @@ enum AuditAction {
         #[arg(long, default_value = "merge")]
         action: String,
         /// Stable id for retries and a later revoke (default
-        /// `<action>-pr<N>-<head[..12]>`).
+        /// `<action>-pr<N>-<head[..12]>`, then `-2`, `-3`, … once an
+        /// earlier default was revoked). A revoked id is never reused.
         #[arg(long)]
         id: Option<String>,
     },
@@ -3029,12 +3030,6 @@ fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Result<i32> {
     }
 }
 
-/// `<action>-pr<N>-<head[..12]>` — the id `audit approve` records under
-/// when none is given, so a retry of the same approval dedupes.
-fn default_approval_id(action: &str, pr: u64, head: &str) -> String {
-    format!("{action}-pr{pr}-{}", &head[..head.len().min(12)])
-}
-
 /// `cadence audit approve|revoke` — the operator's approval-evidence
 /// writers (CAD-217). The daemon decides authority from the connection;
 /// nothing here names the caller.
@@ -3059,13 +3054,14 @@ fn run_audit_evidence(state_dir: &Path, action: AuditAction) -> Result<i32> {
                     },
                 )?,
             };
-            let id = id.unwrap_or_else(|| default_approval_id(&action, pr, &head));
-            client::rpc(
-                state_dir,
-                "approval_record",
-                json!({"id": id, "source": source, "action": action,
-                       "head": head, "repo": repo, "pr": pr}),
-            )?
+            // No `--id`: the daemon picks the default, counting past a
+            // revoked one so a re-approval is a fresh record.
+            let mut params = json!({"source": source, "action": action,
+                                    "head": head, "repo": repo, "pr": pr});
+            if let Some(id) = id {
+                params["id"] = json!(id);
+            }
+            client::rpc(state_dir, "approval_record", params)?
         }
         AuditAction::Revoke { id, source, reason } => client::rpc(
             state_dir,
@@ -6954,10 +6950,6 @@ mod tests {
             panic!("audit approve must parse to AuditAction::Approve");
         };
         assert_eq!((pr, action.as_str(), id, repo), (84, "merge", None, None));
-        assert_eq!(
-            default_approval_id("merge", 84, head),
-            "merge-pr84-abcdefabcdef"
-        );
         assert!(
             Cli::try_parse_from(["cadence", "audit", "revoke", "ap-1", "--source", "op"]).is_err()
         );

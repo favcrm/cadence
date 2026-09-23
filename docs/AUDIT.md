@@ -52,7 +52,7 @@ cadence audit revoke merge-pr84-011d212bb531 --source "chris" --reason "head mov
     auditor_check What an auditor should check after the merge: …
     residue CAD-147
     outcome tree_match=yes (patch-id match) smoke=unknown (no smoke record) daemon_restart=… revert=no
-    approval approved · id merge-pr63-7896dd273503 · source "chris in chat" · head 7896dd273 · recorded 2026-09-20T10:50:02Z (before merge)
+    approval operator-claimed · id merge-pr63-7896dd273503 · source "chris in chat" · head 7896dd273 · recorded 2026-09-20T10:50:02Z (before merge) · unverified until CAD-280
 ```
 
 - **merge** — the squash commit on the default branch (from `git log`;
@@ -123,8 +123,9 @@ is true of this merge and not of the fleet as a whole.
 
 ## The digest: structural facts are reported once (CAD-207)
 
-When every GitHub login the rendered rows name — every `mergedBy`
-and every `qa-verdict` status creator — is **one account**, the
+When every GitHub login the fleet names — every `mergedBy` of every
+merged PR the run fetched, and every `qa-verdict` status creator it
+holds — is **one account**, the
 fleet pushes everything through a shared token, and
 `reviewer==merger` holds on every row that has a status by
 construction. A flag that fires on 100% of rows discriminates nothing
@@ -145,8 +146,12 @@ and buries the real findings, so in that case the match is:
 As soon as the run shows a second identity (a QA bot token posting
 some statuses, say), a row whose status creator is its own merger
 deviates from the fleet and keeps `FLAG[reviewer==merger]`. The
-determination is made over the rows the run renders (after
-`--since`/`--class`/`--project`/`--limit`). The structural fact is
+determination is made over the whole fetch, not the rendered window:
+a narrow `--since`/`--class`/`--project`/`--limit` cannot turn a real
+self-review into a structural one. Mergers cover every merged PR
+`gh pr list` returned; status creators cover every status in hand —
+all of them with `--merge-report`, only the rendered rows' on a live
+run (fetching the rest would cost one API call per PR). The structural fact is
 still a real limitation — attestation and merge cannot be told apart
 under one token (see the trust model) — it is just not a per-merge
 finding.
@@ -169,7 +174,7 @@ agent alias, so `agent rm` cannot delete it, and never pruned (the
 
 | field | meaning |
 |---|---|
-| `approval_id` | stable id for retries and revocation (default `<action>-pr<N>-<head[..12]>`) |
+| `approval_id` | stable id for retries and revocation (default `<action>-pr<N>-<head[..12]>`; `-2`, `-3`, … once an earlier default was revoked) |
 | `source` | who approved and where — a claim the record carries, never authority by itself; `user` and `daemon` are refused (they are delivery/stream identities, not operators) |
 | `action` | what was approved (`merge`; the audit binds only `merge`) |
 | `head_sha` | the full 40-hex head the approval names |
@@ -178,10 +183,13 @@ agent alias, so `agent rm` cannot delete it, and never pruned (the
 | time | the event time — when the operator recorded it |
 
 A revocation carries `approval_id`, `source`, `reason` and its time,
-and must name a recorded approval. Identical records dedupe (a retry
-answers `duplicate: true`); the same id naming a different head,
-source, action or scope — or a second, different revocation — is
-refused.
+and must name a recorded approval. An identical re-send of a live
+approval dedupes (`duplicate: true`); the same id naming a different
+head, source, action or scope — or a second, different revocation —
+is refused. An id is never reused after a revoke: re-recording a
+revoked `--id` is refused with a message naming the revoke, and with
+no `--id` the daemon counts the default up (`<base>-2`, …), so
+`approve → revoke → approve` records a fresh approval.
 
 **Who may record.** Only an operator connection, by exactly the rule
 `slot_reconcile` applies (CAD-230, CAD-276). The daemon derives the
@@ -197,9 +205,28 @@ are refused rather than read. Worker output, worker messages and queue
 messages are never authority. Accepted residual, inherited from
 CAD-276: a same-uid process that leaves every agent's ancestry without
 orphaning its session (`setsid -f`) and scrubs its env and stdio still
-passes. Operator-by-positive-proof as a design decision (CAD-280) will
-replace this rule for board writes, `slot_reconcile` and these verbs
-alike.
+passes. Operator-by-positive-proof as a design decision
+(tracker issue **CAD-280**, "operator by positive proof") will replace this rule for
+board writes, `slot_reconcile` and these verbs alike.
+
+**Approvals are operator claims, not proof — until CAD-280.** Two
+gaps mean a bound record cannot prove the operator approved:
+
+1. The residual above is real and reproduced: from inside an agent's
+   pane, `env -u CADENCE_ALIAS setsid -f … cadence audit approve …`
+   passes the gate, and the record is stamped
+   `recorded_via: operator-connection`. An agent could so "approve"
+   its own human-class merge.
+2. Any process running as the daemon's uid can write rows straight
+   into `cadence.sqlite3`, bypassing the daemon entirely.
+
+So the audit never reports a bound approval as verified: its state is
+**`operator-claimed`**, the row carries `verified: false` and the note
+`unverified until CAD-280` (text: `· unverified until CAD-280` on the
+approval line), and the summary line states how many approvals are
+operator-claimed. The gate still discriminates what it can — a
+missing or revoked approval is a real finding — but a claimed one is
+a claim.
 
 **What is never an approval.** Queue and message state is context
 only: a message whose body says `OPERATOR APPROVED #84 at <sha>` —
@@ -209,16 +236,17 @@ delivery is not revoking an authorization. The records grant nothing
 either: dispatch and merge never read them.
 
 **Binding.** For each row the audit looks for records with action
-`merge`, the row's PR number, the audit's own `owner/name` (when it
-knows it — fixture runs do not), and `head_sha` **equal to the full
+`merge`, the row's PR number, the audit's own `owner/name` (gh's
+repo, or the checkout's `origin` in fixture runs; unchecked only when
+neither is a github.com remote), and `head_sha` **equal to the full
 landed head** (`headRefOid`). An approval for an older head never
 counts for a newer one — it is listed under `other_heads` and named
 in the reason. States:
 
-- **`approved`** — a record for the landed head was recorded before
-  the merge and not revoked before it. A revocation after the merge
-  is shown but does not change the state: the question is what held
-  when the merge ran.
+- **`operator-claimed`** — a record for the landed head was recorded
+  before the merge and not revoked before it. A revocation after the
+  merge is shown but does not change the state: the question is what
+  held when the merge ran. Not flagged, and not verified (above).
 - **`revoked`** — every pre-merge record for the landed head was
   revoked before the merge. Flags `approval-revoked` on human rows.
 - **`missing`** — the approval stream answered and no record was in
@@ -233,6 +261,10 @@ in the reason. States:
 - **`not-required`** — an `auto`/`notify` row with no record. A
   non-human row an approval binds to shows that record's state for
   context; only human rows flag.
+
+"Before the merge" compares the daemon host's clock (the record's
+event time) with GitHub's `mergedAt`: skew on the daemon host shifts
+the window by that much. The audit assumes the host keeps NTP time.
 
 Historical human-class merges from before the recorder existed have
 no records, so they report `approval-missing` — that is accurate: at
@@ -260,9 +292,10 @@ once as the `structural:` summary line rather than flagged per row.
 
 An approval record is as strong as the operator rule that admitted
 its writer (above) and the store file it lives in: the daemon refuses
-agent connections, but any same-uid process can write the SQLite
-file directly. The record's `source` is the operator's own statement
-of who approved and where.
+agent connections it can attribute, but a detached same-uid process
+passes, and any same-uid process can write the SQLite file directly —
+hence `operator-claimed`, never verified, until CAD-280. The record's
+`source` is the operator's own statement of who approved and where.
 
 What the audit **cannot** detect:
 
@@ -311,21 +344,27 @@ was down".
       "approval": {
         "required": false, "state": "not-required", "reason": null,
         "record": null, "before_merge": null, "revocation": null,
-        "other_heads": []
+        "other_heads": [], "verified": null, "note": null
       },
       "evidence_unavailable": null,
       "unknowns": [{"field": "smoke", "reason": "…"}]
     }
   ],
   "summary": {"rows": 18, "flagged": 0,
-              "flags": [], "structural": [], "by_class": {"auto": 1}}
+              "flags": [], "structural": [],
+              "approvals": {"operator_claimed": 0, "verified": false,
+                            "note": "unverified until CAD-280"},
+              "by_class": {"auto": 1}}
 }
 ```
 
 `approval.record` (and each `other_heads[]` entry) is
 `{id, source, action, head_sha, scope: {repo, pr}, recorded_via,
 recorded_at}`; `approval.revocation` is `{source, reason, revoked_at,
-before_merge}`; `approval.required` is `true` for human rows, `false`
+before_merge}`; `approval.verified` is `false` whenever a record is
+bound (`null` otherwise) and `approval.note` then reads
+`unverified until CAD-280`; `summary.approvals` is
+`{operator_claimed, verified: false, note}`; `approval.required` is `true` for human rows, `false`
 for other classes and `null` when no class is recorded. A row's
 `structural` lists matches the digest moved out of `flags`
 (`["reviewer==merger"]`); `summary.structural` holds one entry per

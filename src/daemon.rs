@@ -1943,7 +1943,8 @@ impl Shared {
     }
 
     /// `approval_record` — persist an operator's merge approval for one
-    /// exact head as audit evidence. It grants nothing: dispatch and
+    /// exact head as audit evidence (`id` optional: the store picks a
+    /// fresh default, see `Store::record_approval`). It grants nothing: dispatch and
     /// merge never read it; `cadence audit` binds it to the landed head.
     fn rpc_approval_record(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.approval_operator("approval record", params, peer_pid)?;
@@ -1952,20 +1953,20 @@ impl Shared {
             .and_then(Value::as_u64)
             .ok_or_else(|| Error::rejected("Missing or non-numeric 'pr'"))?;
         let approval = store::NewApproval {
-            id: required_str(params, "id")?,
+            id: optional_str(params, "id"),
             source: required_str(params, "source")?,
             action: optional_str(params, "action").unwrap_or("merge"),
             head_sha: required_str(params, "head")?,
             repo: required_str(params, "repo")?,
             pr,
         };
-        let new = self
+        let (new, id) = self
             .store
             .record_approval(&approval, APPROVAL_RECORDED_VIA)?;
         Ok(json!({
             "state": "recorded",
             "duplicate": !new,
-            "approval_id": approval.id,
+            "approval_id": id,
             "source": approval.source,
             "action": approval.action,
             "head_sha": approval.head_sha,

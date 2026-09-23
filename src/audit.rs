@@ -15,7 +15,8 @@
 //!   no operator approval record for the exact landed head that was in
 //!   force at merge time (CAD-217). Records come from the daemon's
 //!   approval stream (`cadence audit approve`); queue messages are
-//!   never read as approvals or revocations.
+//!   never read as approvals or revocations. A bound record reports as
+//!   `operator-claimed`, never verified, until CAD-280.
 //!
 //! Sources are read-only: merge commits on the default branch, `gh` PR
 //! metadata and commit statuses, verdict/ops notes under the notes
@@ -249,17 +250,21 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
     // Pass 2 — the rows that render get their per-head evidence:
     // qa-verdict status (one `gh api` call each), merge-content check,
     // post-merge outcomes, the approval binding, then flags.
+    // The repo an approval must be scoped to — gh's slug, or the
+    // checkout's own origin in fixture runs.
+    let approval_slug = gh.slug.clone().or_else(|| origin_slug(&repo));
     for row in &mut rows {
         enrich_status(gh.slug.as_deref(), &gh, row);
         contains_head(&repo, row);
         post_merge(&branch_log, &store, row);
-        enrich_approval(&store, gh.slug.as_deref(), row);
+        enrich_approval(&store, approval_slug.as_deref(), row);
         finalize_unknowns(row);
         flag_row(row);
     }
     // Fleet-level pass (CAD-207): a match every row shares is a fact
-    // about the fleet, reported once — not a per-row finding.
-    let structural = apply_structural(&mut rows);
+    // about the fleet, reported once — not a per-row finding. Decided
+    // over every merged PR gh returned, not just the rendered window.
+    let structural = apply_structural(&mut rows, &fleet_logins(&gh));
 
     let flagged = rows.iter().filter(|r| !r.flags.is_empty()).count();
     if opts.json {
@@ -1293,8 +1298,9 @@ struct Revocation {
     at: f64,
 }
 
-/// A row's approval binding: `approved` (a record for the exact landed
-/// head, recorded before the merge and not revoked before it),
+/// A row's approval binding: `operator-claimed` (a record for the exact
+/// landed head, recorded before the merge and not revoked before it —
+/// a claim, not proof, until CAD-280: see [`APPROVAL_UNVERIFIED`]),
 /// `revoked` (every such record was revoked before the merge),
 /// `missing` (the store answered and no record was in force at merge
 /// time), `unknown` (the evidence could not be read), or `not-required`
@@ -1310,6 +1316,14 @@ struct ApprovalView {
     /// counted: an approval does not carry over to a later head.
     other_heads: Vec<ApprovalRec>,
 }
+
+/// Why no approval record is authoritative yet (CAD-217 review): the
+/// operator gate inherits CAD-276's residual — a same-uid process that
+/// detaches from every pane (`setsid -f`, scrubbed env and stdio) passes
+/// it — and any same-uid process can write rows into the store file
+/// directly. Until operator-by-positive-proof lands, a bound approval is
+/// reported as `operator-claimed`, never as a verified approval.
+const APPROVAL_UNVERIFIED: &str = "unverified until CAD-280";
 
 fn store_evidence(path: &Path) -> StoreEvidence {
     let mut ev = StoreEvidence::default();
@@ -1479,7 +1493,8 @@ fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalV
         return unknown("no landed head to bind an approval to".into());
     };
     // Scope: a merge approval for this PR in this repo (the repo is
-    // checked whenever the audit knows its own — fixture runs do not).
+    // checked whenever the audit knows its own: gh's slug, or the
+    // checkout's origin in fixture runs).
     let in_scope = |a: &&ApprovalRec| {
         a.action == "merge"
             && row.pr == Some(a.pr)
@@ -1508,7 +1523,7 @@ fn bind_approval(ev: &StoreEvidence, slug: Option<&str>, row: &Row) -> ApprovalV
         // In force at merge time. A later revocation is shown, but the
         // question is what held when the merge happened.
         let reason = revoked(a).map(|r| format!("revoked after the merge ({})", iso(r.at)));
-        return view("approved", a, reason);
+        return view("operator-claimed", a, reason);
     }
     if let Some(a) = bound.iter().find(before) {
         let reason = format!("approval {} was revoked before the merge", a.id);
@@ -1812,18 +1827,33 @@ const SHARED_IDENTITY_EXPLANATION: &str = "the qa-verdict status and the merge w
      through one token, so reviewer==merger cannot tell rows apart here; reported \
      once, not flagged (docs/AUDIT.md)";
 
-/// When every GitHub identity the rows name (mergers and qa-verdict
-/// creators) is ONE account, `reviewer==merger` holds by construction
-/// on every row that has both — a property of the fleet's token, not
-/// of any merge. Those matches move from `flags` to `structural` and
-/// are summarized once. When the run shows more than one identity, a
-/// row whose status creator is its merger deviates from the fleet and
-/// keeps its flag.
-fn apply_structural(rows: &mut [Row]) -> Option<Structural> {
+/// Every GitHub login the whole fetch names, beyond the rendered
+/// window: `mergedBy` of every merged PR `gh pr list` returned, and the
+/// creator of every `qa-verdict` status already in hand (a fixture has
+/// them all; a live run fetches statuses only for rendered rows, so
+/// there the rows add their own creators).
+fn fleet_logins(gh: &Gh) -> Vec<String> {
+    let mergers = gh
+        .prs
+        .values()
+        .filter_map(|p| p["mergedBy"]["login"].as_str().map(str::to_string));
+    let creators = gh.statuses.values().filter_map(|s| qa_verdict_state(s)?.1);
+    mergers.chain(creators).collect()
+}
+
+/// When every GitHub identity the fleet names (`fleet`, plus the rows'
+/// own mergers and qa-verdict creators) is ONE account,
+/// `reviewer==merger` holds by construction on every row that has both
+/// — a property of the fleet's token, not of any merge. Those matches
+/// move from `flags` to `structural` and are summarized once. When the
+/// fleet shows more than one identity, a row whose status creator is
+/// its merger deviates and keeps its flag — however narrow the window.
+fn apply_structural(rows: &mut [Row], fleet: &[String]) -> Option<Structural> {
     let mut logins: Vec<&str> = rows
         .iter()
         .flat_map(|r| [r.merger.as_deref(), r.qa_verdict_creator.as_deref()])
         .flatten()
+        .chain(fleet.iter().map(String::as_str))
         .filter(|s| !s.is_empty())
         .collect();
     logins.sort_by_key(|s| s.to_ascii_lowercase());
@@ -1873,11 +1903,31 @@ fn approval_json(row: &Row) -> Value {
             "before_merge": row.merged_at.map(|m| r.at <= m),
         })),
         "other_heads": v.other_heads.iter().map(approval_rec_json).collect::<Vec<_>>(),
+        // No record is verified until CAD-280 (see APPROVAL_UNVERIFIED).
+        "verified": v.record.as_ref().map(|_| false),
+        "note": v.record.as_ref().map(|_| APPROVAL_UNVERIFIED),
     });
     if v.state.is_empty() {
         j["state"] = json!("unknown");
     }
     j
+}
+
+fn claimed_count(rows: &[Row]) -> usize {
+    rows.iter()
+        .filter(|r| r.approval.state == "operator-claimed")
+        .count()
+}
+
+/// The summary's approval clause: present whenever the run has a human
+/// row or a claimed approval, so the digest never reads a bound record
+/// as proof.
+fn approvals_clause(rows: &[Row]) -> String {
+    let claimed = claimed_count(rows);
+    if claimed == 0 && !rows.iter().any(|r| r.class.as_deref() == Some("human")) {
+        return String::new();
+    }
+    format!(", {claimed} approval(s) operator-claimed ({APPROVAL_UNVERIFIED})")
 }
 
 /// The text row's approval line — for human-class rows, and for any
@@ -1912,6 +1962,9 @@ fn approval_line(row: &Row) -> Option<String> {
     }
     if let Some(reason) = &v.reason {
         line.push_str(&format!(" — {reason}"));
+    }
+    if v.record.is_some() {
+        line.push_str(&format!(" · {APPROVAL_UNVERIFIED}"));
     }
     Some(line)
 }
@@ -2009,6 +2062,11 @@ fn print_json(
                 "flagged": flagged,
                 "flags": rows.iter().flat_map(|r| r.flags.clone()).collect::<Vec<_>>(),
                 "structural": structural,
+                "approvals": {
+                    "operator_claimed": claimed_count(rows),
+                    "verified": false,
+                    "note": APPROVAL_UNVERIFIED,
+                },
                 "by_class": by_class,
             },
         }))
@@ -2145,9 +2203,10 @@ fn render_text(
     }
     let _ = writeln!(
         out,
-        "summary: {} row(s), {} flagged{}{}",
+        "summary: {} row(s), {} flagged{}{}{}",
         rows.len(),
         flagged,
+        approvals_clause(rows),
         if flagged > 0 { " — " } else { "" },
         if flagged > 0 {
             rows.iter()
@@ -2442,7 +2501,7 @@ mod tests {
         for r in &mut rows {
             flag_row(r);
         }
-        let st = apply_structural(&mut rows).expect("one shared identity");
+        let st = apply_structural(&mut rows, &[]).expect("one shared identity");
         assert_eq!((st.identity.as_str(), st.rows), ("cc-syntax", 34));
         let flagged: Vec<(u64, Vec<String>)> = rows
             .iter()
@@ -2473,7 +2532,7 @@ mod tests {
         for r in &mut rows {
             flag_row(r);
         }
-        assert!(apply_structural(&mut rows).is_none());
+        assert!(apply_structural(&mut rows, &[]).is_none());
         assert!(rows[0].flags.is_empty(), "{:?}", rows[0].flags);
         assert_eq!(rows[1].flags, vec!["reviewer==merger".to_string()]);
         assert!(rows[1].structural.is_empty());
@@ -2485,10 +2544,40 @@ mod tests {
         for r in &mut rows {
             flag_row(r);
         }
-        assert_eq!(apply_structural(&mut rows).map(|s| s.rows), Some(1));
+        assert_eq!(apply_structural(&mut rows, &[]).map(|s| s.rows), Some(1));
         assert!(rows[0].flags.is_empty(), "{:?}", rows[0].flags);
         // #2 has no status at all — its real finding still flags.
         assert_eq!(rows[1].flags, vec!["no-passing-verdict".to_string()]);
+    }
+
+    #[test]
+    fn digest_decides_identity_over_the_fleet_not_the_window() {
+        // A narrow window (`--limit 1`) holds one self-merge; outside it
+        // the fleet shows a separate QA identity. The window alone looks
+        // like one shared account — the fleet says otherwise: flag.
+        let mut rows = vec![fleet_row(3, "ops-1", Some("ops-1"))];
+        flag_row(&mut rows[0]);
+        let gh = Gh {
+            prs: HashMap::from([
+                (1, json!({"mergedBy": {"login": "ops-1"}})),
+                (3, json!({"mergedBy": {"login": "ops-1"}})),
+            ]),
+            statuses: HashMap::from([(
+                "h1".to_string(),
+                json!({"statuses": [{"context": "qa-verdict", "state": "success",
+                                     "creator": {"login": "qa-bot"}}]}),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(fleet_logins(&gh).len(), 3);
+        assert!(apply_structural(&mut rows, &fleet_logins(&gh)).is_none());
+        assert_eq!(rows[0].flags, vec!["reviewer==merger".to_string()]);
+        // Without the outside identity it is structural, as before.
+        let mut rows = vec![fleet_row(3, "ops-1", Some("ops-1"))];
+        flag_row(&mut rows[0]);
+        let fleet = vec!["ops-1".to_string()];
+        assert_eq!(apply_structural(&mut rows, &fleet).map(|s| s.rows), Some(1));
+        assert!(rows[0].flags.is_empty());
     }
 
     const HEAD: &str = "7896dd2735035c0c67e246039cb495231702941c";
@@ -2544,10 +2633,15 @@ mod tests {
     fn approval_binds_exact_landed_head_in_force_at_merge() {
         // Approved before the merge for the exact landed head.
         let r = human(&ev(vec![rec("a", HEAD, MERGED - 60.0)], &[]), Some("x/y"));
-        assert_eq!(r.approval.state, "approved");
+        assert_eq!(r.approval.state, "operator-claimed");
         assert_eq!(r.approval.record.as_ref().unwrap().id, "a");
         assert!(r.flags.is_empty(), "{:?}", r.flags);
-        assert!(approval_line(&r).unwrap().contains("(before merge)"));
+        let line = approval_line(&r).unwrap();
+        assert!(line.contains("(before merge)"), "{line}");
+        assert!(line.contains("unverified until CAD-280"), "{line}");
+        let j = approval_json(&r);
+        assert_eq!(j["verified"], false, "{j}");
+        assert_eq!(j["note"], "unverified until CAD-280", "{j}");
 
         // Revoked AFTER the merge: it was in force when the merge ran.
         let e = ev(
@@ -2555,7 +2649,7 @@ mod tests {
             &[("a", revoke(MERGED + 60.0))],
         );
         let r = human(&e, None);
-        assert_eq!(r.approval.state, "approved");
+        assert_eq!(r.approval.state, "operator-claimed");
         assert!(r
             .approval
             .reason
@@ -2573,12 +2667,12 @@ mod tests {
         assert_eq!(r.approval.state, "revoked");
         assert_eq!(r.flags, vec!["approval-revoked".to_string()]);
 
-        // One revoked, another still in force: approved.
+        // One revoked, another still in force: operator-claimed.
         let e = ev(
             vec![rec("a", HEAD, MERGED - 60.0), rec("b", HEAD, MERGED - 10.0)],
             &[("a", revoke(MERGED - 30.0))],
         );
-        assert_eq!(human(&e, None).approval.state, "approved");
+        assert_eq!(human(&e, None).approval.state, "operator-claimed");
 
         // Only recorded after the merge: missing, the record shown.
         let r = human(&ev(vec![rec("a", HEAD, MERGED + 60.0)], &[]), None);
@@ -2608,7 +2702,7 @@ mod tests {
         let e = ev(vec![rec("a", HEAD, MERGED - 60.0)], &[]);
         assert_eq!(human(&e, Some("other/repo")).approval.state, "missing");
         // The fixture/no-slug path still binds on head + PR.
-        assert_eq!(human(&e, None).approval.state, "approved");
+        assert_eq!(human(&e, None).approval.state, "operator-claimed");
     }
 
     #[test]
@@ -2635,7 +2729,10 @@ mod tests {
         // Non-human classes never flag: not-required without a record,
         // the record shown when one binds; an unknown class is unknown.
         let e = ev(vec![rec("a", HEAD, MERGED - 60.0)], &[]);
-        for (class, want) in [(Some("auto"), "approved"), (None, "approved")] {
+        for (class, want) in [
+            (Some("auto"), "operator-claimed"),
+            (None, "operator-claimed"),
+        ] {
             let mut r = flagged_row();
             r.landed_head = Some(HEAD.into());
             r.merged_at = Some(MERGED);

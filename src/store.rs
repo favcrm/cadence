@@ -239,12 +239,21 @@ pub const APPROVAL_REVOKED_EVENT: &str = "approval_revoked";
 /// `repo`, as told by `source` (who approved and where — a claim the
 /// record carries, never authority by itself). The time is the event's.
 pub struct NewApproval<'a> {
-    pub id: &'a str,
+    /// `None` picks [`default_approval_id`], counting up past revoked
+    /// or different records so a fresh approval gets a fresh id.
+    pub id: Option<&'a str>,
     pub source: &'a str,
     pub action: &'a str,
     pub head_sha: &'a str,
     pub repo: &'a str,
     pub pr: u64,
+}
+
+/// `<action>-pr<N>-<head[..12]>` — the base id an approval records
+/// under when the operator names none. A fresh approval after a revoke
+/// becomes `<base>-2`, `<base>-3`, … (see `Store::record_approval`).
+pub fn default_approval_id(action: &str, pr: u64, head: &str) -> String {
+    format!("{action}-pr{pr}-{}", &head[..head.len().min(12)])
 }
 
 /// `owner/name` — the scope a merge approval is bound to.
@@ -1722,11 +1731,13 @@ impl Store {
     /// policy never consult it. `recorded_via` is the daemon's own
     /// statement of how the writer was authorized — never caller input.
     ///
-    /// `Ok(true)` for a new record, `Ok(false)` when the same id already
-    /// names identical evidence (a retry); the same id naming anything
-    /// else is refused.
-    pub fn record_approval(&self, a: &NewApproval, recorded_via: &str) -> Result<bool> {
-        identifier(a.id, "Approval id")?;
+    /// Answers `(new, id)`. An identical re-send of a live (unrevoked)
+    /// approval dedupes (`new == false`). Ids are never reused: an
+    /// explicit id that names different evidence, or that was revoked,
+    /// is refused; with no explicit id the default base counts up
+    /// (`<base>-2`, …) past revoked or different records, so
+    /// re-approving after a revoke records a fresh approval.
+    pub fn record_approval(&self, a: &NewApproval, recorded_via: &str) -> Result<(bool, String)> {
         approval_source(a.source)?;
         identifier(a.action, "Approval action")?;
         approval_head(a.head_sha)?;
@@ -1734,32 +1745,57 @@ impl Store {
         if a.pr == 0 {
             return Err(Error::rejected("Approval PR number must be positive"));
         }
-        let evidence = json!({
-            "approval_id": a.id,
-            "source": a.source,
-            "action": a.action,
-            "head_sha": a.head_sha,
-            "scope": {"repo": a.repo, "pr": a.pr},
-        });
+        let base = match a.id {
+            Some(id) => id.to_string(),
+            None => default_approval_id(a.action, a.pr, a.head_sha),
+        };
+        identifier(&base, "Approval id")?;
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        if let Some(old) = Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, a.id)? {
-            let same = ["approval_id", "source", "action", "head_sha", "scope"]
+        for n in 1..=1000u32 {
+            let id = if n == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{n}")
+            };
+            identifier(&id, "Approval id")?;
+            let evidence = json!({
+                "approval_id": id,
+                "source": a.source,
+                "action": a.action,
+                "head_sha": a.head_sha,
+                "scope": {"repo": a.repo, "pr": a.pr},
+            });
+            let Some(old) = Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, &id)? else {
+                let mut payload = evidence;
+                payload["recorded_via"] = json!(recorded_via);
+                Self::event(&tx, APPROVAL_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
+                tx.commit()?;
+                return Ok((true, id));
+            };
+            let same = ["source", "action", "head_sha", "scope"]
                 .iter()
                 .all(|k| old[k] == evidence[k]);
-            if same {
-                return Ok(false);
+            let revoked = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, &id)?.is_some();
+            match (a.id.is_some(), revoked, same) {
+                (_, false, true) => return Ok((false, id)),
+                (true, true, _) => {
+                    return Err(Error::rejected(format!(
+                        "Approval id '{id}' was revoked — an approval id is never \
+                         reused; pass a new --id, or omit --id for a fresh default id"
+                    )))
+                }
+                (true, false, false) => {
+                    return Err(Error::rejected(format!(
+                        "Approval id '{id}' already names different evidence"
+                    )))
+                }
+                (false, _, _) => continue,
             }
-            return Err(Error::rejected(format!(
-                "Approval id '{}' already names different evidence",
-                a.id
-            )));
         }
-        let mut payload = evidence;
-        payload["recorded_via"] = json!(recorded_via);
-        Self::event(&tx, APPROVAL_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
-        tx.commit()?;
-        Ok(true)
+        Err(Error::rejected(format!(
+            "Approval id '{base}': no free default id — pass --id"
+        )))
     }
 
     /// Persist an explicit operator revocation of approval `id`. It must
@@ -6109,7 +6145,7 @@ mod tests {
 
     fn approval<'a>(id: &'a str, source: &'a str, head: &'a str, pr: u64) -> NewApproval<'a> {
         NewApproval {
-            id,
+            id: Some(id),
             source,
             action: "merge",
             head_sha: head,
@@ -6145,14 +6181,18 @@ mod tests {
         reg(&s, "a1", &cwd);
         let via = "operator-connection";
         let op = "chris via chat";
-        assert!(s
-            .record_approval(&approval("ap-1", op, SHA40_A, 84), via)
-            .unwrap());
+        assert!(
+            s.record_approval(&approval("ap-1", op, SHA40_A, 84), via)
+                .unwrap()
+                .0
+        );
         // Identical retry dedupes; the same id naming another head,
         // source or PR is refused.
-        assert!(!s
-            .record_approval(&approval("ap-1", op, SHA40_A, 84), via)
-            .unwrap());
+        assert!(
+            !s.record_approval(&approval("ap-1", op, SHA40_A, 84), via)
+                .unwrap()
+                .0
+        );
         for conflicting in [
             approval("ap-1", op, SHA40_B, 84),
             approval("ap-1", "someone else", SHA40_A, 84),
@@ -6161,12 +6201,22 @@ mod tests {
             let err = s.record_approval(&conflicting, via).unwrap_err();
             assert!(err.to_string().contains("different evidence"), "{err}");
         }
-        assert!(s
-            .record_approval(&approval("ap-2", op, SHA40_B, 70), via)
-            .unwrap());
+        assert!(
+            s.record_approval(&approval("ap-2", op, SHA40_B, 70), via)
+                .unwrap()
+                .0
+        );
         assert!(s.revoke_approval("ap-1", op, "head changed", via).unwrap());
         assert!(!s.revoke_approval("ap-1", op, "head changed", via).unwrap());
         assert!(s.revoke_approval("ap-1", op, "other reason", via).is_err());
+        // A revoked id is never reused — not even for identical evidence.
+        let err = s
+            .record_approval(&approval("ap-1", op, SHA40_A, 84), via)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("was revoked") && err.to_string().contains("--id"),
+            "{err}"
+        );
         assert!(s.revoke_approval("missing", op, "no record", via).is_err());
         // `user`/`daemon` are delivery/stream identities, not operators;
         // abbreviated heads, bad scopes and bad ids are refused.
@@ -6214,6 +6264,45 @@ mod tests {
         // The stream name can never be an agent alias, so `agent rm`'s
         // per-alias event delete cannot reach it either.
         assert!(identifier(APPROVAL_STREAM, "alias").is_err());
+    }
+
+    /// CAD-217 review: re-approving after a revoke with the default id
+    /// records a FRESH approval (`<base>-2`), never a silent duplicate of
+    /// the revoked one; identical re-sends of the live one still dedupe.
+    #[test]
+    fn approval_default_id_counts_past_a_revoke() {
+        let (_dir, s) = store();
+        let via = "operator-connection";
+        let mut a = approval("unused", "op", SHA40_A, 84);
+        a.id = None;
+        let base = default_approval_id("merge", 84, SHA40_A);
+        assert_eq!(base, "merge-pr84-aaaaaaaaaaaa");
+        assert_eq!(s.record_approval(&a, via).unwrap(), (true, base.clone()));
+        assert_eq!(s.record_approval(&a, via).unwrap(), (false, base.clone()));
+        assert!(s.revoke_approval(&base, "op", "head moved", via).unwrap());
+        let fresh = format!("{base}-2");
+        assert_eq!(s.record_approval(&a, via).unwrap(), (true, fresh.clone()));
+        assert_eq!(s.record_approval(&a, via).unwrap(), (false, fresh.clone()));
+        // A different source for the same head takes the next free id
+        // instead of colliding with the default.
+        let mut b = approval("unused", "someone else", SHA40_A, 84);
+        b.id = None;
+        assert_eq!(
+            s.record_approval(&b, via).unwrap(),
+            (true, format!("{base}-3"))
+        );
+        assert_eq!(
+            approval_rows(&s),
+            vec![
+                (APPROVAL_RECORDED_EVENT.to_string(), base.clone()),
+                (APPROVAL_REVOKED_EVENT.to_string(), base),
+                (APPROVAL_RECORDED_EVENT.to_string(), fresh),
+                (
+                    APPROVAL_RECORDED_EVENT.to_string(),
+                    "merge-pr84-aaaaaaaaaaaa-3".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
