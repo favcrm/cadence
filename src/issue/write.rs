@@ -426,6 +426,199 @@ pub fn new_issue(
     Ok(json!({"id": id, "project": project.key, "path": dir, "committed": true}))
 }
 
+/// CAD-359 `plan propose` — the epic (the plan, `plan.state:
+/// proposed`) and one child per ticket in `backlog`, with acceptance,
+/// sizes, suggested agents (`owner`) and `blocked_by` links, all in ONE
+/// tracker commit. Ids are allocated under the lock; any structural
+/// refusal removes every folder this call created.
+pub fn create_plan(
+    pm: &Pm,
+    project_key: &str,
+    doc: &crate::issue::plan::PlanDoc,
+    actor: &str,
+) -> Result<Value> {
+    use crate::issue::plan::Dep;
+    let project = project::list(&pm.dir)?
+        .into_iter()
+        .find(|p| p.key == project_key)
+        .ok_or_else(|| {
+            Error::rejected(format!(
+                "Unknown project '{project_key}' — `cadence issue project ls` lists them"
+            ))
+        })?;
+    let proposer = actor_who(actor, None);
+    let _lock = pm.lock()?;
+    let root = pm.dir.join(&project.key);
+    let first = next_id(&root, &project.prefix)?;
+    let id_at = |n: u64| format!("{}-{}", project.prefix, first + n);
+    let epic = id_at(0);
+    let ids: Vec<String> = (0..=doc.tickets.len() as u64).map(id_at).collect();
+    let now = time::iso(time::now_epoch());
+
+    let mut epic_front = Front::new(&epic, &doc.title, &now);
+    epic_front.plan = Some(model::Plan {
+        state: "proposed".to_string(),
+        proposed_by: proposer.clone(),
+        proposed_at: now.clone(),
+        decided_by: None,
+        decided_at: None,
+        reason: None,
+    });
+    let mut epic_body = format!("{}\n\n## Goal\n\n{}\n", doc.title, doc.goal);
+    if !doc.non_goals.is_empty() {
+        epic_body.push_str("\n## Non-goals\n\n");
+        for g in &doc.non_goals {
+            epic_body.push_str(&format!("- {g}\n"));
+        }
+    }
+    if !doc.intro.is_empty() {
+        epic_body.push_str(&format!("\n## Plan\n\n{}\n", doc.intro));
+    }
+    let mut files: Vec<(PathBuf, Front, String)> = vec![(root.join(&epic), epic_front, epic_body)];
+    for (n, ticket) in doc.tickets.iter().enumerate() {
+        let id = &ids[n + 1];
+        let mut front = Front::new(id, &ticket.title, &now);
+        front.parent = Some(epic.clone());
+        front.size = ticket.size.clone();
+        front.owner = ticket.agent.clone();
+        front.blocked_by = ticket
+            .depends_on
+            .iter()
+            .map(|d| match d {
+                Dep::Ticket(k) => ids[k + 1].clone(),
+                Dep::Issue(i) => i.clone(),
+            })
+            .collect();
+        let mut body = format!("{}\n", ticket.title);
+        if !ticket.description.is_empty() {
+            body.push_str(&format!("\n{}\n", ticket.description));
+        }
+        let body = parse::replace_acceptance(&body, &ticket.acceptance)?;
+        files.push((root.join(id), front, body));
+    }
+    if let Some((dir, _, _)) = files.iter().find(|(dir, _, _)| dir.exists()) {
+        return Err(Error::rejected(format!(
+            "{} already exists — refusing to overwrite it",
+            dir.display()
+        )));
+    }
+    let created = || files.iter().map(|(dir, _, _)| dir);
+    let build = || -> Result<()> {
+        for (dir, front, body) in &files {
+            std::fs::create_dir_all(dir.join("comments"))?;
+            std::fs::create_dir_all(dir.join("artifacts"))?;
+            save_front(dir, front, body)?;
+        }
+        let issues = board::load_all(&pm.dir, None)?;
+        for id in &ids {
+            check_structure(&issues, id)?;
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        commit(
+            pm,
+            &format!(
+                "{epic}: plan proposed — {} ({} tickets)",
+                doc.title,
+                doc.tickets.len()
+            ),
+            &refs,
+            actor,
+        )
+    };
+    if let Err(e) = build() {
+        for dir in created() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        return Err(e);
+    }
+    Ok(json!({
+        "epic": epic,
+        "project": project.key,
+        "title": doc.title,
+        "state": "proposed",
+        "proposed_by": proposer,
+        "tickets": ids[1..],
+        "committed": true,
+    }))
+}
+
+/// CAD-360 `plan approve` / `plan reject` — record the operator's
+/// decision on a `proposed` plan (state, who, when, why) and, on
+/// approval, move its `backlog` tickets to `ready` — one commit. The
+/// caller has already proven operator authority (the daemon's
+/// connection-bound check); this only writes.
+pub fn decide_plan(
+    pm: &Pm,
+    epic: &str,
+    approve: bool,
+    by: &str,
+    reason: Option<&str>,
+) -> Result<Value> {
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+    if !approve && reason.is_none() {
+        return Err(Error::rejected("plan reject needs --reason"));
+    }
+    if let Some(reason) = reason {
+        crate::secret::guard(&format!("{epic}: plan reason"), reason)?;
+    }
+    let (project, dir) = issue_dir(pm, epic)?;
+    let _lock = pm.lock()?;
+    let (mut front, body) = load_front(&dir)?;
+    let Some(plan) = front.plan.as_mut() else {
+        return Err(Error::rejected(format!(
+            "{epic} is not a plan — `cadence plan show` needs a proposed plan"
+        )));
+    };
+    if plan.state != "proposed" {
+        return Err(Error::rejected(format!(
+            "plan {epic} is already {} — only a proposed plan is decided",
+            plan.state
+        )));
+    }
+    let state = if approve { "approved" } else { "rejected" };
+    plan.state = state.to_string();
+    plan.decided_by = Some(by.to_string());
+    plan.decided_at = Some(time::iso(time::now_epoch()));
+    plan.reason = reason.map(str::to_string);
+    let decided = plan.clone();
+    let mut ready = vec![];
+    let mut writes = vec![(dir.clone(), front.clone(), body)];
+    if approve {
+        for kid in board::load_all(&pm.dir, Some(&project.key))? {
+            if kid.front.parent.as_deref() == Some(epic) && kid.front.status == "backlog" {
+                let mut f = kid.front.clone();
+                f.status = "ready".to_string();
+                ready.push(f.id.clone());
+                writes.push((kid.dir.clone(), f, kid.body.clone()));
+            }
+        }
+    }
+    for (dir, front, body) in &writes {
+        save_front(dir, front, body)?;
+    }
+    let mut ids: Vec<&str> = vec![epic];
+    ids.extend(ready.iter().map(String::as_str));
+    let subject = if approve {
+        format!(
+            "{epic}: plan approved by {by} ({} tickets ready)",
+            ready.len()
+        )
+    } else {
+        format!("{epic}: plan rejected by {by}")
+    };
+    commit_who(pm, &subject, &ids, "", Some(by))?;
+    Ok(json!({
+        "epic": epic,
+        "project": project.key,
+        "state": state,
+        "decided_by": decided.decided_by,
+        "decided_at": decided.decided_at,
+        "reason": decided.reason,
+        "ready": ready,
+        "committed": true,
+    }))
+}
+
 /// Reject shapes lint would flag, at write time: self-links, missing
 /// targets, parent cycles and depth > 2, blocked_by cycles.
 pub(crate) fn check_structure(issues: &[board::Issue], id: &str) -> Result<()> {

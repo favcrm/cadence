@@ -1920,6 +1920,9 @@ impl Shared {
             "slot_runner" => self.rpc_slot_runner(params, peer_pid),
             "approval_record" => self.rpc_approval_record(params, peer_pid),
             "approval_revoke" => self.rpc_approval_revoke(params, peer_pid),
+            "plan_propose" => self.rpc_plan_propose(params, peer_pid),
+            "plan_approve" => self.rpc_plan_decide(params, peer_pid, true),
+            "plan_reject" => self.rpc_plan_decide(params, peer_pid, false),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -3000,6 +3003,94 @@ impl Shared {
             "reason": reason,
             "recorded_via": APPROVAL_RECORDED_VIA,
         }))
+    }
+
+    /// CAD-359 `plan_propose` — write a plan (epic + tickets, one
+    /// tracker commit) and emit `plan_proposed` on the daemon stream for
+    /// a UI's plan card. The proposer is the connection's: a pane or
+    /// managed endpoint's lane, else the proven operator; anything
+    /// unattributable is refused, as is an identity-shaped field.
+    fn rpc_plan_propose(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        for field in [
+            "by",
+            "actor",
+            "alias",
+            "lane",
+            "pane",
+            "pid",
+            "operator",
+            "proposed_by",
+        ] {
+            if params.get(field).is_some() {
+                return Err(Error::rejected(format!(
+                    "plan propose attribution is connection-bound; request field \
+                     '{field}' is not accepted"
+                )));
+            }
+        }
+        let actor = match self.slot_identity(peer_pid)? {
+            Some(who) => who.lane().to_string(),
+            None => match self.operator_evidence(peer_pid) {
+                Ok(()) => "operator".to_string(),
+                Err(why) => {
+                    return Err(Error::rejected(format!(
+                        "plan propose needs an attributable caller — a pane agent, an \
+                         enrolled managed endpoint or the proven operator: {why}"
+                    )))
+                }
+            },
+        };
+        let project = required_str(params, "project")?;
+        let text = required_str(params, "text")?;
+        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let allow = crate::secret::Allowlist::load(&self.state_dir)?;
+        let out = crate::issue::plan::propose(&pm, project, text, &allow, &actor)?;
+        let _ = self.store.event_public(
+            DAEMON_ALIAS,
+            "plan_proposed",
+            json!({
+                "epic": out["epic"],
+                "project": out["project"],
+                "title": out["title"],
+                "tickets": out["tickets"],
+                "ticket_count": out["tickets"].as_array().map_or(0, Vec::len),
+                "proposed_by": out["proposed_by"],
+            }),
+        );
+        self.wake();
+        Ok(out)
+    }
+
+    /// CAD-360 `plan_approve` / `plan_reject` — operator only, exactly
+    /// the connection-bound rule of the approval-evidence verbs
+    /// ([`Self::approval_operator`]): an agent caller is refused, and a
+    /// caller with no agent identity must be the proven operator
+    /// (CAD-276). The decision is a tracker commit; approval moves the
+    /// plan's backlog tickets to ready.
+    fn rpc_plan_decide(&self, params: &Value, peer_pid: u32, approve: bool) -> Result<Value> {
+        let verb = if approve {
+            "plan approve"
+        } else {
+            "plan reject"
+        };
+        self.approval_operator(verb, params, peer_pid)?;
+        let epic = required_str(params, "epic")?;
+        let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
+        let out = crate::issue::write::decide_plan(
+            &pm,
+            epic,
+            approve,
+            "operator",
+            optional_str(params, "reason"),
+        )?;
+        let kind = if approve {
+            "plan_approved"
+        } else {
+            "plan_rejected"
+        };
+        let _ = self.store.event_public(DAEMON_ALIAS, kind, out.clone());
+        self.wake();
+        Ok(out)
     }
 
     fn rpc_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -4453,6 +4544,21 @@ impl Shared {
             .map(|a| self.resolve_alias(a))
             .transpose()?;
         let by = optional_str(params, "by").unwrap_or("operator");
+        // CAD-360: a job bound to a ticket of an unapproved plan does not
+        // dispatch. Jobs with no issue, or an issue the tracker does not
+        // hold, pass exactly as before.
+        let task_id = required_str(params, "task")?;
+        if let Some(issue) = self
+            .store
+            .task(task_id)
+            .and_then(|t| self.store.job(&t.job_id))
+            .ok()
+            .and_then(|j| j.issue_id)
+        {
+            if let Ok(pm_dir) = self.pm_dir() {
+                crate::issue::plan::gate_id(&pm_dir, &issue)?;
+            }
+        }
         let (task, message, duplicate, behind_dead) = self.store.dispatch_task(
             required_str(params, "task")?,
             to.as_deref(),

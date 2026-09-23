@@ -768,6 +768,10 @@ pub fn detail_json(pm_dir: &Path, view: &View, views_by_id: &HashMap<String, &Vi
         "reports": crate::issue::task_report::list(&view.issue.dir, &f.id),
         "notes_chain": chain,
         "acceptance": acceptance,
+        "size": f.size,
+        // CAD-359/360: plan state, tickets and weighted progress — null
+        // unless this issue is a plan epic.
+        "plan": crate::issue::plan::plan_json(view, views_by_id),
         "history": history,
         "activity": activity,
         "commits": commits,

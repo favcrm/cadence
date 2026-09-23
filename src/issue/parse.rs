@@ -120,7 +120,7 @@ fn line_ranges(text: &str) -> Vec<LineRange> {
 
 /// Return the heading level and title for a Markdown ATX heading.
 /// Closing `#` characters are ignored, matching normal Markdown syntax.
-fn heading(line: &str) -> Option<(usize, &str)> {
+pub(crate) fn heading(line: &str) -> Option<(usize, &str)> {
     let line = markdown_line(line)?;
     let level = line.bytes().take_while(|b| *b == b'#').count();
     if level == 0 {
@@ -181,6 +181,32 @@ fn is_closing_fence(line: &str, marker: u8, count: usize) -> bool {
         && line
             .get(marker_count..)
             .is_some_and(|trailing| trailing.chars().all(char::is_whitespace))
+}
+
+/// Tracks fenced code blocks line by line, so Markdown readers outside
+/// this module (plan files, CAD-359) skip headings and checkboxes inside
+/// a fence exactly as the acceptance reader does.
+#[derive(Default)]
+pub(crate) struct Fences(Option<(u8, usize)>);
+
+impl Fences {
+    /// True when `line` (without its line ending) is a fence marker or
+    /// sits inside a fenced block — i.e. it is not Markdown syntax.
+    pub(crate) fn is_code(&mut self, line: &str) -> bool {
+        if let Some((marker, count)) = fence(line) {
+            match self.0 {
+                Some((open_marker, open_count))
+                    if open_marker == marker && is_closing_fence(line, marker, open_count) =>
+                {
+                    self.0 = None;
+                }
+                None => self.0 = Some((marker, count)),
+                _ => {}
+            }
+            return true;
+        }
+        self.0.is_some()
+    }
 }
 
 /// Locate level-two `Acceptance` sections outside fenced code blocks.
