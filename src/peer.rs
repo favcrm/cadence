@@ -23,6 +23,11 @@
 //!   ([`PeerTies::attributed_agents`]): an env alias alone attributes
 //!   nothing, so `CADENCE_ALIAS=B curl …` from a pane-less process
 //!   writes as `operator (ui)`, not as agent B.
+//! - A board write is also attributed to a MANAGED endpoint (a claude or
+//!   codex provider the daemon launched, no pane — CAD-335) when the
+//!   provider's recorded pid is on the peer's ancestry
+//!   ([`AgentRoots::managed`]). Ancestry is the only managed signal:
+//!   the provider's stdio is pipes and log files, so there is no pty.
 //!
 //! Accepted residual (CAD-276): the pty tie is kept because it is what
 //! attributes a `setsid` child of a pane to its agent instead of to
@@ -32,8 +37,8 @@
 //! attributed as that pane's agent. It gains no privilege over what it
 //! already had as `operator (ui)`; it only chooses whose name a write
 //! carries. The root weakness — an unattributable local caller defaults
-//! to `operator` — is tracked as a design note on CAD-276
-//! (operator-by-positive-proof); `slot_reconcile` already requires
+//! to `operator` — is CAD-335 phase 2 (operator-by-positive-proof, with
+//! ADR 0004's operator session); `slot_reconcile` already requires
 //! positive proof ([`operator_proof`]).
 //!
 //! The daemon names its Unix peer through `SO_PEERCRED`; a TCP
@@ -78,13 +83,19 @@ impl PeerTies {
         self.chain.is_some()
     }
 
+    /// `pid` is the peer itself or on its `/proc` ancestry — the one
+    /// unforgeable signal: a process can leave an ancestry but never
+    /// join another's.
+    fn descends_from(&self, pid: u32) -> bool {
+        self.chain.as_deref().is_some_and(|c| c.contains(&pid))
+    }
+
     /// The process signals: the pane pid is on the peer's ancestry
     /// (unforgeable), or the peer holds the pane's pty on its stdio
     /// (choosable by any same-uid process — the accepted lateral
     /// residual in the module doc).
     fn process_tied(&self, pane_pid: u32) -> bool {
-        self.chain.as_deref().is_some_and(|c| c.contains(&pane_pid))
-            || holds_pane_tty(self.pid, pane_pid)
+        self.descends_from(pane_pid) || holds_pane_tty(self.pid, pane_pid)
     }
 
     /// The widest tie — a process signal OR the pane's `CADENCE_ALIAS`
@@ -341,18 +352,42 @@ fn proc_session(pid: u32) -> Result<u32, String> {
         .ok_or_else(|| format!("/proc/{pid}/stat: malformed"))
 }
 
-/// Which registered agent the TCP peer `peer` of a connection to our
-/// `server_port` is attributed as — [`PeerTies::attributed_agents`]:
-/// the pane on its ancestry or whose pty it holds; `panes` maps pane
-/// pid to alias. `Ok(None)` — the peer is a local process tied to no pane,
-/// or (non-loopback address, no local socket holds the connection's
-/// other end) a different host, which no pane here can be. `Err` — the
-/// peer could not be attributed at all (unreadable ancestry, several
-/// agents): callers must fail closed, never read it as "no pane".
-pub(crate) fn tcp_peer_pane(
+/// The live agents a board write can be attributed to, each by the
+/// process the daemon recorded for it.
+#[derive(Default)]
+pub(crate) struct AgentRoots {
+    /// Registered pty panes, pane pid → alias. A peer is tied by
+    /// ancestry or by the pane's pty on its stdio
+    /// ([`PeerTies::attributed_agents`]).
+    pub(crate) panes: HashMap<u32, String>,
+    /// Live managed endpoints (CAD-335), provider pid → alias: the
+    /// claude/codex process the daemon launched with no pane, whose
+    /// tool shells descend from it. A peer is tied by ancestry only —
+    /// the provider's stdio is pipes and log files, never a pty.
+    pub(crate) managed: HashMap<u32, String>,
+}
+
+impl AgentRoots {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.panes.is_empty() && self.managed.is_empty()
+    }
+}
+
+/// Which live agent the TCP peer `peer` of a connection to our
+/// `server_port` is attributed as: the registered pane on its ancestry
+/// or whose pty it holds ([`PeerTies::attributed_agents`]), or the
+/// managed endpoint whose provider is on its ancestry
+/// ([`AgentRoots::managed`]). `Ok(None)` — the peer is a local process
+/// tied to no agent, or (non-loopback address, no local socket holds
+/// the connection's other end) a different host, which no agent here
+/// can be. `Ok(None)` is NOT proof of the operator: a process that left
+/// every agent's ancestry lands there too. `Err` — the peer could not
+/// be attributed at all (unreadable ancestry, several agents): callers
+/// must fail closed, never read it as "no agent".
+pub(crate) fn tcp_peer_agent(
     server_port: u16,
     peer: SocketAddr,
-    panes: &HashMap<u32, String>,
+    roots: &AgentRoots,
 ) -> Result<Option<String>, String> {
     let peer = canonical(peer);
     let Some(inode) = client_socket_inode(server_port, peer)? else {
@@ -377,12 +412,24 @@ pub(crate) fn tcp_peer_pane(
             return Err(format!("peer pid {pid}: /proc ancestry unreadable"));
         }
         agents.extend(
-            ties.attributed_agents(panes.iter().map(|(pid, alias)| (alias.as_str(), *pid))),
+            ties.attributed_agents(
+                roots
+                    .panes
+                    .iter()
+                    .map(|(pid, alias)| (alias.as_str(), *pid)),
+            ),
+        );
+        agents.extend(
+            roots
+                .managed
+                .iter()
+                .filter(|(provider, _)| ties.descends_from(**provider))
+                .map(|(_, alias)| alias.clone()),
         );
     }
     if agents.len() > 1 {
         return Err(format!(
-            "peer {peer} is tied to several panes ({})",
+            "peer {peer} is tied to several agents ({})",
             agents.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
@@ -525,18 +572,61 @@ mod tests {
         let (_accepted, peer) = listener.accept().unwrap();
         assert_eq!(peer, client.local_addr().unwrap());
 
-        let none = HashMap::new();
-        assert_eq!(tcp_peer_pane(port, peer, &none), Ok(None));
-        let panes = HashMap::from([(std::process::id(), "w1".to_string())]);
-        assert_eq!(tcp_peer_pane(port, peer, &panes), Ok(Some("w1".into())));
+        let none = AgentRoots::default();
+        assert_eq!(tcp_peer_agent(port, peer, &none), Ok(None));
+        let panes = AgentRoots {
+            panes: HashMap::from([(std::process::id(), "w1".to_string())]),
+            ..Default::default()
+        };
+        assert_eq!(tcp_peer_agent(port, peer, &panes), Ok(Some("w1".into())));
 
         // A loopback address no local socket holds is not "no pane" —
         // it is unattributable, and the caller must refuse.
         let ghost: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        assert!(tcp_peer_pane(port, ghost, &panes).is_err());
+        assert!(tcp_peer_agent(port, ghost, &panes).is_err());
         // A non-loopback address with no local client end is a
         // different host: no pane here can be it.
         let remote: SocketAddr = "192.0.2.7:40000".parse().unwrap();
-        assert_eq!(tcp_peer_pane(port, remote, &panes), Ok(None));
+        assert_eq!(tcp_peer_agent(port, remote, &panes), Ok(None));
+    }
+
+    /// CAD-335: a managed endpoint's provider on the peer's ancestry
+    /// attributes the peer to that agent; one that is not on it (an
+    /// unrelated live process) attributes nothing; a peer tied to a
+    /// pane AND a managed provider is ambiguous and refused.
+    #[test]
+    fn a_loopback_peer_under_a_managed_provider_is_that_agent() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_accepted, peer) = listener.accept().unwrap();
+        let me = std::process::id();
+        let parent = std::os::unix::process::parent_id();
+
+        // Our parent stands in for the provider that launched us.
+        let managed = AgentRoots {
+            managed: HashMap::from([(parent, "wk".to_string())]),
+            ..Default::default()
+        };
+        assert_eq!(tcp_peer_agent(port, peer, &managed), Ok(Some("wk".into())));
+
+        // A provider that is not on our ancestry: a child we spawned.
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let unrelated = AgentRoots {
+            managed: HashMap::from([(other.id(), "wk".to_string())]),
+            ..Default::default()
+        };
+        assert_eq!(tcp_peer_agent(port, peer, &unrelated), Ok(None));
+        let _ = other.kill();
+        let _ = other.wait();
+
+        let both = AgentRoots {
+            panes: HashMap::from([(me, "w1".to_string())]),
+            managed: HashMap::from([(parent, "wk".to_string())]),
+        };
+        assert!(tcp_peer_agent(port, peer, &both).is_err());
     }
 }
