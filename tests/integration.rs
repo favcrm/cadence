@@ -33774,10 +33774,11 @@ fn forged(params: &Value, field: &str, value: &str) -> Value {
     p
 }
 
-/// CAD-373 / CAD-374: `job task reopen`, `monitor stop`, `monitor
-/// dispatch`, `message reconcile` and `agent unfence` are operator
-/// actions decided by the CONNECTION (`operator_connection`), never by
-/// a `pane`/`by` field the caller controls. A pane agent speaking the
+/// CAD-373 / CAD-374: `monitor stop`, `monitor dispatch`, `message
+/// reconcile` and `agent unfence` are operator actions decided by the
+/// CONNECTION (`operator_connection`), never by a `pane`/`by` field the
+/// caller controls; `job task reopen` refuses every agent that is not
+/// the job's PM (its own test below). A pane agent speaking the
 /// socket directly — even the fenced worker's own PM, even forging
 /// `by:"operator"` or an empty `pane` — and a managed endpoint are
 /// refused naming the verb and the rule; nothing lands. The proven
@@ -33823,8 +33824,11 @@ fn operator_verbs_refuse_agents_whatever_they_claim() {
     )
     .unwrap();
 
+    let r = lead.rpc(&d.state, "task_reopen", json!({"task": "j1-t"}));
+    assert_refused(&r, "job task reopen", "not job 'j1''s PM", "pane reopen");
+    let r = wk.rpc("self", "task_reopen", json!({"task": "j1-t"}));
+    assert_refused(&r, "job task reopen", "not job 'j1''s PM", "managed reopen");
     let calls = [
-        ("task_reopen", "job task reopen", json!({"task": "j1-t"})),
         ("monitor_stop", "monitor stop", json!({"monitor": "m1"})),
         (
             "monitor_dispatch",
@@ -33893,6 +33897,90 @@ fn operator_verbs_refuse_agents_whatever_they_claim() {
         .find(|e| e["kind"] == "reconciled")
         .expect("reconciled event");
     assert_eq!(rec["payload"]["by"], "operator", "{rec}");
+}
+
+/// CAD-373: `job task reopen` is the proven operator's or the job's own
+/// PM's (the cadence skill tells PMs to run it) — decided by the
+/// connection. The task's assignee, a peer worker and another group's
+/// PM are refused, forged identity fields or not; the job's PM pane
+/// reopens it and is who the record names.
+#[test]
+fn task_reopen_is_the_operator_or_the_jobs_pm() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut pm = LaneShell::spawn(home.path());
+    plant_pane(&d, "pm", pm.pid());
+    d.register_member("w1", "pm");
+    d.wait_agent("w1", "idle", 10);
+    let (spec, sha) = d.spec_file("spec.md", "reopen rule");
+    d.job_new("pm", "j1", &spec, &sha);
+    for task in ["j1-a", "j1-b"] {
+        d.rpc(
+            "task_new",
+            json!({"job": "j1", "task": task, "assignee": "w1",
+                   "acceptance": format!("ok REPORT_SHA:{SHA_A}")}),
+        )
+        .unwrap();
+        d.job_dispatch(task, json!({})).unwrap();
+        d.wait_task(task, "review", 15);
+        d.job_verdict(task, SHA_A, "blocked").unwrap();
+    }
+    d.rpc("agent_stop", json!({"alias": "w1"})).unwrap();
+    d.wait_agent("w1", "stopped", 15);
+    let mut worker = LaneShell::spawn(home.path());
+    plant_pane(&d, "w1", worker.pid());
+    let mut peer = LaneShell::spawn(home.path());
+    plant_pane(&d, "w9", peer.pid());
+    let mut other_pm = LaneShell::spawn(home.path());
+    plant_pane(&d, "pm2", other_pm.pid());
+
+    let reopen = json!({"task": "j1-a"});
+    for (shell, who, rule) in [
+        (&mut worker, "assignee", "is the task's assignee"),
+        (&mut peer, "peer", "is not job 'j1''s PM"),
+        (&mut other_pm, "other PM", "is not job 'j1''s PM"),
+    ] {
+        let r = shell.rpc(&d.state, "task_reopen", reopen.clone());
+        assert_refused(&r, "job task reopen", rule, who);
+        for (field, value) in FORGED_IDENTITY
+            .iter()
+            .chain(&[("by", "pm"), ("pane", "pm")])
+        {
+            let r = shell.rpc(&d.state, "task_reopen", forged(&reopen, field, value));
+            // Refused either for the field itself or, for a field the
+            // gate does not list (`owner`), by the caller rule.
+            assert_refused(
+                &r,
+                "job task reopen",
+                "",
+                &format!("{who} forging {field}={value}"),
+            );
+        }
+    }
+    // The PM itself cannot name someone else either.
+    let r = pm.rpc(&d.state, "task_reopen", forged(&reopen, "by", "operator"));
+    assert_refused(
+        &r,
+        "job task reopen",
+        "'by' is not accepted",
+        "pm forging by",
+    );
+    assert_eq!(d.task_state("j1-a"), "blocked");
+
+    // The job's PM pane reopens, recorded as itself; so does the operator.
+    let r = pm.rpc(&d.state, "task_reopen", reopen);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(d.task_state("j1-a"), "draft");
+    d.operator_rpc("task_reopen", json!({"task": "j1-b"}))
+        .unwrap();
+    assert_eq!(d.task_state("j1-b"), "draft");
+    let by: Vec<Value> = d
+        .events("pm")
+        .into_iter()
+        .filter(|e| e["kind"] == "task_reopened")
+        .map(|e| e["payload"]["by"].clone())
+        .collect();
+    assert_eq!(by, vec![json!("pm"), json!("operator")], "{by:?}");
 }
 
 /// CAD-372: the verdict's reviewer is the verified connection. The

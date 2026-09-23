@@ -1457,7 +1457,8 @@ enum TaskAction {
         #[arg(long)]
         reason: String,
     },
-    /// Reopen a blocked/verified/failed task to draft — operator only.
+    /// Reopen a blocked/verified/failed task to draft — the operator or
+    /// the job's own PM, derived from the calling process (CAD-373).
     Reopen { task: String },
     /// Cancel a task; a still-queued kickoff is cancelled with it.
     Cancel { task: String },

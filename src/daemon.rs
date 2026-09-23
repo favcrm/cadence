@@ -5386,17 +5386,38 @@ impl Shared {
         Ok(json!({"task": task.to_json()}))
     }
 
-    /// `job task reopen` — operator only (docs/JOBS.md transition
-    /// table): re-scoping blocked work is the human's call. Authority
-    /// is the connection's (CAD-373, [`Self::operator_connection`]): an
-    /// agent's pane or managed endpoint — its PM's included — and any
-    /// caller not provably the operator are refused; no request field
-    /// (`pane`, `by`, …) decides who is asking.
+    /// `job task reopen` — the proven operator or the job's own PM
+    /// (skill/cadence/SKILL.md "Job work": PMs run it). Authority is the
+    /// connection's (CAD-373, [`Self::agent_caller`]): an agent may
+    /// reopen only a task of a job whose recorded `pm` is that agent,
+    /// and never one assigned to itself — the assignee, a peer and
+    /// another group's PM are refused. No request field (`pane`, `by`,
+    /// …) decides who is asking; the record names the verified caller.
     fn rpc_task_reopen(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
-        self.operator_connection("job task reopen", params, peer_pid)?;
-        let task = self
-            .store
-            .reopen_task(required_str(params, "task")?, "operator")?;
+        reject_identity_fields(params, "job task reopen")?;
+        let task_id = required_str(params, "task")?;
+        let caller = self.agent_caller(peer_pid, "job task reopen")?;
+        if let AgentCaller::Agent(alias) = &caller {
+            let task = self.store.task(task_id)?;
+            let job = self.store.job(&task.job_id)?;
+            let why = if task.assignee.as_deref() == Some(alias.as_str()) {
+                Some(format!("agent '{alias}' is the task's assignee"))
+            } else if job.pm_alias != *alias {
+                Some(format!(
+                    "agent '{alias}' is not job '{}''s PM ('{}')",
+                    job.id, job.pm_alias
+                ))
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                return Err(Error::rejected(format!(
+                    "job task reopen refused: {why} — a task is reopened only by \
+                     the operator or its job's own PM (caller rule, CAD-373)"
+                )));
+            }
+        }
+        let task = self.store.reopen_task(task_id, caller.audit().0)?;
         self.wake();
         Ok(json!({"task": task.to_json()}))
     }

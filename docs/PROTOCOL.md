@@ -75,7 +75,7 @@ Error kinds:
 | `task_accept` | `task, merged_sha?, by?` | `{task}` — `verified → done` |
 | `task_sha` | `task, sha, by?` | `{task}` — repairs a NULL `head_sha` on a `review` task |
 | `task_fail` | `task, reason, by?` | `{task}` — mark unrecoverable |
-| `task_reopen` | `task` | `{task}` — `blocked|verified|failed → draft`, `revision` resets. Operator only, by the connection (CAD-373) |
+| `task_reopen` | `task` | `{task}` — `blocked|verified|failed → draft`, `revision` resets. The proven operator or the job's own PM, by the connection (CAD-373); the assignee and other agents are refused |
 | `task_cancel` | `task, by?` | `{task}` — cancels the task; a `queued`/`submitting` kickoff cancels in the same tx, a `running` one completes on its own |
 | `memory_propose` | `project, kind, scope?, source?, confidence?, text? or from?, id?` | `{project,slug,status:"proposed",digest,quorum}` — proposer identity is derived from the Unix peer's one live agent endpoint (owned pty pane or enrolled managed endpoint, CAD-381); request aliases and operator fallbacks are refused |
 | `memory_review` | `project?, slug, operation: accept|verify, verdict: pass|revise, evidence, digest` | `{project,slug,operation,cycle,digest,quorum}` — only a distinct non-author native PM or worker endpoint may submit one receipt for the exact digest; the operation/cycle and registration incarnation are durable |
@@ -90,7 +90,7 @@ Error kinds:
 | `monitor_dispatch` | `monitor, task` | `{monitor, task, message, duplicate, queued_behind_dead}` — explicit operator handoff (by the connection, CAD-373) through the existing guarded job-dispatch transaction; automatic reconciliation calls the same internal guard only for a registration with `auto_dispatch_enabled` |
 | `job_cancel` | `job, by?` | `{job}` — cancels the job + every non-terminal task |
 | `job_close` | `job, by?` | `{job}` — legal only when every task is `done` |
-| `agent_unfence` | `alias, status?, note?, resume?` | operator only, by the connection (CAD-374); reconciles every `unknown` on the agent (default `interrupted`); `{alias, reconciled:[id], resumed, pane?, state, error?}` — `resume:true` also starts the actor and waits (bounded ~30s) for its open; `pane` is pty-only: `adopted`/`respawned`/`none` |
+| `agent_unfence` | `alias, status?, note?, resume?` | operator only, by the connection (CAD-374) — a PM cannot unfence its worker and escalates to the operator; reconciles every `unknown` on the agent (default `interrupted`); `{alias, reconciled:[id], resumed, pane?, state, error?}` — `resume:true` also starts the actor and waits (bounded ~30s) for its open; `pane` is pty-only: `adopted`/`respawned`/`none` |
 | `agent_stop` | `alias` | `{alias,state:"stopped"|"attention"}` |
 | `agent_resume` | `alias` | `{alias,state:"starting"|"attention"}` |
 | `agent_remove` | `alias, force?` | deletes the agent + the history no job references; refuses live endpoints and open work unless `force` (queued/submitting cancelled, running finished `interrupted`, each through the normal finish path so `reply_to` is notified; `agent_remove_forced` names them and who was `notified` — only recipients a notice actually reached); non-terminal tasks assigned to the alias are unassigned in the same transaction (state, revision and history kept; `task_unassigned` job event and a `job_event` to the job's PM naming `job dispatch <task> --to <worker>`; listed as `unassigned`), so a later agent under the alias inherits no task; an `unknown` message refuses even `force`. Only the operator or the agent's own PM (the `agent_set` caller rule, CAD-304); records `agent_removed` with `by`/`by_kind` on the `daemon` stream |
@@ -146,15 +146,16 @@ below they are refused, naming the field, and nothing is written.
 | Verb | Who may call | Refused |
 |---|---|---|
 | `task_verdict` | any verified agent except the task's assignee and the agent whose kickoff reported the judged revision; or the proven operator. The reviewer recorded is the caller's alias, or `operator` | the assignee/author (`… the task's assignee …`); an unprovable caller; `reviewer`/`pane`/`by`/… in the request |
-| `task_reopen` | the proven operator (`operator_connection`, docs/JOBS.md transition table) | every agent, the job's PM included |
+| `task_reopen` | the proven operator, or the job's own PM (the caller's derived alias equals the job's `pm`; skill/cadence/SKILL.md "Job work"). The record names the caller | the task's assignee, a peer, another group's PM |
 | `monitor_stop`, `monitor_dispatch` | the proven operator | every agent |
-| `message_reconcile`, `agent_unfence` | the proven operator; the record says `by:"operator"` | every agent: the fenced one, a peer and its own PM ("reconciliation is an explicit operator decision") |
+| `message_reconcile`, `agent_unfence` | the proven operator; the record says `by:"operator"` | every agent: the fenced one, a peer and its own PM ("reconciliation is an explicit operator decision"). A PM cannot unfence or reconcile its worker; it escalates to the operator |
 | `agent_respond` | the proven operator, or the requester's own PM (`params.upstream`, bound to the PM's registration as in `agent_set`) | the requesting agent itself, a peer, another group's PM |
 | `plan_approve`, `plan_reject`, `approval_record`, `approval_revoke`, `model_defaults_set`, `slot_reconcile` | the proven operator (`operator_connection`) | every agent |
 | running turn tokens (any answer) | only the connection that derives the agent owning the turn | everyone else, the operator and the board included, reads `null` for that `turn_id` (and `[turn token withheld]` where prose quotes it) |
 
-Refusals name the verb and the rule, e.g. `job task reopen is an
-operator action — this connection is agent 'lead'`, `agent respond
+Refusals name the verb and the rule, e.g. `monitor stop is an
+operator action — this connection is agent 'lead'`, `job task reopen
+refused: agent 'w9' is not job 'j1''s PM ('pm')`, `agent respond
 refused: agent 'wr' cannot answer its own request … (caller rule,
 CAD-370)`, `job verdict: caller identity is connection-bound; request
 field 'reviewer' is not accepted`. Turn tokens are withheld on every

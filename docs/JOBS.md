@@ -176,7 +176,7 @@ work axis (tasks):
 | dispatched → running | **daemon** | kickoff message observed `running` |
 | running → review | **daemon** | kickoff `completed`; `head_sha` = `result.sha` else last `SHA:` line else NULL |
 | review → verified/revising/blocked | reviewer or operator | `job verdict --sha` — one tx |
-| blocked/verified/failed → draft | operator (proven by the connection, CAD-373) | `job task reopen` — re-scope, `revision` resets to 0 |
+| blocked/verified/failed → draft | the job's PM or operator (by the connection, CAD-373) | `job task reopen` — re-scope, `revision` resets to 0. The caller's derived alias must be the job's `pm` and not the assignee; peers and other PMs are refused |
 | → failed | PM/operator | `job task fail --reason` |
 | → cancelled | PM/operator | `job task cancel` / `job cancel` |
 
@@ -214,7 +214,7 @@ task state.
 Max-revision enforcement: `revise` while `revision >=
 jobs.max_revisions` records the verdict but transitions to `blocked` —
 the PM is notified once per verdict, and the loop cannot continue
-without an operator `reopen`.
+without a `reopen` by the job's PM or the operator.
 
 4. **Worktree verification (CAD-51).** When the task carries
    `worktree` + `branch` (every task `cadence issue start --job`
