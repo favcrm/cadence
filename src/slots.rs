@@ -1780,13 +1780,17 @@ impl Slots {
         )
     }
 
-    /// Owners with an active enrollment — whose rows the daemon must
-    /// read for [`Self::revalidate_owners`].
+    /// Owners with a live (active or expired, never revoked) endpoint
+    /// enrollment — whose rows the daemon must read for
+    /// [`Self::revalidate_owners`]. An expired enrollment still vouches
+    /// for identity (CAD-381), so it is revalidated too: omitting it
+    /// would read as "owner gone" and revoke it whenever any other
+    /// owner is active.
     pub fn enrolled_owners(&self) -> Vec<String> {
         let mut owners: Vec<String> = self
             .enrollments
             .iter()
-            .filter(|e| e.auth == AuthState::Active && e.runner.is_none())
+            .filter(|e| !matches!(e.auth, AuthState::Revoked(_)) && e.runner.is_none())
             .map(|e| e.owner_actor.clone())
             .collect();
         owners.sort();
@@ -1794,7 +1798,7 @@ impl Slots {
         owners
     }
 
-    /// Revalidate each active enrollment against its owner row as the
+    /// Revalidate each unrevoked enrollment against its owner row as the
     /// daemon reads it now (`current`: owner → its generation, `None`
     /// when the row is gone or has no live endpoint). A missing or
     /// changed generation revokes — fail closed.
@@ -1849,11 +1853,37 @@ impl Slots {
     /// pane for as long as that exact root lives. A pid only matches a root that is still the same process
     /// (an unreadable one matches, so the strict verifier refuses it).
     pub fn nearest_enrolled_root(&self, chain: &[u32]) -> Option<usize> {
-        chain.iter().position(|pid| {
-            self.enrollments
-                .iter()
-                .any(|e| e.root.pid == *pid && self.proc.same_start(*pid, e.root.starttime))
-        })
+        chain.iter().position(|pid| self.is_enrolled_root(*pid))
+    }
+
+    /// Every chain index holding an enrolled root, nearest first — the
+    /// same match as [`Self::nearest_enrolled_root`]. The caller
+    /// identity verifier (CAD-381) counts them all: two agent
+    /// endpoints on one ancestry is an ambiguous caller, refused.
+    pub fn enrolled_roots_on(&self, chain: &[u32]) -> Vec<usize> {
+        (0..chain.len())
+            .filter(|&i| self.is_enrolled_root(chain[i]))
+            .collect()
+    }
+
+    fn is_enrolled_root(&self, pid: u32) -> bool {
+        self.enrollments
+            .iter()
+            .any(|e| e.root.pid == pid && self.proc.same_start(pid, e.root.starttime))
+    }
+
+    /// The enrollment `id` while it still vouches for a live agent
+    /// endpoint: never revoked, and owned by an agent row — a build
+    /// runner's enrollment (CAD-230b) is the daemon's own command,
+    /// never an agent identity. `expired` still vouches: the TTL caps
+    /// build-slot admission, not who the endpoint is, and a long-lived
+    /// endpoint renews only at its next open. Identity rests on the
+    /// per-call checks — owner-row revalidation (revocation), verified
+    /// descent to the exact root (pid + starttime + uid).
+    pub fn endpoint_enrollment(&self, id: &str) -> Option<&Enrollment> {
+        self.enrollments
+            .iter()
+            .find(|e| e.id == id && !matches!(e.auth, AuthState::Revoked(_)) && e.runner.is_none())
     }
 
     /// Every enrollment rooted at `root_pid`, in the one order a caller
