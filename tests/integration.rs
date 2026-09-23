@@ -37092,6 +37092,72 @@ fn cad319_thread_redacts_secrets_in_claude_tool_input() {
     );
 }
 
+/// CAD-410: a tool use whose input quotes a private key cut before its
+/// END marker (a head-limited read) keeps none of the key body in the
+/// lifecycle event or the thread.
+#[test]
+fn cad410_thread_redacts_a_truncated_private_key_in_claude_tool_input() {
+    let d = TestDaemon::start();
+    let body: Vec<String> = (0..4)
+        .map(|i| cad109_token("", &format!("cad410-pem:{i}"), 64))
+        .collect();
+    let key = format!(
+        "{}\n{}",
+        ["-----BEGIN RSA ", "PRIVATE", " KEY-----"].concat(),
+        body.join("\n")
+    );
+    let fixture = d.dir.path().join("tool-pem.jsonl");
+    let lines = [
+        json!({"type": "system", "subtype": "init", "session_id": "", "model": "mock-claude", "tools": []}),
+        json!({"type": "assistant", "session_id": "",
+               "message": {"role": "assistant", "content": [
+                   {"type": "tool_use", "id": "tu_1", "name": "Bash",
+                    "input": {"command": format!("printf '%s' '{key}' > /tmp/k")}}]}}),
+        json!({"type": "result", "subtype": "success", "is_error": false, "session_id": "",
+               "result": "done", "stop_reason": "end_turn", "num_turns": 1}),
+    ];
+    std::fs::write(
+        &fixture,
+        lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let _mock = d.mock_claude("replay", Some(&fixture));
+    d.register_claude("master", Value::Null);
+    d.wait_agent("master", "idle", 15);
+    d.rpc(
+        "thread_send",
+        json!({"alias": "master", "text": "stash the key", "message": "r1"}),
+    )
+    .unwrap();
+    d.wait_message("master", "r1", &["completed"], 20);
+    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    let call = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "tool_call")
+        .cloned()
+        .unwrap_or_else(|| panic!("no tool_call in {page}"));
+    let text = call["text"].as_str().unwrap();
+    assert!(text.starts_with("Bash: printf "), "{call}");
+    assert!(text.ends_with("[redacted:private-key]"), "{call}");
+    let events = Value::Array(d.events("master")).to_string();
+    for line in &body {
+        assert!(
+            !page.to_string().contains(line.as_str()),
+            "thread leaked the key"
+        );
+        assert!(
+            !events.contains(line.as_str()),
+            "the tool_use event leaked the key"
+        );
+    }
+}
+
 /// Managed Codex: a persisted commentary `agentMessage` item lands as
 /// `assistant_text` before the final turn result.
 #[test]

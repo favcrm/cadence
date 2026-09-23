@@ -394,3 +394,107 @@ fn redact_text_covers_the_union_of_overlapping_spans() {
     assert!(!out.contains(&pat) && !out.contains(&tail), "{out}");
     assert!(out.starts_with("my secret: [redacted:"), "{out}");
 }
+
+/// A PEM private key built at runtime: the `kind` header (`"RSA "`,
+/// `"OPENSSH "`, `""`…), `lines` 64-character body lines, and the END
+/// footer when `end`. Returns the text and its body lines. The markers
+/// are joined from pieces so no literal here has a key shape.
+fn pem_key(kind: &str, seed: &str, lines: usize, end: bool) -> (String, Vec<String>) {
+    let body: Vec<String> = (0..lines)
+        .map(|i| noise(&format!("{seed}:{i}"), 64))
+        .collect();
+    let mut text = ["-----BEGIN ", kind, "PRIVATE", " KEY-----\n"].concat();
+    text.push_str(&body.join("\n"));
+    if end {
+        text.push_str(&["\n-----END ", kind, "PRIVATE", " KEY-----"].concat());
+    }
+    (text, body)
+}
+
+fn assert_no_body(out: &str, body: &[String]) {
+    for line in body {
+        assert!(!out.contains(line.as_str()), "key body survived: {out}");
+    }
+}
+
+/// CAD-410: a key with BEGIN but no END (a head- or line-limited read)
+/// is redacted from its BEGIN line to the end of the text.
+#[test]
+fn redact_text_redacts_a_private_key_with_no_end_marker() {
+    let (key, body) = pem_key("RSA ", "pem-open", 6, false);
+    let out = redact_text(&format!("head -n 7 id_rsa:\n{key}\n")).unwrap();
+    assert_no_body(&out, &body);
+    assert_eq!(out, "head -n 7 id_rsa:\n[redacted:private-key]");
+
+    // Cut mid-line and cut right after the header.
+    let (key, body) = pem_key("", "pem-cut", 3, false);
+    let cut = &key[..key.len() - 20];
+    let out = redact_text(&format!("x {cut}")).unwrap();
+    assert_no_body(&out, &body[..2]);
+    assert!(!out.contains(&body[2][..44]), "{out}");
+    assert_eq!(out, "x [redacted:private-key]");
+    let header = &key[..key.find('\n').unwrap()];
+    assert_eq!(
+        redact_text(&format!("{header} ")).unwrap(),
+        "[redacted:private-key]"
+    );
+
+    // Flattened onto one line, as a tool summary stores it.
+    let (key, body) = pem_key("OPENSSH ", "pem-flat", 4, false);
+    let out = redact_text(&format!("Bash: printf '{}'", key.replace('\n', " "))).unwrap();
+    assert_no_body(&out, &body);
+    assert_eq!(out, "Bash: printf '[redacted:private-key]");
+
+    // PGP's `BLOCK` form and a lower-case header.
+    let pgp = ["-----BEGIN PGP ", "PRIVATE", " KEY BLOCK-----\n"].concat();
+    let armor = noise("pem-pgp", 64);
+    let out = redact_text(&format!("{pgp}{armor}")).unwrap();
+    assert!(!out.contains(&armor), "{out}");
+    let lower = ["-----begin ", "private", " key-----\n"].concat();
+    let out = redact_text(&format!("{lower}{armor}")).unwrap();
+    assert!(!out.contains(&armor), "{out}");
+}
+
+/// CAD-410: with its END marker a key is redacted to that marker and
+/// the text after it is kept — a body too short for the gitleaks rule
+/// included. A truncated key followed by a whole one loses both bodies.
+#[test]
+fn redact_text_redacts_a_private_key_to_its_end_marker() {
+    let (key, body) = pem_key("EC ", "pem-closed", 5, true);
+    let out = redact_text(&format!("before\n{key}\nafter ✓")).unwrap();
+    assert_no_body(&out, &body);
+    assert_eq!(out, "before\n[redacted:private-key]\nafter ✓");
+
+    let short = [
+        "-----BEGIN ",
+        "PRIVATE",
+        " KEY-----\nabc123\n-----END ",
+        "PRIVATE",
+        " KEY-----",
+    ]
+    .concat();
+    let out = redact_text(&format!("{short}\ntail")).unwrap();
+    assert_eq!(out, "[redacted:private-key]\ntail");
+
+    let (open, open_body) = pem_key("RSA ", "pem-first", 3, false);
+    let (closed, closed_body) = pem_key("RSA ", "pem-second", 3, true);
+    let out = redact_text(&format!("{open}\n---\n{closed}\nend")).unwrap();
+    assert_no_body(&out, &open_body);
+    assert_no_body(&out, &closed_body);
+    assert!(out.ends_with("\nend"), "{out}");
+
+    // Not a private key: a certificate is left alone.
+    let cert = ["-----BEGIN ", "CERTIFICATE-----\n", &noise("pem-cert", 64)].concat();
+    assert_eq!(redact_text(&cert).unwrap(), cert);
+}
+
+/// CAD-410 acceptance 3: the widening is redaction-only. `scan` — the
+/// commit hook, `secret scan` and the export — reports what it did
+/// before: `private-key` for a whole key, nothing new for a truncated one.
+#[test]
+fn scan_rule_ids_for_private_keys_are_unchanged() {
+    let (closed, _) = pem_key("RSA ", "pem-scan-closed", 4, true);
+    assert_eq!(rules(&scan(&closed, None).unwrap()), ["private-key"]);
+    let (open, _) = pem_key("RSA ", "pem-scan-open", 4, false);
+    assert!(scan(&open, None).unwrap().is_empty());
+}
