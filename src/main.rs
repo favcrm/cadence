@@ -168,6 +168,15 @@ enum Commands {
         /// reasoning efforts are validated at open time.
         #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max", "ultra"])]
         effort: Option<String>,
+        /// Seconds without any provider event before a turn is declared
+        /// unknown [default: 900]. Liveness is activity-based — a turn
+        /// that keeps streaming runs as long as it needs.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn_idle_secs: Option<u64>,
+        /// Optional absolute turn cap in seconds — fences even a chatty
+        /// turn. Unset by default.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        turn_max_secs: Option<u64>,
         /// Codex filesystem sandbox sent on `thread/start` [default:
         /// workspace-write — a cadence-launched worker is writable;
         /// read-only only when asked].
@@ -555,12 +564,12 @@ enum Commands {
         /// dangerous for devin, force for cursor.
         #[arg(long, conflicts_with = "permission_mode")]
         bypass: bool,
-        /// Seconds without any provider event before a claude turn is
-        /// declared unknown [default: 900]. Managed endpoint only.
+        /// Seconds without any provider event before a claude or codex
+        /// turn is declared unknown [default: 900]. Managed endpoint only.
         #[arg(long, conflicts_with = "tui", value_parser = clap::value_parser!(u64).range(1..))]
         turn_idle_secs: Option<u64>,
-        /// Optional absolute turn cap in seconds for provider `claude`.
-        /// Managed endpoint only.
+        /// Optional absolute turn cap in seconds for provider `claude` or
+        /// `codex`. Managed endpoint only.
         #[arg(long, conflicts_with = "tui", value_parser = clap::value_parser!(u64).range(1..))]
         turn_max_secs: Option<u64>,
         /// Broker a claude worker's tool-permission prompts through
@@ -3827,6 +3836,8 @@ fn run() -> Result<i32> {
             provider_default_model,
             team_role,
             effort,
+            turn_idle_secs,
+            turn_max_secs,
             sandbox,
             instructions_file,
             worktree,
@@ -3853,7 +3864,12 @@ fn run() -> Result<i32> {
             &ClaudeOpts::default(),
             &DevinOpts::default(),
             &CursorOpts::default(),
-            &CodexOpts { model, effort },
+            &CodexOpts {
+                model,
+                effort,
+                turn_idle_secs,
+                turn_max_secs,
+            },
             team_role.as_deref(),
             provider_default_model,
         ),
@@ -4025,7 +4041,12 @@ fn run() -> Result<i32> {
                 permission_mode,
                 bypass,
             },
-            CodexOpts { model, effort },
+            CodexOpts {
+                model,
+                effort,
+                turn_idle_secs,
+                turn_max_secs,
+            },
             team_role,
             provider_default_model,
         ),
@@ -5403,6 +5424,10 @@ struct CursorOpts {
 struct CodexOpts {
     model: Option<String>,
     effort: Option<String>,
+    /// `params.turn_idle_secs` / `params.turn_max_secs` — the same
+    /// activity-based turn liveness as managed claude (CAD-227).
+    turn_idle_secs: Option<u64>,
+    turn_max_secs: Option<u64>,
 }
 
 /// `cadence devin [-r slug]` / `cadence codex` / `cadence claude`:
@@ -5615,6 +5640,12 @@ fn provider_launch(
         if let Some(effort) = &codex.effort {
             registry::codex_effort(effort)?;
             params_obj.insert("effort".to_string(), json!(effort));
+        }
+        if let Some(secs) = codex.turn_idle_secs {
+            params_obj.insert("turn_idle_secs".to_string(), json!(secs));
+        }
+        if let Some(secs) = codex.turn_max_secs {
+            params_obj.insert("turn_max_secs".to_string(), json!(secs));
         }
     }
     if auto_ready {

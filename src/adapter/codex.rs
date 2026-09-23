@@ -23,9 +23,14 @@ use super::{AdapterHooks, Identity, ProviderAdapter, ProviderEnv, ProviderReques
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
-const TURN_DEADLINE: Duration = Duration::from_secs(600);
+/// Silence bound before a turn is `unknown` (`params.turn_idle_secs`) —
+/// the same activity-based liveness as managed claude: a turn that keeps
+/// streaming is alive however long it runs. `params.turn_max_secs` adds
+/// an optional absolute cap (CAD-227; the old fixed 600 s wall clock
+/// fenced healthy long turns).
+const DEFAULT_TURN_IDLE: Duration = Duration::from_secs(900);
 /// Quota is advisory startup telemetry. A provider/auth mode that does not
-/// expose the endpoint must not hold an agent open for the turn deadline.
+/// expose the endpoint must not hold an agent open for a turn window.
 const QUOTA_DEADLINE: Duration = Duration::from_secs(5);
 
 const ENV_SCRUB: &[&str] = &[
@@ -318,6 +323,10 @@ struct Shared {
     /// Every transport message bumps this — the raw activity clock the
     /// daemon's stall watch reads (`ProviderAdapter::activity_at`).
     last_activity: Mutex<Instant>,
+    /// `params.turn_idle_secs` (default 900 s) and optional
+    /// `params.turn_max_secs`, read at `open`.
+    idle_window: Mutex<Duration>,
+    max_turn: Mutex<Option<Duration>>,
     /// The last provider-owned rate-limit snapshot. It remains raw JSON;
     /// the store adds Cadence identity and timestamps before exposure.
     quota: Mutex<Option<Value>>,
@@ -332,6 +341,8 @@ fn shared_state(hooks: AdapterHooks) -> Arc<Shared> {
         thread_id: Mutex::new(None),
         active_turn: Mutex::new(None),
         last_activity: Mutex::new(Instant::now()),
+        idle_window: Mutex::new(DEFAULT_TURN_IDLE),
+        max_turn: Mutex::new(None),
         quota: Mutex::new(None),
     })
 }
@@ -589,6 +600,17 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn open(&self, agent: &Agent) -> Result<Identity> {
+        let window = |key: &str| {
+            agent
+                .params
+                .as_ref()
+                .and_then(|p| p.get(key))
+                .and_then(Value::as_u64)
+                .map(|s| Duration::from_secs(s.max(1)))
+        };
+        *self.shared.idle_window.lock().unwrap() =
+            window("turn_idle_secs").unwrap_or(DEFAULT_TURN_IDLE);
+        *self.shared.max_turn.lock().unwrap() = window("turn_max_secs");
         let launched = self.transport.launch(&agent.cwd, &self.log_path)?;
         // Everything after launch is guarded: any failure closes the
         // transport so no owned provider process is left behind.
@@ -750,7 +772,10 @@ impl ProviderAdapter for CodexAdapter {
             .to_string();
         *self.shared.active_turn.lock().unwrap() = Some(turn_id.clone());
         on_started(&turn_id);
-        let deadline = Instant::now() + TURN_DEADLINE;
+        let start = Instant::now();
+        *self.shared.last_activity.lock().unwrap() = start;
+        let idle_window = *self.shared.idle_window.lock().unwrap();
+        let max_turn = *self.shared.max_turn.lock().unwrap();
         let turn = {
             let mut completed = self.shared.completed.lock().unwrap();
             loop {
@@ -762,12 +787,23 @@ impl ProviderAdapter for CodexAdapter {
                         "Connection lost during turn; provider outcome is unknown",
                     ));
                 }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(Error::unknown(
-                        "Turn deadline reached; provider outcome needs review",
-                    ));
+                let now = Instant::now();
+                let last = *self.shared.last_activity.lock().unwrap();
+                let idle_left = (last + idle_window).saturating_duration_since(now);
+                if idle_left.is_zero() {
+                    return Err(Error::unknown(format!(
+                        "No provider event for {}s; outcome is unknown",
+                        idle_window.as_secs()
+                    )));
                 }
+                let max_left = max_turn.map(|cap| (start + cap).saturating_duration_since(now));
+                if matches!(max_left, Some(d) if d.is_zero()) {
+                    return Err(Error::unknown(format!(
+                        "Turn exceeded turn_max_secs ({}s); provider outcome needs review",
+                        max_turn.unwrap_or_default().as_secs()
+                    )));
+                }
+                let remaining = max_left.map_or(idle_left, |m| m.min(idle_left));
                 let (guard, _) = self
                     .shared
                     .turn_cv

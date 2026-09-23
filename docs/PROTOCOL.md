@@ -197,7 +197,12 @@ posture is `sandbox` — `read-only` or `workspace-write`
 --sandbox`). A joined codex worker defaults to `workspace-write`
 scoped to its worktree cwd, `read-only` only when explicitly asked —
 paired with `approval_policy=never` that is the same trust posture the
-other providers already run under, not a new one.
+other providers already run under, not a new one. Codex turn liveness
+is activity-based like managed claude's: every app-server message
+resets the clock, `{"turn_idle_secs": N}` (default 900; `cadence codex
+--turn-idle-secs`, `join --turn-idle-secs`) bounds silence and the
+optional `{"turn_max_secs": N}` is an absolute cap. The old fixed 600 s
+wall-clock deadline fenced healthy long turns (CAD-227).
 
 **Briefings.** Every launch path (`devin`, `codex`, `claude`, `join`) writes
 `$CADENCE_STATE_DIR/briefings/<root>/BRIEFING-<alias>.md` — under the
