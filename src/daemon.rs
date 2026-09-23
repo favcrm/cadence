@@ -161,6 +161,11 @@ const DAEMON_ALIAS: &str = Store::DAEMON_STREAM;
 /// How an approval-evidence writer was authorized — the daemon's own
 /// statement, stamped on every record (CAD-217).
 const APPROVAL_RECORDED_VIA: &str = "operator-connection";
+/// CAD-250 N3: how long a nudge may wait in the queue (a busy or
+/// menu-blocked pane) before it is cancelled as stale steering.
+const NUDGE_TTL_SECS: u64 = 900;
+/// CAD-250 N4: nudges are short steering, not tasks.
+const NUDGE_MAX_CHARS: usize = 500;
 /// `stall_secs` when neither the job nor the agent sets one.
 const DEFAULT_STALL_SECS: u64 = 1800;
 /// `silent_end_secs` when the agent doesn't set one: ten minutes of
@@ -782,6 +787,17 @@ impl Shared {
             // reports `closed` to its caller.
             self.answered.lock().unwrap().retain(|_, (a, _)| a != alias);
         }
+        // CAD-250 N2: a nudge never outlives the actor it was aimed at —
+        // whatever ended it (stop, fence, shutdown), queued nudges close
+        // here with `nudge_cancelled`, never pasted into a later pane.
+        let nudge_reason = if self.closing.load(Ordering::SeqCst) {
+            "shutdown"
+        } else if outcome.is_err() {
+            "fence"
+        } else {
+            "stop"
+        };
+        let _ = self.store.cancel_nudges_for(alias, nudge_reason);
         self.wake();
         let closing = self.closing.load(Ordering::SeqCst);
         match outcome {
@@ -1174,7 +1190,7 @@ impl Shared {
             json!({"message": message.id, "reason": reason}),
         );
         // `finish` idles the agent; a turn still held keeps it busy.
-        if !self.store.awaiting_reports(&message.alias)?.is_empty() {
+        if !self.store.held_turns(&message.alias)?.is_empty() {
             let _ = self
                 .store
                 .set_agent_state_if(&message.alias, "busy", "idle");
@@ -1190,7 +1206,7 @@ impl Shared {
             let delivered = json!({"status": "completed", "via": "pty_nudge",
                         "turn_id": result.turn_id});
             self.store.finish(message, "completed", &delivered, None)?;
-            if !self.store.awaiting_reports(&message.alias)?.is_empty() {
+            if !self.store.held_turns(&message.alias)?.is_empty() {
                 let _ = self
                     .store
                     .set_agent_state_if(&message.alias, "busy", "idle");
@@ -1240,11 +1256,17 @@ impl Shared {
     /// when at least one has run out — `None` while every one is within
     /// it (or the bound is `0`, disabled).
     fn report_overdue(&self, alias: &str) -> Option<(Vec<Message>, u64)> {
-        let awaiting = self.store.awaiting_reports(alias).ok()?;
+        // Every turn-holding row, marked `awaiting_report` or not (F2): the
+        // hold and the bound share one predicate.
+        let awaiting = self.store.held_turns(alias).ok()?;
         if awaiting.is_empty() {
             return None;
         }
-        let bound = store::report_timeout_secs(self.store.agent(alias).ok()?.params.as_ref());
+        let agent = self.store.agent(alias).ok()?;
+        if agent.endpoint_kind != "pty" {
+            return None;
+        }
+        let bound = store::report_timeout_secs(agent.params.as_ref());
         let now = epoch_secs();
         awaiting
             .iter()
@@ -1325,7 +1347,10 @@ impl Shared {
     /// delivered-unreported turn, how long it has waited, the bound and
     /// what is queued behind it. `None` when no turn awaits a report.
     fn awaiting_report_view(&self, agent: &Agent) -> Option<Value> {
-        let awaiting = self.store.awaiting_reports(&agent.alias).ok()?;
+        if agent.endpoint_kind != "pty" {
+            return None;
+        }
+        let awaiting = self.store.held_turns(&agent.alias).ok()?;
         let head = awaiting.first()?;
         let bound = store::report_timeout_secs(agent.params.as_ref());
         let waited = head
@@ -2363,6 +2388,17 @@ impl Shared {
             .unwrap_or(false)
             || optional_str(params, "source") == Some(store::NUDGE_SOURCE);
         if nudge {
+            if optional_str(params, "task").is_some() {
+                return Err(Error::rejected(
+                    "--nudge is steering, not task work — it takes no --task",
+                ));
+            }
+            if text.chars().count() > NUDGE_MAX_CHARS {
+                return Err(Error::rejected(format!(
+                    "a nudge is at most {NUDGE_MAX_CHARS} characters — send longer \
+                     guidance as a normal message or a file path"
+                )));
+            }
             if let Some(agent) = target.as_ref().filter(|a| a.endpoint_kind != "pty") {
                 return Err(Error::rejected(format!(
                     "--nudge only applies to pty endpoints — '{alias}' is {}/{}; \
@@ -2374,6 +2410,15 @@ impl Shared {
                 return Err(Error::rejected(
                     "--nudge owes no report, so it takes no reply_to",
                 ));
+            }
+            // N1: a nudge is for a pane that exists now — never queued for
+            // a stopped or fenced agent to receive later.
+            let live = self.lifecycle.lock().unwrap().agents.contains_key(&alias)
+                && target.as_ref().is_some_and(|a| {
+                    a.endpoint.is_some() && matches!(a.state.as_str(), "idle" | "busy")
+                });
+            if !live {
+                return Err(Error::rejected(format!("agent {alias} has no live pane")));
             }
         }
         if pty && crate::adapter::pty::has_control_chars(text) {
@@ -3072,19 +3117,37 @@ impl Shared {
                 let sha = optional_str(params, "sha")
                     .map(store::check_commit_sha)
                     .transpose()?;
-                if message.state == "running" {
+                // CAD-250 F1: the `running` check and the finish are one
+                // transaction — a report racing the report bound (or a
+                // reconcile) either wins outright or is judged against
+                // the row as it now stands, never both.
+                let message = if message.state == "running" {
                     let stored = json!({
                         "status": "completed", "text": text,
                         "turn_id": token, "via": "pty_report",
                         "sha": sha,
                     });
-                    self.store.finish(&message, "completed", &stored, None)?;
-                    self.notify_routed_target(&message, &stored);
-                    // CAD-250: the report frees the actor's one turn —
-                    // wake it so the next queued delivery is claimed now,
-                    // not on the idle poll.
-                    self.notify_agent(&message.alias);
-                } else if message.state == "completed" {
+                    match self
+                        .store
+                        .finish_running(&message.id, "completed", &stored, None)?
+                    {
+                        Ok(finished) => {
+                            self.notify_routed_target(&finished, &stored);
+                            // The report frees the actor's one turn — wake
+                            // it so the next queued delivery is claimed
+                            // now, not on the idle poll.
+                            self.notify_agent(&finished.alias);
+                            self.wake();
+                            return Ok(json!({"state": "reported", "kind": kind}));
+                        }
+                        Err(current) => {
+                            current.ok_or_else(|| Error::rejected("Unknown message"))?
+                        }
+                    }
+                } else {
+                    message
+                };
+                if message.state == "completed" {
                     // Idempotent retry vs conflicting duplicate.
                     let same = message
                         .result
@@ -4403,8 +4466,17 @@ impl Shared {
     /// re-dispatches or fences anything it observes.
     fn run_stall_watch(self: &Arc<Self>) {
         let mut inbox_swept: Option<Instant> = None;
+        let mut nudges_swept: Option<Instant> = None;
         while !self.closing.load(Ordering::SeqCst) {
             self.stall_tick();
+            // CAD-250 N3: a nudge still queued past its TTL is stale
+            // steering — cancelled, never pasted late.
+            if nudges_swept.is_none_or(|at| at.elapsed() >= Duration::from_secs(10)) {
+                let _ = self
+                    .store
+                    .expire_queued_nudges(epoch_secs(), NUDGE_TTL_SECS as f64);
+                nudges_swept = Some(Instant::now());
+            }
             // CAD-251: the unconsumed-inbox sweep rides the screen-sample
             // cadence (one minute by default) — a store read per mailbox.
             if inbox_swept.is_none_or(|at| at.elapsed() >= screen_sample(&self.stall_sample_secs)) {

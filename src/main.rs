@@ -439,8 +439,9 @@ enum Commands {
         /// Mid-turn steering (pty only): paste into the live pane without
         /// owning a turn — passes the one-running-turn hold, owes no
         /// report, completes when the paste is confirmed, never replayed
-        /// after a daemon restart. Takes no `--reply-to`.
-        #[arg(long, conflicts_with_all = ["ready", "reply_to"])]
+        /// after a daemon restart. Live pane only; at most 500 chars;
+        /// takes no `--reply-to` or `--task`.
+        #[arg(long, conflicts_with_all = ["ready", "reply_to", "task"])]
         nudge: bool,
     },
     /// One-step issue dispatch: `issue start` (idempotent, owner =
@@ -1810,8 +1811,9 @@ enum MessageAction {
         /// Mid-turn steering (pty only): paste into the live pane without
         /// owning a turn — passes the one-running-turn hold, owes no
         /// report, completes when the paste is confirmed, never replayed
-        /// after a daemon restart. Takes no `--reply-to`.
-        #[arg(long, conflicts_with_all = ["ready", "reply_to"])]
+        /// after a daemon restart. Live pane only; at most 500 chars;
+        /// takes no `--reply-to` or `--task`.
+        #[arg(long, conflicts_with_all = ["ready", "reply_to", "task"])]
         nudge: bool,
     },
     /// Send and wait for the turn's terminal state.

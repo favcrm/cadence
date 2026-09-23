@@ -857,12 +857,21 @@ impl Message {
                 == Some("submitted")
     }
 
-    /// When the report bound's clock started for an `awaiting_report`
-    /// turn: the delivery (`started`, else `created`), restarted by the
-    /// latest valid ack — an ack is the worker's own report that it holds
-    /// the turn. `None` for any other row.
+    /// CAD-250: the row holds its actor's one turn — `running` and not a
+    /// turnless delivery (routed notice or nudge). Exactly what
+    /// `take_queued`'s hold matches, and what the report bound covers, so
+    /// no row can hold the queue without a bound — including a pty row
+    /// adopted before its `submitted` marker landed.
+    pub fn holds_turn(&self) -> bool {
+        self.state == "running" && !self.is_routed() && !self.is_nudge()
+    }
+
+    /// When the report bound's clock started for a turn-holding row: the
+    /// delivery (`started`, else `created`), restarted by the latest valid
+    /// ack — an ack is the worker's own report that it holds the turn.
+    /// `None` for any other row.
     pub fn report_clock(&self) -> Option<f64> {
-        if !self.awaiting_report() {
+        if !self.holds_turn() {
             return None;
         }
         let delivered = self.started.unwrap_or(self.created);
@@ -1505,45 +1514,8 @@ impl Store {
             }
         }
         // CAD-250: a nudge is steering for the moment it was sent — it is
-        // never replayed into a later daemon's pane. One still `queued`
-        // is cancelled with a `nudge_cancelled` event; one caught
-        // mid-paste (`submitting`) may have landed, so it goes `unknown`
-        // with the same event — an unknown that fences nothing.
-        {
-            let mut stmt = tx.prepare(
-                "SELECT id, alias, state FROM messages
-                 WHERE source='nudge' AND state IN ('queued','submitting')",
-            )?;
-            let stale = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(stmt);
-            for (id, alias, state) in stale {
-                let (to, via) = if state == "queued" {
-                    ("cancelled", "restart_cancelled")
-                } else {
-                    ("unknown", "restart_unconfirmed")
-                };
-                let result = json!({"status": to, "via": via,
-                                    "reason": "daemon restarted — a nudge is never replayed"});
-                tx.execute(
-                    "UPDATE messages SET state=?,result=?,completed=? WHERE id=?",
-                    params![to, result.to_string(), now(), id],
-                )?;
-                Self::event(
-                    &tx,
-                    &alias,
-                    "nudge_cancelled",
-                    json!({"message": id, "was": state, "state": to}),
-                )?;
-            }
-        }
+        // never replayed into a later daemon's pane.
+        Self::cancel_nudges_in(&tx, None, "restart", None)?;
         // Dynamic NOT IN for the protected message ids — one UPDATE
         // either way, never string-interpolated values.
         let kept_ids: Vec<String> = kept.iter().map(|e| e.message_id.clone()).collect();
@@ -2700,6 +2672,110 @@ impl Store {
         Ok(())
     }
 
+    /// CAD-250: a nudge never outlives the pane it was aimed at. Cancel the
+    /// matching queued nudges (one caught mid-paste may have landed, so it
+    /// goes non-fencing `unknown`), each with a `nudge_cancelled` event
+    /// naming `reason`. `alias` scopes to one agent (its actor stopped);
+    /// `older_than` limits to rows created before that epoch (the TTL).
+    /// Returns the `(id, alias)` pairs it closed.
+    fn cancel_nudges_in(
+        tx: &Connection,
+        alias: Option<&str>,
+        reason: &str,
+        older_than: Option<f64>,
+    ) -> Result<Vec<(String, String)>> {
+        // The TTL only ever takes a nudge still waiting in the queue — a
+        // paste in flight finishes or fails on its own.
+        let states = if older_than.is_some() {
+            "('queued')"
+        } else {
+            "('queued','submitting')"
+        };
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id, alias, state FROM messages
+             WHERE source='nudge' AND state IN {states}
+               AND (?1 IS NULL OR alias=?1) AND (?2 IS NULL OR created < ?2)"
+        ))?;
+        let stale = stmt
+            .query_map(params![alias, older_than], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut closed = Vec::new();
+        for (id, alias, state) in stale {
+            let (to, why) = if state == "queued" {
+                ("cancelled", format!("{reason}_cancelled"))
+            } else {
+                ("unknown", format!("{reason}_unconfirmed"))
+            };
+            let result = json!({"status": to, "via": why,
+                                "reason": format!("{reason} — a nudge is never replayed")});
+            let n = tx.execute(
+                "UPDATE messages SET state=?,result=?,completed=? WHERE id=? AND state=?",
+                params![to, result.to_string(), now(), id, state],
+            )?;
+            if n == 1 {
+                Self::event(
+                    tx,
+                    &alias,
+                    "nudge_cancelled",
+                    json!({"message": id, "was": state, "state": to, "reason": reason}),
+                )?;
+                closed.push((id, alias));
+            }
+        }
+        Ok(closed)
+    }
+
+    /// CAD-250 N2: the alias's actor stopped (stop, fence, shutdown, any
+    /// exit) — its queued nudges are cancelled, never pasted later.
+    pub fn cancel_nudges_for(&self, alias: &str, reason: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let closed = Self::cancel_nudges_in(&tx, Some(alias), reason, None)?;
+        tx.commit()?;
+        Ok(closed)
+    }
+
+    /// CAD-250 N3: a nudge still queued `ttl` seconds after it was created
+    /// (a pane that stayed busy) is stale steering — cancelled at `now`.
+    pub fn expire_queued_nudges(&self, now: f64, ttl: f64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let closed = Self::cancel_nudges_in(&tx, None, "ttl", Some(now - ttl))?;
+        tx.commit()?;
+        Ok(closed)
+    }
+
+    /// CAD-250: finish a turn from its worker's `message result` — only
+    /// while it is still `running`, checked in the same transaction as the
+    /// write. `Ok(None)` when it is not (the report bound or a reconcile
+    /// got there first): nothing written, and the caller refuses or
+    /// dedupes against the returned current row. The report and the
+    /// expiry can never both win.
+    pub fn finish_running(
+        &self,
+        message_id: &str,
+        status: &str,
+        result: &Value,
+        error: Option<&str>,
+    ) -> Result<std::result::Result<Message, Option<Message>>> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let current = self.message_in(&tx, message_id)?;
+        let Some(current) = current.filter(|m| m.state == "running") else {
+            return Ok(Err(self.message_in(&tx, message_id)?));
+        };
+        self.finish_in(&tx, &current, status, result, error)?;
+        tx.commit()?;
+        Ok(Ok(current))
+    }
+
     /// CAD-250: move a delivered, unreported pty turn to `unknown` —
     /// the report bound ran out, or a sibling's did and the actor fences.
     /// Guarded in one transaction: a report or ack that landed after the
@@ -2722,7 +2798,7 @@ impl Store {
         };
         let due = match bound {
             Some((secs, now)) => current.report_overdue(secs, now),
-            None => current.awaiting_report(),
+            None => current.holds_turn(),
         };
         if !due {
             return Ok(false);
@@ -3993,6 +4069,18 @@ impl Store {
         Ok(rows.into_iter().filter(Message::awaiting_report).collect())
     }
 
+    /// CAD-250: every row holding the alias's turn ([`Message::holds_turn`]),
+    /// oldest first — marked `awaiting_report` or not. The report bound
+    /// walks these.
+    pub fn held_turns(&self, alias: &str) -> Result<Vec<Message>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT * FROM messages WHERE alias=? AND state='running' ORDER BY seq")?;
+        let rows = stmt.query_map([alias], row_message)?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter(Message::holds_turn).collect())
+    }
+
     /// Queued deliveries that are turns of their own — what an
     /// unreported turn holds back (routed notifications still pass).
     pub fn queued_turns(&self, alias: &str) -> Result<i64> {
@@ -4016,7 +4104,8 @@ impl Store {
     pub fn busy_providers(&self, live: &HashSet<String>, now: f64) -> Result<HashSet<String>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT a.provider AS agent_provider, a.params AS agent_params, m.*
+            "SELECT a.provider AS agent_provider, a.params AS agent_params,
+                    a.endpoint_kind AS agent_kind, m.*
              FROM agents a JOIN messages m ON m.alias = a.alias
              WHERE m.state IN ('submitting','running')",
         )?;
@@ -4025,16 +4114,19 @@ impl Store {
             Ok((
                 r.get::<_, String>("agent_provider")?,
                 params.and_then(|p| serde_json::from_str::<Value>(&p).ok()),
+                r.get::<_, String>("agent_kind")? == "pty",
                 row_message(r)?,
             ))
         })?;
         let mut busy = HashSet::new();
         for row in rows {
-            let (provider, params, message) = row?;
+            let (provider, params, pty, message) = row?;
             if !live.contains(&message.alias) {
                 continue;
             }
-            if message.report_overdue(report_timeout_secs(params.as_ref()), now) {
+            // The report bound is a pty rule: a managed turn is live
+            // while its provider call runs, however long.
+            if pty && message.report_overdue(report_timeout_secs(params.as_ref()), now) {
                 continue;
             }
             busy.insert(provider);
@@ -6815,6 +6907,129 @@ mod tests {
         // The crash path fences the held turn — and only it: the
         // unconfirmed nudge is still no unfence item.
         assert_eq!(s.unknown_messages("w1").unwrap(), ["t1"]);
+    }
+
+    /// CAD-250 F1: a worker's report reads `running`, the report bound's
+    /// expiry commits `unknown` (+ one notice) before the report writes —
+    /// the report's guarded finish then refuses: the row stays `unknown`
+    /// and exactly one routed message (the notice) exists, no result.
+    #[test]
+    fn report_racing_the_expiry_never_both_win() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg(&s, "pm", &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "task", Some("pm"), "m1", "user").unwrap();
+        let Take::Message(m1) = s.take_queued("w1").unwrap() else {
+            panic!("m1 must be claimed");
+        };
+        s.mark_running(&m1.id, "pty-g-m1").unwrap();
+        let m1 = s.message("m1").unwrap().unwrap();
+        s.mark_submitted(&m1).unwrap();
+        // The report's read: `running`.
+        let seen = s.message("m1").unwrap().unwrap();
+        assert_eq!(seen.state, "running");
+        // The expiry commits in between.
+        let clock = seen.report_clock().unwrap();
+        assert!(s
+            .expire_awaiting_report("m1", Some((10, clock + 11.0)), "bound ran out")
+            .unwrap());
+        // The report's write: refused, judged against the current row.
+        let stored = json!({"status": "completed", "text": "done", "via": "pty_report"});
+        let outcome = s.finish_running("m1", "completed", &stored, None).unwrap();
+        let current = outcome.expect_err("the report must not win after the expiry");
+        assert_eq!(current.unwrap().state, "unknown");
+        assert_eq!(s.message("m1").unwrap().unwrap().state, "unknown");
+        let routed: Vec<String> = s
+            .messages("pm")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.source)
+            .collect();
+        assert_eq!(routed, ["worker_notice"], "one notice, no result");
+        // And the other order: a report first wins, the expiry refuses.
+        s.enqueue("w1", "task 2", Some("pm"), "m2", "user").unwrap();
+        let Take::Message(m2) = s.take_queued("w1").unwrap() else {
+            panic!("m2 must be claimed");
+        };
+        s.mark_running(&m2.id, "pty-g-m2").unwrap();
+        assert!(s
+            .finish_running("m2", "completed", &stored, None)
+            .unwrap()
+            .is_ok());
+        assert!(!s.expire_awaiting_report("m2", None, "late").unwrap());
+        assert_eq!(s.message("m2").unwrap().unwrap().state, "completed");
+    }
+
+    /// CAD-250 F2: a pty row that holds the turn without the `submitted`
+    /// marker (adopted between `mark_running` and `mark_submitted`) is
+    /// bounded from `started` like any other — the hold and the bound
+    /// share one predicate — and stops deferring checkpoints past it.
+    #[test]
+    fn unmarked_running_row_is_bounded_too() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "task", None, "m1", "user").unwrap();
+        s.enqueue("w1", "next", None, "m2", "user").unwrap();
+        let Take::Message(m1) = s.take_queued("w1").unwrap() else {
+            panic!("m1 must be claimed");
+        };
+        s.mark_running(&m1.id, "pty-g-m1").unwrap();
+        let m1 = s.message("m1").unwrap().unwrap();
+        assert!(!m1.awaiting_report() && m1.holds_turn());
+        assert!(matches!(s.take_queued("w1").unwrap(), Take::Empty));
+        let started = m1.report_clock().unwrap();
+        assert_eq!(Some(started), m1.started);
+        assert_eq!(s.held_turns("w1").unwrap().len(), 1);
+        let live: HashSet<String> = ["w1".to_string()].into();
+        assert!(!s.busy_providers(&live, started + 60.0).unwrap().is_empty());
+        let past = started + DEFAULT_REPORT_TIMEOUT_SECS as f64 + 1.0;
+        assert!(s.busy_providers(&live, past).unwrap().is_empty());
+        assert!(!s
+            .expire_awaiting_report(
+                "m1",
+                Some((DEFAULT_REPORT_TIMEOUT_SECS, started + 60.0)),
+                "r"
+            )
+            .unwrap());
+        assert!(s
+            .expire_awaiting_report("m1", Some((DEFAULT_REPORT_TIMEOUT_SECS, past)), "r")
+            .unwrap());
+        assert_eq!(s.message("m1").unwrap().unwrap().state, "unknown");
+    }
+
+    /// CAD-250 N3: a nudge still queued past its TTL is cancelled with a
+    /// `nudge_cancelled` event (reason `ttl`); a younger one and a
+    /// non-nudge are untouched. The clock is injected — no sleeps.
+    #[test]
+    fn queued_nudge_expires_after_its_ttl() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        reg_pty(&s, "w1", &cwd);
+        s.enqueue("w1", "steer", None, "n1", NUDGE_SOURCE).unwrap();
+        s.enqueue("w1", "task", None, "t1", "user").unwrap();
+        let created = s.message("n1").unwrap().unwrap().created;
+        assert!(s
+            .expire_queued_nudges(created + 899.0, 900.0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(s.message("n1").unwrap().unwrap().state, "queued");
+        let closed = s.expire_queued_nudges(created + 901.0, 900.0).unwrap();
+        assert_eq!(closed, [("n1".to_string(), "w1".to_string())]);
+        let n1 = s.message("n1").unwrap().unwrap();
+        assert_eq!(n1.state, "cancelled");
+        assert_eq!(n1.result.as_ref().unwrap()["via"], "ttl_cancelled");
+        assert_eq!(s.message("t1").unwrap().unwrap().state, "queued");
+        let ev = s
+            .last_event_of("w1", &["nudge_cancelled"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.payload["reason"], "ttl");
+        assert!(s
+            .expire_queued_nudges(created + 9e9, 900.0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -746,22 +746,31 @@ result` wakes the actor so the next one is claimed at once.
 one way to reach a pane that holds a turn. A nudge is a durable
 message with `source: "nudge"` (`nudge: true` on its row) that owns no
 turn: like a routed notification it passes the hold and needs no
-ready claim, but it still waits for the screen probe to read the pane
-idle and menu-free. It never becomes `running` or `awaiting_report`,
+ready claim — though, like a routed notice, it consumes a stacked
+operator `agent ready` claim if one is waiting — and it still waits for
+the screen probe to read the pane idle and menu-free. It is accepted
+only for an agent with a live pane (an actor and an endpoint, state
+`idle`/`busy`); otherwise `send` refuses with `agent <a> has no live
+pane`. It never becomes `running` or `awaiting_report`,
 owes no report, takes no `reply_to` (and no upstream default), and
 completes at its confirmed paste (`result.via: "pty_nudge"`). An
 unconfirmed paste ends `unknown` with a `nudge_unconfirmed` event —
 never retried, and an unknown nudge fences nothing (it is excluded
 from the agent's `unknown` count and from `agent unfence`; reconcile
 it with `message reconcile` if you want it closed). Delivered at most
-once and never replayed: a nudge still `queued` when the daemon stops
-is `cancelled` at the next start (`result.via: "restart_cancelled"`),
-one caught mid-paste goes non-fencing `unknown`, each with a
-`nudge_cancelled` event; nudges are never recorded for hot-restart
-adoption. pty endpoints only — a managed, inbox or cloud agent refuses
+once and never replayed: whenever the agent's actor ends — stop,
+fence or daemon shutdown — its queued nudges are `cancelled`
+(`result.via: "stop_cancelled"` / `"fence_cancelled"` /
+`"shutdown_cancelled"`); after a crash the next start does the same
+(`"restart_cancelled"`), and one caught mid-paste goes non-fencing
+`unknown`. A nudge still queued 15 minutes after it was sent (a pane
+that stayed busy) is cancelled too (`"ttl_cancelled"`). Every one of
+these emits a `nudge_cancelled` event `{message, was, state, reason}`;
+nudges are never recorded for hot-restart adoption. pty endpoints only — a managed, inbox or cloud agent refuses
 `--nudge` naming its provider/kind; `--nudge` with `--ready` is a CLI
-error; the body follows the pty rules (one line, no control
-characters, no forbidden leading character). A nudge caller needs no
+error, and so is `--nudge` with `--task` (steering, not task work);
+the body is at most 500 characters and follows the pty rules (one
+line, no control characters, no forbidden leading character). A nudge caller needs no
 authority a plain `send` lacks. The held
 turn is **`awaiting_report`** — derived, never stored: `running` with
 the `submitted` marker (an ack keeps it). `agent_show`/`agent_list`
@@ -774,8 +783,13 @@ waiting is not a row.
 
 **Report bound.** A delivered turn waits at most `report_timeout_secs`
 (agent param, launch or live `agent set <alias> report_timeout_secs=<n>`;
-default 7200 = 2h; `0` disables) for its result. The clock starts at
-delivery and restarts on each valid ack — an ack is the worker's own
+default 7200 = 2h; `0` disables — and with it the WAL watch's bound
+too: a stale unreported row on a live actor then keeps deferring that
+provider's checkpoints) for its result. The bound covers every row that
+holds the turn — `running` and not a routed notice or nudge, exactly
+what the hold matches — including one adopted before its `submitted`
+marker landed, so no row can hold the queue unbounded. The clock starts
+at delivery and restarts on each valid ack — an ack is the worker's own
 report that it holds the turn. When it runs out the actor moves the
 turn to `unknown` with `result.via: "report_timeout"` and one
 `report_timeout` event `{message, turn_id, waited_secs,
@@ -784,8 +798,12 @@ report_timeout_secs}`, then fences like any other uncertain outcome
 routes exactly one `worker_notice` to `reply_to` (which `send` defaults
 to the agent's upstream; a kickoff's is the job PM, whose scoped
 `turn_unknown` also raises the monitor alert) — never a result, never
-a completion, never a replay. The write is guarded: a report or ack
-that lands first wins. Other unreported turns on the same actor — only
+a completion, never a replay. Both writes are guarded: the expiry and
+a `message result` each check `running` inside the transaction that
+writes, so whichever commits first wins and the other is judged
+against the row as it now stands (the report is refused `not awaiting
+a report (state unknown)`) — the PM never receives both a notice and a
+result for one turn. Other unreported turns on the same actor — only
 rows that accumulated before this rule — go `unknown` with it, since
 the pane they ran on is detached. The operator exits the fence the
 usual way (`message reconcile` / `agent unfence`); what queued behind

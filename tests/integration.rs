@@ -1775,8 +1775,16 @@ fn pty_hot_restart_adopts_multiple_running_turns() {
         conn.execute(
             "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,
                  created)
-             VALUES('m2','dv1','task',NULL,'test','running',?1,1.0)",
-            rusqlite::params![token2],
+             VALUES('m2','dv1','task',NULL,'test','running',?1,?2)",
+            // A fresh row: since CAD-250 F2 every turn-holding row is
+            // bounded from its delivery, so an epoch-1970 one would expire.
+            rusqlite::params![
+                token2,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64()
+            ],
         )
         .unwrap();
     }
@@ -1977,7 +1985,9 @@ fn pty_nudge_queued_at_restart_is_cancelled_not_replayed() {
     let d = TestDaemon::start_on(state);
     let m = d.wait_message("dv1", "n1", &["cancelled", "unknown"], 20);
     assert_eq!(m["state"], "cancelled", "{m}");
-    assert_eq!(m["result"]["via"], "restart_cancelled", "{m}");
+    // The actor's own exit at shutdown cancelled it (N2); a crash would
+    // leave it to the next start's recovery (`restart_cancelled`).
+    assert_eq!(m["result"]["via"], "shutdown_cancelled", "{m}");
     let ev = d.wait_event_where(
         "dv1",
         "nudge_cancelled",
@@ -1994,6 +2004,65 @@ fn pty_nudge_queued_at_restart_is_cancelled_not_replayed() {
         d.rpc("agent_show", json!({"alias": "dv1"})).unwrap()["unknown"],
         0
     );
+}
+
+/// CAD-250 N1/N2/N4: a nudge needs a live pane and dies with it. Queued
+/// behind an open menu, it is cancelled (`nudge_cancelled`, reason
+/// `stop`) when the agent stops — never pasted into a later pane — and a
+/// nudge to the stopped agent is refused. Over 500 characters or with a
+/// task it is refused outright.
+#[test]
+fn pty_nudge_needs_a_live_pane_and_dies_with_the_actor() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    d.register_devin("dv1", None);
+    d.wait_agent("dv1", "idle", 20);
+    let long = "x".repeat(501);
+    let err = d
+        .rpc(
+            "agent_send",
+            json!({"alias": "dv1", "text": long, "nudge": true}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("500"), "{err}");
+    let err = d
+        .rpc(
+            "agent_send",
+            json!({"alias": "dv1", "text": "steer", "nudge": true, "task": "t-1"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--task"), "{err}");
+    atomic_write(d.pane_file(&mock, "dv1", "tui-state"), DEVIN_MENU);
+    d.rpc(
+        "agent_send",
+        json!({"alias": "dv1", "text": "steer", "message": "n1", "nudge": true}),
+    )
+    .unwrap();
+    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "n1", 20);
+    d.rpc("agent_stop", json!({"alias": "dv1"})).unwrap();
+    d.wait_agent("dv1", "stopped", 20);
+    let m = d.wait_message("dv1", "n1", &["cancelled"], 10);
+    assert_eq!(m["result"]["via"], "stop_cancelled", "{m}");
+    let ev = d.wait_event_where(
+        "dv1",
+        "nudge_cancelled",
+        |e| e["payload"]["message"] == "n1",
+        5,
+    );
+    assert_eq!(ev["payload"]["reason"], "stop", "{ev}");
+    let err = d
+        .rpc(
+            "agent_send",
+            json!({"alias": "dv1", "text": "steer", "nudge": true}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("agent dv1 has no live pane"), "{err}");
+    // Nothing reached the pane.
+    let input = std::fs::read_to_string(d.pane_file(&mock, "dv1", "input")).unwrap_or_default();
+    assert!(!input.contains("steer"), "{input}");
 }
 
 /// The mock pane file for `alias` under `state` — for a restarted daemon
@@ -2036,25 +2105,34 @@ fn pty_hot_restart_retires_stale_awaiting_report_rows() {
             )
             .unwrap();
         }
+        // F2: a row adopted before its `submitted` marker landed holds the
+        // queue just the same — and is bounded just the same.
+        conn.execute(
+            "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,
+                 result,created,started)
+             VALUES('old3','dv1','nudge',NULL,'user','running',?1,NULL,?2,?2)",
+            rusqlite::params![format!("pty-{generation}-turn-old3"), old],
+        )
+        .unwrap();
     }
     d.rpc("shutdown", json!({})).unwrap();
     d.handle.take().unwrap().join().unwrap().unwrap();
     let state = d.state.clone();
     assert_eq!(
         read_marker(&state)["entries"].as_array().unwrap().len(),
-        2,
-        "both stale rows are recorded like any running turn"
+        3,
+        "every stale row is recorded like any running turn"
     );
     std::mem::forget(d);
     let d = TestDaemon::start_on(state);
-    wait_event_count(&d, "dv1", "turn_adopted", 2, 25);
-    for id in ["old1", "old2"] {
+    wait_event_count(&d, "dv1", "turn_adopted", 3, 25);
+    for id in ["old1", "old2", "old3"] {
         let m = d.wait_message("dv1", id, &["unknown"], 20);
         assert_eq!(m["result"]["via"], "report_timeout", "{m}");
     }
     d.wait_agent("dv1", "attention", 20);
-    let timeouts = wait_event_count(&d, "dv1", "report_timeout", 2, 5);
-    assert_eq!(timeouts.len(), 2);
+    let timeouts = wait_event_count(&d, "dv1", "report_timeout", 3, 5);
+    assert_eq!(timeouts.len(), 3);
     // Fenced, so a later send is held, never delivered to the pane.
     d.rpc(
         "agent_send",
@@ -2063,7 +2141,7 @@ fn pty_hot_restart_retires_stale_awaiting_report_rows() {
     .unwrap();
     assert_eq!(d.message_state("dv1", "new1"), "queued");
     let show = d.rpc("agent_show", json!({"alias": "dv1"})).unwrap();
-    assert_eq!(show["unknown"], 2, "{show}");
+    assert_eq!(show["unknown"], 3, "{show}");
     assert!(show["agent"]["awaiting_report"].is_null(), "{show}");
 }
 
@@ -2115,8 +2193,17 @@ fn park_idle_labelled_turns(d: &TestDaemon, mock: &MockDevin) -> (String, String
         conn.execute(
             "INSERT INTO messages(id,alias,body,reply_to,source,state,turn_id,
                  created)
-             VALUES('m2','dv1','other',NULL,'test','running',?1,1.0)",
-            rusqlite::params![token2],
+             VALUES('m2','dv1','other',NULL,'test','running',?1,?2)",
+            // Fresh: since CAD-250 F2 every turn-holding pty row is
+            // bounded from its delivery, so an epoch-1970 row would
+            // expire (and fence) on the actor's next pass.
+            rusqlite::params![
+                token2,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64()
+            ],
         )
         .unwrap();
         conn.execute("UPDATE agents SET state='idle' WHERE alias='dv1'", [])
