@@ -5301,12 +5301,14 @@ fn pty_claim_is_single_use_and_expires() {
     .unwrap();
     pty_token(&d, "dv1", "m1");
     // The claim was consumed: a second send queues, it does not paste.
+    // Wait for m2's own recorded refusal, not a fixed sleep: the actor
+    // takes the send at once and the gate may still be probing (CAD-286).
     d.rpc(
         "agent_send",
         json!({"alias": "dv1", "text": "two", "message": "m2"}),
     )
     .unwrap();
-    thread::sleep(Duration::from_millis(700));
+    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m2", 20);
     assert_eq!(d.message_state("dv1", "m2"), "queued");
     let input = std::fs::read_to_string(d.pane_file(&_mock, "dv1", "input")).unwrap_or_default();
     assert!(!input.contains("two"), "second send pasted without a claim");
@@ -5679,7 +5681,8 @@ fn pty_respond_rejected_and_mode_blocks_send() {
         json!({"alias": "dv1", "text": "x", "message": "m1"}),
     )
     .unwrap();
-    thread::sleep(Duration::from_millis(700));
+    // The recorded refusal, not a fixed sleep (CAD-286).
+    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
     assert_eq!(d.message_state("dv1", "m1"), "queued");
     std::fs::remove_file(d.pane_file(&mock, "dv1", "mode")).unwrap();
     d.rpc("agent_ready", json!({"alias": "dv1"})).unwrap();
