@@ -139,6 +139,7 @@ pub fn enable() -> io::Result<()> {
 
 /// Turn registration on, then mark the process child subreaper — both
 /// before any child exists, so every child it ever has is registered.
+#[cfg(target_os = "linux")]
 fn arm() -> io::Result<()> {
     ENABLED.store(true, Ordering::SeqCst);
     // SAFETY: plain prctl with integer arguments.
@@ -146,6 +147,18 @@ fn arm() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// No child subreaper off Linux, and the daemon must not run without
+/// one: refuse, before registration is ever turned on. The macOS port
+/// is CAD-315.
+#[cfg(not(target_os = "linux"))]
+fn arm() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the child subreaper (CAD-308) is Linux-only; `cadence daemon run` is not \
+         supported on this platform until the macOS port (CAD-315)",
+    ))
 }
 
 /// One adopted live child, for [`adopted_report`].
@@ -197,12 +210,25 @@ pub fn adopted_report(limit: usize) -> (usize, Vec<Adopted>, u64) {
 }
 
 /// Whether this process is marked child subreaper (`PR_GET_CHILD_SUBREAPER`).
+#[cfg(target_os = "linux")]
 pub fn is_subreaper() -> bool {
     let mut flag: libc::c_int = 0;
     // SAFETY: the kernel writes one int through the pointer.
     let rc = unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut flag as *mut libc::c_int) };
     rc == 0 && flag != 0
 }
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_subreaper() -> bool {
+    false
+}
+
+/// `waitid` flag that also waits for clone children; Linux-only, and
+/// nothing else reaps here (`arm` refuses off Linux).
+#[cfg(target_os = "linux")]
+const WALL: libc::c_int = libc::__WALL;
+#[cfg(not(target_os = "linux"))]
+const WALL: libc::c_int = 0;
 
 /// One reaper pass (see the module doc). Returns how many adopted
 /// children it reaped.
@@ -252,7 +278,7 @@ fn still_owned(pid: u32, start: Option<u64>) -> bool {
             libc::P_PID,
             pid as libc::id_t,
             &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | WALL,
         )
     };
     if rc == -1 {
@@ -274,7 +300,7 @@ fn peek_exited() -> Option<u32> {
             libc::P_ALL,
             0,
             &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | WALL,
         )
     };
     let pid = unsafe { info.si_pid() };
@@ -291,7 +317,7 @@ fn reap_if_exited(pid: u32) -> bool {
             libc::P_PID,
             pid as libc::id_t,
             &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::__WALL,
+            libc::WEXITED | libc::WNOHANG | WALL,
         )
     };
     rc == 0 && unsafe { info.si_pid() } == pid as libc::pid_t

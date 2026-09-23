@@ -7000,6 +7000,7 @@ fn owner_generation(agent: &Agent) -> Option<String> {
 
 /// Reject peers that are not the same Unix user; return the peer PID
 /// used to derive slot and approval-answer caller identity.
+#[cfg(target_os = "linux")]
 fn check_peer(stream: &UnixStream) -> Result<u32> {
     let mut cred = libc::ucred {
         pid: 0,
@@ -7023,6 +7024,17 @@ fn check_peer(stream: &UnixStream) -> Result<u32> {
         return Err(Error::rejected("Socket peer is not the same user"));
     }
     Ok(cred.pid as u32)
+}
+
+/// Off Linux there is no `SO_PEERCRED`: refuse every peer (fail closed)
+/// until the macOS port (CAD-315) brings a verified equivalent. The
+/// daemon does not start there anyway — see `reaper::enable`.
+#[cfg(not(target_os = "linux"))]
+fn check_peer(_stream: &UnixStream) -> Result<u32> {
+    Err(Error::rejected(
+        "socket peer credentials are only checked on Linux; the daemon is Linux-only \
+         until the macOS port (CAD-315)",
+    ))
 }
 
 /// Linux process-start identity for an endpoint pid. The daemon stores the

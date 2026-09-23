@@ -765,11 +765,18 @@ fn fs_free(path: &Path) -> Option<FsFree> {
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
         return None;
     }
+    // Block counts are u64 on Linux but u32 on macOS; widen them there.
+    #[allow(clippy::useless_conversion)]
+    let (bavail, blocks, frsize) = (
+        u64::from(st.f_bavail),
+        u64::from(st.f_blocks),
+        u64::from(st.f_frsize),
+    );
     Some(FsFree {
         path: path.to_path_buf(),
         dev,
-        free: st.f_bavail.saturating_mul(st.f_frsize),
-        total: st.f_blocks.saturating_mul(st.f_frsize),
+        free: bavail.saturating_mul(frsize),
+        total: blocks.saturating_mul(frsize),
     })
 }
 
