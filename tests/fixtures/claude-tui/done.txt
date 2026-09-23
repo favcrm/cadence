@@ -1,0 +1,14 @@
+       "state": "reported"
+     }
+  ⎿  Allowed by auto mode classifier
+
+● HEAD is 016ef37f28ff4d63b6f86cd0032f62b139b8e090 and the worktree is clean, so QA can start on that commit. The remote
+  branch is at the same SHA. I made no edits, commits, pushes or builds, and reported the SHA for this task with --sha.
+
+✻ Crunched for 18s · done 11:57 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  [Opus 5.5 (1M context)] 📁 cad-144-finish-hardening | [████████████████████████] 124.9% (194,910)
+  ⏵⏵ auto mode on (shift+tab to cycle) · PR #169 · ← 3 agents

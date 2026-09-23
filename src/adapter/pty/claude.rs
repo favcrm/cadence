@@ -46,6 +46,10 @@ const STATUS_LINES: usize = 16;
 /// Menu anchors only match inside it — the transcript above can
 /// legitimately quote the same strings.
 const MENU_LINES: usize = 24;
+/// How far above the input box's top border a running turn's status
+/// row may sit: the row itself, a blank, and the turn's todo list or
+/// queued-message rows rendered under it.
+const SPINNER_REACH: usize = 12;
 
 /// Claude TUI screen signatures — THE one place they live. A provider
 /// TUI update means editing this table, never the gate logic. Every
@@ -62,6 +66,11 @@ mod claude_screen {
     /// On-screen markers while a turn is running: the spinner line's
     /// interrupt hint and a tool call's pending marker.
     pub const BUSY: &[&str] = &["esc to interrupt", "Waiting…"];
+    /// Frames of the glyph leading a turn's status row. 2.1.280 no
+    /// longer prints `esc to interrupt` there — while a turn runs the
+    /// row reads `✻ Warping… (1m 35s · ↓ 6.5k tokens · …)`, and once it
+    /// ends `✻ Crunched for 18s · done 11:57 AM` (CAD-285).
+    pub const SPINNER: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '*'];
     /// An open select/permission menu — the anchors are the permission
     /// prompt's title plus the workspace-trust dialog in both observed
     /// 2.1.x wordings. They are natural-language rows, so a match only
@@ -288,6 +297,30 @@ fn menu_subject(screen: &str) -> Option<String> {
         .map(|l| l.trim().chars().take(100).collect())
 }
 
+/// A running turn's status row: flush left, a [`claude_screen::SPINNER`]
+/// glyph, a space, then a verb ending in `…`. A finished turn's row
+/// keeps the glyph but has no ellipsis (`✻ Crunched for 18s · done`),
+/// and transcript output quoting the row is indented, so neither
+/// matches.
+fn spinner_row(line: &str) -> bool {
+    let mut chars = line.chars();
+    let (Some(glyph), Some(' ')) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    let Some(stem) = claude_screen::SPINNER
+        .contains(&glyph)
+        .then(|| chars.as_str().split_whitespace().next())
+        .flatten()
+        .and_then(|verb| verb.strip_suffix('…'))
+    else {
+        return false;
+    };
+    stem.chars().next().is_some_and(char::is_alphabetic)
+        && stem
+            .chars()
+            .all(|c| c.is_alphabetic() || c == '\'' || c == '-')
+}
+
 /// Reduce a captured Claude screen to gate facts. The last boxed `❯`
 /// line is the input box; text after it is a draft — except ghost
 /// suggestion text, which a cursor parked at the box's start gives
@@ -298,7 +331,8 @@ fn menu_subject(screen: &str) -> Option<String> {
 /// text) without the pane being busy at all. The region is anchored
 /// at the last NON-BLANK row — `capture-pane` pads to pane height, so
 /// a young session on a tall pane has blank rows below the real
-/// content.
+/// content. A running turn's spinner row is read by position instead:
+/// flush left between the box and the last transcript item.
 pub fn analyze_claude(screen: &str, cursor: Option<(u32, u32)>) -> Probe {
     analyze_frame(screen, None, cursor)
 }
@@ -385,7 +419,7 @@ fn analyze_frame(screen: &str, undimmed: Option<&str>, cursor: Option<(u32, u32)
     let legend_ok = hints >= 2 || hint_near_anchor;
     let approval_menu = (anchor && (numbered.len() >= 2 || highlighted || legend_ok))
         || (legend_ok && (numbered.len() >= 2 || highlighted));
-    let busy_marker = claude_screen::BUSY.iter().any(|m| tail.contains(m));
+    let interrupt_marker = claude_screen::BUSY.iter().any(|m| tail.contains(m));
     // The input box is a `❯`-leading line whose previous row is the
     // `─` border — menu option lists lead with `❯` too but are never
     // boxed, and transcript `❯` echoes have no border either.
@@ -401,6 +435,18 @@ fn analyze_frame(screen: &str, undimmed: Option<&str>, cursor: Option<(u32, u32)
         }
     }
     let prompt_visible = prompt.is_some();
+    // The live status row sits between the box's top border and the
+    // last transcript item (`●`) — the frame position a quoted row
+    // cannot take.
+    let spinner = prompt.is_some_and(|(row, _)| {
+        lines[..row.saturating_sub(1)]
+            .iter()
+            .rev()
+            .take(SPINNER_REACH)
+            .take_while(|l| !l.starts_with('●'))
+            .any(|l| spinner_row(l))
+    });
+    let busy_marker = interrupt_marker || spinner;
     let draft_of = |l: &str| {
         l.trim_start()
             .trim_start_matches(claude_screen::PROMPT)
@@ -425,10 +471,15 @@ fn analyze_frame(screen: &str, undimmed: Option<&str>, cursor: Option<(u32, u32)
             false,
             menu_subject(content).unwrap_or_else(|| "approval menu is open".to_string()),
         )
-    } else if busy_marker {
+    } else if interrupt_marker {
         (
             false,
             "tui is busy (interrupt marker on screen)".to_string(),
+        )
+    } else if spinner {
+        (
+            false,
+            "tui is busy (turn spinner above the input box)".to_string(),
         )
     } else if !prompt_visible {
         (false, "no prompt line visible".to_string())
@@ -1064,6 +1115,69 @@ mod tests {
             let p = analyze_claude(&screen, None);
             assert!(!p.idle && p.busy_marker, "{marker}: {}", p.reason);
         }
+    }
+
+    /// CAD-285: Claude Code 2.1.280 dropped `esc to interrupt` from the
+    /// running turn's status row. spinner.txt is a live capture of a
+    /// working pane (cad-284, 2026-09-23) whose only busy evidence is
+    /// that row above an empty box; it probed idle.
+    #[test]
+    fn running_turn_spinner_above_the_box_is_busy() {
+        let busy = fixture("spinner.txt");
+        let p = analyze_claude(&busy, Some((2, 14)));
+        assert!(!p.idle && p.busy_marker, "{p:?}");
+        assert_eq!(p.reason, "tui is busy (turn spinner above the input box)");
+        // Every spinner frame and status shape observed on 2.1.280.
+        let observed = "✻ Warping… (1m 35s · ↓ 6.5k tokens · thinking with high effort)";
+        for row in [
+            "✢ Thundering… (4m 5s · ↓ 22.6k tokens · thinking with high effort)",
+            "· Warping… (11s · ↓ 595 tokens)",
+            "✶ Recombobulating… (4s · ↓ 217 tokens · thought for 1s)",
+            "✳ Tomfoolering… (8s · ↓ 400 tokens · thinking with high effort)",
+            "✽ Schlepping…",
+        ] {
+            let p = analyze_claude(&busy.replace(observed, row), None);
+            assert!(!p.idle && p.busy_marker, "{row}: {p:?}");
+        }
+        // A todo list rendered under the spinner keeps it busy.
+        let todos = busy.replace(
+            observed,
+            &format!(
+                "{observed}\n  ⎿  ☒ Read the store\n     ☐ Write the test\n     ☐ Run the suite"
+            ),
+        );
+        assert!(analyze_claude(&todos, None).busy_marker);
+    }
+
+    /// A finished turn keeps the glyph but loses the ellipsis
+    /// (`✻ Crunched for 18s · done 11:57 AM`, live capture from an idle
+    /// cad-144 pane), and a spinner-shaped row is only the live status
+    /// row when it is flush left below the last transcript item.
+    #[test]
+    fn finished_turn_row_and_quoted_spinners_are_not_busy() {
+        let done = fixture("done.txt");
+        let p = analyze_claude(&done, Some((2, 9)));
+        assert!(p.idle && !p.busy_marker, "{p:?}");
+        for row in [
+            "✻ Cooked for 50m 41s · done 10:02 AM",
+            "✻ Baked for 2s · done 12:30 PM",
+        ] {
+            let p = analyze_claude(
+                &done.replace("✻ Crunched for 18s · done 11:57 AM", row),
+                None,
+            );
+            assert!(!p.busy_marker, "{row}: {p:?}");
+        }
+        // Quoted in tool output (indented) or above the last transcript
+        // item, the same text is transcript, not the live status row.
+        let spinner = "✻ Warping… (1m 35s · ↓ 6.5k tokens)";
+        let indented = done.replace(
+            "✻ Crunched for 18s · done 11:57 AM",
+            &format!("  ⎿  {spinner}\n\n✻ Crunched for 18s · done 11:57 AM"),
+        );
+        assert!(!analyze_claude(&indented, None).busy_marker);
+        let above_item = format!("{spinner}\n\n{done}");
+        assert!(!analyze_claude(&above_item, None).busy_marker);
     }
 
     #[test]
