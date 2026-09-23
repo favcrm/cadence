@@ -95,8 +95,11 @@ Company-scope items keep the two-review quorum of the current store.
   record (the CAD-230 enrollment: provider pid + start time + uid + owner
   generation), for **pty and managed endpoints alike**. No memory-specific
   `/proc` PTY rule; this also makes identity work on macOS.
-- Callers outside every agent tree are "not an agent" — the operator path — and
-  are never impersonated.
+- Callers outside every agent tree have **no agent identity**. That is not proof
+  of being the operator: an agent can leave its process tree (setsid, double
+  fork, systemd-run, a new tmux session). Operator authority, such as finalizing
+  memory from the Vault, requires positive proof — the CAD-276 rule now, web
+  operator auth (CAD-313) for the UI (review of PR #197).
 - The backlog (CAD-382): the 11 stuck proposals become *agent · claimed*
   candidates. Mechanical ones pass after re-run + curator; judgement ones go to
   the operator queue in the Vault UI (CAD-357) under web operator auth (CAD-313).
