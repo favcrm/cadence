@@ -43,7 +43,11 @@ id: CAD-16                  # must equal the folder name
 title: claude provider: managed stream-json endpoint
 status: backlog             # file status; notes/rollup can override it
 priority: P1                # P0..P3
-owner: cookie-cesium        # optional
+owner: cookie-cesium        # optional — the lane doing the work
+claim:                      # optional (CAD-383) — who holds the issue while
+  by: pm-opus               #  it is in flight, since when, and a note; set
+  at: 2026-09-23T14:31:14Z  #  by `issue claim` and by the start/dispatch
+  note: claude subagent lane #  that puts it into work — see Claims below
 component: adapter          # optional, must be declared by the project
 tags: [claude, provider]    # optional; [a-z0-9][a-z0-9-]{0,31}, ≤12, stored
                             # sorted + de-duplicated; from project.yaml's
@@ -140,6 +144,12 @@ cadence issue start CAD-16                  # mints .cadence/wt/cad-16-<slug> on
     [--job --pm <alias> --spec <file>       # moves backlog|ready to doing, prints
      [--assignee <alias>]]                  # the trailer; --job also opens the M3
                                             # job + scoped task (daemon required)
+    [--by <who>] [--take-over <reason>]     # refused on a doing/review issue
+                                            # someone else holds (see Claims)
+cadence issue claim CAD-16 [--by <who>]     # record/refresh a claim the dispatch
+    [--note <text>] [--take-over <reason>]  # check sees; backlog|ready → doing
+cadence issue release CAD-16 [--by <who>]   # the holder gives the claim up
+    [--note <text>]
 cadence issue set CAD-16 status=doing owner=fable-cc
 cadence issue set CAD-16 tags=claude,provider
                                             # replaces the tag list; `tags=` clears
@@ -284,7 +294,8 @@ The board API serves the same entries:
 `.cadence/wt/<id-lower>-<slug>` on branch `cadence/<id-lower>-<slug>`
 inside the project repo, records both as refs on the issue, moves
 `backlog`/`ready` to `doing` (other statuses are left alone), sets
-`owner` when empty (`--owner`, else the resolved actor), and prints
+`owner` when empty (`--owner`, else the resolved actor), records the
+requester as the `claim` when the issue has none, and prints
 everything the worker needs — worktree, branch, base `{ref, sha}` and
 the `Issue: <ID>` trailer — as JSON.
 
@@ -451,6 +462,80 @@ or running — the output says so. Delivery itself stays the daemon's
 business: no `--ready`, no forced claims; the output prints the queued
 message id and the worker's probe verdict so the operator knows
 whether it lands now or when the pane idles.
+
+### Claims — who may start or dispatch an issue in flight (CAD-383)
+
+Two sessions implementing the same ticket is the failure this prevents:
+a PM had set `owner`, but neither `dispatch` nor `issue start` read it.
+Now both check the issue's **holders** — `claim.by` (the PM that took
+it) and `owner` (the lane doing the work) — against the **requesters**
+a command speaks for:
+
+| Command | Requesters |
+| --- | --- |
+| `dispatch` (plain and `--job`) | the PM (`--reply-to`, default `CADENCE_ALIAS`) and the worker (`--to`) |
+| `issue start` | `--by`, else `--pm` (with `--job`), else `CADENCE_ALIAS`, else `operator` — plus the owner it would record (`--owner`/`--assignee`) |
+| `issue claim` / `issue release` | `--by`, else `CADENCE_ALIAS`, else `operator` |
+
+- **Shared name → unchanged.** Re-dispatching to the same worker, the
+  claiming PM handing the issue to another of its workers, dispatching
+  to the current owner, and an idempotent re-start all go through as
+  before.
+- **No shared name, status `doing`/`review` → refused** before anything
+  is created (no worktree, branch, commit, message or job), naming the
+  holder and the claim age: `D-1 is doing and held by pm-a (owner w1),
+  claimed 2h ago — dispatch by pm-b → w3 refused …`. The error's code is
+  `claimed`.
+- **`--take-over "<reason>"`** (on `dispatch`, `issue start`, `issue
+  claim`) proceeds anyway. The reason is required (one line, ≤500
+  bytes). The take-over replaces `claim` (by the requester, reason as
+  its note) and `owner` (the new worker, else the requester) and is
+  recorded as a `Take-over by <who> from <holder>, claimed <age>:
+  <reason>` comment in its own commit — `claim take-over by <who> from
+  <holder>` in `issue log` (kind `claim`). It commits before the lane
+  is touched, so a later lane failure leaves the take-over standing.
+- **`backlog`/`ready` with an owner → warning only** (`warning: …` on
+  stderr, `claim.warning` in the JSON), and the owner is kept. An owner
+  there is a triage assignment or the project's `default_owner`, not
+  work in flight; refusing would block every dispatch of an issue
+  created with a default owner. Done/dropped issues are not protected
+  either. Unowned, unclaimed issues pass silently in every status.
+
+The start that puts an unclaimed issue into work records the claim —
+`dispatch` records the PM, `issue start` the requester — in the same
+commit as the refs, so the dispatching PM stays a holder after the
+worker becomes `owner`. Claim age is `now − claim.at`; an issue owned
+before claims existed is dated by the tracker commit that last changed
+its `owner:` line (a bounded `git log -G '^owner:'`, "age unknown" past
+the bound).
+
+**A PM whose lanes run outside cadence** (Claude Code subagents, Codex,
+a human) leaves no dispatch message ref — the claim is the only signal,
+so record it before the lane starts:
+
+```bash
+cadence issue claim CAD-383 --by pm-opus --note "claude subagent, branch fix/cad383-owner-check"
+```
+
+One commit: the claim, `backlog|ready → doing`, and a `Claimed by …`
+comment. `owner` stays the lane: a claim leaves it alone, so the worker
+a later `dispatch` names becomes owner (a take-over displaces the old
+lane and makes the claimant owner until it dispatches one). Re-claiming your own claim refreshes `at` —
+a heartbeat for long work. A claim on someone else's doing/review
+issue refuses unless `--take-over`; so does the owner lane claiming an
+issue its PM holds. `cadence issue release CAD-383 [--note …]` clears
+the claim (and `owner` when it is the releaser); status is left alone,
+and only a holder may release. `issue set owner=…` and the board's
+PATCH are manual edits and are not checked.
+
+Claims show up where people look: `issue show`/`issue ls --json` and
+the board cards carry `claim: {by, at, note, age_secs}`; `cadence status`
+lists each agent's owned or claimed doing/review issues with their age
+(`CAD-383(2h)`) and a `claims:` footer line for holders with no agent
+row; `cadence overview` (and the board's project summary) lists every
+in-flight claim under its project. `cadence job dispatch <task>` is not
+checked — it re-sends a task whose job was minted through the checked
+`issue start --job`/`dispatch --job` path.
 
 `issue finish <ID>` is the other end — safe cleanup of the recorded
 worktree+branch pair. An issue with several open worktree refs needs

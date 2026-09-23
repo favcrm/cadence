@@ -55,6 +55,21 @@ pub struct Ref {
     pub agent: Option<String>,
 }
 
+/// CAD-383: who holds an issue that is in flight, since when, and why.
+/// Written by `issue claim`, by `issue start`/`dispatch` when they move
+/// an unclaimed issue into work, and replaced by a recorded take-over.
+/// `by` is the PM (or other requester) that took the issue — `owner`
+/// stays the lane doing the work — so the claimant can re-dispatch or
+/// reassign without a take-over.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Claim {
+    pub by: String,
+    /// RFC 3339 UTC — the claim age is measured from here.
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// `issue.md` YAML frontmatter. No `project` field (the folder says
 /// it), and never session, job or loop fields.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,6 +80,9 @@ pub struct Front {
     pub priority: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// CAD-383: the in-flight claim — see [`Claim`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<Claim>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component: Option<String>,
     /// Free-form slicing labels — stored sorted and de-duplicated.
@@ -97,6 +115,7 @@ impl Front {
             status: "backlog".to_string(),
             priority: "P2".to_string(),
             owner: None,
+            claim: None,
             component: None,
             tags: vec![],
             kind: None,

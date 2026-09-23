@@ -674,7 +674,8 @@ export default function OverviewView({
               const c = issues.data ? issueCounts(issues.data, p.key) : null;
               const excluded = c ? exclusionLabel(c) : "";
               return (
-                <div key={p.key} className="px-4 py-2.5 flex items-baseline gap-3">
+                <div key={p.key} className="px-4 py-2.5">
+                <div className="flex items-baseline gap-3">
                   <span className="text-label font-semibold text-ink-100 w-28 shrink-0 truncate">
                     {p.key}
                   </span>
@@ -693,6 +694,20 @@ export default function OverviewView({
                       oldest review {age(p.oldest_review_age)}
                     </span>
                   )}
+                </div>
+                {/* CAD-383: who holds each in-flight issue, and since when. */}
+                {(p.claims ?? []).length > 0 && (
+                  <ul className="mt-1 ml-[7.75rem] space-y-0.5">
+                    {(p.claims ?? []).map((cl) => (
+                      <li key={cl.issue} className="text-micro text-ink-400 truncate">
+                        <span className="text-ink-200">{cl.issue}</span> {cl.status} ·{" "}
+                        {cl.by ?? "?"}
+                        {cl.owner && cl.owner !== cl.by ? ` (owner ${cl.owner})` : ""} ·{" "}
+                        {cl.age_secs != null ? `claimed ${age(cl.age_secs)} ago` : "claim age unknown"}
+                      </li>
+                    ))}
+                  </ul>
+                )}
                 </div>
               );
             })}

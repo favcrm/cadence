@@ -1498,6 +1498,7 @@ mod tests {
                 status: "backlog".to_string(),
                 priority: "P2".to_string(),
                 owner: None,
+                claim: None,
                 component: None,
                 tags: vec!["intake".to_string(), "feedback".to_string()],
                 kind: Some("feedback".to_string()),

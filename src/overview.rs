@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use crate::adapter::registry;
 use crate::client;
 use crate::inbox;
-use crate::issue::{self, board, history, project, report};
+use crate::issue::{self, board, claim, history, project, report};
 use crate::proc::run_bounded;
 
 /// Git identity baked in by build.rs — `unknown` when git or a repo
@@ -2525,15 +2525,27 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                 ),
             ));
         }
+        // CAD-383: in-flight claims per project, with their age.
+        let claim_clock = claim::Clock::new(&pm.dir, STATUS_CLOCK_BUDGET);
         for p in &projects {
             if opts.scope.project.as_deref().is_some_and(|k| k != p.key) {
                 continue;
             }
             let mut open_by_status = serde_json::Map::new();
             let mut oldest_review: Option<i64> = None;
+            let mut claims: Vec<Value> = Vec::new();
             for v in views.iter().filter(|v| v.issue.project == p.key) {
                 if matches!(v.status.as_str(), "done" | "dropped") {
                     continue;
+                }
+                let front = &v.issue.front;
+                if matches!(v.status.as_str(), "doing" | "review")
+                    && !claim::holders(front).is_empty()
+                {
+                    let since = claim_clock.since(&p.key, front);
+                    let mut row = claim::row(&p.key, front, since, now);
+                    row["status"] = json!(v.status);
+                    claims.push(row);
                 }
                 let n = open_by_status
                     .get(&v.status)
@@ -2551,6 +2563,7 @@ pub fn overview_with(state_dir: &Path, pm_dir: &Path, opts: &Options) -> Result<
                 "key": p.key,
                 "open_by_status": open_by_status,
                 "oldest_review_age": oldest_review,
+                "claims": claims,
             }));
         }
         // Tracker behind its upstream — local refs only, never a fetch.

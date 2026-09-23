@@ -111,6 +111,21 @@ cadence inbox obs --wait 30                         # drain; each completes
                                                     #  via=inbox_read
 ```
 
+Issue dispatch and claims (docs/BOARD.md "Claims"):
+
+```bash
+cadence dispatch CAD-31 --to <w> --note <kickoff>   # issue start + one kickoff;
+                                                    #  records you as claimant
+cadence issue claim CAD-31 --note "<lane/branch>"   # lanes outside cadence:
+                                                    #  claim before starting
+cadence issue release CAD-31                        # give the claim up
+```
+
+`dispatch` and `issue start` refuse a doing/review issue another PM or lane
+holds, naming the holder and the claim age. Do not route around it with a
+second lane: ask the holder, or pass `--take-over "<reason>"` for a stale or
+agreed hand-over (recorded on the issue).
+
 Job work (the work axis over messages — see docs/JOBS.md):
 
 ```bash

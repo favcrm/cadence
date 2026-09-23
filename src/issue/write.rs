@@ -1035,6 +1035,58 @@ pub fn add_comment(
     Ok(out)
 }
 
+/// CAD-383: write `front` and one comment by `author` in a single tracker
+/// commit (`subject` without the id). Call under the PM lock. A failed
+/// commit restores `prev` and removes the comment, so a refusal leaves
+/// the issue as it was.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_front_with_comment(
+    pm: &Pm,
+    dir: &Path,
+    prev: &Front,
+    front: &Front,
+    body: &str,
+    author: &str,
+    text: &str,
+    subject: &str,
+    actor: &str,
+) -> Result<String> {
+    let id = front.id.as_str();
+    crate::issue::claim::check_alias(author, "Claimant")?;
+    // CAD-109: a credential-shaped note or reason is refused here too.
+    crate::secret::guard(&format!("{id}: comment"), text)?;
+    let comments = dir.join("comments");
+    if comments.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{id}: comments/ is a symlink — refusing to write outside the PM dir"
+        )));
+    }
+    std::fs::create_dir_all(&comments)?;
+    let epoch = time::now_epoch();
+    let meta = model::CommentFront {
+        author: author.to_string(),
+        at: time::iso(epoch),
+        kind: Some("claim".to_string()),
+    };
+    let rendered = parse::render(&meta, text)?;
+    let path = create_exclusive(
+        &comments,
+        &format!("{}-{author}.md", time::basic(epoch)),
+        rendered.as_bytes(),
+    )?;
+    let committed = save_front(dir, front, body)
+        .and_then(|_| commit_who(pm, &format!("{id}: {subject}"), &[id], actor, Some(author)));
+    if let Err(e) = committed {
+        let _ = save_front(dir, prev, body);
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default())
+}
+
 /// `issue attach <ID> <file>` — copy into `artifacts/` (basename only),
 /// create-only, under `artifact_max_bytes`.
 pub fn attach(pm: &Pm, id: &str, file: &Path) -> Result<Value> {
