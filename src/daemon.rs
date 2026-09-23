@@ -804,15 +804,7 @@ impl Shared {
     /// optionally long-polling up to `wait` seconds (≤ 30) for the next
     /// entry, the way `agent_events` does. Read-only.
     fn rpc_thread_read(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        let raw = required_str(params, "alias")?;
-        // A thread outlives its agent row: a removed alias still reads.
-        let alias = match self.resolve_alias(raw) {
-            Ok(alias) => alias,
-            Err(e) => match self.store.thread(raw)? {
-                Some(_) => raw.to_string(),
-                None => return Err(e),
-            },
-        };
+        let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let after = optional_i64(params, "after").unwrap_or(0);
         if after < 0 {
             return Err(Error::rejected("Thread cursor must be nonnegative"));
@@ -886,13 +878,18 @@ impl Shared {
             }
         }
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
-        required_str(params, "text")?;
-        let thread = self.store.ensure_thread(&alias)?;
         let mut send = params.clone();
         send["alias"] = json!(alias);
         send["source"] = json!("operator");
-        let mut receipt = self.send_as(&send, &|_| store::Sender::Operator)?;
-        receipt["thread"] = thread.to_json();
+        // The thread starts inside the enqueue transaction: a refused
+        // message leaves no thread and no `thread_created` event.
+        let mut receipt = self.send_as(&send, &|_| store::Sender::OperatorChat)?;
+        receipt["thread"] = self
+            .store
+            .thread(&alias)?
+            .as_ref()
+            .map(store::Thread::to_json)
+            .unwrap_or(Value::Null);
         Ok(receipt)
     }
 

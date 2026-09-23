@@ -4,7 +4,10 @@
 //! chat — kept in the runtime store so it outlives every provider
 //! session: a new, lost or compacted session changes nothing here. One
 //! thread per agent alias for now; the thread has its own id so more
-//! than one per agent can come later without a schema change.
+//! than one per agent can come later without a schema change. Removing
+//! the agent archives its thread (`alias` NULL, `archived_alias` kept,
+//! a `system` entry marks it): a new agent under a reused alias starts
+//! fresh (CAD-304 S4).
 //!
 //! Entries are append-only and ordered by `seq` (one global
 //! autoincrement, so a cursor is a plain integer):
@@ -66,6 +69,10 @@ pub enum Sender {
     /// A caller tied to no agent. This is the operator by default, not
     /// by positive proof (CAD-313 / CAD-335 phase 2).
     Operator,
+    /// The operator's chat (`thread_send`): an [`Sender::Operator`] that
+    /// also starts the alias's thread — inside the enqueue transaction,
+    /// so a refused message never leaves a thread behind.
+    OperatorChat,
     /// A caller the daemon attributed to a registered agent.
     Agent(String),
     /// Internal enqueues (routed results, kickoffs, monitor dispatch)
@@ -76,6 +83,7 @@ pub enum Sender {
 #[derive(Debug, Clone)]
 pub struct Thread {
     pub id: String,
+    /// The live alias; archived threads are never returned by alias.
     pub alias: String,
     pub created: f64,
     pub updated: f64,
@@ -157,7 +165,8 @@ fn row_entry(row: &rusqlite::Row) -> rusqlite::Result<ThreadEntry> {
 /// converges on reopen.
 pub(super) const SCHEMA_V13: &str = "CREATE TABLE IF NOT EXISTS threads(
         id TEXT PRIMARY KEY,
-        alias TEXT NOT NULL UNIQUE,
+        alias TEXT UNIQUE,
+        archived_alias TEXT,
         created REAL NOT NULL,
         updated REAL NOT NULL);
      CREATE TABLE IF NOT EXISTS thread_entries(
@@ -253,7 +262,7 @@ pub fn tool_summary(name: &str, input: &Value) -> String {
 /// The thread entry for a message queued to a threaded agent.
 fn message_entry<'a>(sender: &Sender, source: &str, body: &'a str, id: &'a str) -> NewEntry<'a> {
     let (role, payload) = match sender {
-        Sender::Operator => (ROLE_OPERATOR, json!({"source": source})),
+        Sender::Operator | Sender::OperatorChat => (ROLE_OPERATOR, json!({"source": source})),
         Sender::Agent(alias) => (ROLE_SYSTEM, json!({"source": source, "from": alias})),
         Sender::Unattributed => (ROLE_SYSTEM, json!({"source": source})),
     };
@@ -272,7 +281,15 @@ impl Store {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         self.agent_in(&tx, alias)?;
-        if let Some(thread) = Self::thread_in(&tx, alias)? {
+        let thread = Self::ensure_thread_in(&tx, alias)?;
+        tx.commit()?;
+        Ok(thread)
+    }
+
+    /// [`Self::ensure_thread`] inside the caller's transaction; the
+    /// caller has already proved the agent exists.
+    fn ensure_thread_in(tx: &Connection, alias: &str) -> Result<Thread> {
+        if let Some(thread) = Self::thread_in(tx, alias)? {
             return Ok(thread);
         }
         let at = now();
@@ -281,14 +298,42 @@ impl Store {
             "INSERT INTO threads(id,alias,created,updated) VALUES(?,?,?,?)",
             params![id, alias, at, at],
         )?;
-        Self::event(&tx, alias, "thread_created", json!({"thread": id}))?;
-        tx.commit()?;
+        Self::event(tx, alias, "thread_created", json!({"thread": id}))?;
         Ok(Thread {
             id,
             alias: alias.to_string(),
             created: at,
             updated: at,
         })
+    }
+
+    /// Detach the alias's thread when its agent row is removed (CAD-304
+    /// S4: a reused alias starts fresh). The rows stay, keyed by thread
+    /// id; the alias moves to `archived_alias` and a `system` entry marks
+    /// the removal. A later registration under the alias gets a new
+    /// thread.
+    pub(super) fn thread_detach_in(tx: &Connection, alias: &str) -> Result<()> {
+        let Some(thread) = Self::thread_in(tx, alias)? else {
+            return Ok(());
+        };
+        Self::thread_append_in(
+            tx,
+            alias,
+            NewEntry {
+                role: ROLE_SYSTEM,
+                kind: KIND_MESSAGE,
+                text: &format!("agent '{alias}' was removed; this thread is archived"),
+                payload: Some(json!({"event": "agent_removed"})),
+                message_id: None,
+            },
+        )?;
+        // No event under the alias: the alias's events were just pruned,
+        // and a new registration must not inherit one.
+        tx.execute(
+            "UPDATE threads SET alias=NULL, archived_alias=? WHERE id=?",
+            params![alias, thread.id],
+        )?;
+        Ok(())
     }
 
     /// The alias's thread, if one was ever started.
@@ -406,6 +451,9 @@ impl Store {
         body: &str,
         id: &str,
     ) -> Result<()> {
+        if *sender == Sender::OperatorChat {
+            Self::ensure_thread_in(tx, alias)?;
+        }
         Self::thread_append_in(tx, alias, message_entry(sender, source, body, id))?;
         Ok(())
     }
@@ -767,11 +815,15 @@ mod tests {
         }
     }
 
+    /// CAD-304 S4 applied to chats: removing an agent archives its
+    /// thread (rows kept by thread id, a `system` entry marks it); a new
+    /// agent under the reused alias starts a fresh thread and inherits
+    /// nothing. The timer gc path archives the same way.
     #[test]
-    fn a_thread_outlives_its_agent_row() {
+    fn a_removed_alias_archives_its_thread_and_a_reuse_starts_fresh() {
         let (dir, s) = store();
         reg(&s, "master", dir.path());
-        s.ensure_thread("master").unwrap();
+        let old = s.ensure_thread("master").unwrap();
         s.enqueue("master", "remember me", None, "m1", "user")
             .unwrap();
         let m = s.message("m1").unwrap().unwrap();
@@ -779,13 +831,112 @@ mod tests {
             .unwrap();
         s.set_agent_state("master", "stopped", None).unwrap();
         s.remove_agent("master", false).unwrap();
-        let entries = s.thread_entries("master", 0, 10).unwrap();
-        assert_eq!(entries.len(), 2);
-        // The same alias registered again continues the same chat.
-        reg(&s, "master", dir.path());
-        s.enqueue("master", "back again", None, "m2", "user")
+        assert!(s.thread("master").unwrap().is_none());
+        assert!(s.thread_entries("master", 0, 10).unwrap().is_empty());
+        // The archived rows stay under the old thread id.
+        let (archived_alias, alias): (Option<String>, Option<String>) = s
+            .conn()
+            .query_row(
+                "SELECT archived_alias, alias FROM threads WHERE id=?",
+                [&old.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(s.thread_entries("master", 0, 10).unwrap().len(), 3);
+        assert_eq!(archived_alias.as_deref(), Some("master"));
+        assert_eq!(alias, None);
+        let kept: Vec<(String, String)> = s
+            .conn()
+            .prepare("SELECT role, text FROM thread_entries WHERE thread_id=? ORDER BY seq")
+            .unwrap()
+            .query_map([&old.id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        assert_eq!(kept[2].0, "system");
+        assert!(kept[2].1.contains("removed"), "{kept:?}");
+        let left: i64 = s
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM events WHERE alias='master' AND job_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "no event is left for a reused alias to inherit");
+
+        // A new agent under the same alias: no thread until one starts,
+        // and then a different one with none of the old entries.
+        reg(&s, "master", dir.path());
+        s.enqueue("master", "unthreaded", None, "m2", "user")
+            .unwrap();
+        assert!(s.thread("master").unwrap().is_none());
+        let fresh = s.ensure_thread("master").unwrap();
+        assert_ne!(fresh.id, old.id);
+        s.enqueue("master", "hello again", None, "m3", "user")
+            .unwrap();
+        let entries = s.thread_entries("master", 0, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "hello again");
+
+        // Removing again archives the second thread beside the first.
+        for id in ["m2", "m3"] {
+            let m = s.message(id).unwrap().unwrap();
+            s.finish(&m, "completed", &json!({"text": "ok"}), None)
+                .unwrap();
+        }
+        s.set_agent_state("master", "stopped", None).unwrap();
+        s.remove_agent("master", false).unwrap();
+        let archived: i64 = s
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM threads WHERE archived_alias='master' AND alias IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived, 2);
+    }
+
+    /// A refused chat message starts no thread: the thread is created
+    /// inside the enqueue transaction, after validation.
+    #[test]
+    fn a_refused_operator_chat_message_leaves_no_thread() {
+        let (dir, s) = store();
+        reg(&s, "master", dir.path());
+        let too_long = "x".repeat(48_001);
+        for body in ["", too_long.as_str()] {
+            assert!(s
+                .enqueue_sent(
+                    "master",
+                    body,
+                    None,
+                    "c1",
+                    "operator",
+                    None,
+                    &Sender::OperatorChat,
+                )
+                .is_err());
+        }
+        assert!(s.thread("master").unwrap().is_none());
+        assert!(s
+            .events("master", 0, 100)
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != "thread_created"));
+        s.enqueue_sent(
+            "master",
+            "ok now",
+            None,
+            "c2",
+            "operator",
+            None,
+            &Sender::OperatorChat,
+        )
+        .unwrap();
+        let entries = s.thread_entries("master", 0, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, "operator");
     }
 
     #[test]

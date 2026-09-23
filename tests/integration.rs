@@ -37217,3 +37217,43 @@ fn cad319_thread_post_is_refused_for_an_agent_caller() {
     assert_eq!(peer["role"], "system", "{peer}");
     assert_eq!(peer["payload"]["from"], "wk", "{peer}");
 }
+
+/// Review round 1: a `thread_send` the queue refuses (48 001 bytes, empty
+/// text) starts no thread and writes no `thread_created` event; the
+/// first accepted one does.
+#[test]
+fn cad319_refused_thread_send_leaves_no_thread() {
+    let d = TestDaemon::start();
+    d.register("master");
+    d.wait_agent("master", "idle", 15);
+    for text in ["x".repeat(48_001), String::new()] {
+        assert!(d
+            .rpc(
+                "thread_send",
+                json!({"alias": "master", "text": text, "message": "big-1"}),
+            )
+            .is_err());
+    }
+    let page = d.rpc("thread_read", json!({"alias": "master"})).unwrap();
+    assert_eq!(page["thread"], Value::Null, "{page}");
+    assert!(
+        d.events("master")
+            .iter()
+            .all(|e| e["kind"] != "thread_created"),
+        "a refused send wrote thread_created"
+    );
+    let receipt = d
+        .rpc(
+            "thread_send",
+            json!({"alias": "master", "text": "fits", "message": "ok-1"}),
+        )
+        .unwrap();
+    assert!(receipt["thread"]["id"].is_string(), "{receipt}");
+    assert_eq!(
+        d.events("master")
+            .iter()
+            .filter(|e| e["kind"] == "thread_created")
+            .count(),
+        1
+    );
+}

@@ -4132,6 +4132,8 @@ impl Store {
             "DELETE FROM events WHERE alias=? AND job_id IS NULL",
             [alias],
         )?;
+        // CAD-319: the chat is archived, not deleted, and never inherited.
+        Self::thread_detach_in(tx, alias)?;
         Ok(())
     }
 
