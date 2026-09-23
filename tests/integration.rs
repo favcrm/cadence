@@ -2478,7 +2478,7 @@ fn restart_idle_pty_after_forced_detach(via_signal: bool) {
     let screen_before = std::fs::read_to_string(d.pane_file(&mock, "dv1", "screen")).unwrap();
     let mut gate = SnapshotGate { barrier: None };
     if via_signal {
-        unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
+        sigterm_own_process();
     } else {
         d.rpc("shutdown", json!({})).unwrap();
     }
@@ -2585,11 +2585,150 @@ fn pty_shutdown_facts_before_detach_rpc() {
     restart_idle_pty_after_forced_detach(false);
 }
 
+/// CAD-406: set only on a child spawned by [`run_signal_child`]; names
+/// the one test that child runs.
+const SIGNAL_CHILD_ENV: &str = "CADENCE_TEST_SIGNAL_CHILD";
+
+/// Why this process may not signal itself, or `None` inside a
+/// [`run_signal_child`] child. Every `TestDaemon` registers a
+/// process-wide SIGTERM/SIGINT hook that is never unregistered, and
+/// plain `cargo test` runs all tests in one process: a self-signal there
+/// shuts down every concurrent daemon (CAD-406's 15-16 collateral
+/// failures), not just the one under test.
+fn self_signal_refusal(child_env: Option<&str>) -> Option<&'static str> {
+    match child_env {
+        Some(test) if !test.is_empty() => None,
+        _ => Some(
+            "refusing to signal the shared test process: it would stop every \
+             concurrent TestDaemon (CAD-406); run the test through run_signal_child",
+        ),
+    }
+}
+
+/// SIGTERM this process — the only sanctioned self-signal in the
+/// suite, and only from a [`run_signal_child`] child.
+fn sigterm_own_process() {
+    let env = std::env::var(SIGNAL_CHILD_ENV).ok();
+    if let Some(why) = self_signal_refusal(env.as_deref()) {
+        panic!("{why}");
+    }
+    unsafe { libc::kill(std::process::id() as i32, libc::SIGTERM) };
+}
+
+/// Run the `#[ignore]`d `test` alone in a fresh copy of this test binary,
+/// so a signal it sends itself reaches only its own daemons, and assert
+/// that it ran and passed. A child whose signal never lands can block in
+/// its own teardown, so it is killed and failed after `limit`.
+fn run_signal_child(test: &str, limit: Duration) {
+    let logs = TempDir::new().unwrap();
+    let out_path = logs.path().join("out.log");
+    let out = std::fs::File::create(&out_path).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", test, "--ignored", "--test-threads=1"])
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .env(SIGNAL_CHILD_ENV, test)
+        // A plain libtest child: the outer run's suite lock and
+        // nextest markers are not its to honour.
+        .env_remove("CADENCE_SUITE_LOCK")
+        .env_remove("CADENCE_REVIEW_SUITE_LOCK_HELD");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("NEXTEST") {
+            child.env_remove(key);
+        }
+    }
+    let mut child = child.spawn().unwrap();
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    let text = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let Some(status) = status else {
+        panic!("{test} did not finish in its child within {limit:?}: {text}");
+    };
+    assert!(status.success(), "{test} failed in its child: {text}");
+    assert!(
+        text.contains("test result: ok. 1 passed"),
+        "{test} must actually run in its child: {text}"
+    );
+}
+
 #[test]
 fn pty_shutdown_facts_before_detach_signal() {
-    // Process-per-test: SIGTERM is delivered to this process, and the
-    // daemon's signal hook is what requests shutdown.
+    // SIGTERM goes to a child process that hosts only this test's
+    // daemon; the daemon's signal hook is what requests shutdown.
+    run_signal_child(
+        "pty_shutdown_facts_before_detach_signal_child",
+        Duration::from_secs(180),
+    );
+}
+
+#[test]
+#[ignore = "run by pty_shutdown_facts_before_detach_signal in its own process"]
+fn pty_shutdown_facts_before_detach_signal_child() {
+    if std::env::var(SIGNAL_CHILD_ENV).as_deref()
+        != Ok("pty_shutdown_facts_before_detach_signal_child")
+    {
+        return;
+    }
     restart_idle_pty_after_forced_detach(true);
+}
+
+/// CAD-406 guard: the shared test process refuses to signal itself, and
+/// no test sends itself a signal except through `sigterm_own_process`.
+#[test]
+fn test_suite_never_signals_the_shared_process() {
+    assert!(self_signal_refusal(None).is_some());
+    assert!(self_signal_refusal(Some("")).is_some());
+    assert!(self_signal_refusal(Some("pty_x_child")).is_none());
+    assert!(
+        std::env::var_os(SIGNAL_CHILD_ENV).is_none(),
+        "the suite itself must not carry {SIGNAL_CHILD_ENV}"
+    );
+    // Split so this test's own source does not match.
+    let patterns = [
+        concat!("kill(std::process", "::id()"),
+        concat!("kill(libc::", "getpid()"),
+        concat!("kill(0", ","),
+        concat!("libc::", "raise("),
+        concat!("low_level::", "raise("),
+    ];
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut hits = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap();
+        let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        for p in patterns {
+            let n = flat.matches(p).count();
+            if n > 0 {
+                hits.push(format!("{}: {p} x{n}", path.display()));
+            }
+        }
+    }
+    let sanctioned = format!(
+        "{}: {} x1",
+        dir.join("integration.rs").display(),
+        patterns[0]
+    );
+    assert_eq!(
+        hits,
+        vec![sanctioned],
+        "self-signal outside sigterm_own_process would stop every concurrent \
+         TestDaemon under plain cargo test (CAD-406)"
+    );
 }
 
 #[test]
