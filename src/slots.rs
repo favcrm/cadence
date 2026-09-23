@@ -776,7 +776,14 @@ impl Slots {
     /// and swapped into memory only once the write landed: a failure
     /// leaves disk and memory exactly as they were — no grant, no free
     /// — and makes strict admission unavailable until a restart loads
-    /// a good file. Revoked enrollments no hold references are pruned.
+    /// a good file.
+    ///
+    /// A revoked or expired enrollment is a TOMBSTONE: it stays while
+    /// any hold names it or while its root process is alive or
+    /// unknown, because [`Self::nearest_enrolled_root`] must keep
+    /// seeing that exact root — otherwise its processes would fall
+    /// through to an outer pane's legacy binding. It is pruned only
+    /// once nothing holds under it and its root is proven dead.
     fn commit(&mut self, enrollments: Vec<Enrollment>, held: Vec<SlotHold>) -> Result<()> {
         if let Some(b) = &self.blocked {
             return Err(strict_unavailable(&b.reason));
@@ -784,10 +791,11 @@ impl Slots {
         let enrollments: Vec<Enrollment> = enrollments
             .into_iter()
             .filter(|e| {
-                !matches!(e.auth, AuthState::Revoked(_))
+                e.auth == AuthState::Active
                     || held
                         .iter()
                         .any(|h| h.enrollment_id() == Some(e.id.as_str()))
+                    || self.proc.liveness(&e.root).0 != Liveness::Dead
             })
             .collect();
         if let Some(path) = self.persist_path.clone() {
@@ -859,6 +867,12 @@ impl Slots {
                 version.cloned().unwrap_or(Value::Null)
             )),
             (None, Some(version)) if version != 1 => Err(format!("unknown version {version}")),
+            // Anything that is not a well-formed envelope — `{}`,
+            // `null`, `[]`, a non-list `holds` — is malformed state:
+            // kept as evidence, never rewritten, strict blocked.
+            (None, _) if !doc.is_object() || !doc["holds"].is_array() => {
+                Err("not a well-formed v1 envelope (an object with a 'holds' list)".to_string())
+            }
             // The v1 shape — or a version-less file an older writer
             // left: the legacy rows, under the unchanged rules.
             (None, _) => {
@@ -956,10 +970,12 @@ impl Slots {
         for e in list("enrollments")? {
             let parsed = Enrollment::from_json(&e, now, wall)
                 .ok_or_else(|| format!("malformed enrollment {e}"))?;
-            if enrollments
-                .iter()
-                .any(|o: &Enrollment| o.id == parsed.id || o.root == parsed.root)
-            {
+            // Ids are unique; a root may appear again only under a
+            // tombstone (a revoked enrollment kept for its holds).
+            let revoked = |e: &Enrollment| matches!(e.auth, AuthState::Revoked(_));
+            if enrollments.iter().any(|o: &Enrollment| {
+                o.id == parsed.id || (o.root == parsed.root && !revoked(o) && !revoked(&parsed))
+            }) {
                 return Err(format!("duplicate enrollment {}", parsed.id));
             }
             enrollments.push(parsed);
@@ -1606,6 +1622,16 @@ impl Slots {
                         e.auth = AuthState::Revoked("superseded by a new endpoint".into());
                     }
                 }
+                // A tombstone for this very root is covered by the new
+                // enrollment (which keeps blocking the pane fallback);
+                // keep it only while a hold still names it.
+                let held = &self.held;
+                next.retain(|e| {
+                    e.root != root
+                        || held
+                            .iter()
+                            .any(|h| h.enrollment_id() == Some(e.id.as_str()))
+                });
                 let id = format!("enr-{}", Uuid::new_v4().simple());
                 next.push(Enrollment {
                     id: id.clone(),
@@ -1698,9 +1724,10 @@ impl Slots {
     }
 
     /// The chain index of the nearest enrolled root on a caller's
-    /// ancestry — any authorization state, so a revoked enrollment's
+    /// ancestry — any authorization state, tombstones included (see
+    /// [`Self::commit`]), so a revoked or expired enrollment's
     /// processes can still release but never fall through to an outer
-    /// pane. A pid only matches a root that is still the same process
+    /// pane for as long as that exact root lives. A pid only matches a root that is still the same process
     /// (an unreadable one matches, so the strict verifier refuses it).
     pub fn nearest_enrolled_root(&self, chain: &[u32]) -> Option<usize> {
         chain.iter().position(|pid| {
@@ -1719,7 +1746,14 @@ impl Slots {
             return Err(strict_unavailable(&b.reason));
         }
         let mut why = Vec::new();
-        for e in self.enrollments.iter().filter(|e| e.root.pid == root_pid) {
+        // A live enrollment before any tombstone sharing its root.
+        let mut candidates: Vec<&Enrollment> = self
+            .enrollments
+            .iter()
+            .filter(|e| e.root.pid == root_pid)
+            .collect();
+        candidates.sort_by_key(|e| matches!(e.auth, AuthState::Revoked(_)));
+        for e in candidates {
             match self
                 .proc
                 .verified_descent(peer_pid, &e.root, self.daemon_uid)

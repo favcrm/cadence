@@ -1321,7 +1321,13 @@ before every slot call: a missing row, a closed endpoint or a changed
 owner generation revokes the enrollment. A failed strict verification
 refuses — it never falls through to an outer pane, and an alias, lane,
 pid, argv or `CADENCE_ALIAS` in the request or environment never
-grants ownership.
+grants ownership. A revoked or expired enrollment stays as a
+**tombstone** for as long as any hold names it or its exact root
+process (pid + starttime) is alive or unknown: the tombstone keeps
+winning the nearest-identity check, so the provider and its tool tree
+are refused new work instead of falling through to a pane registered
+above them. It is pruned only once nothing holds under it and its root
+is proven dead.
 
 *Deviation from design v3:* v3 admits only the exact root/worker
 process. A managed provider's builds run in its tools' subprocesses
@@ -1396,8 +1402,10 @@ included, serializes the whole state, so legacy traffic never drops a
 strict record. Strict writes are fail-closed: the next state is
 written before it is applied, so a failed write grants and frees
 nothing and makes strict admission unavailable. An unreadable or
-unparsable file, an unknown version, a malformed or duplicate record
-or a strict hold naming no enrollment rejects the file at boot: it is
+unparsable file, an unknown version, anything that is not a
+well-formed envelope (`{}`, `null`, `[]`, a v1 file whose `holds` is
+not a list), a malformed or duplicate record or a strict hold naming
+no enrollment rejects the file at boot: it is
 kept untouched as evidence, strict admission is unavailable
 (`strict.available:false`), and legacy callers carry on in memory.
 Boot validates in order — the envelope, then enrollments (expiry; a

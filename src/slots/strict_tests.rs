@@ -674,3 +674,152 @@ fn restart_validates_enrollments_before_holds() {
     let q = acquire_as(&mut s, 400, 400, "r10", 2.0).unwrap();
     assert_eq!(q["granted"], false, "the unknown hold still counts");
 }
+
+/// What keeps a revoked endpoint's processes off an outer pane: the
+/// daemon takes the legacy pane binding only when no enrolled root is
+/// nearer on the chain. After revocation the tombstone must still be
+/// nearest, the caller still verifies (so it can release), yet no new
+/// work is admitted and nothing is held.
+fn assert_tombstone_blocks(s: &mut Slots, route: &str) {
+    assert_eq!(
+        s.nearest_enrolled_root(&[400, 300, 200, 100]),
+        Some(2),
+        "{route}: the revoked root must stay visible"
+    );
+    let err = acquire_as(s, 400, 400, &format!("{route}-new"), 5.0).unwrap_err();
+    assert!(err.to_string().contains("revoked"), "{route}: {err}");
+    assert!(s.held.is_empty(), "{route}: no hold of any binding");
+    assert!(s.waiting.is_empty(), "{route}: no waiter");
+}
+
+/// Review BLOCKING #1: a revoked enrollment is a tombstone while its
+/// exact root lives — on every route that revokes it: owner drift with
+/// no hold, release of the last hold after revocation, endpoint close
+/// with the provider still alive, and supersession by a new endpoint.
+/// Only the root's proven death prunes it.
+#[test]
+fn revoked_root_stays_a_tombstone_on_every_route() {
+    // Route 1: owner-generation drift while holding nothing.
+    let p = tree();
+    let mut s = strict_slots(&p, 2);
+    enroll(&mut s, "wk", "g1", 200);
+    let drift = HashMap::from([("wk".to_string(), Some("g2".to_string()))]);
+    assert!(!s.revalidate_owners(&drift).is_empty());
+    assert_tombstone_blocks(&mut s, "no-hold drift");
+
+    // Route 2: the last hold of a revoked enrollment is released.
+    let p = tree();
+    let mut s = strict_slots(&p, 2);
+    enroll(&mut s, "wk", "g1", 200);
+    let g = acquire_as(&mut s, 300, 300, "r1", 0.0).unwrap();
+    let token = g["token"].as_str().unwrap().to_string();
+    s.revalidate_owners(&drift);
+    let caller = s.strict_caller(300, 200).unwrap();
+    s.release_strict(&token, &caller, 300, 1.0).unwrap();
+    assert_tombstone_blocks(&mut s, "last-hold release");
+
+    // Route 3: the endpoint closed while its provider still lives.
+    let p = tree();
+    let mut s = strict_slots(&p, 2);
+    enroll(&mut s, "wk", "g1", 200);
+    assert!(!s.revoke_owner("wk", "endpoint closed").is_empty());
+    assert_tombstone_blocks(&mut s, "endpoint close");
+
+    // Route 4: superseded by a new endpoint (another provider process)
+    // while the old provider lives on.
+    let p = tree();
+    p.spawn(600, 100, 90);
+    let mut s = strict_slots(&p, 2);
+    enroll(&mut s, "wk", "g1", 200);
+    enroll(&mut s, "wk", "g2", 600);
+    assert_tombstone_blocks(&mut s, "supersession");
+
+    // Proven death of the old root is what finally prunes it — at the
+    // next strict write — and then nothing is left to match.
+    p.kill(200);
+    s.revoke_owner("wk", "endpoint closed");
+    assert!(s.enrollments.iter().all(|e| e.root.pid != 200));
+    assert_eq!(s.nearest_enrolled_root(&[400, 300, 200, 100]), None);
+
+    // An unknown root is never proven dead: its tombstone stays.
+    let p = tree();
+    let mut s = strict_slots(&p, 2);
+    enroll(&mut s, "wk", "g1", 200);
+    p.garble(200);
+    s.revoke_owner("wk", "endpoint closed");
+    assert_eq!(s.enrollments.len(), 1, "unknown root keeps its tombstone");
+}
+
+/// Supersession by the SAME process (a new owner generation, same
+/// root) while a hold still names the old enrollment: the tombstone
+/// stays for its hold, the new enrollment admits, and the pair — two
+/// records sharing a root, one revoked — restores cleanly.
+#[test]
+fn a_tombstone_may_share_its_root_with_the_live_enrollment() {
+    let p = tree();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slots.json");
+    let mut s = strict_slots(&p, 3);
+    s.persist_to(path.clone());
+    let old = enroll(&mut s, "wk", "g1", 200);
+    acquire_as(&mut s, 300, 300, "r1", 0.0).unwrap();
+    let new = enroll(&mut s, "wk", "g2", 200);
+    assert_ne!(old, new);
+    assert_eq!(s.enrollments.len(), 2);
+    assert_eq!(s.strict_caller(400, 200).unwrap().enrollment_id, new);
+    let g = acquire_as(&mut s, 400, 400, "r2", 1.0).unwrap();
+    assert_eq!(g["granted"], true, "{g}");
+    let mut s = strict_slots(&p, 3);
+    s.persist_to(path);
+    s.restore(clk(2.0));
+    assert!(s.strict_available());
+    assert_eq!(s.held.len(), 2);
+}
+
+/// Review SHOULD-FIX #3: valid JSON that is not a well-formed v1 or v2
+/// envelope is malformed state — kept byte-identical as evidence
+/// (never rewritten, not even by legacy traffic) and strict admission
+/// is blocked.
+#[test]
+fn malformed_v1_envelope_is_kept_and_blocks_strict() {
+    for text in [
+        "{}",
+        "null",
+        "[]",
+        r#"{"holds":"x"}"#,
+        r#"{"version":1}"#,
+        r#"{"version":1,"holds":null}"#,
+    ] {
+        let p = tree();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slots.json");
+        std::fs::write(&path, text).unwrap();
+        let mut s = strict_slots(&p, 2);
+        s.persist_to(path.clone());
+        s.restore(clk(0.0));
+        assert!(!s.strict_available(), "{text}");
+        let (g, _) = s
+            .acquire(
+                SlotKind::Build,
+                "pane-1",
+                std::process::id(),
+                "r",
+                false,
+                clk(1.0),
+            )
+            .unwrap();
+        assert_eq!(g["granted"], true, "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{text}");
+    }
+    // The well-formed v1 shapes still load: version 1, or version-less.
+    for text in [r#"{"version":1,"holds":[]}"#, r#"{"holds":[]}"#] {
+        let p = tree();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slots.json");
+        std::fs::write(&path, text).unwrap();
+        let mut s = strict_slots(&p, 2);
+        s.persist_to(path);
+        s.restore(clk(0.0));
+        assert!(s.strict_available(), "{text}");
+    }
+}

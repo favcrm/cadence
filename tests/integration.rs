@@ -25871,6 +25871,108 @@ fn slot_managed_endpoint_enrolls_and_admits_only_its_verified_processes() {
         .is_empty());
 }
 
+/// CAD-230 review BLOCKING #1: once a managed endpoint's enrollment is
+/// revoked, its provider must never fall through to a pane registered
+/// ABOVE it — not when it held nothing at the drift, and not after it
+/// released its last hold. Each acquire is refused and no hold of any
+/// binding (legacy included) appears.
+#[test]
+fn slot_revoked_managed_endpoint_never_falls_back_to_an_outer_pane() {
+    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let mut observer = LaneShell::spawn(home.path());
+    plant_pane(&d, "observer", observer.pid());
+    let mut wk = ManagedWorker::start(&d, "wk");
+    // The outer pane: the test process, an ancestor of the provider.
+    plant_self(&d);
+    let held = |observer: &mut LaneShell| {
+        let s = observer.rpc(&d.state, "slot_status", json!({}));
+        assert_eq!(s["ok"], true, "{s}");
+        let mut all = s["result"]["pools"]["build"]["held"]
+            .as_array()
+            .unwrap()
+            .clone();
+        all.extend(
+            s["result"]["pools"]["suite"]["held"]
+                .as_array()
+                .unwrap()
+                .clone(),
+        );
+        all
+    };
+    let drift = |generation: &str| {
+        let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE agents SET generation=?1 WHERE alias='wk'",
+            [generation],
+        )
+        .unwrap();
+    };
+    let refused = |r: &Value, route: &str| {
+        assert_eq!(r["ok"], false, "{route}: {r}");
+        assert!(
+            r["error"]["message"].as_str().unwrap().contains("revoked"),
+            "{route}: {r}"
+        );
+    };
+
+    // Route: drift while holding NOTHING — twice, as the reviewer did.
+    drift("drift-1");
+    for req in ["a1", "a2"] {
+        let r = wk.rpc(
+            "self",
+            "slot_acquire",
+            json!({"kind": "build", "pid": "$PID", "request_id": req}),
+        );
+        refused(&r, "no-hold drift");
+    }
+    assert!(held(&mut observer).is_empty(), "no legacy hold appeared");
+
+    // Route: release of the last hold after revocation. A fresh
+    // enrollment needs a reopen; take a new endpoint for the same
+    // provider mock under another alias.
+    let mut wk2 = ManagedWorker::start(&d, "wk2");
+    let g = wk2.rpc(
+        "self",
+        "slot_acquire",
+        json!({"kind": "build", "pid": "$PID", "request_id": "b1"}),
+    );
+    assert_eq!(g["result"]["granted"], true, "{g}");
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE agents SET generation='drift-2' WHERE alias='wk2'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let r = wk2.rpc(
+        "self",
+        "slot_release",
+        json!({"token": token, "pid": "$PID"}),
+    );
+    assert_eq!(r["result"]["released"], true, "{r}");
+    for req in ["b2", "b3"] {
+        let r = wk2.rpc(
+            "self",
+            "slot_acquire",
+            json!({"kind": "build", "pid": "$PID", "request_id": req}),
+        );
+        refused(&r, "last-hold release");
+    }
+    assert!(held(&mut observer).is_empty(), "no legacy hold appeared");
+    // The revoked endpoints are still listed — the tombstones that
+    // keep the outer pane out.
+    let s = observer.rpc(&d.state, "slot_status", json!({}));
+    let revoked = s["result"]["enrollments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["auth_state"] == "revoked")
+        .count();
+    assert_eq!(revoked, 2, "{s}");
+}
+
 /// CAD-230: `slot_reconcile` is operator authority — an agent's
 /// connection (a pane or an enrolled endpoint) is refused, as are
 /// identity-shaped request fields; and it never frees a live hold.
