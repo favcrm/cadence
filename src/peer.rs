@@ -51,8 +51,8 @@
 //! another user's process (a root proxy) cannot be attributed, and the
 //! caller decides what that means — the board refuses the write. The
 //! one foreign peer the board accepts is the `tailscale serve` proxy,
-//! proven by its socket's owner uid, which `/proc/net/tcp` shows for
-//! any user ([`tailscale_proxy_proof`], CAD-336).
+//! proven by [`crate::tailnet_proof`] from the owner uid
+//! [`client_socket`] reads, which `/proc/net/tcp` shows for any user.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -332,7 +332,7 @@ pub(crate) fn operator_proof(
 }
 
 /// Real and effective uid from `/proc/<pid>/status`.
-fn proc_uids(pid: u32) -> Result<(u32, u32), String> {
+pub(crate) fn proc_uids(pid: u32) -> Result<(u32, u32), String> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
         .map_err(|e| format!("/proc/{pid}/status: {e}"))?;
     status
@@ -439,82 +439,9 @@ pub(crate) fn tcp_peer_agent(
     Ok(agents.into_iter().next())
 }
 
-/// Where tailscaled keeps its LocalAPI socket on Linux (`/var/run` is
-/// normally a symlink to `/run`). Only tailscaled's own uid can create
-/// it there, so the socket file's owner names tailscaled's uid.
-const TAILSCALED_SOCKETS: [&str; 2] = [
-    "/run/tailscale/tailscaled.sock",
-    "/var/run/tailscale/tailscaled.sock",
-];
-
-/// Positive proof that the TCP peer `peer` of a connection to our
-/// `server_port` is the `tailscale serve` proxy (CAD-336) — the only
-/// caller whose `Tailscale-User-*` headers mean anything. Host and
-/// loopback say nothing: any local process can send both. The proof
-/// is the connection's client socket: the kernel records the uid that
-/// created it (`/proc/net/tcp`'s uid column, readable for any user's
-/// socket), and it must be tailscaled's uid — the owner of its LocalAPI
-/// socket ([`TAILSCALED_SOCKETS`]) — which must not be this process's
-/// uid. `Err` names the first check that failed; callers fail closed.
-///
-/// A tailscaled running as this board's own uid (userspace networking
-/// under the operator's account) can never be told apart from any
-/// other same-uid process, so it is never proven.
-pub(crate) fn tailscale_proxy_proof(server_port: u16, peer: SocketAddr) -> Result<(), String> {
-    let peer = canonical(peer);
-    if !peer.ip().is_loopback() {
-        return Err(format!(
-            "peer {peer} is not loopback — tailscale serve connects locally"
-        ));
-    }
-    let proxy_uid = tailscaled_uid()?;
-    let (_, socket_uid) = client_socket(server_port, peer)?.ok_or_else(|| {
-        format!("no local socket is the client end of {peer} → port {server_port}")
-    })?;
-    let (_, own_uid) = proc_uids(std::process::id())?;
-    proxy_socket_proof(socket_uid, proxy_uid, own_uid)
-}
-
-/// The owner uid of tailscaled's LocalAPI socket — the first of
-/// [`TAILSCALED_SOCKETS`] that is a socket itself (not a symlink to
-/// one).
-fn tailscaled_uid() -> Result<u32, String> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    TAILSCALED_SOCKETS
-        .iter()
-        .find_map(|path| {
-            let meta = std::fs::symlink_metadata(path).ok()?;
-            meta.file_type().is_socket().then(|| meta.uid())
-        })
-        .ok_or_else(|| {
-            format!(
-                "tailscaled's LocalAPI socket is not at {} — its uid is unknown",
-                TAILSCALED_SOCKETS.join(" or ")
-            )
-        })
-}
-
-/// The decision of [`tailscale_proxy_proof`] once the three uids are
-/// read: the client socket was created by tailscaled's uid, and that
-/// uid is not ours (else any same-uid process could pose as it).
-fn proxy_socket_proof(socket_uid: u32, proxy_uid: u32, own_uid: u32) -> Result<(), String> {
-    if proxy_uid == own_uid {
-        return Err(format!(
-            "tailscaled runs as this board's uid {own_uid} — any same-uid \
-             process could pose as its proxy"
-        ));
-    }
-    if socket_uid != proxy_uid {
-        return Err(format!(
-            "the client socket belongs to uid {socket_uid}, not tailscaled's uid {proxy_uid}"
-        ));
-    }
-    Ok(())
-}
-
 /// A v4-mapped v6 address (`::ffff:127.0.0.1`, what a dual-stack
 /// listener reports) compares as the v4 address the kernel lists.
-fn canonical(addr: SocketAddr) -> SocketAddr {
+pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
     match addr.ip() {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
@@ -530,7 +457,10 @@ fn canonical(addr: SocketAddr) -> SocketAddr {
 /// the kernel prints for every socket, readable for another user's
 /// socket too). `Ok(None)` when no table lists it; `Err` only when
 /// neither table could be read.
-fn client_socket(server_port: u16, peer: SocketAddr) -> Result<Option<(u64, u32)>, String> {
+pub(crate) fn client_socket(
+    server_port: u16,
+    peer: SocketAddr,
+) -> Result<Option<(u64, u32)>, String> {
     let mut read_any = false;
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let Ok(text) = std::fs::read_to_string(table) else {
@@ -720,29 +650,5 @@ mod tests {
         let (_, own) = proc_uids(std::process::id()).unwrap();
         let (_, uid) = client_socket(port, peer).unwrap().unwrap();
         assert_eq!(uid, own);
-    }
-
-    /// A same-uid process is never the proxy, whatever it sends — the
-    /// proof rests on the socket's uid, never on headers.
-    #[test]
-    fn a_same_uid_peer_is_never_the_tailscale_proxy() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let (_accepted, peer) = listener.accept().unwrap();
-        assert!(tailscale_proxy_proof(port, peer).is_err());
-        let remote: SocketAddr = "192.0.2.7:40000".parse().unwrap();
-        assert!(tailscale_proxy_proof(port, remote).is_err());
-    }
-
-    /// tailscaled as root (0), board as 1000: only a socket root created
-    /// is the proxy; a tailscaled under the board's own uid proves
-    /// nothing, even for its own socket.
-    #[test]
-    fn proxy_proof_needs_tailscaleds_foreign_uid() {
-        assert_eq!(proxy_socket_proof(0, 0, 1000), Ok(()));
-        assert!(proxy_socket_proof(1000, 0, 1000).is_err());
-        assert!(proxy_socket_proof(1001, 0, 1000).is_err());
-        assert!(proxy_socket_proof(1000, 1000, 1000).is_err());
     }
 }

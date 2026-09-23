@@ -213,6 +213,10 @@ pub struct ServeOpts {
     /// Tailscale sharing armed: `(dns_name, https_port)` — the trust
     /// rule for `Tailscale-User-*` headers and the `/api/meta` URL.
     pub tailnet: Option<(String, u16)>,
+    /// tailscaled's LocalAPI socket the tailnet proof reads
+    /// ([`crate::tailnet_proof`]); `None` is tailscaled's default path.
+    /// Never set from the command line — tests inject a fixture.
+    pub tailscaled_socket: Option<PathBuf>,
 }
 
 fn opts_file(state_dir: &Path) -> PathBuf {
@@ -362,6 +366,7 @@ fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         allow_origins,
         read_only: eff.read_only,
         tailnet,
+        tailscaled_socket: None,
     })
 }
 
@@ -1175,16 +1180,26 @@ fn write_err(e: &Error) -> HttpResp {
     }
 }
 
-/// The actor a request would write as, header-wise: the
+/// The actor a request would write as, header-wise, and the tailnet
+/// proof behind it — `/api/meta`'s `actor` and `tailnet_proof`. The
 /// `Tailscale-User-Login` of a request [`tailnet_proxy`] proves came
-/// through `tailscale serve`, else the plain operator. The header is
-/// never considered otherwise — a local process forging it under the
-/// tailnet Host is not the proxy.
-fn request_actor(request: &Request, opts: &ServeOpts) -> String {
-    if tailnet_proxy(request, opts) != Some(Ok(())) {
-        return UI_ACTOR.to_string();
+/// through `tailscale serve` is the actor; otherwise the plain operator
+/// and the header is never considered — a local process forging it
+/// under the tailnet Host is not the proxy. `tailnet_proof` is `null`
+/// for a request that is not tailnet-shaped, `{"proven": true}`, or
+/// `{"proven": false, "check", "why"}` naming the check that refused.
+fn request_identity(request: &Request, opts: &ServeOpts) -> (String, Value) {
+    match tailnet_proxy(request, opts) {
+        None => (UI_ACTOR.to_string(), Value::Null),
+        Some(Ok(())) => (
+            tailnet_login(request).unwrap_or_else(|| UI_ACTOR.to_string()),
+            json!({"proven": true}),
+        ),
+        Some(Err(r)) => (
+            UI_ACTOR.to_string(),
+            json!({"proven": false, "check": r.check.as_str(), "why": r.why}),
+        ),
     }
-    tailnet_login(request).unwrap_or_else(|| UI_ACTOR.to_string())
 }
 
 /// `<login> (tailscale)` from the proxy's `Tailscale-User-Login`.
@@ -1196,12 +1211,14 @@ fn tailnet_login(request: &Request) -> Option<String> {
 
 /// Is this request from the `tailscale serve` proxy (CAD-336)? `None`
 /// — not tailnet-shaped at all (tailscale mode off, or the Host is not
-/// the tailnet name). `Some(Ok)` — tailnet-shaped and the peer is
-/// proven to be tailscaled ([`crate::peer::tailscale_proxy_proof`]:
-/// the connection's client socket belongs to tailscaled's uid).
-/// `Some(Err)` — tailnet-shaped but unproven: Host and loopback are
-/// caller-controlled, so the identity headers are not trusted.
-fn tailnet_proxy(request: &Request, opts: &ServeOpts) -> Option<std::result::Result<(), String>> {
+/// the tailnet name). `Some(Ok)` — tailnet-shaped and proven by
+/// [`crate::tailnet_proof::prove`]. `Some(Err)` — tailnet-shaped but
+/// unproven: Host and loopback are caller-controlled, so the identity
+/// headers are not trusted.
+fn tailnet_proxy(
+    request: &Request,
+    opts: &ServeOpts,
+) -> Option<std::result::Result<(), crate::tailnet_proof::Refusal>> {
     let (dns, _) = opts.tailnet.as_ref()?;
     let host = header_value(request, "Host").unwrap_or_default();
     let name = host.split(':').next().unwrap_or_default();
@@ -1209,8 +1226,13 @@ fn tailnet_proxy(request: &Request, opts: &ServeOpts) -> Option<std::result::Res
         return None;
     }
     Some(match request.remote_addr() {
-        Some(peer) => crate::peer::tailscale_proxy_proof(opts.port, *peer),
-        None => Err("the request has no peer address".to_string()),
+        Some(peer) => {
+            crate::tailnet_proof::prove(opts.tailscaled_socket.as_deref(), opts.port, *peer)
+        }
+        None => Err(crate::tailnet_proof::Refusal {
+            check: crate::tailnet_proof::Check::ClientSocket,
+            why: "the request has no peer address".to_string(),
+        }),
     })
 }
 
@@ -1277,7 +1299,7 @@ fn write_caller(
     opts: &ServeOpts,
 ) -> std::result::Result<WriteCaller, HttpResp> {
     let proxy = tailnet_proxy(request, opts);
-    if proxy == Some(Ok(())) {
+    if matches!(proxy, Some(Ok(()))) {
         return Ok(WriteCaller::Operator(
             tailnet_login(request).unwrap_or_else(|| UI_ACTOR.to_string()),
         ));
@@ -2219,12 +2241,13 @@ fn handle(request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {
         // the one deploy drift measures).
         "/api/meta" => {
             let daemon = client::rpc(state_dir, "daemon_info", json!({})).ok();
-            let actor = request_actor(&request, opts);
+            let (actor, tailnet_proof) = request_identity(&request, opts);
             send(
                 request,
                 json_response(json!({
                     "read_only": opts.read_only,
                     "actor": actor,
+                    "tailnet_proof": tailnet_proof,
                     "tailnet_url": opts
                         .tailnet
                         .as_ref()
@@ -3198,10 +3221,9 @@ fn ts_status(state_dir: &Path) -> Result<i32> {
             &[login_hdr.as_str()],
         ) {
             Ok((200, body)) => {
-                let actor = serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|v| v["actor"].as_str().map(str::to_string))
-                    .unwrap_or_default();
+                let meta = serde_json::from_str::<Value>(&body).unwrap_or_default();
+                let actor = meta["actor"].as_str().unwrap_or_default();
+                let check = meta["tailnet_proof"]["check"].as_str().unwrap_or("?");
                 if actor.contains(forged) {
                     println!(
                         "identity: FORGEABLE — a local process posing as the proxy \
@@ -3209,8 +3231,8 @@ fn ts_status(state_dir: &Path) -> Result<i32> {
                     );
                 } else {
                     println!(
-                        "identity: local forged login ignored ({actor}); tailnet \
-                         logins resolve only via {url}/api/meta"
+                        "identity: local forged login ignored ({actor}; refused by \
+                         check {check}); tailnet logins resolve only via {url}/api/meta"
                     );
                 }
             }

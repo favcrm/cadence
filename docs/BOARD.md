@@ -676,39 +676,75 @@ tailnet-only, no public exposure.
 Writers are attributed per request. `Tailscale-User-Login` resolves
 the actor to `<login> (tailscale)` — the tracker commit's `Actor:`
 trailer names the person who wrote — only for a request **proven** to
-come through `tailscale serve` (CAD-336): tailscale sharing is armed,
-the request's `Host` is the tailnet name, **and** the connection's
-client socket belongs to tailscaled's uid. Host and a loopback peer
-prove nothing — any local process can send both — so the proof is the
-socket's owner: the kernel records the uid that created every socket
-(the `uid` column of `/proc/net/tcp{,6}`, readable for another user's
-socket), and tailscaled's uid is the owner of its LocalAPI socket
-(`/run/tailscale/tailscaled.sock`, which only tailscaled's user can
-create). A local process runs as the operator's uid, never
-tailscaled's, so the same headers from it — under the tailnet `Host`
-or any other — are ignored: the write is attributed to the process
-itself, `operator (ui)` or the agent of the pane it is tied to (see
-[Write identity](#write-identity)). Fail closed: when tailscaled's
-LocalAPI socket is elsewhere, or tailscaled runs as the board's own
-uid (userspace networking under the operator's account), no request
-is ever proven and tailnet logins are not recorded.
-`GET /api/meta` reports `{read_only, actor,
-tailnet_url, version, build_commit, build_time, daemon}` so the SPA
-renders the right controls and the serving binary's build identity.
+come through the `tailscale serve` HTTPS proxy (CAD-336). The HTTPS
+proxy is the one path that replaces client-sent `Tailscale-User-*`
+headers with the login tailscaled itself resolved; Host and a loopback
+peer prove nothing, since any local process can send both. The proof
+(`src/tailnet_proof.rs`) runs these checks in order and fails closed
+on the first that cannot be read or does not hold:
 
-Threat model, unchanged in four lines:
+| Check | Holds when |
+|---|---|
+| `loopback` | the TCP peer is a loopback address |
+| `tailscaled_socket` | tailscaled's LocalAPI socket is at `/run/tailscale/tailscaled.sock` (or `/var/run/…`) and is a socket, not a symlink — its owner is tailscaled's uid |
+| `localapi` | the LocalAPI answers `status` and `serve-config` (read-only; cached 2 s) |
+| `kernel_networking` | `status.TUN` is true. Under userspace networking tailscaled itself dials `127.0.0.1:<port>` for any tailnet peer the ACL lets reach the port — tagged nodes too — so its sockets carry that peer's bytes |
+| `no_tcp_forwarder` | no `TCPForward` handler (`tailscale serve --tcp=N tcp://…`) anywhere in the serve config — background, foreground sessions, services — targets the board's port. A raw forwarder passes the client's headers through untouched |
+| `client_socket` | the connection's client socket is listed in `/proc/net/tcp{,6}` |
+| `socket_owner` | that socket was created by tailscaled's uid — the table's `uid` column, readable for another user's socket |
+| `foreign_uid` | tailscaled's uid is not the board's; otherwise any same-uid process could pose as it |
+
+Every request that fails is attributed to its own peer process —
+`operator (ui)`, or the agent it is tied to (see
+[Write identity](#write-identity)) — and its identity headers are never
+read. `GET /api/meta` reports `{read_only, actor, tailnet_proof,
+tailnet_url, version, build_commit, build_time, daemon}`: `actor` is
+the identity this request would write as, `tailnet_proof` is `null`
+for a request that is not tailnet-shaped, else `{"proven": true}` or
+`{"proven": false, "check", "why"}` naming the check that refused.
+`ui tailscale status` sends a local forged login and prints the check
+that ignored it (or `FORGEABLE` if it resolved).
+
+**What is proven:** the connection was opened by tailscaled's uid, from
+a tailscaled in kernel-networking mode whose serve config, as read at
+most 2 s earlier, forwards no raw TCP to the board. Any process at
+the board's (the operator's) uid connecting directly is refused.
+
+**What is not proven — the boundary is "whoever can make tailscaled
+open a connection to the board port":**
+
+- **root**, which can do anything here anyway;
+- **tailscaled's operator user.** `ui tailscale start` expects the
+  board's user to be tailscaled's `OperatorUser` (`tailscale set
+  --operator=$USER`), so that user — and any process running as it,
+  agents included — can reconfigure serve. It can add a TCP forwarder
+  to the board, and a request that arrives before the next LocalAPI
+  read (within the 2 s cache) is believed. The check narrows the
+  window; only running the board as a user that is not tailscaled's
+  operator closes it;
+- **this node itself.** A local process can open the tailnet URL like
+  any tailnet client; the proxy then names this node's owner, which
+  is the operator's own login;
+- **the login is tailscaled's word.** Tagged nodes get no
+  `Tailscale-User-Login`, so their writes land as `operator (ui)`.
+
+The proof also fails closed on a tailscaled whose LocalAPI socket is
+elsewhere, that runs as the board's own uid, or whose LocalAPI refuses
+the board's user: tailnet logins are then never recorded.
+
+Threat model in four lines:
 
 1. **Tailnet-only** — `tailscale serve`, never `funnel`; nothing is
    exposed outside your tailnet.
-2. **Loopback bind** — the board still binds `127.0.0.1`; only
-   tailscaled (same host) can reach it.
+2. **Loopback bind** — the board binds `127.0.0.1`: reachable from the
+   tailnet only through tailscaled, and from any local process
+   directly.
 3. **Host + Origin allowlists** — the tailnet name is the only new
    allowed Host; `https://<dns>:<port>` the only new write Origin.
    Everything else is `421`/`403` exactly as before.
 4. **Header trust rule** — `Tailscale-User-*` identity headers count
-   only on the tailnet `Host` from a peer proven to be tailscaled (its
-   socket's uid); the same headers from any other local process are
-   ignored.
+   only from a peer the checks above prove to be the serve HTTPS
+   proxy; from anything else they are ignored.
 
 `--read-only` on `tailscale start` is the browse-only share: every
 write route answers `403` with `check: "read_only"` and the SPA hides
@@ -719,7 +755,7 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | Route | Returns |
 |---|---|
 | `GET /api/health` | `ok`, `pm_dir`, `pm_present`, counts, `daemon`, `embedded` |
-| `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_url`, the serving binary's `version`/`build_commit`/`build_time`, plus the daemon's `daemon_info` when reachable |
+| `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_proof` (`null`, or whether the tailnet proxy was proven and which check refused), `tailnet_url`, the serving binary's `version`/`build_commit`/`build_time`, plus the daemon's `daemon_info` when reachable |
 | `GET /api/projects` | folders, prefixes, components, declared tags, repos, issue counts |
 | `GET /api/issues?project=` | card views: derived status, readiness, `tags`, counts, `rev`. The `issue ls` filters, combinable: `tag=` (repeat or comma-join — all of), `status=` (repeat or comma-join — any of), `epic=<ID>`, `owner=`, `component=`, `priority=`, `open=1`; `400` on a value that could never match (unknown status/priority, bad tag or id grammar) |
 | `GET /api/epics?project=` | issues with children — the `issue epic ls --json` payload: `total`, `counts` per status, `done_ratio`, `blocked`, `owners`, `children` |
