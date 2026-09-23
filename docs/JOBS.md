@@ -299,6 +299,12 @@ Acceptance: <criteria>. Report when done:
 Do not report a SHA you have not committed. Correlation: <32-hex>.
 ```
 
+`<criteria>` is the task's acceptance string, control characters
+turned to spaces. When `issue start --job`/`dispatch --job` set it, it
+is the issue's items as `1) [ ] "first"; 2) [x] "second"` — numbered,
+each text a JSON string literal, so a `; ` or `[x]` inside an item
+stays inside its quotes (CAD-300).
+
 Explicit envelopes end with ` Correlation: <32-hex sha256 of the
 dispatch id>.` — the pty render probe slices the body's tail, and the
 derived suffix keeps that tail unique per dispatch id (bounded even for
@@ -398,7 +404,9 @@ and a disciplined retry path, never a blind replay.
 
 `job_new` also accepts optional task-scope params — `task_worktree`,
 `task_branch`, `task_base_sha`, `task_assignee`, `task_acceptance`
-(CAD-159: `issue start --job` passes the issue's acceptance items) —
+(CAD-159: `issue start --job` passes the issue's acceptance items as
+the numbered, JSON-quoted listing `1) [ ] "a"; 2) [x] "b"` that plain
+`dispatch` inlines — see BOARD.md, CAD-300) —
 applied to the default `<job>-t1` it mints (assignee is validated
 against the job's group, same rule as `task_new`). Absent params keep
 the original behaviour: an unscoped draft `t1`.

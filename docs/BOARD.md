@@ -414,12 +414,22 @@ then adds a tracker comment `Dispatched to <worker>: <note>` and a
 `## Acceptance` items through the same section-scoped readback as
 `issue show --json` (a bare `- [ ]` stub is not an item). With at
 least one item the kickoff lists them on its single line —
-` Acceptance: [ ] first; [x] second.` appended to the plain template,
-or the `<job>-t1` task's acceptance on the `--job` path, which the
-daemon's kickoff inlines. A list too long to fit (the plain body's
-4000-char limit, or 2000 bytes for the task) is replaced by a pointer:
-`N items, too long to inline — cadence issue show <ID> --json lists
-them under .acceptance`. With **no** items, both paths **warn and
+` Acceptance: 1) [ ] "first"; 2) [x] "second".` appended to the plain
+template, or the `<job>-t1` task's acceptance on the `--job` path,
+which the daemon's kickoff inlines; both paths use the same listing.
+Each item is numbered and its text is a JSON string literal (CAD-300),
+so text such as `a; [x] b` stays one unchecked item —
+`1) [ ] "a; [x] b"` — and cannot read as an extra or checked one. The
+quoting escapes `"` and `\`, writes tab as `\t` and every other control
+character and U+2028/U+2029 as `\uXXXX`, so the kickoff stays one
+control-free line and the text is recoverable exactly
+(`dispatch::parse_acceptance_listing` reads it back). A list too long
+to fit (the plain body's 4000-char limit, or 2000 bytes for the task)
+is replaced by a pointer: `N items, too long to inline — cadence issue
+show <ID> --json lists them under .acceptance`. If even the pointer
+would push the plain kickoff past 4000 chars (a near-limit
+`--summary`), the kickoff is sent without the clause instead of being
+refused; the JSON still lists the items. With **no** items, both paths **warn and
 still dispatch** (PM decision 2026-09-23, ADR-0002 §8.3 — refusal is a
 follow-up once live issues are backfilled): the warning names the
 issue and `cadence issue acceptance <ID> --from <file>`, prints on
@@ -427,7 +437,8 @@ stderr as `warning: …`, and the JSON carries it as
 `acceptance: {items, criteria, warning}` (`warning` is `null` when
 items exist). It is recorded exactly once, as an `Acceptance warning:`
 line on that dispatch's `Dispatched to …` tracker comment — a
-duplicate run records nothing — so the PM counts unspecified
+duplicate run records nothing, and its warning says the kickoff was
+not re-sent rather than `Dispatched anyway.` — so the PM counts unspecified
 dispatches with `grep -l 'Acceptance warning:' <pm>/*/*/comments/*`.
 
 Everything is checked before anything is created: the note is
