@@ -73,6 +73,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::adapter::registry;
 use crate::error::{Error, Result};
 use crate::store::Agent;
 
@@ -1046,7 +1047,7 @@ impl ProviderAdapter for PtyAdapter {
 
         let token = {
             let s = self.state.lock().unwrap();
-            format!("pty-{}-{}", s.generation, Uuid::new_v4().simple())
+            registry::PTY_TURN_TOKENS.mint(&s.generation)
         };
         let session = self.session();
 

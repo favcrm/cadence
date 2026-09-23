@@ -1574,6 +1574,22 @@ impl Store {
         Ok(())
     }
 
+    /// CAD-162: `token` is current for `generation` under the alias's
+    /// own endpoint scheme — [`registry::turn_token_current`] with the
+    /// pair read in the caller's transaction. An alias with no agent
+    /// row has no scheme, so nothing is current for it (fail closed).
+    fn turn_token_current_in(tx: &Connection, alias: &str, generation: &str, token: &str) -> bool {
+        tx.query_row(
+            "SELECT provider, endpoint_kind FROM agents WHERE alias=?",
+            [alias],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok()
+        .is_some_and(|(provider, kind)| {
+            registry::turn_token_current(&provider, &kind, Some(generation), token)
+        })
+    }
+
     /// Why a recorded shutdown entry cannot be adopted at the store
     /// level — `None` means the message may stay `running` for the
     /// actor's pane checks. Every failure maps to the plain recovery
@@ -1595,15 +1611,6 @@ impl Store {
         if turn_id.as_deref() != Some(e.turn_id.as_str()) {
             return Some(format!("turn id for {} changed", e.message_id));
         }
-        // Marker-internal consistency: a token that does not embed the
-        // recorded generation can never validate again — a marker this
-        // inconsistent is corrupt or hand-built, so the turn fences.
-        if !e.turn_id.starts_with(&format!("pty-{}-", e.generation)) {
-            return Some(format!(
-                "turn {} does not match recorded generation",
-                e.message_id
-            ));
-        }
         let agent = tx
             .query_row(
                 "SELECT enabled, state FROM agents WHERE alias=?",
@@ -1611,6 +1618,19 @@ impl Store {
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
             )
             .ok();
+        if agent.is_none() {
+            return Some(format!("agent {} is gone", e.alias));
+        }
+        // Marker-internal consistency: a token that is not current for
+        // the recorded generation under the agent's own endpoint scheme
+        // (CAD-162) can never validate again — a marker this
+        // inconsistent is corrupt or hand-built, so the turn fences.
+        if !Self::turn_token_current_in(tx, &e.alias, &e.generation, &e.turn_id) {
+            return Some(format!(
+                "turn {} does not match recorded generation",
+                e.message_id
+            ));
+        }
         match agent {
             None => Some(format!("agent {} is gone", e.alias)),
             Some((0, _)) => Some(format!("agent {} was disabled at shutdown", e.alias)),
@@ -1739,7 +1759,8 @@ impl Store {
                 }
                 continue;
             };
-            if state == "running" && !turn_id.starts_with(&format!("pty-{generation}-")) {
+            if state == "running" && !Self::turn_token_current_in(&tx, &alias, generation, &turn_id)
+            {
                 Self::event(
                     &tx,
                     &alias,
@@ -2667,15 +2688,36 @@ impl Store {
         Ok(())
     }
 
-    /// Explicit acknowledgement for a submitted PTY message; the
-    /// message stays `running` until a result report completes it.
+    /// Explicit acknowledgement for a running message; it stays
+    /// `running` until a result completes it — a pty result report, or
+    /// (CAD-162) the adapter's turn result on a managed endpoint. Only a
+    /// pty-style (explicitly reported) turn carries the `submitted`
+    /// marker, so a managed ack never makes its turn `awaiting_report`.
     pub fn mark_ack(&self, message: &Message, text: Option<&str>) -> Result<()> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        let turn_result = tx
+            .query_row(
+                "SELECT provider, endpoint_kind FROM agents WHERE alias=?",
+                [&message.alias],
+                |r| {
+                    Ok(registry::reports_turn_result(
+                        &r.get::<_, String>(0)?,
+                        &r.get::<_, String>(1)?,
+                    ))
+                },
+            )
+            .optional()?
+            .unwrap_or(false);
+        let status = if turn_result {
+            "acknowledged"
+        } else {
+            "submitted"
+        };
         let n = tx.execute(
             "UPDATE messages SET result=? WHERE id=? AND state='running'",
             params![
-                json!({"status": "submitted",
+                json!({"status": status,
                        "ack": {"text": text, "at": now()}})
                 .to_string(),
                 message.id
@@ -8685,6 +8727,142 @@ mod tests {
         assert_eq!(vs.len(), 2);
         assert_eq!(vs[0].revision, 1);
         assert_eq!(vs[1].revision, 2);
+    }
+
+    // ---- CAD-162: adoption judges tokens by the agent's own scheme ----
+
+    const CAD162_GEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// `alias` on `(provider, kind)` at `CAD162_GEN`, holding one running
+    /// message `m-<alias>` under `token`.
+    fn cad162_turn(
+        s: &Store,
+        cwd: &Path,
+        alias: &str,
+        (provider, kind): (&str, &str),
+        token: &str,
+    ) {
+        s.register_agent(&NewAgent {
+            alias,
+            provider,
+            endpoint_kind: kind,
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        s.set_identity(
+            alias,
+            &crate::adapter::Identity {
+                thread_id: format!("thread-{alias}"),
+                session_id: format!("session-{alias}"),
+                model: None,
+                effort: None,
+                pid: 4242,
+                endpoint: None,
+                generation: Some(CAD162_GEN.to_string()),
+                attach: None,
+            },
+        )
+        .unwrap();
+        let id = format!("m-{alias}");
+        s.enqueue(alias, "work", None, &id, "user").unwrap();
+        let Take::Message(m) = s.take_queued(alias).unwrap() else {
+            panic!("{alias}: message must be claimed");
+        };
+        s.mark_running(&m.id, token).unwrap();
+    }
+
+    fn cad162_refusals(s: &Store, alias: &str) -> Vec<String> {
+        s.events_tail(alias, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "turn_adopt_refused")
+            .map(|e| e.payload["reason"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// CAD-162 acceptance 1/3, the recovery check: a shutdown-marker
+    /// entry whose token is not current for the recorded generation
+    /// under the AGENT'S OWN scheme is refused — a pty-shaped token on a
+    /// managed agent (which the old `pty-{gen}-` literal kept) and a
+    /// managed-shaped token on a pty agent — while a genuine pty entry
+    /// is kept.
+    #[test]
+    fn adoption_refuses_a_marker_token_from_another_endpoint_kind() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.sqlite3");
+        let cwd = dir.path().join("w");
+        std::fs::create_dir(&cwd).unwrap();
+        let pty_token = format!("pty-{CAD162_GEN}-{}", "a".repeat(32));
+        let claude_token = format!("claude-{CAD162_GEN}-{}", "b".repeat(32));
+        {
+            let s = Store::open(&path).unwrap();
+            cad162_turn(&s, &cwd, "mc", ("claude", "managed"), &pty_token);
+            cad162_turn(&s, &cwd, "dp", ("devin", "pty"), &claude_token);
+            cad162_turn(&s, &cwd, "ok", ("devin", "pty"), &pty_token);
+        }
+        let entry = |alias: &str, token: &str| AdoptEntry {
+            alias: alias.to_string(),
+            message_id: format!("m-{alias}"),
+            turn_id: token.to_string(),
+            generation: CAD162_GEN.to_string(),
+            pane_pid: 4242,
+            native_session: format!("session-{alias}"),
+        };
+        let s = Store::open_adopting(
+            &path,
+            Some(ConsumedMarker {
+                entries: vec![
+                    entry("mc", &pty_token),
+                    entry("dp", &claude_token),
+                    entry("ok", &pty_token),
+                ],
+                stale: None,
+            }),
+        )
+        .unwrap();
+        for alias in ["mc", "dp"] {
+            assert_eq!(
+                cad162_refusals(&s, alias),
+                [format!("turn m-{alias} does not match recorded generation")],
+                "{alias}"
+            );
+            assert!(s.take_adoption(alias).is_none(), "{alias} adopted");
+            let m = s.message(&format!("m-{alias}")).unwrap().unwrap();
+            assert_eq!(m.state, "unknown", "{alias}");
+        }
+        assert!(cad162_refusals(&s, "ok").is_empty());
+        assert_eq!(s.take_adoption("ok").map(|e| e.len()), Some(1));
+        assert_eq!(s.message("m-ok").unwrap().unwrap().state, "running");
+    }
+
+    /// CAD-162 acceptance 1/3, the shutdown-record check: a running pty
+    /// turn whose token is another kind's shape under the snapshot
+    /// generation is refused and named, never recorded for adoption.
+    #[test]
+    fn shutdown_entries_refuse_a_token_from_another_endpoint_kind() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        let claude_token = format!("claude-{CAD162_GEN}-{}", "b".repeat(32));
+        let pty_token = format!("pty-{CAD162_GEN}-{}", "a".repeat(32));
+        cad162_turn(&s, &cwd, "dp", ("devin", "pty"), &claude_token);
+        cad162_turn(&s, &cwd, "ok", ("devin", "pty"), &pty_token);
+        let facts = s.pty_endpoint_facts().unwrap();
+        assert_eq!(facts.len(), 2, "{facts:?}");
+        let entries = s.shutdown_entries(&facts).unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.alias.as_str()).collect::<Vec<_>>(),
+            ["ok"]
+        );
+        assert_eq!(
+            cad162_refusals(&s, "dp"),
+            ["turn token predates endpoint generation"]
+        );
     }
 
     /// A worker on an explicit-reporting pty endpoint (`devin/pty`,

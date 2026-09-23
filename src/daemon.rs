@@ -3676,11 +3676,18 @@ impl Shared {
         }
     }
 
-    /// Explicit ack/result report for a submitted PTY message. The
-    /// `token` is the `turn_id` minted at submission; it embeds the
-    /// endpoint generation, so a report aimed at a previous pane life
-    /// is rejected as stale. Callers are identified by possession of
+    /// Explicit ack/result report for a running message. The `token` is
+    /// the `turn_id` minted at submission; it embeds the endpoint
+    /// generation under the endpoint's own scheme (CAD-162:
+    /// `registry::turn_token_current`), so a report aimed at a previous
+    /// endpoint life — or carrying another endpoint kind's token — is
+    /// rejected as stale, and an endpoint with no checkable scheme
+    /// refuses every report. Callers are identified by possession of
     /// the token, which is self-asserted — not an authentication.
+    ///
+    /// On an endpoint whose adapter turn result completes the message
+    /// (managed), only `ack` is accepted: the turn result is the one
+    /// writer of the outcome, so a reported `result` would race it.
     fn rpc_message_report(self: &Arc<Self>, params: &Value) -> Result<Value> {
         let id = required_str(params, "message")?;
         let token = required_str(params, "token")?;
@@ -3696,13 +3703,20 @@ impl Shared {
                 "Token does not match the message's submission token",
             ));
         }
-        let stale = match &agent.generation {
-            Some(gen) => !token.starts_with(&format!("pty-{gen}-")),
-            None => true,
-        };
-        if stale {
+        if !registry::turn_token_current(
+            &agent.provider,
+            &agent.endpoint_kind,
+            agent.generation.as_deref(),
+            token,
+        ) {
             return Err(Error::rejected(
                 "Submission token belongs to a stale endpoint generation",
+            ));
+        }
+        if kind == "result" && registry::reports_turn_result(&agent.provider, &agent.endpoint_kind)
+        {
+            return Err(Error::rejected(
+                "This endpoint's turn result completes the message — report `ack` only",
             ));
         }
         // A valid ack/result report is explicit agent activity — it
@@ -9193,6 +9207,259 @@ mod tests {
             unmatched_caller(true, false, false, "answer").unwrap(),
             ("unknown".to_string(), "unknown")
         );
+    }
+
+    // ---- CAD-162: turn-token staleness keyed on the endpoint's scheme ----
+
+    const GEN: &str = "0123456789abcdef0123456789abcdef";
+    const OLD_GEN: &str = "fedcba9876543210fedcba9876543210";
+
+    /// An agent of `(provider, kind)` whose live endpoint is at
+    /// `generation`, holding one `running` message minted `token`.
+    /// Returns the message id. No actor runs — the RPC is judged
+    /// against the store alone, exactly as the daemon does.
+    fn running_turn(
+        shared: &Arc<Shared>,
+        dir: &Path,
+        alias: &str,
+        (provider, kind): (&str, &str),
+        generation: Option<&str>,
+        token: &str,
+    ) -> String {
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias,
+                provider,
+                endpoint_kind: kind,
+                role: "worker",
+                cwd: dir.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        shared
+            .store
+            .set_identity(
+                alias,
+                &adapter::Identity {
+                    thread_id: format!("thread-{alias}"),
+                    session_id: format!("session-{alias}"),
+                    model: None,
+                    effort: None,
+                    pid: 0,
+                    endpoint: None,
+                    generation: generation.map(str::to_string),
+                    attach: None,
+                },
+            )
+            .unwrap();
+        let id = format!("m-{alias}");
+        shared
+            .store
+            .enqueue(alias, "work", None, &id, "test")
+            .unwrap();
+        let Take::Message(msg) = shared.store.take_queued(alias).unwrap() else {
+            panic!("{alias}: queued message must be taken");
+        };
+        shared.store.mark_running(&msg.id, token).unwrap();
+        id
+    }
+
+    fn report(shared: &Arc<Shared>, id: &str, token: &str, kind: &str) -> Result<Value> {
+        shared.dispatch(
+            "message_report",
+            &json!({"message": id, "token": token, "kind": kind, "text": "reported"}),
+            0,
+        )
+    }
+
+    /// A refused report changed nothing: the message is still `running`
+    /// under the same token and carries no ack or result.
+    fn assert_refused_untouched(shared: &Arc<Shared>, id: &str, token: &str, what: &str) {
+        for kind in ["ack", "result"] {
+            let err = report(shared, id, token, kind)
+                .expect_err(&format!("{what}: {kind} accepted as current"))
+                .to_string();
+            assert!(err.contains("stale endpoint generation"), "{what}: {err}");
+        }
+        let m = shared.store.message(id).unwrap().unwrap();
+        assert_eq!(m.state, "running", "{what}");
+        assert_eq!(m.turn_id.as_deref(), Some(token), "{what}");
+        assert!(m.result.is_none(), "{what}: {:?}", m.result);
+    }
+
+    /// Endpoints whose turn tokens embed their generation, with each
+    /// one's own token shape and another kind's shape.
+    fn schemed_endpoints() -> Vec<((&'static str, &'static str), &'static str, &'static str)> {
+        vec![
+            (("claude", "pty"), "pty", "claude"),
+            (("devin", "pty"), "pty", "claude"),
+            (("cursor", "pty"), "pty", "claude"),
+            (("tui-stub", "pty"), "pty", "claude"),
+            (("claude", "managed"), "claude", "pty"),
+        ]
+    }
+
+    /// CAD-162 acceptance 2/3: on every endpoint kind with a scheme, the
+    /// token minted under the live generation is current; the same
+    /// shape from an EARLIER generation, another endpoint kind's token
+    /// carrying the LIVE generation, and any token while the generation
+    /// is unproven (cleared at store open) are each refused and change
+    /// nothing.
+    #[test]
+    fn message_report_judges_tokens_by_the_endpoints_own_scheme() {
+        let (dir, shared) = shared();
+        for (i, (pair, own, foreign)) in schemed_endpoints().into_iter().enumerate() {
+            let what = format!("{}/{}", pair.0, pair.1);
+            // Current: accepted, and the ack keeps the message running.
+            let token = format!("{own}-{GEN}-nonce{i}");
+            let id = running_turn(
+                &shared,
+                dir.path(),
+                &format!("cur{i}"),
+                pair,
+                Some(GEN),
+                &token,
+            );
+            report(&shared, &id, &token, "ack")
+                .unwrap_or_else(|e| panic!("{what}: current token refused: {e}"));
+            let m = shared.store.message(&id).unwrap().unwrap();
+            assert_eq!(m.state, "running", "{what}");
+            assert_eq!(
+                m.result.as_ref().unwrap()["ack"]["text"],
+                "reported",
+                "{what}"
+            );
+
+            // Earlier generation, same scheme.
+            let stale = format!("{own}-{OLD_GEN}-nonce{i}");
+            let id = running_turn(
+                &shared,
+                dir.path(),
+                &format!("old{i}"),
+                pair,
+                Some(GEN),
+                &stale,
+            );
+            assert_refused_untouched(&shared, &id, &stale, &format!("{what} stale"));
+
+            // Another endpoint kind's token under the LIVE generation.
+            let cross = format!("{foreign}-{GEN}-nonce{i}");
+            let id = running_turn(
+                &shared,
+                dir.path(),
+                &format!("xk{i}"),
+                pair,
+                Some(GEN),
+                &cross,
+            );
+            assert_refused_untouched(&shared, &id, &cross, &format!("{what} cross-kind"));
+
+            // Generation not proven: nothing is current.
+            let id = running_turn(&shared, dir.path(), &format!("ng{i}"), pair, None, &token);
+            assert_refused_untouched(&shared, &id, &token, &format!("{what} no generation"));
+        }
+    }
+
+    /// CAD-162 acceptance 2/3, fail closed: an endpoint whose token
+    /// carries nothing cadence can check against its generation (codex:
+    /// provider turn ids; devin cloud: the message id; fake; mailbox)
+    /// accepts NO report — not its own token, not a pty- or claude-
+    /// shaped token forged under its live generation.
+    #[test]
+    fn message_report_refuses_every_token_on_endpoints_without_a_scheme() {
+        let (dir, shared) = shared();
+        let pairs = [
+            ("codex", "managed"),
+            ("codex", "managed-ws"),
+            ("devin", "cloud"),
+            ("fake", "fake"),
+            ("inbox", "inbox"),
+        ];
+        for (i, pair) in pairs.into_iter().enumerate() {
+            let alias = format!("ns{i}");
+            let id = format!("m-{alias}");
+            let tokens = [
+                // What each adapter mints today: codex a provider turn
+                // id, devin cloud the message id, fake a counter.
+                "turn-0001".to_string(),
+                id.clone(),
+                "fake-turn-1".to_string(),
+                // Forgeries under the live generation.
+                format!("pty-{GEN}-n"),
+                format!("claude-{GEN}-n"),
+                format!("{}-{GEN}-n", pair.0),
+                format!("{}-{GEN}-n", pair.1),
+            ];
+            let first = running_turn(&shared, dir.path(), &alias, pair, Some(GEN), &tokens[0]);
+            assert_eq!(first, id);
+            for token in &tokens {
+                shared.store.mark_running(&id, token).unwrap();
+                assert_refused_untouched(
+                    &shared,
+                    &id,
+                    token,
+                    &format!("{}/{} {token}", pair.0, pair.1),
+                );
+            }
+        }
+    }
+
+    /// CAD-162 acceptance 4: an ack on a managed endpoint keeps the
+    /// message running without the pty `submitted` marker (so it is
+    /// never `awaiting_report`), a reported `result` is refused — the
+    /// adapter's turn result is the one writer of the outcome — and that
+    /// later turn result completes the message.
+    #[test]
+    fn managed_ack_keeps_running_and_the_turn_result_completes() {
+        let (dir, shared) = shared();
+        let token = format!("claude-{GEN}-n");
+        let id = running_turn(
+            &shared,
+            dir.path(),
+            "mc1",
+            ("claude", "managed"),
+            Some(GEN),
+            &token,
+        );
+        report(&shared, &id, &token, "ack").unwrap();
+        let m = shared.store.message(&id).unwrap().unwrap();
+        assert_eq!(m.state, "running");
+        let result = m.result.clone().unwrap();
+        assert_eq!(result["status"], "acknowledged", "{result}");
+        assert_eq!(result["ack"]["text"], "reported", "{result}");
+        assert!(!m.awaiting_report(), "a managed ack owes no report");
+        assert!(m.holds_turn());
+
+        let err = report(&shared, &id, &token, "result")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("report `ack` only"), "{err}");
+        let m = shared.store.message(&id).unwrap().unwrap();
+        assert_eq!(m.state, "running");
+        assert_eq!(m.result.as_ref().unwrap()["status"], "acknowledged");
+
+        shared
+            .complete(
+                &m,
+                TurnResult {
+                    turn_id: token.clone(),
+                    status: "completed".into(),
+                    text: "done".into(),
+                    stop_reason: Some("end_turn".into()),
+                    error: None,
+                },
+            )
+            .unwrap();
+        let m = shared.store.message(&id).unwrap().unwrap();
+        assert_eq!(m.state, "completed");
+        assert_eq!(m.result.as_ref().unwrap()["text"], "done");
+        // An ack after completion is refused like on pty.
+        assert!(report(&shared, &id, &token, "ack").is_err());
     }
 }
 

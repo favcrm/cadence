@@ -80,6 +80,57 @@ pub enum Reporting {
     TurnResult,
 }
 
+/// A turn-token scheme that binds a token to the endpoint generation
+/// that minted it (CAD-162): `<prefix>-<generation>-<nonce>`. The same
+/// value mints the token (in the adapter) and judges it (daemon report,
+/// store adoption), so the two can never drift apart.
+///
+/// A token is current for generation `G` only under ITS OWN endpoint's
+/// scheme: a pty token never satisfies a managed endpoint and the
+/// reverse, whatever generation it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnTokenScheme {
+    prefix: &'static str,
+}
+
+/// Every pty endpoint (claude, devin, cursor, tui-stub): the pty adapter
+/// mints `pty-<generation>-<uuid>` per submitted message; the generation
+/// is a fresh simple uuid per pane `open`.
+pub const PTY_TURN_TOKENS: TurnTokenScheme = TurnTokenScheme { prefix: "pty" };
+
+/// Managed Claude (stream-json): the claude adapter mints
+/// `claude-<generation>-<uuid>` per turn; the generation is minted per
+/// provider-process `open`.
+pub const CLAUDE_MANAGED_TURN_TOKENS: TurnTokenScheme = TurnTokenScheme { prefix: "claude" };
+
+impl TurnTokenScheme {
+    /// A fresh token for one turn under `generation`.
+    pub fn mint(&self, generation: &str) -> String {
+        format!(
+            "{}-{generation}-{}",
+            self.prefix,
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    /// `token` was minted by this scheme under exactly `generation`.
+    /// Fails closed: an empty generation, or one containing the `-`
+    /// delimiter (which would let `pty-a-b-…`, minted under `a-b`, pass
+    /// for generation `a`), is never current; neither is a token with
+    /// no nonce after the generation.
+    pub fn is_current(&self, generation: &str, token: &str) -> bool {
+        if generation.is_empty() || generation.contains('-') {
+            return false;
+        }
+        token
+            .strip_prefix(self.prefix)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .and_then(|rest| rest.strip_prefix(generation))
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|nonce| !nonce.is_empty())
+    }
+}
+
 /// One `(provider, endpoint_kind)` capability descriptor.
 #[derive(Debug)]
 pub struct EndpointSpec {
@@ -100,6 +151,12 @@ pub struct EndpointSpec {
     /// always equal to `reports` — managed-ws workers are humans in a
     /// TUI and are still taught the explicit token flow.
     pub report_hint: Reporting,
+    /// How this endpoint's turn tokens prove their generation, judged by
+    /// [`turn_token_current`]. `None` — the token carries nothing
+    /// cadence can check against the live generation (codex: provider
+    /// turn ids; devin cloud: the message id; mailbox; fake) — so no
+    /// token is ever accepted as current: fail closed.
+    pub turn_token: Option<TurnTokenScheme>,
     /// Provider-initiated JSON-RPC requests reach `agent respond`.
     pub brokers_requests: bool,
     /// `agent resume` / launch `-r` is meaningful for this endpoint.
@@ -151,6 +208,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: false,
         reports: Reporting::TurnResult,
         report_hint: Reporting::Explicit,
+        turn_token: None,
         brokers_requests: true,
         resumable: true,
         resume_label: "codex resume --remote",
@@ -185,6 +243,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: false,
         reports: Reporting::TurnResult,
         report_hint: Reporting::Explicit,
+        turn_token: None,
         brokers_requests: true,
         resumable: true,
         resume_label: "codex resume --remote",
@@ -219,6 +278,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: false,
         reports: Reporting::TurnResult,
         report_hint: Reporting::TurnResult,
+        turn_token: Some(CLAUDE_MANAGED_TURN_TOKENS),
         brokers_requests: true,
         resumable: true,
         resume_label: "claude --resume <session>",
@@ -263,6 +323,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: true,
         reports: Reporting::Explicit,
         report_hint: Reporting::Explicit,
+        turn_token: Some(PTY_TURN_TOKENS),
         brokers_requests: false,
         resumable: true,
         resume_label: "claude --resume <session>",
@@ -307,6 +368,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: true,
         reports: Reporting::Explicit,
         report_hint: Reporting::Explicit,
+        turn_token: Some(PTY_TURN_TOKENS),
         brokers_requests: false,
         resumable: true,
         resume_label: "devin -r <slug>",
@@ -348,6 +410,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: false,
         reports: Reporting::TurnResult,
         report_hint: Reporting::TurnResult,
+        turn_token: None,
         brokers_requests: true,
         resumable: true,
         resume_label: "wake archived devin session <session>",
@@ -387,6 +450,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: true,
         reports: Reporting::Explicit,
         report_hint: Reporting::Explicit,
+        turn_token: Some(PTY_TURN_TOKENS),
         brokers_requests: false,
         resumable: true,
         resume_label: "cursor-agent --resume <session>",
@@ -429,6 +493,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: true,
         reports: Reporting::Explicit,
         report_hint: Reporting::Explicit,
+        turn_token: Some(PTY_TURN_TOKENS),
         brokers_requests: false,
         resumable: true,
         resume_label: "stub -r <session>",
@@ -468,6 +533,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: false,
         reports: Reporting::Explicit,
         report_hint: Reporting::Explicit,
+        turn_token: None,
         brokers_requests: false,
         resumable: false,
         resume_label: "n/a — mailbox",
@@ -492,6 +558,7 @@ pub static SPECS: &[EndpointSpec] = &[
         screen_probe: false,
         reports: Reporting::TurnResult,
         report_hint: Reporting::Explicit,
+        turn_token: None,
         brokers_requests: true,
         resumable: true,
         resume_label: "in-process double",
@@ -738,6 +805,27 @@ pub fn reports_turn_result(provider: &str, kind: &str) -> bool {
     spec_opt(provider, kind)
         .map(|s| s.reports == Reporting::TurnResult)
         .unwrap_or(false)
+}
+
+/// CAD-162: THE predicate for "is `token` current for generation
+/// `generation` of this `(provider, kind)` endpoint". The daemon's
+/// `message_report` and the store's adoption checks all call it; none
+/// of them knows a token shape. Fails closed: an unknown pair, an
+/// endpoint whose tokens carry no checkable generation, or a missing
+/// generation (cleared at store open, not yet proven) is never current.
+pub fn turn_token_current(
+    provider: &str,
+    kind: &str,
+    generation: Option<&str>,
+    token: &str,
+) -> bool {
+    match (
+        spec_opt(provider, kind).and_then(|s| s.turn_token),
+        generation,
+    ) {
+        (Some(scheme), Some(generation)) => scheme.is_current(generation, token),
+        _ => false,
+    }
 }
 
 /// Which report instruction the briefing prints for this endpoint.
@@ -1850,5 +1938,89 @@ mod tests {
             unknown.contains("unknown devin cloud launch param"),
             "{unknown}"
         );
+    }
+
+    /// CAD-162: every endpoint kind that exists today, judged by its own
+    /// scheme. A token minted under the live generation is current; one
+    /// from an earlier generation, from another endpoint kind, or with
+    /// no checkable generation at all is never current.
+    #[test]
+    fn turn_token_current_is_keyed_on_each_endpoints_own_scheme() {
+        let gen = "0123456789abcdef0123456789abcdef";
+        let old = "fedcba9876543210fedcba9876543210";
+        let pty = PTY_TURN_TOKENS.mint(gen);
+        let claude = CLAUDE_MANAGED_TURN_TOKENS.mint(gen);
+        assert!(pty.starts_with(&format!("pty-{gen}-")), "{pty}");
+        assert!(claude.starts_with(&format!("claude-{gen}-")), "{claude}");
+        for provider in ["claude", "devin", "cursor", "tui-stub"] {
+            // Current under its own scheme and generation.
+            assert!(turn_token_current(provider, "pty", Some(gen), &pty));
+            // Earlier generation: stale.
+            assert!(!turn_token_current(provider, "pty", Some(old), &pty));
+            // Another endpoint kind's token, SAME generation: refused.
+            assert!(!turn_token_current(provider, "pty", Some(gen), &claude));
+            // Generation not yet proven (cleared at store open): refused.
+            assert!(!turn_token_current(provider, "pty", None, &pty));
+        }
+        assert!(turn_token_current("claude", "managed", Some(gen), &claude));
+        assert!(!turn_token_current("claude", "managed", Some(old), &claude));
+        assert!(!turn_token_current("claude", "managed", Some(gen), &pty));
+        assert!(!turn_token_current("claude", "managed", None, &claude));
+        // No checkable scheme: nothing is ever current — not even a
+        // token shaped exactly like the endpoint's generation.
+        for (provider, kind, generation) in [
+            ("codex", "managed", gen),
+            ("codex", "managed-ws", gen),
+            ("devin", "cloud", "devin-0123"),
+            ("devin", "cloud", gen),
+            ("fake", "fake", gen),
+            (INBOX, INBOX, gen),
+            ("nosuch", "pty-like", gen),
+        ] {
+            for token in [
+                pty.clone(),
+                claude.clone(),
+                format!("{kind}-{generation}-x"),
+                format!("{provider}-{generation}-x"),
+                format!("{generation}-x"),
+                "m1".to_string(),
+            ] {
+                assert!(
+                    !turn_token_current(provider, kind, Some(generation), &token),
+                    "{provider}/{kind} accepted {token}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn turn_token_scheme_fails_closed_on_ambiguous_shapes() {
+        let s = PTY_TURN_TOKENS;
+        assert!(s.is_current("g1", "pty-g1-n"));
+        // A generation containing the delimiter is ambiguous against
+        // the nonce: never current, whatever the token.
+        assert!(!s.is_current("a-b", "pty-a-b-n"));
+        // Empty generation, missing nonce, prefix-only look-alikes.
+        assert!(!s.is_current("", "pty--n"));
+        assert!(!s.is_current("g1", "pty-g1-"));
+        assert!(!s.is_current("g1", "pty-g1"));
+        assert!(!s.is_current("g1", "pty-g10-n"));
+        assert!(!s.is_current("g1", "ptyx-g1-n"));
+        assert!(!s.is_current("g1", "xpty-g1-n"));
+        assert!(!s.is_current("g1", "PTY-g1-n"));
+    }
+
+    /// Adding an endpoint kind forces a decision: every spec row names
+    /// its scheme, and only pty rows and managed claude have one today.
+    #[test]
+    fn only_generation_minting_endpoints_carry_a_turn_token_scheme() {
+        for s in SPECS {
+            let expected = match (s.provider, s.endpoint_kind) {
+                (_, "pty") => Some(PTY_TURN_TOKENS),
+                ("claude", "managed") => Some(CLAUDE_MANAGED_TURN_TOKENS),
+                _ => None,
+            };
+            assert_eq!(s.turn_token, expected, "{}/{}", s.provider, s.endpoint_kind);
+        }
     }
 }

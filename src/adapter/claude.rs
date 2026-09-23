@@ -51,6 +51,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::link::Incoming;
+use super::registry;
 use super::stdio::{EnvScrub, StdioAdapter};
 use super::{AdapterHooks, Identity, ProviderAdapter, ProviderEnv, TurnResult};
 use crate::error::{Error, Result};
@@ -492,7 +493,7 @@ impl ProviderAdapter for ClaudeAdapter {
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
         let generation = self.shared.generation.lock().unwrap().clone();
-        let turn_id = format!("claude-{generation}-{}", Uuid::new_v4().simple());
+        let turn_id = registry::CLAUDE_MANAGED_TURN_TOKENS.mint(&generation);
         // A queued result here is stale — it belongs to a turn the
         // daemon already fenced. Discard it rather than misattribute.
         {

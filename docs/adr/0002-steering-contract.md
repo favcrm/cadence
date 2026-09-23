@@ -355,6 +355,17 @@ Independent of elicitation, two changes still stand:
    `token.starts_with("pty-{gen}-")` (`daemon.rs:1757-1767`) — so a
    managed turn id (`claude-<gen>-<uuid>`) can never satisfy it. Generalise
    the prefix to the endpoint's own scheme and ack works everywhere.
+   *Landed (CAD-162, phase 2):* the scheme is registry data
+   (`EndpointSpec.turn_token`), judged by one predicate,
+   `registry::turn_token_current`, that `message_report` and both store
+   adoption checks call. Schemes today: every pty endpoint mints
+   `pty-<gen>-<uuid>`; managed Claude mints `claude-<gen>-<uuid>` and may
+   `ack` (kept `running`, never `awaiting_report`) but not report a
+   `result` — its turn result completes the message. Codex (provider
+   turn ids), Devin Cloud (the message id; its generation is the Devin
+   session id, per CAD-204 gap 1), fake and inbox carry no checkable
+   generation, so every report is refused (fail closed). A token from
+   an earlier generation or another endpoint kind is never current.
 2. **A turn on a `steer` message never completes the objective.** It
    completes the amendment. This is close to today's behaviour by
    accident (only `job_dispatch` drives task state) and should become
