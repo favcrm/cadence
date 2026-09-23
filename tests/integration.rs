@@ -13071,7 +13071,10 @@ fn message_cancel_gate_pty_and_running_refusal() {
         json!({"alias": "dv1", "text": "first", "message": "m1"}),
     )
     .unwrap();
-    thread::sleep(Duration::from_secs(1));
+    // Wait for m1's own recorded refusal, not a fixed sleep: the actor
+    // takes the send at once and the gate may still be probing, and a
+    // cancel is refused unless the message is back to `queued` (CAD-293).
+    d.wait_event_where("dv1", "gate_wait", |e| e["payload"]["message"] == "m1", 20);
     assert_eq!(d.message_state("dv1", "m1"), "queued");
     d.rpc("message_cancel", json!({"message": "m1", "reason": "typo"}))
         .unwrap();
