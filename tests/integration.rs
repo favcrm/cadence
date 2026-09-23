@@ -32781,6 +32781,54 @@ fn concurrent_daemon_starts_report_one_started_one_already_running() {
     );
 }
 
+/// CAD-321: a start whose pre-spawn `health` check failed while a
+/// daemon is live (under load it can time out) spawns a child anyway.
+/// It reports `already_running` for the live daemon and returns only
+/// once its own child is gone — the live daemon stays the only one.
+#[test]
+fn daemon_start_whose_precheck_failed_leaves_only_the_live_daemon() {
+    let home = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let _reaper = DaemonReaper::new(state.path());
+    let start = cadence_at(home.path(), state.path(), &["daemon", "start"]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let v: Value = serde_json::from_slice(&start.stdout).unwrap();
+    assert_eq!(v["state"], "started", "{v}");
+    let pid = v["pid"].as_u64().unwrap();
+
+    let again = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(state.path())
+        .args(["daemon", "start"])
+        .env("HOME", home.path())
+        .env_remove("CADENCE_ALIAS")
+        .env_remove("CADENCE_ROLLOUT_AS")
+        .envs(test_env().vars())
+        .env("CADENCE_TEST_START_PRECHECK_FAILS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    let v: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(v["state"], "already_running", "{v}");
+    assert_eq!(v["health"]["pid"].as_u64(), Some(pid), "{v}");
+    assert_eq!(daemon_run_pids(state.path()), vec![pid]);
+
+    let stop = cadence_at(home.path(), state.path(), &["daemon", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
 #[test]
 fn restart_and_rollout_help_say_same_build_restart_is_lease_free() {
     let home = TempDir::new().unwrap();

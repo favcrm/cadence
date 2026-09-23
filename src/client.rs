@@ -71,6 +71,12 @@ const START_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 ///   `already_running`. If the other daemon exits first and our child
 ///   takes the lock after all, its pid answers and we report `started`.
 ///
+/// Every return other than `started` — `already_running` or an error —
+/// first makes sure the child this call spawned is gone (see
+/// [`SpawnedDaemon`]): a child still alive then has not reached the
+/// lock yet and would take it later, once the daemon we reported exits.
+/// Only that child is ever signalled, by its `Child` handle.
+///
 /// The pre-spawn check is a `health` call, not a lock probe: a
 /// try-lock-and-release would itself hold the lock for an instant and
 /// can make a concurrent start's child fail its non-blocking lock with
@@ -78,15 +84,20 @@ const START_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Value> {
     use std::time::Instant;
     let forward = crate::rollout::authorize_daemon_spawn(state_dir, as_identity)?;
-    if let Ok(health) = rpc_timeout(
-        state_dir,
-        "health",
-        serde_json::json!({}),
-        START_HEALTH_TIMEOUT,
-    ) {
-        return Ok(already_running(state_dir, health));
+    if !precheck_forced_to_fail() {
+        if let Ok(health) = rpc_timeout(
+            state_dir,
+            "health",
+            serde_json::json!({}),
+            START_HEALTH_TIMEOUT,
+        ) {
+            return Ok(already_running(state_dir, health));
+        }
     }
-    let mut child = spawn_daemon_run(state_dir, forward.as_deref().or(as_identity))?;
+    let mut child = SpawnedDaemon::new(spawn_daemon_run(
+        state_dir,
+        forward.as_deref().or(as_identity),
+    )?);
     let child_pid = u64::from(child.id());
     let mut last_error = None;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -100,6 +111,7 @@ pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Va
             START_HEALTH_TIMEOUT,
         ) {
             Ok(health) if health["pid"].as_u64() == Some(child_pid) => {
+                child.keep();
                 return Ok(serde_json::json!({
                     "state": "started",
                     "pid": child.id(),
@@ -129,6 +141,96 @@ pub fn daemon_start_as(state_dir: &Path, as_identity: Option<&str>) -> Result<Va
             );
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Debug/test builds only: `CADENCE_TEST_START_PRECHECK_FAILS=1` makes
+/// `daemon start` treat its pre-spawn `health` check as failed — as when
+/// it times out under load while a daemon is live — so it spawns a child
+/// anyway. Release builds never read it.
+fn precheck_forced_to_fail() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("CADENCE_TEST_START_PRECHECK_FAILS").is_some_and(|v| v == "1")
+}
+
+/// How long a spawned child that did not become the daemon gets to
+/// exit on the singleton lock by itself before it is sent SIGTERM.
+const CHILD_EXIT_GRACE: Duration = Duration::from_secs(3);
+/// How long after SIGTERM before SIGKILL.
+const CHILD_TERM_WAIT: Duration = Duration::from_secs(2);
+
+/// The `daemon run` child one `daemon start` spawned. Unless [`keep`]
+/// was called (the `started` path), dropping it ends the child and
+/// reaps it: wait for it to exit on the lock, else SIGTERM, else
+/// SIGKILL — all bounded. It signals only this child, through its
+/// handle; the child is unreaped until then, so its pid cannot be
+/// reused.
+///
+/// [`keep`]: SpawnedDaemon::keep
+struct SpawnedDaemon {
+    child: std::process::Child,
+    keep: bool,
+}
+
+impl SpawnedDaemon {
+    fn new(child: std::process::Child) -> Self {
+        Self { child, keep: false }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// The child became the daemon: leave it running.
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for SpawnedDaemon {
+    fn drop(&mut self) {
+        if !self.keep {
+            end_child(&mut self.child, CHILD_EXIT_GRACE, CHILD_TERM_WAIT);
+        }
+    }
+}
+
+/// Make sure `child` has exited and is reaped: wait up to `grace` for
+/// it to exit by itself, then SIGTERM it and wait up to `term_wait`,
+/// then SIGKILL it and wait.
+fn end_child(child: &mut std::process::Child, grace: Duration, term_wait: Duration) {
+    if exited_within(child, grace) {
+        return;
+    }
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: plain kill(2) on our own unreaped child's pid.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    if exited_within(child, term_wait) {
+        return;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Poll `child` until it has exited (reaping it) or `bound` passes.
+fn exited_within(child: &mut std::process::Child, bound: Duration) -> bool {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            // Not waitable: there is nothing left of it to end.
+            Err(_) => return true,
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -203,4 +305,80 @@ pub fn rpc_timeout(
     let frame: Value = serde_json::from_str(&line)
         .map_err(|_| Error::internal("Daemon returned a malformed response"))?;
     proto::unwrap(frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    #[test]
+    fn end_child_waits_for_a_child_that_exits_by_itself() {
+        let mut child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        end_child(&mut child, Duration::from_secs(10), Duration::from_secs(10));
+        let status = child.try_wait().unwrap().expect("reaped");
+        assert_eq!(status.code(), Some(7), "{status:?}");
+    }
+
+    #[test]
+    fn end_child_terms_a_child_still_running_after_the_grace() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let begin = Instant::now();
+        end_child(
+            &mut child,
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+        );
+        let status = child.try_wait().unwrap().expect("reaped");
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+        assert!(begin.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn end_child_kills_a_child_that_ignores_sigterm() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        end_child(
+            &mut child,
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+        );
+        let status = child.try_wait().unwrap().expect("reaped");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    }
+
+    #[test]
+    fn a_kept_spawned_daemon_is_left_running() {
+        let mut spawned = SpawnedDaemon::new(Command::new("sleep").arg("30").spawn().unwrap());
+        spawned.keep();
+        let pid = libc::pid_t::try_from(spawned.id()).unwrap();
+        let begin = Instant::now();
+        drop(spawned);
+        assert!(begin.elapsed() < CHILD_EXIT_GRACE);
+        // Still ours and unreaped: signal 0 finds it, and it is no zombie.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let running = stat
+            .rsplit(')')
+            .next()
+            .is_some_and(|rest| !rest.trim_start().starts_with('Z'));
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        assert!(
+            alive && running,
+            "kept child {pid} should still run: {stat}"
+        );
+    }
 }
