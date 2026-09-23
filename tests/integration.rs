@@ -246,6 +246,19 @@ impl TestDaemon {
         cadence_agent::proto::unwrap(frame)
     }
 
+    /// A fixture registration — the operator's act. Plain `rpc` from
+    /// this process, unless a test planted this very process as a pane
+    /// ([`plant_self`]): then this process IS that agent, which the
+    /// registration caller rule (CAD-149) refuses, so the call goes
+    /// through [`Self::operator_rpc`].
+    fn fixture_rpc(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        if self.rpc("agent_show", json!({"alias": SELF_LANE})).is_ok() {
+            self.operator_rpc(method, params)
+        } else {
+            self.rpc(method, params)
+        }
+    }
+
     /// `cadence --state-dir <state> <args>` run the way
     /// [`Self::operator_rpc`] calls: as an operator shell outside every
     /// pane, however the suite is run. Answers `(success, stdout,
@@ -296,7 +309,7 @@ impl TestDaemon {
 
     fn register(&self, alias: &str) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "fake",
                    "endpoint_kind": "fake", "cwd": cwd}),
@@ -3768,7 +3781,7 @@ impl TestDaemon {
 
     fn register_kind(&self, alias: &str, endpoint_kind: &str) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "codex",
                    "endpoint_kind": endpoint_kind, "cwd": cwd}),
@@ -3778,7 +3791,7 @@ impl TestDaemon {
 
     fn register_codex_params(&self, alias: &str, endpoint_kind: &str, params: Value) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "codex",
                    "endpoint_kind": endpoint_kind, "cwd": cwd,
@@ -5409,7 +5422,7 @@ impl TestDaemon {
     fn register_devin(&self, alias: &str, session: Option<&str>) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
         let params = session.map(|s| json!({"session": s}).to_string());
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "devin",
                    "endpoint_kind": "pty", "cwd": cwd, "params": params}),
@@ -5476,7 +5489,7 @@ impl TestDaemon {
     /// Register a pty agent on the stub (test-double) profile.
     fn register_stub(&self, alias: &str, params: Value) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "tui-stub",
                    "endpoint_kind": "pty", "cwd": cwd,
@@ -5762,7 +5775,7 @@ impl TestDaemon {
     /// Register a pty agent on the claude profile.
     fn register_claude_pty(&self, alias: &str, params: Value) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "claude",
                    "endpoint_kind": "pty", "cwd": cwd,
@@ -5958,7 +5971,7 @@ impl TestDaemon {
     /// Register a pty agent on the cursor profile.
     fn register_cursor_pty(&self, alias: &str, params: Value) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "cursor",
                    "endpoint_kind": "pty", "cwd": cwd,
@@ -8596,7 +8609,7 @@ impl TestDaemon {
     /// no actor.
     fn register_inbox(&self, alias: &str) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "inbox",
                    "endpoint_kind": "inbox", "cwd": cwd}),
@@ -8607,7 +8620,7 @@ impl TestDaemon {
     /// Register a pty devin agent with arbitrary endpoint params.
     fn register_devin_opts(&self, alias: &str, params: Value) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "devin",
                    "endpoint_kind": "pty", "cwd": cwd,
@@ -10489,7 +10502,7 @@ impl TestDaemon {
     fn register_claude(&self, alias: &str, params: Value) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
         let params = (!params.is_null()).then(|| params.to_string());
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "claude",
                    "endpoint_kind": "managed", "cwd": cwd,
@@ -11896,7 +11909,7 @@ impl TestDaemon {
     /// A fake worker joined to `pm`'s group (`params.upstream`).
     fn register_member(&self, alias: &str, pm: &str) {
         let cwd = self.dir.path().to_str().unwrap().to_string();
-        self.rpc(
+        self.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "fake",
                    "endpoint_kind": "fake", "cwd": cwd,
@@ -29478,7 +29491,7 @@ fn plant_pane(d: &TestDaemon, alias: &str, pid: u32) {
     // spawning a pty actor for the row — its open cannot verify a
     // planted pane and the exit-detach clears the pid the pane map
     // resolves callers by (the CAD-113 CI flake).
-    let _ = d.rpc(
+    let _ = d.fixture_rpc(
         "agent_register",
         json!({"alias": alias, "provider": "inbox",
                "endpoint_kind": "inbox",
