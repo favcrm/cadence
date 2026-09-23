@@ -773,6 +773,19 @@ impl Agent {
     }
 
     pub fn to_json(&self) -> Value {
+        // Codex's effective approval policy and whether an operator chose
+        // it — an absent key is the cadence default, not a decision.
+        let (approval_policy, approval_policy_source) = if self.provider == "codex" {
+            match self.param_str("approval_policy") {
+                Some(policy) => (Some(policy), Some("configured")),
+                None => (
+                    Some(registry::CODEX_DEFAULT_APPROVAL_POLICY),
+                    Some("cadence default"),
+                ),
+            }
+        } else {
+            (None, None)
+        };
         json!({
             "alias": self.alias, "provider": self.provider,
             "endpoint_kind": self.endpoint_kind, "role": self.role,
@@ -804,6 +817,8 @@ impl Agent {
             } else {
                 "provider default"
             },
+            "approval_policy": approval_policy,
+            "approval_policy_source": approval_policy_source,
             "enabled": self.enabled, "error": self.error,
             "endpoint": self.endpoint, "params": self.params,
             "quota": self.quota,
