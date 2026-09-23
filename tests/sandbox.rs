@@ -4,6 +4,10 @@
 //! clears the caller's cadence env, so nothing here can reach the
 //! host's live daemon, tracker or board.
 
+// A test binary never runs the CAD-308 reaper (only `daemon run` does),
+// so its own spawns need not go through `cadence_agent::reaper`.
+#![allow(clippy::disallowed_methods)]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
