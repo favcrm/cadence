@@ -121,6 +121,9 @@ const MONITOR_TICK: Duration = Duration::from_secs(1);
 /// The daemon's own event stream — `wal_checkpointed` lands here.
 /// Readable via `cadence events daemon`; not a sendable alias.
 const DAEMON_ALIAS: &str = Store::DAEMON_STREAM;
+/// How an approval-evidence writer was authorized — the daemon's own
+/// statement, stamped on every record (CAD-217).
+const APPROVAL_RECORDED_VIA: &str = "operator-connection";
 /// `stall_secs` when neither the job nor the agent sets one.
 const DEFAULT_STALL_SECS: u64 = 1800;
 /// `silent_end_secs` when the agent doesn't set one: ten minutes of
@@ -1303,8 +1306,6 @@ impl Shared {
             "message_report" => self.rpc_message_report(params),
             "message_reconcile" => self.rpc_reconcile(params),
             "message_cancel" => self.rpc_cancel(params),
-            "approval_record" => self.rpc_approval_record(params),
-            "approval_revoke" => self.rpc_approval_revoke(params),
             "job_new" => self.rpc_job_new(params),
             "job_list" => self.rpc_job_list(params),
             "job_show" => self.rpc_job_show(params),
@@ -1411,6 +1412,8 @@ impl Shared {
             "slot_release" => self.rpc_slot_release(params, peer_pid),
             "slot_status" => self.rpc_slot_status(params, peer_pid),
             "slot_reconcile" => self.rpc_slot_reconcile(params, peer_pid),
+            "approval_record" => self.rpc_approval_record(params, peer_pid),
+            "approval_revoke" => self.rpc_approval_revoke(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
         }
     }
@@ -1824,18 +1827,19 @@ impl Shared {
         Ok(status)
     }
 
-    /// Operator authority for `slot_reconcile` on POSITIVE proof only
-    /// (CAD-276): deriving no slot identity is not enough — a detached
-    /// child of a pane or managed tool derives none. See
+    /// Operator authority on POSITIVE proof only (CAD-276) — for
+    /// `slot_reconcile` and the approval-evidence verbs (CAD-217), named
+    /// by `verb` in refusals: deriving no slot identity is not enough —
+    /// a detached child of a pane or managed tool derives none. See
     /// [`crate::peer::operator_proof`] for the checks; anything
     /// unreadable or ambiguous refuses.
-    fn reconcile_operator(&self, peer_pid: u32) -> Result<()> {
+    fn proven_operator(&self, verb: &str, peer_pid: u32) -> Result<()> {
         let panes: HashMap<u32, String> = self
             .store
             .pty_endpoint_facts()
             .map_err(|e| {
                 Error::rejected(format!(
-                    "slot reconcile is an operator action — the registered panes \
+                    "{verb} is an operator action — the registered panes \
                      cannot be read to prove this connection is not one ({e})"
                 ))
             })?
@@ -1852,7 +1856,7 @@ impl Shared {
         )
         .map_err(|why| {
             Error::rejected(format!(
-                "slot reconcile is an operator action — this connection is not \
+                "{verb} is an operator action — this connection is not \
                  provably the operator: {why}; run it from an attached operator \
                  shell outside every pane and managed endpoint"
             ))
@@ -1863,7 +1867,7 @@ impl Shared {
     /// hold (CAD-230). Operator authority is the connection's: a caller
     /// that derives ANY slot identity (a pane or an enrolled endpoint)
     /// is an agent and is refused, and so is one that is not PROVABLY
-    /// the operator ([`Self::reconcile_operator`], CAD-276);
+    /// the operator ([`Self::proven_operator`], CAD-276);
     /// identity-shaped request fields are refused rather than read. The
     /// daemon frees the hold only on its own proof of the holder's
     /// death; see [`Slots::reconcile`].
@@ -1883,7 +1887,7 @@ impl Shared {
                 who.lane()
             )));
         }
-        self.reconcile_operator(peer_pid)?;
+        self.proven_operator("slot reconcile", peer_pid)?;
         let enrollment = required_str(params, "enrollment_id")?;
         let token = required_str(params, "token")?;
         let evidence = params
@@ -1897,6 +1901,97 @@ impl Shared {
             .reconcile(enrollment, token, evidence, (self.slot_clock)())?;
         self.emit_slot_events(events);
         Ok(result)
+    }
+
+    /// Operator authority for the approval-evidence verbs (CAD-217):
+    /// exactly the connection-bound rule `slot_reconcile` applies. A
+    /// caller whose `SO_PEERCRED` ancestry reaches a registered pane or
+    /// an enrolled managed endpoint is an agent and is refused, and so
+    /// is one that is not provably the operator
+    /// ([`Self::proven_operator`]). Identity-shaped request fields are
+    /// refused rather than read — a worker's output or message can
+    /// never name who recorded the evidence. Residual (CAD-276's, see
+    /// docs/AUDIT.md; CAD-280 replaces the rule): a same-uid process
+    /// that leaves every agent's ancestry without orphaning its session
+    /// and scrubs its env and stdio still passes.
+    fn approval_operator(&self, verb: &str, params: &Value, peer_pid: u32) -> Result<()> {
+        for field in [
+            "by",
+            "operator",
+            "actor",
+            "alias",
+            "lane",
+            "pid",
+            "pane",
+            "recorded_via",
+        ] {
+            if params.get(field).is_some() {
+                return Err(Error::rejected(format!(
+                    "{verb} authority is connection-bound; request field \
+                     '{field}' is not accepted"
+                )));
+            }
+        }
+        if let Some(who) = self.slot_identity(peer_pid)? {
+            return Err(Error::rejected(format!(
+                "{verb} is an operator action — this connection is agent \
+                 '{}'; run it outside every pane and managed endpoint",
+                who.lane()
+            )));
+        }
+        self.proven_operator(verb, peer_pid)
+    }
+
+    /// `approval_record` — persist an operator's merge approval for one
+    /// exact head as audit evidence. It grants nothing: dispatch and
+    /// merge never read it; `cadence audit` binds it to the landed head.
+    fn rpc_approval_record(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.approval_operator("approval record", params, peer_pid)?;
+        let pr = params
+            .get("pr")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::rejected("Missing or non-numeric 'pr'"))?;
+        let approval = store::NewApproval {
+            id: required_str(params, "id")?,
+            source: required_str(params, "source")?,
+            action: optional_str(params, "action").unwrap_or("merge"),
+            head_sha: required_str(params, "head")?,
+            repo: required_str(params, "repo")?,
+            pr,
+        };
+        let new = self
+            .store
+            .record_approval(&approval, APPROVAL_RECORDED_VIA)?;
+        Ok(json!({
+            "state": "recorded",
+            "duplicate": !new,
+            "approval_id": approval.id,
+            "source": approval.source,
+            "action": approval.action,
+            "head_sha": approval.head_sha,
+            "scope": {"repo": approval.repo, "pr": approval.pr},
+            "recorded_via": APPROVAL_RECORDED_VIA,
+        }))
+    }
+
+    /// `approval_revoke` — the only way an approval is withdrawn. A
+    /// cancelled or superseded message never reaches this.
+    fn rpc_approval_revoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.approval_operator("approval revoke", params, peer_pid)?;
+        let id = required_str(params, "id")?;
+        let source = required_str(params, "source")?;
+        let reason = required_str(params, "reason")?;
+        let new = self
+            .store
+            .revoke_approval(id, source, reason, APPROVAL_RECORDED_VIA)?;
+        Ok(json!({
+            "state": "revoked",
+            "duplicate": !new,
+            "approval_id": id,
+            "source": source,
+            "reason": reason,
+            "recorded_via": APPROVAL_RECORDED_VIA,
+        }))
     }
 
     fn rpc_register(self: &Arc<Self>, params: &Value) -> Result<Value> {
@@ -2778,58 +2873,6 @@ impl Shared {
         }
         self.wake();
         Ok(json!({"state": "cancelled", "message": message.to_json()}))
-    }
-
-    /// Record audit evidence outside the worker/dispatch authority path.
-    /// The CLI supplies a pane claim so a cadence worker cannot use this
-    /// operator-only surface; the store separately rejects ambiguous
-    /// `user`/`daemon` sources and validates the full head.
-    fn rpc_approval_record(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        if optional_str(params, "pane").is_some() {
-            return Err(Error::rejected(
-                "approval evidence is an operator action — run it outside a cadence pane",
-            ));
-        }
-        let id = required_str(params, "id")?;
-        let source = required_str(params, "source")?;
-        let action = required_str(params, "action")?;
-        let head = required_str(params, "head")?;
-        let scope = required_str(params, "scope")?;
-        let recorded = self
-            .store
-            .record_approval(id, source, action, head, scope)?;
-        self.wake();
-        Ok(json!({
-            "state": "recorded",
-            "duplicate": !recorded,
-            "approval_id": id,
-            "source": source,
-            "action": action,
-            "head_sha": head,
-            "scope": scope,
-        }))
-    }
-
-    /// Record explicit revocation evidence. Delivery cancellation never
-    /// reaches this method and therefore cannot revoke authorization.
-    fn rpc_approval_revoke(self: &Arc<Self>, params: &Value) -> Result<Value> {
-        if optional_str(params, "pane").is_some() {
-            return Err(Error::rejected(
-                "approval evidence is an operator action — run it outside a cadence pane",
-            ));
-        }
-        let id = required_str(params, "id")?;
-        let source = required_str(params, "source")?;
-        let reason = required_str(params, "reason")?;
-        let revoked = self.store.revoke_approval(id, source, reason)?;
-        self.wake();
-        Ok(json!({
-            "state": "revoked",
-            "duplicate": !revoked,
-            "approval_id": id,
-            "source": source,
-            "reason": reason,
-        }))
     }
 
     /// The resume path shared by `agent_resume` and `agent_unfence`:

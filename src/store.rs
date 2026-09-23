@@ -222,9 +222,50 @@ fn automatic_quota_error(agent: &Agent) -> Option<String> {
     None
 }
 
-const APPROVAL_RECORDED_EVENT: &str = "approval_recorded";
-const APPROVAL_REVOKED_EVENT: &str = "approval_revoked";
-const APPROVAL_PROVENANCE: &str = "operator_explicit";
+/// Operator approval evidence (CAD-217) rides its own event stream.
+/// The name is not a valid agent identifier (it holds a `:`), so no
+/// `agent rm` can delete it, and no retention prune names it — unlike
+/// the `daemon` stream, which the WAL watcher trims to its newest rows.
+/// `cadence audit` reads it read-only; nothing else consults it.
+pub const APPROVAL_STREAM: &str = "audit:approvals";
+/// An operator approved `action` on one exact head — see [`NewApproval`].
+pub const APPROVAL_RECORDED_EVENT: &str = "approval_recorded";
+/// An operator withdrew an earlier approval id. Message delivery state
+/// (a cancelled or superseded queue message) never writes this.
+pub const APPROVAL_REVOKED_EVENT: &str = "approval_revoked";
+
+/// One operator approval as `Store::record_approval` persists it: the
+/// operator approved `action` on the exact `head_sha` of PR `pr` in
+/// `repo`, as told by `source` (who approved and where — a claim the
+/// record carries, never authority by itself). The time is the event's.
+pub struct NewApproval<'a> {
+    pub id: &'a str,
+    pub source: &'a str,
+    pub action: &'a str,
+    pub head_sha: &'a str,
+    pub repo: &'a str,
+    pub pr: u64,
+}
+
+/// `owner/name` — the scope a merge approval is bound to.
+fn approval_repo(repo: &str) -> Result<()> {
+    let ok = repo.split_once('/').is_some_and(|(owner, name)| {
+        let part = |p: &str| {
+            !p.is_empty()
+                && p.len() <= 100
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
+        part(owner) && part(name)
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::rejected(format!(
+            "Approval repo '{repo}' must be owner/name"
+        )))
+    }
+}
 
 fn approval_text(value: &str, what: &str, max: usize) -> Result<()> {
     if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
@@ -236,11 +277,14 @@ fn approval_text(value: &str, what: &str, max: usize) -> Result<()> {
 }
 
 fn approval_source(source: &str) -> Result<()> {
-    approval_text(source, "Approval source", 128)?;
+    approval_text(source, "Approval source", 200)?;
     // `user` is the default daemon message source, not an authenticated
     // human identity. `daemon` is the event stream identity. Neither is
     // accepted as the source of an explicit approval record.
-    if matches!(source, "user" | "daemon") {
+    if ["user", "daemon"]
+        .iter()
+        .any(|s| source.trim().eq_ignore_ascii_case(s))
+    {
         return Err(Error::rejected(
             "Approval source must identify an explicit operator; `user` and `daemon` are not proof of human approval",
         ));
@@ -1654,13 +1698,13 @@ impl Store {
         Self::event(&conn, alias, kind, payload)
     }
 
-    /// Find an approval event by its caller-supplied id. Approval
-    /// evidence lives in the daemon stream rather than an agent mailbox,
-    /// so deleting/cancelling a message cannot remove or revoke it.
-    fn approval_event(&self, conn: &Connection, kind: &str, id: &str) -> Result<Option<Value>> {
+    /// The first approval event of `kind` naming approval `id` on
+    /// [`APPROVAL_STREAM`]. The stream is not a mailbox, so deleting or
+    /// cancelling a message can neither remove nor revoke an approval.
+    fn approval_event(conn: &Connection, kind: &str, id: &str) -> Result<Option<Value>> {
         let mut stmt =
             conn.prepare("SELECT payload FROM events WHERE alias=? AND kind=? ORDER BY seq")?;
-        let mut rows = stmt.query(params![Self::DAEMON_STREAM, kind])?;
+        let mut rows = stmt.query(params![APPROVAL_STREAM, kind])?;
         while let Some(row) = rows.next()? {
             let raw: String = row.get(0)?;
             let Ok(payload) = serde_json::from_str::<Value>(&raw) else {
@@ -1673,84 +1717,87 @@ impl Store {
         Ok(None)
     }
 
-    /// Persist an explicit operator approval as audit evidence. This is
-    /// deliberately a write-only evidence primitive: dispatch, task
-    /// acceptance, and merge policy never consult it.
+    /// Persist an explicit operator approval as audit evidence
+    /// (CAD-217). Evidence only: dispatch, task acceptance and merge
+    /// policy never consult it. `recorded_via` is the daemon's own
+    /// statement of how the writer was authorized — never caller input.
     ///
-    /// The return value is `true` for a new event and `false` when the
-    /// exact same record id and payload were already stored.
-    pub fn record_approval(
-        &self,
-        approval_id: &str,
-        source: &str,
-        action: &str,
-        head_sha: &str,
-        scope: &str,
-    ) -> Result<bool> {
-        identifier(approval_id, "Approval id")?;
-        approval_source(source)?;
-        approval_text(action, "Approval action", 128)?;
-        approval_head(head_sha)?;
-        approval_text(scope, "Approval scope", 256)?;
-        let payload = json!({
-            "approval_id": approval_id,
-            "source": source,
-            "action": action,
-            "head_sha": head_sha,
-            "scope": scope,
-            "provenance": APPROVAL_PROVENANCE,
+    /// `Ok(true)` for a new record, `Ok(false)` when the same id already
+    /// names identical evidence (a retry); the same id naming anything
+    /// else is refused.
+    pub fn record_approval(&self, a: &NewApproval, recorded_via: &str) -> Result<bool> {
+        identifier(a.id, "Approval id")?;
+        approval_source(a.source)?;
+        identifier(a.action, "Approval action")?;
+        approval_head(a.head_sha)?;
+        approval_repo(a.repo)?;
+        if a.pr == 0 {
+            return Err(Error::rejected("Approval PR number must be positive"));
+        }
+        let evidence = json!({
+            "approval_id": a.id,
+            "source": a.source,
+            "action": a.action,
+            "head_sha": a.head_sha,
+            "scope": {"repo": a.repo, "pr": a.pr},
         });
-
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        if let Some(old) = self.approval_event(&tx, APPROVAL_RECORDED_EVENT, approval_id)? {
-            if old == payload {
-                tx.commit()?;
+        if let Some(old) = Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, a.id)? {
+            let same = ["approval_id", "source", "action", "head_sha", "scope"]
+                .iter()
+                .all(|k| old[k] == evidence[k]);
+            if same {
                 return Ok(false);
             }
             return Err(Error::rejected(format!(
-                "Approval id '{approval_id}' already names different evidence"
+                "Approval id '{}' already names different evidence",
+                a.id
             )));
         }
-        Self::event(&tx, Self::DAEMON_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
+        let mut payload = evidence;
+        payload["recorded_via"] = json!(recorded_via);
+        Self::event(&tx, APPROVAL_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
         tx.commit()?;
         Ok(true)
     }
 
-    /// Persist an explicit operator revocation. Revocation is separate
-    /// from message delivery state and must reference an existing
-    /// approval record. Identical retries are idempotent.
-    pub fn revoke_approval(&self, approval_id: &str, source: &str, reason: &str) -> Result<bool> {
-        identifier(approval_id, "Approval id")?;
+    /// Persist an explicit operator revocation of approval `id`. It must
+    /// name a recorded approval; identical retries dedupe and a second,
+    /// different revocation of the same id is refused. Message delivery
+    /// state never reaches this — cancelling a message is not revoking.
+    pub fn revoke_approval(
+        &self,
+        id: &str,
+        source: &str,
+        reason: &str,
+        recorded_via: &str,
+    ) -> Result<bool> {
+        identifier(id, "Approval id")?;
         approval_source(source)?;
         approval_text(reason, "Approval revocation reason", 256)?;
-        let payload = json!({
-            "approval_id": approval_id,
-            "source": source,
-            "reason": reason,
-            "provenance": APPROVAL_PROVENANCE,
-        });
-
-        let conn = self.conn.lock().unwrap();
+        let evidence = json!({"approval_id": id, "source": source, "reason": reason});
+        let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
-        if self
-            .approval_event(&tx, APPROVAL_RECORDED_EVENT, approval_id)?
-            .is_none()
-        {
+        if Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)?.is_none() {
             return Err(Error::rejected(format!(
-                "Approval id '{approval_id}' has no recorded approval to revoke"
+                "Approval id '{id}' has no recorded approval to revoke"
             )));
         }
-        if let Some(old) = self.approval_event(&tx, APPROVAL_REVOKED_EVENT, approval_id)? {
-            if old == payload {
-                tx.commit()?;
+        if let Some(old) = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, id)? {
+            let same = ["approval_id", "source", "reason"]
+                .iter()
+                .all(|k| old[k] == evidence[k]);
+            if same {
                 return Ok(false);
             }
             return Err(Error::rejected(format!(
-                "Approval id '{approval_id}' already names different revocation evidence"
+                "Approval id '{id}' already names different revocation evidence"
             )));
         }
-        Self::event(&tx, Self::DAEMON_STREAM, APPROVAL_REVOKED_EVENT, payload)?;
+        let mut payload = evidence;
+        payload["recorded_via"] = json!(recorded_via);
+        Self::event(&tx, APPROVAL_STREAM, APPROVAL_REVOKED_EVENT, payload)?;
         tx.commit()?;
         Ok(true)
     }
@@ -6060,61 +6107,113 @@ mod tests {
         assert!(s.enqueue("a1", "different", None, "m1", "user").is_err());
     }
 
+    fn approval<'a>(id: &'a str, source: &'a str, head: &'a str, pr: u64) -> NewApproval<'a> {
+        NewApproval {
+            id,
+            source,
+            action: "merge",
+            head_sha: head,
+            repo: "favcrm/cadence",
+            pr,
+        }
+    }
+
+    /// `(kind, approval_id)` rows on the approval stream, in order.
+    fn approval_rows(s: &Store) -> Vec<(String, String)> {
+        let conn = s.conn();
+        let mut stmt = conn
+            .prepare("SELECT kind, payload FROM events WHERE alias=? ORDER BY seq")
+            .unwrap();
+        let rows = stmt
+            .query_map([APPROVAL_STREAM], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(|r| {
+                let (kind, raw) = r.unwrap();
+                let v: Value = serde_json::from_str(&raw).unwrap();
+                (kind, v["approval_id"].as_str().unwrap().to_string())
+            })
+            .collect();
+        rows
+    }
+
     #[test]
     fn approval_evidence_is_idempotent_and_separate_from_delivery() {
         let (dir, s) = store();
         let cwd = dir.path().join("w");
         reg(&s, "a1", &cwd);
+        let via = "operator-connection";
+        let op = "chris via chat";
         assert!(s
-            .record_approval("approval-1", "operator", "merge", SHA40_A, "CAD-217/PR-1")
+            .record_approval(&approval("ap-1", op, SHA40_A, 84), via)
             .unwrap());
+        // Identical retry dedupes; the same id naming another head,
+        // source or PR is refused.
         assert!(!s
-            .record_approval("approval-1", "operator", "merge", SHA40_A, "CAD-217/PR-1")
+            .record_approval(&approval("ap-1", op, SHA40_A, 84), via)
             .unwrap());
+        for conflicting in [
+            approval("ap-1", op, SHA40_B, 84),
+            approval("ap-1", "someone else", SHA40_A, 84),
+            approval("ap-1", op, SHA40_A, 85),
+        ] {
+            let err = s.record_approval(&conflicting, via).unwrap_err();
+            assert!(err.to_string().contains("different evidence"), "{err}");
+        }
         assert!(s
-            .record_approval("approval-1", "operator", "merge", SHA40_B, "CAD-217/PR-1")
-            .is_err());
-        assert!(s
-            .record_approval("approval-2", "operator", "merge", SHA40_B, "scope")
-            .is_ok());
-        assert!(s
-            .revoke_approval("approval-1", "operator", "head changed")
+            .record_approval(&approval("ap-2", op, SHA40_B, 70), via)
             .unwrap());
-        assert!(!s
-            .revoke_approval("approval-1", "operator", "head changed")
-            .unwrap());
+        assert!(s.revoke_approval("ap-1", op, "head changed", via).unwrap());
+        assert!(!s.revoke_approval("ap-1", op, "head changed", via).unwrap());
+        assert!(s.revoke_approval("ap-1", op, "other reason", via).is_err());
+        assert!(s.revoke_approval("missing", op, "no record", via).is_err());
+        // `user`/`daemon` are delivery/stream identities, not operators;
+        // abbreviated heads, bad scopes and bad ids are refused.
         assert!(s
-            .revoke_approval("missing", "operator", "no record")
+            .record_approval(&approval("ap-3", "user", SHA40_A, 1), via)
             .is_err());
         assert!(s
-            .record_approval("bad-source", "user", "merge", SHA40_A, "scope")
+            .record_approval(&approval("ap-3", "Daemon", SHA40_A, 1), via)
             .is_err());
         assert!(s
-            .record_approval("short-head", "operator", "merge", "aaaa", "scope")
+            .record_approval(&approval("ap-3", op, "aaaaaaa", 1), via)
             .is_err());
+        assert!(s
+            .record_approval(&approval("ap-3", op, SHA40_A, 0), via)
+            .is_err());
+        assert!(s
+            .record_approval(&approval("AP 3", op, SHA40_A, 1), via)
+            .is_err());
+        let mut bad_repo = approval("ap-3", op, SHA40_A, 1);
+        bad_repo.repo = "no-slash";
+        assert!(s.record_approval(&bad_repo, via).is_err());
 
-        // A cancelled delivery has its own mailbox event and cannot
-        // alter the daemon approval stream.
-        s.enqueue("a1", "approval phrase", None, "m-cancel", "user")
-            .unwrap();
+        // A cancelled delivery carrying an approval phrase writes nothing
+        // to the approval stream, and the daemon stream's retention prune
+        // does not reach it.
+        s.enqueue(
+            "a1",
+            &format!("OPERATOR APPROVED #84 at {SHA40_A}"),
+            None,
+            "m-cancel",
+            "user",
+        )
+        .unwrap();
         s.cancel("m-cancel", "operator", Some("delivery withdrawn"))
             .unwrap();
-        let approval_events = s.events(Store::DAEMON_STREAM, 0, 100).unwrap();
+        s.prune_stream(Store::DAEMON_STREAM, 0).unwrap();
         assert_eq!(
-            approval_events
-                .iter()
-                .filter(|e| e.kind == APPROVAL_RECORDED_EVENT)
-                .count(),
-            2
+            approval_rows(&s),
+            vec![
+                (APPROVAL_RECORDED_EVENT.to_string(), "ap-1".to_string()),
+                (APPROVAL_RECORDED_EVENT.to_string(), "ap-2".to_string()),
+                (APPROVAL_REVOKED_EVENT.to_string(), "ap-1".to_string()),
+            ]
         );
-        assert_eq!(
-            approval_events
-                .iter()
-                .filter(|e| e.kind == APPROVAL_REVOKED_EVENT)
-                .count(),
-            1
-        );
-        assert!(!approval_events.iter().any(|e| e.kind == "cancelled"));
+        // The stream name can never be an agent alias, so `agent rm`'s
+        // per-alias event delete cannot reach it either.
+        assert!(identifier(APPROVAL_STREAM, "alias").is_err());
     }
 
     #[test]

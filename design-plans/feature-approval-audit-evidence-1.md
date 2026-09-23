@@ -2,15 +2,15 @@
 goal: Add durable, provenance-bounded approval evidence to cadence audit
 version: '1.0'
 date_created: 2026-09-20
-last_updated: 2026-09-20
-owner: luna-approval
-status: 'In progress'
+last_updated: 2026-09-23
+owner: luna-approval, opus-q
+status: 'Completed'
 tags: [feature, audit, approval, provenance]
 ---
 
 # Introduction
 
-![Status: In progress](https://img.shields.io/badge/status-In%20progress-yellow)
+![Status: Completed](https://img.shields.io/badge/status-Completed-brightgreen)
 
 This plan adds a small evidence-only record to the existing daemon event log. An explicit operator record is bound to an action, a full landed head SHA, and a scope; an explicit revocation is a separate event. The audit consumes those events read-only and reports approved, revoked, missing, or unknown evidence. Message delivery state, worker output, and an arbitrary daemon message source never grant or revoke authorization.
 
@@ -106,3 +106,26 @@ This plan adds a small evidence-only record to the existing daemon event log. An
 - `docs/PROTOCOL.md`
 - `docs/adr/0001-role-profiles.md`
 - `CAD-217` and `CAD-207` tracker history
+
+## 9. Outcome (opus-q, 2026-09-23)
+
+Completed on top of this plan's WIP commit (da0bd0b, cherry-picked).
+Where the shipped design departs from sections 1-7, docs/AUDIT.md is
+authoritative:
+
+- **Stream, not `daemon`.** The `daemon` event stream is pruned to its
+  newest 200 rows by the WAL watcher, which would silently delete
+  approvals. Records live on `audit:approvals` — never pruned, and not
+  a valid agent alias, so `agent rm` cannot reach it (CON-001 holds: no
+  schema change).
+- **Operator rule is connection-bound.** The WIP refused callers by a
+  CLI-supplied `CADENCE_ALIAS` (caller-choosable). The daemon now
+  applies `slot_reconcile`'s rule (no pane/endpoint ancestry plus
+  `peer::operator_proof`) and refuses identity-shaped request fields;
+  CAD-280 will replace it.
+- **Structured scope.** `scope` is `{repo, pr}` instead of free text,
+  so the audit can bind a record to a merge row.
+- **CLI.** `cadence audit approve|revoke` instead of a top-level
+  `cadence approval`, which read like the provider approval broker.
+- **Timing.** Only a record in force at merge time clears the gate; a
+  post-merge backfill is shown but reports `missing` (the verdict rule).

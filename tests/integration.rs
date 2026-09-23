@@ -25104,6 +25104,292 @@ fn audit_post_hoc_verdict_does_not_clear_flag() {
     );
 }
 
+// ---------- CAD-217: operator approval evidence ------------------------
+
+/// `mergedAt` of `audit_repo`'s PR n is 2026-09-20T12:00:0nZ.
+const AUDIT_MERGE_EPOCH: f64 = 1_789_905_600.0;
+
+/// Record an approval through the store's writer, then pin its event
+/// time — the fixture merges are in the past, so "before the merge"
+/// needs an explicit clock.
+fn seed_approval(state: &Path, id: &str, head: &str, pr: u64, at: f64) {
+    let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+    let new = store
+        .record_approval(
+            &cadence_agent::store::NewApproval {
+                id,
+                source: "operator in chat",
+                action: "merge",
+                head_sha: head,
+                repo: "x/y",
+                pr,
+            },
+            "operator-connection",
+        )
+        .unwrap();
+    assert!(new);
+    drop(store);
+    set_approval_at(state, "approval_recorded", id, at);
+}
+
+fn set_approval_at(state: &Path, kind: &str, id: &str, at: f64) {
+    let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+    let n = conn
+        .execute(
+            "UPDATE events SET at=?1 WHERE alias='audit:approvals' AND kind=?2 \
+             AND json_extract(payload,'$.approval_id')=?3",
+            rusqlite::params![at, kind, id],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+/// CAD-217: a human-class merge binds to the operator approval in force
+/// at merge time for the EXACT landed head. Approved, revoked-before-
+/// merge, post-merge-only and older-head approvals each render with
+/// their provenance; a cancelled queue message carrying the approval
+/// phrase is never an approval; no readable store is `unknown`, not a
+/// flag.
+#[test]
+fn audit_binds_human_merge_to_exact_head_approval() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    for (i, h) in heads.iter().enumerate() {
+        verdict_note(
+            &notes,
+            &format!("20260920-1159{i}0-x-p{n}-verdict.md", n = i + 1),
+            h,
+            "qa-1",
+            "human",
+        );
+    }
+    let before = AUDIT_MERGE_EPOCH - 600.0;
+    let after = AUDIT_MERGE_EPOCH + 3600.0;
+    // #1: approved for its landed head before the merge.
+    seed_approval(&state, "ap-1", &heads[0], 1, before);
+    // #2: an approval for an OLDER head before the merge, and one for
+    // the landed head only after it.
+    let old_head = "1111111111111111111111111111111111111111";
+    seed_approval(&state, "ap-2-old", old_head, 2, before);
+    seed_approval(&state, "ap-2-late", &heads[1], 2, after);
+    // #3: approved, then explicitly revoked before the merge.
+    seed_approval(&state, "ap-3", &heads[2], 3, before);
+    let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+    assert!(store
+        .revoke_approval(
+            "ap-3",
+            "operator in chat",
+            "head moved",
+            "operator-connection"
+        )
+        .unwrap());
+    // The PR #84 shape: the approval phrase for #2's landed head sits
+    // only in a queue message that was then CANCELLED.
+    let cwd = dir.path().to_string_lossy().to_string();
+    store
+        .register_agent(&NewAgent {
+            alias: "ops-1",
+            provider: "inbox",
+            endpoint_kind: "inbox",
+            role: "worker",
+            cwd: &cwd,
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    store
+        .enqueue(
+            "ops-1",
+            &format!("OPERATOR APPROVED #2 at {}", heads[1]),
+            None,
+            "m-approval",
+            "user",
+        )
+        .unwrap();
+    store
+        .cancel("m-approval", "operator", Some("competing executor"))
+        .unwrap();
+    drop(store);
+    set_approval_at(&state, "approval_revoked", "ap-3", before + 60.0);
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--json"]);
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{j}");
+    let row = |pr: u64| {
+        j["merges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["pr"].as_u64() == Some(pr))
+            .unwrap()
+            .clone()
+    };
+    let r1 = row(1);
+    assert_eq!(r1["approval"]["state"], "approved", "{r1}");
+    assert_eq!(r1["approval"]["required"], true, "{r1}");
+    assert_eq!(r1["approval"]["before_merge"], true, "{r1}");
+    assert_eq!(r1["approval"]["record"]["id"], "ap-1", "{r1}");
+    assert_eq!(
+        r1["approval"]["record"]["source"], "operator in chat",
+        "{r1}"
+    );
+    assert_eq!(r1["approval"]["record"]["head_sha"], heads[0], "{r1}");
+    assert_eq!(r1["approval"]["record"]["scope"]["pr"], 1, "{r1}");
+    assert_eq!(
+        r1["approval"]["record"]["recorded_via"], "operator-connection",
+        "{r1}"
+    );
+    assert_eq!(r1["flags"], json!([]), "{r1}");
+
+    let r2 = row(2);
+    assert_eq!(r2["approval"]["state"], "missing", "{r2}");
+    assert_eq!(r2["approval"]["before_merge"], false, "{r2}");
+    assert!(
+        r2["approval"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("post-merge"),
+        "{r2}"
+    );
+    assert_eq!(
+        r2["approval"]["other_heads"][0]["head_sha"], old_head,
+        "{r2}"
+    );
+    assert_eq!(r2["flags"], json!(["approval-missing"]), "{r2}");
+
+    let r3 = row(3);
+    assert_eq!(r3["approval"]["state"], "revoked", "{r3}");
+    assert_eq!(r3["approval"]["revocation"]["reason"], "head moved", "{r3}");
+    assert_eq!(r3["approval"]["revocation"]["before_merge"], true, "{r3}");
+    assert_eq!(r3["flags"], json!(["approval-revoked"]), "{r3}");
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("approval approved · id ap-1 · source \"operator in chat\""),
+        "{text}"
+    );
+    assert!(text.contains("(before merge)"), "{text}");
+    assert!(text.contains("FLAG[approval-revoked]"), "{text}");
+
+    // With no daemon store the approval question is unanswerable:
+    // `unknown`, reported with its reason, never flagged.
+    let bare = dir.path().join("bare-state");
+    std::fs::create_dir_all(&bare).unwrap();
+    let out = run_audit(&bare, &pm, &repo, &notes, &report, &["--json"]);
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{j}");
+    for pr in 1..=3u64 {
+        let m = j["merges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["pr"].as_u64() == Some(pr))
+            .unwrap();
+        assert_eq!(m["approval"]["state"], "unknown", "{m}");
+        assert!(
+            m["approval"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no daemon store"),
+            "{m}"
+        );
+        assert_eq!(m["flags"], json!([]), "{m}");
+    }
+}
+
+/// CAD-217: only an operator connection records or revokes approval
+/// evidence. A pane (and every process descended from it — the RPC
+/// and the `cadence audit approve` CLI alike) is refused, as is an
+/// identity-shaped request field; the operator's writes dedupe and a
+/// conflicting reuse of an id is refused.
+#[test]
+fn audit_approval_record_is_operator_only() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&d, "pane-1", pane.pid());
+    let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let params = json!({"id": "ap-7", "source": "operator in chat",
+                        "head": head, "repo": "x/y", "pr": 7});
+
+    let r = pane.rpc(&d.state, "approval_record", params.clone());
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("operator action") && msg.contains("pane-1"),
+        "{r}"
+    );
+    let (rc, out) = pane.cadence(
+        &d.state,
+        &format!("audit approve --pr 7 --head {head} --source op --repo x/y"),
+    );
+    assert_ne!(rc, 0, "{out}");
+    assert!(out.contains("operator action"), "{out}");
+
+    let mut forged = params.clone();
+    forged["by"] = json!("operator");
+    let err = d.rpc("approval_record", forged).unwrap_err();
+    assert!(err.to_string().contains("'by'"), "{err}");
+
+    let r = d.rpc("approval_record", params.clone()).unwrap();
+    assert_eq!(r["state"], "recorded", "{r}");
+    assert_eq!(r["duplicate"], false, "{r}");
+    assert_eq!(r["recorded_via"], "operator-connection", "{r}");
+    let r = d.rpc("approval_record", params.clone()).unwrap();
+    assert_eq!(r["duplicate"], true, "{r}");
+    let mut other = params.clone();
+    other["head"] = json!("0123456789012345678901234567890123456789");
+    let err = d.rpc("approval_record", other).unwrap_err();
+    assert!(err.to_string().contains("different evidence"), "{err}");
+    let mut short = params.clone();
+    short["id"] = json!("ap-short");
+    short["head"] = json!("abcdefa");
+    assert!(d.rpc("approval_record", short).is_err());
+
+    let revoke = json!({"id": "ap-7", "source": "operator", "reason": "moved"});
+    let r = pane.rpc(&d.state, "approval_revoke", revoke.clone());
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator action"),
+        "{r}"
+    );
+    let r = d.rpc("approval_revoke", revoke).unwrap();
+    assert_eq!(r["state"], "revoked", "{r}");
+
+    // The operator's CLI cannot be exercised as a child here: the test
+    // daemon runs in this process, so every child descends from the
+    // daemon and `operator_proof` refuses it (the CLI's argument
+    // shaping is unit-tested in main.rs). A second operator record:
+    let mut second = params.clone();
+    second["id"] = json!("ap-8");
+    second["pr"] = json!(8);
+    let r = d.rpc("approval_record", second).unwrap();
+    assert_eq!(r["duplicate"], false, "{r}");
+
+    // Exactly the operator's writes reached the approval stream.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let kinds: Vec<String> = conn
+        .prepare("SELECT kind FROM events WHERE alias='audit:approvals' ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["approval_recorded", "approval_revoked", "approval_recorded"]
+    );
+}
+
 // ---------- CAD-113: build slots ----------
 
 /// A daemon with a shrunken slot config — hermetic (ServeOptions wins
