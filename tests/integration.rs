@@ -27306,6 +27306,169 @@ fn audit_digest_decides_identity_over_the_fleet_not_the_window() {
     assert_eq!(out.status.code(), Some(1), "{text}");
 }
 
+/// A fake `gh` for the live audit path (CAD-287): `pr list` answers
+/// `$FAKE_GH_DIR/prs.json`, `statuses/<sha>` answers
+/// `status-<sha>.json` (or `[]`), the combined endpoint has nothing.
+/// Every call is logged to `calls.log`. `audit_live_gh` prepends the
+/// shebang and `FAKE_GH_DIR` — baked in, not a process-wide env var
+/// that parallel tests would race on.
+const AUDIT_FAKE_GH: &str = r#"
+printf '%s\n' "$*" >> "$FAKE_GH_DIR/calls.log"
+case "$1 $2" in
+  "pr list"*) cat "$FAKE_GH_DIR/prs.json" ;;
+  "api repos/x/y/statuses/"*)
+    sha=${2#repos/x/y/statuses/}; sha=${sha%%\?*}
+    if [ -f "$FAKE_GH_DIR/status-$sha.json" ]; then cat "$FAKE_GH_DIR/status-$sha.json"; else echo '[]'; fi ;;
+  "api repos/x/y/commits/"*) echo '{"statuses": []}' ;;
+  *) echo "fake gh: unexpected call: $*" >&2; exit 64 ;;
+esac
+"#;
+
+/// `audit_repo` wired for the live path: a github.com origin, the
+/// fake gh first on PATH, `prs.json` from the fixture's PR list, and
+/// one `statuses/<head>` answer per `(pr index, creator)` in `posted`.
+/// Returns the PATH to run under and the gh call log.
+fn audit_live_gh(
+    dir: &TempDir,
+    repo: &Path,
+    report: &Path,
+    heads: &[String],
+    posted: &[(usize, &str)],
+) -> (PathBuf, PathBuf) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "add", "origin", "https://github.com/x/y"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let ghdir = dir.path().join("fake-gh");
+    std::fs::create_dir_all(&ghdir).unwrap();
+    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(report).unwrap()).unwrap();
+    std::fs::write(ghdir.join("prs.json"), fixture["prs"].to_string()).unwrap();
+    for (i, login) in posted {
+        let list = json!([{"context": "qa-verdict", "state": "success",
+                           "created_at": "2026-09-20T11:59:30Z",
+                           "creator": {"login": login}}]);
+        std::fs::write(
+            ghdir.join(format!("status-{}.json", heads[*i])),
+            list.to_string(),
+        )
+        .unwrap();
+    }
+    let gh = ghdir.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\nFAKE_GH_DIR='{}'{AUDIT_FAKE_GH}",
+            ghdir.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        ghdir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (PathBuf::from(path), ghdir.join("calls.log"))
+}
+
+/// CAD-287: a live run fetches statuses only for rendered rows, so its
+/// in-hand creators are the window's. QA posts #1's qa-verdict with its
+/// own token (outside a `--limit 1` window); in-window #3 was posted
+/// and merged by `ops-1` — a real self-review. The mergers alone (all
+/// `ops-1`) must not make it structural: flagged, and #1's status is
+/// still never fetched (`--limit` keeps bounding the fan-out).
+#[test]
+fn audit_live_self_review_outside_qa_token_window_is_flagged() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    let (path, calls) = audit_live_gh(&dir, &repo, &report, &heads, &[(0, "qa-bot"), (2, "ops-1")]);
+
+    let out = run_audit_full(
+        &state,
+        &pm,
+        &repo,
+        Some(&notes),
+        None, // live gh path
+        &["--limit", "1"],
+        Some(&path),
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let log = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(text.contains("#3 work 3"), "{text}");
+    assert!(
+        text.contains("reviewer@gh ops-1"),
+        "live status read: {text}"
+    );
+    assert!(text.contains("FLAG[reviewer==merger]"), "{text}\n{log}");
+    assert!(!text.contains("structural:"), "{text}");
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(log.contains(&format!("statuses/{}", heads[2])), "{log}");
+    assert!(
+        !log.contains(&heads[0]),
+        "out-of-window head fetched: {log}"
+    );
+}
+
+/// CAD-287, the other side: a shared-token fleet (every merge and every
+/// qa-verdict by `ops-1`). A window that holds every fetched PR decides
+/// the fleet live — structural, exit 0. A narrower window cannot see
+/// the rest of the fleet's creators, so it keeps the per-row flag.
+#[test]
+fn audit_live_structural_only_when_every_fetched_pr_is_in_hand() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    let posted = [(0, "ops-1"), (1, "ops-1"), (2, "ops-1")];
+    let (path, _calls) = audit_live_gh(&dir, &repo, &report, &heads, &posted);
+    let run =
+        |extra: &[&str]| run_audit_full(&state, &pm, &repo, Some(&notes), None, extra, Some(&path));
+
+    let out = run(&["--limit", "0"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("structural: 3 merge(s) share GitHub identity ops-1"),
+        "{text}"
+    );
+    assert!(!text.contains("FLAG["), "{text}");
+    assert_eq!(out.status.code(), Some(0), "{text}");
+
+    let out = run(&["--limit", "1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("FLAG[reviewer==merger]"), "{text}");
+    assert!(!text.contains("structural:"), "{text}");
+    assert_eq!(out.status.code(), Some(1), "{text}");
+}
+
+/// CAD-287: an operator-claimed approval satisfies the human-class gate
+/// in the exit code — the one channel that cannot carry the
+/// disclosure — and docs/AUDIT.md must say so until CAD-280.
+#[test]
+fn audit_docs_state_exit_code_accepts_operator_claimed() {
+    let doc =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/AUDIT.md")).unwrap();
+    let doc = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        doc.contains(
+            "The exit code treats an `operator-claimed` approval as satisfied: \
+             text and JSON disclose the claim, the exit code cannot."
+        ),
+        "docs/AUDIT.md must state the exit-code limitation"
+    );
+}
+
 // ---------- CAD-113: build slots ----------
 
 /// A daemon with a shrunken slot config — hermetic (ServeOptions wins
