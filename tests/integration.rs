@@ -30948,7 +30948,7 @@ impl ManagedWorkerMock {
     fn enroll_role(self, d: &TestDaemon, alias: &str, role: &str) -> ManagedWorker {
         let ManagedWorkerMock { cmd_dir, mock } = self;
         let cwd = d.dir.path().to_str().unwrap().to_string();
-        d.rpc(
+        d.fixture_rpc(
             "agent_register",
             json!({"alias": alias, "provider": "claude",
                    "endpoint_kind": "managed", "cwd": cwd, "role": role}),
