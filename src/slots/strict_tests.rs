@@ -865,21 +865,21 @@ fn restored(p: &FakeProc, text: &str) -> (Slots, tempfile::TempDir, std::path::P
     (s, dir, path)
 }
 
-/// CAD-276 item 3: two enrollments sharing a root never make restore
-/// reject the file — not two live ones across owners (the reviewer's
-/// review140_restore_two_active_same_root_different_owner probe), not
-/// a live one beside its own owner's tombstone — and `strict_caller`
-/// chooses between them deterministically: live first (active before
-/// expired before revoked), then the most recently issued, then the
-/// enrollment id — whatever order the file lists them in.
+/// CAD-276 item 3: two enrollments of ONE owner sharing a root never
+/// make restore reject the file — two live ones, or a live one beside
+/// its own tombstone — and `strict_caller` chooses between them
+/// deterministically: live first (active before expired before
+/// revoked), then the most recently issued, then the enrollment id —
+/// whatever order the file lists them in. Across owners the pair is
+/// rejected (CAD-289, next test).
 #[test]
 fn shared_root_enrollments_restore_and_resolve_deterministically() {
     let cases: [(&str, [Value; 2], &str); 4] = [
         (
-            "two active across owners: newest issue wins",
+            "two active: newest issue wins",
             [
                 enrollment_row("enr-a", "wk", 1.0, "active"),
-                enrollment_row("enr-b", "wk2", 5.0, "active"),
+                enrollment_row("enr-b", "wk", 5.0, "active"),
             ],
             "enr-b",
         ),
@@ -895,14 +895,14 @@ fn shared_root_enrollments_restore_and_resolve_deterministically() {
             "active beats a newer expired record",
             [
                 enrollment_row("enr-a", "wk", 1.0, "active"),
-                enrollment_row("enr-b", "wk2", 5.0, "expired"),
+                enrollment_row("enr-b", "wk", 5.0, "expired"),
             ],
             "enr-a",
         ),
         (
             "an issue-time tie falls to the id",
             [
-                enrollment_row("enr-b", "wk2", 5.0, "active"),
+                enrollment_row("enr-b", "wk", 5.0, "active"),
                 enrollment_row("enr-a", "wk", 5.0, "active"),
             ],
             "enr-a",
@@ -923,45 +923,49 @@ fn shared_root_enrollments_restore_and_resolve_deterministically() {
     }
 }
 
-/// CAD-276 item 3: a revoked+live same-root pair must share an owner —
-/// the same-root supersession tombstone only ever names its own owner.
-/// Across owners the pair is invalid: strict is blocked and the file
-/// is kept byte-identical as evidence, like every other malformed
-/// state. (Two revoked records across owners carry no live claim and
-/// load.)
+/// CAD-289: every same-root enrollment pair must share an owner, in
+/// any authorization state — the restore mirror of `enroll`'s guard.
+/// A cross-owner pair has no lineage and would attribute the root's
+/// work to whichever record ranks first, so the file is invalid:
+/// strict is blocked and the file is kept byte-identical as evidence,
+/// like every other malformed state, in either file order.
 #[test]
-fn restore_rejects_a_cross_owner_revoked_live_same_root_pair() {
-    for auth in ["active", "expired"] {
-        let p = tree();
-        let text = envelope_of(json!([
-            enrollment_row("enr-a", "wk", 1.0, "revoked"),
-            enrollment_row("enr-b", "wk2", 5.0, auth),
-        ]));
-        let (mut s, _dir, path) = restored(&p, &text);
-        assert!(!s.strict_available(), "{auth}");
-        assert!(s.strict_caller(400, 200).is_err(), "{auth}");
-        let (g, _) = s
-            .acquire(
-                SlotKind::Build,
-                "pane-1",
-                std::process::id(),
-                "r",
-                false,
-                clk(1.0),
-            )
-            .unwrap();
-        assert_eq!(g["granted"], true, "{auth}: legacy still works");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{auth}");
+fn restore_rejects_every_cross_owner_same_root_pair() {
+    let pairs = [
+        ("active", "active"),
+        ("active", "expired"),
+        ("expired", "expired"),
+        ("revoked", "active"),
+        ("revoked", "expired"),
+        ("revoked", "revoked"),
+    ];
+    for (a, b) in pairs {
+        let first = enrollment_row("enr-a", "wk", 1.0, a);
+        let second = enrollment_row("enr-b", "wk2", 5.0, b);
+        for order in [
+            json!([first.clone(), second.clone()]),
+            json!([second.clone(), first.clone()]),
+        ] {
+            let name = format!("{a}/{b} {order}");
+            let p = tree();
+            let text = envelope_of(order);
+            let (mut s, _dir, path) = restored(&p, &text);
+            assert!(!s.strict_available(), "{name}");
+            assert!(s.strict_caller(400, 200).is_err(), "{name}");
+            let (g, _) = s
+                .acquire(
+                    SlotKind::Build,
+                    "pane-1",
+                    std::process::id(),
+                    "r",
+                    false,
+                    clk(1.0),
+                )
+                .unwrap();
+            assert_eq!(g["granted"], true, "{name}: legacy still works");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{name}");
+        }
     }
-    let p = tree();
-    let (s, _dir, _) = restored(
-        &p,
-        &envelope_of(json!([
-            enrollment_row("enr-a", "wk", 1.0, "revoked"),
-            enrollment_row("enr-b", "wk2", 5.0, "revoked"),
-        ])),
-    );
-    assert!(s.strict_available());
 }
 
 /// CAD-276 item 3 (write side): the daemon never mints the state its
@@ -1050,6 +1054,37 @@ fn old_holder_releases_after_same_root_supersession() {
     assert_eq!(g["granted"], true, "{g}");
     assert_eq!(s.held.len(), 1);
     assert_eq!(s.held[0].enrollment_id(), Some(e2.as_str()));
+}
+
+/// CAD-289: a release never rebinds a hold across owners. Restore and
+/// `enroll` both refuse a cross-owner same-root pair, so the state is
+/// injected directly: a second owner's newer active enrollment on the
+/// hold's exact root. The exact holder process verifies as that owner
+/// and must NOT release the first owner's hold through it.
+#[test]
+fn release_never_rebinds_a_hold_across_owners() {
+    let p = tree();
+    let mut s = strict_slots(&p, 1);
+    let e1 = enroll(&mut s, "wk", "g1", 200);
+    let g = acquire_as(&mut s, 300, 300, "r1", 0.0).unwrap();
+    let token = g["token"].as_str().unwrap().to_string();
+    let mut foreign = s.enrollments[0].clone();
+    foreign.id = "enr-foreign".into();
+    foreign.owner_actor = "wk2".into();
+    foreign.issued_epoch += 10.0;
+    s.enrollments.push(foreign);
+    let caller = s.strict_caller(300, 200).unwrap();
+    assert_eq!(caller.enrollment_id, "enr-foreign");
+    let rebound = s.hold_enrollment_caller(&token, &caller);
+    assert_eq!(
+        rebound.enrollment_id, "enr-foreign",
+        "no cross-owner rebind"
+    );
+    assert_eq!(rebound.lane, "wk2");
+    let err = s.release_strict(&token, &caller, 300, 1.0).unwrap_err();
+    assert!(err.to_string().contains("another caller"), "{err}");
+    assert_eq!(s.held.len(), 1);
+    assert_eq!(s.held[0].enrollment_id(), Some(e1.as_str()));
 }
 
 /// CAD-276 item 2: `reconcile_required` marks only a hold reconcile can
