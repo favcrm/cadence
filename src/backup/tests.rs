@@ -871,3 +871,120 @@ fn cad396_install_no_clobber_puts_the_old_store_back_on_failure() {
     assert!(!wal.exists() && !partial.exists());
     assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1);
 }
+
+// ---- CAD-396 review round 2 ----
+
+#[test]
+fn cad396_export_redacts_turn_tokens_written_by_mark_running() {
+    let root = TempDir::new().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let generation = uuid::Uuid::new_v4().simple().to_string();
+    let token = format!("claude-{generation}-{}", uuid::Uuid::new_v4().simple());
+    let orphan = format!("pty-{generation}-{}", uuid::Uuid::new_v4().simple());
+    {
+        drop(Store::open(&live(&state)).unwrap());
+        let conn = writer(&state);
+        add_agent(&conn, "w1", "/nowhere");
+        conn.execute(
+            "UPDATE agents SET generation=?1 WHERE alias='w1'",
+            [&generation],
+        )
+        .unwrap();
+        add_message(&conn, "m1", "w1", "hello");
+        add_message(&conn, "m2", "w1", "doomed");
+        // Prose quoting the token, as an operator note would.
+        add_message(
+            &conn,
+            "m3",
+            "w1",
+            &format!("stale: --token {token} earlier"),
+        );
+        drop(conn);
+        let store = Store::open(&live(&state)).unwrap();
+        store.mark_running("m1", &token).unwrap();
+        // An event whose message row is gone still carries its token.
+        store.mark_running("m2", &orphan).unwrap();
+        drop(store);
+        writer(&state)
+            .execute("DELETE FROM messages WHERE id='m2'", [])
+            .unwrap();
+    }
+    assert!(
+        count(
+            &live(&state),
+            &format!("SELECT count(*) FROM events WHERE payload LIKE '%{token}%'")
+        ) > 0,
+        "mark_running must have written the token into an event"
+    );
+
+    let out = export(&state, &root.path().join("bundle")).unwrap();
+
+    let bytes = std::fs::read(root.path().join("bundle").join(BUNDLE_DB)).unwrap();
+    for secret in [&token, &orphan, &generation] {
+        assert!(!contains(&bytes, secret), "{secret} left in the bundle");
+    }
+    assert!(out["redacted"]["cells"].as_u64().unwrap() >= 3, "{out}");
+    let db = root.path().join("bundle").join(BUNDLE_DB);
+    assert!(
+        count(
+            &db,
+            "SELECT count(*) FROM events WHERE payload LIKE '%[redacted]%'"
+        ) >= 2
+    );
+}
+
+#[test]
+fn cad396_remaining_tokens_refuse_the_export() {
+    let root = TempDir::new().unwrap();
+    let db = root.path().join("x.sqlite3");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE t(v TEXT); INSERT INTO t VALUES ('has tok-abcdefgh here');")
+        .unwrap();
+    drop(conn);
+    let matcher = aho_corasick::AhoCorasick::new(["tok-abcdefgh"]).unwrap();
+    let err = refuse_remaining_tokens(&db, &matcher)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("t.v rowid 1"), "{err}");
+}
+
+#[test]
+fn cad396_restore_refuses_after_an_interrupted_forced_restore() {
+    let root = TempDir::new().unwrap();
+    let source = fresh_state(root.path(), "source");
+    let taken = backup(&source, &root.path().join("b"), DEFAULT_KEEP, "manual").unwrap();
+    let target = root.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    // What a crash between "rename aside" and "link in" leaves behind.
+    let aside = target.join("cadence.sqlite3.replaced-20260923T000000Z-deadbeef");
+    std::fs::write(&aside, b"previous store").unwrap();
+    assert_eq!(interrupted_restore_leftovers(&target), vec![aside.clone()]);
+    for force in [false, true] {
+        let err = restore(
+            Path::new(taken["manifest"].as_str().unwrap()),
+            &target,
+            &RestoreOptions {
+                force,
+                repos: vec![],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("interrupted"), "{err}");
+    }
+    assert!(!live(&target).exists());
+    assert_eq!(std::fs::read(&aside).unwrap(), b"previous store");
+}
+
+#[test]
+fn cad396_a_failed_rollback_is_reported_not_hidden() {
+    let root = TempDir::new().unwrap();
+    let from = root.path().join("cadence.sqlite3");
+    let aside = root.path().join("cadence.sqlite3.replaced-x");
+    // The aside file is gone: renaming it back fails.
+    let err = put_back(&[(from.clone(), aside.clone())], "could not install".into()).to_string();
+    assert!(err.contains("ROLLBACK FAILED"), "{err}");
+    assert!(!err.contains("was put back"), "{err}");
+    assert!(err.contains(&aside.display().to_string()), "{err}");
+}

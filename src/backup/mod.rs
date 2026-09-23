@@ -100,6 +100,7 @@ const EXPORT_EXCLUDES: &[&str] = &[
     "state-dir folders: private/, sessions/, briefings/, reviews/, agents/, roles/, backups/",
     "provider auth (Claude, Codex, Devin, Cursor sign-in state in their own dirs): never read",
     "endpoint tokens: agents.generation (turn-token generation), messages.turn_id (turn tokens) and agents.pid are set to NULL",
+    "turn tokens and generations elsewhere (event payloads, message text): every known value is replaced with [redacted]; the export refuses if any remain",
     "freed database pages: VACUUM drops deleted rows",
     "the tracker (PM dir): a git repo with its own remote",
 ];
@@ -142,6 +143,12 @@ pub struct ExportInfo {
     pub scrubbed: Vec<String>,
     pub scanned_cells: u64,
     pub scan_warnings: usize,
+    /// Distinct turn tokens and generations redacted, and the text cells
+    /// they were redacted from (CAD-396).
+    #[serde(default)]
+    pub redacted_tokens: usize,
+    #[serde(default)]
+    pub redacted_cells: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -516,7 +523,8 @@ pub fn export(state_dir: &Path, out: &Path) -> Result<Value> {
 fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
     let partial = out.join(format!(".{BUNDLE_DB}.partial"));
     snapshot(live, &partial)?;
-    let scrubbed = scrub(&partial)?;
+    let scrub = scrub(&partial)?;
+    let scrubbed = scrub.columns.clone();
     let scan = scan_db(&partial, allow)?;
     let (integrity, schema) = inspect(&partial)?;
     require_ok(&partial, &integrity)?;
@@ -542,6 +550,8 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
             contains: EXPORT_CONTAINS.iter().map(|s| s.to_string()).collect(),
             excludes: EXPORT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
             scrubbed: scrubbed.clone(),
+            redacted_tokens: scrub.redacted_values,
+            redacted_cells: scrub.redacted_cells,
             scanned_cells: scan.cells,
             scan_warnings: scan.warnings.len(),
         }),
@@ -561,6 +571,7 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
         "schema_version": manifest.schema_version,
         "repos": manifest.repos,
         "scrubbed": scrubbed,
+        "redacted": {"tokens": scrub.redacted_values, "cells": scrub.redacted_cells},
         "scan": {
             "cells": scan.cells,
             "warnings": scan.warnings.len(),
@@ -572,8 +583,12 @@ fn export_into(live: &Path, out: &Path, allow: &Allowlist) -> Result<Value> {
 
 /// Null the token-bearing columns, then rebuild the file so freed pages
 /// (deleted rows, old values) are not carried along.
-fn scrub(db: &Path) -> Result<Vec<String>> {
+fn scrub(db: &Path) -> Result<Scrub> {
     let conn = Connection::open(db)?;
+    // Turn tokens live on in event payloads and prose long after the
+    // messages row, and a token spells out its generation. Redact every
+    // known value everywhere before the columns are nulled.
+    let redaction = redact_turn_tokens(&conn)?;
     let mut scrubbed = Vec::new();
     for (table, column) in SCRUB_COLUMNS {
         if has_column(&conn, table, column)? {
@@ -583,7 +598,165 @@ fn scrub(db: &Path) -> Result<Vec<String>> {
     }
     conn.execute_batch("VACUUM")?;
     conn.close().map_err(|(_, e)| e)?;
-    Ok(scrubbed)
+    if let Some(matcher) = &redaction.matcher {
+        refuse_remaining_tokens(db, matcher)?;
+    }
+    Ok(Scrub {
+        columns: scrubbed,
+        redacted_values: redaction.values,
+        redacted_cells: redaction.cells,
+    })
+}
+
+struct Scrub {
+    columns: Vec<String>,
+    redacted_values: usize,
+    redacted_cells: u64,
+}
+
+struct Redaction {
+    values: usize,
+    cells: u64,
+    matcher: Option<aho_corasick::AhoCorasick>,
+}
+
+/// What a redacted turn token or generation reads as in an export.
+pub const REDACTED: &str = "[redacted]";
+
+/// Shortest value treated as a token: shorter strings are too likely to
+/// occur in unrelated text.
+const MIN_TOKEN_LEN: usize = 8;
+
+fn user_tables(conn: &Connection) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Visit every TEXT cell: `(table, column, rowid, text)`.
+fn each_text_cell(
+    conn: &Connection,
+    mut f: impl FnMut(&str, &str, i64, &str) -> Result<()>,
+) -> Result<()> {
+    for table in user_tables(conn)? {
+        let mut stmt = conn.prepare(&format!("SELECT rowid, * FROM {}", quote_ident(&table)))?;
+        let columns: Vec<String> = stmt
+            .column_names()
+            .iter()
+            .skip(1)
+            .map(|s| s.to_string())
+            .collect();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            for (i, column) in columns.iter().enumerate() {
+                let text = match row.get_ref(i + 1)? {
+                    ValueRef::Text(bytes) | ValueRef::Blob(bytes) => String::from_utf8_lossy(bytes),
+                    _ => continue,
+                };
+                f(&table, column, rowid, &text)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every turn token and generation the snapshot knows: `messages.turn_id`,
+/// `agents.generation`, every `"turn_id": "…"` value in any text cell
+/// (events outlive their messages), and the generation spelled inside
+/// each `<prefix>-<generation>-<uuid>` token. Each occurrence in any text
+/// cell is replaced with [`REDACTED`].
+fn redact_turn_tokens(conn: &Connection) -> Result<Redaction> {
+    let mut values = std::collections::BTreeSet::new();
+    for (table, column) in [("messages", "turn_id"), ("agents", "generation")] {
+        if has_column(conn, table, column)? {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"
+            ))?;
+            for value in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                values.insert(value?);
+            }
+        }
+    }
+    let keyed = regex::Regex::new(r#""turn_id"\s*:\s*"([^"\\]+)""#)
+        .map_err(|e| Error::internal(format!("turn_id pattern: {e}")))?;
+    each_text_cell(conn, |_, _, _, text| {
+        for caps in keyed.captures_iter(text) {
+            values.insert(caps[1].to_string());
+        }
+        Ok(())
+    })?;
+    let generations: Vec<String> = values
+        .iter()
+        .filter_map(|token| {
+            let mut parts = token.splitn(3, '-');
+            let (_prefix, generation, _id) = (parts.next()?, parts.next()?, parts.next()?);
+            Some(generation.to_string())
+        })
+        .collect();
+    values.extend(generations);
+    values.retain(|v| v.len() >= MIN_TOKEN_LEN && v != REDACTED);
+    if values.is_empty() {
+        return Ok(Redaction {
+            values: 0,
+            cells: 0,
+            matcher: None,
+        });
+    }
+    let matcher = aho_corasick::AhoCorasick::builder()
+        .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+        .build(&values)
+        .map_err(|e| Error::internal(format!("token matcher: {e}")))?;
+    let mut updates: Vec<(String, String, i64, String)> = Vec::new();
+    each_text_cell(conn, |table, column, rowid, text| {
+        if matcher.is_match(text) {
+            let replaced = matcher.replace_all(text, &vec![REDACTED; values.len()]);
+            updates.push((table.into(), column.into(), rowid, replaced));
+        }
+        Ok(())
+    })?;
+    let tx = conn.unchecked_transaction()?;
+    for (table, column, rowid, text) in &updates {
+        tx.execute(
+            &format!(
+                "UPDATE {} SET {}=?1 WHERE rowid=?2",
+                quote_ident(table),
+                quote_ident(column)
+            ),
+            params![text, rowid],
+        )?;
+    }
+    tx.commit()?;
+    Ok(Redaction {
+        values: values.len(),
+        cells: updates.len() as u64,
+        matcher: Some(matcher),
+    })
+}
+
+/// Fail closed: after redaction, no known token or generation may be
+/// left anywhere in the file.
+fn refuse_remaining_tokens(db: &Path, matcher: &aho_corasick::AhoCorasick) -> Result<()> {
+    let conn = crate::store::open_read_only(db)?;
+    let mut left: Vec<String> = Vec::new();
+    each_text_cell(&conn, |table, column, rowid, text| {
+        if matcher.is_match(text) && left.len() < LIST_CAP {
+            left.push(format!("{table}.{column} rowid {rowid}"));
+        }
+        Ok(())
+    })?;
+    if !left.is_empty() {
+        return Err(Error::rejected(format!(
+            "export refused: turn tokens are still present after redaction ({}); \
+             nothing was written",
+            left.join("; ")
+        )));
+    }
+    Ok(())
 }
 
 struct DbScan {
@@ -705,6 +878,20 @@ pub fn restore(source: &Path, state_dir: &Path, opts: &RestoreOptions) -> Result
     let (mappings, unmapped) = plan_remap(&manifest.repos, &opts.repos)?;
     ensure_private_dir(state_dir)?;
     let _lock = lock_state_dir(state_dir)?;
+    let leftovers = interrupted_restore_leftovers(state_dir);
+    if !leftovers.is_empty() {
+        return Err(Error::rejected(format!(
+            "an earlier restore into {} was interrupted: {} may hold the previous store. \
+             Refusing to restore over it. Inspect them, move the store back to \
+             cadence.sqlite3 (and its -wal/-shm) or somewhere safe, then retry",
+            state_dir.display(),
+            leftovers
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     let live = db_file(state_dir);
     let wal = sidecar(&live, "-wal");
     let shm = sidecar(&live, "-shm");
@@ -900,6 +1087,52 @@ fn under(path: &str, root: &str) -> bool {
 /// an existing target. On failure every aside file is renamed back. On
 /// success the aside files are removed (`--force` took a verified
 /// pre-restore backup before this point).
+/// Files an interrupted `restore --force` left behind: the previous store
+/// (or its sidecars) renamed aside as `cadence.sqlite3*.replaced-*`.
+/// A restore refuses while any exist, and `daemon start` warns.
+pub fn interrupted_restore_leftovers(state_dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = fs::read_dir(state_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with(BUNDLE_DB) && name.contains(".replaced-")
+        })
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Rename every aside file back after a failed install. The outcome is
+/// part of the error: a failed rollback says where the previous store now
+/// is instead of claiming it was put back.
+fn put_back(moved: &[(PathBuf, PathBuf)], what: String) -> Error {
+    let failed: Vec<String> = moved
+        .iter()
+        .rev()
+        .filter_map(|(from, aside)| {
+            fs::rename(aside, from).err().map(|e| {
+                format!(
+                    "{} is still at {} ({e}); move it back by hand",
+                    from.display(),
+                    aside.display()
+                )
+            })
+        })
+        .collect();
+    if failed.is_empty() {
+        Error::internal(format!("{what}; the previous store was put back"))
+    } else {
+        Error::internal(format!(
+            "{what}; ROLLBACK FAILED: {}. Do not start a daemon on this state dir \
+             until the store is back in place",
+            failed.join("; ")
+        ))
+    }
+}
+
 fn install_no_clobber(partial: &Path, live: &Path, old: &[&Path]) -> Result<()> {
     let tag = format!(
         ".replaced-{}-{}",
@@ -907,31 +1140,24 @@ fn install_no_clobber(partial: &Path, live: &Path, old: &[&Path]) -> Result<()> 
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let roll_back = |moved: &[(PathBuf, PathBuf)]| {
-        for (from, aside) in moved.iter().rev() {
-            let _ = fs::rename(aside, from);
-        }
-    };
     for path in old {
         if fs::symlink_metadata(path).is_err() {
             continue;
         }
         let aside = sidecar(path, &tag);
         if let Err(e) = fs::rename(path, &aside) {
-            roll_back(&moved);
-            return Err(Error::internal(format!(
-                "could not move {} aside ({e}); nothing was replaced",
-                path.display()
-            )));
+            return Err(put_back(
+                &moved,
+                format!("could not move {} aside ({e})", path.display()),
+            ));
         }
         moved.push((path.to_path_buf(), aside));
     }
     if let Err(e) = fs::hard_link(partial, live) {
-        roll_back(&moved);
-        return Err(Error::internal(format!(
-            "could not install {} ({e}); the previous store was put back",
-            live.display()
-        )));
+        return Err(put_back(
+            &moved,
+            format!("could not install {} ({e})", live.display()),
+        ));
     }
     let _ = fs::remove_file(partial);
     for (_, aside) in &moved {
