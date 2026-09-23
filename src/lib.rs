@@ -19,6 +19,7 @@ pub mod peer;
 pub mod proc;
 pub mod proto;
 pub mod review;
+pub mod rollout;
 pub mod secret;
 pub mod session;
 pub mod skill;
