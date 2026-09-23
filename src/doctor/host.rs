@@ -182,6 +182,14 @@ pub struct HostOverrides {
     /// Records only: frees no memory and no disk, and a removed agent
     /// can no longer be resumed.
     pub agent_gc_older_than_secs: Option<u64>,
+    /// CAD-96 — read by the daemon's idle auto-stop timer, not by
+    /// `Thresholds`. Unset is the built-in 3600 (ON); `0` turns it off
+    /// for every provider without a `_by_provider` entry. A resumable
+    /// stop: `cadence agent resume <alias>` brings the agent back.
+    pub auto_stop_idle_secs: Option<u64>,
+    /// Per-provider idle bound (`claude: 7200`, `codex: 0` = off for
+    /// that provider) — overrides `auto_stop_idle_secs`.
+    pub auto_stop_idle_secs_by_provider: Option<std::collections::BTreeMap<String, u64>>,
 }
 
 /// Every threshold in one place; `pm.yaml [host]` overrides any subset.

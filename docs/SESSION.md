@@ -168,6 +168,18 @@ agents, live pty panes and any agent with a queued, running or
 disk, and a removed agent can no longer be resumed — so it is not a
 remedy for memory or disk pressure. `cadence daemon status` shows the
 effective setting under `agent_gc_timer`.
+Idle agents *are* the memory remedy, and that one is on by default: an
+agent with nothing queued, running, awaiting a report or `unknown` and
+no delivery, report or turn activity for 60 minutes is stopped through
+the normal `agent stop` path (its pane and MCP children go with it) and
+records `agent_auto_stopped`. It stays resumable — `cadence agent
+resume <alias>`, or `cadence resume <group>` — and `cadence status`
+shows it as `stopped (auto, idle 72m)`. PMs/group roots, inboxes and
+pty agents with an attached terminal are never stopped; opt one agent
+out with `cadence agent set <alias> auto_stop=off`, or tune the bound
+with `[host] auto_stop_idle_secs` (0 = off) and
+`auto_stop_idle_secs_by_provider`. `cadence daemon status` shows the
+bound and why each live agent was kept, under `agent_auto_stop`.
 `pm.yaml [host]` also tunes `mem_warn_pct`/`mem_fail_pct` (15/5) and
 `swap_warn_pct`/`swap_fail_pct` (20/5) — and note `Committed_AS` over
 `CommitLimit` under heuristic overcommit is normal, not a failure.
