@@ -402,6 +402,8 @@ pub struct Shared {
     /// The slot clock — `mono_secs` in production, injectable so the
     /// integration suite advances starvation/age without sleeping.
     slot_clock: Arc<dyn Fn() -> f64 + Send + Sync>,
+    /// CAD-199: the opt-in, records-only agent-gc timer.
+    agent_gc: AgentGcTimer,
 }
 
 impl Shared {
@@ -443,6 +445,7 @@ impl Shared {
             instance,
             slots: Mutex::new(slots),
             slot_clock,
+            agent_gc: AgentGcTimer::new(opts.agent_gc.clone()),
         });
         // Holds dropped by boot-time revalidation get their release
         // events now that the store-backed emitter exists.
@@ -1161,6 +1164,7 @@ impl Shared {
                 "state": "ready",
                 "protocol": proto::PROTOCOL_VERSION,
                 "capabilities": proto::capabilities(),
+                "agent_gc_timer": self.agent_gc.status(),
             })),
             // Build identity + process start — the deploy-drift check
             // measures merged commits against *this* binary's commit.
@@ -4006,6 +4010,8 @@ impl Shared {
                 self.inbox_sweep();
                 inbox_swept = Some(Instant::now());
             }
+            // CAD-199: off unless configured; sweeps at most hourly.
+            self.agent_gc_tick();
             std::thread::sleep(STALL_TICK);
         }
     }
@@ -5201,6 +5207,238 @@ fn acquire_singleton(state_dir: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
+// ---- Agent-gc timer (CAD-199): opt-in, registry records only ----
+//
+// `agent gc` removes stopped agents that are otherwise resumable, so the
+// timer is OFF unless the operator sets `[host] agent_gc_older_than_secs`
+// in pm.yaml. It never kills a process and never touches a pane: it
+// deletes registry rows (and their message/event history) and nothing
+// else, so it frees no memory and no disk.
+
+/// What every agent-gc timer output says, verbatim.
+pub const AGENT_GC_RECORDS_ONLY: &str = "records only: frees no memory and no disk; \
+     a removed agent can no longer be resumed";
+/// A configured age below this is raised to it, with a warning — an
+/// automatic sweep never reaches an agent idle for less than a week.
+pub const AGENT_GC_FLOOR_SECS: u64 = 7 * 86_400;
+/// The timer sweeps at most this often.
+const AGENT_GC_EVERY: Duration = Duration::from_secs(3600);
+/// How often the timer re-reads `[host]` — enabling, retuning or
+/// disabling it applies without a daemon restart.
+const AGENT_GC_RECHECK: Duration = Duration::from_secs(60);
+
+/// The agent-gc timer's setting: `[host] agent_gc_older_than_secs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentGcSetting {
+    /// The configured age in seconds; `None` (the default) is OFF.
+    pub configured_secs: Option<u64>,
+    /// Why `[host]` could not be read — the timer is then off.
+    pub config_error: Option<String>,
+}
+
+impl AgentGcSetting {
+    /// The timer on, sweeping rows idle longer than `secs`.
+    pub fn older_than(secs: u64) -> Self {
+        Self {
+            configured_secs: Some(secs),
+            config_error: None,
+        }
+    }
+
+    /// `[host]` in `<pm_dir>/pm.yaml`; no file or no key is off, and an
+    /// unusable table is off with its error — the sweep fails closed.
+    pub fn from_pm_dir(pm_dir: Option<&Path>) -> Self {
+        match pm_dir
+            .map(crate::doctor::host::read_host_overrides)
+            .transpose()
+        {
+            Ok(overrides) => Self {
+                configured_secs: overrides.flatten().and_then(|o| o.agent_gc_older_than_secs),
+                config_error: None,
+            },
+            Err(error) => Self {
+                configured_secs: None,
+                config_error: Some(error),
+            },
+        }
+    }
+
+    /// The age a sweep uses: the configured one raised to the floor.
+    /// `None` is off.
+    pub fn effective_secs(&self) -> Option<u64> {
+        self.configured_secs.map(|s| s.max(AGENT_GC_FLOOR_SECS))
+    }
+
+    /// The operator-facing warning, if any: an unreadable `[host]`, or
+    /// an age below the floor that the timer raised.
+    pub fn warning(&self) -> Option<String> {
+        if let Some(error) = &self.config_error {
+            return Some(format!("agent-gc timer off: {error}"));
+        }
+        match self.configured_secs {
+            Some(secs) if secs < AGENT_GC_FLOOR_SECS => Some(format!(
+                "[host] agent_gc_older_than_secs {secs} is below the 7-day floor; \
+                 the timer uses {AGENT_GC_FLOOR_SECS}s"
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// The daemon's agent-gc timer: where its setting comes from and what
+/// it last did — `health` (`cadence daemon status`) reports both.
+struct AgentGcTimer {
+    /// `Some` is verbatim (tests); `None` re-reads `[host]` each check.
+    pinned: Option<AgentGcSetting>,
+    state: Mutex<AgentGcState>,
+}
+
+#[derive(Default)]
+struct AgentGcState {
+    setting: AgentGcSetting,
+    next_check: Option<Instant>,
+    last_sweep: Option<Instant>,
+    last_check_at: Option<f64>,
+    last_sweep_at: Option<f64>,
+    last_removed: Option<usize>,
+}
+
+impl AgentGcTimer {
+    fn new(pinned: Option<AgentGcSetting>) -> Self {
+        let timer = Self {
+            pinned,
+            state: Mutex::new(AgentGcState::default()),
+        };
+        timer.state.lock().unwrap().setting = timer.resolve();
+        timer
+    }
+
+    fn resolve(&self) -> AgentGcSetting {
+        self.pinned.clone().unwrap_or_else(|| {
+            AgentGcSetting::from_pm_dir(crate::issue::default_dir().ok().as_deref())
+        })
+    }
+
+    fn status(&self) -> Value {
+        let st = self.state.lock().unwrap();
+        let effective = st.setting.effective_secs();
+        json!({
+            "enabled": effective.is_some(),
+            "older_than_secs": effective,
+            "configured_secs": st.setting.configured_secs,
+            "floor_secs": AGENT_GC_FLOOR_SECS,
+            "every_secs": AGENT_GC_EVERY.as_secs(),
+            "setting": "pm.yaml [host] agent_gc_older_than_secs (unset = off)",
+            "warning": st.setting.warning(),
+            "last_check_at": st.last_check_at,
+            "last_sweep_at": st.last_sweep_at,
+            "last_removed": st.last_removed,
+            "note": AGENT_GC_RECORDS_ONLY,
+        })
+    }
+}
+
+impl Shared {
+    /// One stall-watch tick of the agent-gc timer: a no-op until a
+    /// check is due (every `AGENT_GC_RECHECK`), and a sweep at most once
+    /// per `AGENT_GC_EVERY`, only while the setting is on. Runs on the
+    /// stall-watch thread, never on an actor loop.
+    fn agent_gc_tick(&self) {
+        let now = Instant::now();
+        let due = self
+            .agent_gc
+            .state
+            .lock()
+            .unwrap()
+            .next_check
+            .is_none_or(|at| now >= at);
+        if !due {
+            return;
+        }
+        // pm.yaml is read outside the lock `health` takes.
+        let setting = self.agent_gc.resolve();
+        let older_than = {
+            let mut st = self.agent_gc.state.lock().unwrap();
+            if st.last_check_at.is_none() || st.setting != setting {
+                if let Some(warning) = setting.warning() {
+                    eprintln!("agent-gc timer: {warning}");
+                }
+            }
+            st.next_check = Some(now + AGENT_GC_RECHECK);
+            st.last_check_at = Some(epoch_secs());
+            st.setting = setting;
+            let Some(older_than) = st.setting.effective_secs() else {
+                return;
+            };
+            if st
+                .last_sweep
+                .is_some_and(|at| now.duration_since(at) < AGENT_GC_EVERY)
+            {
+                return;
+            }
+            st.last_sweep = Some(now);
+            older_than
+        };
+        let removed = self.agent_gc_sweep(older_than as f64);
+        {
+            let mut st = self.agent_gc.state.lock().unwrap();
+            st.last_sweep_at = Some(epoch_secs());
+            st.last_removed = Some(removed.len());
+        }
+        if !removed.is_empty() {
+            eprintln!(
+                "agent-gc timer: removed {} dead agent registry row(s) idle over {older_than}s \
+                 ({}) — {AGENT_GC_RECORDS_ONLY}",
+                removed.len(),
+                removed.join(", ")
+            );
+            self.wake();
+        }
+    }
+
+    /// The manual `agent gc` candidate rule, narrowed: never an enabled
+    /// agent, a lifecycle-owned alias, a pty row whose pane is still up,
+    /// or a row with an open or `unknown` message. The store re-checks
+    /// the row rules in the removing transaction and records one
+    /// `agent_gc_removed` event per row. Unlike `agent gc`, nothing is
+    /// killed — registry rows only.
+    fn agent_gc_sweep(&self, older_than: f64) -> Vec<String> {
+        let candidates = match self.store.gc_candidates(Some(older_than)) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                eprintln!("agent-gc timer: candidate read failed: {error}");
+                return Vec::new();
+            }
+        };
+        let mut removed = Vec::new();
+        for agent in candidates {
+            if agent.enabled {
+                continue;
+            }
+            if agent.endpoint_kind == "pty"
+                && adapter::pty::pane_alive(&self.state_dir, &agent.alias, &self.provider_env)
+            {
+                continue;
+            }
+            // Held per row, as `agent gc` holds it: a resume cannot
+            // start an actor between the ownership check and the delete.
+            let lc = self.lifecycle.lock().unwrap();
+            if lc.owned(&agent.alias) {
+                continue;
+            }
+            match self.store.timer_gc_remove(&agent.alias, older_than) {
+                Ok(Some(_)) => {
+                    self.open_attach.lock().unwrap().remove(&agent.alias);
+                    removed.push(agent.alias);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("agent-gc timer: {}: {error}", agent.alias),
+            }
+        }
+        removed
+    }
+}
+
 /// Per-instance daemon configuration.
 #[derive(Clone, Default)]
 pub struct ServeOptions {
@@ -5224,6 +5462,10 @@ pub struct ServeOptions {
     /// waits on the same barrier so the marker is written after that
     /// detach.
     pub release_shutdown_snapshot: Option<Arc<Barrier>>,
+    /// CAD-199 agent-gc timer: `Some` is verbatim (tests keep daemons
+    /// hermetic this way); `None` reads `[host]
+    /// agent_gc_older_than_secs` from pm.yaml each check — unset is off.
+    pub agent_gc: Option<AgentGcSetting>,
 }
 
 /// Slot configuration precedence: explicit `ServeOptions.slots`, then
@@ -6340,5 +6582,178 @@ mod unknown_fence_guidance {
             interrupted.contains("`cadence job dispatch task-a` starts revision 2"),
             "{interrupted}"
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_gc_timer {
+    use super::*;
+    use crate::store::NewAgent;
+
+    const DAY: f64 = 86_400.0;
+
+    fn pinned(dir: &Path, setting: AgentGcSetting) -> Arc<Shared> {
+        let opts = ServeOptions {
+            agent_gc: Some(setting),
+            ..ServeOptions::default()
+        };
+        Shared::new(dir, &opts).unwrap()
+    }
+
+    /// Register a stopped, disabled fake agent last updated `age_days`
+    /// ago — pre-aged through a side connection, no clock or sleep.
+    fn stopped_row(shared: &Shared, dir: &Path, alias: &str, age_days: f64) {
+        shared
+            .store
+            .register_agent(&NewAgent {
+                alias,
+                provider: "fake",
+                endpoint_kind: "fake",
+                role: "worker",
+                cwd: dir.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        rusqlite::Connection::open(dir.join("cadence.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
+                 updated=? WHERE alias=?",
+                rusqlite::params![epoch_secs() - age_days * DAY, alias],
+            )
+            .unwrap();
+    }
+
+    fn removed_events(shared: &Shared) -> Vec<Value> {
+        shared
+            .store
+            .events(Store::DAEMON_STREAM, 0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "agent_gc_removed")
+            .map(|e| e.payload)
+            .collect()
+    }
+
+    #[test]
+    fn setting_is_off_unless_host_sets_it_and_floors_at_seven_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = dir.path();
+        // No pm.yaml, and a [host] table without the key: off.
+        assert_eq!(
+            AgentGcSetting::from_pm_dir(Some(pm)),
+            AgentGcSetting::default()
+        );
+        assert_eq!(AgentGcSetting::from_pm_dir(None).effective_secs(), None);
+        std::fs::write(
+            pm.join("pm.yaml"),
+            "schema: 1\nhost:\n  wal_max_bytes: 4096\n",
+        )
+        .unwrap();
+        let off = AgentGcSetting::from_pm_dir(Some(pm));
+        assert_eq!(off.effective_secs(), None);
+        assert_eq!(off.warning(), None);
+        // Set at or above the floor: used verbatim, no warning.
+        std::fs::write(
+            pm.join("pm.yaml"),
+            "schema: 1\nhost:\n  agent_gc_older_than_secs: 1209600\n",
+        )
+        .unwrap();
+        let on = AgentGcSetting::from_pm_dir(Some(pm));
+        assert_eq!(on.effective_secs(), Some(1_209_600));
+        assert_eq!(on.warning(), None);
+        // Below the floor: raised to 7 days, with a warning.
+        std::fs::write(
+            pm.join("pm.yaml"),
+            "schema: 1\nhost:\n  agent_gc_older_than_secs: 3600\n",
+        )
+        .unwrap();
+        let low = AgentGcSetting::from_pm_dir(Some(pm));
+        assert_eq!(low.configured_secs, Some(3600));
+        assert_eq!(low.effective_secs(), Some(AGENT_GC_FLOOR_SECS));
+        assert!(low.warning().unwrap().contains("below the 7-day floor"));
+        // An unusable [host] table fails closed: off, with the error.
+        std::fs::write(
+            pm.join("pm.yaml"),
+            "schema: 1\nhost:\n  agent_gc_older_than_secs: \"7d\"\n",
+        )
+        .unwrap();
+        let bad = AgentGcSetting::from_pm_dir(Some(pm));
+        assert_eq!(bad.effective_secs(), None);
+        assert!(
+            bad.warning().unwrap().contains("agent_gc_older_than_secs"),
+            "{bad:?}"
+        );
+    }
+
+    #[test]
+    fn unconfigured_tick_never_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = pinned(dir.path(), AgentGcSetting::default());
+        stopped_row(&shared, dir.path(), "ancient", 365.0);
+        shared.agent_gc_tick();
+        assert!(shared.store.agent_opt("ancient").unwrap().is_some());
+        assert!(removed_events(&shared).is_empty());
+        let status = shared.agent_gc.status();
+        assert_eq!(status["enabled"], false, "{status}");
+        assert!(status["last_check_at"].is_f64(), "{status}");
+        assert!(status["last_sweep_at"].is_null(), "{status}");
+    }
+
+    #[test]
+    fn configured_tick_sweeps_eligible_rows_at_most_hourly() {
+        let dir = tempfile::tempdir().unwrap();
+        // One hour configured: below the floor, so the timer uses 7 days.
+        let shared = pinned(dir.path(), AgentGcSetting::older_than(3600));
+        stopped_row(&shared, dir.path(), "old", 30.0);
+        stopped_row(&shared, dir.path(), "under-floor", 2.0);
+        stopped_row(&shared, dir.path(), "unknown", 30.0);
+        shared
+            .store
+            .enqueue("unknown", "work", None, "m-u", "user")
+            .unwrap();
+        rusqlite::Connection::open(dir.path().join("cadence.sqlite3"))
+            .unwrap()
+            .execute("UPDATE messages SET state='unknown' WHERE id='m-u'", [])
+            .unwrap();
+
+        shared.agent_gc_tick();
+        assert!(shared.store.agent_opt("old").unwrap().is_none());
+        assert!(shared.store.agent_opt("under-floor").unwrap().is_some());
+        assert!(shared.store.agent_opt("unknown").unwrap().is_some());
+        let events = removed_events(&shared);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["alias"], "old");
+        assert_eq!(events[0]["older_than_secs"], AGENT_GC_FLOOR_SECS as f64);
+        let status = shared.agent_gc.status();
+        assert_eq!(status["enabled"], true, "{status}");
+        assert_eq!(status["older_than_secs"], AGENT_GC_FLOOR_SECS, "{status}");
+        assert_eq!(status["configured_secs"], 3600, "{status}");
+        assert!(status["warning"].as_str().unwrap().contains("floor"));
+        assert_eq!(status["last_removed"], 1, "{status}");
+        assert!(status["note"]
+            .as_str()
+            .unwrap()
+            .contains("frees no memory and no disk"));
+
+        // A fresh eligible row within the hour waits: a forced re-check
+        // reads the setting but does not sweep again.
+        stopped_row(&shared, dir.path(), "later", 30.0);
+        shared.agent_gc.state.lock().unwrap().next_check = None;
+        shared.agent_gc_tick();
+        assert!(shared.store.agent_opt("later").unwrap().is_some());
+        // An hour after the last sweep, the next tick takes it.
+        {
+            let mut st = shared.agent_gc.state.lock().unwrap();
+            st.next_check = None;
+            st.last_sweep = Instant::now().checked_sub(AGENT_GC_EVERY);
+        }
+        shared.agent_gc_tick();
+        assert!(shared.store.agent_opt("later").unwrap().is_none());
+        assert_eq!(removed_events(&shared).len(), 2);
     }
 }

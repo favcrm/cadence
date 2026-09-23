@@ -284,6 +284,25 @@ pub(crate) fn kill_pane(state_dir: &Path, alias: &str, env: &ProviderEnv) {
         .output();
 }
 
+/// Whether `alias` still has a session on this state dir's private
+/// tmux socket. The CAD-199 agent-gc timer is records-only — it never
+/// kills — so it keeps any pty row whose pane survived a fence rather
+/// than orphan that pane. A `tmux` that cannot run counts as alive:
+/// fail closed, keep the row.
+pub(crate) fn pane_alive(state_dir: &Path, alias: &str, env: &ProviderEnv) -> bool {
+    let tmux = env
+        .var("CADENCE_TMUX_COMMAND")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "tmux".to_string());
+    let socket = format!("cadence-{}", short_hash(&state_dir.to_string_lossy()));
+    Command::new(tmux)
+        .arg("-L")
+        .arg(&socket)
+        .args(["has-session", "-t", &format!("={alias}")])
+        .output()
+        .map_or(true, |out| out.status.success())
+}
+
 pub(crate) fn resolve_on_path(bin: &str) -> Result<String> {
     let path = std::env::var("PATH").unwrap_or_default();
     for dir in path.split(':') {

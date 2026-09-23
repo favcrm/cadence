@@ -2654,6 +2654,8 @@ fn daemon_opts() -> daemon::ServeOptions {
         slots: Some(cadence_agent::slots::SlotConfig::default()),
         slot_clock: None,
         release_shutdown_snapshot: None,
+        // CAD-199: the agent-gc timer stays off unless a test pins it.
+        agent_gc: Some(daemon::AgentGcSetting::default()),
     }
 }
 
@@ -28339,4 +28341,166 @@ fn dispatch_checks_pty_lane_cwd_against_project_repos() {
                 .contains("Dispatch override (--force")),
         "{issue}"
     );
+}
+
+// ---- CAD-199: opt-in, records-only agent-gc timer ----
+
+/// Seed a state dir with stopped, disabled fake agents pre-aged through
+/// a side connection — no clock injection, no sleeping for age.
+/// `old` (30 days) is eligible; `young` (2 days) sits under the 7-day
+/// floor; `unknown` (30 days) holds an unknown message and `queued`
+/// (30 days) a queued one.
+fn seed_agent_gc_state() -> TempDir {
+    let seeded = TempDir::new().unwrap();
+    let state = seeded.path();
+    let db = state.join("cadence.sqlite3");
+    let cwd = state.to_str().unwrap().to_string();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    {
+        let store = Store::open(&db).unwrap();
+        for alias in ["old", "young", "unknown", "queued"] {
+            store
+                .register_agent(&NewAgent {
+                    alias,
+                    provider: "fake",
+                    endpoint_kind: "fake",
+                    role: "worker",
+                    cwd: &cwd,
+                    sandbox: "read-only",
+                    instructions: None,
+                    params: None,
+                    team_role: None,
+                    model_policy: None,
+                })
+                .unwrap();
+        }
+        store
+            .enqueue("unknown", "work", None, "m-u", "user")
+            .unwrap();
+        store
+            .enqueue("queued", "work", None, "m-q", "user")
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    for (alias, days) in [
+        ("old", 30.0),
+        ("young", 2.0),
+        ("unknown", 30.0),
+        ("queued", 30.0),
+    ] {
+        conn.execute(
+            "UPDATE agents SET state='stopped', enabled=0, endpoint=NULL,
+             updated=? WHERE alias=?",
+            rusqlite::params![now - days * 86_400.0, alias],
+        )
+        .unwrap();
+    }
+    conn.execute("UPDATE messages SET state='unknown' WHERE id='m-u'", [])
+        .unwrap();
+    seeded
+}
+
+fn agent_gc_removed_events(d: &TestDaemon) -> Vec<Value> {
+    d.rpc("agent_events", json!({"alias": "daemon", "after": 0}))
+        .unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "agent_gc_removed")
+        .cloned()
+        .collect()
+}
+
+fn agent_gc_timer_status(d: &TestDaemon) -> Value {
+    d.rpc("health", json!({})).unwrap()["agent_gc_timer"].clone()
+}
+
+#[test]
+fn agent_gc_timer_configured_removes_old_row_with_event() {
+    let seeded = seed_agent_gc_state();
+    // One hour configured — below the floor, so the timer uses 7 days.
+    let d = TestDaemon::start_on_opts(
+        seeded.path().to_path_buf(),
+        daemon::ServeOptions {
+            agent_gc: Some(daemon::AgentGcSetting::older_than(3600)),
+            ..daemon_opts()
+        },
+    );
+    // The first stall tick after start sweeps; wait for its record.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let events = loop {
+        let events = agent_gc_removed_events(&d);
+        if !events.is_empty() && agent_gc_timer_status(&d)["last_sweep_at"].is_f64() {
+            break events;
+        }
+        assert!(Instant::now() < deadline, "the agent-gc timer never swept");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(events.len(), 1, "{events:?}");
+    let payload = &events[0]["payload"];
+    assert_eq!(payload["alias"], "old", "{payload}");
+    assert_eq!(payload["records_only"], true, "{payload}");
+    assert_eq!(payload["older_than_secs"], 604_800.0, "{payload}");
+    assert!(payload["age_secs"].as_f64().unwrap() >= 29.0 * 86_400.0);
+    assert!(payload["reason"]
+        .as_str()
+        .unwrap()
+        .contains("agent-gc timer"));
+    let note = payload["note"].as_str().unwrap();
+    assert!(note.contains("frees no memory and no disk"), "{note}");
+    assert!(note.contains("can no longer be resumed"), "{note}");
+    assert!(d.rpc("agent_show", json!({"alias": "old"})).is_err());
+    // Under the floor, an unknown message, a queued message: all kept.
+    for kept in ["young", "unknown", "queued"] {
+        d.rpc("agent_show", json!({"alias": kept})).unwrap();
+    }
+    // `cadence daemon status` renders the effective setting.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["daemon", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let timer = &status["agent_gc_timer"];
+    assert_eq!(timer["enabled"], true, "{status}");
+    assert_eq!(timer["older_than_secs"], 604_800, "{status}");
+    assert_eq!(timer["configured_secs"], 3600, "{status}");
+    assert_eq!(timer["last_removed"], 1, "{status}");
+    assert!(timer["warning"].as_str().unwrap().contains("7-day floor"));
+    assert!(timer["note"]
+        .as_str()
+        .unwrap()
+        .contains("frees no memory and no disk"));
+}
+
+#[test]
+fn agent_gc_timer_unconfigured_never_removes() {
+    let seeded = seed_agent_gc_state();
+    let d = TestDaemon::start_on_opts(seeded.path().to_path_buf(), daemon_opts());
+    // Wait until the timer has checked its (off) setting at least once.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !agent_gc_timer_status(&d)["last_check_at"].is_f64() {
+        assert!(
+            Instant::now() < deadline,
+            "the agent-gc timer never checked"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let timer = agent_gc_timer_status(&d);
+    assert_eq!(timer["enabled"], false, "{timer}");
+    assert!(timer["older_than_secs"].is_null(), "{timer}");
+    assert!(timer["last_sweep_at"].is_null(), "{timer}");
+    for kept in ["old", "young", "unknown", "queued"] {
+        d.rpc("agent_show", json!({"alias": kept})).unwrap();
+    }
+    assert!(agent_gc_removed_events(&d).is_empty());
 }
