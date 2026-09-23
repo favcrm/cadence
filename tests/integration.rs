@@ -34819,11 +34819,22 @@ fn dispatch_refuses_criteria_past_the_pty_ceiling() {
         .collect();
     std::fs::write(&criteria, items).unwrap();
     let criteria_s = criteria.to_str().unwrap();
-    for title in ["Plain", "Job"] {
+    // QA N1 probe: 37 such items fit under 4000 alone but not beside
+    // the job kickoff's fixed fields.
+    let gap = tmp.path().join("gap.md");
+    let items: String = (0..37)
+        .map(|i| format!("- [ ] criterion {i} {}\n", "x".repeat(80)))
+        .collect();
+    std::fs::write(&gap, items).unwrap();
+    for title in ["Plain", "Job", "Gap"] {
         assert!(cli(&["issue", "new", title, "--project", "demo"]).0);
     }
-    for id in ["D-1", "D-2"] {
-        let (ok, out) = cli(&["issue", "acceptance", id, "--from", criteria_s]);
+    for (id, file) in [
+        ("D-1", criteria_s),
+        ("D-2", criteria_s),
+        ("D-3", gap.to_str().unwrap()),
+    ] {
+        let (ok, out) = cli(&["issue", "acceptance", id, "--from", file]);
         assert!(ok, "{out}");
     }
     let note = tmp.path().join("kickoff.md");
@@ -34843,21 +34854,26 @@ fn dispatch_refuses_criteria_past_the_pty_ceiling() {
     ]);
     assert!(!ok, "{out}");
     assert!(out.contains("4000-char") && out.contains(&note_s), "{out}");
-    let (ok, out) = cli(&[
-        "dispatch",
-        "D-2",
-        "--to",
-        "w1",
-        "--note",
-        &note_s,
-        "--reply-to",
-        "pm",
-        "--job",
-        "--spec",
-        &spec,
-    ]);
-    assert!(!ok, "{out}");
-    assert!(out.contains("4000-char") && out.contains(&spec), "{out}");
+    for id in ["D-2", "D-3"] {
+        let (ok, out) = cli(&[
+            "dispatch",
+            id,
+            "--to",
+            "w1",
+            "--note",
+            &note_s,
+            "--reply-to",
+            "pm",
+            "--job",
+            "--spec",
+            &spec,
+        ]);
+        assert!(!ok, "{id}: {out}");
+        assert!(
+            out.contains("4000-char") && out.contains(&spec),
+            "{id}: {out}"
+        );
+    }
 
     // Nothing was created or queued.
     assert!(!repo.join(".cadence").join("wt").exists());

@@ -576,11 +576,8 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
         // so the daemon's `job dispatch` kickoff lists them — all of
         // them, never a pointer (CAD-160): the kickoff refuses a list
         // that cannot fit rather than dropping it.
-        let task_acceptance = crate::issue::dispatch::acceptance_listing(
-            &front.id,
-            &parse::acceptance_items(&body),
-            usize::MAX,
-        );
+        let task_acceptance =
+            crate::issue::dispatch::acceptance_listing(&parse::acceptance_items(&body));
         let created_job = client::rpc(
             &state_dir,
             "job_new",

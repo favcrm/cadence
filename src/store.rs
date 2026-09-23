@@ -5299,19 +5299,29 @@ impl Store {
     /// the sender's text, then the task's objective, then every
     /// still-unchecked acceptance criterion — a steering message
     /// restates what the worker is still on the hook for, so it cannot
-    /// read as a replacement. A terminal task's message is `text`
-    /// unchanged. Criteria are never cut: the restated objective gives
-    /// way first, and a body that still exceeds `ceiling` refuses
-    /// naming the ceiling and the spec file.
+    /// read as a replacement. Only the task's assignee is on the hook:
+    /// a message to anyone else (a worker's note to its PM), or bound
+    /// to an unassigned or terminal task, is `text` unchanged. A
+    /// composed message needs non-blank text — the amendment comes
+    /// first. Criteria are never cut: the restated objective gives way
+    /// first, and a body that still exceeds `ceiling` refuses naming
+    /// the ceiling and the spec file.
     pub fn compose_task_message(
         &self,
         task_id: &str,
+        recipient: &str,
         text: &str,
         ceiling: usize,
     ) -> Result<String> {
         let task = self.task(task_id)?;
-        if is_task_terminal(&task.state) {
+        if is_task_terminal(&task.state) || task.assignee.as_deref() != Some(recipient) {
             return Ok(text.to_string());
+        }
+        if text.trim().is_empty() {
+            return Err(Error::rejected(
+                "Prompt must contain 1-48000 characters — a message to an open task \
+                 needs non-blank text before its restated objective and criteria",
+            ));
         }
         let job = self.job(&task.job_id)?;
         let spec = task.spec_path.as_deref().unwrap_or(&job.spec_path);
@@ -5349,6 +5359,7 @@ impl Store {
         let total = full.len() - objective.len();
         Err(criteria_too_long(
             &task.id,
+            "message",
             total,
             criteria.len(),
             ceiling,
@@ -6824,6 +6835,7 @@ fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Result<String> {
     if head.len() + kept > ENQUEUE_BYTES {
         return Err(criteria_too_long(
             &task.id,
+            "kickoff",
             head.len() + kept,
             acceptance.len(),
             ENQUEUE_BYTES,
@@ -6852,23 +6864,47 @@ fn cloud_kickoff_body(job: &Job, task: &Task, revision: i64) -> Result<String> {
     Ok(body)
 }
 
-/// CAD-160: the refusal when a message cannot carry its acceptance
-/// criteria whole within `ceiling` — names the ceiling and the spec
-/// file, and says nothing was queued.
+/// CAD-160: the refusal when a `kind` ("message" or "kickoff") cannot
+/// carry its acceptance criteria whole within `ceiling` — names the
+/// ceiling and the spec file, and says nothing was queued. A kickoff
+/// has no sender text, so its hint names only the criteria.
 fn criteria_too_long(
     task: &str,
+    kind: &str,
     total: usize,
     criteria: usize,
     ceiling: usize,
     spec: &str,
 ) -> Error {
+    let shorten = if kind == "message" {
+        "shorten your text or the criteria"
+    } else {
+        "shorten the criteria"
+    };
     Error::rejected(format!(
-        "Task '{task}': the message is {total} bytes with its acceptance criteria \
+        "Task '{task}': the {kind} is {total} bytes with its acceptance criteria \
          ({criteria} bytes) whole — over the {ceiling}-char delivery ceiling. Criteria are \
-         never truncated (CAD-160): shorten the text or the criteria, and keep the detail \
-         in the spec file {}. Nothing was queued.",
+         never truncated (CAD-160): {shorten}, and keep the detail in the spec file {}. \
+         Nothing was queued.",
         flatten_controls(spec)
     ))
+}
+
+/// A Devin cloud session: it cannot read host paths, so its kickoff
+/// inlines the spec text ([`cloud_kickoff_body`]).
+fn cloud_session(provider: &str, endpoint_kind: &str) -> bool {
+    provider == "devin" && endpoint_kind == "cloud"
+}
+
+/// CAD-160: the size a `job dispatch` kickoff must fit for an assignee
+/// on `provider`/`endpoint_kind` — the enqueue limit for a Devin cloud
+/// session (its kickoff inlines the spec), else the pty ceiling.
+pub fn kickoff_ceiling(provider: &str, endpoint_kind: &str) -> usize {
+    if cloud_session(provider, endpoint_kind) {
+        ENQUEUE_BYTES
+    } else {
+        pty::MAX_BODY
+    }
 }
 
 fn kickoff_correlation(message_id: &str) -> String {
@@ -6888,7 +6924,29 @@ fn kickoff_body(
     message_id: &str,
     assignee: &Agent,
 ) -> Result<String> {
-    if assignee.provider == "devin" && assignee.endpoint_kind == "cloud" {
+    job_kickoff(
+        job,
+        task,
+        revision,
+        message_id,
+        &assignee.provider,
+        &assignee.endpoint_kind,
+    )
+}
+
+/// The `job dispatch` kickoff for an assignee on `provider`/
+/// `endpoint_kind`. Public so `cadence dispatch --job` can build the
+/// same text before `issue start` and refuse a list that will not fit
+/// (CAD-160) instead of leaving a worktree and job behind.
+pub fn job_kickoff(
+    job: &Job,
+    task: &Task,
+    revision: i64,
+    message_id: &str,
+    provider: &str,
+    endpoint_kind: &str,
+) -> Result<String> {
+    if cloud_session(provider, endpoint_kind) {
         return cloud_kickoff_body(job, task, revision);
     }
     let spec = task.spec_path.as_deref().unwrap_or(&job.spec_path);
@@ -6931,7 +6989,7 @@ fn kickoff_body(
         .as_deref()
         .map(|i| format!(" Issue: {i}."))
         .unwrap_or_default();
-    let managed = registry::reports_turn_result(&assignee.provider, &assignee.endpoint_kind);
+    let managed = registry::reports_turn_result(provider, endpoint_kind);
     let report = if managed {
         " Report when done: end your final answer with a one-line \
          summary followed by a last line `SHA: <40-hex>` naming the \
@@ -6978,6 +7036,7 @@ fn kickoff_body(
     }
     Err(criteria_too_long(
         &task.id,
+        "kickoff",
         compact.len(),
         acceptance.len(),
         pty::MAX_BODY,
@@ -9159,6 +9218,11 @@ mod tests {
         assert!(err.contains("4000-char"), "{err}");
         assert!(err.contains("spec file /s.md"), "{err}");
         assert!(err.contains("Nothing was queued"), "{err}");
+        // QA N1: a kickoff has no sender text — the hint names only
+        // the criteria.
+        assert!(err.contains("the kickoff is"), "{err}");
+        assert!(err.contains("shorten the criteria"), "{err}");
+        assert!(!err.contains("text"), "{err}");
         assert!(s.message("k-long").unwrap().is_none());
         assert_eq!(s.queued_count("w1").unwrap(), 0);
         let task = s.task("t1").unwrap();
@@ -9189,7 +9253,7 @@ mod tests {
         )
         .unwrap();
         let body = s
-            .compose_task_message("t1", "actually, use the V1 provider", 4000)
+            .compose_task_message("t1", "w1", "actually, use the V1 provider", 4000)
             .unwrap();
         assert_eq!(
             body,
@@ -9213,7 +9277,7 @@ mod tests {
             "j1",
             "t2",
             None,
-            None,
+            Some("w1"),
             None,
             Some("green; tests"),
             None,
@@ -9221,7 +9285,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let body = s.compose_task_message("t2", "ping", 4000).unwrap();
+        let body = s.compose_task_message("t2", "w1", "ping", 4000).unwrap();
         assert!(
             body.ends_with(
                 "Objective: implement per spec. Spec: /s.md. Outstanding criteria: \
@@ -9233,7 +9297,7 @@ mod tests {
             "j1",
             "t3",
             None,
-            None,
+            Some("w1"),
             None,
             Some(r#"1) [x] "a""#),
             None,
@@ -9241,7 +9305,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let body = s.compose_task_message("t3", "ping", 4000).unwrap();
+        let body = s.compose_task_message("t3", "w1", "ping", 4000).unwrap();
         assert!(body.ends_with("Outstanding criteria: none."), "{body}");
     }
 
@@ -9255,7 +9319,7 @@ mod tests {
             "j1",
             "t1",
             None,
-            None,
+            Some("pm"),
             None,
             Some("green"),
             None,
@@ -9265,7 +9329,91 @@ mod tests {
         .unwrap();
         s.cancel_task("t1", "test").unwrap();
         let text = "  exact\ttext, trailing space ";
-        assert_eq!(s.compose_task_message("t1", text, 4000).unwrap(), text);
+        assert_eq!(
+            s.compose_task_message("t1", "pm", text, 4000).unwrap(),
+            text
+        );
+    }
+
+    /// CAD-160 (QA N2): only the task's assignee is on the hook, so a
+    /// `--task` message to anyone else — a worker's note to its PM —
+    /// and one bound to an unassigned task go out byte-identical.
+    #[test]
+    fn task_message_to_a_non_assignee_is_unchanged() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task(
+            "j1",
+            "t1",
+            None,
+            Some("w1"),
+            None,
+            Some("green"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        s.create_task(
+            "j1",
+            "t2",
+            None,
+            None,
+            None,
+            Some("green"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let text = "PR is up — see #1 ";
+        assert_eq!(
+            s.compose_task_message("t1", "pm", text, 4000).unwrap(),
+            text
+        );
+        assert_eq!(
+            s.compose_task_message("t2", "w1", text, 4000).unwrap(),
+            text
+        );
+        assert_ne!(
+            s.compose_task_message("t1", "w1", text, 4000).unwrap(),
+            text
+        );
+    }
+
+    /// CAD-160 (QA N3): a composed message needs an amendment — blank
+    /// text is refused rather than sent as a bare restatement.
+    #[test]
+    fn task_message_refuses_blank_text() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_job(&s, &cwd);
+        reg_pty(&s, "w1", &cwd);
+        s.create_task(
+            "j1",
+            "t1",
+            None,
+            Some("w1"),
+            None,
+            Some("green"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        for text in ["", "  \t "] {
+            let err = s
+                .compose_task_message("t1", "w1", text, 4000)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("Prompt must contain 1-48000 characters"),
+                "{err}"
+            );
+            assert!(err.contains("non-blank"), "{err}");
+        }
     }
 
     /// CAD-160: over the ceiling the restated objective gives way and
@@ -9281,7 +9429,7 @@ mod tests {
             "j1",
             "t1",
             Some(&"T".repeat(3000)),
-            None,
+            Some("pm"),
             None,
             Some(&criteria),
             None,
@@ -9290,7 +9438,7 @@ mod tests {
         )
         .unwrap();
         let text = "p".repeat(500);
-        let body = s.compose_task_message("t1", &text, 4000).unwrap();
+        let body = s.compose_task_message("t1", "pm", &text, 4000).unwrap();
         assert!(body.len() <= 4000, "{} bytes", body.len());
         assert!(body.starts_with(&format!("{text} — Task t1")), "{body}");
         assert!(body.contains("T…. Spec: /s.md."), "{body}");
@@ -9302,7 +9450,7 @@ mod tests {
             "j1",
             "t2",
             None,
-            None,
+            Some("pm"),
             None,
             Some(&"c".repeat(5000)),
             None,
@@ -9311,7 +9459,7 @@ mod tests {
         )
         .unwrap();
         let err = s
-            .compose_task_message("t2", "ping", 4000)
+            .compose_task_message("t2", "pm", "ping", 4000)
             .unwrap_err()
             .to_string();
         assert!(err.contains("4000-char"), "{err}");

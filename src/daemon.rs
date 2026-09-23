@@ -3024,7 +3024,10 @@ impl Shared {
                 } else {
                     store::ENQUEUE_BYTES
                 };
-                Some(self.store.compose_task_message(task, text, ceiling)?)
+                Some(
+                    self.store
+                        .compose_task_message(task, &alias, text, ceiling)?,
+                )
             }
             None => None,
         };
@@ -8807,6 +8810,34 @@ mod tests {
             .rpc_send(&json!({"alias": "w1", "text": text, "task": "j1-t1", "message": "m2"}))
             .unwrap();
         assert_eq!(stored_body(&shared, "m2"), text);
+    }
+
+    /// QA N2: a worker's `--task` note to its PM is not steering —
+    /// the PM is not the one on the hook — so it goes out unchanged.
+    #[test]
+    fn task_bound_send_to_a_non_assignee_is_byte_identical() {
+        let (_dir, shared) = task_bound_fixture(r#"1) [ ] "sends via V2""#);
+        let text = "PR is up";
+        shared
+            .rpc_send(&json!({"alias": "pm", "text": text, "task": "j1-t1", "message": "r1"}))
+            .unwrap();
+        assert_eq!(stored_body(&shared, "r1"), text);
+    }
+
+    /// QA N3: blank text bound to an open task is refused before it
+    /// becomes a bare restatement; nothing is queued.
+    #[test]
+    fn blank_task_bound_send_is_refused() {
+        let (_dir, shared) = task_bound_fixture(r#"1) [ ] "sends via V2""#);
+        for (id, text) in [("e1", ""), ("e2", "   ")] {
+            let err = shared
+                .rpc_send(&json!({"alias": "w1", "text": text, "task": "j1-t1", "message": id}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Prompt must contain"), "{err}");
+            assert!(shared.store.message(id).unwrap().is_none());
+        }
+        assert_eq!(shared.store.queued_count("w1").unwrap(), 0);
     }
 
     /// Criteria past the pty ceiling refuse the send, naming the

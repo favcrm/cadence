@@ -324,7 +324,8 @@ first, the criteria never.
 ### Task-bound messages (`send --task`)
 
 `send`/`message send`/`ask --task <task>` to an **open** task (any state
-but `verified`, `done`, `cancelled`, `failed`) is delivered composed, so
+but `verified`, `done`, `cancelled`, `failed`) **whose assignee is the
+recipient** is delivered composed, so
 a steering message restates what the worker is still on the hook for
 and cannot read as a replacement (AOS-12):
 
@@ -342,8 +343,10 @@ the adapter pastes — is the composed one. Over the endpoint's ceiling
 (4000 chars for pty, the 48000-byte enqueue limit otherwise) the
 restated objective is cut with `…`; the sender's text and the criteria
 are not, and a body that still cannot fit refuses naming the ceiling
-and the spec file, with nothing queued. No task, or a terminal task:
-the body is the sender's text, byte for byte. `--nudge` takes no
+and the spec file, with nothing queued. Blank text is refused (the
+amendment comes first). No task, a terminal task, or a recipient who is
+not the task's assignee (a worker's `--task` note to its PM): the body
+is the sender's text, byte for byte. `--nudge` takes no
 `--task`, so nudges are never composed.
 
 Managed endpoints get the trailer form instead:

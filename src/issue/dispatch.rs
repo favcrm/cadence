@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::issue::parse::AcceptanceItem;
 use crate::issue::{board, parse, start, write, Pm};
 use crate::memory;
+use crate::store;
 
 /// Message states that mean a dispatch is still in flight — a second
 /// dispatch must not queue a duplicate while one is live.
@@ -64,10 +65,9 @@ fn kickoff_body(
     )
 }
 
-/// CAD-159: an issue's acceptance items on one line when that fits
-/// `budget` bytes, else a pointer to the CAD-238 section-scoped
-/// readback. `None` when there are no items. Every kickoff passes
-/// `usize::MAX`: CAD-160 never replaces criteria with the pointer.
+/// CAD-159: an issue's acceptance items on one line; `None` when there
+/// are none. Always the whole list — CAD-160 removed the "N items, too
+/// long to inline" pointer, since criteria are never dropped.
 ///
 /// CAD-300: each item is numbered and its text is a JSON string
 /// literal — `1) [ ] "a"; 2) [x] "b"` — so text that looks like the
@@ -76,24 +76,8 @@ fn kickoff_body(
 /// [`parse_acceptance_listing`] reads it back exactly. Quoting escapes
 /// every control character and U+2028/U+2029, so the result can ride a
 /// single-line pty kickoff without losing them.
-pub(crate) fn acceptance_listing(
-    issue: &str,
-    items: &[AcceptanceItem],
-    budget: usize,
-) -> Option<String> {
-    if items.is_empty() {
-        return None;
-    }
-    let inline = inline_listing(items);
-    Some(if inline.len() <= budget {
-        inline
-    } else {
-        format!(
-            "{} items, too long to inline — `cadence issue show {issue} --json` \
-             lists them under .acceptance",
-            items.len()
-        )
-    })
+pub(crate) fn acceptance_listing(items: &[AcceptanceItem]) -> Option<String> {
+    (!items.is_empty()).then(|| inline_listing(items))
 }
 
 /// The CAD-300 listing of `items` at any length —
@@ -198,8 +182,8 @@ fn acceptance_warning(issue: &str, dispatched: bool) -> String {
 /// The plain-path kickoff with every one of the issue's acceptance
 /// items appended as ` Acceptance: <listing>.` — never a pointer, never
 /// cut (CAD-160). [`plain_kickoff`] fits the result to the pty ceiling.
-fn with_acceptance(body: String, issue: &str, items: &[AcceptanceItem]) -> String {
-    match acceptance_listing(issue, items, usize::MAX) {
+fn with_acceptance(body: String, items: &[AcceptanceItem]) -> String {
+    match acceptance_listing(items) {
         Some(listing) => format!("{body} Acceptance: {listing}."),
         None => body,
     }
@@ -225,7 +209,6 @@ fn plain_kickoff(
     let build = |title: &str| {
         with_acceptance(
             kickoff_body(issue, title, note, wt_dir, branch, base_sha, reply_to),
-            issue,
             items,
         )
     };
@@ -241,7 +224,7 @@ fn plain_kickoff(
         }
         return Ok(build(&format!("{}{CUT}", &title[..end])));
     }
-    let criteria = acceptance_listing(issue, items, usize::MAX).unwrap_or_default();
+    let criteria = acceptance_listing(items).unwrap_or_default();
     Err(Error::rejected(format!(
         "{issue}'s acceptance criteria ({} bytes) do not fit the {}-char pty kickoff \
          ceiling even with the title cut — criteria are never truncated or dropped \
@@ -253,25 +236,74 @@ fn plain_kickoff(
     )))
 }
 
-/// CAD-160: a `--job` dispatch whose acceptance items alone exceed the
-/// pty ceiling can never be kicked off whole — refuse it before `issue
-/// start` creates anything. (A list that fits alone but not beside the
-/// kickoff's fixed fields is refused by `job dispatch`, nothing queued.)
-fn check_job_acceptance(issue: &str, items: &[AcceptanceItem], spec: &Path) -> Result<()> {
-    let Some(listing) = acceptance_listing(issue, items, usize::MAX) else {
+/// CAD-160: a `--job` dispatch whose kickoff cannot carry its
+/// acceptance items whole is refused before `issue start` creates a
+/// worktree, branch or job. The check builds the kickoff `job dispatch`
+/// will send — same spec path, scope, criteria and report contract, for
+/// the assignee's own endpoint and ceiling (48000 for a Devin cloud
+/// session) — with placeholders the length of what the daemon mints
+/// (`job-` + 8 hex, a 32-hex message id). `agent` is the assignee's
+/// `agent_show` row.
+fn check_job_kickoff(
+    issue: &str,
+    items: &[AcceptanceItem],
+    spec: &Path,
+    wt_name: &str,
+    branch: &str,
+    base_sha: &str,
+    agent: &Value,
+) -> Result<()> {
+    // `issue start --job` records the canonical spec path on the job.
+    let spec = spec.canonicalize().unwrap_or_else(|_| spec.to_path_buf());
+    let spec = spec.to_string_lossy().into_owned();
+    let job_id = "job-00000000";
+    let job = store::Job {
+        id: job_id.to_string(),
+        title: None,
+        spec_path: spec.clone(),
+        spec_sha256: None,
+        pm_alias: String::new(),
+        issue_id: Some(issue.to_string()),
+        repo: None,
+        base_ref: None,
+        state: "open".to_string(),
+        max_revisions: 0,
+        stall_secs: None,
+        error: None,
+        created: 0.0,
+        updated: 0.0,
+    };
+    let task = store::Task {
+        id: format!("{job_id}-t1"),
+        job_id: job_id.to_string(),
+        title: None,
+        role: "worker".to_string(),
+        assignee: None,
+        spec_path: None,
+        acceptance: acceptance_listing(items),
+        worktree: Some(wt_name.to_string()),
+        branch: Some(branch.to_string()),
+        base_sha: Some(base_sha.to_string()),
+        head_sha: None,
+        state: "draft".to_string(),
+        revision: 0,
+        dispatch_message: None,
+        error: None,
+        created: 0.0,
+        updated: 0.0,
+    };
+    let provider = agent["provider"].as_str().unwrap_or_default();
+    let kind = agent["endpoint_kind"].as_str().unwrap_or_default();
+    let Err(_) = store::job_kickoff(&job, &task, 1, &"0".repeat(32), provider, kind) else {
         return Ok(());
     };
-    if listing.len() < pty::MAX_BODY {
-        return Ok(());
-    }
     Err(Error::rejected(format!(
-        "{issue}'s acceptance criteria alone are {} bytes — over the {}-char pty kickoff \
-         ceiling; criteria are never truncated or dropped (CAD-160). Shorten them \
-         (`cadence issue acceptance {issue} --from <file>`) and keep the detail in the \
-         spec file {}. Nothing was created or queued.",
-        listing.len(),
-        pty::MAX_BODY,
-        spec.display()
+        "{issue}'s acceptance criteria ({} bytes) do not fit the {}-char kickoff ceiling \
+         beside its fixed fields — criteria are never truncated or dropped (CAD-160). \
+         Shorten them (`cadence issue acceptance {issue} --from <file>`) and keep the \
+         detail in the spec file {spec}. Nothing was created or queued.",
+        acceptance_listing(items).unwrap_or_default().len(),
+        store::kickoff_ceiling(provider, kind),
     )))
 }
 
@@ -428,10 +460,10 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
     // sent. `--job` sends the daemon's own kickoff instead, so the
     // template check is skipped.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
+    let (_base, base_sha) = start::resolve_base(&root, args.base.as_deref())?;
+    let (wt_name, branch) = start::names(&front.id, &front.title, args.name.as_deref())?;
     let body = if args.job_spec.is_none() {
-        let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-        let (_base, base_sha) = start::resolve_base(&root, args.base.as_deref())?;
-        let (wt_name, branch) = start::names(&front.id, &front.title, args.name.as_deref())?;
         let wt_dir = root.join(".cadence").join("wt").join(&wt_name);
         let summary = args.summary.as_deref().unwrap_or(&front.title);
         let body = plain_kickoff(
@@ -441,7 +473,7 @@ pub fn run(pm: &Pm, id: &str, args: &DispatchArgs, actor: &str, state_dir: &Path
         Some(body)
     } else {
         if let Some(spec) = &args.job_spec {
-            check_job_acceptance(&front.id, &items, spec)?;
+            check_job_kickoff(&front.id, &items, spec, &wt_name, &branch, &base_sha, agent)?;
         }
         None
     };
@@ -777,8 +809,8 @@ mod tests {
         ] {
             let items = parse::acceptance_items(body);
             assert!(items.is_empty(), "{body:?}");
-            assert_eq!(acceptance_listing("D-1", &items, 4000), None);
-            assert_eq!(with_acceptance(kickoff(), "D-1", &items), kickoff());
+            assert_eq!(acceptance_listing(&items), None);
+            assert_eq!(with_acceptance(kickoff(), &items), kickoff());
         }
         let warning = acceptance_warning("D-1", true);
         assert!(
@@ -795,10 +827,10 @@ mod tests {
         let body = "T\n\n## Acceptance\n\n- [ ] first\tpart\n- [x] second\n\n## Notes\n- [ ] not acceptance\n";
         let items = parse::acceptance_items(body);
         assert_eq!(
-            acceptance_listing("D-1", &items, 4000).as_deref(),
+            acceptance_listing(&items).as_deref(),
             Some(r#"1) [ ] "first\tpart"; 2) [x] "second""#)
         );
-        let body = with_acceptance(kickoff(), "D-1", &items);
+        let body = with_acceptance(kickoff(), &items);
         assert!(
             body.ends_with(r#" Acceptance: 1) [ ] "first\tpart"; 2) [x] "second"."#),
             "{body}"
@@ -831,12 +863,12 @@ mod tests {
                 checked: false,
             },
         ];
-        let listing = acceptance_listing("D-1", &items, 4000).unwrap();
+        let listing = acceptance_listing(&items).unwrap();
         let (back, rest) = parse_acceptance_listing(&listing)
             .unwrap_or_else(|| panic!("listing does not parse: {listing}"));
         assert_eq!(back, items, "{listing}");
         assert_eq!(rest, "", "{listing}");
-        let body = with_acceptance(kickoff(), "D-1", &items);
+        let body = with_acceptance(kickoff(), &items);
         check_body(&body, "fake").unwrap();
         assert!(
             !body
@@ -924,13 +956,60 @@ mod tests {
         assert!(err.contains("4000-char"), "{err}");
         assert!(err.contains("note /tmp/note.md"), "{err}");
         assert!(err.contains("Nothing was created or queued"), "{err}");
-        let err = check_job_acceptance("D-1", &items, Path::new("/tmp/spec.md"))
-            .unwrap_err()
-            .to_string();
+        let err = job_check(&items, "pty").unwrap_err().to_string();
         assert!(err.contains("4000-char"), "{err}");
         assert!(err.contains("spec file /tmp/spec.md"), "{err}");
-        // A list that fits alone passes the `--job` pre-check.
-        check_job_acceptance("D-1", &items[..10], Path::new("/tmp/spec.md")).unwrap();
+        job_check(&items[..10], "pty").unwrap();
+    }
+
+    fn items(n: usize) -> Vec<AcceptanceItem> {
+        (0..n)
+            .map(|i| AcceptanceItem {
+                text: format!("criterion {i} {}", "x".repeat(80)),
+                checked: false,
+            })
+            .collect()
+    }
+
+    /// The `--job` pre-check against a `devin/<kind>` assignee.
+    fn job_check(items: &[AcceptanceItem], kind: &str) -> Result<()> {
+        check_job_kickoff(
+            "D-2",
+            items,
+            Path::new("/tmp/spec.md"),
+            "d-2-job",
+            "cadence/d-2-job",
+            &"0".repeat(40),
+            &json!({"provider": "devin", "endpoint_kind": kind}),
+        )
+    }
+
+    /// CAD-160 (QA N1): the `--job` pre-check builds the kickoff the
+    /// daemon will send, so a listing that fits alone but not beside
+    /// the fixed fields (QA's 37-item probe) refuses before
+    /// `issue start` — naming the criteria, not a sender's text. (QA
+    /// N6) a Devin cloud assignee is held to its own 48000 ceiling.
+    #[test]
+    fn job_pre_check_reserves_the_kickoffs_fixed_fields() {
+        // QA's probe: 37 items — a 3864-byte listing, 3878 bytes as the
+        // kickoff's ` Acceptance: ….` clause — under 4000 alone.
+        let gap = items(37);
+        assert_eq!(acceptance_listing(&gap).unwrap().len(), 3864);
+        let err = job_check(&gap, "pty").unwrap_err().to_string();
+        assert!(
+            err.contains("D-2's acceptance criteria (3864 bytes)"),
+            "{err}"
+        );
+        assert!(err.contains("4000-char"), "{err}");
+        assert!(err.contains("spec file /tmp/spec.md"), "{err}");
+        assert!(err.contains("Nothing was created or queued"), "{err}");
+        assert!(!err.contains("text"), "{err}");
+        // A cloud kickoff carries 48000: the same list, and one past
+        // 4000, go out; one past 48000 does not.
+        job_check(&gap, "cloud").unwrap();
+        job_check(&items(60), "cloud").unwrap();
+        let err = job_check(&items(600), "cloud").unwrap_err().to_string();
+        assert!(err.contains("48000-char"), "{err}");
     }
 
     /// CAD-160: the outstanding criteria of a stored task acceptance.

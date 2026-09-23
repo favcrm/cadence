@@ -429,9 +429,11 @@ plain kickoff would pass the 4000-char pty ceiling, the title (or
 `--summary`) is shortened and ends in `…`; when the items cannot fit
 even so, the dispatch refuses before anything is created, naming the
 ceiling and the note. On the `--job` path the task stores the whole
-listing; items alone over 4000 chars refuse before `issue start`, and
-a list that fits alone but not beside the kickoff's fixed fields is
-refused by `job dispatch` with nothing queued (see JOBS.md). With **no** items, both paths **warn and
+listing, and dispatch builds the kickoff `job dispatch` will send (same
+spec path, scope, criteria and report contract, at the assignee's own
+ceiling — 48000 bytes for a Devin cloud session) before `issue start`:
+a list that cannot fit refuses naming the ceiling and the spec file,
+leaving no worktree, branch or job (see JOBS.md). With **no** items, both paths **warn and
 still dispatch** (PM decision 2026-09-23, ADR-0002 §8.3 — refusal is a
 follow-up once live issues are backfilled): the warning names the
 issue and `cadence issue acceptance <ID> --from <file>`, prints on
