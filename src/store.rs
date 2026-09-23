@@ -4816,6 +4816,7 @@ impl Store {
         task_branch: Option<&str>,
         task_base_sha: Option<&str>,
         task_assignee: Option<&str>,
+        task_acceptance: Option<&str>,
     ) -> Result<(bool, Job)> {
         identifier(id, "Job id")?;
         if let Some(issue) = issue_id {
@@ -4893,14 +4894,15 @@ impl Store {
         }
         let task_id = format!("{id}-t1");
         tx.execute(
-            "INSERT INTO tasks(id,job_id,title,assignee,worktree,branch,
-             base_sha,state,created,updated)
-             VALUES(?,?,?,?,?,?,?,'draft',?,?)",
+            "INSERT INTO tasks(id,job_id,title,assignee,acceptance,worktree,
+             branch,base_sha,state,created,updated)
+             VALUES(?,?,?,?,?,?,?,?,'draft',?,?)",
             params![
                 task_id,
                 id,
                 task_title.or(title),
                 task_assignee,
+                task_acceptance,
                 task_worktree,
                 task_branch,
                 task_base_sha,
@@ -6921,6 +6923,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let v: i64 = s
@@ -6990,6 +6993,7 @@ mod tests {
             None,
             None,
             2,
+            None,
             None,
             None,
             None,
@@ -7353,6 +7357,7 @@ mod tests {
             None,
             None,
             2,
+            None,
             None,
             None,
             None,

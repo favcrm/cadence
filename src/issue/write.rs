@@ -247,11 +247,7 @@ pub fn set_acceptance(pm: &Pm, id: &str, source: &Path, actor: &str) -> Result<V
         "id": id,
         "acceptance": items
             .iter()
-            .map(|item| json!({
-                "text": item.text,
-                "checked": item.checked,
-                "done": item.checked,
-            }))
+            .map(parse::AcceptanceItem::to_json)
             .collect::<Vec<_>>(),
         "committed": true,
     }))
