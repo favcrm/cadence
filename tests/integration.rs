@@ -13508,9 +13508,11 @@ fn cli_join_refuses_different_provider_managed() {
     assert_provider_refused(&out, "wx", "claude");
     let after = d.rpc("agent_show", json!({"alias": "wx"})).unwrap();
     assert_eq!(after, before);
-    // A live alias is not silently reused under the wrong provider either.
+    // A live alias is not silently reused under the wrong provider
+    // either — and the refusal leaves it exactly as it was (CAD-305).
     d.register("wl");
     d.wait_agent("wl", "idle", 10);
+    let before = d.rpc("agent_show", json!({"alias": "wl"})).unwrap();
     let out = std::process::Command::new(bin)
         .arg("--state-dir")
         .arg(&d.state)
@@ -13518,6 +13520,8 @@ fn cli_join_refuses_different_provider_managed() {
         .output()
         .unwrap();
     assert_provider_refused(&out, "wl", "codex");
+    let after = d.rpc("agent_show", json!({"alias": "wl"})).unwrap();
+    assert_eq!(after, before);
 }
 
 /// CAD-283 guard: a same-provider join onto a stopped alias still
@@ -13540,6 +13544,162 @@ fn cli_join_same_provider_resumes_stopped_alias() {
     let agent = d.wait_agent("wx", "idle", 15);
     assert_eq!(agent["provider"], "fake");
     assert_eq!(agent["params"], before["agent"]["params"]);
+}
+
+/// A launch onto an alias registered under the same provider but another
+/// endpoint kind is refused, naming both kinds and the remove-then-launch
+/// remedy.
+fn assert_kind_refused(out: &std::process::Output, alias: &str, registered: &str, asked: &str) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    for want in [
+        format!("'{alias}' is already registered as a {registered} agent, not {asked}"),
+        format!("cadence agent remove {alias}"),
+    ] {
+        assert!(stderr.contains(&want), "missing {want:?}: {stderr}");
+    }
+}
+
+/// CAD-305: an alias registered as managed claude, relaunched with
+/// `--tui` (standalone or `join`, with or without `--worktree`), is
+/// refused rather than silently reopened as the managed agent — no row,
+/// param or worktree changes.
+#[test]
+fn cli_launch_refuses_endpoint_kind_change_claude() {
+    let d = TestDaemon::start();
+    let _mock = d.mock_claude("ok", None);
+    let pm_repo = d.dir.path().join("pmrepo");
+    git_repo(&pm_repo);
+    d.rpc(
+        "agent_register",
+        json!({"alias": "pm", "provider": "fake", "endpoint_kind": "fake",
+               "cwd": pm_repo}),
+    )
+    .unwrap();
+    d.wait_agent("pm", "idle", 10);
+    d.register_claude("cm", Value::Null);
+    d.wait_agent("cm", "idle", 15);
+    d.rpc("agent_stop", json!({"alias": "cm"})).unwrap();
+    d.wait_agent("cm", "stopped", 10);
+    let before = d.rpc("agent_show", json!({"alias": "cm"})).unwrap();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let launches: [&[&str]; 3] = [
+        &[
+            "claude",
+            "--tui",
+            "--alias",
+            "cm",
+            "--detach",
+            "--no-bootstrap",
+        ],
+        &["join", "pm", "claude", "--tui", "--alias", "cm", "--detach"],
+        &[
+            "join",
+            "pm",
+            "claude",
+            "--tui",
+            "--alias",
+            "cm",
+            "--detach",
+            "--worktree",
+            "feat-k",
+        ],
+    ];
+    for args in launches {
+        let out = std::process::Command::new(bin)
+            .arg("--state-dir")
+            .arg(&d.state)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_kind_refused(&out, "cm", "claude managed", "claude pty");
+    }
+    let after = d.rpc("agent_show", json!({"alias": "cm"})).unwrap();
+    assert_eq!(after, before);
+    assert!(!pm_repo.join(".cadence/wt/feat-k").exists());
+}
+
+/// CAD-305: Devin pty and Devin Cloud share provider `devin` — a stopped
+/// pty alias relaunched with `--cloud` is not resumed as pty (cloud
+/// params dropped), and a cloud alias relaunched without `--cloud` is
+/// not a silent no-op. Both refuse and leave the row untouched.
+#[test]
+fn cli_launch_refuses_endpoint_kind_change_devin() {
+    let d = TestDaemon::start();
+    let mock = d.mock_devin();
+    // A blank key keeps the cloud adapter from ever reaching the network:
+    // its open refuses before any HTTP.
+    test_env().set("CADENCE_DEVIN_API_KEY", "");
+    d.register_devin("dvx", None);
+    d.wait_agent("dvx", "idle", 20);
+    d.rpc("agent_stop", json!({"alias": "dvx"})).unwrap();
+    d.wait_agent("dvx", "stopped", 10);
+    let before = d.rpc("agent_show", json!({"alias": "dvx"})).unwrap();
+    let bin = env!("CARGO_BIN_EXE_cadence");
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args([
+            "devin",
+            "--cloud",
+            "--cloud-params",
+            "repo=o/r",
+            "--alias",
+            "dvx",
+        ])
+        .args(["--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert_kind_refused(&out, "dvx", "devin pty", "devin cloud");
+    let after = d.rpc("agent_show", json!({"alias": "dvx"})).unwrap();
+    assert_eq!(after, before);
+
+    let cwd = d.dir.path().to_str().unwrap().to_string();
+    d.rpc(
+        "agent_register",
+        json!({"alias": "dvc", "provider": "devin", "endpoint_kind": "cloud",
+               "cwd": cwd, "params": json!({"repos": ["o/r"]}).to_string()}),
+    )
+    .unwrap();
+    // With no key the cloud open refuses and parks the agent in
+    // `attention` — a settled row to compare against.
+    d.wait_agent("dvc", "attention", 10);
+    let before = d.rpc("agent_show", json!({"alias": "dvc"})).unwrap();
+    let out = std::process::Command::new(bin)
+        .arg("--state-dir")
+        .arg(&d.state)
+        .args(["devin", "--alias", "dvc", "--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    assert_kind_refused(&out, "dvc", "devin cloud", "devin pty");
+    let after = d.rpc("agent_show", json!({"alias": "dvc"})).unwrap();
+    assert_eq!(after, before);
+    assert!(!d.pane_file(&mock, "dvc", "argv").exists());
+}
+
+/// CAD-305: the alias lookup fails closed — an `agent_show` error other
+/// than not-found (here: no daemon answering) is never read as "not
+/// registered", so `--worktree` creates no checkout before the launch
+/// fails.
+#[test]
+fn cli_launch_fails_closed_when_alias_lookup_errors() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let repo = dir.path().join("repo");
+    git_repo(&repo);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["claude", "--alias", "wz", "--worktree", "feat-z", "--cwd"])
+        .arg(&repo)
+        .args(["--detach", "--no-bootstrap"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("Daemon is not reachable"), "{stderr}");
+    assert!(!repo.join(".cadence/wt/feat-z").exists(), "{stderr}");
 }
 
 /// `join <pm> codex` records the worker's sandbox on the agent row and
@@ -22334,6 +22494,164 @@ stress_pattern = ["wait_"]
     }
     // The scratch HOME is removed with the review.
     assert!(!Path::new(gate_home).exists(), "{gate_home} left behind");
+}
+
+/// CAD-264: `vite build` strips TypeScript types without checking them,
+/// so the repo's own `cadence-review.toml` must type-check ui/src as a
+/// gate. The gate command is taken from that file and run by
+/// `cadence review` against the real `tsc` in ui/node_modules: a ui/src
+/// type error fails the gate with tsc's message, a clean tree passes.
+#[test]
+fn review_verb_ui_typecheck_gate_catches_a_ui_type_error() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let real: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("cadence-review.toml")).unwrap())
+            .unwrap();
+    let typecheck = "cd ui && node_modules/.bin/tsc --noEmit";
+    let gates: Vec<&str> = real["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g.as_str().unwrap())
+        .collect();
+    assert!(gates.contains(&typecheck), "{gates:?}");
+    let node_modules = root.join("ui/node_modules");
+    assert!(
+        node_modules.join(".bin/tsc").exists(),
+        "{} has no tsc — run `pnpm install` in ui/ (or link the main \
+         checkout's ui/node_modules, as the review's prepare does)",
+        node_modules.display()
+    );
+
+    let base = TempDir::new().unwrap();
+    let f = review_fixture(base.path());
+    // Base config: link the real node_modules, then gate with the
+    // repo's own typecheck command and nothing else.
+    std::fs::write(
+        f.repo.join("cadence-review.toml"),
+        format!(
+            r#"prepare = ["cd ui && ln -sfn '{}' node_modules"]
+gates = ["{typecheck}"]
+full_suite = "sh suite.sh"
+test_globs = ["tests/**"]
+test_command = "sh one_test.sh {{test}}"
+stress_pattern = ["wait_"]
+"#,
+            node_modules.display()
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(f.repo.join("ui/src")).unwrap();
+    std::fs::copy(
+        root.join("ui/tsconfig.json"),
+        f.repo.join("ui/tsconfig.json"),
+    )
+    .unwrap();
+    std::fs::write(f.repo.join(".gitignore"), "/ui/node_modules\n").unwrap();
+    std::fs::write(
+        f.repo.join("ui/src/count.ts"),
+        "export const count: number = 1;\n",
+    )
+    .unwrap();
+    review_git(&f.repo, &["add", "-A"]);
+    review_git(&f.repo, &["commit", "-qm", "base: a typed ui"]);
+    review_git(&f.repo, &["push", "-q", "origin", "main"]);
+
+    let open_pr = |n: i64, file: &str, text: &str| {
+        review_git(&f.repo, &["checkout", "-qb", &format!("pr-{n}"), "main"]);
+        std::fs::write(f.repo.join(file), text).unwrap();
+        review_git(&f.repo, &["add", "-A"]);
+        review_git(&f.repo, &["commit", "-qm", &format!("pr{n}")]);
+        let head = review_git_sha(&f.repo, &["rev-parse", "HEAD"]);
+        review_git(
+            &f.repo,
+            &["push", "-q", "origin", &format!("HEAD:refs/pull/{n}/head")],
+        );
+        std::fs::write(
+            f.fakedir.join(format!("pr-view-{n}.json")),
+            serde_json::to_string(&json!({
+                "number": n, "title": format!("PR {n}"),
+                "url": format!("https://example/{n}"),
+                "headRefName": format!("pr-{n}"), "headRefOid": head,
+                "baseRefName": "main",
+                "files": [{"path": file}],
+                "state": "OPEN",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        review_git(&f.repo, &["checkout", "-q", "main"]);
+    };
+    // PR 12 assigns a string to a number — vite would build it.
+    open_pr(
+        12,
+        "ui/src/label.ts",
+        "export const label: number = \"not a number\";\n",
+    );
+    // PR 13 is the same file, well typed.
+    open_pr(
+        13,
+        "ui/src/label.ts",
+        "export const label: string = \"ok\";\n",
+    );
+
+    let typecheck_gate = |pr: i64| {
+        let out = review_cmd(&f)
+            .args([&pr.to_string(), "--no-full"])
+            .output()
+            .unwrap();
+        let r = review_report(&f, pr);
+        assert!(
+            r["prepare"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["outcome"] == json!("ok")),
+            "{:?}\nstderr: {}",
+            r["prepare"],
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let gates = r["gates"].as_array().unwrap().clone();
+        assert_eq!(gates.len(), 1, "{gates:?}");
+        assert_eq!(gates[0]["cmd"], json!(typecheck));
+        (out, r, gates[0].clone())
+    };
+
+    let (out, r, gate) = typecheck_gate(12);
+    assert_eq!(out.status.code(), Some(2), "{r}");
+    assert_eq!(gate["outcome"], json!("fail"), "{gate:?}");
+    let tail: Vec<&str> = gate["tail"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        tail.iter()
+            .any(|l| l.contains("src/label.ts") && l.contains("error TS2322")),
+        "{tail:?}"
+    );
+    assert_eq!(r["suggested_verdict"], json!("blocked"));
+    assert!(
+        r["verdict_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(format!("gate `{typecheck}` fail"))),
+        "{:?}",
+        r["verdict_reasons"]
+    );
+
+    let (_, r, gate) = typecheck_gate(13);
+    assert_eq!(gate["outcome"], json!("ok"), "{gate:?}");
+    assert!(
+        !r["verdict_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("gate `")),
+        "{:?}",
+        r["verdict_reasons"]
+    );
 }
 // ==== CAD-83: `cadence overview` — daemon-dependent rows ====
 
@@ -34180,4 +34498,221 @@ fn dispatch_warns_on_empty_acceptance() {
         })
         .count();
     assert_eq!(warned, 1, "{issue}");
+}
+
+// ---- CAD-335: board writes from a managed endpoint's processes ----
+
+/// Seed a tracker in `pm` for the board tests below: one project and
+/// one issue, `CAD-1`. Runs the real CLI against the daemon's state.
+fn seed_board(pm: &Path, state: &Path) {
+    for args in [
+        &["issue", "init"][..],
+        &["issue", "project", "add", "cadence", "--prefix", "CAD"],
+        &["issue", "new", "root task", "--project", "cadence"],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(state)
+            .args(args)
+            .env("CADENCE_PM_DIR", pm)
+            .env_remove("CADENCE_ALIAS")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Serve the board in-process over `pm` and the daemon's `state` on a
+/// free loopback port and wait for health. A lost bind race (another
+/// test took the port) retries on a fresh one; the probe's `Host`
+/// names the port, so only OUR server answers 200.
+fn start_board(pm: &Path, state: &Path) -> u16 {
+    use std::io::Read;
+    let overall = Instant::now() + Duration::from_secs(20);
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (sd, pd) = (state.to_path_buf(), pm.to_path_buf());
+        thread::spawn(move || {
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".to_string(),
+                port,
+                ..Default::default()
+            };
+            let _ = cadence_agent::ui::serve(&sd, &pd, &opts);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let probe = format!("GET /api/health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+                let _ = s.write_all(probe.as_bytes());
+                let mut buf = String::new();
+                if s.read_to_string(&mut buf).is_ok() && buf.contains("200") {
+                    return port;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            assert!(Instant::now() < overall, "board server did not start");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// A raw board write — a comment `body` on CAD-1 — addressed to the
+/// board on `port`, with every cross-site guard satisfied.
+fn board_comment_request(port: u16, body: &str) -> String {
+    let body = format!(r#"{{"body":"{body}"}}"#);
+    format!(
+        "POST /api/issues/CAD-1/comments HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\
+         Content-Type: application/json\r\nX-Cadence-Board: 1\r\n\
+         Origin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The comment `body` in a board write's raw HTTP reply (asserting 200).
+/// A reply relayed through the mock provider's text-mode capture has
+/// its `\r\n` folded to `\n`, so either blank line ends the head.
+fn board_replied_comment(response: &str, body: &str) -> Value {
+    assert!(
+        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
+        "{response}"
+    );
+    let (_, json_body) = response
+        .split_once("\r\n\r\n")
+        .or_else(|| response.split_once("\n\n"))
+        .unwrap_or_else(|| panic!("no header end in {response:?}"));
+    let v: Value = serde_json::from_str(json_body).unwrap();
+    v["issue"]["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["body"] == body)
+        .cloned()
+        .unwrap_or_else(|| panic!("no comment {body:?} in {v}"))
+}
+
+/// The tracker's newest commit message.
+fn board_last_commit(pm: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(pm)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Plain HTTP over bash's `/dev/tcp`: `$1` is the port, `$2` the raw
+/// request; the reply goes to stdout.
+const DEV_TCP_CLIENT: &str = r#"exec 3<>"/dev/tcp/127.0.0.1/$1"; printf '%s' "$2" >&3; cat <&3"#;
+
+/// CAD-335 phase 1 ACCEPTANCE (item 2): a managed endpoint has no pane,
+/// so before this fix its tool subprocess — a headless `claude -p`
+/// running its Bash tool and curling the loopback board — was "tied to
+/// no pane" and wrote as `operator (ui)`, author `operator`. The
+/// daemon records the provider process it launched; a board write from
+/// a process that descends from it is that agent's, never the
+/// operator's.
+#[test]
+fn ui_write_caller_attributes_a_managed_endpoint_tool_process() {
+    let d = TestDaemon::start();
+    let pm = TempDir::new().unwrap();
+    seed_board(pm.path(), &d.state);
+    let port = start_board(pm.path(), &d.state);
+    let mut wk = ManagedWorker::start(&d, "wk");
+    let request = board_comment_request(port, "from a managed tool");
+    let r = wk.exec(&[
+        "bash",
+        "-c",
+        DEV_TCP_CLIENT,
+        "_",
+        &port.to_string(),
+        &request,
+    ]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let comment = board_replied_comment(r["out"].as_str().unwrap(), "from a managed tool");
+    assert_eq!(comment["author"], "wk", "{comment}");
+    let last = board_last_commit(pm.path());
+    assert!(last.contains("Actor: wk"), "{last}");
+    assert!(!last.contains("operator"), "{last}");
+}
+
+/// Forwards ONE connection from a fresh loopback port (printed first)
+/// to 127.0.0.1:`argv[1]` — the shape of the operator's tailnet relay
+/// (`socat TCP-LISTEN:13010,fork TCP:127.0.0.1:3010`), whose forking
+/// child is the board's TCP peer.
+const RELAY_PY: &str = r#"
+import socket, sys, threading
+ls = socket.socket()
+ls.bind(("127.0.0.1", 0))
+ls.listen(1)
+print(ls.getsockname()[1], flush=True)
+c, _ = ls.accept()
+u = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+def pump(a, b):
+    while True:
+        data = a.recv(65536)
+        if not data:
+            break
+        b.sendall(data)
+    try:
+        b.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+t = threading.Thread(target=pump, args=(u, c))
+t.start()
+pump(c, u)
+t.join()
+"#;
+
+/// CAD-335 phase 1 (item 4): attributing managed endpoints must not
+/// cost the operator the board. With a managed agent live, a write
+/// relayed by a process that is neither a pane nor a managed
+/// provider's descendant — the operator's `socat` relay shape — still
+/// writes as `operator (ui)`, exactly as before.
+#[test]
+fn ui_write_caller_keeps_the_operator_relay_with_a_managed_agent_live() {
+    use std::io::Read;
+    let d = TestDaemon::start();
+    let pm = TempDir::new().unwrap();
+    seed_board(pm.path(), &d.state);
+    let port = start_board(pm.path(), &d.state);
+    let _wk = ManagedWorker::start(&d, "wk");
+    let mut relay = std::process::Command::new("python3")
+        .args(["-c", RELAY_PY, &port.to_string()])
+        .env_remove("CADENCE_ALIAS")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(relay.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    let relay_port: u16 = first.trim().parse().unwrap();
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", relay_port)).unwrap();
+    s.write_all(board_comment_request(port, "via the relay").as_bytes())
+        .unwrap();
+    let mut response = String::new();
+    s.read_to_string(&mut response).unwrap();
+    // Closing our end lets the relay's client-side pump finish.
+    drop(s);
+    assert!(relay.wait().unwrap().success());
+    let comment = board_replied_comment(&response, "via the relay");
+    assert_eq!(comment["author"], "operator", "{comment}");
+    let last = board_last_commit(pm.path());
+    assert!(last.contains("(operator (ui))"), "{last}");
+    assert!(last.contains("Actor: operator"), "{last}");
+    assert!(!last.contains("wk"), "{last}");
 }

@@ -386,7 +386,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
 <div class="chrome">
   <div class="brand">
     <svg width="22" height="22" viewBox="0 0 1024 1024" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0B0B0C"/><path d="M232 336 416 512 232 688" fill="none" stroke="#2DD4BF" stroke-opacity=".55" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><path d="M408 336 592 512 408 688" fill="none" stroke="#2DD4BF" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><rect x="656" y="656" width="160" height="64" rx="32" fill="#2DD4BF" fill-opacity=".7"/></svg>
-    <span class="bname">Cadence</span> <small>· plan, roadmap, research &amp; prototype — v4</small>
+    <span class="bname">Cadence</span> <small>· plan, roadmap, research &amp; prototype — v5</small>
   </div>
   <div class="seg" role="group" aria-label="View" id="tabseg">
     <button data-act="tab" data-v="plan" aria-pressed="true">Plan</button>
@@ -420,7 +420,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
   </nav>
   <article>
     <section class="hero">
-      <div class="kicker">Consolidated plan · v4 · 2026-09-23</div>
+      <div class="kicker">Consolidated plan · v5 · 2026-09-23 · Markdown source: design-plans/…/PLAN.md</div>
       <h1>An autonomous dev team that learns — on your machine.</h1>
       <p class="lede">One <b>master assistant</b> talks with you. It staffs <b>teams</b> — one PM each, with developers, QA and DevOps from the agents you already pay for — using a company <b>role catalog</b>. Every finished job, question or blocker produces a <b>report</b>; a <b>verifier</b> (deterministic checks plus a curator from a different vendor) turns reports into <b>verified memory</b> in a git <b>company vault</b>; every agent starts its next task with a small, cited <b>context pack</b> instead of re-reading. You approve what matters.</p>
       <p style="margin-top:14px"><button class="btn pri" data-act="tab" data-v="proto">Clickable prototype →</button> <button class="btn" data-act="tab" data-v="roadmap">Milestones &amp; tickets →</button> <button class="btn" data-act="tab" data-v="research">State of the art →</button></p>
@@ -482,7 +482,7 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
     </table></div>
 
     <h2 id="p-roles"><span class="n">03</span>Roles — defined once, staffed per team</h2>
-    <p class="sub">Each role is a versioned file in the vault (<code>vault/company/roles/*.md</code>) compiled into each vendor's format at launch. Teams reference roles in <code>team.yaml</code> (ADR-0001).</p>
+    <p class="sub">Every agent is a folder of Markdown in the vault — <code>agents/&lt;slug&gt;/SOUL.md</code> (who it is), <code>AGENT.md</code> (what it does: role, provider, model, effort, permissions), <code>MEMORY.md</code> (what it knows) — built from role templates in <code>roles/&lt;role&gt;/</code> and staffed by <code>teams/&lt;team&gt;/TEAM.md</code>. Design record: <code>docs/design/AGENT-FILESYSTEM.md</code>.</p>
     <div class="tblwrap"><table class="tbl">
       <tr><th>Role</th><th>Mandate</th><th>Preferred</th><th>Fallback</th><th>Staffing</th></tr>
       <tr><td>Master · assistant</td><td>Talks with you; creates teams and plans; routes questions; daily digest. Never implements.</td><td class="mono">claude · opus · high</td><td class="mono muted">codex · gpt-5.5 · high</td><td>1 per install</td></tr>
@@ -523,9 +523,9 @@ ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
     <div class="tblwrap"><table class="tbl">
       <tr><th>Topic</th><th>Default</th><th>Status</th></tr>
       <tr><td>Organization</td><td>One master; one PM per team; dev, QA, DevOps (researcher on demand); curator at company level</td><td><span class="chip ok">your direction</span></td></tr>
-      <tr><td>Role catalog</td><td>Roles with description and preferred provider/model/effort replace Settings model defaults; team.yaml holds staffing (CAD-338, answers CAD-116)</td><td><span class="chip warn">confirm</span></td></tr>
-      <tr><td>Memory policy</td><td>Logic checks + cross-vendor curator for project/role scope; two-review quorum kept for company scope; external content quarantined (CAD-347)</td><td><span class="chip warn">confirm</span></td></tr>
-      <tr><td>Unblock memory</td><td>Accept daemon-launched managed endpoints as authenticated reviewers (CAD-260)</td><td><span class="chip warn">confirm</span></td></tr>
+      <tr><td>#1 Agent files</td><td>Agents are folders <code>agents/&lt;slug&gt;/</code> with SOUL.md, AGENT.md, MEMORY.md; roles are templates; TEAM.md replaces team.yaml; all Markdown (CAD-338)</td><td><span class="chip ok">your direction</span></td></tr>
+      <tr><td>#2 Memory policy</td><td>Logic checks + cross-vendor curator for project/role scope; two-review quorum kept for company scope; external content quarantined (CAD-347)</td><td><span class="chip ok">approved</span></td></tr>
+      <tr><td>#3 Unblock memory</td><td>Separate who proposed from whether it is true: one daemon identity check for every agent (CAD-381); trust matrix provenance × evidence; the 11 stuck lessons go through checks → curator → your queue (CAD-382)</td><td><span class="chip ok">confirmed</span></td></tr>
       <tr><td>Vault location</td><td><code>~/pm/vault</code> in the tracker repo; project memory stays in <code>&lt;pm&gt;/&lt;project&gt;/memory</code>; agent notes move into git (CAD-355)</td><td><span class="chip">default</span></td></tr>
       <tr><td>Autonomy</td><td>Plan freely, ask to dispatch; you merge and press effects</td><td><span class="chip ok">decided</span></td></tr>
       <tr><td>Master providers</td><td>Structured (Claude, Codex, Pi); terminal agents are workers; unmodified official binaries only</td><td><span class="chip ok">decided</span></td></tr>
@@ -1532,7 +1532,7 @@ function orgView(){
    <div class="callout acc" style="max-width:none">Responsibility flows down; reports flow up. Workers report to their PM, PMs to the master, the master to you. A question climbs one level at a time and stops at the first level — or vault entry — that can answer it. One writer per code area; reviews and research run in parallel.</div></div>`;
 }
 function rolesView(){
-  return `<div class="pane"><div class="between" style="margin-bottom:10px;flex-wrap:wrap;gap:8px"><div><b class="strong">Roles</b> <span class="muted" style="font-size:12.5px">defined once for the company · <code>vault/company/roles/*.md</code> · every change is a commit</span></div><button class="btn sm" data-act="toast" data-v="Describe the role in chat, or add vault/company/roles/<name>.md">+ Role</button></div>
+  return `<div class="pane"><div class="between" style="margin-bottom:10px;flex-wrap:wrap;gap:8px"><div><b class="strong">Roles</b> <span class="muted" style="font-size:12.5px">role templates in <code>vault/roles/&lt;role&gt;/AGENT.md</code> · each agent is a folder <code>vault/agents/&lt;slug&gt;/</code> with SOUL.md, AGENT.md, MEMORY.md · every change is a commit</span></div><button class="btn sm" data-act="toast" data-v="Describe the role in chat, or add vault/roles/<name>/AGENT.md">+ Role</button></div>
   <div class="tblwrap"><table class="tbl"><tr><th>Role</th><th>Description</th><th>Preferred</th><th>Fallback</th><th>Staffing</th><th></th></tr>
   ${ROLES.map(r0=>{const r=S.roles[r0.k];return `<tr><td><div class="row">${av(r.p)}<div>${r0.t}<div class="muted" style="font-size:11px;font-weight:400">${r0.lvl}</div></div></div></td><td style="min-width:260px;color:var(--soft)">${r0.d}${r0.rule?`<div style="margin-top:5px"><span class="chip warn">${r0.rule}</span></div>`:''}</td><td class="mono" style="white-space:nowrap">${r.p} · ${r.m} · ${r.e}</td><td class="mono muted" style="white-space:nowrap">${r0.fb.join(' · ')}</td><td>${r0.n}</td><td><button class="btn sm" data-act="role" data-v="${r0.k}">Edit</button></td></tr>`}).join('')}</table></div>
   <div class="cards" style="margin-top:14px">
@@ -1543,7 +1543,7 @@ function rolesView(){
 function roleDrawer(k){
   const r0=ROLES.find(x=>x.k===k),r=S.roles[k],provs=['claude','codex','pi','cursor','devin'];
   return `<div class="scrim" data-act="close" style="place-items:stretch end;padding:0;background:rgba(0,0,0,.35)"><div class="drawer" role="dialog" aria-label="Role ${r0.t}">
-   <div class="dh"><div class="between"><span class="num muted">vault/company/roles/${k}.md</span><button class="btn sm ghost" data-act="close" aria-label="Close">✕</button></div><h3 style="margin:6px 0 6px;font-size:18px">${r0.t}</h3><div class="row"><span class="chip">${r0.lvl}</span><span class="chip">${r0.n}</span></div></div>
+   <div class="dh"><div class="between"><span class="num muted">vault/roles/${k}/AGENT.md</span><button class="btn sm ghost" data-act="close" aria-label="Close">✕</button></div><h3 style="margin:6px 0 6px;font-size:18px">${r0.t}</h3><div class="row"><span class="chip">${r0.lvl}</span><span class="chip">${r0.n}</span></div></div>
    <div class="db">
     <label class="field"><span>Description — what agents in this role are told</span><textarea class="input" rows="4">${esc(r0.d)}</textarea></label>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
@@ -1600,13 +1600,15 @@ const VV={
    <tr><td>Reads avoided</td><td class="num">11 / task</td><td>median files not re-read thanks to the pack</td></tr>
    <tr><td>Questions answered by the vault</td><td class="num">64%</td><td>no human or PM interrupted</td></tr></table></div>
   <div class="slabel" style="margin:18px 0 8px">Scopes</div>
-  <div class="pre">company/        handbook, standards, policies, glossary, roles/
-teams/<team>/   charter, rituals
+  <div class="pre">company/        HANDBOOK, STANDARDS, POLICIES, GLOSSARY, USER.md
+roles/<role>/   AGENT.md, SOUL.md — templates
+agents/<slug>/  SOUL.md, AGENT.md, MEMORY.md, memory/, journal/
+teams/<team>/   TEAM.md — staffing, autonomy
 projects/<key>/ context manifest, ADRs, code map (per commit), runbooks
 playbooks/      skills (SKILL.md), loaded on demand
 lessons/        verified memory · scope · evidence · confidence
 decisions/  faq/  inbox/ (candidates awaiting the curator)</div>`,
- company:()=>`<h3>Company</h3><p class="muted">Owned by you. Every role's pack starts from the relevant excerpt.</p><div class="tblwrap"><table class="tbl"><tr><th>Document</th><th>Given to</th><th>Updated</th></tr>${[['Mission & product','every role','2 d ago'],['Engineering standards','dev, qa','5 d ago'],['Security & secrets policy','every role','Sep 19'],['Review policy (cross-vendor)','qa, devops','Sep 21'],['Autonomy & approvals','master, pm, devops','Sep 23'],['Brand voice (en, zh-HK)','research, dev','Sep 02'],['Glossary','every role','1 d ago'],['Roles (7)','— defines every agent','today']].map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td class="muted">${r[2]}</td></tr>`).join('')}</table></div>`,
+ company:()=>`<h3>Company</h3><p class="muted">Owned by you. Every role's pack starts from the relevant excerpt.</p><div class="tblwrap"><table class="tbl"><tr><th>Document</th><th>Given to</th><th>Updated</th></tr>${[['Mission & product','every role','2 d ago'],['Engineering standards','dev, qa','5 d ago'],['Security & secrets policy','every role','Sep 19'],['Review policy (cross-vendor)','qa, devops','Sep 21'],['Autonomy & approvals','master, pm, devops','Sep 23'],['Brand voice (en, zh-HK)','research, dev','Sep 02'],['Glossary','every role','1 d ago'],['USER.md — your preferences','master','today']].map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td class="muted">${r[2]}</td></tr>`).join('')}</table></div>`,
  projects:()=>`<h3>Teams &amp; projects</h3><div class="cards">${[['reminders','Reminders team','Context manifest · 2 ADRs · 3 runbooks','Code map: 6 of 6 modules fresh at 3f9c2e1'],['storefront','Storefront team','Context manifest · 5 ADRs · 1 runbook','Code map: 38 of 41 fresh · 3 stale after the last merge']].map(([k,t,a,c])=>`<div class="card"><h4>${k}</h4><p>${t}</p><p style="margin-top:6px">${a}</p><p style="margin-top:6px"><span class="chip ${c.includes('stale')?'warn':'ok'}">${c}</span></p></div>`).join('')}</div>
   <p class="muted" style="font-size:12.5px">Code maps are module summaries keyed to a commit. A merge invalidates only the modules it touched, so agents stop re-reading unchanged code.</p>`,
  playbooks:()=>`<h3>Playbooks</h3><p class="muted">Procedural memory in the open Agent Skills format. Only the name and one line sit in context until an agent loads one.</p><div class="tblwrap"><table class="tbl"><tr><th>Playbook</th><th>Version</th><th>Built from</th><th>Success</th></tr>${[['PB-3 cloudflare-worker-cron','v4','5 lessons','8 / 9'],['PB-7 cloudflare-deploy','v2','3 lessons','4 / 4'],['PB-5 whatsapp-template-send','v2','4 lessons','3 / 3'],['PB-1 cadence-review','v7','12 lessons','41 / 43'],['PB-8 rust-test-isolation','v3','9 lessons','17 / 19']].map(r=>`<tr><td class="mono">${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td class="num">${r[3]}</td></tr>`).join('')}</table></div>`,
@@ -1971,7 +1973,7 @@ function transcriptView(a){
    ['as','Build is clean. Writing a unit test for the scheduled handler next.']]:[
    ['sys',a.id==='master'?'Chat lives on Home — this is the raw event stream.':'Session started'],['as',a.id==='qa-rmd'?'Idle. Reviews are routed here when a non-Claude worker reports a commit.':a.id==='curator'?'Idle. Wakes when a lesson candidate lands in the vault inbox.':'Waiting for work.']];
   return `<div class="between" style="margin-bottom:12px;flex-wrap:wrap;gap:8px"><div class="row">${av(a.p)}<div><b class="strong">${a.id}</b> <span class="muted" style="font-size:12px">${a.p} · ${a.m}</span></div></div>
-   <div class="row"><span class="chip">structured transcript</span><button class="btn sm">Message</button><button class="btn sm danger">Stop</button></div></div>
+   <div class="row"><span class="chip acc">agents/${a.id}/SOUL.md · AGENT.md · MEMORY.md</span><span class="chip">structured transcript</span><button class="btn sm">Message</button><button class="btn sm danger">Stop</button></div></div>
    <div class="box"><div class="bd stack" style="gap:8px;font-size:13px">${lines.map(([k,t])=>k==='sys'?`<div class="sys" style="padding-left:0"><span class="line"></span>${t}</div>`:k==='tool'?`<div class="tool" style="margin:0">${t.replace('✓','<span class="ok">✓</span>')}</div>`:`<div>${t}</div>`).join('')}</div></div>
    <div class="row" style="margin-top:10px;font-size:12px" ><span class="muted">Desired</span><span class="chip">${a.m}</span><span class="muted">Running</span><span class="chip ok">${a.m}</span><span class="muted">· quota: </span><span class="chip">${a.p==='codex'?'62% of 5h window':'unknown'}</span></div>`;
 }
@@ -2114,7 +2116,7 @@ document.addEventListener('click',e=>{
     case 'teamtab':S.teamTab=v;break;
     case 'vaulttab':S.vaultTab=v;break;
     case 'role':overlay='role:'+v;break;
-    case 'rolesave':overlay=null;toast('Role saved · vault/company/roles/'+v+'.md committed');return;
+    case 'rolesave':overlay=null;toast('Role saved · vault/roles/'+v+'/AGENT.md committed');return;
     case 'lesson':overlay='lesson:'+v;break;
     case 'packrole':S.pack=v;break;
     case 'newteam':toast('Ask the master to start a team — it proposes staffing together with a plan');return;

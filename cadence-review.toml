@@ -23,9 +23,11 @@ prepare = [
 ]
 
 # Ordered gates — the first failure stops the sequence and its last 40
-# output lines land in the report.
+# output lines land in the report. vite build strips TypeScript types
+# without checking them, so the UI type check is its own gate (CAD-264).
 gates = [
     "cargo fmt --all -- --check",
+    "cd ui && node_modules/.bin/tsc --noEmit",
     "cargo clippy --all-targets --all-features -- -D warnings",
     "cargo test --lib --bins --test board",
 ]
