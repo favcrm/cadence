@@ -1849,11 +1849,33 @@ impl Slots {
     /// pane for as long as that exact root lives. A pid only matches a root that is still the same process
     /// (an unreadable one matches, so the strict verifier refuses it).
     pub fn nearest_enrolled_root(&self, chain: &[u32]) -> Option<usize> {
-        chain.iter().position(|pid| {
-            self.enrollments
-                .iter()
-                .any(|e| e.root.pid == *pid && self.proc.same_start(*pid, e.root.starttime))
-        })
+        chain.iter().position(|pid| self.is_enrolled_root(*pid))
+    }
+
+    /// Every chain index holding an enrolled root, nearest first — the
+    /// same match as [`Self::nearest_enrolled_root`]. The caller
+    /// identity verifier (CAD-381) counts them all: two agent
+    /// endpoints on one ancestry is an ambiguous caller, refused.
+    pub fn enrolled_roots_on(&self, chain: &[u32]) -> Vec<usize> {
+        (0..chain.len())
+            .filter(|&i| self.is_enrolled_root(chain[i]))
+            .collect()
+    }
+
+    fn is_enrolled_root(&self, pid: u32) -> bool {
+        self.enrollments
+            .iter()
+            .any(|e| e.root.pid == pid && self.proc.same_start(pid, e.root.starttime))
+    }
+
+    /// The enrollment `id` while it still vouches for a live agent
+    /// endpoint: active (not expired, not revoked) and owned by an
+    /// agent row — a build runner's enrollment (CAD-230b) is the
+    /// daemon's own command, never an agent identity.
+    pub fn active_endpoint_enrollment(&self, id: &str) -> Option<&Enrollment> {
+        self.enrollments
+            .iter()
+            .find(|e| e.id == id && e.auth == AuthState::Active && e.runner.is_none())
     }
 
     /// Every enrollment rooted at `root_pid`, in the one order a caller
