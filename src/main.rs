@@ -75,8 +75,10 @@ enum Commands {
     /// daemon is not blocked. The copy is integrity-checked, hashed and
     /// described by a manifest (schema, sha256, versions, repo remotes),
     /// then re-verified from disk. `--keep` prunes older backups with
-    /// the same `--reason` in that directory; files without a cadence
-    /// manifest are never touched. Schedule `--reason nightly` from cron
+    /// the same `--reason` in that directory, oldest by file-name stamp;
+    /// the copy just written is never pruned, and a file is deleted only
+    /// when it is `<manifest stem>.sqlite3` and matches its manifest's
+    /// sha256 and size. Schedule `--reason nightly` from cron
     /// for the nightly week of copies. See docs/SESSION.md.
     Backup {
         /// Where the copy and manifest go [default: <state dir>/backups].
@@ -91,9 +93,13 @@ enum Commands {
         reason: String,
     },
     /// Write a portable bundle (`cadence.sqlite3` + `manifest.json`) to
-    /// a new directory. Only the store goes in: endpoint tokens are
-    /// nulled, freed pages dropped, and every text cell secret-scanned.
-    /// One blocking finding refuses the export and writes nothing.
+    /// a new directory. Only the store goes in: endpoint columns are
+    /// nulled, every turn token and generation is redacted from every
+    /// text cell (refused if any remain), freed pages dropped, and every
+    /// text cell scanned for
+    /// credential patterns. One blocking finding refuses the export and
+    /// writes nothing; warnings pass. The bundle is not signed: its
+    /// sha256 detects corruption, not tampering.
     Export {
         /// The bundle directory to create. It must not exist.
         #[arg(long)]
@@ -4294,7 +4300,26 @@ fn run() -> Result<i32> {
                 as_identity,
             } => {
                 std::fs::create_dir_all(&state_dir)?;
+                // CAD-396: an interrupted `restore --force` leaves the old
+                // store renamed aside; a daemon started now would create an
+                // empty store next to it.
+                let leftovers = cadence_agent::backup::interrupted_restore_leftovers(&state_dir);
+                if !leftovers.is_empty() {
+                    eprintln!(
+                        "warning: an interrupted restore left {} in {}; the previous store \
+                         may be there. Stop the daemon and move it back to cadence.sqlite3",
+                        leftovers
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        state_dir.display()
+                    );
+                }
                 let mut result = client::daemon_start_as(&state_dir, as_identity.as_deref())?;
+                if !leftovers.is_empty() {
+                    result["warning"] = json!({"interrupted_restore": leftovers});
+                }
                 // --resume: once the daemon answers, sweep every agent
                 // with a stored thread and no live endpoint.
                 if resume {
