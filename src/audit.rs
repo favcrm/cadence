@@ -197,7 +197,7 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
 
     // 2. GitHub enrichment (or the fixture): one `pr list` plus one
     //    status call per landed head.
-    let gh = match &opts.merge_report {
+    let mut gh = match &opts.merge_report {
         Some(path) => merge_fixture(path)?,
         None => github(&repo)?,
     };
@@ -254,7 +254,7 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
     // checkout's own origin in fixture runs.
     let approval_slug = gh.slug.clone().or_else(|| origin_slug(&repo));
     for row in &mut rows {
-        enrich_status(gh.slug.as_deref(), &gh, row);
+        enrich_status(&mut gh, row);
         contains_head(&repo, row);
         post_merge(&branch_log, &store, row);
         enrich_approval(&store, approval_slug.as_deref(), row);
@@ -263,8 +263,9 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
     }
     // Fleet-level pass (CAD-207): a match every row shares is a fact
     // about the fleet, reported once — not a per-row finding. Decided
-    // over every merged PR gh returned, not just the rendered window.
-    let structural = apply_structural(&mut rows, &fleet_logins(&gh));
+    // over every merged PR gh returned, not just the rendered window —
+    // and not at all while any of their statuses is out of hand (CAD-287).
+    let structural = fleet_logins(&gh).and_then(|fleet| apply_structural(&mut rows, &fleet));
 
     let flagged = rows.iter().filter(|r| !r.flags.is_empty()).count();
     if opts.json {
@@ -626,8 +627,9 @@ fn enrich_gh_pr(gh: &Gh, row: &mut Row) {
 /// The per-row network call — `qa-verdict` status on the exact landed
 /// head. Runs only for rows that survive the filters, so a narrow
 /// `--since`/`--class`/`--limit` audit spends one API call per shown
-/// merge, not per in-window commit.
-fn enrich_status(slug: Option<&str>, gh: &Gh, row: &mut Row) {
+/// merge, not per in-window commit. A fetched answer is kept in
+/// `gh.statuses`, the evidence `fleet_logins` decides from.
+fn enrich_status(gh: &mut Gh, row: &mut Row) {
     // Direct pushes have no PR head — but the merge commit itself can
     // still carry a `qa-verdict` status, so it is queried too.
     let head = row
@@ -642,7 +644,13 @@ fn enrich_status(slug: Option<&str>, gh: &Gh, row: &mut Row) {
         // Fixture mode never falls back to a live call; a missing key
         // is the fixture saying "no statuses on this head".
         None if gh.fixture => None,
-        None => slug.map(|s| gh_status(s, head.as_str())),
+        None => gh.slug.clone().map(|s| {
+            let fetched = gh_status(&s, head.as_str());
+            if let Ok(v) = &fetched {
+                gh.statuses.insert(head.clone(), v.clone());
+            }
+            fetched
+        }),
     };
     match status {
         Some(Err(e)) => {
@@ -1829,16 +1837,27 @@ const SHARED_IDENTITY_EXPLANATION: &str = "the qa-verdict status and the merge w
 
 /// Every GitHub login the whole fetch names, beyond the rendered
 /// window: `mergedBy` of every merged PR `gh pr list` returned, and the
-/// creator of every `qa-verdict` status already in hand (a fixture has
-/// them all; a live run fetches statuses only for rendered rows, so
-/// there the rows add their own creators).
-fn fleet_logins(gh: &Gh) -> Vec<String> {
+/// `qa-verdict` creator on every one of their landed heads. `None` when
+/// any of those heads' statuses is not in hand — a fixture has them
+/// all (a missing key is "no statuses"); a live run fetches only the
+/// rendered rows', so a PR outside the window, or one whose fetch
+/// failed, leaves the fleet undecided (CAD-287): its creator could be
+/// the second identity that makes a self-review a finding.
+fn fleet_logins(gh: &Gh) -> Option<Vec<String>> {
+    let in_hand = |p: &Value| {
+        p["headRefOid"]
+            .as_str()
+            .is_some_and(|h| gh.statuses.contains_key(h))
+    };
+    if !gh.fixture && !gh.prs.values().all(in_hand) {
+        return None;
+    }
     let mergers = gh
         .prs
         .values()
         .filter_map(|p| p["mergedBy"]["login"].as_str().map(str::to_string));
     let creators = gh.statuses.values().filter_map(|s| qa_verdict_state(s)?.1);
-    mergers.chain(creators).collect()
+    Some(mergers.chain(creators).collect())
 }
 
 /// When every GitHub identity the fleet names (`fleet`, plus the rows'
@@ -2567,10 +2586,12 @@ mod tests {
                 json!({"statuses": [{"context": "qa-verdict", "state": "success",
                                      "creator": {"login": "qa-bot"}}]}),
             )]),
+            fixture: true,
             ..Default::default()
         };
-        assert_eq!(fleet_logins(&gh).len(), 3);
-        assert!(apply_structural(&mut rows, &fleet_logins(&gh)).is_none());
+        let fleet = fleet_logins(&gh).expect("a fixture holds every status");
+        assert_eq!(fleet.len(), 3);
+        assert!(apply_structural(&mut rows, &fleet).is_none());
         assert_eq!(rows[0].flags, vec!["reviewer==merger".to_string()]);
         // Without the outside identity it is structural, as before.
         let mut rows = vec![fleet_row(3, "ops-1", Some("ops-1"))];
@@ -2578,6 +2599,40 @@ mod tests {
         let fleet = vec!["ops-1".to_string()];
         assert_eq!(apply_structural(&mut rows, &fleet).map(|s| s.rows), Some(1));
         assert!(rows[0].flags.is_empty());
+    }
+
+    #[test]
+    fn live_fleet_is_undecided_until_every_fetched_status_is_in_hand() {
+        // CAD-287: live, a merged PR whose landed-head status was never
+        // fetched (outside the window) may hide a second identity — the
+        // mergers alone decide nothing.
+        let status = json!({"statuses": [{"context": "qa-verdict", "state": "success",
+                                          "creator": {"login": "ops-1"}}]});
+        let mut gh = Gh {
+            prs: HashMap::from([
+                (
+                    1,
+                    json!({"headRefOid": "h1", "mergedBy": {"login": "ops-1"}}),
+                ),
+                (
+                    3,
+                    json!({"headRefOid": "h3", "mergedBy": {"login": "ops-1"}}),
+                ),
+            ]),
+            statuses: HashMap::from([("h3".to_string(), status.clone())]),
+            ..Default::default()
+        };
+        assert!(fleet_logins(&gh).is_none());
+        // A fixture's missing key is "no statuses on this head" — decided.
+        gh.fixture = true;
+        assert_eq!(fleet_logins(&gh).map(|f| f.len()), Some(3));
+        // Live with every head's status in hand — decided.
+        gh.fixture = false;
+        gh.statuses.insert("h1".into(), status);
+        assert_eq!(fleet_logins(&gh).map(|f| f.len()), Some(4));
+        // A PR with no landed head cannot be fetched — undecided.
+        gh.prs.insert(4, json!({"mergedBy": {"login": "ops-1"}}));
+        assert!(fleet_logins(&gh).is_none());
     }
 
     const HEAD: &str = "7896dd2735035c0c67e246039cb495231702941c";
