@@ -3,6 +3,11 @@
 //! The CLI binary `cadence` is a thin client over this library plus the
 //! Unix-socket daemon defined in [`daemon`].
 
+// Test code spawns freely: a test binary never runs the CAD-308 reaper
+// (only `daemon run` does, and `reaper`'s own proof in a process of its
+// own), so the spawn registry need not see test spawns.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod adapter;
 pub mod audit;
 pub mod backup;
@@ -19,6 +24,7 @@ pub mod overview;
 pub mod peer;
 pub mod proc;
 pub mod proto;
+pub mod reaper;
 pub mod review;
 pub mod rollout;
 pub mod runner;

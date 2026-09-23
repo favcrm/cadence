@@ -1,0 +1,9 @@
+# CAD-308: the daemon is a child subreaper and reaps adopted orphans; it
+# must know every child it spawned itself so it never consumes that
+# child's exit status. Every spawn goes through `crate::reaper`, which
+# registers the pid before a reaper pass can see it.
+disallowed-methods = [
+    { path = "std::process::Command::spawn", reason = "use cadence_agent::reaper::spawn — the subreaper must know every child it did not adopt (CAD-308)" },
+    { path = "std::process::Command::output", reason = "use cadence_agent::reaper::output — the subreaper must know every child it did not adopt (CAD-308)" },
+    { path = "std::process::Command::status", reason = "use cadence_agent::reaper::status — the subreaper must know every child it did not adopt (CAD-308)" },
+]

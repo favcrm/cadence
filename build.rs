@@ -4,6 +4,10 @@
 //! Every value falls back to `unknown` when git or a repo is absent —
 //! consumers treat `unknown` as "cannot tell", never as zero.
 
+// Runs in cargo, never in the daemon: the CAD-308 spawn registry
+// (`cadence_agent::reaper`) does not apply to build scripts.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

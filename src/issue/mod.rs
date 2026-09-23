@@ -182,11 +182,12 @@ impl Pm {
 
     /// True when the worktree differs from HEAD.
     fn git_dirty(&self) -> bool {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&self.dir)
-            .args(["status", "--porcelain"])
-            .output();
+        let status = crate::reaper::output(
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.dir)
+                .args(["status", "--porcelain"]),
+        );
         match status {
             Ok(out) => out.status.success() && !out.stdout.is_empty(),
             Err(_) => false,
@@ -217,11 +218,12 @@ impl Pm {
     }
 
     fn git_dirty_cached(&self) -> bool {
-        let diff = Command::new("git")
-            .arg("-C")
-            .arg(&self.dir)
-            .args(["diff", "--cached", "--quiet"])
-            .status();
+        let diff = crate::reaper::status(
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.dir)
+                .args(["diff", "--cached", "--quiet"]),
+        );
         match diff {
             // exit 1 = staged changes exist; 0 = clean.
             Ok(s) => !s.success(),
@@ -242,11 +244,7 @@ impl Drop for PmLock {
 
 /// Run a git subcommand in `dir`; rejected error carries stderr.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
+    let out = crate::reaper::output(Command::new("git").arg("-C").arg(dir).args(args))
         .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
     if !out.status.success() {
         return Err(Error::rejected(format!(

@@ -273,7 +273,7 @@ fn spawn_daemon_run(state_dir: &Path, identity: Option<&str>) -> Result<std::pro
             Ok(())
         });
     }
-    Ok(command.spawn()?)
+    Ok(crate::reaper::spawn(&mut command)?)
 }
 
 /// Send one request, return the result value or the wire error.

@@ -47,12 +47,13 @@ const HOOKS: [(&str, &str); 2] = [("pre-commit", PRE_COMMIT), ("post-commit", PO
 /// absolute) — `.git` may be a file when the tracker is a worktree.
 /// `None` when the tracker has no repo.
 pub fn git_dir(pm_dir: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(pm_dir)
-        .args(["rev-parse", "--git-dir"])
-        .output()
-        .ok()?;
+    let out = crate::reaper::output(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(pm_dir)
+            .args(["rev-parse", "--git-dir"]),
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }

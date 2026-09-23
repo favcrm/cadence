@@ -3,6 +3,10 @@
 //! Commands that are not implemented in this milestone fail loudly rather
 //! than pretending to work.
 
+// Test code spawns freely: no test process runs the CAD-308 reaper
+// (only `daemon run` does), so the spawn registry need not see it.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -4246,6 +4250,9 @@ fn run() -> Result<i32> {
         }
         Commands::Daemon { action } => match action {
             DaemonAction::Run { rollout_as } => {
+                // CAD-308: before anything is spawned, so every tree the
+                // daemon launches keeps its orphans under the daemon.
+                cadence_agent::reaper::enable()?;
                 cadence_agent::rollout::set_forwarded_identity(rollout_as);
                 // Never keep the holder in the environment, even if the
                 // parent shell exported it. Panes inherit the daemon's env.
@@ -5564,11 +5571,13 @@ fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
     }
     // stderr (the when-idle progress) streams through; the before/after
     // table is captured into the report.
-    let out = cmd
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .map_err(|e| Error::internal(format!("could not run {}: {e}", installed.display())))?;
+    let out = cadence_agent::reaper::spawn(
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit()),
+    )
+    .and_then(|child| child.wait_with_output())
+    .map_err(|e| Error::internal(format!("could not run {}: {e}", installed.display())))?;
     let ok = out.status.success();
     report["restarted"] = json!(ok);
     report["restart"] = json!({
@@ -6357,9 +6366,13 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
             .and_then(|rest| rest.split_once('/'))
             .ok_or_else(|| Error::internal("malformed tmux endpoint"))?;
         if run {
-            let status = Command::new("tmux")
-                .args(["-L", socket, "attach-session", "-t", session])
-                .status()?;
+            let status = cadence_agent::reaper::status(Command::new("tmux").args([
+                "-L",
+                socket,
+                "attach-session",
+                "-t",
+                session,
+            ]))?;
             return Ok(status.code().unwrap_or(1));
         }
         print_json(&json!({
@@ -6376,9 +6389,9 @@ fn attach_agent(state_dir: &Path, alias: &str, run: bool) -> Result<i32> {
         return Err(Error::internal("unreachable: attach arm narrowed above"));
     };
     if run {
-        let status = Command::new(program)
-            .args(["resume", "--remote", endpoint, thread])
-            .status()?;
+        let status = cadence_agent::reaper::status(
+            Command::new(program).args(["resume", "--remote", endpoint, thread]),
+        )?;
         return Ok(status.code().unwrap_or(1));
     }
     print_json(&json!({
@@ -7153,11 +7166,7 @@ impl BriefMode {
 /// Run a git subcommand in `dir`, returning stdout or a rejected error
 /// carrying stderr.
 fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
+    let out = cadence_agent::reaper::output(Command::new("git").arg("-C").arg(dir).args(args))
         .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))?;
     if !out.status.success() {
         return Err(Error::rejected(format!(

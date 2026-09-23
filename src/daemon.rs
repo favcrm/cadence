@@ -1647,6 +1647,9 @@ impl Shared {
                 "capabilities": proto::capabilities(),
                 "agent_gc_timer": self.agent_gc.status(),
                 "agent_auto_stop": self.auto_stop.status(),
+                // CAD-308: whether orphans of what this daemon launched
+                // re-parent to it (true for `daemon run`).
+                "child_subreaper": crate::reaper::is_subreaper(),
             })),
             // Build identity + process start — the deploy-drift check
             // measures merged commits against *this* binary's commit.

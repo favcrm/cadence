@@ -811,14 +811,15 @@ fn git_log(pm_dir: &Path, issue: &Issue) -> Vec<Value> {
         .strip_prefix(pm_dir)
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|_| issue.dir.join("issue.md"));
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(pm_dir)
-        // No --follow: identical issue.md templates across siblings trip
-        // rename detection and leak other issues' creation commits.
-        .args(["log", "--format=%h|%aI|%s", "--"])
-        .arg(&rel)
-        .output();
+    let out = crate::reaper::output(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(pm_dir)
+            // No --follow: identical issue.md templates across siblings trip
+            // rename detection and leak other issues' creation commits.
+            .args(["log", "--format=%h|%aI|%s", "--"])
+            .arg(&rel),
+    );
     let Ok(out) = out else { return vec![] };
     if !out.status.success() {
         return vec![];

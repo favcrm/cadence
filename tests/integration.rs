@@ -2,6 +2,10 @@
 //! These exercise the observable contract — queue order, idempotency,
 //! restart fencing, approval brokering, serialization — without model calls.
 
+// A test binary never runs the CAD-308 reaper (only `daemon run` does),
+// so its own spawns need not go through `cadence_agent::reaper`.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -53,6 +57,9 @@ struct TestDaemon {
     dir: TempDir,
     state: PathBuf,
     handle: Option<JoinHandle<cadence_agent::Result<()>>>,
+    /// A `daemon run` process instead of an in-process daemon
+    /// ([`TestDaemon::start_process_in`]).
+    process: Option<std::process::Child>,
 }
 
 impl TestDaemon {
@@ -73,6 +80,7 @@ impl TestDaemon {
             dir,
             state,
             handle: Some(handle),
+            process: None,
         };
         daemon.wait_health();
         daemon
@@ -94,8 +102,56 @@ impl TestDaemon {
             dir,
             state,
             handle: Some(handle),
+            process: None,
         };
         daemon.wait_health();
+        daemon
+    }
+
+    /// CAD-308: a real `cadence daemon run` PROCESS serving a state dir
+    /// in `dir` — the production shape. Only that process is the child
+    /// subreaper: an in-process daemon never enables it, because a test
+    /// binary spawns children outside the reaper's registry. The daemon
+    /// takes this test's provider env (`test_env`) as its process env
+    /// at spawn, so install mock commands and `CADENCE_PM_DIR` BEFORE
+    /// starting it; HOME is a directory inside `dir`. Drop shuts it
+    /// down and reaps it — SIGKILL after 15s — even while a failed
+    /// assertion unwinds (CAD-306).
+    fn start_process_in(dir: TempDir) -> Self {
+        suite_slot();
+        let state = dir.path().to_path_buf();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let log = std::fs::File::create(dir.path().join("daemon-process.log")).unwrap();
+        let process = std::process::Command::new(env!("CARGO_BIN_EXE_cadence"))
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["daemon", "run"])
+            .env("HOME", &home)
+            .env_remove("CADENCE_ALIAS")
+            .env_remove("CADENCE_ROLLOUT_AS")
+            .envs(test_env().vars())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let daemon = Self {
+            dir,
+            state,
+            handle: None,
+            process: Some(process),
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while daemon.rpc("health", json!({})).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "daemon run never became healthy: {}",
+                std::fs::read_to_string(daemon.dir.path().join("daemon-process.log"))
+                    .unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
         daemon
     }
 
@@ -227,6 +283,15 @@ impl Drop for TestDaemon {
         let _ = self.rpc("shutdown", json!({}));
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+        // Our own child: waiting on it can never touch another process.
+        if let Some(mut process) = self.process.take() {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while matches!(process.try_wait(), Ok(None)) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let _ = process.kill();
+            let _ = process.wait();
         }
     }
 }
@@ -29535,6 +29600,14 @@ struct ManagedWorker {
     _mock: MockClaude,
 }
 
+/// The enrollment mock installed as this test's claude command, not yet
+/// registered — [`ManagedWorker::install`] before a `daemon run` process
+/// exists (it takes its env at spawn), then [`Self::enroll`].
+struct ManagedWorkerMock {
+    cmd_dir: TempDir,
+    mock: MockClaude,
+}
+
 impl ManagedWorker {
     /// Register `alias` as a managed claude endpoint running the
     /// enrollment mock and wait for the daemon to enroll it.
@@ -29544,9 +29617,15 @@ impl ManagedWorker {
 
     /// [`Self::start`] registering the endpoint with `role`.
     fn start_role(d: &TestDaemon, alias: &str, role: &str) -> ManagedWorker {
+        Self::install(d.dir.path(), &d.state, alias).enroll_role(d, alias, role)
+    }
+
+    /// Write the enrollment mock into `dir` and install it as the claude
+    /// command for a daemon serving `state`.
+    fn install(dir: &Path, state: &Path, alias: &str) -> ManagedWorkerMock {
         let cmd_dir = TempDir::new().unwrap();
-        let pidfile = d.dir.path().join(format!("claude-{alias}.pid"));
-        let script = d.dir.path().join("claude-enroll.py");
+        let pidfile = dir.join(format!("claude-{alias}.pid"));
+        let script = dir.join("claude-enroll.py");
         std::fs::write(&script, MOCK_ENROLL_PY).unwrap();
         test_env().set(
             "CADENCE_CLAUDE_COMMAND",
@@ -29554,13 +29633,27 @@ impl ManagedWorker {
                 "python3 {} {} {} {}",
                 script.display(),
                 pidfile.display(),
-                client::socket_path(&d.state).display(),
+                client::socket_path(state).display(),
                 cmd_dir.path().display()
             ),
         );
-        let mock = MockClaude {
-            pidfile: pidfile.clone(),
-        };
+        ManagedWorkerMock {
+            cmd_dir,
+            mock: MockClaude { pidfile },
+        }
+    }
+}
+
+impl ManagedWorkerMock {
+    /// Register `alias` as a managed claude worker and wait for `d` to
+    /// enroll the provider it launched.
+    fn enroll(self, d: &TestDaemon, alias: &str) -> ManagedWorker {
+        self.enroll_role(d, alias, "worker")
+    }
+
+    /// [`Self::enroll`] registering the endpoint with `role`.
+    fn enroll_role(self, d: &TestDaemon, alias: &str, role: &str) -> ManagedWorker {
+        let ManagedWorkerMock { cmd_dir, mock } = self;
         let cwd = d.dir.path().to_str().unwrap().to_string();
         d.rpc(
             "agent_register",
@@ -29593,7 +29686,9 @@ impl ManagedWorker {
             _mock: mock,
         }
     }
+}
 
+impl ManagedWorker {
     /// One slot RPC performed `how` = `self` | `child` | `detached` |
     /// `detached-bare`; the answer is the wire frame.
     fn rpc(&mut self, how: &str, method: &str, params: Value) -> Value {
@@ -30785,8 +30880,9 @@ fn build_slot_launch_refuses_unknown_recipes_injection_and_unproven_callers() {
 /// cannot launch as `(operator)`; and a straggler the recipe left in its
 /// process group is ended with the recipe, never left building after
 /// its slot frees. A detached descendant that ALSO scrubs the runner's
-/// environment is not contained — see
-/// `build_slot_launch_detached_scrubbed_descendant_passes_as_operator`.
+/// environment is refused too, by the daemon-descendant rule under the
+/// child subreaper (CAD-308) — see
+/// `build_slot_launch_detached_scrubbed_descendant_is_refused`.
 #[test]
 fn build_slot_launch_runner_tree_is_contained() {
     let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
@@ -30866,22 +30962,43 @@ fn build_slot_launch_runner_tree_is_contained() {
     );
 }
 
-/// KNOWN RESIDUAL, pinned (CAD-230 phase b2 review; CAD-308): a recipe
+/// Wait until `pid` has no `/proc` entry — REAPED, not merely exited:
+/// an unreaped zombie keeps its entry (state `Z`).
+fn wait_reaped(pid: u32, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} (pid {pid}) was never reaped: {}",
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The `daemon run` process's pid, and that it is the child subreaper.
+fn subreaper_daemon_pid(d: &TestDaemon) -> u64 {
+    let health = d.rpc("health", json!({})).unwrap();
+    assert_eq!(health["child_subreaper"], true, "{health}");
+    health["pid"].as_u64().unwrap()
+}
+
+/// CAD-308 (flips the residual CAD-230 phase b2 pinned): a recipe
 /// descendant that detaches AND scrubs the runner's environment —
-/// `env -u CADENCE_RUNNER_ID -u CADENCE_RUNNER_DIGEST setsid -f …`, stdio
-/// to /dev/null — re-parents off the runner, carries no marker, and
-/// today PASSES operator proof: its `slot_launch` is accepted as
-/// `(operator)`. This asserts the CURRENT behaviour on purpose. The
-/// daemon child-subreaper fix (CAD-308) must flip it — the launch
-/// refused and no nested runner — so that change lands deliberately.
+/// `env -u CADENCE_RUNNER_ID -u CADENCE_RUNNER_DIGEST setsid -f …`,
+/// stdio to /dev/null — re-parents to the daemon, its child subreaper,
+/// instead of to init. It is still a daemon descendant, so operator
+/// proof refuses it by that rule: no `(operator)` launch, no nested
+/// runner. Once it exits the daemon reaps it — no zombie lingers. A
+/// real `daemon run` process: only that one is the subreaper.
 #[test]
-fn build_slot_launch_detached_scrubbed_descendant_passes_as_operator() {
-    let d = TestDaemon::start_opts(slot_opts(2, 1, 900, &[]));
-    plant_self(&d);
+fn build_slot_launch_detached_scrubbed_descendant_is_refused() {
+    let dir = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
     let req = work.path().join("req.json");
     let resp = work.path().join("resp.json");
+    let pidf = work.path().join("detached.pid");
     std::fs::write(
         &req,
         cadence_agent::proto::request("slot_launch", json!({"recipe": "inner", "project": "p"}))
@@ -30889,11 +31006,13 @@ fn build_slot_launch_detached_scrubbed_descendant_passes_as_operator() {
     )
     .unwrap();
     let py = format!(
-        "import socket,os;s=socket.socket(socket.AF_UNIX);s.connect({sock:?});\
+        "import socket,os;open({pid:?},'w').write(str(os.getpid()));\
+         s=socket.socket(socket.AF_UNIX);s.connect({sock:?});\
          s.sendall(open({req:?},'rb').read()+b'\\n');\
          open({out:?}+'.tmp','w').write(s.makefile().readline());\
          os.rename({out:?}+'.tmp',{out:?})",
-        sock = client::socket_path(&d.state).display().to_string(),
+        pid = pidf.display().to_string(),
+        sock = client::socket_path(dir.path()).display().to_string(),
         req = req.display().to_string(),
         out = resp.display().to_string(),
     );
@@ -30906,57 +31025,243 @@ fn build_slot_launch_detached_scrubbed_descendant_passes_as_operator() {
     );
     let recipes = sh_recipe("outer", &outer, &["PATH"]) + &sh_recipe("inner", "echo inner", &[]);
     let (_proj, _repo) = runner_project(&recipes);
-    let run = cadence_at(
-        home.path(),
-        &d.state,
-        &["build-slot", "launch", "outer", "--project", "p"],
-    );
-    assert_eq!(
-        run.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+    let d = TestDaemon::start_process_in(dir);
+    let _reaper = DaemonReaper::new(&d.state);
+    let daemon_pid = subreaper_daemon_pid(&d);
+    let mut lane = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", lane.pid());
+    let (rc, out) = lane.cadence(&d.state, "build-slot launch outer --project p");
+    assert_eq!(rc, 0, "{out}");
     let answer: Value = serde_json::from_str(&std::fs::read_to_string(&resp).unwrap()).unwrap();
-    // CAD-308 must flip this: expect `ok:false` (refused) instead.
-    assert_eq!(
-        answer["ok"], true,
-        "the residual is pinned as accepted until CAD-308 lands \
-         (a refusal here from another cause means the host's orphan \
-         reaper ancestry differs): {answer}"
+    assert_eq!(answer["ok"], false, "{answer}");
+    let msg = answer["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("not provably the operator"), "{msg}");
+    assert!(
+        msg.contains(&format!("descends from the daemon (pid {daemon_pid})")),
+        "refused by the daemon-descendant rule: {msg}"
     );
-    assert_eq!(answer["result"]["requester"], "operator", "{answer}");
-    assert_eq!(answer["result"]["lane"], "(operator)", "{answer}");
-    // Cleanup (CAD-306): the nested runner is the daemon's own child and
-    // runs a one-line recipe — wait until it has ended and been reaped,
-    // so no runner outlives this test.
-    let nested = answer["result"]["runner_id"].as_str().unwrap().to_string();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let r = loop {
-        let r = cadence_agent::runner::read_receipt(&d.state, &nested).unwrap();
-        if r.is_terminal() {
-            break r;
+    assert_eq!(
+        std::fs::read_dir(cadence_agent::runner::runners_dir(&d.state))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .count(),
+        1,
+        "the detached descendant launched nothing"
+    );
+    let pid: u32 = std::fs::read_to_string(&pidf)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_reaped(pid, "the detached descendant, adopted by the daemon");
+}
+
+/// CAD-308 with the CAD-276 shape: a managed provider's tool runs
+/// `env -u CADENCE_ALIAS setsid -f … build-slot reconcile` — its own
+/// session leader, the alias scrubbed, stdio redirected. Without the
+/// subreaper it re-parented to init and passed operator proof; under
+/// `daemon run` it re-parents to the daemon, is refused by the
+/// daemon-descendant rule, and is reaped by the daemon once it exits.
+///
+/// The same detach from a registered pane whose shell the daemon did
+/// NOT launch still passes the operator gate — it reaches the
+/// live-holder rule. That is the documented pane-route residual
+/// (CAD-280), asserted as today's behaviour on purpose.
+#[test]
+fn slot_reconcile_refuses_a_managed_tools_setsid_detach() {
+    let dir = TempDir::new().unwrap();
+    // A hermetic tracker dir for the daemon (no host pm.yaml).
+    let (_proj, _repo) = runner_project(&sh_recipe("ok", "echo ok", &[]));
+    let mock = ManagedWorker::install(dir.path(), dir.path(), "wk");
+    let d = TestDaemon::start_process_in(dir);
+    let _reaper = DaemonReaper::new(&d.state);
+    let daemon_pid = subreaper_daemon_pid(&d);
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&d, "pane-1", pane.pid());
+    let mut wk = mock.enroll(&d, "wk");
+    let g = wk.rpc(
+        "self",
+        "slot_acquire",
+        json!({"kind": "build", "pid": "$PID", "request_id": "r1"}),
+    );
+    let token = g["result"]["token"].as_str().unwrap().to_string();
+    let s = pane.rpc(&d.state, "slot_status", json!({}));
+    let hold = s["result"]["pools"]["build"]["held"][0].clone();
+    let root = s["result"]["enrollments"][0]["root"].clone();
+    let work = TempDir::new().unwrap();
+    let evidence = work.path().join("evidence.json");
+    std::fs::write(
+        &evidence,
+        json!({
+            "owner_generation": hold["owner_generation"], "pid": root["pid"],
+            "starttime": root["starttime"], "uid": root["uid"],
+            "observed_at": "now", "process_read": "claimed exited",
+            "command_outcome": "done", "side_effect_review": "none",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // `sh detach.sh OUT`: record its pid, run the reconcile, land the
+    // CLI's output and exit code at OUT.
+    let script = work.path().join("detach.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "echo $$ > \"$1.pid\"\n\
+             {bin} --state-dir {state} build-slot reconcile {enr} {token} \
+             --evidence \"$(cat {ev})\" > \"$1.tmp\" 2>&1\n\
+             echo \"rc=$?\" >> \"$1.tmp\"\n\
+             mv \"$1.tmp\" \"$1\"\n",
+            bin = env!("CARGO_BIN_EXE_cadence"),
+            state = d.state.display(),
+            enr = hold["enrollment_id"].as_str().unwrap(),
+            ev = evidence.display(),
+        ),
+    )
+    .unwrap();
+    let detach = |out: &Path| {
+        format!(
+            "env -u CADENCE_ALIAS setsid -f sh {} {} </dev/null >/dev/null 2>&1",
+            script.display(),
+            out.display()
+        )
+    };
+    let landed = |out: &Path, route: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !out.exists() {
+            assert!(Instant::now() < deadline, "{route}: never answered");
+            thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read_to_string(out).unwrap()
+    };
+
+    // Off a managed tool: re-parented to the daemon, refused.
+    let out = work.path().join("managed.out");
+    let r = wk.exec(&["sh", "-c", &detach(&out)]);
+    assert_eq!(r["rc"], 0, "{r}");
+    let text = landed(&out, "managed detach");
+    assert!(text.contains("not provably the operator"), "{text}");
+    assert!(
+        text.contains(&format!("descends from the daemon (pid {daemon_pid})")),
+        "refused by the daemon-descendant rule: {text}"
+    );
+    let pid: u32 = std::fs::read_to_string(work.path().join("managed.out.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    wait_reaped(pid, "the detached reconcile shell, adopted by the daemon");
+
+    // Off a pane the daemon did not launch: the residual (CAD-280).
+    let out = work.path().join("pane.out");
+    let (rc, run) = pane.run(&detach(&out));
+    assert_eq!(rc, 0, "{run}");
+    let text = landed(&out, "pane detach");
+    assert!(
+        !text.contains("not provably the operator") && text.contains("is alive"),
+        "the pane-route residual (CAD-280) passes the operator gate and meets \
+         the live-holder rule (a gate refusal here means this host re-parents \
+         the test's orphans to a process carrying an agent's env): {text}"
+    );
+
+    let s = pane.rpc(&d.state, "slot_status", json!({}));
+    assert_eq!(
+        s["result"]["pools"]["build"]["held"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "no detached caller freed anything: {s}"
+    );
+}
+
+/// CAD-308: the reaper never takes an owned child's exit status. Under
+/// `daemon run`, recipes that each leave a burst of detached children
+/// exiting at once — orphans the daemon adopts and must reap — still
+/// end with their own exit code on every receipt: the runner threads'
+/// waits and the `git` calls around each gate all got their statuses.
+/// Afterwards no zombie child of the daemon lingers, and `daemon.log`
+/// says once that the daemon is the subreaper.
+#[test]
+fn subreaper_reaps_orphans_while_owners_keep_their_exit_statuses() {
+    let dir = TempDir::new().unwrap();
+    let flood = "i=0; while [ $i -lt 40 ]; do setsid -f sh -c 'exit 0' \
+                 </dev/null >/dev/null 2>&1; i=$((i+1)); done; exit 7";
+    let (_proj, _repo) = runner_project(&sh_recipe("flood", flood, &["PATH"]));
+    let d = TestDaemon::start_process_in(dir);
+    let _reaper = DaemonReaper::new(&d.state);
+    let daemon_pid = subreaper_daemon_pid(&d);
+    let home = TempDir::new().unwrap();
+    let mut lane = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", lane.pid());
+    let launch = format!(
+        "{} --state-dir {} build-slot launch flood --project p >/dev/null 2>&1",
+        env!("CARGO_BIN_EXE_cadence"),
+        d.state.display()
+    );
+    // Three at once — the default pool's three build slots — twice.
+    for _ in 0..2 {
+        lane.run(&format!("{launch} & {launch} & {launch} & wait"));
+    }
+    let receipts: Vec<_> = std::fs::read_dir(cadence_agent::runner::runners_dir(&d.state))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let id = name.strip_suffix(".json")?.to_string();
+            Some(cadence_agent::runner::read_receipt(&d.state, &id).unwrap())
+        })
+        .collect();
+    assert_eq!(receipts.len(), 6, "{receipts:?}");
+    for r in &receipts {
+        assert_eq!(
+            (r.state.as_str(), r.exit_code),
+            ("exited", Some(7)),
+            "every owner kept its child's status: {r:?}"
+        );
+    }
+    // Every child of the daemon that is a zombie now must be gone soon:
+    // nothing owns the adopted orphans but the reaper.
+    let zombies = || -> Vec<u32> {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{daemon_pid}/task")) else {
+            return Vec::new();
+        };
+        tasks
+            .flatten()
+            .filter_map(|t| std::fs::read_to_string(t.path().join("children")).ok())
+            .flat_map(|c| {
+                c.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+                    s.rsplit_once(')')
+                        .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+                })
+            })
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let left = zombies();
+        if left.is_empty() {
+            break;
         }
         assert!(
             Instant::now() < deadline,
-            "nested runner never ended: {r:?}"
+            "zombie children of the daemon linger: {left:?}"
         );
-        thread::sleep(Duration::from_millis(50));
-    };
+        thread::sleep(Duration::from_millis(100));
+    }
+    let log = std::fs::read_to_string(d.dir.path().join("daemon-process.log")).unwrap();
     assert_eq!(
-        (r.state.as_str(), r.exit_code),
-        ("exited", Some(0)),
-        "{r:?}"
-    );
-    let pid = r.pid.unwrap();
-    assert!(
-        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-        "nested runner {pid} was reaped"
-    );
-    let s = d.rpc("slot_status", json!({})).unwrap();
-    assert!(
-        s["pools"]["build"]["held"].as_array().unwrap().is_empty(),
-        "{s}"
+        log.matches(&format!("subreaper: pid {daemon_pid} "))
+            .count(),
+        1,
+        "{log}"
     );
 }
 

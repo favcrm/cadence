@@ -132,13 +132,13 @@ fn receive_limited(
 /// child leads its own process group and the deadline kills the whole
 /// group, so a grandchild holding the pipes cannot stall the readers.
 pub fn run_bounded(cmd: &mut Command, timeout: Duration) -> Result<Output, BoundedError> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(BoundedError::Spawn)?;
+    let mut child = crate::reaper::spawn(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0),
+    )
+    .map_err(BoundedError::Spawn)?;
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + timeout;
@@ -178,13 +178,13 @@ pub fn run_bounded_limited(
     timeout: Duration,
     limit: usize,
 ) -> Result<(Output, OutputBounds), BoundedError> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(BoundedError::Spawn)?;
+    let mut child = crate::reaper::spawn(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0),
+    )
+    .map_err(BoundedError::Spawn)?;
     let stdout = drain_limited(child.stdout.take(), limit);
     let stderr = drain_limited(child.stderr.take(), limit);
     let deadline = Instant::now() + timeout;
