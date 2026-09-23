@@ -24,6 +24,7 @@ pub mod report;
 pub mod retro;
 pub mod start;
 pub mod sync;
+pub mod task_report;
 pub mod time;
 pub mod write;
 
