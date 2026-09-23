@@ -183,10 +183,8 @@ pub(super) fn stream(
         ) {
             Ok(page) => {
                 let entries = page["entries"].as_array().cloned().unwrap_or_default();
-                if entries.is_empty() {
-                    if !frame(&mut w, b": ping\n\n") {
-                        return;
-                    }
+                if entries.is_empty() && !frame(&mut w, b": ping\n\n") {
+                    return;
                 }
                 for entry in entries {
                     let Some(seq) = entry["seq"].as_i64() else {
