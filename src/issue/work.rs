@@ -1046,19 +1046,21 @@ mod tests {
         let by_id: HashMap<String, &View> =
             vs.iter().map(|v| (v.issue.front.id.clone(), v)).collect();
         let mut ctx = ctx_for(&by_id);
-        let mut cfg = WorkConfig::default();
-        cfg.milestones = vec![
-            Milestone {
-                id: "m0".into(),
-                title: Some("Safe".into()),
-                exit: Some("restore".into()),
-            },
-            Milestone {
-                id: "m2".into(),
-                title: Some("One team".into()),
-                exit: None,
-            },
-        ];
+        let cfg = WorkConfig {
+            milestones: vec![
+                Milestone {
+                    id: "m0".into(),
+                    title: Some("Safe".into()),
+                    exit: Some("restore".into()),
+                },
+                Milestone {
+                    id: "m2".into(),
+                    title: Some("One team".into()),
+                    exit: None,
+                },
+            ],
+            ..WorkConfig::default()
+        };
         ctx.configs.insert("cadence".into(), (cfg, None));
         let rows = milestones_json(&ctx, &vs, None);
         let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();

@@ -969,8 +969,8 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     })?;
                     if model::item_type(&epic.issue.front, epic.container) != "epic" {
                         return Err(Error::rejected(format!(
-                            "{id} is not an epic — `cadence issue set {id} type=epic`, or \
-                             `cadence issue new --epic {id} \"title\"` gives it children"
+                            "{id} has no children and is not `type: epic` — \
+                             `cadence issue new --epic {id} \"title\"` makes it an epic"
                         )));
                     }
                     let ctx = work::Ctx::new(&pm.dir, &by_id, now);

@@ -37661,6 +37661,310 @@ fn plan_claim_refused_on_unapproved_ticket() {
     assert_eq!(f.front("D-3").status, "doing");
 }
 
+// ---- CAD-405: work model — types, stages, progress, milestones ----
+
+/// CAD-405: `type`, `size` and `milestone` are settable (and checked);
+/// `stage` is not — it moves only through `epic_stage`, a gate decision
+/// and one tracker commit. A forward move into an operator stage
+/// (`build`, `release` by default) needs the proven operator; a pane
+/// agent makes the routine moves and sends an epic back, attributed to
+/// its own lane; skips and identity fields are refused. `issue epic ls`
+/// and `issue show` carry stage, weighted progress and health. An older
+/// binary that drops `stage` makes the epic read as its first stage —
+/// earlier, never later — so re-entering build asks the operator again.
+#[test]
+fn work_model_stage_moves_are_gated_and_committed() {
+    let f = PlanFixture::start();
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-1", pane.pid());
+    assert!(f.cli(&["issue", "new", "Epic", "--project", "demo"]).0);
+    for title in ["Big", "Small", "Plain"] {
+        let (ok, out) = f.cli(&["issue", "new", title, "--project", "demo", "--epic", "D-1"]);
+        assert!(ok, "{out}");
+    }
+    let (ok, out) = f.cli(&["issue", "set", "D-2", "size=l", "status=done"]);
+    assert!(ok, "{out}");
+    assert_eq!(f.front("D-2").size.as_deref(), Some("L"));
+    assert!(f.cli(&["issue", "set", "D-3", "size=S"]).0);
+    let (ok, out) = f.cli(&["issue", "set", "D-1", "type=epic", "milestone=m1"]);
+    assert!(ok, "{out}");
+    for (pair, want) in [
+        ("type=story", "Unknown type 'story'"),
+        ("size=XL", "Unknown size 'XL'"),
+        ("milestone=M1", "Invalid milestone"),
+        ("stage=build", "gate decision"),
+    ] {
+        let (ok, err) = f.cli(&["issue", "set", "D-1", pair]);
+        assert!(!ok && err.to_string().contains(want), "{pair}: {err}");
+    }
+
+    // Never moved: the first stage, entry time unknown; weighted
+    // progress L done of L+S+M = 8/12.
+    let (ok, out) = f.cli(&["issue", "epic", "ls", "--json"]);
+    assert!(ok, "{out}");
+    let w = &out["epics"][0]["work"];
+    assert_eq!(w["stage"]["id"], "shape", "{out}");
+    assert_eq!(w["stage"]["source"], "default", "{out}");
+    assert_eq!(w["stage"]["next_needs_operator"], true, "{out}");
+    assert_eq!(w["progress"]["done_weight"], 8, "{out}");
+    assert_eq!(w["progress"]["total_weight"], 12, "{out}");
+    assert_eq!(w["health"]["state"], "on_track", "{out}");
+    assert_eq!(w["milestone"], "m1", "{out}");
+
+    // shape → build is the operator's: the pane is refused, nothing
+    // is written.
+    let before = f.commits();
+    let r = pane.rpc(
+        &f.d.state,
+        "epic_stage",
+        json!({"epic": "D-1", "stage": "build"}),
+    );
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("operator action") && msg.contains("pane-1"),
+        "{r}"
+    );
+    let err =
+        f.d.operator_rpc("epic_stage", json!({"epic": "D-1", "stage": "verify"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("skips a stage"), "{err}");
+    let err =
+        f.d.operator_rpc(
+            "epic_stage",
+            json!({"epic": "D-1", "stage": "build", "by": "operator"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'by'"), "{err}");
+    let err =
+        f.d.operator_rpc("epic_stage", json!({"epic": "D-2", "stage": "build"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("only epics have stages"), "{err}");
+    assert_eq!(f.commits(), before, "refused moves write nothing");
+    assert!(f.front("D-1").stage.is_none());
+
+    let out =
+        f.d.operator_rpc(
+            "epic_stage",
+            json!({"epic": "D-1", "stage": "build", "note": "scope agreed"}),
+        )
+        .unwrap();
+    assert_eq!(
+        (out["from"].as_str(), out["to"].as_str()),
+        (Some("shape"), Some("build"))
+    );
+    assert_eq!(out["by"], "operator", "{out}");
+    assert_eq!(f.commits(), before + 1, "one commit per move");
+    let msg = f.last_commit();
+    assert!(
+        msg.starts_with("D-1: stage shape → build — scope agreed"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("Issue: D-1\n") && msg.contains("Actor: operator"),
+        "{msg}"
+    );
+    let epic = f.front("D-1");
+    assert_eq!(epic.stage.as_deref(), Some("build"));
+    assert!(epic.stage_at.is_some());
+
+    // build → verify is routine: the pane moves it, as itself; then it
+    // sends the epic back to build.
+    let r = pane.rpc(
+        &f.d.state,
+        "epic_stage",
+        json!({"epic": "D-1", "stage": "verify"}),
+    );
+    assert_eq!(r["result"]["by"], "pane-1", "{r}");
+    assert!(f.last_commit().contains("Actor: pane-1"));
+    let r = pane.rpc(
+        &f.d.state,
+        "epic_stage",
+        json!({"epic": "D-1", "stage": "build"}),
+    );
+    assert_eq!(r["result"]["forward"], false, "{r}");
+    let (ok, show) = f.cli(&["issue", "show", "D-1", "--json"]);
+    assert!(ok, "{show}");
+    assert_eq!(show["work"]["stage"]["id"], "build", "{show}");
+    assert_eq!(show["work"]["stage"]["source"], "field", "{show}");
+    assert_eq!(show["work"]["type"], "epic", "{show}");
+    assert_eq!(show["work"]["type_source"], "field", "{show}");
+    let (ok, card) = f.cli(&["issue", "ls", "--json"]);
+    assert!(ok, "{card}");
+    assert_eq!(card["issues"][1]["work"]["weight"], 8, "{card}");
+    assert_eq!(card["issues"][1]["work"]["type"], "task", "{card}");
+
+    // An older binary rewrites the epic without the keys it does not
+    // know: it reads as shape again, and build needs the operator.
+    let mut old = f.front("D-1");
+    old.stage = None;
+    old.stage_at = None;
+    old.item_type = None;
+    old.milestone = None;
+    f.write_front("D-1", &old);
+    let (ok, out) = f.cli(&["issue", "epic", "ls", "--json"]);
+    assert!(ok, "{out}");
+    assert_eq!(out["epics"][0]["work"]["stage"]["id"], "shape", "{out}");
+    assert_eq!(
+        out["epics"][0]["work"]["type"], "epic",
+        "children still make an epic"
+    );
+    let r = pane.rpc(
+        &f.d.state,
+        "epic_stage",
+        json!({"epic": "D-1", "stage": "build"}),
+    );
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator action"),
+        "{r}"
+    );
+
+    // A plan's stage follows the plan: before approval it cannot move.
+    f.propose("---\ntitle: P\ngoal: g\n---\n## A\n### Acceptance\n- [ ] a\n")
+        .unwrap();
+    let err =
+        f.d.operator_rpc("epic_stage", json!({"epic": "D-5", "stage": "build"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("cadence plan approve D-5"), "{err}");
+    f.d.operator_rpc("plan_approve", json!({"epic": "D-5"}))
+        .unwrap();
+    let (_, out) = f.cli(&["issue", "show", "D-5", "--json"]);
+    assert_eq!(out["work"]["stage"]["id"], "build", "{out}");
+    assert_eq!(out["work"]["stage"]["source"], "plan", "{out}");
+    // Last: opening the store resets the planted pane's runtime row.
+    assert_eq!(f.daemon_events("epic_stage_moved").len(), 3);
+}
+
+/// CAD-405: stages, operator stages, the stage limit and milestones
+/// come from the project's optional PROJECT.md (lenient: other keys are
+/// ignored; project.yaml is untouched). Milestones roll up their epics'
+/// children and loose issues, from the `milestone` field or an
+/// `m<n>-…` tag; `milestone=` must be declared when the project
+/// declares any. A malformed PROJECT.md degrades readers to the
+/// defaults (with `config_error` and a lint warning) and refuses stage
+/// moves.
+#[test]
+fn work_model_project_md_and_milestones() {
+    let f = PlanFixture::start();
+    let project_md = f.pm_dir.join("demo/PROJECT.md");
+    std::fs::write(
+        &project_md,
+        "---\nproject: demo\nagents: {dev: 2}\nstages: [shape, build, done]\n\
+         operator_stages: []\nstage_limit_days: 2\nmilestones:\n  \
+         - {id: m1, title: First, exit: \"one chat works\"}\n  - {id: m2, title: Second}\n---\n\
+         # Demo\n",
+    )
+    .unwrap();
+    let (ok, out) = f.cli(&[
+        "issue",
+        "new",
+        "Epic",
+        "--project",
+        "demo",
+        "--tag",
+        "m1-first",
+    ]);
+    assert!(ok, "{out}");
+    assert!(
+        f.cli(&["issue", "new", "Kid", "--project", "demo", "--epic", "D-1"])
+            .0
+    );
+    assert!(f.cli(&["issue", "set", "D-2", "size=S", "status=done"]).0);
+    assert!(f.cli(&["issue", "new", "Loose", "--project", "demo"]).0);
+    let (ok, out) = f.cli(&["issue", "set", "D-3", "milestone=m1"]);
+    assert!(ok, "{out}");
+    let (ok, err) = f.cli(&["issue", "set", "D-3", "milestone=m7"]);
+    assert!(
+        !ok && err.to_string().contains("demo declares: m1, m2"),
+        "{err}"
+    );
+
+    // No operator stages here: the pane agent moves shape → build.
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&f.d, "pane-1", pane.pid());
+    let r = pane.rpc(
+        &f.d.state,
+        "epic_stage",
+        json!({"epic": "D-1", "stage": "build"}),
+    );
+    assert_eq!(r["result"]["by"], "pane-1", "{r}");
+    let r = pane.rpc(
+        &f.d.state,
+        "epic_stage",
+        json!({"epic": "D-1", "stage": "verify"}),
+    );
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unknown stage 'verify'"),
+        "{r}"
+    );
+
+    let (ok, out) = f.cli(&["milestone", "ls", "--json"]);
+    assert!(ok, "{out}");
+    let rows = out["milestones"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{out}");
+    let m1 = &rows[0];
+    assert_eq!(
+        (m1["id"].as_str(), m1["title"].as_str()),
+        (Some("m1"), Some("First"))
+    );
+    assert_eq!(m1["exit"], "one chat works");
+    assert_eq!(m1["epics"][0]["id"], "D-1", "{m1}");
+    assert_eq!(m1["epics"][0]["stage"], "build", "{m1}");
+    assert_eq!(m1["issues"][0]["id"], "D-3", "{m1}");
+    // D-2 (S, done) + D-3 (unsized = M): 1 / 4.
+    assert_eq!(m1["progress"]["done_weight"], 1, "{m1}");
+    assert_eq!(m1["progress"]["total_weight"], 4, "{m1}");
+    assert_eq!(rows[1]["progress"]["total_weight"], 0);
+    let (ok, show) = f.cli(&["milestone", "show", "m1", "--json"]);
+    assert!(ok && show["id"] == "m1", "{show}");
+    let (ok, err) = f.cli(&["milestone", "show", "m9"]);
+    assert!(
+        !ok && err.to_string().contains("Unknown milestone 'm9'"),
+        "{err}"
+    );
+    let (ok, err) = f.cli(&["milestone", "ls", "--project", "nope"]);
+    assert!(!ok && err.to_string().contains("nope"), "{err}");
+
+    // A malformed PROJECT.md: readers fall back, writers refuse.
+    std::fs::write(&project_md, "---\nstages: [only]\n---\n").unwrap();
+    let (ok, out) = f.cli(&["issue", "epic", "ls", "--json"]);
+    assert!(ok, "{out}");
+    let w = &out["epics"][0]["work"];
+    assert!(
+        w["config_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("at least two"),
+        "{out}"
+    );
+    assert_eq!(
+        w["stage"]["id"], "build",
+        "a recorded stage in the default list"
+    );
+    let err =
+        f.d.operator_rpc("epic_stage", json!({"epic": "D-1", "stage": "verify"}))
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains("PROJECT.md"), "{err}");
+    let (ok, lint) = f.cli(&["issue", "lint"]);
+    assert!(ok, "a bad PROJECT.md only warns: {lint}");
+    assert!(
+        lint["warnings"].to_string().contains("PROJECT.md"),
+        "{lint}"
+    );
+}
+
 // ---- CAD-319: durable conversation threads ----
 
 /// The thread's entries as `(role, kind, text)` triples, oldest first.
