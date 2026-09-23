@@ -1701,7 +1701,7 @@ impl Slots {
         if let Some(other) = self
             .enrollments
             .iter()
-            .find(|e| e.root == root && e.owner_actor != owner)
+            .find(|e| e.root == root && (e.owner_actor != owner || e.runner.is_some()))
         {
             return Err(Error::rejected(format!(
                 "cannot enroll pid {root_pid} for '{owner}': that exact process is \

@@ -206,8 +206,40 @@ fn epoch_secs() -> f64 {
         .as_secs_f64()
 }
 
+/// Wait until runner root `pid` (a child of this daemon, leader of its
+/// own process group) has exited WITHOUT reaping it, then SIGKILL what
+/// is left of its group. While the zombie is unreaped the kernel cannot
+/// hand its pid — the group id — to another process, so the kill can
+/// only reach the runner's own stragglers (CAD-230b).
+fn end_process_group(pid: u32) {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            // Not our child any more (already reaped): the group id may
+            // be reused — never signal it.
+            return;
+        }
+    }
+    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+}
+
 /// How often the daemon re-reads strict holders (CAD-230b).
 const SLOT_WATCH_TICK: Duration = Duration::from_secs(1);
+
+/// The lane an operator-launched runner is accounted to — not a valid
+/// alias, so it never collides with an agent's.
+const OPERATOR_LANE: &str = "(operator)";
 
 /// A launched runner queues this long for its slot unless asked
 /// otherwise (`wait_secs`), and never longer than the cap.
@@ -2384,8 +2416,10 @@ impl Shared {
                     .launch_lane(&caller, (self.slot_clock)())?;
                 Ok(requester("managed", lane))
             }
+            // `(operator)` can never be an agent alias, so the operator's
+            // runners never share a lane (or its events) with an agent.
             None => match self.operator_evidence(peer_pid) {
-                Ok(()) => Ok(requester("operator", "operator".to_string())),
+                Ok(()) => Ok(requester("operator", OPERATOR_LANE.to_string())),
                 Err(why) => Err(Error::rejected(format!(
                     "build-slot launch needs a pane agent, an enrolled managed \
                      endpoint or the proven operator — this connection derives no \
@@ -2604,6 +2638,14 @@ impl Shared {
                     );
                     return self.finish_runner(&enrollment, receipt);
                 }
+                // A closing daemon opens no gate, even on a grant that
+                // raced its shutdown.
+                if self.closing.load(Ordering::SeqCst) {
+                    drop(gate.take());
+                    let _ = child.wait();
+                    return;
+                }
+                receipt.dirty |= crate::runner::is_dirty(Path::new(&receipt.worktree));
                 receipt.state = "running".into();
                 receipt.started = Some(epoch_secs());
                 let opened = crate::runner::write_receipt(&self.state_dir, &receipt).is_ok()
@@ -2613,6 +2655,13 @@ impl Shared {
                             .is_ok()
                     });
                 drop(gate.take());
+                // The recipe's process group ends with it: once the root
+                // has exited — observed WITHOUT reaping it, so its pid
+                // (the group id) cannot be reused yet — any straggler
+                // left in the group (a backgrounded job, the rustc of a
+                // killed cargo) is killed, so nothing keeps building
+                // outside the slot that is about to free.
+                end_process_group(child.id());
                 let status = child.wait();
                 match (opened, status) {
                     (false, _) => receipt.finish(

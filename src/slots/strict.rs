@@ -75,6 +75,10 @@ enum Read {
         /// `stat` field 3 — `Z` (zombie) or `X` (dead) is a process
         /// that has already exited and is only waiting to be reaped.
         exited: bool,
+        /// `status` `Threads:` — a zombie thread-group leader whose
+        /// other threads still run (`pthread_exit` from main) is NOT a
+        /// finished process. Absent when the line is missing.
+        threads: Option<u32>,
     },
     /// No such pid — the process is gone.
     Gone,
@@ -149,11 +153,16 @@ impl ProcFs {
         let Some(uid) = uid else {
             return Read::Unreadable(format!("/proc/{pid}/status: no Uid line"));
         };
+        let threads = status.lines().find_map(|l| {
+            l.strip_prefix("Threads:")
+                .and_then(|n| n.trim().parse::<u32>().ok())
+        });
         Read::Found {
             ppid,
             starttime,
             uid,
             exited: matches!(*state, "Z" | "X"),
+            threads,
         }
     }
 
@@ -186,17 +195,29 @@ impl ProcFs {
 
     /// Is the recorded process still that same process? A missing pid
     /// or a different starttime proves it gone, and so does a zombie of
-    /// the recorded process — it has exited, only its parent has not
-    /// reaped it yet (CAD-230b: an exec-bound hold ends with the
-    /// command, not with its parent's `wait`). An unreadable entry or a
-    /// changed uid proves nothing either way.
+    /// the recorded process whose thread group is down to itself — it
+    /// has exited, only its parent has not reaped it yet (CAD-230b: an
+    /// exec-bound hold ends with the command, not with its parent's
+    /// `wait`). A zombie leader with live threads, an unreadable entry
+    /// or a changed uid proves nothing either way (`unknown`).
     pub fn liveness(&self, id: &ProcIdentity) -> (Liveness, &'static str) {
         match self.read(id.pid) {
             Read::Gone => (Liveness::Dead, "holder died"),
             Read::Found { starttime, .. } if starttime != id.starttime => {
                 (Liveness::Dead, "pid recycled")
             }
-            Read::Found { exited: true, .. } => (Liveness::Dead, "holder exited"),
+            // A zombie whose thread group is provably down to itself has
+            // exited; one with live threads, or no readable count, is not
+            // proof of death.
+            Read::Found {
+                exited: true,
+                threads: Some(n),
+                ..
+            } if n <= 1 => (Liveness::Dead, "holder exited"),
+            Read::Found { exited: true, .. } => (
+                Liveness::Unknown,
+                "zombie leader with live or unreadable threads",
+            ),
             Read::Found { uid, .. } if uid != (id.uid, id.uid) => {
                 (Liveness::Unknown, "holder uid changed")
             }

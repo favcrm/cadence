@@ -211,7 +211,8 @@ pub(crate) fn unmatched_caller(
 /// 3. no hop is a registered pane pid (`panes`), an enrolled or
 ///    tombstoned managed-endpoint root (`enrolled_root`), or a strict
 ///    descendant of `daemon_pid` (every process the daemon launched);
-/// 4. no hop of this uid carries `CADENCE_ALIAS` in its environment,
+/// 4. no hop of this uid carries `CADENCE_ALIAS` (an agent's) or
+///    `CADENCE_RUNNER_ID` (a daemon-launched runner's) in its environment,
 ///    and the peer's own environment is readable. An ancestor's
 ///    unreadable environment is not a refusal: the kernel hides a
 ///    privilege-separated process's (`sshd: user@pts/N` is non-
@@ -273,6 +274,19 @@ pub(crate) fn operator_proof(
             {
                 return Err(format!(
                     "pid {hop} on its ancestry carries CADENCE_ALIAS — an agent's environment"
+                ));
+            }
+            // A daemon-launched runner's tree (CAD-230b) carries its id:
+            // a detached (`setsid -f`) descendant of a recipe leaves the
+            // runner's ancestry but not its environment.
+            Ok(env)
+                if env
+                    .split(|b| *b == 0)
+                    .any(|kv| kv.starts_with(b"CADENCE_RUNNER_ID=")) =>
+            {
+                return Err(format!(
+                    "pid {hop} on its ancestry carries CADENCE_RUNNER_ID — a \
+                     daemon-launched runner's environment"
                 ));
             }
             Ok(_) => {}

@@ -1170,11 +1170,14 @@ fn reconcile_required_only_where_reconcile_can_act() {
 
 // ---------- CAD-230 phase b: exec-bound holds and runners ----------
 
-/// Mark `pid` as exited but not yet reaped by its parent (a zombie).
-fn zombify(p: &FakeProc, pid: u32) {
-    let stat = p.root().join(pid.to_string()).join("stat");
-    let text = std::fs::read_to_string(&stat).unwrap();
-    std::fs::write(&stat, text.replacen(") S ", ") Z ", 1)).unwrap();
+/// Mark `pid` as exited but not yet reaped by its parent (a zombie)
+/// with `threads` threads still in its group.
+fn zombify(p: &FakeProc, pid: u32, threads: u32) {
+    let dir = p.root().join(pid.to_string());
+    let text = std::fs::read_to_string(dir.join("stat")).unwrap();
+    std::fs::write(dir.join("stat"), text.replacen(") S ", ") Z ", 1)).unwrap();
+    let status = std::fs::read_to_string(dir.join("status")).unwrap();
+    std::fs::write(dir.join("status"), format!("{status}Threads:\t{threads}\n")).unwrap();
 }
 
 fn acquire_exec(s: &mut Slots, peer: u32, pid: u32, req: &str, now: f64) -> Result<Value> {
@@ -1215,7 +1218,15 @@ fn exec_bound_hold_names_the_peer_and_ends_with_its_exit() {
         assert_eq!(s.held.len(), 1);
         match how {
             "gone" => p.kill(400),
-            _ => zombify(&p, 400),
+            _ => {
+                // A zombie leader whose other threads still run is not
+                // proof of death: kept, as unknown.
+                zombify(&p, 400, 3);
+                assert!(s.reap_strict_holds(2.5).is_empty(), "{how}");
+                assert_eq!(held_json(&mut s, 2.5)[0]["liveness"], "unknown");
+                p.spawn(400, 300, 70);
+                zombify(&p, 400, 1);
+            }
         }
         let events = s.reap_strict_holds(3.0);
         assert!(s.held.is_empty(), "{how}: freed without a release");
@@ -1270,9 +1281,27 @@ fn exec_bound_hold_refuses_forged_release_and_pid_reuse() {
     assert!(s
         .release_strict(&token, &caller, 400, 3.0)
         .is_err_and(|e| e.to_string().contains("Unknown slot token")));
-    // The dead holder's release reason named the recycling.
-    let persisted = s.recent_reaped.iter().any(|r| r.token == token);
-    assert!(!persisted, "a same-call reap is answered by that call");
+    // Re-poll adoption itself compares the exact holder: a request from
+    // the same pid, lane, kind, enrollment and request id but another
+    // starttime never matches the hold — even one the reaper could not
+    // prove dead yet.
+    let h = s.held[0].clone();
+    let b = h.strict.clone().unwrap();
+    let req = |starttime: u64| SlotReq {
+        kind: h.kind,
+        lane: &h.lane,
+        pid: h.pid,
+        request_id: &h.request_id,
+        strict: Some(StrictBind {
+            holder: ProcIdentity {
+                starttime,
+                ..b.holder
+            },
+            ..b.clone()
+        }),
+    };
+    assert!(s.find_hold(&req(b.holder.starttime)).is_some());
+    assert!(s.find_hold(&req(b.holder.starttime + 1)).is_none());
 }
 
 /// ACCEPTANCE (b2): a runner enrollment is the daemon's own — root =

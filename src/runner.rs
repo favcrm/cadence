@@ -279,11 +279,24 @@ pub fn recover(state_dir: &Path, now: f64) -> Vec<Receipt> {
     marked
 }
 
+/// Read-only git in a checkout the requester controls, run by the
+/// daemon: no fsmonitor hook (a checkout's config could name any
+/// program), no optional index lock, and only `PATH`/`HOME` from the
+/// daemon's environment.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env_clear()
+        .envs(
+            ["PATH", "HOME"]
+                .iter()
+                .filter_map(|k| Some((k, std::env::var_os(k)?))),
+        )
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -299,6 +312,13 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 pub fn head_of(checkout: &Path) -> Option<String> {
     git(checkout, &["rev-parse", "--verify", "HEAD"])
         .filter(|s| s.len() >= 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Uncommitted changes — tracked edits or untracked (non-ignored)
+/// files — in the checkout now; an unreadable status counts as dirty.
+/// Re-read when the gate opens: the receipt's `dirty` covers both reads.
+pub fn is_dirty(checkout: &Path) -> bool {
+    git(checkout, &["status", "--porcelain"]).is_none_or(|out| !out.is_empty())
 }
 
 /// `^[a-z0-9][a-z0-9_-]{0,63}$`
@@ -338,6 +358,9 @@ fn check_recipe(project: &str, name: &str, r: &Recipe) -> Result<SlotKind> {
         return Err(bad(
             "argv must be a non-empty list of non-empty strings".into()
         ));
+    }
+    if r.argv[0].starts_with('-') {
+        return Err(bad("argv[0] must name a program, not an option".into()));
     }
     if let Some(n) = r.env.iter().find(|n| !valid_env_name(n)) {
         return Err(bad(format!(
@@ -484,8 +507,7 @@ pub fn resolve(
             top.display()
         ))
     })?;
-    let dirty = git(&top, &["status", "--porcelain", "--untracked-files=no"])
-        .is_none_or(|out| !out.is_empty());
+    let dirty = is_dirty(&top);
     let mut intent = Intent {
         runner_id: new_runner_id(),
         project: project_key.to_string(),
@@ -634,6 +656,7 @@ mod tests {
                 "repo-relative",
             ),
             ("    bad:\n      argv: [true]\n      kind: deploy\n", "kind"),
+            ("    bad:\n      argv: [-c, x]\n", "not an option"),
         ] {
             let (_d, pm, _repo) = fixture(yaml);
             let e = resolve(&pm, "p", "bad", None).unwrap_err().to_string();

@@ -28556,6 +28556,11 @@ fn sh_recipe(name: &str, script: &str, env: &[&str]) -> String {
     )
 }
 
+/// `text` as one single-quoted POSIX shell word.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// The runner id a `build-slot launch` announced on stderr.
 fn launched_runner(stderr: &str) -> String {
     stderr
@@ -28760,6 +28765,91 @@ fn build_slot_launch_refuses_unknown_recipes_injection_and_unproven_callers() {
     assert_eq!(r["rc"], 0, "{r}");
     assert!(r["out"].as_str().unwrap().contains("fixed"), "{r}");
     assert_eq!(receipts(&d.state), 2);
+}
+
+/// CAD-230 phase b2 (review): a runner's tree stays contained. A
+/// descendant that detaches (`setsid -f`, reparented off the runner) is
+/// still not the operator — it carries the runner's environment — so
+/// it cannot launch as `(operator)`; and a straggler the recipe left
+/// in its process group is ended with the recipe, never left building
+/// after its slot frees.
+#[test]
+fn build_slot_launch_runner_tree_is_contained() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let req = work.path().join("req.json");
+    let resp = work.path().join("resp.json");
+    let straggler = work.path().join("straggler");
+    std::fs::write(
+        &req,
+        cadence_agent::proto::request("slot_launch", json!({"recipe": "ok", "project": "p"}))
+            .to_string(),
+    )
+    .unwrap();
+    let py = format!(
+        "import socket;s=socket.socket(socket.AF_UNIX);s.connect({sock:?});\
+         s.sendall(open({req:?},'rb').read()+b'\\n');\
+         open({out:?}+'.tmp','w').write(s.makefile().readline());\
+         import os;os.rename({out:?}+'.tmp',{out:?})",
+        sock = client::socket_path(&d.state).display().to_string(),
+        req = req.display().to_string(),
+        out = resp.display().to_string(),
+    );
+    let script = format!(
+        "sleep 60 & echo $! > {st}; setsid -f python3 -c {py}; \
+         while [ ! -e {r} ]; do sleep 0.05; done; exit 0",
+        st = straggler.display(),
+        py = shell_quote(&py),
+        r = resp.display()
+    );
+    let (_proj, _repo) = runner_project(&sh_recipe("ok", &script, &["PATH"]));
+    let run = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "launch", "ok", "--project", "p"],
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let answer: Value = serde_json::from_str(&std::fs::read_to_string(&resp).unwrap()).unwrap();
+    assert_eq!(answer["ok"], false, "{answer}");
+    let msg = answer["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("CADENCE_RUNNER_ID"), "{msg}");
+    let pid: u32 = std::fs::read_to_string(&straggler)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let gone = stat.is_empty()
+            || stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
+        if gone {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "straggler {pid} outlived its recipe"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        std::fs::read_dir(cadence_agent::runner::runners_dir(&d.state))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .count(),
+        1,
+        "the detached descendant launched nothing"
+    );
 }
 
 /// CAD-230 phase b2: a launch queues like any other request — behind a
