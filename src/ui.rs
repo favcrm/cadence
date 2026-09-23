@@ -1207,10 +1207,11 @@ fn tailnet_request(request: &Request, opts: &ServeOpts) -> bool {
 
 /// Who a board write commits as (CAD-254, CAD-263). The cross-site
 /// guards stop browsers, not local processes: an agent with a shell can
-/// send the same headers. So a write derives its caller by the daemon's
-/// own rule — the TCP peer's process, tied to a registered pane by its
-/// `/proc` ancestry, the pane's `CADENCE_ALIAS` in its environment, or
-/// the pane's pty on its stdio ([`crate::peer::tcp_peer_pane`]).
+/// send the same headers. So a write derives its caller from the peer
+/// module the daemon shares — the TCP peer's process, attributed to a
+/// registered pane by a process signal: its `/proc` ancestry or the
+/// pane's pty on its stdio. A caller-chosen `CADENCE_ALIAS` alone never
+/// attributes ([`crate::peer::tcp_peer_pane`]).
 enum WriteCaller {
     /// The operator — `actor` is `operator (ui)` or a trusted tailnet
     /// login; comment authors and monitor acks record `operator`.

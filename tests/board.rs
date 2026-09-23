@@ -2,7 +2,7 @@
 //! `cadence ui` HTTP server in-process — routes, host/method/id/traversal
 //! rejection, and daemon-unreachable honesty.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -2246,12 +2246,60 @@ fn ui_write_caller_derives_from_pane_ancestry() {
     assert_eq!(commits(pm.path()), commits_before);
 }
 
+/// A POST of `body` as a comment on CAD-3 — the raw request a pane-side
+/// client writes over bash's /dev/tcp.
+fn comment_request(host: &str, body: &str) -> String {
+    let body = format!(r#"{{"body":"{body}"}}"#);
+    format!(
+        "POST /api/issues/CAD-3/comments HTTP/1.0\r\nHost: {host}\r\n\
+         Content-Type: application/json\r\nX-Cadence-Board: 1\r\n\
+         Origin: http://{host}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The comment `body` in a board write's HTTP reply.
+fn replied_comment(response: &str, body: &str) -> Value {
+    assert!(
+        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
+        "{response}"
+    );
+    let v: Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    v["issue"]["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["body"] == body)
+        .unwrap()
+        .clone()
+}
+
+/// Runs a bash script as a "pane" whose stdio is a real pty, relaying
+/// the test's stdin lines to it; prints the pane's pid first.
+const PTY_PANE_PY: &str = r#"
+import os, subprocess, sys, threading
+m, s = os.openpty()
+p = subprocess.Popen(["bash", "-c", sys.argv[1]], stdin=s, stdout=s, stderr=s)
+os.close(s)
+print(p.pid, flush=True)
+def drain():
+    try:
+        while os.read(m, 4096):
+            pass
+    except OSError:
+        pass
+threading.Thread(target=drain, daemon=True).start()
+for line in sys.stdin:
+    os.write(m, line.encode())
+p.wait()
+"#;
+
 /// CAD-263: a `setsid`'d child of a registered pane has no pane on its
-/// `/proc` ancestry, but it still carries the pane's `CADENCE_ALIAS` —
-/// the daemon's caller rule ties it to that agent, and the board shares
-/// the rule, so the write is the agent's, never `operator`'s. The
-/// client double-forks (`setsid -f`) and connects only once the pane is
-/// provably off its ancestry, so the ancestry signal cannot carry it.
+/// `/proc` ancestry, but a detach keeps stdio — it still holds the
+/// pane's pty, the process signal the board shares with the daemon, so
+/// the write is the agent's, never `operator`'s. The client
+/// double-forks (`setsid -f`) and connects only once the pane is
+/// provably off its ancestry, so ancestry cannot carry it.
 #[test]
 fn ui_write_caller_attributes_a_setsid_child_of_a_pane() {
     let pm = TempDir::new().unwrap();
@@ -2261,17 +2309,11 @@ fn ui_write_caller_attributes_a_setsid_child_of_a_pane() {
     let d = UiDaemon::start_on(state.path().to_path_buf());
     let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
     let host = format!("127.0.0.1:{port}");
-    let body = r#"{"body":"from a detached child"}"#;
-    let request = format!(
-        "POST /api/issues/CAD-3/comments HTTP/1.0\r\nHost: {host}\r\n\
-         Content-Type: application/json\r\nX-Cadence-Board: 1\r\n\
-         Origin: http://{host}\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
     let out = out_dir.path().join("response");
     // The client waits until the pane pid is off its ancestry (the
     // `setsid -f` intermediate has exited and it was reparented), then
-    // writes over bash's /dev/tcp and lands the reply atomically.
+    // writes over bash's /dev/tcp and lands the reply atomically. Its
+    // stdio stays the pane's pty.
     let client = r#"
         on_pane_lineage() {
             p=$$
@@ -2287,22 +2329,27 @@ fn ui_write_caller_attributes_a_setsid_child_of_a_pane() {
         printf '%s' "$REQ" >&3
         cat <&3 >"$OUT.tmp" && mv "$OUT.tmp" "$OUT"
     "#;
-    // The pane: detaches the client, then stays alive (its row is a
-    // live registered pane) until the test closes its stdin.
-    let mut pane = Command::new("bash")
+    let mut pane = Command::new("python3")
         .args([
             "-c",
-            r#"read -r _; PANE=$$ setsid -f bash -c "$CLIENT" </dev/null >/dev/null 2>&1; read -r _; true"#,
+            PTY_PANE_PY,
+            r#"read -r _; PANE=$$ setsid -f bash -c "$CLIENT"; read -r _; true"#,
         ])
         .env("CADENCE_ALIAS", "pane-s")
         .env("CLIENT", client)
         .env("PORT", port.to_string())
-        .env("REQ", &request)
+        .env("REQ", comment_request(&host, "from a detached child"))
         .env("OUT", &out)
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    plant_pane(&d, "pane-s", pane.id());
+    let mut first = String::new();
+    BufReader::new(pane.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    let pane_pid: u32 = first.trim().parse().unwrap();
+    plant_pane(&d, "pane-s", pane_pid);
     let mut stdin = pane.stdin.take().unwrap();
     stdin.write_all(b"go\n").unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -2313,26 +2360,58 @@ fn ui_write_caller_attributes_a_setsid_child_of_a_pane() {
         );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+    stdin.write_all(b"done\n").unwrap();
     drop(stdin);
     assert!(pane.wait().unwrap().success());
     let response = std::fs::read_to_string(&out).unwrap();
-    assert!(
-        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
-        "{response}"
-    );
-    let json_body = response.split_once("\r\n\r\n").unwrap().1;
-    let v: Value = serde_json::from_str(json_body).unwrap();
-    let comment = v["issue"]["comments"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["body"] == "from a detached child")
-        .unwrap()
-        .clone();
+    let comment = replied_comment(&response, "from a detached child");
     assert_eq!(comment["author"], "pane-s", "{comment}");
     let (_, last) = git(pm.path(), &["log", "-1", "--format=%B"]);
     assert!(last.contains("Actor: pane-s"), "{last}");
     assert!(!last.contains("operator"), "{last}");
+}
+
+/// CAD-263 review: `CADENCE_ALIAS` is caller-chosen, so on the board it
+/// never attributes by itself. A pane-less process exporting a
+/// registered pane's alias — no ancestry, no pane pty — writes as
+/// `operator (ui)`, not as that agent.
+#[test]
+fn ui_write_caller_ignores_an_uncorroborated_env_alias() {
+    let pm = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    seed(pm.path(), state.path());
+    let d = UiDaemon::start_on(state.path().to_path_buf());
+    let port = start_ui(pm.path().to_path_buf(), state.path().to_path_buf());
+    let host = format!("127.0.0.1:{port}");
+    // pane-b is a registered, live pane the client is unrelated to.
+    let mut pane_b = Command::new("sleep")
+        .arg("600")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    plant_pane(&d, "pane-b", pane_b.id());
+    let client = Command::new("bash")
+        .args([
+            "-c",
+            r#"exec 3<>"/dev/tcp/127.0.0.1/$PORT"; printf '%s' "$REQ" >&3; cat <&3"#,
+        ])
+        .env("CADENCE_ALIAS", "pane-b")
+        .env("PORT", port.to_string())
+        .env("REQ", comment_request(&host, "forged alias"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let _ = pane_b.kill();
+    let _ = pane_b.wait();
+    let response = String::from_utf8(client.stdout).unwrap();
+    let comment = replied_comment(&response, "forged alias");
+    assert_eq!(comment["author"], "operator", "{comment}");
+    let (_, last) = git(pm.path(), &["log", "-1", "--format=%B"]);
+    assert!(last.contains("(operator (ui))"), "{last}");
+    assert!(!last.contains("pane-b"), "{last}");
 }
 
 /// Seed the tracker and daemon-side world for the binding tests:

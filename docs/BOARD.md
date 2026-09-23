@@ -690,8 +690,8 @@ fully buffered first.
 The cross-site guards below stop browsers, not local processes: any
 process with a shell can send `X-Cadence-Board: 1` and a board Origin.
 So every write — issue routes, monitor acks and model defaults —
-derives its caller by the daemon's own rule for pane-attention verbs
-(`agent answer`), from one shared module (`src/peer.rs`, CAD-254,
+derives its caller from the same shared module as the daemon's
+pane-attention verbs (`agent answer`; `src/peer.rs`, CAD-254,
 CAD-263), never from anything the request says:
 
 1. The TCP peer's process: the connection's client-side socket in
@@ -699,13 +699,18 @@ CAD-263), never from anything the request says:
    `socket:[inode]` in `/proc/<pid>/fd` is a peer.
 2. Each peer is matched against the daemon's live registered panes
    (`agent_list`: `pty` endpoints with a pid and generation). A peer
-   is tied to a pane's agent when **any** of three signals holds:
+   is that pane's agent when either **process signal** holds:
    - the pane pid is on the peer's `/proc` ancestry;
-   - the peer's environment carries that pane's `CADENCE_ALIAS` (an
-     alias no registered pane owns means nothing) — a `setsid` or
-     double-forked child of a pane keeps it;
-   - one of the peer's stdio fds (0–2) is the pane's pts — a detach
-     keeps stdio.
+   - one of the peer's stdio fds (0–2) is the pane's pts — a `setsid`
+     or double-forked child of a pane keeps its stdio, so it stays
+     attributed after the detach.
+
+   The pane's `CADENCE_ALIAS` in the peer's environment is **not** a
+   board signal on its own: any process can export it, so
+   `CADENCE_ALIAS=B curl …` from a pane-less process writes as
+   `operator (ui)`, never as agent B. (`agent answer` does consult it,
+   only to *refuse* a caller tied to the target pane and to label its
+   audit stamp — there it can narrow, never authorize.)
 
 | Peer | Writes as |
 |---|---|
@@ -714,7 +719,7 @@ CAD-263), never from anything the request says:
 | tailnet-shaped request (see Remote access) tied to no pane | `<login> (tailscale)` as before |
 | cannot be attributed — socket owned by another user's process, ancestry unreadable, tied to several panes, or a store exists but the daemon cannot list panes | refused: `403`, `check: "caller_identity"`, naming why |
 
-The board and `agent answer` differ only in how they place a caller
+The board and `agent answer` also differ in how they place a caller
 tied to no pane: `answer` requires positive terminal evidence (a pts
 that is no pane's) to stamp `operator`, because it gates a pane's own
 menu; the board writes as `operator (ui)`, because the operator's own
@@ -726,9 +731,9 @@ A different host (non-loopback peer with no local client socket) is
 never a pane here. Reads are unchanged.
 
 The limit: identity follows the process that holds the TCP connection
-and the three signals it carries. A same-user relay a pane can reach
-but that carries none of them still writes as the relay — exactly as
-it would to the daemon's socket:
+and the process signals it carries. A same-user relay a pane can reach
+but that carries neither still writes as the relay — exactly as it
+would to the daemon's socket:
 
 - **the loopback gateway** (nginx or any long-lived proxy the operator
   started): its worker holds the connection, descends from no pane,
@@ -736,11 +741,10 @@ it would to the daemon's socket:
   (ui)`, or refused when it runs as another user;
 - **an ssh tunnel** (`ssh -L` from a pane back to this host): the
   board's peer is the host's `sshd` session process, whose ancestry
-  is `sshd` and whose environment is the ssh session's — `operator
-  (ui)`;
-- **a fully scrubbed detach** (`env -u CADENCE_ALIAS setsid -f … </dev/null
-  >/dev/null 2>&1`): no ancestry, no alias, no pane pty — `operator
-  (ui)`.
+  is `sshd` and which holds no pane pty — `operator (ui)`;
+- **a detach with redirected stdio** (`setsid -f … </dev/null
+  >/dev/null 2>&1`): no ancestry and no pane pty — `operator (ui)`,
+  whatever `CADENCE_ALIAS` it still carries.
 
 Same-user is not a hostile isolation boundary; this closes the direct
 path (a pane's `curl` approving its own work as `operator`) and the
