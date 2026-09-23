@@ -24911,14 +24911,34 @@ fn audit_flags_reviewer_equals_merger() {
         "note From: alias must not feed the flag:\n{text}"
     );
 
-    // Same GitHub identity posted qa-verdict and merged: flag.
+    // Same GitHub identity posted qa-verdict and merged, while the run
+    // shows the fleet has a separate QA identity (`qa-bot` on #1): the
+    // row deviates from the norm — flag.
     report_json["statuses"] = status("ops-1");
+    report_json["statuses"][heads[0].clone()] = json!({"statuses":[{
+        "context":"qa-verdict","state":"SUCCESS",
+        "created_at":"2026-09-20T11:59:30Z",
+        "creator":{"login":"qa-bot"}
+    }]});
     std::fs::write(&report, report_json.to_string()).unwrap();
     let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(1), "flag must exit 1:\n{text}");
     assert!(text.contains("FLAG[reviewer==merger]"), "{text}");
     assert!(text.contains("reviewer@gh ops-1"), "{text}");
+    assert!(!text.contains("structural:"), "{text}");
+
+    // CAD-207: when ops-1 is the ONLY GitHub identity in the run, the
+    // match is structural — one summary line, no per-row flag.
+    report_json["statuses"] = status("ops-1");
+    std::fs::write(&report, report_json.to_string()).unwrap();
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("FLAG[reviewer==merger]"), "{text}");
+    assert!(
+        text.contains("structural: 1 merge(s) share GitHub identity ops-1"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -25303,6 +25323,496 @@ fn audit_post_hoc_verdict_does_not_clear_flag() {
             .any(|f| f == "no-passing-verdict"),
         "post-hoc pass must not clear the flag: {m}"
     );
+}
+
+// ---------- CAD-217: operator approval evidence ------------------------
+
+/// `mergedAt` of `audit_repo`'s PR n is 2026-09-20T12:00:0nZ.
+const AUDIT_MERGE_EPOCH: f64 = 1_789_905_600.0;
+
+/// Record an approval through the store's writer, then pin its event
+/// time — the fixture merges are in the past, so "before the merge"
+/// needs an explicit clock.
+fn seed_approval(state: &Path, id: &str, head: &str, pr: u64, at: f64) {
+    seed_approval_in(state, "x/y", id, head, pr, at);
+}
+
+/// `seed_approval` scoped to another repository.
+fn seed_approval_in(state: &Path, repo: &str, id: &str, head: &str, pr: u64, at: f64) {
+    let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+    let (new, recorded) = store
+        .record_approval(
+            &cadence_agent::store::NewApproval {
+                id: Some(id),
+                source: "operator in chat",
+                action: "merge",
+                head_sha: head,
+                repo,
+                pr,
+            },
+            "operator-connection",
+        )
+        .unwrap();
+    assert!(new);
+    assert_eq!(recorded, id);
+    drop(store);
+    set_approval_at(state, "approval_recorded", id, at);
+}
+
+fn set_approval_at(state: &Path, kind: &str, id: &str, at: f64) {
+    let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+    let n = conn
+        .execute(
+            "UPDATE events SET at=?1 WHERE alias='audit:approvals' AND kind=?2 \
+             AND json_extract(payload,'$.approval_id')=?3",
+            rusqlite::params![at, kind, id],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+/// CAD-217: a human-class merge binds to the operator approval in force
+/// at merge time for the EXACT landed head. Approved, revoked-before-
+/// merge, post-merge-only and older-head approvals each render with
+/// their provenance; a cancelled queue message carrying the approval
+/// phrase is never an approval; no readable store is `unknown`, not a
+/// flag.
+#[test]
+fn audit_binds_human_merge_to_exact_head_approval() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    for (i, h) in heads.iter().enumerate() {
+        verdict_note(
+            &notes,
+            &format!("20260920-1159{i}0-x-p{n}-verdict.md", n = i + 1),
+            h,
+            "qa-1",
+            "human",
+        );
+    }
+    // The checkout's origin scopes approvals even in fixture runs.
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["remote", "add", "origin", "https://github.com/x/y"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let before = AUDIT_MERGE_EPOCH - 600.0;
+    let after = AUDIT_MERGE_EPOCH + 3600.0;
+    // #1: approved for its landed head before the merge.
+    seed_approval(&state, "ap-1", &heads[0], 1, before);
+    // #2: an approval for an OLDER head before the merge, and one for
+    // the landed head only after it.
+    let old_head = "1111111111111111111111111111111111111111";
+    seed_approval(&state, "ap-2-old", old_head, 2, before);
+    seed_approval(&state, "ap-2-late", &heads[1], 2, after);
+    // …and one for the landed head before the merge, but scoped to
+    // another repository: out of scope, never binds.
+    seed_approval_in(&state, "other/z", "ap-2-foreign", &heads[1], 2, before);
+    // #3: approved, then explicitly revoked before the merge.
+    seed_approval(&state, "ap-3", &heads[2], 3, before);
+    let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+    assert!(store
+        .revoke_approval(
+            "ap-3",
+            "operator in chat",
+            "head moved",
+            "operator-connection"
+        )
+        .unwrap());
+    // The PR #84 shape: the approval phrase for #2's landed head sits
+    // only in a queue message that was then CANCELLED.
+    let cwd = dir.path().to_string_lossy().to_string();
+    store
+        .register_agent(&NewAgent {
+            alias: "ops-1",
+            provider: "inbox",
+            endpoint_kind: "inbox",
+            role: "worker",
+            cwd: &cwd,
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    store
+        .enqueue(
+            "ops-1",
+            &format!("OPERATOR APPROVED #2 at {}", heads[1]),
+            None,
+            "m-approval",
+            "user",
+        )
+        .unwrap();
+    store
+        .cancel("m-approval", "operator", Some("competing executor"))
+        .unwrap();
+    drop(store);
+    set_approval_at(&state, "approval_revoked", "ap-3", before + 60.0);
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--json"]);
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{j}");
+    let row = |pr: u64| {
+        j["merges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["pr"].as_u64() == Some(pr))
+            .unwrap()
+            .clone()
+    };
+    let r1 = row(1);
+    // Bound, but only an operator CLAIM until CAD-280.
+    assert_eq!(r1["approval"]["state"], "operator-claimed", "{r1}");
+    assert_eq!(r1["approval"]["verified"], false, "{r1}");
+    assert_eq!(r1["approval"]["note"], "unverified until CAD-280", "{r1}");
+    assert_eq!(r1["approval"]["required"], true, "{r1}");
+    assert_eq!(r1["approval"]["before_merge"], true, "{r1}");
+    assert_eq!(r1["approval"]["record"]["id"], "ap-1", "{r1}");
+    assert_eq!(
+        r1["approval"]["record"]["source"], "operator in chat",
+        "{r1}"
+    );
+    assert_eq!(r1["approval"]["record"]["head_sha"], heads[0], "{r1}");
+    assert_eq!(r1["approval"]["record"]["scope"]["pr"], 1, "{r1}");
+    assert_eq!(
+        r1["approval"]["record"]["recorded_via"], "operator-connection",
+        "{r1}"
+    );
+    assert_eq!(r1["flags"], json!([]), "{r1}");
+
+    let r2 = row(2);
+    assert_eq!(r2["approval"]["state"], "missing", "{r2}");
+    assert_eq!(r2["approval"]["before_merge"], false, "{r2}");
+    assert!(
+        r2["approval"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("post-merge"),
+        "{r2}"
+    );
+    assert_eq!(
+        r2["approval"]["other_heads"][0]["head_sha"], old_head,
+        "{r2}"
+    );
+    assert_eq!(r2["flags"], json!(["approval-missing"]), "{r2}");
+
+    let r3 = row(3);
+    assert_eq!(r3["approval"]["state"], "revoked", "{r3}");
+    assert_eq!(r3["approval"]["revocation"]["reason"], "head moved", "{r3}");
+    assert_eq!(r3["approval"]["revocation"]["before_merge"], true, "{r3}");
+    assert_eq!(r3["flags"], json!(["approval-revoked"]), "{r3}");
+    assert_eq!(j["summary"]["approvals"]["operator_claimed"], 1, "{j}");
+    assert_eq!(j["summary"]["approvals"]["verified"], false, "{j}");
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("approval operator-claimed · id ap-1 · source \"operator in chat\""),
+        "{text}"
+    );
+    assert!(text.contains("unverified until CAD-280"), "{text}");
+    assert!(
+        text.contains("1 approval(s) operator-claimed (unverified until CAD-280)"),
+        "{text}"
+    );
+    assert!(text.contains("(before merge)"), "{text}");
+    assert!(text.contains("FLAG[approval-revoked]"), "{text}");
+
+    // With no daemon store the approval question is unanswerable:
+    // `unknown`, reported with its reason, never flagged.
+    let bare = dir.path().join("bare-state");
+    std::fs::create_dir_all(&bare).unwrap();
+    let out = run_audit(&bare, &pm, &repo, &notes, &report, &["--json"]);
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{j}");
+    for pr in 1..=3u64 {
+        let m = j["merges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["pr"].as_u64() == Some(pr))
+            .unwrap();
+        assert_eq!(m["approval"]["state"], "unknown", "{m}");
+        assert!(
+            m["approval"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no daemon store"),
+            "{m}"
+        );
+        assert_eq!(m["flags"], json!([]), "{m}");
+    }
+}
+
+/// CAD-217: only an operator connection records or revokes approval
+/// evidence. A pane (and every process descended from it — the RPC
+/// and the `cadence audit approve` CLI alike) is refused, as is an
+/// identity-shaped request field; the operator's writes dedupe and a
+/// conflicting reuse of an id is refused.
+#[test]
+fn audit_approval_record_is_operator_only() {
+    let d = TestDaemon::start();
+    let home = TempDir::new().unwrap();
+    let mut pane = LaneShell::spawn(home.path());
+    plant_pane(&d, "pane-1", pane.pid());
+    let head = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let params = json!({"id": "ap-7", "source": "operator in chat",
+                        "head": head, "repo": "x/y", "pr": 7});
+
+    let r = pane.rpc(&d.state, "approval_record", params.clone());
+    let msg = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("operator action") && msg.contains("pane-1"),
+        "{r}"
+    );
+    let (rc, out) = pane.cadence(
+        &d.state,
+        &format!("audit approve --pr 7 --head {head} --source op --repo x/y"),
+    );
+    assert_ne!(rc, 0, "{out}");
+    assert!(out.contains("operator action"), "{out}");
+
+    let mut forged = params.clone();
+    forged["by"] = json!("operator");
+    let err = d.rpc("approval_record", forged).unwrap_err();
+    assert!(err.to_string().contains("'by'"), "{err}");
+
+    let r = d.rpc("approval_record", params.clone()).unwrap();
+    assert_eq!(r["state"], "recorded", "{r}");
+    assert_eq!(r["duplicate"], false, "{r}");
+    assert_eq!(r["recorded_via"], "operator-connection", "{r}");
+    let r = d.rpc("approval_record", params.clone()).unwrap();
+    assert_eq!(r["duplicate"], true, "{r}");
+    let mut other = params.clone();
+    other["head"] = json!("0123456789012345678901234567890123456789");
+    let err = d.rpc("approval_record", other).unwrap_err();
+    assert!(err.to_string().contains("different evidence"), "{err}");
+    let mut short = params.clone();
+    short["id"] = json!("ap-short");
+    short["head"] = json!("abcdefa");
+    assert!(d.rpc("approval_record", short).is_err());
+
+    let revoke = json!({"id": "ap-7", "source": "operator", "reason": "moved"});
+    let r = pane.rpc(&d.state, "approval_revoke", revoke.clone());
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator action"),
+        "{r}"
+    );
+    let r = d.rpc("approval_revoke", revoke).unwrap();
+    assert_eq!(r["state"], "revoked", "{r}");
+    // A revoked id is never re-recorded — the operator is told why.
+    let err = d.rpc("approval_record", params.clone()).unwrap_err();
+    assert!(
+        err.to_string().contains("was revoked") && err.to_string().contains("--id"),
+        "{err}"
+    );
+
+    // Revoke → re-approve with the DEFAULT id: a fresh record under
+    // `<base>-2`, never a silent duplicate of the revoked one.
+    let auto = json!({"source": "operator in chat", "head": head,
+                      "repo": "x/y", "pr": 9});
+    let r = d.rpc("approval_record", auto.clone()).unwrap();
+    assert_eq!(r["approval_id"], "merge-pr9-abcdefabcdef", "{r}");
+    assert_eq!(r["duplicate"], false, "{r}");
+    let r = d.rpc("approval_record", auto.clone()).unwrap();
+    assert_eq!(r["duplicate"], true, "{r}");
+    let r = d
+        .rpc(
+            "approval_revoke",
+            json!({"id": "merge-pr9-abcdefabcdef", "source": "operator", "reason": "moved"}),
+        )
+        .unwrap();
+    assert_eq!(r["state"], "revoked", "{r}");
+    let r = d.rpc("approval_record", auto.clone()).unwrap();
+    assert_eq!(r["approval_id"], "merge-pr9-abcdefabcdef-2", "{r}");
+    assert_eq!(r["duplicate"], false, "{r}");
+    let r = d.rpc("approval_record", auto).unwrap();
+    assert_eq!(r["approval_id"], "merge-pr9-abcdefabcdef-2", "{r}");
+    assert_eq!(r["duplicate"], true, "{r}");
+
+    // The operator's CLI cannot be exercised as a child here: the test
+    // daemon runs in this process, so every child descends from the
+    // daemon and `operator_proof` refuses it (the CLI's argument
+    // shaping is unit-tested in main.rs). A second operator record:
+    let mut second = params.clone();
+    second["id"] = json!("ap-8");
+    second["pr"] = json!(8);
+    let r = d.rpc("approval_record", second).unwrap();
+    assert_eq!(r["duplicate"], false, "{r}");
+
+    // Exactly the operator's writes reached the approval stream.
+    let conn = rusqlite::Connection::open(d.state.join("cadence.sqlite3")).unwrap();
+    let kinds: Vec<String> = conn
+        .prepare("SELECT kind FROM events WHERE alias='audit:approvals' ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "approval_recorded",
+            "approval_revoked",
+            "approval_recorded",
+            "approval_revoked",
+            "approval_recorded",
+            "approval_recorded"
+        ]
+    );
+}
+
+// ---------- CAD-207: the digest discriminates -------------------------
+
+/// The live CAD-207 run: 36 merges all pushed through ONE GitHub
+/// account (`cc-syntax`), 34 of them with a `qa-verdict` status that
+/// same account posted, and 2 (#43, #50) with no passing verdict on
+/// the landed head. The shared identity is reported once as a summary
+/// line; only the two real findings flag.
+#[test]
+fn audit_digest_reports_shared_identity_once() {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    git_repo(&repo);
+    let mut prs = Vec::new();
+    let mut statuses = serde_json::Map::new();
+    for n in 15..=50u64 {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q"])
+            .args(["--allow-empty", "-m", &format!("work {n} (#{n})")])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let head = format!("{n:040x}");
+        prs.push(
+            json!({"number": n, "title": format!("work {n}"), "headRefOid": head,
+                        "mergedBy": {"login": "cc-syntax"},
+                        "mergedAt": "2026-09-20T12:00:00Z"}),
+        );
+        if n != 43 && n != 50 {
+            statuses.insert(
+                head,
+                json!({"statuses": [{"context": "qa-verdict", "state": "success",
+                                     "created_at": "2026-09-20T11:00:00Z",
+                                     "creator": {"login": "cc-syntax"}}]}),
+            );
+        }
+    }
+    let report = dir.path().join("report.json");
+    let write_report = |statuses: &serde_json::Map<String, Value>| {
+        std::fs::write(
+            &report,
+            json!({"prs": prs, "statuses": statuses}).to_string(),
+        )
+        .unwrap();
+    };
+    write_report(&statuses);
+    let notes = dir.path().join("notes");
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    for d in [&notes, &state, &pm] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    let flagged: Vec<&str> = text.lines().filter(|l| l.contains("FLAG[")).collect();
+    assert_eq!(
+        flagged,
+        [
+            "#50 work 50  FLAG[no-passing-verdict]",
+            "#43 work 43  FLAG[no-passing-verdict]"
+        ],
+        "{text}"
+    );
+    assert_eq!(text.matches("reviewer==merger").count(), 1, "{text}");
+    assert!(
+        text.contains("structural: 34 merge(s) share GitHub identity cc-syntax"),
+        "{text}"
+    );
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--json"]);
+    let j: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(j["summary"]["flagged"], 2, "{j}");
+    let st = &j["summary"]["structural"];
+    assert_eq!(st.as_array().unwrap().len(), 1, "{j}");
+    assert_eq!(st[0]["code"], "shared-github-identity", "{j}");
+    assert_eq!(st[0]["identity"], "cc-syntax", "{j}");
+    assert_eq!(st[0]["rows"], 34, "{j}");
+    let structural_rows = j["merges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["structural"] == json!(["reviewer==merger"]))
+        .count();
+    assert_eq!(structural_rows, 34, "{j}");
+
+    // A clean run against the shared-token fleet exits 0: pass the
+    // two real findings and nothing is left to flag.
+    for n in [43u64, 50] {
+        statuses.insert(
+            format!("{n:040x}"),
+            json!({"statuses": [{"context": "qa-verdict", "state": "success",
+                                 "created_at": "2026-09-20T11:00:00Z",
+                                 "creator": {"login": "cc-syntax"}}]}),
+        );
+    }
+    write_report(&statuses);
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!text.contains("FLAG["), "{text}");
+    assert!(
+        text.contains("structural: 36 merge(s) share GitHub identity cc-syntax"),
+        "{text}"
+    );
+}
+
+/// CAD-207 review: "one shared identity" is decided over every merged
+/// PR the fetch returned, not the rendered window. The fleet has a
+/// separate QA identity (`qa-bot` posted #1's status); a `--limit 1`
+/// window holding only #3 — posted and merged by `ops-1` — must still
+/// flag the self-review instead of calling it structural.
+#[test]
+fn audit_digest_decides_identity_over_the_fleet_not_the_window() {
+    let dir = TempDir::new().unwrap();
+    let (repo, notes, report, heads) = audit_repo(&dir);
+    let state = dir.path().join("state");
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&pm).unwrap();
+    let mut report_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    let status = |login: &str| {
+        json!({"statuses":[{"context":"qa-verdict","state":"SUCCESS",
+                            "created_at":"2026-09-20T11:59:30Z",
+                            "creator":{"login":login}}]})
+    };
+    report_json["statuses"][heads[0].clone()] = status("qa-bot");
+    report_json["statuses"][heads[2].clone()] = status("ops-1");
+    std::fs::write(&report, report_json.to_string()).unwrap();
+
+    let out = run_audit(&state, &pm, &repo, &notes, &report, &["--limit", "1"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("#3 work 3"), "{text}");
+    assert!(text.contains("FLAG[reviewer==merger]"), "{text}");
+    assert!(!text.contains("structural:"), "{text}");
+    assert_eq!(out.status.code(), Some(1), "{text}");
 }
 
 // ---------- CAD-113: build slots ----------
