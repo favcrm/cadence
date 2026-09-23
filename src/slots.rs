@@ -948,8 +948,8 @@ impl Slots {
     }
 
     /// Validate the whole v2 envelope, then apply it in order. Any
-    /// schema fault — or a revoked+live same-root enrollment pair
-    /// across owners — is an `Err` before anything is applied.
+    /// schema fault — or a same-root enrollment pair across owners, in
+    /// any authorization state — is an `Err` before anything is applied.
     fn restore_v2(
         &mut self,
         doc: &Value,
@@ -971,24 +971,22 @@ impl Slots {
         for e in list("enrollments")? {
             let parsed = Enrollment::from_json(&e, now, wall)
                 .ok_or_else(|| format!("malformed enrollment {e}"))?;
-            // Ids are unique. A shared root alone never rejects the
-            // file (CAD-276) — `strict_caller` chooses between such
-            // records deterministically — but a revoked record beside
-            // a live one on the same root is the same-root supersession
-            // tombstone, which only ever names the SAME owner: across
-            // owners the pair has no lineage and the file is invalid.
-            let revoked = |e: &Enrollment| matches!(e.auth, AuthState::Revoked(_));
+            // Ids are unique. A shared root of ONE owner never rejects
+            // the file (CAD-276) — a same-root supersession, which
+            // `strict_caller` resolves deterministically — but across
+            // owners, in any authorization state, the pair has no
+            // lineage: the daemon never writes it (`enroll` refuses a
+            // process enrolled for another owner) and the file is
+            // invalid (CAD-289).
             if enrollments.iter().any(|o: &Enrollment| o.id == parsed.id) {
                 return Err(format!("duplicate enrollment {}", parsed.id));
             }
             if let Some(o) = enrollments.iter().find(|o: &&Enrollment| {
-                o.root == parsed.root
-                    && revoked(o) != revoked(&parsed)
-                    && o.owner_actor != parsed.owner_actor
+                o.root == parsed.root && o.owner_actor != parsed.owner_actor
             }) {
                 return Err(format!(
                     "enrollments {} and {} share root pid {} across owners ({} / {}) \
-                     with one revoked — a supersession tombstone names its own owner",
+                     — one provider process is enrolled for one owner",
                     o.id, parsed.id, parsed.root.pid, o.owner_actor, parsed.owner_actor
                 ));
             }
@@ -1924,8 +1922,10 @@ impl Slots {
     }
 
     /// `caller` rebound to the enrollment the hold `token` names, when
-    /// that enrollment shares the exact root identity of the one the
-    /// caller verified against; otherwise `caller` unchanged.
+    /// that enrollment shares the exact root identity AND the owner of
+    /// the one the caller verified against; otherwise `caller`
+    /// unchanged. Never across owners (CAD-289): one owner's verified
+    /// caller must not release another owner's hold.
     fn hold_enrollment_caller(&self, token: &str, caller: &StrictCaller) -> StrictCaller {
         let by_id = |id: &str| self.enrollments.iter().find(|e| e.id == id);
         let held = self
@@ -1936,11 +1936,15 @@ impl Slots {
             .filter(|id| *id != caller.enrollment_id)
             .and_then(by_id);
         match (held, by_id(&caller.enrollment_id)) {
-            (Some(held), Some(verified)) if held.root == verified.root => StrictCaller {
-                enrollment_id: held.id.clone(),
-                lane: held.owner_actor.clone(),
-                segment: caller.segment.clone(),
-            },
+            (Some(held), Some(verified))
+                if held.root == verified.root && held.owner_actor == verified.owner_actor =>
+            {
+                StrictCaller {
+                    enrollment_id: held.id.clone(),
+                    lane: held.owner_actor.clone(),
+                    segment: caller.segment.clone(),
+                }
+            }
             _ => caller.clone(),
         }
     }
