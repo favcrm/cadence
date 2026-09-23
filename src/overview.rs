@@ -1233,12 +1233,17 @@ fn probe_agent(state_dir: &Path, a: &Value, timeout: Duration, deadline: Instant
     let provider = a["provider"].as_str().unwrap_or_default();
     let kind = a["endpoint_kind"].as_str().unwrap_or_default();
     let mut p = AgentProbe::default();
-    if !registry::has_actor(provider, kind) {
+    // A mailbox has no pane and no requests: its `agent_list` row
+    // carries the backlog. Only rows that predate the `inbox` block
+    // (an older daemon) need the show read for the queued count.
+    let mailbox = !registry::has_actor(provider, kind);
+    if mailbox && a["inbox"]["queued"].is_i64() {
         return p;
     }
     if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(50) {
         p.unprobed = true;
-        p.holds_drift = true;
+        // A mailbox never holds a restart back.
+        p.holds_drift = !mailbox;
         return p;
     }
     let rpc = |method: &str| {
@@ -1253,6 +1258,9 @@ fn probe_agent(state_dir: &Path, a: &Value, timeout: Duration, deadline: Instant
     match rpc("agent_show") {
         Ok(v) => p.show = Some(v),
         Err(e) => p.degraded.push(degraded("agent_show", alias, e)),
+    }
+    if mailbox {
+        return p;
     }
     match rpc("agent_requests") {
         Ok(v) => p.requests = v["requests"].as_array().cloned().unwrap_or_default(),
