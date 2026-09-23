@@ -309,26 +309,27 @@ pub(crate) fn kill_server(state_dir: &Path, env: &ProviderEnv) -> usize {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "tmux".to_string());
     let socket = tmux_socket(state_dir);
-    let sessions = Command::new(&tmux)
-        .arg("-L")
-        .arg(&socket)
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .count()
-        })
-        .unwrap_or(0);
+    let sessions = crate::reaper::output(Command::new(&tmux).arg("-L").arg(&socket).args([
+        "list-sessions",
+        "-F",
+        "#{session_name}",
+    ]))
+    .ok()
+    .filter(|out| out.status.success())
+    .map(|out| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    })
+    .unwrap_or(0);
     if sessions > 0 {
-        let _ = Command::new(&tmux)
-            .arg("-L")
-            .arg(&socket)
-            .arg("kill-server")
-            .output();
+        let _ = crate::reaper::output(
+            Command::new(&tmux)
+                .arg("-L")
+                .arg(&socket)
+                .arg("kill-server"),
+        );
     }
     sessions
 }

@@ -558,7 +558,7 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Command {
 
 /// Run one child verb to completion; its JSON stdout is the result.
 fn run_child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Result<Value> {
-    let out = child(sb, exe, args).output()?;
+    let out = crate::reaper::output(&mut child(sb, exe, args))?;
     if !out.status.success() {
         return Err(Error::rejected(format!(
             "`cadence {}` in sandbox '{}' failed: {} — see {}/*.log; \
