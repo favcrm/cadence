@@ -1,0 +1,1456 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cadence Onboarding Proposal</title>
+<meta name="description" content="Proposal and clickable mockups: one-command install, setup wizard, chat with a master agent, delegation, AgenticOS managed services and a sandbox testing mode.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0b0b0c;--bg2:#0e0e10;--panel:#141518;--panel2:#191a1e;--line:#222428;--line2:#2e3136;
+  --mute:#858c96;--soft:#9ba1a9;--text:#e7e9ec;--strong:#f6f7f8;
+  --accent:#2dd4bf;--accent2:#22d3ee;--accent-ink:#04201c;--accent-dim:rgba(45,212,191,.12);
+  --ok:#4ade80;--fail:#f87171;--warn:#fbbf24;--info:#60a5fa;
+  --ok-dim:rgba(74,222,128,.12);--fail-dim:rgba(248,113,113,.12);--warn-dim:rgba(251,191,36,.12);--info-dim:rgba(96,165,250,.12);
+  --gold:#f5b544;--gold-dim:rgba(245,181,68,.14);
+  --shadow:0 10px 40px rgba(0,0,0,.45);
+  --grid:rgba(255,255,255,.025);
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#f4f5f6;--bg2:#eceef0;--panel:#ffffff;--panel2:#f7f8f9;--line:#e3e5e8;--line2:#d3d7dc;
+  --mute:#6b7280;--soft:#4b5563;--text:#1b1d21;--strong:#0b0b0c;
+  --accent:#0d9488;--accent2:#0891b2;--accent-ink:#ffffff;--accent-dim:rgba(13,148,136,.10);
+  --ok:#15803d;--fail:#dc2626;--warn:#b45309;--info:#2563eb;
+  --ok-dim:rgba(21,128,61,.10);--fail-dim:rgba(220,38,38,.09);--warn-dim:rgba(180,83,9,.10);--info-dim:rgba(37,99,235,.09);
+  --gold:#c98a1b;--gold-dim:rgba(201,138,27,.12);
+  --shadow:0 10px 30px rgba(15,23,42,.12);
+  --grid:rgba(0,0,0,.03);
+  color-scheme:light;
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){
+    --bg:#f4f5f6;--bg2:#eceef0;--panel:#ffffff;--panel2:#f7f8f9;--line:#e3e5e8;--line2:#d3d7dc;
+    --mute:#6b7280;--soft:#4b5563;--text:#1b1d21;--strong:#0b0b0c;
+    --accent:#0d9488;--accent2:#0891b2;--accent-ink:#ffffff;--accent-dim:rgba(13,148,136,.10);
+    --ok:#15803d;--fail:#dc2626;--warn:#b45309;--info:#2563eb;
+    --ok-dim:rgba(21,128,61,.10);--fail-dim:rgba(220,38,38,.09);--warn-dim:rgba(180,83,9,.10);--info-dim:rgba(37,99,235,.09);
+    --gold:#c98a1b;--gold-dim:rgba(201,138,27,.12);
+    --shadow:0 10px 30px rgba(15,23,42,.12);--grid:rgba(0,0,0,.03);color-scheme:light;
+  }
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--text);font:14px/1.55 "IBM Plex Sans",system-ui,sans-serif;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+code,.mono,kbd,pre{font-family:"IBM Plex Mono",ui-monospace,monospace}
+code{font-size:.86em;background:var(--panel2);border:1px solid var(--line);padding:.05em .35em;border-radius:5px;color:var(--strong)}
+a{color:var(--accent)}
+button{font:inherit;color:inherit;cursor:pointer}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.num{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums}
+/* ---------- preview chrome ---------- */
+.chrome{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:12px;padding:10px 16px;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:9px;font-weight:600;color:var(--strong);white-space:nowrap}
+.brand small{font-weight:400;color:var(--mute);font-size:12px}
+.seg{display:inline-flex;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:3px;gap:2px}
+.seg button{border:0;background:transparent;padding:5px 12px;border-radius:6px;font-size:13px;color:var(--soft)}
+.seg button[aria-pressed="true"]{background:var(--panel2);color:var(--strong);box-shadow:inset 0 0 0 1px var(--line2)}
+.spacer{flex:1}
+.iconbtn{white-space:nowrap;border:1px solid var(--line);background:var(--panel);border-radius:8px;height:32px;min-width:32px;padding:0 10px;display:inline-flex;align-items:center;justify-content:center;gap:6px;font-size:12.5px;color:var(--soft)}
+.iconbtn:hover{color:var(--strong);border-color:var(--line2)}
+@media (max-width:1000px){.brand small{display:none}}
+@media (max-width:720px){.brand small,.hide-sm{display:none}.chrome{gap:8px;padding:8px 12px}.seg button{padding:5px 9px}}
+/* ---------- proposal doc ---------- */
+.doc{display:grid;grid-template-columns:220px minmax(0,1fr);gap:40px;max-width:1180px;margin:0 auto;padding:32px 16px 96px}
+.toc{position:sticky;top:72px;align-self:start;font-size:13px}
+.toc a{display:block;padding:4px 10px;border-left:2px solid var(--line);color:var(--mute);text-decoration:none}
+.toc a:hover,.toc a.on{color:var(--strong);border-left-color:var(--accent)}
+.toc .k{font-family:"IBM Plex Mono";font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--mute);margin:0 0 8px 12px}
+@media (max-width:900px){.doc{grid-template-columns:minmax(0,1fr)}.toc{display:none}}
+article{min-width:0}
+.card code,.callout code,p code,li code,td code{overflow-wrap:anywhere}
+@media (max-width:480px){.brand .bname{display:none}.chrome{gap:6px;padding:8px}.seg button{padding:5px 7px;font-size:12px}.hero{padding:20px 16px}}
+.hero{position:relative;padding:36px 32px;border:1px solid var(--line);border-radius:16px;background:
+  radial-gradient(700px 300px at 85% -10%,var(--accent-dim),transparent 70%),
+  linear-gradient(var(--grid) 1px,transparent 1px) 0 0/24px 24px,
+  linear-gradient(90deg,var(--grid) 1px,transparent 1px) 0 0/24px 24px,var(--panel);overflow:hidden}
+.kicker{font-family:"IBM Plex Mono";font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}
+h1{font-size:clamp(26px,4vw,38px);line-height:1.12;margin:10px 0 12px;color:var(--strong);letter-spacing:-.02em;font-weight:600}
+h2{font-size:22px;margin:56px 0 6px;color:var(--strong);letter-spacing:-.01em;font-weight:600;scroll-margin-top:80px}
+h2 .n{font-family:"IBM Plex Mono";font-size:13px;color:var(--accent);margin-right:10px;font-weight:500}
+h3{font-size:15px;margin:22px 0 6px;color:var(--strong);font-weight:600}
+.lede{font-size:16px;color:var(--soft);max-width:760px}
+.sub{color:var(--mute);margin:0 0 16px}
+p{max-width:780px}
+.journey{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-top:26px}
+.journey div{border:1px solid var(--line);background:var(--bg2);border-radius:10px;padding:10px 12px;font-size:12.5px}
+.journey b{display:block;color:var(--strong);font-weight:600;font-size:13px}
+.journey .s{font-family:"IBM Plex Mono";font-size:10.5px;color:var(--accent)}
+@media (max-width:720px){.journey{grid-template-columns:1fr 1fr}.hero{padding:24px 18px}}
+.tbl{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}
+.tbl th{text-align:left;font-weight:500;color:var(--mute);font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;padding:8px 10px;border-bottom:1px solid var(--line2)}
+.tbl td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+.tbl td:first-child{color:var(--strong);font-weight:500;white-space:nowrap}
+.tblwrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:2px 6px}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:2px 8px;border-radius:999px;background:var(--panel2);color:var(--soft);white-space:nowrap;font-weight:500}
+.chip.ok{background:var(--ok-dim);color:var(--ok)}.chip.fail{background:var(--fail-dim);color:var(--fail)}
+.chip.warn{background:var(--warn-dim);color:var(--warn)}.chip.info{background:var(--info-dim);color:var(--info)}
+.chip.acc{background:var(--accent-dim);color:var(--accent)}.chip.gold{background:var(--gold-dim);color:var(--gold)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;display:inline-block}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:14px 0}
+.card{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:16px}
+.card h4{margin:0 0 6px;font-size:14px;color:var(--strong);font-weight:600}
+.card p{margin:0;color:var(--soft);font-size:13px}
+.callout{border:1px solid var(--line);border-left:3px solid var(--warn);background:var(--panel);border-radius:10px;padding:12px 16px;margin:14px 0;font-size:13.5px;max-width:860px}
+.callout.acc{border-left-color:var(--accent)}.callout.gold{border-left-color:var(--gold)}
+.callout b{color:var(--strong)}
+.diagram{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:12px;margin:14px 0;overflow-x:auto}
+.diagram svg{display:block;min-width:760px;width:100%;height:auto}
+.term{background:#0a0a0b;color:#d8dde3;border:1px solid #26282c;border-radius:12px;font:12.5px/1.6 "IBM Plex Mono",monospace;overflow:auto}
+.term .bar{display:flex;gap:6px;align-items:center;padding:9px 12px;border-bottom:1px solid #1f2124;color:#7b828b;font-size:11.5px}
+.term .bar i{width:10px;height:10px;border-radius:50%;background:#2a2d31;display:inline-block}
+.term pre{margin:0;padding:14px 16px;white-space:pre-wrap;word-break:break-word}
+.term .p{color:#2dd4bf}.term .m{color:#7b828b}.term .g{color:#4ade80}.term .y{color:#fbbf24}.term .r{color:#f87171}.term .w{color:#f6f7f8}
+.phases{display:grid;gap:10px;margin:14px 0}
+.phase{display:grid;grid-template-columns:64px 1fr;gap:14px;border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:14px 16px}
+.phase .id{font-family:"IBM Plex Mono";font-size:20px;color:var(--accent);font-weight:500}
+.phase h4{margin:0 0 4px;color:var(--strong);font-size:14px}
+.phase ul{margin:6px 0 0;padding-left:18px;color:var(--soft);font-size:13px}
+.phase .exit{font-size:12.5px;color:var(--mute);margin-top:6px}
+ul.tight{padding-left:18px;margin:6px 0}ul.tight li{margin:3px 0}
+/* ---------- prototype ---------- */
+.proto{padding:16px 16px 60px;max-width:1440px;margin:0 auto}
+.story{display:flex;gap:6px;overflow-x:auto;padding:2px 0 12px;scrollbar-width:thin}
+.story button{flex:none;border:1px solid var(--line);background:var(--panel);border-radius:9px;padding:7px 12px;font-size:12.5px;color:var(--soft);display:flex;gap:8px;align-items:center}
+.story button .i{font-family:"IBM Plex Mono";font-size:10.5px;color:var(--mute)}
+.story button[aria-current="true"]{border-color:var(--accent);color:var(--strong);background:var(--accent-dim)}
+.story button[aria-current="true"] .i{color:var(--accent)}
+.stage{display:flex;justify-content:center}
+.device{width:100%;transition:max-width .25s ease}
+.device.narrow{max-width:400px}
+.appframe{border:1px solid var(--line2);border-radius:14px;overflow:hidden;background:var(--bg);box-shadow:var(--shadow);min-height:720px;display:flex;flex-direction:column}
+.urlbar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--panel2);border-bottom:1px solid var(--line);font:12px "IBM Plex Mono";color:var(--mute)}
+.urlbar .u{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:4px 10px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.urlbar i{width:10px;height:10px;border-radius:50%;background:var(--line2);display:inline-block}
+.sbx{display:flex;align-items:center;gap:10px;padding:6px 14px;font:500 12px "IBM Plex Mono";color:#1a1405;background:repeating-linear-gradient(135deg,#fbbf24 0 14px,#f5b544 14px 28px)}
+.sbx b{font-weight:600}
+.app{display:grid;grid-template-columns:200px minmax(0,1fr);flex:1;min-height:0}
+.nav{border-right:1px solid var(--line);background:var(--bg2);padding:12px 10px;display:flex;flex-direction:column;gap:2px}
+.nav .logo{display:flex;align-items:center;gap:8px;padding:4px 8px 14px;font-weight:600;color:var(--strong)}
+.nav button{display:flex;align-items:center;gap:10px;border:0;background:transparent;text-align:left;padding:7px 10px;border-radius:8px;color:var(--soft);font-size:13px}
+.nav button:hover{background:var(--panel);color:var(--strong)}
+.nav button[aria-current="page"]{background:var(--panel);color:var(--strong);box-shadow:inset 2px 0 0 var(--accent)}
+.nav .badge{margin-left:auto;font:500 10.5px "IBM Plex Mono";background:var(--warn-dim);color:var(--warn);border-radius:999px;padding:1px 7px}
+.nav .sect{font:500 10.5px "IBM Plex Mono";letter-spacing:.08em;text-transform:uppercase;color:var(--mute);padding:14px 10px 6px}
+.nav .foot{margin-top:auto;font-size:11.5px;color:var(--mute);padding:10px;border-top:1px solid var(--line)}
+.main{min-width:0;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line);min-height:48px}
+.topbar .crumb{font-size:13px;color:var(--mute)}.topbar .crumb b{color:var(--strong);font-weight:600}
+.body{flex:1;min-height:0;overflow:auto}
+.btn{border:1px solid var(--line2);background:var(--panel);border-radius:8px;padding:7px 13px;font-size:13px;color:var(--strong);display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+.btn:hover{border-color:var(--mute)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+.btn.pri:hover{filter:brightness(1.06)}
+.btn.gold{background:var(--gold);border-color:var(--gold);color:#1a1405;font-weight:600}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--soft)}
+.btn.danger{color:var(--fail)}
+.btn[disabled]{opacity:.5;cursor:not-allowed}
+.btn.sm{padding:4px 9px;font-size:12px;border-radius:7px}
+.field{display:block;margin:0 0 14px}
+.field span{display:block;font-size:12px;color:var(--mute);margin-bottom:5px}
+.input,select.input,textarea.input{width:100%;background:var(--bg);border:1px solid var(--line2);border-radius:8px;padding:8px 11px;color:var(--strong);font:13px "IBM Plex Sans"}
+.input.mono{font-family:"IBM Plex Mono"}
+.muted{color:var(--mute)}.soft{color:var(--soft)}.strong{color:var(--strong)}
+.row{display:flex;align-items:center;gap:10px}
+.between{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.stack{display:flex;flex-direction:column;gap:10px}
+.pane{padding:20px}
+.box{border:1px solid var(--line);background:var(--panel);border-radius:12px}
+.box .hd{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:11px 14px;border-bottom:1px solid var(--line)}
+.box .hd h5{margin:0;font-size:13px;color:var(--strong);font-weight:600}
+.box .bd{padding:12px 14px}
+.slabel{font:500 10.5px "IBM Plex Mono";letter-spacing:.09em;text-transform:uppercase;color:var(--mute)}
+.av{width:24px;height:24px;border-radius:7px;display:inline-grid;place-items:center;font:600 10.5px "IBM Plex Mono";flex:none}
+.av.claude{background:#3a2418;color:#f0a37a}.av.codex{background:#1d2433;color:#8fb4ff}.av.pi{background:#2a1f33;color:#d0a6ff}
+.av.devin{background:#132a26;color:#5eead4}.av.cursor{background:#262626;color:#d4d4d4}.av.op{background:var(--accent-dim);color:var(--accent)}
+:root[data-theme="light"] .av.claude{background:#fbe6da;color:#9a4a1f}:root[data-theme="light"] .av.codex{background:#e2e9fb;color:#2c4fa0}
+:root[data-theme="light"] .av.pi{background:#efe3fb;color:#6b35a8}:root[data-theme="light"] .av.devin{background:#d9f4ef;color:#0f766e}:root[data-theme="light"] .av.cursor{background:#ececec;color:#333}
+/* install */
+.install{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:18px;padding:22px}
+@media (max-width:960px){.install{grid-template-columns:1fr}}
+.cursor-blink::after{content:"▋";color:#2dd4bf;animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+/* wizard */
+.wiz{display:grid;grid-template-columns:230px minmax(0,1fr);min-height:640px}
+.steps{border-right:1px solid var(--line);padding:18px 12px;background:var(--bg2)}
+.steps button{display:flex;gap:10px;align-items:flex-start;width:100%;border:0;background:transparent;text-align:left;padding:8px 10px;border-radius:9px;color:var(--soft)}
+.steps button .c{width:22px;height:22px;border-radius:50%;border:1px solid var(--line2);display:grid;place-items:center;font:500 11px "IBM Plex Mono";flex:none;margin-top:1px}
+.steps button.done .c{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.steps button[aria-current="step"]{background:var(--panel);color:var(--strong)}
+.steps button[aria-current="step"] .c{border-color:var(--accent);color:var(--accent)}
+.steps small{display:block;color:var(--mute);font-size:11.5px}
+.wbody{padding:26px 30px;max-width:820px}
+.wbody h3{font-size:19px;margin:0 0 4px}
+.check{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--line)}
+.check:last-child{border-bottom:0}
+.check .st{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font-size:12px}
+.st.ok{background:var(--ok-dim);color:var(--ok)}.st.warn{background:var(--warn-dim);color:var(--warn)}.st.fail{background:var(--fail-dim);color:var(--fail)}.st.load{border:2px solid var(--line2);border-top-color:var(--accent);animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.fix{margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pick{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+.opt{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:14px;text-align:left;position:relative}
+.opt[aria-pressed="true"]{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.opt[disabled]{opacity:.55;cursor:not-allowed}
+.opt h6{margin:8px 0 2px;font-size:14px;color:var(--strong)}
+.opt p{margin:0;font-size:12.5px;color:var(--soft)}
+.opt .tag{position:absolute;top:12px;right:12px}
+.dial{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.aosbtn{display:inline-flex;align-items:center;gap:10px;border:1px solid var(--line2);background:var(--panel);border-radius:10px;padding:10px 16px;font-weight:600;color:var(--strong)}
+.aosbtn:hover{border-color:var(--gold)}
+/* consent modal (AgenticOS styling) */
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:80;display:grid;place-items:center;padding:16px;animation:fade .15s ease}
+@keyframes fade{from{opacity:0}}
+.aos{width:min(460px,100%);background:#fafafa;color:#18181b;border-radius:16px;font:13px/1.5 "Plus Jakarta Sans",system-ui,sans-serif;box-shadow:0 30px 80px rgba(0,0,0,.4);overflow:hidden;color-scheme:light}
+.aos .top{display:flex;align-items:center;gap:8px;padding:14px 20px;background:#fff;border-bottom:1px solid #e7e7ea}
+.aos .wm{font-weight:700;font-size:14px}.aos .wm em{font-style:normal;color:#e09a2e}
+.aos .url{margin-left:auto;font:11px "IBM Plex Mono";color:#71717a}
+.aos .in{padding:20px}
+.aos h4{font-size:17px;margin:0 0 4px;font-weight:700}
+.aos .sm{color:#52525b;font-size:12.5px}
+.aos .sc{background:#fff;border:1px solid #e7e7ea;border-radius:12px;margin:14px 0;overflow:hidden}
+.aos .sc label{display:grid;grid-template-columns:18px 1fr auto;gap:10px;align-items:start;padding:10px 12px;border-bottom:1px solid #f0f0f2;cursor:pointer}
+.aos .sc label:last-child{border-bottom:0}
+.aos .sc code{background:#f4f4f5;border-color:#e7e7ea;color:#52525b;font-size:10.5px}
+.aos .ask{font-size:10.5px;font-weight:600;color:#b26b00;background:#fff4e0;border-radius:999px;padding:1px 7px;white-space:nowrap}
+.aos select{width:100%;border:1px solid #e7e7ea;border-radius:8px;padding:8px 10px;font:inherit;background:#fff;color:#18181b}
+.aos .act{display:flex;gap:8px;justify-content:flex-end;padding:14px 20px;background:#fff;border-top:1px solid #e7e7ea}
+.aos .b{border-radius:8px;padding:8px 16px;font:600 13px "Plus Jakarta Sans";border:1px solid #e7e7ea;background:#fff;color:#18181b}
+.aos .b.go{background:#f5b544;border-color:#f5b544}
+.aos .b.go:hover{background:#e09a2e}
+/* chat home */
+.home{display:grid;grid-template-columns:minmax(0,1fr) 320px;height:100%;min-height:680px}
+.chat{display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)}
+.chathd{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line)}
+.thread{flex:1;overflow:auto;padding:18px 20px 8px;display:flex;flex-direction:column;gap:14px}
+.msg{display:grid;grid-template-columns:28px minmax(0,1fr);gap:10px;max-width:820px;animation:rise .25s ease both}
+@keyframes rise{from{opacity:0;transform:translateY(4px)}}
+.msg .who{font-size:12px;color:var(--mute);margin-bottom:3px}.msg .who b{color:var(--strong);font-weight:600}
+.msg .txt{color:var(--text)}
+.msg.me .txt{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:9px 13px;display:inline-block}
+.tool{display:flex;align-items:center;gap:8px;font:12px "IBM Plex Mono";color:var(--soft);background:var(--bg2);border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:6px 0;flex-wrap:wrap}
+.tool .ns{color:var(--mute)}.tool .ok{color:var(--ok)}.tool .aos-ns{color:var(--gold)}
+.sys{font:12px "IBM Plex Mono";color:var(--mute);display:flex;gap:8px;align-items:center;padding-left:38px;animation:rise .25s ease both}
+.sys .line{flex:none;width:14px;height:1px;background:var(--line2)}
+.plan{border:1px solid var(--line2);background:var(--panel);border-radius:14px;margin-top:8px;overflow:hidden}
+.plan .ph{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}
+.plan .ph b{color:var(--strong)}
+.plan .it{display:grid;grid-template-columns:62px minmax(0,1fr) auto;gap:10px;align-items:center;padding:9px 14px;border-bottom:1px solid var(--line);font-size:13px}
+.plan .it:last-of-type{border-bottom:0}
+.plan .pf{display:flex;gap:8px;align-items:center;padding:11px 14px;background:var(--bg2);border-top:1px solid var(--line);flex-wrap:wrap}
+.req{border:1px solid var(--warn);background:var(--warn-dim);border-radius:12px;padding:12px 14px;margin-top:6px}
+.req.gold{border-color:var(--gold);background:var(--gold-dim)}
+.req.done{border-color:var(--line);background:var(--panel)}
+.composer{padding:10px 16px 14px;border-top:1px solid var(--line)}
+.composer .cbox{border:1px solid var(--line2);background:var(--panel);border-radius:12px;padding:8px 10px}
+.composer textarea{width:100%;border:0;background:transparent;resize:none;color:var(--strong);font:14px "IBM Plex Sans";outline:none;min-height:42px}
+.typing{display:inline-flex;gap:4px}.typing i{width:6px;height:6px;border-radius:50%;background:var(--mute);animation:bob 1s infinite}
+.typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
+@keyframes bob{50%{transform:translateY(-3px);opacity:.5}}
+.rail{overflow:auto;padding:14px;display:flex;flex-direction:column;gap:12px;background:var(--bg2)}
+.need{display:grid;grid-template-columns:auto minmax(0,1fr);gap:9px;padding:9px 12px;border-bottom:1px solid var(--line);font-size:12.5px;cursor:pointer}
+.need:last-child{border-bottom:0}
+.need:hover{background:var(--panel2)}
+.need .k{font-size:10.5px}
+.work{display:grid;grid-template-columns:24px minmax(0,1fr) auto;gap:9px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px}
+.work:last-child{border-bottom:0}
+.bar{height:5px;border-radius:9px;background:var(--line);overflow:hidden}.bar i{display:block;height:100%;background:var(--accent);border-radius:9px}
+/* board */
+.kan{display:grid;grid-template-columns:repeat(5,minmax(200px,1fr));gap:12px;padding:16px;overflow-x:auto}
+.col h6{margin:0 0 8px;font:500 11px "IBM Plex Mono";letter-spacing:.07em;text-transform:uppercase;color:var(--mute);display:flex;justify-content:space-between}
+.tcard{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:10px 11px;margin-bottom:8px;font-size:13px;cursor:pointer}
+.tcard:hover{border-color:var(--line2)}
+.tcard .id{font:500 11px "IBM Plex Mono";color:var(--mute)}
+.tcard .t{color:var(--strong);margin:3px 0 7px;line-height:1.35}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:min(460px,100%);background:var(--panel);border-left:1px solid var(--line2);z-index:70;box-shadow:var(--shadow);display:flex;flex-direction:column;animation:slide .2s ease}
+@keyframes slide{from{transform:translateX(30px);opacity:0}}
+.drawer .dh{padding:16px 18px;border-bottom:1px solid var(--line)}
+.drawer .db{padding:16px 18px;overflow:auto;flex:1}
+.ck{display:flex;gap:9px;align-items:flex-start;padding:5px 0;font-size:13px}
+.ck .b{width:16px;height:16px;border-radius:4px;border:1px solid var(--line2);flex:none;margin-top:2px;display:grid;place-items:center;font-size:10px}
+.ck .b.on{background:var(--ok);border-color:var(--ok);color:#06200f}
+.tl{border-left:1px solid var(--line2);margin-left:6px;padding-left:14px}
+.tl div{position:relative;font-size:12.5px;padding:5px 0;color:var(--soft)}
+.tl div::before{content:"";position:absolute;left:-18px;top:11px;width:7px;height:7px;border-radius:50%;background:var(--line2)}
+.tl div.a::before{background:var(--accent)}
+/* agents */
+.agents{display:grid;grid-template-columns:minmax(280px,380px) minmax(0,1fr);height:100%;min-height:680px}
+.roster{border-right:1px solid var(--line);overflow:auto}
+.arow{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:10px;align-items:center;padding:11px 14px;border-bottom:1px solid var(--line);cursor:pointer}
+.arow:hover{background:var(--panel)}
+.arow[aria-selected="true"]{background:var(--panel);box-shadow:inset 2px 0 0 var(--accent)}
+.arow .nm{color:var(--strong);font-weight:500;font-size:13px}
+.arow .sub2{font-size:11.5px;color:var(--mute)}
+.xterm{background:#0a0a0b;color:#cfd5dc;font:12px/1.55 "IBM Plex Mono";padding:14px;border-radius:10px;border:1px solid #26282c;white-space:pre-wrap;min-height:300px}
+/* services */
+.svc{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;padding:16px}
+.aoshead{display:flex;align-items:center;gap:14px;padding:16px;border-bottom:1px solid var(--line);flex-wrap:wrap;background:linear-gradient(90deg,var(--gold-dim),transparent 60%)}
+.mini{display:flex;align-items:flex-end;gap:4px;height:38px}.mini i{flex:1;background:var(--gold);opacity:.75;border-radius:3px 3px 0 0}
+.conv{display:grid;grid-template-columns:30px minmax(0,1fr) auto;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.conv:last-child{border-bottom:0}
+.conn{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+.conn div{border:1px solid var(--line);border-radius:10px;padding:9px 10px;font-size:12.5px;background:var(--bg2)}
+.matrix td,.matrix th{text-align:center!important}.matrix td:first-child,.matrix th:first-child{text-align:left!important}
+/* settings */
+.set{display:grid;grid-template-columns:200px minmax(0,1fr);min-height:640px}
+.set .sn{border-right:1px solid var(--line);padding:14px 10px;background:var(--bg2)}
+.set .sn button{display:block;width:100%;text-align:left;border:0;background:transparent;padding:7px 10px;border-radius:8px;color:var(--soft);font-size:13px}
+.set .sn button[aria-current="true"]{background:var(--panel);color:var(--strong)}
+.set .sb{padding:22px 26px;max-width:820px}
+/* offline */
+.offline{display:flex;align-items:center;gap:10px;padding:8px 16px;background:var(--fail-dim);color:var(--fail);font-size:12.5px;border-bottom:1px solid var(--line)}
+.empty{display:grid;place-items:center;text-align:center;padding:60px 20px;color:var(--mute)}
+.empty .ic{width:44px;height:44px;border-radius:12px;border:1px dashed var(--line2);display:grid;place-items:center;margin:0 auto 10px;color:var(--accent)}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--strong);color:var(--bg);padding:9px 16px;border-radius:10px;font-size:13px;z-index:90;animation:rise .2s ease}
+/* narrow device */
+.device.narrow .app{grid-template-columns:1fr}
+.device.narrow .nav{position:static;flex-direction:row;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line);padding:6px}
+.device.narrow .nav .logo,.device.narrow .nav .sect,.device.narrow .nav .foot{display:none}
+.device.narrow .nav button{flex:none;padding:6px 9px;font-size:12px}
+.device.narrow .nav button .lbl2{display:none}
+.device.narrow .home{grid-template-columns:1fr}
+.device.narrow .rail{display:none}
+.device.narrow .home.showrail .rail{display:flex}
+.device.narrow .home.showrail .chat{display:none}
+.device.narrow .railtoggle{display:inline-flex!important}
+.device.narrow .wiz,.device.narrow .agents,.device.narrow .set{grid-template-columns:1fr}
+.device.narrow .steps{display:flex;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line);padding:8px}
+.device.narrow .steps button{flex:none;width:auto}.device.narrow .steps small{display:none}
+.device.narrow .wbody{padding:18px 16px}
+.device.narrow .roster{max-height:260px;border-right:0;border-bottom:1px solid var(--line)}
+.device.narrow .set .sn{display:flex;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line)}
+.device.narrow .set .sn button{flex:none;width:auto}
+.device.narrow .install{grid-template-columns:1fr;padding:14px}
+.device.narrow .plan .it{grid-template-columns:52px minmax(0,1fr)}
+.device.narrow .plan .it>:last-child{grid-column:2}
+.device.narrow .dial{grid-template-columns:1fr}
+.device.narrow .topbar .hide-n{display:none}
+.railtoggle{display:none!important}
+@media (max-width:760px){
+  .app{grid-template-columns:1fr}.nav{flex-direction:row;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line);padding:6px}
+  .nav .logo,.nav .sect,.nav .foot{display:none}.nav button{flex:none;padding:6px 9px;font-size:12px}.nav button .lbl2{display:none}
+  .home{grid-template-columns:1fr}.rail{display:none}.home.showrail .rail{display:flex}.home.showrail .chat{display:none}.railtoggle{display:inline-flex!important}
+  .wiz,.agents,.set{grid-template-columns:1fr}.steps{display:flex;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line);padding:8px}.steps button{flex:none;width:auto}.steps small{display:none}
+  .wbody{padding:18px 16px}.roster{max-height:260px;border-right:0;border-bottom:1px solid var(--line)}
+  .set .sn{display:flex;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line)}.set .sn button{flex:none;width:auto}
+  .dial{grid-template-columns:1fr}.topbar .hide-n{display:none}
+}
+@media (max-width:1180px){.home{grid-template-columns:1fr}.rail{display:none}.home.showrail .rail{display:flex}.home.showrail .chat{display:none}.railtoggle{display:inline-flex!important}}
+.v2{font-family:"Plus Jakarta Sans",system-ui,sans-serif}
+.otp{display:flex;gap:6px}.otp input{width:40px;height:44px;text-align:center;font:600 18px "Plus Jakarta Sans";border:1px solid #d9d9de;border-radius:8px;background:#fff;color:#18181b}
+.ptabs{display:flex;gap:6px;padding:12px 16px 0;flex-wrap:wrap}
+.since{border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;padding:10px 12px;background:var(--panel);font-size:12.5px}
+.stor{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.stor div{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg2)}
+.stor b{display:block;font:600 18px "IBM Plex Mono";color:var(--strong)}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="chrome">
+  <div class="brand">
+    <svg width="22" height="22" viewBox="0 0 1024 1024" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0B0B0C"/><path d="M232 336 416 512 232 688" fill="none" stroke="#2DD4BF" stroke-opacity=".55" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><path d="M408 336 592 512 408 688" fill="none" stroke="#2DD4BF" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><rect x="656" y="656" width="160" height="64" rx="32" fill="#2DD4BF" fill-opacity=".7"/></svg>
+    <span class="bname">Cadence</span> <small>· plan, direction &amp; prototype — v3</small>
+  </div>
+  <div class="seg" role="group" aria-label="View">
+    <button data-act="tab" data-v="plan" aria-pressed="true">Plan</button>
+    <button data-act="tab" data-v="direction" aria-pressed="false">Direction</button>
+    <button data-act="tab" data-v="proposal" aria-pressed="false">Details</button>
+    <button data-act="tab" data-v="proto" aria-pressed="false">Prototype</button>
+  </div>
+  <div class="spacer"></div>
+  <div class="seg hide-sm" role="group" aria-label="Viewport" id="vpseg" hidden>
+    <button data-act="vp" data-v="wide" aria-pressed="true">Desktop</button>
+    <button data-act="vp" data-v="narrow" aria-pressed="false">390px</button>
+  </div>
+  <button class="iconbtn hide-sm" data-act="sim" id="simbtn" hidden title="Simulate daemon offline">Sim: normal</button>
+  <button class="iconbtn hide-sm" data-act="sbx" id="sbxbtn" hidden title="Show sandbox profile banner">Sandbox: off</button>
+  <button class="iconbtn" data-act="theme" aria-label="Toggle theme" id="themebtn">◐</button>
+</div>
+
+<main id="plan">
+<div class="doc" style="grid-template-columns:minmax(0,1fr);max-width:1080px">
+  <article>
+    <section class="hero">
+      <div class="kicker">Plan on a page · 2026-09-23</div>
+      <h1>Your AI dev team, on your machine.</h1>
+      <p class="lede">Cadence turns the coding agents you already pay for into one team: a <b>master agent you chat with</b> plans the work, <b>workers deliver it</b>, an <b>independent reviewer verifies it</b>, and <b>you approve what matters</b>. Local-first, provider-neutral, and it remembers everything.</p>
+      <div class="journey">
+        <div><span class="s">01</span><b>Install</b>one command or agent prompt</div>
+        <div><span class="s">02</span><b>Start</b>fresh · restore · import</div>
+        <div><span class="s">03</span><b>Plan</b>chat → plan card → approve</div>
+        <div><span class="s">04</span><b>Deliver</b>workers · review · merge</div>
+        <div><span class="s">05</span><b>Ship</b>platform effects you press</div>
+      </div>
+      <p style="margin-top:18px"><button class="btn pri" data-act="tab" data-v="proto">Clickable prototype →</button> <button class="btn" data-act="tab" data-v="direction">Direction &amp; go-to-market →</button> <button class="btn ghost" data-act="tab" data-v="proposal">Full technical proposal</button></p>
+    </section>
+
+    <h2><span class="n">A</span>Five product pillars</h2>
+    <div class="cards">
+      <div class="card"><h4>1 · One-command start</h4><p><code>curl | sh</code> or a paste-in agent prompt → <code>cadence setup</code> → browser wizard. Linux + macOS.</p></div>
+      <div class="card"><h4>2 · A master that remembers</h4><p>Chat with Claude, Codex or Pi. Conversations live in Cadence, not the provider session; restore, import and backups mean nobody starts empty.</p></div>
+      <div class="card"><h4>3 · Plans you approve, work that is verified</h4><p>Plan cards, daemon-enforced dispatch gate, independent reviewer, verdicts pinned to the exact commit.</p></div>
+      <div class="card"><h4>4 · Any agent</h4><p>Claude, Codex, Pi, Cursor, Devin as workers — the subscriptions you already have. No lock-in.</p></div>
+      <div class="card"><h4>5 · Ship through platforms</h4><p>Generic platform contract; every send, publish, deploy or spend is an effect card you press. AgenticOS v2 and Cloudflare first.</p></div>
+    </div>
+
+    <h2><span class="n">B</span>Must-have scope (MVP = P0–P3)</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Phase</th><th>Delivers</th><th>Exit test</th></tr>
+      <tr><td>P0 Foundation</td><td>Sandbox profile · release + <code>install.sh</code> + <code>setup --json</code> · operator auth (ADR) · macOS · backup / export / restore</td><td>Clean-machine CI installs on Linux + macOS; backup → restore round-trip; production daemon untouched</td></tr>
+      <tr><td>P1 Chat &amp; continuity</td><td>Threads store · payload events · Pi adapter · real interrupt · continuity packs · fast read model · wizard · chat Home</td><td>Kill the master's session mid-plan → it resumes with plan state; issues load &lt;300 ms</td></tr>
+      <tr><td>P2 Plans</td><td><code>project new</code> · <code>plan propose</code> · plan card · approval commit · dispatch gate</td><td>Unapproved dispatch refused with reason</td></tr>
+      <tr><td>P3 Delegation</td><td>Workers from approved plans · reviewer routing · merge in Needs-you · terminal view</td><td>3-issue plan lands with independent verdicts, one click per merge</td></tr>
+      <tr><td>P4 Platforms</td><td>Platform contract · proxy · effect gate · Cloudflare · AgenticOS v2 as AOS-14 lands</td><td>Preview deploy auto; production + sends wait for a press</td></tr>
+      <tr><td>P5 Autonomy dial</td><td>Routine merges auto per project</td><td>Only after CAD-225 is green</td></tr>
+    </table></div>
+
+    <h2><span class="n">C</span>Decisions (defaults — change any)</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Topic</th><th>Default</th></tr>
+      <tr><td>Audience</td><td>Public developers, Linux + macOS</td></tr>
+      <tr><td>Autonomy</td><td>Plan freely, ask to dispatch; human merges and sends</td></tr>
+      <tr><td>Master</td><td>Structured providers (Claude, Codex, Pi) as equals; terminal agents are workers; pty is a view. Setup shows each provider's billing/terms note; only official binaries are driven</td></tr>
+      <tr><td>Continuity</td><td>Threads in Cadence; encrypted backup + status projection to platforms; no cloud authority</td></tr>
+      <tr><td>Platforms</td><td>Contract-first; Cloudflare own-account deploy first; AgenticOS device-code credential proposed under AOS-14</td></tr>
+      <tr><td>Tracker remote</td><td>Setup offers a private GitHub repo for <code>~/pm</code>, off by default</td></tr>
+      <tr><td>First build step</td><td>Sandbox profile, so everything else is tested without touching the live daemon</td></tr>
+    </table></div>
+
+    <h2><span class="n">D</span>What we will not do</h2>
+    <ul class="tight">
+      <li>Run a hosted Cadence service — hosting is AgenticOS's job (AOS-34), Cadence stays local software.</li>
+      <li>Replace provider tools or copy their cookies/sessions.</li>
+      <li>Let any agent execute a send, merge its own work, or see a platform credential.</li>
+      <li>Turn on auto-merge before the unattended acceptance check passes.</li>
+    </ul>
+  </article>
+</div>
+</main>
+
+<main id="direction" hidden>
+<div class="doc">
+  <nav class="toc" aria-label="Direction contents">
+    <div class="k">Direction</div>
+    <a href="#d-market">Market, Sep 2026</a>
+    <a href="#d-position">Positioning</a>
+    <a href="#d-icp">Who it is for</a>
+    <a href="#d-direction">Product direction</a>
+    <a href="#d-model">Business model</a>
+    <a href="#d-risks">Strategic risks</a>
+    <a href="#d-gtm">Marketing strategy</a>
+    <a href="#d-launch">Launch plan</a>
+    <a href="#d-metrics">Metrics</a>
+    <a href="#d-nice">Nice to have</a>
+  </nav>
+  <article>
+    <section class="hero">
+      <div class="kicker">Product direction &amp; go-to-market · 2026-09-23</div>
+      <h1>Don't sell parallel agents. Sell work you can trust.</h1>
+      <p class="lede">Running several agents at once is now built into Claude Code, Codex, Cursor, Copilot and a dozen free apps. What nobody neutral offers is a <b>governed team</b>: a plan you approve, workers from any vendor, <b>a different vendor reviewing</b>, verdicts pinned to the exact commit, and nothing shipped without your press. Local, open source, and it remembers.</p>
+    </section>
+
+    <h2 id="d-market"><span class="n">01</span>Market, September 2026</h2>
+    <p class="sub">Verified against primary sources on 2026-09-23 (footer). Revenue figures for private companies are deliberately left out.</p>
+    <div class="diagram"><svg viewBox="0 0 900 300" font-family="IBM Plex Sans" font-size="12" role="img" aria-label="Positioning map: cloud vs local, single vendor vs multi provider.">
+      <line x1="450" y1="20" x2="450" y2="290" stroke="var(--line2)"/><line x1="20" y1="155" x2="880" y2="155" stroke="var(--line2)"/>
+      <text x="230" y="16" text-anchor="middle" fill="var(--mute)" font-family="IBM Plex Mono" font-size="11">SINGLE VENDOR</text>
+      <text x="670" y="16" text-anchor="middle" fill="var(--mute)" font-family="IBM Plex Mono" font-size="11">MULTI PROVIDER</text>
+      <text x="14" y="90" fill="var(--mute)" font-family="IBM Plex Mono" font-size="11" transform="rotate(-90 14 90)">CLOUD</text>
+      <text x="14" y="240" fill="var(--mute)" font-family="IBM Plex Mono" font-size="11" transform="rotate(-90 14 240)">LOCAL</text>
+      <g fill="var(--soft)">
+        <text x="60" y="60">Claude Code Projects (coordinator, Sep 17)</text><text x="60" y="82">Devin · Jules · Codex cloud · Kiro</text>
+        <text x="480" y="60">GitHub Agent HQ (Copilot + Claude + Codex)</text><text x="480" y="82">Factory Missions · Antigravity · Augment Cosmos</text><text x="480" y="104" fill="var(--mute)">† Terragon — shut down Feb 2026</text>
+        <text x="60" y="200">Claude Agent Teams / Agent View</text><text x="60" y="222">Codex app + Symphony · Sculptor</text>
+        <text x="480" y="200">Conductor · Superset · Claude Squad · Nimbalyst</text><text x="480" y="222">Vibe Kanban (community) · Paseo · opencode</text>
+      </g>
+      <rect x="600" y="240" width="260" height="40" rx="9" fill="var(--accent-dim)" stroke="var(--accent)"/>
+      <text x="614" y="264" fill="var(--strong)" font-weight="600">Cadence: local · multi · governed</text>
+    </svg></div>
+    <div class="cards">
+      <div class="card"><h4>Vendors bundled the master</h4><p>Claude Code Projects: "Claude scopes the request, delegates the work, coordinates parallel threads, reviews the outputs" — public beta on Pro/Max, threads in the cloud today, local "coming very soon" (Sep 17). Codex app, Cursor 3 and GitHub Agent HQ ship multi-agent too.</p></div>
+      <div class="card"><h4>The local quadrant is crowded but shallow</h4><p>Conductor, Superset, Claude Squad, Nimbalyst, Vibe Kanban: session runners with worktrees and a diff view. None has plans, independent review, approval gates or continuity.</p></div>
+      <div class="card"><h4>Free tools die, open local tools survive</h4><p>Terragon shut down Feb 9 and bloop (Vibe Kanban's company) on Apr 10, 2026; Vibe Kanban lives on "open source and community maintained" because it was local.</p></div>
+      <div class="card"><h4>Trust is the bottleneck</h4><p>Stack Overflow 2025: only 3.1% of developers highly trust AI output; 46% distrust vs 33% trust. Governance, not throughput, is the unmet need — the lesson Cadence learned dogfooding: review, not worker count, is the bottleneck.</p></div>
+    </div>
+
+    <h2 id="d-position"><span class="n">02</span>Positioning</h2>
+    <div class="callout acc" style="font-size:15px;max-width:none"><b>Cadence is the open-source control plane that turns the coding agents you already pay for into a governed team.</b> One master plans with you, workers from any vendor deliver, a different vendor reviews, and nothing merges, sends or deploys without your approval. It runs on your machine and remembers everything.</div>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Wedge</th><th>Why it is defensible</th><th>Proof we can show</th></tr>
+      <tr><td>Cross-vendor review</td><td>No vendor will ship "our rival grades our output". Codex reviews Claude, Claude reviews Codex, verdict pinned to the SHA.</td><td>Stats from our own verdict store: defects caught per reviewer/author pair</td></tr>
+      <tr><td>Evidence &amp; governance</td><td>Plans, dispatch gate, separation of duties, merge/send/deploy approvals with an audit trail — a category above session runners.</td><td><code>cadence audit</code> report of every merge's provenance</td></tr>
+      <tr><td>Local, MIT, survives the company</td><td>Headless daemon on Linux/macOS servers and SSH boxes, not a Mac-only Electron app; your data, your subscriptions.</td><td>Runs on the same box as your repos; backup/restore bundle</td></tr>
+      <tr><td>Continuity</td><td>Conversations and decisions outlive provider sessions, reinstalls and machines.</td><td>Kill-the-session demo: master resumes mid-plan</td></tr>
+    </table></div>
+    <p><b>Category name:</b> "agent delivery control plane". <b>Avoid:</b> leading with "run agents in parallel", "autonomous" or "replace developers" — table stakes, or a trust red flag.</p>
+    <div class="cards">
+      <div class="card"><h4>Tagline options</h4><p>"Your agents. Cross-checked." · "Many agents, one standard." · "Your AI dev team, on your machine." · "Ship with agents you can trust."</p></div>
+      <div class="card"><h4>One-line pitch</h4><p>"Chat with one master agent; it plans, hires Claude, Codex or Cursor, has a different one review, and asks you before anything ships."</p></div>
+    </div>
+
+    <h2 id="d-icp"><span class="n">03</span>Who it is for — in order</h2>
+    <div class="phases">
+      <div class="phase"><div class="id">1</div><div><h4>Multi-subscription power developers (launch ICP)</h4><ul><li>Senior devs, indie builders and CTOs who already pay for two or more of Claude, ChatGPT/Codex, Cursor; run agents in terminals, tmux or SSH boxes.</li><li>Pain: babysitting panes, unreviewed agent code, lost context, stalled approval menus.</li><li>Hook: "stop babysitting terminals — get reviewed PRs".</li></ul></div></div>
+      <div class="phase"><div class="id">2</div><div><h4>Small product teams and agencies (2–15 devs)</h4><ul><li>Need audit trails, shared tracker, separation of duties, predictable spend across client repos.</li><li>Unlock: team mode (multiple operators), cost reporting, playbooks.</li></ul></div></div>
+      <div class="phase"><div class="id">3</div><div><h4>Businesses via AgenticOS</h4><ul><li>Owners who never open a terminal; AgenticOS hosts Cadence as its agent runtime (AOS-34) and sells managed services. Hong Kong / zh-HK first.</li></ul></div></div>
+    </div>
+
+    <h2 id="d-direction"><span class="n">04</span>Product direction</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Horizon</th><th>Theme</th><th>Scope</th></tr>
+      <tr><td>Now (MVP)</td><td>Governed team on one machine</td><td>P0–P3: install, continuity, chat master, plans, delegation, cross-vendor review, merge approvals</td></tr>
+      <tr><td>Next</td><td>Ship &amp; see cost</td><td>P4 platforms (Cloudflare, AgenticOS v2), <b>vendor cloud agents as workers</b> (Codex cloud, Jules, Cursor Cloud Agents, Devin cloud — CAD-243, later Claude Projects), cost &amp; quota per plan, playbooks</td></tr>
+      <tr><td>Later</td><td>Team &amp; self-improvement</td><td>Team mode, reviewer scorecards → routing, retros → memory, autonomy dial after CAD-225, hosted runtime inside AgenticOS</td></tr>
+    </table></div>
+    <div class="callout"><b>Strategic move:</b> treat vendor orchestrators as <i>workers</i>, not competitors. When Claude Projects or Codex cloud run a sub-goal, Cadence still owns the plan, the independent review and the approval. The more vendors bundle masters, the more valuable a neutral layer above them becomes.</div>
+    <h3>Product principles (carry the charter forward)</h3>
+    <ul class="tight"><li>Evidence over self-report — "done" is a claim until a different agent verifies the commit.</li><li>Humans approve the substantial, never the routine.</li><li>Bring your own agents; drive official binaries; never borrow their tokens.</li><li>Local-first; the cloud is optional and never the authority.</li><li>Nobody starts empty; nothing is silently lost.</li></ul>
+
+    <h2 id="d-model"><span class="n">05</span>Business model</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Layer</th><th>Offer</th><th>Price direction</th></tr>
+      <tr><td>Cadence (MIT)</td><td>Full local product, single operator, all providers</td><td>Free forever — the distribution engine</td></tr>
+      <tr><td>Platform revenue</td><td>AgenticOS v2 managed services: gateway credits, connectors, hosting, business records; Cadence hosted as its runtime</td><td>AgenticOS plans (HK$980/mo proposed, AOS-28) + usage</td></tr>
+      <tr><td>Cadence Team (later)</td><td>Multiple operators, SSO, audit export, policy packs, priority support</td><td>Per seat; only once ICP 2 asks for it</td></tr>
+    </table></div>
+    <p class="muted">Rationale: free orchestrators without a revenue layer died in 2026. Revenue attaches where money already flows (managed services, credits, teams), not to local orchestration itself.</p>
+
+    <h2 id="d-risks"><span class="n">06</span>Strategic risks and responses</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Risk</th><th>Response</th></tr>
+      <tr><td>Vendors ship local masters (Claude Projects local "soon", Codex app, Cursor 3)</td><td>Compete on neutrality + governance + continuity; integrate their orchestrators as workers.</td></tr>
+      <tr><td>Anthropic subscription terms changed twice this year (Feb OAuth-token ban incl. Agent SDK; May credit plan; paused Jun 15)</td><td>Current terms allow "an end user … signing in to the unmodified Claude Code binary with their own Claude subscription", but forbid offering Claude.ai login or routing requests through plan credentials on users' behalf, and paying for, reselling or intermediating usage. So: drive the unmodified binary, the user signs in themselves, Cadence never touches tokens; AgenticOS-hosted mode must not intermediate Claude subscriptions (use Pi via gateway/API keys). Legal review before launch.</td></tr>
+      <tr><td>OpenAI terms for third-party clients</td><td>No primary policy found. App-server is documented for "deep integration inside your own product"; public statements were permissive (secondary). Treat as permitted-but-unwritten; same user-signs-in rule.</td></tr>
+      <tr><td>Crowded local quadrant, star-count noise</td><td>Don't compete on "parallel"; publish verifiable review data nobody else has.</td></tr>
+      <tr><td>Rising per-token costs (Copilot credits, Amp paid)</td><td>Cost per plan visible up front; route cheap work to cheap agents.</td></tr>
+      <tr><td>Complexity scares new users</td><td>Chat-first home, sane defaults, restore/import, "Approve plans" level by default.</td></tr>
+    </table></div>
+
+    <h2 id="d-gtm"><span class="n">07</span>Marketing strategy</h2>
+    <div class="cards">
+      <div class="card"><h4>Message pillars</h4><p>1 · Cross-checked by a different vendor · 2 · You approve what ships · 3 · Your subscriptions, your machine · 4 · It remembers.</p></div>
+      <div class="card"><h4>Proof, not claims</h4><p>Built by Cadence itself: 11 PRs merged in a day through it; publish the incidents the system caught and how. Numbers from our own verdict store and <code>cadence audit</code>.</p></div>
+      <div class="card"><h4>Flagship content</h4><p>"Who catches whose bugs": a recurring cross-vendor review report (Claude vs Codex vs Pi as author/reviewer). Unique data, honest, shareable.</p></div>
+      <div class="card"><h4>Demo that sells</h4><p>90-second video: one chat → plan card → three vendors working → Codex rejects Claude's PR → fix → merge click → preview deploy. Plus the kill-the-session continuity moment.</p></div>
+      <div class="card"><h4>Community</h4><p>Discord with channels per provider; shared playbooks (plan templates); office hours; contributor-friendly issues from the tracker.</p></div>
+      <div class="card"><h4>Growth loops</h4><p>Opt-in "Reviewed by Cadence" footer on PRs · install-by-agent-prompt (agents recommend the tool) · skill listed in Claude/Cursor/Pi marketplaces · awesome-agent-orchestrators · honest comparison pages.</p></div>
+    </div>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Channel</th><th>Use</th></tr>
+      <tr><td>X / GitHub</td><td>Launch thread with demo video; star surge day; weekly build-in-public posts from real Cadence runs</td></tr>
+      <tr><td>Product Hunt → Show HN</td><td>PH first; Show HN 2–4 days later with a different, technical angle ("pinned verdicts and cross-vendor review")</td></tr>
+      <tr><td>Reddit, Discords</td><td>Provider communities (Claude, Codex, Cursor, Pi, local-LLM): answer "how do you manage many agents" threads with specifics, not links</td></tr>
+      <tr><td>YouTube / podcasts</td><td>Long-form walkthroughs; dev-tool podcasts on the dogfooding story</td></tr>
+      <tr><td>AgenticOS channels</td><td>SMB audience in HK (en + zh-HK): outcomes, not agents — "your website fixes itself, you approve"</td></tr>
+    </table></div>
+
+    <h2 id="d-launch"><span class="n">08</span>Launch plan</h2>
+    <div class="phases">
+      <div class="phase"><div class="id">L0</div><div><h4>Design partners (during P0–P1)</h4><ul><li>10–20 multi-subscription developers and 2–3 agencies; sandbox-tested installs; weekly calls; collect the quotes and data for launch.</li></ul><div class="exit">Gate: 10 partners reach an approved plan without help.</div></div></div>
+      <div class="phase"><div class="id">L1</div><div><h4>Public beta — open-source launch (after P3)</h4><ul><li>README with GIF, docs site, install prompt, demo video, first "who catches whose bugs" report, comparison page, Discord.</li><li>Sequence: X thread + GitHub → Product Hunt → Show HN (+2–4 days) → Reddit/Discord follow-ups → podcast circuit.</li></ul><div class="exit">Gate: legal review of provider terms; clean-machine CI green; zero-telemetry default with opt-in.</div></div></div>
+      <div class="phase"><div class="id">L2</div><div><h4>Platforms GA (after P4)</h4><ul><li>"Ship from chat": Cloudflare deploy + AgenticOS v2 services; joint AgenticOS announcement; SMB campaign in HK.</li></ul></div></div>
+    </div>
+
+    <h2 id="d-metrics"><span class="n">09</span>Metrics</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Metric</th><th>Definition</th><th>Target direction</th></tr>
+      <tr><td><b>North star</b></td><td>Verified merges per active install per week (PR merged with an independent PASS on its head)</td><td>up</td></tr>
+      <tr><td>Activation</td><td>Install → first approved plan within 24 h</td><td>&gt; 40%</td></tr>
+      <tr><td>Time to first plan</td><td>From <code>curl | sh</code> to plan card</td><td>&lt; 10 min</td></tr>
+      <tr><td>Trust</td><td>Share of plans approved without edits; review rounds per PR</td><td>up; ≤ 2</td></tr>
+      <tr><td>Human minutes per merged PR</td><td>From the charter</td><td>down</td></tr>
+      <tr><td>Retention</td><td>Week-4 active installs</td><td>up</td></tr>
+    </table></div>
+    <p class="muted">Telemetry is opt-in and local-first; public numbers come from partners who share them and from our own dogfooding.</p>
+
+    <h2 id="d-nice"><span class="n">10</span>Nice to have (after MVP)</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Idea</th><th>Value</th><th>Effort</th><th>Note</th></tr>
+      <tr><td>Vendor cloud agents as workers</td><td><span class="chip ok">high</span></td><td>M each</td><td>Codex cloud, Jules, Cursor Cloud Agents, Devin cloud (CAD-243); strategic hedge</td></tr>
+      <tr><td>Cost &amp; quota per plan</td><td><span class="chip ok">high</span></td><td>M</td><td>Estimate before approval, actual after; builds on CAD-114/80</td></tr>
+      <tr><td>Reviewer scorecards → routing</td><td><span class="chip ok">high</span></td><td>M</td><td>Feeds the "who catches whose bugs" report; L5 direction</td></tr>
+      <tr><td>Playbooks / plan templates</td><td><span class="chip ok">high</span></td><td>S</td><td>Bugfix, feature, dependency upgrade, security patch; community-shared</td></tr>
+      <tr><td>Shareable run report</td><td><span class="chip ok">high</span></td><td>S</td><td>Read-only page: plan → diffs → verdicts → approvals. Growth loop</td></tr>
+      <tr><td>⌘K palette + "ask master about this"</td><td><span class="chip">medium</span></td><td>S</td><td>From any issue, PR or agent</td></tr>
+      <tr><td>GitHub App</td><td><span class="chip">medium</span></td><td>M</td><td>Label an issue → master drafts a plan; reviewer comments on the PR</td></tr>
+      <tr><td>Scheduled goals</td><td><span class="chip">medium</span></td><td>M</td><td>"Every Monday: upgrade deps" → plan card waits for approval</td></tr>
+      <tr><td>Local models via Pi</td><td><span class="chip">medium</span></td><td>S</td><td>Ollama/LM Studio for private or offline work</td></tr>
+      <tr><td>Voice to master (en + zh-HK)</td><td><span class="chip">medium</span></td><td>M</td><td>Reuses AgenticOS speech research</td></tr>
+      <tr><td>Phone approvals (PWA)</td><td><span class="chip">medium</span></td><td>M</td><td><b>Push notifications reverse the 09-21 "UI is the alert destination" ruling</b> — needs the operator's decision</td></tr>
+      <tr><td>Multi-machine view</td><td><span class="chip">medium</span></td><td>L</td><td>One UI over several hosts; deferred cross-host work</td></tr>
+      <tr><td>Team mode</td><td><span class="chip">medium</span></td><td>L</td><td>Multiple operators, approvals by role; depends on auth ADR</td></tr>
+      <tr><td>Knowledge graph of the project</td><td><span class="chip">low</span></td><td>M</td><td>graphify index fed into continuity packs</td></tr>
+      <tr><td>Slack / Discord bridge</td><td><span class="chip">low</span></td><td>S</td><td>Same ruling conflict as push notifications</td></tr>
+    </table></div>
+    <p class="muted" style="margin-top:28px;font-size:12.5px">Primary sources (retrieved 2026-09-23): claude.com/blog/projects-redesigned (Sep 17) · code.claude.com/docs/en/claude-projects · code.claude.com/docs/en/legal-and-compliance · support.claude.com article 15036540 (pause, Jun 15) · theregister.com 2026-02-20 · learn.chatgpt.com/docs/app-server · github.blog changelog 2026-02-04 (Claude and Codex on GitHub) · github.blog usage-based billing (2026-04-27, effective Jun 1) · factory.com/news/5-billion-valuation (Sep 15) · cursor.com/blog/joining-spacex (Aug 14) · vibekanban.com/blog/shutdown (Apr 10) · Terragon shutdown notice (Feb 9, mirror) · survey.stackoverflow.co/2025/ai. Secondary only: OpenAI's permissive stance on third-party ChatGPT sign-in; star counts.</p>
+  </article>
+</div>
+</main>
+
+<!-- ===================== PROPOSAL ===================== -->
+<main id="proposal" hidden>
+<div class="doc">
+  <nav class="toc" aria-label="Contents">
+    <div class="k">Contents</div>
+    <a href="#s-summary">Summary</a>
+    <a href="#s-review">Where we are</a>
+    <a href="#s-uireview">Current UI review</a>
+    <a href="#s-decisions">Decisions</a>
+    <a href="#s-arch">Architecture</a>
+    <a href="#s-install">Install &amp; setup</a>
+    <a href="#s-trust">Identity &amp; trust</a>
+    <a href="#s-store">Data store &amp; continuity</a>
+    <a href="#s-master">Master agent</a>
+    <a href="#s-platforms">Connected platforms</a>
+    <a href="#s-loop">Autonomous loop</a>
+    <a href="#s-ui">UI revamp</a>
+    <a href="#s-sandbox">Sandbox mode</a>
+    <a href="#s-phases">Phases</a>
+    <a href="#s-risks">Risks</a>
+    <a href="#s-open">Open decisions</a>
+  </nav>
+  <article>
+    <section class="hero" id="s-summary">
+      <div class="kicker">Proposal v2 · 2026-09-23 · status: for review</div>
+      <h1>From <code style="font-size:.8em">curl | sh</code> to a master agent that remembers, plans, delegates and ships — with you approving what matters.</h1>
+      <p class="lede">A developer installs Cadence with one command (or by pasting a prompt into their coding agent). The daemon starts a local web UI. Setup checks the machine, <b>restores or imports existing work</b> so nobody starts empty, and launches a <b>master agent</b> (Claude, Codex or Pi). The master keeps a durable conversation that survives restarts and lost provider sessions; it creates projects, proposes plans, and — after one approval — delegates to workers and brings merges, sends and deploys back as decisions. <b>Connected platforms</b> add managed services; AgenticOS v2 is the reference platform.</p>
+      <div class="journey">
+        <div><span class="s">01</span><b>Install</b>curl | sh or agent prompt</div>
+        <div><span class="s">02</span><b>Start</b>fresh · restore · import</div>
+        <div><span class="s">03</span><b>Chat</b>goal → project → plan card</div>
+        <div><span class="s">04</span><b>Delegate</b>workers · review · merge</div>
+        <div><span class="s">05</span><b>Ship</b>platform services, effect cards</div>
+      </div>
+      <p style="margin-top:18px"><button class="btn pri" data-act="tab" data-v="proto">Open the clickable prototype →</button> <span class="muted" style="font-size:12.5px;margin-left:8px">synthetic data · no live actions</span></p>
+    </section>
+
+    <h2 id="s-review"><span class="n">01</span>Where we are</h2>
+    <p class="sub">Cadence at origin/main <code>9ae2e52</code> (this checkout's main is 28 behind) and AgenticOS v2 at staging <code>c330262</code>.</p>
+    <div class="cards">
+      <div class="card"><h4>Strong foundation</h4><p>Durable messages &amp; jobs, 4 provider adapters, git-native tracker, SHA-pinned verdicts, monitor alerts, secret scan, approval broker for headless Claude, tmux socket per state dir.</p></div>
+      <div class="card"><h4>No front door</h4><p>No release workflow, install script, <code>init</code>/<code>setup</code>. Release dirs are a host convention.</p></div>
+      <div class="card"><h4>UI is a read-mostly board</h4><p>Issue writes only; no launch / send / dispatch / project-create endpoints, and <code>BOARD.md</code> forbids them without auth.</p></div>
+      <div class="card"><h4>Users start empty</h4><p>Lost provider session → blank new session, no replay. Claude intermediate text never stored. No export/backup (rollout backup is a receipt only). Only <code>~/pm</code> is portable.</p></div>
+      <div class="card"><h4>Identity gap</h4><p>Non-agent callers are "the operator" (CAD-280); same-UID socket trust; macOS lacks <code>/proc</code> attribution.</p></div>
+      <div class="card"><h4>AgenticOS v2 is early</h4><p>Email-OTP cookies only, no tokens/OAuth; no approvals (send = owner presses "Post now"); connectors on branches; gateway ledger merged, public billing not. AOS-34 chose Cadence as its agent runtime.</p></div>
+    </div>
+    <div class="callout"><b>Tension to respect:</b> the 09-22 audit recommends freezing L4 autonomy until the unattended acceptance harness (CAD-225) is green — 7 steps UNSUPPORTED. This plan ships chat, continuity, planning and <i>approved</i> delegation first; auto-merge waits for CAD-225.</div>
+
+    <h2 id="s-uireview"><span class="n">02</span>Current UI review</h2>
+    <p class="sub">Measured against the live daemon on this host (357 issues, 78 agents, 6 projects).</p>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Area</th><th>Finding</th><th>Evidence</th><th>Proposed fix</th></tr>
+      <tr><td>Data loading</td><td>Every SSE event calls one <code>refresh()</code> that refetches health, projects, all issues, agents and overview</td><td><code>App.tsx:160-235</code>; SSE payload is <code>{}</code></td><td>Query cache per resource; SSE carries entity diffs that patch the cache</td></tr>
+      <tr><td>API latency</td><td>Tracker re-parsed per request</td><td><span class="chip fail">/api/issues 16.4 s</span> <span class="chip fail">/api/overview 29 s</span> <span class="chip warn">/api/agents 5.8 s</span></td><td>Indexed read model in the store (§07); cached aggregates</td></tr>
+      <tr><td>Routing</td><td>No router; tabs in query string via <code>replaceState</code>, so Back never works; tab union duplicated in 3 places</td><td><code>urlState.ts</code>, <code>Sidebar.tsx:6</code></td><td>Router with nested routes and real history</td></tr>
+      <tr><td>State</td><td>~25 <code>useState</code> hooks in <code>App.tsx</code>, props drilled; four copies of fetch-and-throw write logic</td><td><code>App.tsx:41-70</code>, <code>api.ts</code></td><td>Feature folders; one API client with typed errors</td></tr>
+      <tr><td>Components</td><td>Two 1,000-line drawers with duplicated markup</td><td><code>Drawer.tsx</code> 1,130 · <code>Agents.tsx</code> 953</td><td>Shared <code>Sheet</code> + section components</td></tr>
+      <tr><td>Content</td><td>Plan tab is hard-coded Cadence docs, some stale ("never add dispatch")</td><td><code>Plan.tsx:4-27, 343</code></td><td>Plans become real objects; docs move to project context</td></tr>
+      <tr><td>Signals</td><td>Needs-me mixes information with decisions; counts disagree across screens</td><td>09-22 audit</td><td>Needs-you = decisions only, one per cause</td></tr>
+      <tr><td>Theme &amp; reach</td><td>Dark only, hex duplicated outside tokens; Plan overflows at 390 px</td><td><code>styles.css</code></td><td>Light + dark tokens; phone layout (CAD-140)</td></tr>
+      <tr><td>Persistence</td><td>Only <code>cadence-project-view</code> in localStorage; no server-side prefs except model defaults</td><td><code>urlState.ts:7</code></td><td>Server-side settings + drafts (§07)</td></tr>
+      <tr><td>Tests</td><td>Pure-module tests only; no component or e2e</td><td><code>package.json</code></td><td>Component tests + sandbox e2e (§12)</td></tr>
+    </table></div>
+    <h3>Current → proposed structure</h3>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Today</th><th>Becomes</th><th>Notes</th></tr>
+      <tr><td>Overview</td><td>Home rail: Needs you · Active work · Since you left</td><td>Deploy drift moves to Settings → System</td></tr>
+      <tr><td>Projects (Board)</td><td>Projects → List / Board / Plans</td><td>Board + QuickAdd kept; plan swimlanes added</td></tr>
+      <tr><td>Plan (static docs)</td><td>Project → Context</td><td>Reuses <code>ProjectContext.tsx</code> + <code>/context</code> API</td></tr>
+      <tr><td>Agents</td><td>Agents → transcript or live terminal</td><td>Recovery commands kept in the sheet</td></tr>
+      <tr><td>Memory</td><td>Memory (+ continuity pack preview)</td><td>Quorum/curation unchanged</td></tr>
+      <tr><td>Settings (model defaults)</td><td>Settings → Models · Providers · Autonomy · Platforms · Data · Access · Sandbox</td><td><code>ModelDefaults.tsx</code> reused</td></tr>
+      <tr><td>—</td><td><b>New:</b> Setup, Chat (Home), Platforms, Data &amp; backup</td><td></td></tr>
+    </table></div>
+
+    <h2 id="s-decisions"><span class="n">03</span>Decisions taken</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Question</th><th>Decision</th><th>Consequence</th></tr>
+      <tr><td>Audience</td><td>Public developers, Linux + macOS</td><td>Release matrix; macOS port of attribution and host doctor.</td></tr>
+      <tr><td>Default autonomy</td><td>Plan freely, ask to dispatch; human merges</td><td>Daemon-enforced dispatch gate; auto-merge only after CAD-225.</td></tr>
+      <tr><td>Master providers</td><td>Claude · Codex · Pi (structured)</td><td>Pi headless adapter — also AOS-34 gap #1.</td></tr>
+      <tr><td>Layout</td><td>Chat-first Home</td><td>Router + query-cache rebuild.</td></tr>
+      <tr><td>Managed services</td><td>Generic connected-platform contract; AgenticOS v2 is the reference</td><td>No AgenticOS-specific code outside one platform adapter.</td></tr>
+      <tr><td>Continuity</td><td>Durable store; users never start empty</td><td>Threads, continuity packs, backup/restore, import.</td></tr>
+    </table></div>
+
+    <h2 id="s-arch"><span class="n">04</span>Architecture</h2>
+    <p class="sub">A web UI over the existing daemon. Agents keep using the <code>cadence</code> CLI; authority lives in the daemon and the platform, never in a prompt.</p>
+    <div class="diagram" role="img" aria-label="Architecture: browser, local UI server, daemon, data store, tracker, master and workers, platform proxy, and optional connected platforms with AgenticOS v2 as reference.">
+      <svg viewBox="0 0 980 470" font-family="IBM Plex Sans" font-size="12">
+        <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="var(--mute)"/></marker></defs>
+        <rect x="10" y="10" width="620" height="450" rx="14" fill="none" stroke="var(--line2)" stroke-dasharray="4 4"/>
+        <text x="26" y="34" fill="var(--mute)" font-family="IBM Plex Mono" font-size="11" letter-spacing="1">YOUR MACHINE — LINUX / MACOS</text>
+        <rect x="680" y="10" width="290" height="450" rx="14" fill="none" stroke="var(--gold)" stroke-opacity=".6" stroke-dasharray="4 4"/>
+        <text x="696" y="34" fill="var(--gold)" font-family="IBM Plex Mono" font-size="11" letter-spacing="1">CONNECTED PLATFORMS (OPTIONAL)</text>
+        <rect x="30" y="54" width="180" height="58" rx="10" fill="var(--panel2)" stroke="var(--line2)"/><text x="46" y="78" fill="var(--strong)" font-weight="600">Browser</text><text x="46" y="96" fill="var(--mute)">operator cookie</text>
+        <rect x="245" y="54" width="180" height="58" rx="10" fill="var(--panel2)" stroke="var(--accent)"/><text x="261" y="78" fill="var(--strong)" font-weight="600">UI server</text><text x="261" y="96" fill="var(--mute)">127.0.0.1 · SSE diffs</text>
+        <line x1="210" y1="83" x2="243" y2="83" stroke="var(--mute)" marker-end="url(#ar)"/>
+        <rect x="245" y="150" width="180" height="74" rx="10" fill="var(--panel2)" stroke="var(--accent)"/><text x="261" y="174" fill="var(--strong)" font-weight="600">Daemon</text><text x="261" y="192" fill="var(--mute)">adapters · dispatch gate</text><text x="261" y="208" fill="var(--mute)">monitor · continuity</text>
+        <line x1="335" y1="112" x2="335" y2="148" stroke="var(--mute)" marker-end="url(#ar)"/>
+        <rect x="30" y="150" width="180" height="74" rx="10" fill="var(--panel2)" stroke="var(--line2)"/><text x="46" y="174" fill="var(--strong)" font-weight="600">Tracker ~/pm (git)</text><text x="46" y="192" fill="var(--mute)">projects · plans · issues</text><text x="46" y="208" fill="var(--mute)">decisions · memory</text>
+        <line x1="243" y1="187" x2="212" y2="187" stroke="var(--mute)" marker-end="url(#ar)"/>
+        <rect x="460" y="150" width="150" height="74" rx="10" fill="var(--accent-dim)" stroke="var(--accent)"/><text x="474" y="174" fill="var(--strong)" font-weight="600">Data store</text><text x="474" y="192" fill="var(--soft)">runtime · threads</text><text x="474" y="208" fill="var(--soft)">index · backups</text>
+        <line x1="427" y1="187" x2="458" y2="187" stroke="var(--mute)" marker-end="url(#ar)"/>
+        <rect x="30" y="266" width="190" height="70" rx="10" fill="var(--accent-dim)" stroke="var(--accent)"/><text x="46" y="290" fill="var(--strong)" font-weight="600">Master agent</text><text x="46" y="308" fill="var(--soft)">Claude · Codex · Pi</text><text x="46" y="324" fill="var(--mute)">durable thread, disposable session</text>
+        <rect x="235" y="266" width="200" height="70" rx="10" fill="var(--panel2)" stroke="var(--line2)"/><text x="251" y="290" fill="var(--strong)" font-weight="600">Workers + reviewer</text><text x="251" y="308" fill="var(--soft)">Claude · Codex · Pi · Devin · Cursor</text><text x="251" y="324" fill="var(--mute)">worktree each</text>
+        <rect x="450" y="266" width="160" height="70" rx="10" fill="var(--gold-dim)" stroke="var(--gold)"/><text x="464" y="290" fill="var(--strong)" font-weight="600">Platform proxy</text><text x="464" y="308" fill="var(--soft)">holds credentials</text><text x="464" y="324" fill="var(--soft)">scopes · effect gate</text>
+        <line x1="300" y1="224" x2="140" y2="264" stroke="var(--mute)" marker-end="url(#ar)"/>
+        <line x1="350" y1="224" x2="340" y2="264" stroke="var(--mute)" marker-end="url(#ar)"/>
+        <line x1="220" y1="300" x2="448" y2="300" stroke="var(--gold)" stroke-dasharray="3 3" marker-end="url(#ar)" opacity=".8"/>
+        <rect x="30" y="378" width="580" height="50" rx="10" fill="var(--panel2)" stroke="var(--line2)"/><text x="46" y="402" fill="var(--strong)" font-weight="600">GitHub</text><text x="110" y="402" fill="var(--mute)">PRs · CI · merge queue · optional private remote for the tracker</text>
+        <line x1="335" y1="336" x2="335" y2="376" stroke="var(--mute)" marker-end="url(#ar)"/>
+        <rect x="700" y="54" width="250" height="200" rx="10" fill="var(--panel2)" stroke="var(--gold)"/>
+        <text x="716" y="78" fill="var(--strong)" font-weight="600">AgenticOS v2 — reference</text>
+        <text x="716" y="100" fill="var(--soft)">✓ workspace · threads · files</text>
+        <text x="716" y="118" fill="var(--soft)">✓ AI gateway models (GLM 5.3 Flash)</text>
+        <text x="716" y="136" fill="var(--soft)">◐ connectors FB/IG (branch)</text>
+        <text x="716" y="154" fill="var(--soft)">◐ credits ledger (no public API)</text>
+        <text x="716" y="172" fill="var(--mute)">○ agent credential (AOS-14)</text>
+        <text x="716" y="190" fill="var(--mute)">○ gadgets in Containers (AOS-32)</text>
+        <text x="716" y="208" fill="var(--mute)">○ CRM · WhatsApp · deploy</text>
+        <text x="716" y="236" fill="var(--gold)" font-size="10.5">✓ merged ◐ partial ○ designed / missing</text>
+        <rect x="700" y="270" width="250" height="50" rx="10" fill="var(--panel2)" stroke="var(--line2)"/><text x="716" y="292" fill="var(--strong)" font-weight="600">Cloudflare (own account)</text><text x="716" y="309" fill="var(--mute)">Workers deploy via wrangler</text>
+        <rect x="700" y="332" width="250" height="50" rx="10" fill="var(--panel2)" stroke="var(--line2)"/><text x="716" y="354" fill="var(--strong)" font-weight="600">Any platform</text><text x="716" y="371" fill="var(--mute)">auth · MCP tools · effects · usage</text>
+        <line x1="612" y1="296" x2="698" y2="200" stroke="var(--gold)" marker-end="url(#ar)"/>
+        <line x1="612" y1="302" x2="698" y2="296" stroke="var(--gold)" marker-end="url(#ar)"/>
+        <line x1="612" y1="308" x2="698" y2="352" stroke="var(--gold)" marker-end="url(#ar)"/>
+        <line x1="427" y1="70" x2="698" y2="70" stroke="var(--gold)" stroke-dasharray="3 3" marker-end="url(#ar)"/><text x="470" y="62" fill="var(--gold)" font-size="10.5">connect (operator only)</text>
+        <text x="696" y="410" fill="var(--mute)" font-size="10.5">Hosted mode (AOS-34): the same Cadence</text>
+        <text x="696" y="426" fill="var(--mute)" font-size="10.5">runs in a platform Container; the platform</text>
+        <text x="696" y="442" fill="var(--mute)" font-size="10.5">keeps only a rebuildable projection.</text>
+      </svg>
+    </div>
+
+    <h2 id="s-install"><span class="n">05</span>Install &amp; setup</h2>
+    <div class="cards">
+      <div class="card"><h4>One command</h4><p><code>curl -fsSL https://raw.githubusercontent.com/favcrm/cadence/main/install.sh | sh</code> — OS/arch detect, tarball + <code>.sha256</code>, <code>~/.local/share/cadence/releases/&lt;ver&gt;/</code>, link <code>~/.local/bin/cadence</code>, then <code>cadence setup</code>. <code>--prefix</code> for sandboxes.</p></div>
+      <div class="card"><h4>Or an agent prompt</h4><p><code>docs/INSTALL-AGENT.md</code>: paste into Claude Code / Codex / Cursor. Runs installer and <code>cadence setup --json --no-open</code>; reports URL and each failed check with its fix.</p></div>
+      <div class="card"><h4><code>cadence setup</code></h4><p>Idempotent: state dir → tracker → skill → daemon → UI → operator login link. Detects an existing install and <b>never re-initialises over it</b>.</p></div>
+      <div class="card"><h4>Start options (wizard step 1)</h4><p><b>Start fresh</b> · <b>Restore a backup</b> (bundle file) · <b>Connect my tracker</b> (git URL) · <b>Import</b> local repos and GitHub issues. Repo paths are remapped by remote URL.</p></div>
+      <div class="card"><h4>Release &amp; upgrade</h4><p>Tag <code>v*</code> → linux x86_64/aarch64 + macOS arm64 with UI embedded, checksums. <code>cadence self-update</code> takes an automatic backup, swaps the link, <code>daemon restart --when-idle</code>.</p></div>
+    </div>
+
+    <h2 id="s-trust"><span class="n">06</span>Identity &amp; trust</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Identity</th><th>Proven by</th><th>Can</th><th>Cannot</th></tr>
+      <tr><td>Operator</td><td>0600 token → single-use login link → HttpOnly SameSite=Strict cookie; existing Host/Origin/marker guards stay</td><td>Launch, approve plans, answer permissions, merge, press effect cards, connect platforms, restore backups</td><td>—</td></tr>
+      <tr><td>Agents</td><td>Pane/process ancestry (<code>/proc</code>, macOS <code>libproc</code>), registered alias</td><td><code>cadence</code> CLI within role; platform tools via the proxy within scope</td><td>Operator endpoints; see credentials; approve own work; execute <code>send</code> effects</td></tr>
+      <tr><td>Platform account</td><td>Platform's agent-credential exchange (AgenticOS: AOS-14, proposed as device-style code + email OTP). Stored in OS keychain, 0600 fallback</td><td>Back the proxy with scoped, revocable access</td><td>Enter agent env/argv (CAD-108), the tracker, or backups</td></tr>
+      <tr><td>Hosted bridge</td><td>Allowlisted, identity-bound control API (AOS-34 gap #4)</td><td>Platform drives Cadence in a Container</td><td>Use the same-UID socket</td></tr>
+    </table></div>
+
+    <h2 id="s-store"><span class="n">07</span>Data store &amp; continuity — never start empty</h2>
+    <p class="sub">Today a lost provider session restarts blank, Claude's intermediate text is never stored, and nothing but <code>~/pm</code> survives a new machine.</p>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Layer</th><th>Holds</th><th>Where</th><th>Portable via</th></tr>
+      <tr><td>Decisions &amp; work</td><td>Projects, plans, issues, approvals, verdict refs, memory</td><td><code>~/pm</code> git (unchanged, source of truth)</td><td>git remote; repo paths remapped by remote URL</td></tr>
+      <tr><td>Runtime</td><td>Agents, messages, jobs, verdicts, monitors</td><td><code>cadence.sqlite3</code> (unchanged)</td><td>backup bundle</td></tr>
+      <tr><td><b>Threads</b> <span class="chip acc">new</span></td><td>Conversations: messages, parts (text, tool call, plan card, effect card), redacted tool I/O, attachments</td><td>new tables in the store</td><td>backup bundle · optional platform sync</td></tr>
+      <tr><td><b>Continuity packs</b> <span class="chip acc">new</span></td><td>Rolling summary per thread, open decisions, active plan state, operator preferences</td><td>store + preferences as tracker notes</td><td>bundle; preferences via git</td></tr>
+      <tr><td><b>Read model</b> <span class="chip acc">new</span></td><td>Issue/project index, overview aggregates</td><td>store, rebuilt from git on HEAD change</td><td>never exported — rebuildable</td></tr>
+      <tr><td><b>Settings &amp; drafts</b> <span class="chip acc">new</span></td><td>Wizard progress, UI prefs, unsent drafts, platform connections (metadata only)</td><td>store</td><td>bundle (no credentials)</td></tr>
+    </table></div>
+    <div class="cards">
+      <div class="card"><h4>Thread ≠ provider session</h4><p>The master's conversation is a Cadence thread. A provider session is disposable: when it is lost, compacted or the provider changes, a new session starts with the <b>continuity pack</b> (summary + last N turns + plan state + preferences) instead of blank.</p></div>
+      <div class="card"><h4>Summaries without extra spend</h4><p>The master writes a checkpoint summary at plan approval and every ~40 turns as part of its own turn; Cadence stores it. No hidden model calls.</p></div>
+      <div class="card"><h4>Backup that is a backup</h4><p><code>cadence backup</code> uses SQLite online backup + manifest (schema, sha256, versions); nightly by default, keep 7. Replaces receipt-only rollout backups and gates <code>self-update</code>.</p></div>
+      <div class="card"><h4>Export / restore</h4><p><code>cadence export --bundle</code> → one file: store snapshot, tracker remote, repo map, briefings. Credentials excluded, secret-scanned. <code>cadence restore</code> or wizard "Restore a backup".</p></div>
+      <div class="card"><h4>Retention</h4><p>Roll up delivery-noise events (30k of 50k live rows are <code>submitting</code>); archive threads, never silently delete; <code>agent rm</code> keeps thread history unless asked.</p></div>
+      <div class="card"><h4>Platform sync (optional)</h4><p>Encrypted bundle to the platform's files API (AgenticOS v2 files merged, AOS-41) and a status projection of plans/threads — the platform never becomes the authority (AOS-34 rule).</p></div>
+    </div>
+
+    <h2 id="s-master"><span class="n">08</span>Master agent: chat, projects, plans, delegation</h2>
+    <div class="cards">
+      <div class="card"><h4>Chat transport</h4><p>Adapters emit payload events (<code>assistant_text</code>, <code>tool_call</code>, <code>tool_result</code>, <code>turn_result</code>) written to the thread. Claude adapter extended; Codex already persists messages; Pi adapter via <code>--mode rpc</code>. <code>/api/threads/:id</code>, <code>/messages</code>, <code>/stream</code>, <code>/interrupt</code>.</p></div>
+      <div class="card"><h4>Tools = cadence CLI</h4><p>New verbs: <code>cadence project new</code>, <code>cadence plan propose --file plan.yaml</code>, <code>cadence thread summary</code>. Platform tools arrive through the proxy as MCP.</p></div>
+      <div class="card"><h4>Plan card → approval</h4><p><code>plan_proposed</code> renders as a card: Approve / Request changes / Reject. Approval is a tracker commit; issues move to <code>ready</code>.</p></div>
+      <div class="card"><h4>Dispatch gate (daemon)</h4><p>Master <code>dispatch</code>/<code>join</code> refused unless the issue is in an approved plan and cap, slot and quota evidence allow it. One alert per cause.</p></div>
+      <div class="card"><h4>Permissions &amp; effects inline</h4><p>Broker requests → Allow once / Deny. Platform <code>send</code> effects → effect card the operator presses (matches v2's "Post now").</p></div>
+      <div class="card"><h4>Terminal workers</h4><p>Devin/Cursor keep the pty contract; the UI shows a live read-only terminal with the attach command.</p></div>
+    </div>
+    <h3>Why not drive the master through a pty?</h3>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th></th><th>PTY only</th><th>Structured only</th><th>Hybrid <span class="chip acc">recommended</span></th></tr>
+      <tr><td>Input</td><td>Paste + ready gate: busy-probes-idle (CAD-285), ghost text (CAD-294), <code>/ ! @</code> prefixes</td><td>One JSON line per turn</td><td>Structured channel carries turns</td></tr>
+      <tr><td>Output</td><td>ANSI redraws; turn end guessed (CAD-105)</td><td>Typed events → cards, chips, thread storage</td><td>Structured events are the source of truth</td></tr>
+      <tr><td>Approvals</td><td>Numbered menus stall (CAD-102, CAD-269)</td><td>Broker → inline</td><td>Broker</td></tr>
+      <tr><td>Native feel</td><td>Real TUI</td><td>None</td><td>Browser terminal (xterm.js over <code>tmux -C</code>) as a view; Codex TUI can attach to the same thread</td></tr>
+    </table></div>
+
+    <h2 id="s-platforms"><span class="n">09</span>Connected platforms — AgenticOS v2 as reference</h2>
+    <p class="sub">Cadence integrates with a <b>platform contract</b>, not a vendor. AgenticOS v2 is the first implementation; a user's own Cloudflare account is the second.</p>
+    <div class="cards">
+      <div class="card"><h4>1 · Connect</h4><p>Credential exchange started by the operator: device-style code, platform sign-in, scope consent, revocable credential returned to Cadence. No cookies copied.</p></div>
+      <div class="card"><h4>2 · Tools</h4><p>MCP tools (local proxy first, remote Streamable HTTP later). Every tool declares an <b>effect</b>: <code>read</code>, <code>draft</code>, <code>send</code> (message, publish, deploy, spend).</p></div>
+      <div class="card"><h4>3 · Effect gate</h4><p><code>read</code>/<code>draft</code> run within scope. <code>send</code> returns a pending effect; the operator presses it in Cadence (and the platform may ask again). Agents never execute sends.</p></div>
+      <div class="card"><h4>4 · Usage &amp; files</h4><p>Optional: model access (gateway), usage/credits read-out, file storage for encrypted backups, status projection.</p></div>
+    </div>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>User-facing service</th><th>AgenticOS v2 today</th><th>Needed from AgenticOS</th><th>Fallback / other platform</th></tr>
+      <tr><td>Sign-in for Cadence</td><td><span class="chip fail">cookie-only, no tokens</span></td><td>AOS-14 scoped agent credential (+ exchange flow; no ticket for OAuth/device yet)</td><td>—</td></tr>
+      <tr><td>Business records / CRM</td><td><span class="chip warn">AOS-14 plans CRM/leads read scopes</span></td><td>CRM read tools over v2 API</td><td>v1 MCP <code>crm.*</code> during transition</td></tr>
+      <tr><td>WhatsApp inbox</td><td><span class="chip warn">connector "coming soon"</span></td><td>WhatsApp Business connector with <code>read</code>/<code>send</code> effects</td><td>v1 inbox via FavCRM</td></tr>
+      <tr><td>Connectors</td><td><span class="chip warn">FB/IG on unmerged branches</span></td><td>Merge marketplace + expose tools with effects</td><td>—</td></tr>
+      <tr><td>Deploy / hosting</td><td><span class="chip fail">none; Container gadgets designed (AOS-32)</span></td><td>Gadget/app publish with preview + production</td><td><b>Cloudflare own account</b> (wrangler) platform</td></tr>
+      <tr><td>Models &amp; credits</td><td><span class="chip warn">GLM 5.3 Flash; ledger merged, billing routes not</span></td><td>Gateway key for Pi; usage read-out</td><td>User's own provider keys</td></tr>
+      <tr><td>Threads &amp; files</td><td><span class="chip ok">threads + files API merged</span></td><td>Append/import API for agent messages (none today)</td><td>Local-only continuity</td></tr>
+      <tr><td>Approvals</td><td><span class="chip">removed in v2 — in-thread "Post now"</span></td><td>Nothing: Cadence effect cards mirror the pattern</td><td>—</td></tr>
+    </table></div>
+    <h3>Two directions, one set of work</h3>
+    <p>AOS-34 wants AgenticOS to <b>host</b> Cadence (Pi in Containers, Company DO projection). Building the local product closes most of its six Cadence gaps on the way:</p>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>AOS-34 gap</th><th>Closed by</th><th>Phase</th></tr>
+      <tr><td>1 · Pi headless adapter</td><td>Pi master/worker adapter</td><td>P1</td></tr>
+      <tr><td>2 · Non-SHA typed evidence</td><td>Effect/gadget evidence records bound to attempt</td><td>P4</td></tr>
+      <tr><td>3 · Hosted durability</td><td>Backup bundle + store replication seam</td><td>P0/P1</td></tr>
+      <tr><td>4 · Authenticated control</td><td>Operator auth → identity-bound bridge</td><td>P0 → P4</td></tr>
+      <tr><td>5 · Real cancellation</td><td>Interrupt/stop that ends the provider turn + reconcile</td><td>P1</td></tr>
+      <tr><td>6 · Idle/wake contract</td><td>Next-deadline API from the monitor</td><td>P4</td></tr>
+    </table></div>
+
+    <h2 id="s-loop"><span class="n">10</span>The autonomous delivery loop</h2>
+    <p class="sub">✋ marks human gates at the default level.</p>
+    <div class="diagram" role="img" aria-label="Loop: goal, plan, approve, dispatch, implement, independent review, merge, send or deploy, learn.">
+      <svg viewBox="0 0 980 170" font-family="IBM Plex Sans" font-size="12"><g id="loop"></g></svg>
+    </div>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Level (per project)</th><th>Plan</th><th>Dispatch</th><th>Merge</th><th>Send / deploy (effects)</th><th>Unlock</th></tr>
+      <tr><td>Ask for everything</td><td>✋</td><td>✋ each</td><td>✋</td><td>✋</td><td>—</td></tr>
+      <tr><td>Approve plans <span class="chip acc">default</span></td><td>✋</td><td>auto within plan</td><td>✋</td><td>✋</td><td>—</td></tr>
+      <tr><td>Routine merges auto</td><td>✋</td><td>auto</td><td>auto if routine + PASS on head</td><td>✋ · preview deploys auto</td><td>CAD-225 green</td></tr>
+    </table></div>
+    <p>Always human: risk class <code>human</code> (trust boundary, migrations, secrets, deps/CI, &gt;1500 lines, 3rd review round), releases, repo settings, every platform <code>send</code> effect.</p>
+
+    <h2 id="s-ui"><span class="n">11</span>UI revamp</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Route</th><th>Screen</th><th>Main data</th></tr>
+      <tr><td><code>/setup/*</code></td><td>Wizard: start · environment · platforms · master · workspace · team · launch</td><td><code>setup --json</code> checks, settings</td></tr>
+      <tr><td><code>/</code></td><td>Home: thread + rail (Needs you, Active work, Since you left, Platforms)</td><td>threads, needs, agents</td></tr>
+      <tr><td><code>/projects/:key/{list,board,plans,context}</code></td><td>Projects</td><td>index read model, plans</td></tr>
+      <tr><td><code>/agents/:alias</code></td><td>Transcript or live terminal</td><td>thread events / pane stream</td></tr>
+      <tr><td><code>/platforms/:id</code></td><td>Connected platform: services, access matrix, pending effects</td><td>proxy state</td></tr>
+      <tr><td><code>/memory</code>, <code>/settings/*</code></td><td>Memory; Models, Providers, Autonomy, Data, Access, Sandbox</td><td>store settings</td></tr>
+    </table></div>
+    <div class="cards">
+      <div class="card"><h4>Frontend structure</h4><p><code>src/app</code> (router, shell) · <code>src/features/{home,threads,projects,agents,platforms,settings,setup}</code> · <code>src/shared/{ui,api,sse}</code>. TanStack Router + Query; SSE diffs patch the cache.</p></div>
+      <div class="card"><h4>Design tokens</h4><p>Keep Cadence identity (graphite, teal, IBM Plex). Add light theme. Platform-branded surfaces (consent, platform page header) use the platform's own tokens — AgenticOS v2: Plus Jakarta Sans, paper <code>#fafafa</code>, act <code>#f5b544</code>.</p></div>
+      <div class="card"><h4>Reach</h4><p>390 px layout, keyboard (<kbd>⌘K</kbd>, <kbd>A</kbd> approve, <kbd>Esc</kbd> interrupt), explicit loading / empty / offline / stale states.</p></div>
+    </div>
+
+    <h2 id="s-sandbox"><span class="n">12</span>Sandbox testing mode</h2>
+    <p class="sub">The production daemon runs on this instance (<code>~/.local/state/cadence</code>, :3010, tailnet :9450, <code>~/pm</code>). Testing must never touch it, restart it or repoint <code>~/.local/bin/cadence</code>.</p>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Resource</th><th>Isolated today?</th><th>Sandbox handling</th></tr>
+      <tr><td>State dir, socket, SQLite</td><td><span class="chip ok">yes</span> <code>CADENCE_STATE_DIR</code></td><td><code>&lt;root&gt;/state</code></td></tr>
+      <tr><td>Tracker</td><td><span class="chip ok">yes</span> <code>CADENCE_PM_DIR</code></td><td><code>&lt;root&gt;/pm</code>, no remote — or a <b>restored copy</b> of a production bundle to test continuity</td></tr>
+      <tr><td>tmux panes</td><td><span class="chip ok">yes</span> socket = hash(state dir)</td><td>automatic</td></tr>
+      <tr><td>UI port / tailnet</td><td><span class="chip warn">flag only</span></td><td>auto 3110+; refuse tailnet; SANDBOX banner</td></tr>
+      <tr><td>Skill sync on start</td><td><span class="chip fail">no</span></td><td>skip or sync into <code>&lt;root&gt;/home</code></td></tr>
+      <tr><td>Cursor <code>cli-config.json</code></td><td><span class="chip fail">no</span></td><td>refused unless <code>--allow-global</code></td></tr>
+      <tr><td>Provider WAL checkpoints</td><td><span class="chip fail">no</span></td><td>observe-only</td></tr>
+      <tr><td>Platforms</td><td>—</td><td>mock platform (credential exchange + MCP + effects) or AgenticOS v2 staging</td></tr>
+    </table></div>
+    <div class="phases">
+      <div class="phase"><div class="id">S1</div><div><h4>Profile sandbox — same user</h4><ul><li><code>cadence sandbox up [name] [--from-backup file]</code>: marker file, own state/pm/port, worktree build only, fake scripted master by default.</li><li>Guards: refuse production dir/socket/port; global side effects off; <code>reset</code> deletes only marked dirs.</li></ul><div class="exit">Exit: wizard → restore → chat → plan → fake worker → review → merge card, with production <code>cadence status</code> unchanged.</div></div></div>
+      <div class="phase"><div class="id">S2</div><div><h4>Fresh-user sandbox</h4><ul><li>Linux user <code>cadence-sbx</code> (operator creates with sudo): real <code>install.sh --prefix</code> from a local tarball, separate UID.</li></ul><div class="exit">Exit: a teammate follows only the install prompt and reaches a working chat.</div></div></div>
+      <div class="phase"><div class="id">S3</div><div><h4>Clean-machine CI</h4><ul><li>Docker <code>ubuntu:24.04</code> + <code>macos-14</code>: install, <code>setup --json</code>, headless browser walks the wizard with fake providers and the mock platform; includes a backup → restore round-trip.</li></ul><div class="exit">Exit: required on release tags.</div></div></div>
+    </div>
+
+    <h2 id="s-phases"><span class="n">13</span>Phases</h2>
+    <div class="phases">
+      <div class="phase"><div class="id">P0</div><div><h4>Foundation</h4><ul><li>Sync local main; sandbox S1</li><li>Release workflow, <code>install.sh</code>, <code>setup --json</code>, <code>self-update</code></li><li>Operator auth + ADR (class human); macOS port</li><li><code>cadence backup / export / restore</code>; event roll-up</li></ul><div class="exit">Exit: S3 installs on Linux + macOS; backup → restore round-trip passes; production untouched.</div></div></div>
+      <div class="phase"><div class="id">P1</div><div><h4>Chat &amp; continuity</h4><ul><li>Threads store, payload events, Pi adapter, real interrupt</li><li>Continuity packs on session loss/compaction; read model (issues/overview in &lt;300 ms)</li><li>Wizard with start options; chat-first Home; router/query rebuild</li></ul><div class="exit">Exit: kill the master's provider session mid-plan → new session resumes with plan state and summary.</div></div></div>
+      <div class="phase"><div class="id">P2</div><div><h4>Projects &amp; plans</h4><ul><li><code>project new</code>, <code>plan propose</code>, plan card, approval commit, dispatch gate</li></ul></div></div>
+      <div class="phase"><div class="id">P3</div><div><h4>Delegation</h4><ul><li>Join/dispatch from approved plans, reviewer routing, merges in Needs-you, terminal view</li></ul></div></div>
+      <div class="phase"><div class="id">P4</div><div><h4>Connected platforms</h4><ul><li>Platform contract, proxy, effect gate, Platforms screen; Cloudflare-own-account platform first (works today)</li><li>AgenticOS v2 adapter as AOS-14 lands; joint AOS-34 spike (hosted mode)</li></ul></div></div>
+      <div class="phase"><div class="id">P5</div><div><h4>Autonomy dial</h4><ul><li>"Routine merges auto" per project after CAD-225</li></ul></div></div>
+    </div>
+
+    <h2 id="s-risks"><span class="n">14</span>Risks</h2>
+    <div class="tblwrap"><table class="tbl">
+      <tr><th>Risk</th><th>Mitigation</th></tr>
+      <tr><td>Trust-boundary changes</td><td>ADR first; class <code>human</code>; independent security review.</td></tr>
+      <tr><td>Prompt injection from repos or platform data</td><td>Gates in the daemon and effect gate; agents never hold credentials; per-agent scopes.</td></tr>
+      <tr><td>Secrets in threads and bundles</td><td>Secret scan on persisted tool I/O and on export; credentials never exported.</td></tr>
+      <tr><td>Store growth</td><td>Event roll-up, thread archive, size shown in Settings → Data.</td></tr>
+      <tr><td>AgenticOS v2 timeline</td><td>Contract-first; Cloudflare platform ships independently; v1 tools only as a bridge.</td></tr>
+      <tr><td>Sandbox leaking into production</td><td>Markers, same-dir refusal, profile-gated side effects, worktree binary.</td></tr>
+    </table></div>
+
+    <h2 id="s-open"><span class="n">15</span>Open decisions</h2>
+    <ul class="tight">
+      <li><b>AgenticOS credential flow:</b> propose device-style exchange as part of AOS-14 (needs an AOS ticket).</li>
+      <li><b>Deploy:</b> ship Cloudflare-own-account first, adopt AgenticOS gadget/app publish when AOS-32 lands?</li>
+      <li><b>Thread sync:</b> ask AgenticOS for an append/import API, or keep sync to encrypted backups + projection?</li>
+      <li><b>Tracker remote on first run:</b> offer to create a private GitHub repo for <code>~/pm</code> during setup?</li>
+      <li><b>S2 user</b> needs sudo on this host — operator action.</li>
+    </ul>
+    <p class="muted" style="margin-top:28px;font-size:12.5px">Sources: Cadence origin/main 9ae2e52 (store.rs, ui.rs, adapters, rollout.rs), live API timings on this host, 09-22 audit; AgenticOS v2 staging c330262 (auth.md, workspace.md, chat-socket.md, cadence-runtime-reuse.md, connectors README, billing.md), AOS-14/27/30/31/32/34. Mockup data is synthetic.</p>
+  </article>
+</div>
+</main>
+
+<!-- ===================== PROTOTYPE ===================== -->
+<main id="proto" class="proto" hidden>
+  <div class="story" role="tablist" aria-label="Flow" id="story"></div>
+  <div class="stage"><div class="device" id="device"><div class="appframe" id="frame"></div></div></div>
+</main>
+
+<div id="overlay"></div>
+
+<script>
+(function(){
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+const S={tab:'plan',screen:'install',step:0,narrow:false,sim:'normal',sbx:false,
+  checks:null,aos:false,aosScopes:{know:true,crm:true,leads:true,files:true,threads:false,wa:true},start:'restore',restored:false,consentStep:0,platTab:'aos',cf:false,
+  master:'claude',model:'opus',effort:'medium',aosCredits:false,
+  repo:'~/code/reminders',maxw:3,reviewer:'claude',workers:{claude:true,codex:true,pi:true,devin:false,cursor:true},dial:1,
+  launched:false,launching:0,
+  planApproved:false,perm:null,ff:false,merge:false,deploy:null,extra:[],typing:false,showRail:false,
+  board:null,agent:'w1',setTab:'providers',toast:null};
+
+/* ---------- theme ---------- */
+function applyTheme(t){ if(t) document.documentElement.setAttribute('data-theme',t); }
+try{ applyTheme(localStorage.getItem('cad-theme')); }catch(e){}
+function toggleTheme(){
+  const cur=document.documentElement.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark');
+  const n=cur==='light'?'dark':'light'; applyTheme(n); try{localStorage.setItem('cad-theme',n)}catch(e){}
+}
+
+/* ---------- loop diagram ---------- */
+(function loop(){
+  const steps=[['Goal','you'],['Plan','master'],['✋ Approve','plan'],['Dispatch','daemon gate'],['Implement','workers'],['Review','independent'],['✋ Merge','default'],['✋ Deploy','external'],['Learn','retro→memory']];
+  let g='';const w=100,gap=8;
+  steps.forEach((s,i)=>{const x=10+i*(w+gap);const gate=s[0].startsWith('✋');
+    g+=`<path d="M${x} 50 h${w-12} l12 30 l-12 30 h-${w-12} ${i?'l12 -30 l-12 -30':'v-60'}z" fill="${gate?'var(--warn-dim)':'var(--panel2)'}" stroke="${gate?'var(--warn)':'var(--line2)'}"/>
+    <text x="${x+w/2+2}" y="77" text-anchor="middle" fill="var(--strong)" font-weight="600">${s[0]}</text>
+    <text x="${x+w/2+2}" y="95" text-anchor="middle" fill="var(--mute)" font-size="10.5">${s[1]}</text>`;});
+  g+=`<path d="M${10+8*(w+gap)+w/2} 112 C 900 160, 80 160, 60 112" fill="none" stroke="var(--accent)" stroke-dasharray="4 4"/>
+      <text x="490" y="160" text-anchor="middle" fill="var(--accent)" font-size="11" font-family="IBM Plex Mono">lessons feed the next plan · revise ≤2 rounds then escalate</text>
+      <text x="10" y="30" fill="var(--mute)" font-size="11" font-family="IBM Plex Mono">DEFAULT LEVEL: "APPROVE PLANS"</text>`;
+  document.getElementById('loop').innerHTML=g;
+})();
+
+/* ---------- data ---------- */
+const SCREENS=[['install','Install'],['setup','Setup wizard'],['home','Home · chat'],['projects','Projects'],['agents','Agents'],['services','Platforms'],['settings','Settings']];
+const STEPS=[['Start','fresh · restore · import'],['Environment','checks & fixes'],['Platforms','optional services'],['Master agent','provider & model'],['Workspace','tracker & first project'],['Team & autonomy','workers, reviewer, dial'],['Launch','review & start']];
+const CHECKS=[
+ {n:'git',d:'2.47.1',s:'ok'},{n:'tmux',d:'3.5a · needed for Devin/Cursor panes',s:'ok'},{n:'gh',d:'2.63 · signed in as @harbor-dev',s:'ok'},
+ {n:'claude',d:'signed in · Claude Max',s:'ok'},{n:'codex',d:'signed in · ChatGPT Pro',s:'ok'},
+ {n:'pi',d:'installed · no model credentials',s:'warn',fix:'pi auth check --provider anthropic',alt:'or use the AgenticOS AI gateway (step 3)'},
+ {n:'cursor-agent',d:'signed in',s:'ok'},{n:'devin',d:'not installed · optional worker',s:'fail',fix:'curl -fsSL https://cli.devin.ai/install.sh | bash',opt:true}];
+const ISSUES=[
+ {id:'RMD-1',t:'Scaffold Worker, wrangler config and cron trigger',p:'codex',a:'w1',risk:'routine',acc:3,st:'doing'},
+ {id:'RMD-2',t:'Read upcoming bookings from AgenticOS CRM',p:'claude',a:'w2',risk:'routine',acc:4,st:'doing'},
+ {id:'RMD-3',t:'Send WhatsApp reminder via approved template',p:'pi',a:'w3',risk:'human',acc:4,st:'ready',dep:'RMD-2'},
+ {id:'RMD-4',t:'Tests, preview deploy and runbook',p:'cursor',a:'w4',risk:'routine',acc:3,st:'ready',dep:'RMD-1'}];
+const AGENTS=[
+ {id:'master',p:'claude',role:'Master · PM',m:'opus · medium',st:'chatting',kind:'chat'},
+ {id:'w1',p:'codex',role:'Worker',m:'gpt-5.5-codex · high',st:'implementing RMD-1 · 18m',kind:'chat'},
+ {id:'w2',p:'claude',role:'Worker',m:'sonnet · medium',st:'implementing RMD-2 · 11m',kind:'chat'},
+ {id:'w3',p:'pi',role:'Worker',m:'aos-gateway/glm · low',st:'idle · waiting on RMD-2',kind:'chat'},
+ {id:'w4',p:'cursor',role:'Worker (pane)',m:'auto',st:'queued · RMD-4 after RMD-1',kind:'pty'},
+ {id:'rev-1',p:'claude',role:'Reviewer',m:'opus · high',st:'idle',kind:'chat'}];
+const PL={claude:'Cl',codex:'Cx',pi:'Pi',devin:'Dv',cursor:'Cu'};
+const av=(p,t)=>`<span class="av ${p}" title="${p}">${t||PL[p]||'?'}</span>`;
+
+/* ---------- chrome ---------- */
+function syncChrome(){
+  document.querySelectorAll('[data-act="tab"]').forEach(b=>{ if(b.closest('.seg')) b.setAttribute('aria-pressed',b.dataset.v===S.tab)});
+  ['plan','direction','proposal','proto'].forEach(k=>{$('#'+k).hidden=S.tab!==k});
+  ['#vpseg','#simbtn','#sbxbtn'].forEach(id=>$(id).hidden=S.tab!=='proto');
+  document.querySelectorAll('#vpseg button').forEach(b=>b.setAttribute('aria-pressed',(b.dataset.v==='narrow')===S.narrow));
+  $('#simbtn').textContent='Sim: '+(S.sim==='normal'?'normal':'daemon offline');
+  $('#sbxbtn').textContent='Sandbox: '+(S.sbx?'on':'off');
+  $('#device').classList.toggle('narrow',S.narrow);
+}
+
+/* ---------- screens ---------- */
+function story(){
+  return SCREENS.map(([k,l],i)=>`<button role="tab" data-act="go" data-v="${k}" aria-current="${S.screen===k}"><span class="i">0${i+1}</span>${l}</button>`).join('');
+}
+function url(){
+  const m={install:'terminal',setup:'127.0.0.1:3010/setup',home:'127.0.0.1:3010/',projects:'127.0.0.1:3010/projects/reminders',agents:'127.0.0.1:3010/agents/'+S.agent,services:'127.0.0.1:3010/services',settings:'127.0.0.1:3010/settings/'+S.setTab};
+  const port=S.sbx?'3110':'3010';
+  return (m[S.screen]||'').replace('3010',port);
+}
+function frame(){
+  let h=`<div class="urlbar"><i></i><i></i><i></i><div class="u">${S.screen==='install'?'~ — bash':'http://'+url()}</div></div>`;
+  if(S.sbx&&S.screen!=='install') h+=`<div class="sbx"><b>SANDBOX · onboarding-1</b><span>state ~/.local/state/cadence-sandbox/onboarding-1 · port 3110 · fake providers · AgenticOS mock</span></div>`;
+  if(S.screen==='install') return h+install();
+  if(S.screen==='setup') return h+setup();
+  return h+`<div class="app">${nav()}<div class="main">${S.sim==='offline'?`<div class="offline"><span class="dot"></span><b>Daemon unreachable</b> — last contact 42s ago. Showing cached data; writes are paused. <code>cadence daemon start</code></div>`:''}${topbar()}<div class="body">${({home,projects,agents,services,settings})[S.screen]()}</div></div></div>`;
+}
+function nav(){
+  const needs=needCount();
+  const it=[['home','⌂','Home',needs?`<span class="badge">${needs}</span>`:''],['projects','▦','Projects',''],['agents','◉','Agents',''],['services','◆','Platforms',S.aos||S.cf?'':'<span class="badge" style="background:var(--gold-dim);color:var(--gold)">off</span>'],['settings','⚙','Settings','']];
+  return `<nav class="nav" aria-label="Main">
+    <div class="logo"><svg width="20" height="20" viewBox="0 0 1024 1024"><rect width="1024" height="1024" rx="224" fill="#0B0B0C"/><path d="M232 336 416 512 232 688" fill="none" stroke="#2DD4BF" stroke-opacity=".55" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/><path d="M408 336 592 512 408 688" fill="none" stroke="#2DD4BF" stroke-width="120" stroke-linecap="round" stroke-linejoin="round"/></svg>Cadence</div>
+    ${it.map(([k,ic,l,b])=>`<button data-act="go" data-v="${k}" aria-current="${S.screen===k?'page':'false'}"><span aria-hidden="true">${ic}</span><span class="lbl2">${l}</span>${b}</button>`).join('')}
+    <div class="sect">Projects</div>
+    <button data-act="go" data-v="projects"><span class="dot" style="color:var(--accent)"></span><span class="lbl2">reminders</span></button>
+    <button data-act="go" data-v="projects"><span class="dot" style="color:var(--mute)"></span><span class="lbl2">storefront</span></button>
+    <div class="foot">operator · signed in<br><span class="num">cadence 0.2.0</span></div>
+  </nav>`;
+}
+function topbar(){
+  const t={home:['Home','Master'],projects:['Projects','reminders'],agents:['Agents',S.agent],services:['Platforms',{aos:'AgenticOS v2',cf:'Cloudflare',add:'Add'}[S.platTab]],settings:['Settings',S.setTab]}[S.screen];
+  return `<div class="topbar"><div class="crumb">${t[0]} / <b>${t[1]}</b></div><div class="spacer"></div>
+   ${S.screen==='home'?`<button class="btn sm railtoggle" data-act="rail">${S.showRail?'← Chat':'Needs you ('+needCount()+')'}</button>`:''}
+   <span class="chip ${S.sim==='offline'?'fail':'ok'} hide-n"><span class="dot"></span>${S.sim==='offline'?'daemon offline':'daemon live'}</span>
+   ${S.aos?`<span class="chip gold hide-n">◆ AgenticOS · Harbor Bakery</span>`:''}</div>`;
+}
+
+/* install */
+function install(){
+  return `<div class="install">
+  <div class="term" aria-label="Terminal"><div class="bar"><i></i><i></i><i></i><span style="margin-left:8px">~ — bash — 96×30</span></div><pre id="termtext">${termText()}</pre></div>
+  <div class="stack">
+    <div class="box"><div class="hd"><h5>Or paste this into your coding agent</h5><button class="btn sm" data-act="copy">Copy</button></div>
+      <div class="bd"><pre class="mono" style="margin:0;white-space:pre-wrap;font-size:12px;color:var(--soft)">Install Cadence on this machine and set it up.
+1. Run: curl -fsSL https://raw.githubusercontent.com/favcrm/cadence/main/install.sh | sh
+2. Run: cadence setup --json --no-open
+3. For every check with status != "ok", run its "fix"
+   command if it is safe and local; otherwise tell me.
+4. Reply with the login URL and a one-line summary
+   per check. Do not sign in to any provider for me.</pre></div></div>
+    <div class="box"><div class="hd"><h5>What setup does</h5><span class="chip">idempotent</span></div>
+      <div class="bd" style="font-size:13px">
+        <div class="ck"><span class="b on">✓</span>State dir <code>~/.local/state/cadence</code> (0700)</div>
+        <div class="ck"><span class="b on">✓</span>Tracker <code>~/pm</code> (git) + hooks</div>
+        <div class="ck"><span class="b on">✓</span>Agent skill → Claude, Cursor, Codex</div>
+        <div class="ck"><span class="b on">✓</span>Daemon + UI on 127.0.0.1:3010</div>
+        <div class="ck"><span class="b on">✓</span>Operator login link (single use)</div>
+      </div></div>
+    <button class="btn pri" data-act="go" data-v="setup" style="align-self:flex-start">Open http://127.0.0.1:3010 →</button>
+  </div></div>`;
+}
+function termText(){
+  return `<span class="p">~ $</span> <span class="w">curl -fsSL https://raw.githubusercontent.com/favcrm/cadence/main/install.sh | sh</span>
+<span class="m">› detected linux-x86_64</span>
+<span class="m">› downloading cadence v0.2.0 (8.4 MB)</span>        <span class="g">done</span>
+<span class="m">› verifying sha256</span>                            <span class="g">ok</span>
+<span class="m">› installed ~/.local/share/cadence/releases/0.2.0</span>
+<span class="m">› linked   ~/.local/bin/cadence</span>
+<span class="m">› running  cadence setup</span>
+
+<span class="w">cadence setup</span>
+  state dir      <span class="g">✓</span> ~/.local/state/cadence
+  tracker        <span class="g">✓</span> ~/pm (new git repo)
+  agent skill    <span class="g">✓</span> claude, cursor, codex
+  daemon         <span class="g">✓</span> pid 48213
+  web ui         <span class="g">✓</span> http://127.0.0.1:3010
+  providers      <span class="g">4 found</span> · <span class="y">1 needs sign-in</span> (pi) · <span class="m">devin missing (optional)</span>
+
+  <span class="w">Open to finish setup:</span>
+  <span class="p">http://127.0.0.1:3010/?login=7Kq…Xw</span>   <span class="m">(single use, 10 min)</span>
+  <span class="m">over SSH? ssh -L 3010:127.0.0.1:3010 you@host   ·   cadence ui tailscale start</span>
+
+<span class="p">~ $</span> <span class="cursor-blink"></span>`;
+}
+
+/* setup */
+function setup(){
+  const side=STEPS.map(([t,s],i)=>`<button data-act="step" data-v="${i}" class="${i<S.step?'done':''}" aria-current="${i===S.step?'step':'false'}"><span class="c">${i<S.step?'✓':i+1}</span><span>${t}<small>${s}</small></span></button>`).join('');
+  const body=[stepStart,stepEnv,stepAos,stepMaster,stepWork,stepTeam,stepLaunch][S.step]();
+  return `<div class="wiz"><div class="steps">${side}<div style="margin-top:18px;padding:10px;font-size:11.5px;color:var(--mute)">Progress is saved — close the tab and <code>cadence ui open</code> resumes here.</div></div>
+   <div class="wbody">${body}</div></div>`;
+}
+function wizNav(nextLabel,disabled){
+  return `<div class="between" style="margin-top:22px;border-top:1px solid var(--line);padding-top:16px">
+   <button class="btn ghost" data-act="step" data-v="${Math.max(0,S.step-1)}" ${S.step?'':'disabled'}>← Back</button>
+   <button class="btn pri" data-act="step" data-v="${S.step+1}" ${disabled?'disabled':''}>${nextLabel||'Continue'} →</button></div>`;
+}
+function stepEnv(){
+  if(!S.checks){ setTimeout(()=>{S.checks=CHECKS;render()},1100);
+    return `<h3>Checking this machine</h3><p class="muted">Looking for git, tmux, gh and agent CLIs, and whether each one is signed in.</p><div class="box">${CHECKS.map(c=>`<div class="check"><span class="st load"></span><div><b class="strong mono">${c.n}</b><div class="muted" style="font-size:12px">checking…</div></div><span></span></div>`).join('')}</div>`;}
+  const bad=S.checks.filter(c=>c.s!=='ok'&&!c.opt).length;
+  return `<h3>Environment</h3><p class="muted">3 of 5 agent CLIs are ready; Pi needs sign-in and Devin is optional. Nothing here is installed or signed in for you — each fix is a command you run.</p>
+  <div class="box">${S.checks.map(c=>`<div class="check"><span class="st ${c.s}">${c.s==='ok'?'✓':c.s==='warn'?'!':'×'}</span>
+   <div><b class="strong mono">${c.n}</b> ${c.opt?'<span class="chip">optional</span>':''}<div class="muted" style="font-size:12px">${esc(c.d)}</div>
+   ${c.fix?`<div class="fix"><code>${esc(c.fix)}</code><button class="btn sm" data-act="copy">Copy</button>${c.alt?`<span class="muted" style="font-size:12px">${c.alt}</span>`:''}</div>`:''}</div>
+   <span class="chip ${c.s==='ok'?'ok':c.s==='warn'?'warn':'fail'}">${c.s==='ok'?'ready':c.s==='warn'?'needs sign-in':'missing'}</span></div>`).join('')}</div>
+  <div class="row" style="margin-top:10px"><button class="btn sm" data-act="recheck">↻ Re-check</button><span class="muted" style="font-size:12px">${bad?bad+' item needs attention — you can continue and fix later.':'All required checks pass.'}</span></div>
+  ${wizNav()}`;
+}
+function stepStart(){
+  const o=[['fresh','Start fresh','Empty tracker and store. Good for a first try.'],['restore','Restore a backup','A cadence export bundle: threads, settings, agents, repo map. Credentials are never inside.'],['tracker','Connect my tracker','Clone your existing ~/pm git repo; runtime starts clean, projects and plans come back.'],['import','Import repos & issues','Scan ~/code for git repos and pull open GitHub issues into draft plans.']];
+  return `<h3>How do you want to start?</h3><p class="muted">Cadence keeps your conversations, plans and settings in a local store. You only start empty if you choose to.</p>
+  <div class="pick" style="margin-top:14px">${o.map(([k,t,d])=>`<button class="opt" data-act="start" data-v="${k}" aria-pressed="${S.start===k}">${S.start===k?'<span class="tag chip acc">selected</span>':''}<h6 style="margin-top:0">${t}</h6><p>${d}</p></button>`).join('')}</div>
+  ${S.start==='restore'?`<div class="box" style="margin-top:14px"><div class="bd" style="font-size:13px">${S.restored?`<div class="between"><b class="strong mono">cadence-2026-09-22.bundle</b><span class="chip ok">verified</span></div>
+    <div class="stor" style="margin-top:10px"><div><b>3</b><span class="muted">projects</span></div><div><b>14</b><span class="muted">threads</span></div><div><b>6</b><span class="muted">preferences</span></div><div><b>0</b><span class="muted">credentials (by design)</span></div></div>
+    <div class="ck" style="margin-top:8px"><span class="b on">✓</span>Repo map: 2 of 3 repos found by remote URL · <b class="strong">storefront</b> → choose folder</div>
+    <div class="ck"><span class="b on">✓</span>Schema 12 · sha256 matches manifest · secret scan clean</div>`:
+    `<div class="between"><span>Drop a <code>.bundle</code> file or choose one</span><button class="btn sm" data-act="restore">Choose file…</button></div><div class="muted" style="font-size:12px;margin-top:6px">From <code>cadence export --bundle</code>, a nightly backup, or your platform's files (if connected).</div>`}</div></div>`:''}
+  ${S.start==='tracker'?`<label class="field" style="margin-top:14px"><span>Tracker git URL</span><input class="input mono" value="git@github.com:harbor-bakery/pm.git"></label>`:''}
+  ${wizNav()}`;
+}
+function stepAos(){
+  const card=(k,n,d,st,on)=>`<div class="box"><div class="bd"><div class="between"><div class="row">${k==='aos'?aosMark(26):k==='cf'?'<span class="av" style="background:#f6821f22;color:#f6821f">CF</span>':'<span class="av op">⋯</span>'}<div><b class="strong">${n}</b><div class="muted" style="font-size:12px">${d}</div></div></div>${on?'<span class="chip ok">connected</span>':st}</div></div></div>`;
+  return `<h3>Connected platforms <span class="chip">optional</span></h3>
+  <p class="muted">Platforms give agents managed services through a local proxy. Each tool declares an effect — <code>read</code>, <code>draft</code> or <code>send</code>. Sends (messages, publishing, deploys, spending) always wait for you.</p>
+  <div class="stack" style="margin-top:14px">
+   ${card('aos','AgenticOS v2','Workspace, threads & files · AI gateway · connectors (planned: CRM, WhatsApp, app hosting)',`<button class="aosbtn" data-act="aoslogin">${aosMark(16)} Connect</button>`,S.aos)}
+   ${card('cf','Cloudflare · your account','Deploy Workers with wrangler. Preview auto, production asks.',`<button class="btn sm" data-act="cf">Connect</button>`,S.cf)}
+   ${card('mcp','Other platform','Any service that implements the platform contract (credential exchange + MCP tools with effects).','<button class="btn sm" disabled>Add…</button>',false)}
+  </div>
+  ${wizNav(S.aos||S.cf?'Continue':'Skip for now')}`;
+}
+function scopeChips(){
+  const m=[['know','Knowledge read/write'],['crm','CRM read'],['leads','Leads read'],['files','Files'],['threads','Threads (sync)'],['wa','WhatsApp · send asks']];
+  return m.filter(([k])=>S.aosScopes[k]).map(([,l])=>`<span class="chip gold">${l}</span>`).join('');
+}
+function aosMark(sz){return `<svg width="${sz}" height="${sz}" viewBox="0 0 32 32" aria-hidden="true"><path d="M16 4 27 12 23 26 9 26 5 12Z" fill="none" stroke="#f5b544" stroke-width="3" stroke-linejoin="round"/><circle cx="16" cy="17" r="3.2" fill="#f5b544"/></svg>`}
+function stepMaster(){
+  const opts=[
+   ['claude','Claude','Headless stream-json · broker approvals · best planner today',true],
+   ['codex','Codex','App-server · resumable remotely · strong implementer',true],
+   ['pi','Pi','RPC mode · any model · can run on AgenticOS credits',true],
+   ['devin','Devin','Terminal pane — worker only',false],['cursor','Cursor','Terminal pane — worker only',false]];
+  const models={claude:['opus','sonnet'],codex:['gpt-5.5-codex','gpt-5.5'],pi:[S.aosCredits?'aos-gateway/glm-5.3-flash':'anthropic/claude-sonnet','openai/gpt-5.5']};
+  return `<h3>Choose your master agent</h3><p class="muted">The master plans, creates projects and delegates. It needs structured output so you can chat with it; terminal agents join as workers.</p>
+  <div class="pick" style="margin-top:14px">${opts.map(([k,n,d,ok])=>`<button class="opt" data-act="master" data-v="${k}" aria-pressed="${S.master===k}" ${ok?'':'disabled'}>
+    ${av(k)}${S.master===k?'<span class="tag chip acc">selected</span>':!ok?'<span class="tag chip">worker only</span>':''}<h6>${n}</h6><p>${d}</p></button>`).join('')}</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px">
+   <label class="field"><span>Model</span><select class="input">${(models[S.master]||[]).map(m=>`<option>${m}</option>`).join('')}</select></label>
+   <label class="field"><span>Effort</span><select class="input"><option>low</option><option selected>medium</option><option>high</option></select></label></div>
+  ${S.master==='pi'?`<label class="row" style="font-size:13px"><input type="checkbox" data-act="credits" ${S.aosCredits?'checked':''} ${S.aos?'':'disabled'}> Use AgenticOS AI gateway for Pi ${S.aos?'<span class="muted">(GLM 5.3 Flash · usage billed to workspace)</span>':'<span class="muted">(connect AgenticOS first)</span>'}</label>`:''}
+  <div class="callout acc" style="margin-top:12px">Permission policy: the master runs with <b>broker approvals</b> — anything outside its allowlist (<code>cadence</code>, <code>git</code>, <code>gh pr view</code>) shows up in chat as Allow / Deny. Unanswered requests deny after 15 minutes.</div>
+  ${wizNav()}`;
+}
+function stepWork(){
+  return `<h3>Workspace</h3><p class="muted">Where plans and issues live, and the first project for the master to work on.</p>
+  <label class="field"><span>Tracker (git repo, separate from your code)</span><input class="input mono" value="~/pm"></label>
+  <div class="seg" style="margin:6px 0 14px"><button aria-pressed="true">Existing repo</button><button aria-pressed="false">Start empty</button><button aria-pressed="false">Clone URL</button></div>
+  <label class="field"><span>Repository path</span><input class="input mono" id="repo" value="${esc(S.repo)}"></label>
+  <div class="box"><div class="bd" style="font-size:13px">
+    <div class="between"><span class="muted">Detected</span><span class="chip ok">git repo</span></div>
+    <div class="ck"><span class="b on">✓</span>remote <code>github.com/harbor-bakery/reminders</code> · branch <code>main</code></div>
+    <div class="ck"><span class="b on">✓</span>TypeScript · <code>wrangler.toml</code> found · 14 files</div>
+    <div class="ck"><span class="b"></span><span>No <code>AGENTS.md</code> — the master will propose one as its first plan item</span></div>
+  </div></div>
+  <div style="display:grid;grid-template-columns:1fr 120px;gap:12px;margin-top:14px">
+   <label class="field"><span>Project key</span><input class="input mono" value="reminders"></label>
+   <label class="field"><span>Issue prefix</span><input class="input mono" value="RMD"></label></div>
+  ${wizNav()}`;
+}
+function stepTeam(){
+  const dl=[['Ask for everything','You approve each plan, dispatch, merge and deploy.'],['Approve plans','Recommended. Workers start once you approve a plan; merges and deploys ask.'],['Routine merges auto','Locked until the unattended acceptance check passes on this machine.']];
+  return `<h3>Team &amp; autonomy</h3><p class="muted">Which agents the master may hire, how many at once, and how much it can do without asking.</p>
+  <div class="slabel" style="margin:14px 0 8px">Workers the master may launch</div>
+  <div class="row" style="flex-wrap:wrap">${['claude','codex','pi','cursor','devin'].map(p=>`<label class="chip" style="padding:6px 10px;cursor:pointer;${p==='devin'?'opacity:.5':''}"><input type="checkbox" ${S.workers[p]?'checked':''} ${p==='devin'?'disabled':''}> ${av(p)} ${p}${p==='devin'?' · not installed':''}</label>`).join('')}</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px">
+   <label class="field"><span>Parallel workers · <b class="strong num" id="mw">${S.maxw}</b> <span class="muted">(host ceiling 5)</span></span><input type="range" min="1" max="5" value="${S.maxw}" data-act="maxw" style="width:100%;accent-color:var(--accent)"></label>
+   <label class="field"><span>Reviewer (never the author)</span><select class="input"><option>claude · opus</option><option>codex · gpt-5.5</option></select></label></div>
+  <div class="slabel" style="margin:8px 0 8px">Autonomy for this project</div>
+  <div class="dial">${dl.map(([t,d],i)=>`<button class="opt" data-act="dial" data-v="${i}" aria-pressed="${S.dial===i}" ${i===2?'disabled':''}><h6 style="margin-top:0">${t}</h6><p>${d}</p>${i===2?'<span class="tag chip warn">locked</span>':''}</button>`).join('')}</div>
+  <p class="muted" style="font-size:12px;margin-top:10px">Always yours at every level: security, migrations, dependency/CI changes, anything larger than 1,500 lines, releases, customer messages and production deploys.</p>
+  ${wizNav('Review')}`;
+}
+function stepLaunch(){
+  if(S.launching){
+    const L=['Registering master (claude · opus)',S.start==='fresh'?'Writing briefing & project context':'Loading continuity pack · 14 threads, plan state, 6 preferences','Starting headless session','Master ready'];
+    return `<h3>Starting your master agent</h3><div class="box" style="margin-top:14px">${L.map((l,i)=>`<div class="check"><span class="st ${i<S.launching?'ok':i===S.launching?'load':''}">${i<S.launching?'✓':''}</span><div class="${i<=S.launching?'strong':'muted'}">${l}</div><span></span></div>`).join('')}</div>`;}
+  const r=[['Start',S.start==='restore'?'restored backup · 3 projects, 14 threads':S.start==='tracker'?'connected tracker git@github.com:harbor-bakery/pm.git':'fresh'],['Master',`${S.master} · ${S.model} · ${S.effort}`],['Platforms',(S.aos?'AgenticOS v2 · Harbor Bakery':'')+(S.aos&&S.cf?' + ':'')+(S.cf?'Cloudflare (own account)':'')||'none'],['Project',`reminders · ${S.repo}`],['Workers',Object.keys(S.workers).filter(k=>S.workers[k]).join(', ')+` · up to ${S.maxw}`],['Autonomy',['Ask for everything','Approve plans','Routine merges auto'][S.dial]]];
+  return `<h3>Review &amp; launch</h3><p class="muted">You can change any of this later in Settings.</p>
+  <div class="tblwrap" style="margin-top:12px"><table class="tbl">${r.map(([a,b])=>`<tr><td>${a}</td><td>${esc(b)}</td><td style="text-align:right"><button class="btn sm ghost" data-act="step" data-v="${({Start:0,Master:3,Platforms:2,Project:4,Workers:5,Autonomy:5})[a]}">Edit</button></td></tr>`).join('')}</table></div>
+  <div class="between" style="margin-top:22px;border-top:1px solid var(--line);padding-top:16px"><button class="btn ghost" data-act="step" data-v="5">← Back</button><button class="btn pri" data-act="launch">Launch master &amp; open chat →</button></div>`;
+}
+
+/* home */
+function needCount(){let n=0;if(!S.planApproved)n++;if(!S.perm)n++;if(S.ff&&!S.merge)n++;if(S.ff&&!S.deploy)n++;if(S.ff&&!S.post)n++;return n}
+function home(){
+  return `<div class="home ${S.showRail?'showrail':''}"><section class="chat" aria-label="Chat with master">
+   <div class="chathd">${av('claude')}<div><b class="strong">Master</b> <span class="muted" style="font-size:12px">claude · opus · medium · project reminders</span></div><div class="spacer"></div>
+     <button class="btn sm hide-n" data-act="ff" ${S.planApproved&&!S.ff?'':'disabled'} title="Demo: skip ahead">⏩ 2 h later</button></div>
+   <div class="thread" id="thread">${thread()}</div>
+   <div class="composer"><div class="cbox"><textarea id="compose" placeholder="Message the master… (Enter to send, Shift+Enter for a new line)" ${S.sim==='offline'?'disabled':''}></textarea>
+     <div class="between"><div class="row"><span class="chip acc">@reminders</span><span class="chip">+ attach</span></div>
+     <div class="row">${S.typing?'<button class="btn sm" data-act="interrupt">■ Interrupt</button>':''}<button class="btn pri sm" data-act="send" ${S.sim==='offline'?'disabled':''}>Send ↵</button></div></div></div>
+     ${S.sim==='offline'?'<div class="muted" style="font-size:12px;margin-top:6px">Your draft is kept. Sending resumes when the daemon is back.</div>':''}</div>
+  </section><aside class="rail" aria-label="Context">${rail()}</aside></div>`;
+}
+function thread(){
+  let h=`${S.start!=='fresh'?`<div class="sys"><span class="line"></span>Yesterday · thread "reminders kickoff" · 42 messages <button class="btn sm ghost" style="padding:0 6px">show</button></div>`:''}
+  <div class="sys"><span class="line"></span>${S.start==='fresh'?'Master started · briefing loaded (project reminders, 0 accepted lessons) · 09:12':'New provider session · continuity pack loaded: summary of 42 messages, plan state, 6 preferences · 09:12'}</div>
+  <div class="msg me">${av('op','Yo')}<div><div class="who"><b>You</b> · 09:13</div><div class="txt">New project: a Cloudflare Worker that sends a WhatsApp reminder 24h before each booking in our CRM. Code is in ~/code/reminders. Use our approved reminder template.</div></div></div>
+  <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 09:13</div><div class="txt">I'll register the project and look at what the CRM and inbox give us before planning.</div>
+   <div class="tool"><span class="ns">cadence</span> project new reminders --repo ~/code/reminders <span class="ok">✓ registered</span></div>
+   <div class="tool"><span class="aos-ns">agenticos</span> crm.bookings.search {window:"48h"} ${S.aos?'<span class="ok">✓ 38 upcoming</span>':'<span class="muted">not connected · using repo fixtures</span>'}</div>
+   <div class="tool"><span class="aos-ns">agenticos</span> inbox.templates.list {channel:"whatsapp"} ${S.aos?'<span class="ok">✓ 2 approved</span>':'<span class="muted">not connected · skipped</span>'}</div>
+   <div class="txt" style="margin-top:6px">Bookings carry <code>starts_at</code> and a phone number; template <code>booking_reminder_v2</code> takes name, time and branch. I'd split it into four issues — sending is the only step that touches customers, so it's marked for your review.</div>
+   ${planCard()}</div></div>`;
+  h+=`<div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 09:15</div><div class="txt">One more thing: the repo has no GitHub Actions yet. I'd like to check what's there.</div>
+   ${permCard()}</div></div>`;
+  if(S.planApproved){
+    h+=`<div class="sys"><span class="line"></span>Plan P-1 approved by you · 4 issues → ready · commit <span class="num">a41c9e0</span></div>
+    <div class="sys"><span class="line"></span>w1 joined · codex · worktree <code>rmd-1</code> · dispatched RMD-1</div>
+    <div class="sys"><span class="line"></span>w2 joined · claude · worktree <code>rmd-2</code> · dispatched RMD-2</div>
+    <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 09:17</div><div class="txt">Two workers are on it. RMD-3 waits for RMD-2's CRM reader; RMD-4 starts when RMD-1 lands. I'll bring you merges and the production deploy — nothing reaches customers without your click.</div></div></div>`;
+  }
+  if(S.ff){
+    h+=`<div class="sys"><span class="line"></span>11:04 · rev-1 verdict <span class="chip ok">PASS</span> RMD-1 @ <span class="num">3f9c2e1</span> · CI green · risk routine</div>
+    <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 11:05</div><div class="txt">RMD-1 passed independent review. Ready to merge PR #12.</div>
+     <div class="req ${S.merge?'done':''}"><div class="between"><div><b class="strong">Merge PR #12 · Scaffold Worker</b><div class="muted" style="font-size:12px">+312 −4 · 9 files · verdict pinned to 3f9c2e1 (current head)</div></div>
+     ${S.merge?'<span class="chip ok">merged by you · 11:06</span>':`<div class="row"><button class="btn sm">View diff</button><button class="btn pri sm" data-act="merge">Merge</button></div>`}</div></div></div></div>
+    <div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · 11:20</div><div class="txt">w4 deployed a preview (<code>reminders-preview.harbor.workers.dev</code>) and a dry run matched 38 bookings. Two effects are waiting for you.</div>
+     <div class="req gold ${S.deploy?'done':''}"><div class="between"><div><span class="slabel" style="color:var(--gold)">effect · send · deploy</span><div><b class="strong">Deploy reminders-worker → production</b></div><div class="muted" style="font-size:12px">Cloudflare (your account) · cron hourly · diff since preview: none · requested by w4</div></div>
+     ${S.deploy?`<span class="chip ${S.deploy==='ok'?'ok':'fail'}">${S.deploy==='ok'?'sent · deploying':'declined'}</span>`:`<div class="row"><button class="btn sm" data-act="deploy" data-v="no">Decline</button><button class="btn gold sm" data-act="deploy" data-v="ok">Deploy now</button></div>`}</div></div>
+     <div class="req gold ${S.post?'done':''}" style="margin-top:8px"><div class="between"><div><span class="slabel" style="color:var(--gold)">effect · send · message</span><div><b class="strong">${aosMark(14)} Test reminder to your own WhatsApp number</b></div><div class="muted" style="font-size:12px">AgenticOS v2 · template booking_reminder_v2 · 1 recipient (you) · planned connector</div></div>
+     ${S.post?'<span class="chip ok">sent</span>':'<div class="row"><button class="btn sm" data-act="post" data-v="no">Not now</button><button class="btn gold sm" data-act="post" data-v="ok">Send now</button></div>'}</div></div></div></div>`;
+  }
+  S.extra.forEach(m=>{h+=m.me?`<div class="msg me">${av('op','Yo')}<div><div class="who"><b>You</b> · now</div><div class="txt">${esc(m.t)}</div></div></div>`:`<div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · now</div><div class="txt">${m.t}</div></div></div>`});
+  if(S.typing) h+=`<div class="msg">${av('claude')}<div><div class="who"><b>Master</b> · thinking</div><span class="typing"><i></i><i></i><i></i></span></div></div>`;
+  return h;
+}
+function planCard(){
+  return `<div class="plan"><div class="ph"><span class="slabel">Plan P-1</span><b>WhatsApp booking reminders</b><div class="spacer"></div>${S.planApproved?'<span class="chip ok">approved</span>':'<span class="chip warn">awaiting you</span>'}</div>
+   ${ISSUES.map(i=>`<div class="it"><span class="num muted">${i.id}</span><div><div class="strong">${i.t}</div><div class="muted" style="font-size:11.5px">${i.acc} acceptance checks${i.dep?' · after '+i.dep:''}</div></div>
+     <div class="row">${av(i.p)}<span class="chip ${i.risk==='human'?'warn':''}">${i.risk}</span></div></div>`).join('')}
+   <div class="pf">${S.planApproved?`<span class="muted" style="font-size:12.5px">Approved 09:16 · workers may start within this plan only.</span>`:
+     `<button class="btn pri sm" data-act="approve">Approve plan</button><button class="btn sm" data-act="changes">Request changes</button><button class="btn sm ghost">Open in Projects</button><span class="muted" style="font-size:12px;margin-left:auto">Workers start only after approval · max ${S.maxw} at once</span>`}</div></div>`;
+}
+function permCard(){
+  if(S.perm) return `<div class="req done"><div class="between"><span class="mono" style="font-size:12.5px">Bash · gh api repos/harbor-bakery/reminders/actions/workflows</span><span class="chip ${S.perm==='allow'?'ok':'fail'}">${S.perm==='allow'?'allowed once':'denied'}</span></div></div>`;
+  return `<div class="req"><div class="slabel" style="color:var(--warn)">Permission request · expires in 14:32</div>
+   <div class="mono" style="font-size:12.5px;margin:6px 0;color:var(--strong)">Bash · gh api repos/harbor-bakery/reminders/actions/workflows</div>
+   <div class="muted" style="font-size:12px">Read-only GitHub API call outside the master's allowlist.</div>
+   <div class="row" style="margin-top:8px"><button class="btn pri sm" data-act="perm" data-v="allow">Allow once</button><button class="btn sm" data-act="perm" data-v="deny">Deny</button><button class="btn sm ghost">Always allow <code>gh api</code> GET…</button></div></div>`;
+}
+function rail(){
+  const needs=[];
+  if(!S.planApproved) needs.push(['warn','Plan','Approve plan P-1 · 4 issues','9m']);
+  if(!S.perm) needs.push(['warn','Permission','master · gh api … workflows','7m']);
+  if(S.ff&&!S.merge) needs.push(['acc','Merge','PR #12 · PASS @ 3f9c2e1','1m']);
+  if(S.ff&&!S.deploy) needs.push(['gold','Effect','Deploy to production · Cloudflare','now']);
+  if(S.ff&&!S.post) needs.push(['gold','Effect','Send test WhatsApp · AgenticOS','now']);
+  const work=S.planApproved?[['codex','w1','RMD-1 · implementing',S.ff?100:40],['claude','w2','RMD-2 · implementing',S.ff?80:25],['pi','w3','RMD-3 · waiting on RMD-2',0],['cursor','w4',S.ff?'RMD-4 · preview deployed':'RMD-4 · queued',S.ff?70:0]]:[];
+  return `${S.start!=='fresh'?`<div class="since"><b class="strong">Since you left</b> · 14 h<div class="muted" style="margin-top:3px">Restored 14 threads · 1 plan in progress · 0 agents were running · nothing was lost.</div></div>`:''}<div class="box"><div class="hd"><h5>Needs you</h5><span class="chip ${needs.length?'warn':'ok'}">${needs.length||'clear'}</span></div>
+   ${needs.length?needs.map(n=>`<div class="need"><span class="chip ${n[0]} k">${n[1]}</span><div><div class="strong">${n[2]}</div><div class="muted" style="font-size:11px">waiting ${n[3]}</div></div></div>`).join(''):'<div class="bd muted" style="font-size:12.5px">Nothing needs a decision. The team is working.</div>'}</div>
+  <div class="box"><div class="hd"><h5>Active work</h5><span class="muted" style="font-size:11.5px">${work.filter(w=>w[3]).length}/${S.maxw} slots</span></div>
+   ${work.length?work.map(w=>`<div class="work">${av(w[0])}<div><div class="strong">${w[1]} <span class="muted" style="font-weight:400">· ${w[2]}</span></div><div class="bar" style="margin-top:5px"><i style="width:${w[3]}%"></i></div></div><span class="num muted" style="font-size:11px">${w[3]?w[3]+'%':'—'}</span></div>`).join(''):'<div class="bd muted" style="font-size:12.5px">No workers yet — they start after you approve a plan.</div>'}</div>
+  <div class="box"><div class="hd"><h5>Platforms</h5><button class="btn sm" data-act="go" data-v="services">${S.aos||S.cf?'Open':'Connect'}</button></div>
+   <div class="bd" style="font-size:12.5px">${S.aos||S.cf?`${S.aos?`<div class="between"><span class="row">${aosMark(14)} AgenticOS v2</span><span class="chip ok">connected</span></div>`:''}${S.cf?`<div class="between" style="margin-top:4px"><span>Cloudflare · own</span><span class="chip ok">connected</span></div>`:''}<div class="between" style="margin-top:6px"><span class="muted">Pending effects</span><span class="num strong">${(S.ff&&!S.deploy?1:0)+(S.ff&&!S.post?1:0)}</span></div>`:'<span class="muted">None connected. Agents build and test locally.</span>'}</div></div>
+  <div class="box"><div class="hd"><h5>Projects</h5></div><div class="bd" style="font-size:12.5px"><div class="between"><span class="strong">reminders</span><span class="muted">${S.planApproved?'2 doing · 2 ready':'plan pending'}</span></div><div class="between" style="margin-top:4px"><span class="strong">storefront</span><span class="muted">idle</span></div></div></div>`;
+}
+
+/* projects */
+function projects(){
+  if(!S.planApproved) return `<div class="empty"><div><div class="ic">▦</div><b class="strong">No work yet in reminders</b><p>The master's plan P-1 is waiting for your approval on Home.</p><button class="btn pri" data-act="go" data-v="home">Review plan</button></div></div>`;
+  const cols=[['proposed','Proposed'],['ready','Ready'],['doing','Doing'],['review','Review'],['done','Done']];
+  const st=i=>S.ff?({'RMD-1':S.merge?'done':'review','RMD-2':'doing','RMD-3':'ready','RMD-4':'review'})[i.id]:i.st;
+  return `<div class="between" style="padding:14px 16px 0;flex-wrap:wrap;gap:8px"><div><b class="strong" style="font-size:16px">reminders</b> <span class="muted mono" style="font-size:12px">RMD · ~/code/reminders · main</span></div>
+   <div class="row"><div class="seg"><button aria-pressed="false">List</button><button aria-pressed="true">Board</button><button aria-pressed="false">Plan</button></div><button class="btn sm">+ Issue</button></div></div>
+   <div style="padding:10px 16px 0"><div class="between" style="font-size:12.5px"><span><span class="slabel">Plan P-1</span> WhatsApp booking reminders</span><span class="muted">${S.ff?(S.merge?'1':'0'):'0'} / 4 done</span></div><div class="bar" style="margin-top:6px"><i style="width:${S.ff&&S.merge?25:6}%"></i></div></div>
+   <div class="kan">${cols.map(([k,l])=>{const its=ISSUES.filter(i=>st(i)===k);return `<div class="col"><h6><span>${l}</span><span>${its.length}</span></h6>${its.map(i=>`<div class="tcard" data-act="issue" data-v="${i.id}" tabindex="0"><div class="between"><span class="id">${i.id}</span>${i.risk==='human'?'<span class="chip warn">human</span>':''}</div><div class="t">${i.t}</div><div class="between">${av(i.p)}<span class="muted" style="font-size:11px">${i.a}${k==='review'?' · PR':''}</span></div></div>`).join('')||'<div class="muted" style="font-size:12px;padding:8px 2px">—</div>'}</div>`}).join('')}</div>`;
+}
+function issueDrawer(id){
+  const i=ISSUES.find(x=>x.id===id);
+  const acc={'RMD-1':['wrangler.toml with cron "0 * * * *"','Worker builds with no type errors','Secrets read from env, never committed'],'RMD-2':['Bookings in the next 24–25h are returned once','Phone numbers normalised to E.164','Reads via local MCP proxy (crm.read only)','Unit tests with CRM fixtures'],'RMD-3':['Uses template booking_reminder_v2 only','Dedup: one reminder per booking','Send is an effect card you press, never direct','Dry-run mode logs instead of sending'],'RMD-4':['Integration test on preview','Runbook in docs/','Preview URL posted to issue']}[id];
+  return `<div class="scrim" data-act="close" style="place-items:stretch end;padding:0;background:rgba(0,0,0,.35)"><div class="drawer" role="dialog" aria-label="${id}">
+   <div class="dh"><div class="between"><span class="num muted">${id} · plan P-1</span><button class="btn sm ghost" data-act="close" aria-label="Close">✕</button></div><h3 style="margin:6px 0 8px;font-size:18px">${i.t}</h3>
+   <div class="row" style="flex-wrap:wrap">${av(i.p)}<span class="chip">${i.a} · ${i.p}</span><span class="chip ${i.risk==='human'?'warn':''}">risk ${i.risk}</span>${i.dep?`<span class="chip">after ${i.dep}</span>`:''}</div></div>
+   <div class="db"><div class="slabel">Acceptance</div>${acc.map((a,n)=>`<div class="ck"><span class="b ${S.ff&&id==='RMD-1'?'on':''}">${S.ff&&id==='RMD-1'?'✓':''}</span>${a}</div>`).join('')}
+   <div class="slabel" style="margin-top:16px">Evidence</div>
+   ${S.ff&&id==='RMD-1'?`<div class="box" style="margin-top:6px"><div class="bd" style="font-size:12.5px"><div class="between"><span>Verdict</span><span class="chip ok">PASS · rev-1</span></div><div class="between"><span>Pinned to</span><span class="num">3f9c2e1</span></div><div class="between"><span>PR head</span><span class="num">3f9c2e1 <span class="chip ok">matches</span></span></div><div class="between"><span>CI</span><span class="chip ok">green</span></div></div></div>`:'<p class="muted" style="font-size:12.5px">No evidence yet. A worker\'s "done" is a claim until review pins a verdict to its commit.</p>'}
+   <div class="slabel" style="margin-top:16px">Timeline</div><div class="tl"><div class="a">09:16 · approved in plan P-1 by you</div><div class="a">09:17 · dispatched to ${i.a} (worktree ${id.toLowerCase()})</div>${S.ff&&id==='RMD-1'?'<div class="a">10:48 · PR #12 opened · SHA 3f9c2e1</div><div class="a">11:04 · rev-1 PASS</div>':''}</div></div></div></div>`;
+}
+
+/* agents */
+function agents(){
+  const a=AGENTS.find(x=>x.id===S.agent)||AGENTS[0];
+  return `<div class="agents"><div class="roster" role="listbox" aria-label="Agents">
+   <div class="between" style="padding:10px 14px;border-bottom:1px solid var(--line)"><span class="slabel">Team · reminders</span><span class="muted" style="font-size:11.5px">${S.planApproved?'4 of '+S.maxw+' slots':'master only'}</span></div>
+   ${AGENTS.filter(x=>S.planApproved||x.id==='master').map(x=>`<div class="arow" role="option" data-act="agent" data-v="${x.id}" aria-selected="${x.id===S.agent}" tabindex="0">${av(x.p)}<div><div class="nm">${x.id} <span class="muted" style="font-weight:400;font-size:11.5px">· ${x.role}</span></div><div class="sub2">${x.p} · ${x.m} · ${x.st}</div></div>
+   <span class="chip ${x.st.startsWith('implementing')||x.st==='chatting'?'ok':x.st.startsWith('queued')?'info':''}"><span class="dot"></span>${x.st.split(' ')[0]}</span></div>`).join('')}
+   <div style="padding:12px 14px"><button class="btn sm" disabled title="The master hires workers from approved plans">+ Add worker</button></div></div>
+   <div style="padding:16px;min-width:0">${a.kind==='pty'?ptyView(a):transcriptView(a)}</div></div>`;
+}
+function transcriptView(a){
+  const lines=a.id==='w1'?[
+   ['sys','Kickoff RMD-1 · objective + 3 acceptance checks · worktree .cadence/wt/rmd-1'],
+   ['as','Reading wrangler.toml and package.json to see what exists.'],
+   ['tool','read_file wrangler.toml ✓'],['tool','shell pnpm add -D wrangler@4 ✓'],
+   ['as','Adding a scheduled handler and a cron trigger for the hourly run. Secrets come from env bindings.'],
+   ['tool','apply_patch src/index.ts (+64 −2) ✓'],['tool','shell pnpm tsc --noEmit ✓ 0 errors'],
+   ['as','Build is clean. Writing a unit test for the scheduled handler next.']]:[
+   ['sys',a.id==='master'?'Chat lives on Home — this is the raw event stream.':'Session started'],['as',a.id==='rev-1'?'Idle. Next review is routed here when a worker reports a commit.':'Waiting for work.']];
+  return `<div class="between" style="margin-bottom:12px;flex-wrap:wrap;gap:8px"><div class="row">${av(a.p)}<div><b class="strong">${a.id}</b> <span class="muted" style="font-size:12px">${a.p} · ${a.m}</span></div></div>
+   <div class="row"><span class="chip">structured transcript</span><button class="btn sm">Message</button><button class="btn sm danger">Stop</button></div></div>
+   <div class="box"><div class="bd stack" style="gap:8px;font-size:13px">${lines.map(([k,t])=>k==='sys'?`<div class="sys" style="padding-left:0"><span class="line"></span>${t}</div>`:k==='tool'?`<div class="tool" style="margin:0">${t.replace('✓','<span class="ok">✓</span>')}</div>`:`<div>${t}</div>`).join('')}</div></div>
+   <div class="row" style="margin-top:10px;font-size:12px" ><span class="muted">Desired</span><span class="chip">${a.m}</span><span class="muted">Running</span><span class="chip ok">${a.m}</span><span class="muted">· quota: </span><span class="chip">${a.p==='codex'?'62% of 5h window':'unknown'}</span></div>`;
+}
+function ptyView(a){
+  return `<div class="between" style="margin-bottom:12px;flex-wrap:wrap;gap:8px"><div class="row">${av(a.p)}<div><b class="strong">${a.id}</b> <span class="muted" style="font-size:12px">cursor-agent · tmux pane</span></div></div>
+   <div class="row"><span class="chip info">terminal agent</span><button class="btn sm" data-act="copy">Copy attach command</button></div></div>
+   <div class="xterm">${esc(`╭──────────────────────────────────────────────╮
+│ Cursor Agent · reminders (rmd-4)              │
+╰──────────────────────────────────────────────╯
+
+ Waiting for kickoff RMD-4 — dispatch holds until
+ RMD-1 is merged (dependency).
+
+ > `)}<span class="cursor-blink"></span></div>
+   <div class="callout" style="margin-top:12px;font-size:12.5px">Read-only capture, refreshed every 2 s. Terminal agents report with <code>cadence message result</code>; their "done" still needs an independent verdict. Pane verdict: <b>idle · ready gate clear</b>.</div>
+   <div class="mono muted" style="font-size:12px;margin-top:8px">tmux -L cadence-${S.sbx?'9c1e':'4a7f'} attach -t w4</div>`;
+}
+
+/* services */
+function services(){
+  const tabs=`<div class="ptabs"><div class="seg"><button data-act="ptab" data-v="aos" aria-pressed="${S.platTab==='aos'}">AgenticOS v2</button><button data-act="ptab" data-v="cf" aria-pressed="${S.platTab==='cf'}">Cloudflare · own</button><button data-act="ptab" data-v="add" aria-pressed="${S.platTab==='add'}">+ Add platform</button></div></div>`;
+  if(S.platTab==='cf') return tabs+(S.cf?`<div class="svc"><div class="box"><div class="hd"><h5>Workers</h5><span class="chip ok">connected · wrangler</span></div><div class="bd" style="font-size:12.5px">
+     <div class="between"><b class="strong">reminders-worker</b><span class="chip ${S.deploy==='ok'?'ok':'info'}">${S.deploy==='ok'?'production':S.ff?'preview':'—'}</span></div><div class="muted mono" style="font-size:11.5px;margin:4px 0 10px">reminders-preview.harbor.workers.dev</div>
+     <div class="between"><span class="muted">deploy preview</span><span>effect <code>draft</code> · agents may</span></div><div class="between"><span class="muted">deploy production</span><span class="chip gold">effect send · asks</span></div><div class="between"><span class="muted">credential</span><span>API token in keychain · scope Workers only</span></div></div></div></div>`:
+     `<div class="empty"><div><b class="strong">Cloudflare not connected</b><p>Create a Workers-scoped API token in your dashboard; Cadence stores it in the keychain and only the proxy uses it.</p><button class="btn pri" data-act="cf">Connect Cloudflare</button></div></div>`);
+  if(S.platTab==='add') return tabs+`<div class="svc">${[['Platform contract','1 · credential exchange (device-style code) · 2 · MCP tools with declared effects · 3 · pending-effect API · 4 · optional usage and files'],['Custom MCP server','Point at a server URL; Cadence treats undeclared effects as send (fail closed).'],['GitHub','Already available through gh — shown here for scopes only.']].map(([t,d])=>`<div class="box"><div class="hd"><h5>${t}</h5></div><div class="bd muted" style="font-size:12.5px">${d}</div></div>`).join('')}</div>`;
+  if(!S.aos) return tabs+`<div class="empty"><div><div style="margin:0 auto 10px;width:44px">${aosMark(44)}</div><b class="strong">AgenticOS v2 is not connected</b><p style="max-width:440px">Connect to give agents your workspace's knowledge, files and AI gateway — and CRM, WhatsApp and app hosting as AgenticOS ships them.</p><button class="aosbtn" data-act="aoslogin">${aosMark(18)} Connect AgenticOS</button></div></div>`;
+  const svc=[['Workspace & threads','live','Knowledge, notes, checklists; thread status projection'],['Files','live','Encrypted Cadence backups (optional)'],['AI gateway','partial','GLM 5.3 Flash for Pi · usage visible, billing routes pending'],['Connectors','partial','Facebook, Instagram (branch) · effects read / send'],['CRM & leads','planned','AOS-14 read scopes'],['WhatsApp Business','planned','connector "coming soon"'],['App hosting','planned','Container-backed gadgets (AOS-32)']];
+  const chip=s=>s==='live'?'<span class="chip ok">live</span>':s==='partial'?'<span class="chip warn">partial</span>':'<span class="chip">planned</span>';
+  return tabs+`<div class="aoshead" style="margin-top:12px">${aosMark(32)}<div class="v2"><b class="strong" style="font-size:16px">Harbor Bakery</b><div class="muted" style="font-size:12px">AgenticOS v2 workspace · owner · credential via AOS-14 exchange · revocable</div></div><div class="spacer"></div><button class="btn sm">Open workspace ↗</button><button class="btn sm danger" data-act="aosout">Disconnect</button></div>
+  <div class="svc">${svc.map(([n,s,d])=>`<div class="box"><div class="hd"><h5>${n}</h5>${chip(s)}</div><div class="bd muted" style="font-size:12.5px">${d}</div></div>`).join('')}</div>
+  <div style="padding:0 16px 16px"><div class="box"><div class="hd"><h5>Agent access</h5><span class="muted" style="font-size:11.5px">enforced by the local proxy — agents never see the credential</span></div>
+   <div style="overflow-x:auto"><table class="tbl matrix" style="margin:0"><tr><th>Agent</th><th>Knowledge</th><th>Files</th><th>CRM read</th><th>WhatsApp draft</th><th>WhatsApp send</th><th>Gateway</th></tr>
+   ${[['master · claude','✓','✓','✓','✓','asks','—'],['w2 · claude (RMD-2)','—','—','✓','—','—','—'],['w3 · pi (RMD-3)','—','—','✓','✓','asks','✓'],['rev-1 · claude','✓','—','—','—','—','—']].map(r=>`<tr>${r.map((c,i)=>`<td>${i?c==='asks'?'<span class="chip gold">asks</span>':c==='✓'?'<span style="color:var(--ok)">✓</span>':'<span class="muted">—</span>':c}</td>`).join('')}</tr>`).join('')}</table></div></div></div>`;
+}
+/* settings */
+function settings(){
+  const tabs=[['providers','Providers'],['master','Master agent'],['autonomy','Autonomy'],['data','Data & backup'],['agenticos','Platforms'],['access','Operator access'],['sandbox','Sandbox']];
+  const b={
+   providers:`<h3>Providers</h3><p class="muted">Detected on this machine. Re-checked on daemon start and every hour.</p><div class="box">${CHECKS.map(c=>`<div class="check"><span class="st ${c.s}">${c.s==='ok'?'✓':c.s==='warn'?'!':'×'}</span><div><b class="strong mono">${c.n}</b><div class="muted" style="font-size:12px">${esc(c.d)}</div></div><span class="chip ${['claude','codex','pi'].includes(c.n)?'acc':''}">${['claude','codex','pi'].includes(c.n)?'master or worker':['cursor-agent','devin'].includes(c.n)?'worker':'tool'}</span></div>`).join('')}</div>`,
+   master:`<h3>Master agent</h3><div class="box"><div class="bd"><div class="row">${av('claude')}<div><b class="strong">master</b> · claude · opus · medium</div><div class="spacer"></div><span class="chip ok">running</span></div><p class="muted" style="font-size:12.5px">Changing provider or model applies at the next restart; the conversation history stays in Cadence.</p><div class="row"><button class="btn sm">Change model…</button><button class="btn sm">New conversation</button><button class="btn sm danger">Stop master</button></div></div></div>`,
+   autonomy:`<h3>Autonomy per project</h3><div class="tblwrap"><table class="tbl"><tr><th>Project</th><th>Level</th><th>Routine merges auto</th></tr><tr><td>reminders</td><td><span class="chip acc">Approve plans</span></td><td><span class="chip warn">locked · acceptance check 1/7</span></td></tr><tr><td>storefront</td><td><span class="chip">Ask for everything</span></td><td><span class="chip warn">locked</span></td></tr></table></div><p class="muted" style="font-size:12.5px">Stored in each project's <code>project.yaml</code> in the tracker, so every change has a commit and an author.</p>`,
+   agenticos:S.aos?`<h3>Platforms</h3><div class="box"><div class="bd" style="font-size:13px"><div class="between"><span class="muted">AgenticOS v2 workspace</span><b class="strong">Harbor Bakery</b></div><div class="between"><span class="muted">Signed in as</span><span>owner@harbor.example</span></div><div class="between"><span class="muted">Credential</span><span>AOS-14 agent credential · OS keychain</span></div><div class="between"><span class="muted">Scopes</span><span>${scopeChips()}</span></div><div class="row" style="margin-top:12px"><button class="btn sm">Change scopes</button><button class="btn sm danger" data-act="aosout">Disconnect</button></div></div></div>`:`<h3>Platforms</h3><p class="muted">No platform connected.</p><button class="aosbtn" data-act="aoslogin">${aosMark(18)} Sign in with Agentic<span style="color:var(--gold)">OS</span></button>`,
+   data:`<h3>Data &amp; backup</h3><p class="muted">Everything Cadence knows lives here and in your tracker. Nothing is lost on restart, lost provider sessions or a new machine.</p>
+   <div class="stor"><div><b>31 MB</b><span class="muted">store</span></div><div><b>14</b><span class="muted">threads</span></div><div><b>3,508</b><span class="muted">messages</span></div><div><b>7</b><span class="muted">backups kept</span></div></div>
+   <div class="box" style="margin-top:14px"><div class="bd" style="font-size:13px"><div class="between"><span class="muted">Last backup</span><span>today 03:00 · <span class="chip ok">verified</span></span></div><div class="between"><span class="muted">Schedule</span><span>nightly · keep 7 · before every update</span></div><div class="between"><span class="muted">Tracker remote</span><span class="mono">git@github.com:harbor-bakery/pm.git · in sync</span></div><div class="between"><span class="muted">Platform copy</span><span>${S.aos?'AgenticOS files · encrypted · weekly':'off'}</span></div>
+   <div class="row" style="margin-top:12px;flex-wrap:wrap"><button class="btn sm" data-act="toast" data-v="Backup started">Back up now</button><button class="btn sm" data-act="toast" data-v="Bundle written · credentials excluded">Export bundle…</button><button class="btn sm">Restore…</button></div></div></div>
+   <div class="box" style="margin-top:14px"><div class="hd"><h5>Continuity pack · master</h5><span class="muted" style="font-size:11.5px">what a new session starts with</span></div><div class="bd" style="font-size:12.5px"><div class="ck"><span class="b on">✓</span>Summary of 42 messages (checkpoint at plan approval)</div><div class="ck"><span class="b on">✓</span>Plan P-1 state: 1 done, 2 doing, 1 ready</div><div class="ck"><span class="b on">✓</span>6 operator preferences (e.g. "run tests before any PR")</div><div class="ck"><span class="b on">✓</span>Last 20 turns verbatim</div></div></div>
+   <div class="box" style="margin-top:14px"><div class="hd"><h5>Retention</h5></div><div class="bd" style="font-size:12.5px"><div class="between"><span class="muted">Delivery events</span><span>rolled up after 7 days</span></div><div class="between"><span class="muted">Threads</span><span>archived, never auto-deleted</span></div><div class="between"><span class="muted">Removed agents</span><span>history kept with their threads</span></div></div></div>`,
+   access:`<h3>Operator access</h3><div class="box"><div class="bd" style="font-size:13px"><div class="between"><span class="muted">This browser</span><span class="chip ok">signed in · expires in 29 days</span></div><div class="between"><span class="muted">Bind</span><span class="mono">127.0.0.1:3010</span></div><div class="between"><span class="muted">Tailnet</span><span class="mono">off</span></div><div class="row" style="margin-top:12px"><button class="btn sm">New login link</button><button class="btn sm">Sign out everywhere</button><button class="btn sm">Enable tailnet…</button></div></div></div><p class="muted" style="font-size:12.5px">Agents in panes cannot use operator-only actions, even from localhost.</p>`,
+   sandbox:`<h3>Sandbox profiles</h3><p class="muted">Test install and onboarding next to a live daemon. Each sandbox has its own state, tracker, port and tmux socket.</p><div class="tblwrap"><table class="tbl"><tr><th>Profile</th><th>Port</th><th>Providers</th><th>AgenticOS</th><th></th></tr><tr><td>production</td><td class="num">3010</td><td>real</td><td>live</td><td><span class="chip ok">this</span></td></tr><tr><td>onboarding-1</td><td class="num">3110</td><td>fake (scripted)</td><td>mock</td><td><button class="btn sm" data-act="sbx">${S.sbx?'Hide banner':'Preview banner'}</button></td></tr></table></div>
+   <div class="term" style="margin-top:14px"><pre><span class="p">$</span> <span class="w">cadence sandbox up onboarding-1 --providers fake --aos mock</span>
+<span class="m">› root   ~/.local/state/cadence-sandbox/onboarding-1  (marker written)</span>
+<span class="m">› binary target/release/cadence (worktree build, not ~/.local/bin)</span>
+<span class="m">› refuse  production state dir / socket / :3010 / tailnet</span>
+<span class="m">› skip    skill sync, cursor cli-config merge, WAL checkpoints</span>
+<span class="g">› ui     http://127.0.0.1:3110/?login=…</span>
+<span class="p">$</span> <span class="w">cadence sandbox reset onboarding-1</span>   <span class="m"># deletes only a dir holding the marker</span></pre></div>`};
+  return `<div class="set"><div class="sn">${tabs.map(([k,l])=>`<button data-act="settab" data-v="${k}" aria-current="${S.setTab===k}">${l}</button>`).join('')}</div><div class="sb">${b[S.setTab]}</div></div>`;
+}
+
+/* consent modal */
+function consent(){
+  const sc=[['know','Read and write workspace knowledge','knowledge.read · knowledge.write',''],['crm','Read CRM records','crm.read',''],['leads','Read leads','leads.read',''],['files','Store encrypted backups in Files','files.write',''],['threads','Mirror plan status into a thread','threads.write',''],['wa','Draft WhatsApp messages','whatsapp.draft','send asks you']];
+  const body=S.consentStep===0?`<h4>Connect Cadence</h4><div class="sm">Cadence on this computer is asking to connect. Check the code matches what Cadence shows.</div>
+     <div style="margin:16px 0;padding:14px;border:1px dashed #d9d9de;border-radius:12px;text-align:center"><div class="sm">Code shown in Cadence</div><div style="font:700 26px 'Geist Mono','IBM Plex Mono',monospace;letter-spacing:.18em;margin-top:4px">HBK-4729</div></div>
+     <div class="sm" style="margin-bottom:6px">Sign in with the code we emailed to <b>owner@harbor.example</b></div>
+     <div class="otp">${'472913'.split('').map(d=>`<input value="${d}" aria-label="digit" readonly>`).join('')}</div>`:
+    `<h4>Allow Cadence to use Harbor Bakery?</h4><div class="sm">You can change or revoke this any time in Settings → Connected apps.</div>
+     <div class="sc">${sc.map(([k,l,c,a])=>`<label><input type="checkbox" data-act="scope" data-v="${k}" ${S.aosScopes[k]?'checked':''}><span>${l}<br><code>${c}</code></span>${a?`<span class="ask">${a}</span>`:'<span></span>'}</label>`).join('')}</div>
+     <div class="sm">Cadence's agents can read and draft. Anything that sends, posts, publishes or spends waits for you to press it — in Cadence or in your thread.</div>`;
+  return `<div class="scrim" data-act="closeconsent"><div class="aos" role="dialog" aria-label="AgenticOS connect">
+   <div class="top">${aosMark(22)}<span class="wm">Agentic<em>OS</em></span><span class="url">agenticos.hk/connect · proposed (AOS-14)</span></div>
+   <div class="in">${body}</div>
+   <div class="act"><button class="b" data-act="closeconsent">Cancel</button>${S.consentStep===0?'<button class="b go" data-act="consentnext">Verify &amp; continue</button>':'<button class="b go" data-act="aosallow">Allow</button>'}</div></div></div>`;
+}
+/* ---------- render ---------- */
+let overlay=null;
+function render(){
+  syncChrome();
+  if(S.tab==='proto'){
+    $('#story').innerHTML=story();
+    const th=$('#thread'); const atBottom=th?th.scrollHeight-th.scrollTop-th.clientHeight<40:true;
+    const draft=$('#compose')?$('#compose').value:'';
+    $('#frame').innerHTML=frame();
+    const c=$('#compose'); if(c) c.value=draft;
+    const t=$('#thread'); if(t&&atBottom) t.scrollTop=t.scrollHeight;
+  }
+  $('#overlay').innerHTML=overlay==='consent'?consent():overlay&&overlay.startsWith('issue:')?issueDrawer(overlay.slice(6)):'';
+  $('#overlay').innerHTML+=S.toast?`<div class="toast" role="status">${S.toast}</div>`:'';
+}
+function toast(m){S.toast=m;render();clearTimeout(toast.t);toast.t=setTimeout(()=>{S.toast=null;render()},1800)}
+function reply(text){
+  S.typing=true;render();
+  setTimeout(()=>{S.typing=false;S.extra.push({t:text});render()},1300);
+}
+document.addEventListener('click',e=>{
+  const el=e.target.closest('[data-act]'); if(!el) return;
+  const a=el.dataset.act,v=el.dataset.v;
+  if(el.classList.contains('scrim')&&e.target!==el) return;
+  if(el.tagName==='INPUT'&&a!=='scope'&&a!=='credits') return;
+  switch(a){
+    case 'tab':S.tab=v;window.scrollTo(0,0);break;
+    case 'theme':toggleTheme();return;
+    case 'vp':S.narrow=v==='narrow';break;
+    case 'sim':S.sim=S.sim==='normal'?'offline':'normal';if(S.screen==='install'||S.screen==='setup')S.screen='home';break;
+    case 'sbx':S.sbx=!S.sbx;break;
+    case 'go':overlay=null;S.screen=v;S.showRail=false;if(v==='home'&&!S.launched){S.launched=true}break;
+    case 'step':S.step=Math.min(6,Math.max(0,+v));break;
+    case 'recheck':S.checks=null;break;
+    case 'aoslogin':overlay='consent';S.consentStep=0;break;
+    case 'consentnext':S.consentStep=1;break;
+    case 'start':S.start=v;S.restored=false;break;
+    case 'restore':S.restored=true;break;
+    case 'cf':S.cf=true;toast('Cloudflare connected · token stored in keychain');return;
+    case 'ptab':S.platTab=v;break;
+    case 'post':S.post=v;toast(v==='ok'?'Sent · 1 message':'Kept as draft');return;
+    case 'toast':toast(v);return;
+    case 'closeconsent':overlay=null;break;
+    case 'scope':S.aosScopes[v]=el.checked;return;
+    case 'aosallow':overlay=null;S.aos=true;toast('Connected to AgenticOS v2 · Harbor Bakery');return;
+    case 'aosout':S.aos=false;S.aosCredits=false;toast('Disconnected. Token revoked.');return;
+    case 'credits':S.aosCredits=el.checked;break;
+    case 'master':S.master=v;S.model={claude:'opus',codex:'gpt-5.5-codex',pi:'claude-sonnet'}[v];break;
+    case 'dial':S.dial=+v;break;
+    case 'launch':S.launching=1;render();[2,3,4].forEach((n,i)=>setTimeout(()=>{S.launching=n;render();if(n===4)setTimeout(()=>{S.launching=0;S.launched=true;S.screen='home';render()},600)},(i+1)*650));return;
+    case 'approve':S.planApproved=true;toast('Plan P-1 approved · workers starting');return;
+    case 'changes':S.extra.push({me:true,t:'Split RMD-3 so the dry-run mode lands before any send code.'});reply('Good call. I\'ll split RMD-3 into <b>RMD-3a dry-run logger</b> and <b>RMD-3b send via approval request</b>, and re-propose the plan as P-1 rev 2.');return;
+    case 'perm':S.perm=v;break;
+    case 'ff':S.ff=true;toast('Skipped ahead 2 hours');return;
+    case 'merge':S.merge=true;toast('Merged via GitHub merge queue');return;
+    case 'deploy':S.deploy=v;toast(v==='ok'?'Deploying to production':'Declined · master notified');return;
+    case 'send':sendMsg();return;
+    case 'interrupt':S.typing=false;S.extra.push({t:'<span class="muted">Interrupted by you.</span>'});break;
+    case 'rail':S.showRail=!S.showRail;break;
+    case 'issue':overlay='issue:'+v;break;
+    case 'close':overlay=null;break;
+    case 'agent':S.agent=v;break;
+    case 'settab':S.setTab=v;break;
+    case 'copy':toast('Copied');return;
+  }
+  render();
+});
+document.addEventListener('input',e=>{if(e.target.dataset.act==='maxw'){S.maxw=+e.target.value;const m=$('#mw');if(m)m.textContent=S.maxw}});
+document.addEventListener('keydown',e=>{
+  if(e.target.id==='compose'&&e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg()}
+  if(e.key==='Escape'&&overlay){overlay=null;render()}
+  if(e.key==='Enter'&&e.target.classList&&(e.target.classList.contains('tcard')||e.target.classList.contains('arow'))){e.target.click()}
+});
+function sendMsg(){
+  const c=$('#compose'); if(!c||!c.value.trim()||S.sim==='offline') return;
+  S.extra.push({me:true,t:c.value.trim()}); c.value='';
+  reply(S.planApproved?'Noted. I\'ll fold that into the next issue that touches it and tell w2 through a steering amendment — the objective and acceptance stay as approved.':'Understood. I\'ll update the plan before anything is dispatched — nothing starts until you approve it.');
+}
+/* toc highlight */
+const obs=new IntersectionObserver(es=>es.forEach(en=>{if(en.isIntersecting){document.querySelectorAll('.toc a').forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+en.target.id))}}),{rootMargin:'-20% 0px -70% 0px'});
+document.querySelectorAll('h2[id],section[id]').forEach(h=>obs.observe(h));
+render();
+})();
+</script>
+</body>
+</html>
