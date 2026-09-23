@@ -315,13 +315,24 @@ impl AuthState {
 }
 
 /// A daemon-minted strict enrollment. `worker` equals `root` for a
-/// managed provider (the provider process itself); the field exists so
-/// a later runner (CAD-236) can record one direct child.
+/// managed provider (the provider process itself) and for a
+/// daemon-launched runner (the process the daemon spawned, which execs
+/// the recipe — CAD-230b); the field exists so a later runner could
+/// record one direct child.
 #[derive(Clone, Debug)]
 pub struct Enrollment {
     pub id: String,
+    /// The lane the enrollment's holds are accounted to — the managed
+    /// endpoint's alias, or the requester a runner was launched for.
     pub owner_actor: String,
+    /// A managed endpoint's owner-row generation, revalidated on every
+    /// call; for a runner `runner:<runner_id>:<intent digest>` — the
+    /// launch intent bound to the runner id before spawn.
     pub owner_generation: String,
+    /// `Some(runner_id)` for a daemon-launched runner (CAD-230b): its
+    /// owner is the daemon's own runner record, never an agent row, so
+    /// owner revalidation and endpoint supersession never touch it.
+    pub runner: Option<String>,
     pub root: ProcIdentity,
     pub worker: ProcIdentity,
     pub issued_epoch: f64,
@@ -347,6 +358,9 @@ impl Enrollment {
         if let AuthState::Revoked(reason) = &self.auth {
             j["revoked_reason"] = json!(reason);
         }
+        if let Some(runner) = &self.runner {
+            j["runner_id"] = json!(runner);
+        }
         j
     }
 
@@ -369,6 +383,10 @@ impl Enrollment {
             id: v["enrollment_id"].as_str()?.to_string(),
             owner_actor: v["owner_actor"].as_str()?.to_string(),
             owner_generation: v["owner_generation"].as_str()?.to_string(),
+            runner: match v.get("runner_id") {
+                None => None,
+                Some(r) => Some(r.as_str()?.to_string()),
+            },
             root: ProcIdentity::from_json(&v["root"])?,
             worker: ProcIdentity::from_json(&v["worker"])?,
             issued_epoch: v["issued_epoch"].as_f64()?,

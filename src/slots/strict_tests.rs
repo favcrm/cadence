@@ -1168,7 +1168,7 @@ fn reconcile_required_only_where_reconcile_can_act() {
     );
 }
 
-// ---------- CAD-230 phase b1: exec-bound holds ----------
+// ---------- CAD-230 phase b: exec-bound holds and runners ----------
 
 /// Mark `pid` as exited but not yet reaped by its parent (a zombie).
 fn zombify(p: &FakeProc, pid: u32) {
@@ -1273,4 +1273,138 @@ fn exec_bound_hold_refuses_forged_release_and_pid_reuse() {
     // The dead holder's release reason named the recycling.
     let persisted = s.recent_reaped.iter().any(|r| r.token == token);
     assert!(!persisted, "a same-call reap is answered by that call");
+}
+
+/// ACCEPTANCE (b2): a runner enrollment is the daemon's own — root =
+/// worker = the exact spawned process, its generation binding the
+/// launch digest to the runner id. Owner revalidation and endpoint
+/// supersession never touch it; its one hold is exec-bound; its process
+/// tree can neither acquire, release nor launch; a recycled root is
+/// refused; and its end frees the hold and prunes the enrollment.
+#[test]
+fn runner_enrollment_is_daemon_owned_and_holds_one_exec_bound_slot() {
+    let p = tree();
+    p.spawn(600, 100, 90).spawn(610, 600, 91);
+    let mut s = strict_slots(&p, 1);
+    enroll(&mut s, "wk", "g1", 200);
+    let (id, root, events) = s.enroll_runner("wk", "run-a", "d1", 600, clk(0.0)).unwrap();
+    assert_eq!(root.pid, 600);
+    assert!(events.iter().any(|e| e.1 == "slot_runner_enrolled"));
+    let e = s.enrollments.iter().find(|e| e.id == id).unwrap().clone();
+    assert_eq!(e.owner_generation, "runner:run-a:d1");
+    assert_eq!((e.root, e.worker), (root, root));
+    assert_eq!(e.to_json()["runner_id"], "run-a");
+    // Never enrolled twice: not the same process, not the same id.
+    assert!(s.enroll_runner("wk", "run-b", "d1", 600, clk(0.0)).is_err());
+    assert!(s.enroll_runner("wk", "run-a", "d1", 500, clk(0.0)).is_err());
+    assert!(s.enroll_runner("wk", "run-c", "d1", 200, clk(0.0)).is_err());
+    // Revalidation against agent rows skips it; the endpoint's own
+    // supersession and close leave it alone.
+    assert_eq!(s.enrolled_owners(), vec!["wk".to_string()]);
+    let same = HashMap::from([("wk".to_string(), Some("g1".to_string()))]);
+    assert!(s.revalidate_owners(&same).is_empty());
+    enroll(&mut s, "wk", "g2", 200);
+    s.revoke_owner("wk", "endpoint closed");
+    let e = s.enrollments.iter().find(|e| e.id == id).unwrap();
+    assert_eq!(e.auth, AuthState::Active);
+    // Its one hold: strict, exec-bound, the runner's exact root.
+    let (g, _) = s.acquire_runner(&id, SlotKind::Build, clk(1.0)).unwrap();
+    assert_eq!(g["granted"], true, "{g}");
+    let h = held_json(&mut s, 1.0)[0].clone();
+    assert_eq!(
+        (
+            h["pid"].as_u64(),
+            h["lane"].as_str(),
+            h["exec_bound"].as_bool()
+        ),
+        (Some(600), Some("wk"), Some(true))
+    );
+    // Its process tree is admitted as the runner — and refused work.
+    assert_eq!(s.nearest_enrolled_root(&[610, 600, 100]), Some(1));
+    let caller = s.strict_caller(610, 600).unwrap();
+    for err in [
+        s.acquire_strict(SlotKind::Build, &caller, 610, "nested", false, clk(1.0))
+            .unwrap_err(),
+        s.release_strict(g["token"].as_str().unwrap(), &caller, 600, 1.0)
+            .unwrap_err(),
+        s.launch_lane(&caller, 1.0).unwrap_err(),
+    ] {
+        assert!(err.to_string().contains("run-a"), "{err}");
+    }
+    // A managed endpoint that is revoked launches nothing either.
+    let wk = s.strict_caller(400, 200).unwrap();
+    assert!(s.launch_lane(&wk, 1.0).is_err());
+    // The end: the process is gone — the hold frees on proof of death,
+    // the enrollment is revoked and, holding nothing, pruned.
+    p.kill(610);
+    p.kill(600);
+    let events = s.end_runner(&id, "runner run-a exited", 2.0);
+    assert!(events
+        .iter()
+        .any(|e| e.1 == "slot_released" && e.2["pid"] == 600));
+    assert!(s.held.is_empty());
+    assert!(s.enrollments.iter().all(|e| e.id != id));
+}
+
+/// ACCEPTANCE (b2): a runner whose root pid was recycled before its
+/// grant is refused, never queued or granted; a live runner that ends
+/// without a grant drops its waiter.
+#[test]
+fn runner_grant_requires_the_exact_enrolled_process() {
+    let p = tree();
+    p.spawn(600, 100, 90).spawn(700, 100, 95);
+    let mut s = strict_slots(&p, 1);
+    let (a, _, _) = s.enroll_runner("x", "run-a", "d", 600, clk(0.0)).unwrap();
+    let (b, _, _) = s.enroll_runner("y", "run-b", "d", 700, clk(0.0)).unwrap();
+    let (g, _) = s.acquire_runner(&a, SlotKind::Build, clk(0.0)).unwrap();
+    assert_eq!(g["granted"], true);
+    let (q, _) = s.acquire_runner(&b, SlotKind::Test, clk(0.0)).unwrap();
+    assert_eq!(q["granted"], false, "one build slot, held by run-a");
+    assert_eq!(s.waiting.len(), 1);
+    p.spawn(700, 100, 96);
+    let err = s.acquire_runner(&b, SlotKind::Test, clk(1.0)).unwrap_err();
+    assert!(err.to_string().contains("no longer the enrolled"), "{err}");
+    s.end_runner(&b, "runner run-b refused", 1.0);
+    assert!(s.waiting.is_empty());
+    assert_eq!(s.held.len(), 1, "run-a's hold is untouched");
+}
+
+/// ACCEPTANCE (b2 restart): a runner in flight at daemon restart keeps
+/// its hold accounted under the tri-state rule, but its enrollment is
+/// revoked — the runner record that owned it died with the old daemon —
+/// so nothing is admitted or relaunched under it.
+#[test]
+fn restart_revokes_runner_enrollments_but_keeps_their_holds() {
+    let p = tree();
+    p.spawn(600, 100, 90);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slots.json");
+    let mut s = strict_slots(&p, 1);
+    s.persist_to(path.clone());
+    let (id, _, _) = s.enroll_runner("wk", "run-a", "d", 600, clk(0.0)).unwrap();
+    s.acquire_runner(&id, SlotKind::Build, clk(0.0)).unwrap();
+    drop(s);
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(doc["holds"][0]["exec_bound"], true);
+    assert_eq!(doc["enrollments"][0]["runner_id"], "run-a");
+    let mut s = strict_slots(&p, 1);
+    s.persist_to(path.clone());
+    s.restore(clk(0.0));
+    assert!(s.strict_available());
+    let e = &s.enrollments[0];
+    assert!(
+        matches!(&e.auth, AuthState::Revoked(why) if why.contains("daemon restarted")),
+        "{:?}",
+        e.auth
+    );
+    let h = held_json(&mut s, 1.0)[0].clone();
+    assert_eq!(
+        (h["exec_bound"].as_bool(), h["liveness"].as_str()),
+        (Some(true), Some("alive"))
+    );
+    assert!(s.acquire_runner(&id, SlotKind::Build, clk(1.0)).is_err());
+    // Proven death still frees it.
+    p.kill(600);
+    s.reap_strict_holds(2.0);
+    assert!(s.held.is_empty());
 }

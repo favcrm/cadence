@@ -560,19 +560,22 @@ mod tests {
     fn shared_deps_default_and_per_worktree() {
         for build in [
             None,
-            Some(project::Build { target_dir: None }),
+            Some(project::Build::default()),
             Some(project::Build {
                 target_dir: Some("shared".to_string()),
+                ..Default::default()
             }),
         ] {
             assert!(shared_deps_enabled(&project_with(build)).unwrap());
         }
         let per = project_with(Some(project::Build {
             target_dir: Some("per-worktree".to_string()),
+            ..Default::default()
         }));
         assert!(!shared_deps_enabled(&per).unwrap());
         let bad = project_with(Some(project::Build {
             target_dir: Some("/somewhere/else".to_string()),
+            ..Default::default()
         }));
         let e = shared_deps_enabled(&bad).unwrap_err();
         assert!(e.to_string().contains("/somewhere/else"), "{e}");

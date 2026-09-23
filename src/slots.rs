@@ -198,7 +198,7 @@ struct StrictBind {
     liveness: Liveness,
     /// CAD-230b: the holder is exactly the process that execs the
     /// command — `build-slot run` itself (the requesting peer, never an
-    /// ancestor). Exec keeps the pid and
+    /// ancestor) or a daemon-launched runner. Exec keeps the pid and
     /// starttime, so the hold names the running build and ends with it.
     exec_bound: bool,
 }
@@ -1087,6 +1087,17 @@ impl Slots {
             if matches!(e.auth, AuthState::Revoked(_)) {
                 continue;
             }
+            // A runner's owner is the previous daemon's in-memory
+            // runner record (CAD-230b): it did not survive the restart,
+            // so the enrollment admits nothing more. Its hold stays
+            // accounted under the tri-state rule below until the
+            // process is proven dead — it is never relaunched.
+            if e.runner.is_some() {
+                e.auth = AuthState::Revoked(
+                    "daemon restarted — runner outcome unknown, never relaunched".into(),
+                );
+                continue;
+            }
             match self.proc.liveness(&e.root).0 {
                 Liveness::Alive => {}
                 Liveness::Dead => {
@@ -1715,7 +1726,10 @@ impl Slots {
                 (next[i].id.clone(), true)
             }
             None => {
-                for e in next.iter_mut().filter(|e| e.owner_actor == owner) {
+                for e in next
+                    .iter_mut()
+                    .filter(|e| e.owner_actor == owner && e.runner.is_none())
+                {
                     if !matches!(e.auth, AuthState::Revoked(_)) {
                         e.auth = AuthState::Revoked("superseded by a new endpoint".into());
                     }
@@ -1735,6 +1749,7 @@ impl Slots {
                     id: id.clone(),
                     owner_actor: owner.to_string(),
                     owner_generation: owner_generation.to_string(),
+                    runner: None,
                     root,
                     worker: root,
                     issued_epoch: clk.wall,
@@ -1759,7 +1774,10 @@ impl Slots {
     /// accounted until released or proven dead.
     pub fn revoke_owner(&mut self, owner: &str, reason: &str) -> Vec<SlotEvent> {
         let reason = reason.to_string();
-        self.revoke_where(|e| e.owner_actor == owner, |_| reason.clone())
+        self.revoke_where(
+            |e| e.owner_actor == owner && e.runner.is_none(),
+            |_| reason.clone(),
+        )
     }
 
     /// Owners with an active enrollment — whose rows the daemon must
@@ -1768,7 +1786,7 @@ impl Slots {
         let mut owners: Vec<String> = self
             .enrollments
             .iter()
-            .filter(|e| e.auth == AuthState::Active)
+            .filter(|e| e.auth == AuthState::Active && e.runner.is_none())
             .map(|e| e.owner_actor.clone())
             .collect();
         owners.sort();
@@ -1784,9 +1802,12 @@ impl Slots {
         &mut self,
         current: &HashMap<String, Option<String>>,
     ) -> Vec<SlotEvent> {
+        // A runner's owner is the daemon's runner record, not an agent
+        // row — it is never revalidated against one (CAD-230b).
         let drifted = |e: &Enrollment| {
-            current.get(&e.owner_actor).and_then(Option::as_deref)
-                != Some(e.owner_generation.as_str())
+            e.runner.is_none()
+                && current.get(&e.owner_actor).and_then(Option::as_deref)
+                    != Some(e.owner_generation.as_str())
         };
         self.revoke_where(drifted, |e| {
             match current.get(&e.owner_actor).and_then(Option::as_deref) {
@@ -1916,7 +1937,8 @@ impl Slots {
     /// `exec` the claimed `pid` must be the connection peer ITSELF — the
     /// `build-slot run` process that execs into the command, so the
     /// hold's recorded `(pid, starttime, uid)` is exactly the running
-    /// build and ends with its exit. An ancestor is refused.
+    /// build and ends with its exit. An ancestor is refused. A runner's
+    /// own process tree never acquires: its one hold is the daemon's.
     #[allow(clippy::too_many_arguments)]
     pub fn acquire_strict_bound(
         &mut self,
@@ -1936,6 +1958,9 @@ impl Slots {
             .iter()
             .find(|e| e.id == caller.enrollment_id)
             .ok_or_else(|| Error::rejected("Slot caller's enrollment is gone"))?;
+        if let Some(runner) = &e.runner {
+            return Err(runner_tree_refused(runner));
+        }
         if e.auth != AuthState::Active || clk.mono >= e.expires_at {
             let state = if e.auth == AuthState::Active {
                 "expired"
@@ -1986,6 +2011,14 @@ impl Slots {
     ) -> Result<(Value, Vec<SlotEvent>)> {
         if let Some(b) = &self.blocked {
             return Err(strict_unavailable(&b.reason));
+        }
+        if let Some(runner) = self
+            .enrollments
+            .iter()
+            .find(|e| e.id == caller.enrollment_id)
+            .and_then(|e| e.runner.as_ref())
+        {
+            return Err(runner_tree_refused(runner));
         }
         let caller = self.hold_enrollment_caller(token, caller);
         let lane = caller.lane.clone();
@@ -2146,6 +2179,183 @@ impl Slots {
             }
         }
     }
+}
+
+/// Runners (CAD-230b) — daemon-launched processes that hold one strict,
+/// exec-bound slot for their whole life. Only the daemon enrolls,
+/// queues, grants and ends them; nothing here takes a caller's word.
+impl Slots {
+    /// The lane a strict caller may launch a runner for: its
+    /// enrollment must be an active managed endpoint's. A runner's own
+    /// process tree never launches another runner.
+    pub fn launch_lane(&self, caller: &StrictCaller, now: f64) -> Result<String> {
+        if let Some(b) = &self.blocked {
+            return Err(strict_unavailable(&b.reason));
+        }
+        let e = self
+            .enrollments
+            .iter()
+            .find(|e| e.id == caller.enrollment_id)
+            .ok_or_else(|| Error::rejected("Launch caller's enrollment is gone"))?;
+        if let Some(runner) = &e.runner {
+            return Err(runner_tree_refused(runner));
+        }
+        if e.auth != AuthState::Active || now >= e.expires_at {
+            return Err(Error::rejected(format!(
+                "Enrollment {} is not active — a revoked or expired managed \
+                 endpoint launches no runner",
+                e.id
+            )));
+        }
+        Ok(e.owner_actor.clone())
+    }
+
+    /// Enroll the process the daemon just spawned for runner
+    /// `runner_id`: root = worker = that exact process (pid, starttime,
+    /// uid as `/proc` reads it now), accounted to `lane`, its owner
+    /// generation binding the launch-intent `digest` to the runner id.
+    /// Refuses what [`Self::enroll`] refuses, a process that is already
+    /// enrolled, and a runner id already in use.
+    pub fn enroll_runner(
+        &mut self,
+        lane: &str,
+        runner_id: &str,
+        digest: &str,
+        pid: u32,
+        clk: SlotClock,
+    ) -> Result<(String, ProcIdentity, Vec<SlotEvent>)> {
+        if let Some(b) = &self.blocked {
+            return Err(strict_unavailable(&b.reason));
+        }
+        if pid <= 1 || pid == std::process::id() {
+            return Err(Error::rejected(format!(
+                "pid {pid} cannot be a runner root — the daemon never enrolls \
+                 itself or init"
+            )));
+        }
+        let root = self
+            .proc
+            .identity(pid)
+            .map_err(|why| Error::rejected(format!("cannot enroll runner pid {pid}: {why}")))?;
+        if root.uid != self.daemon_uid {
+            return Err(Error::rejected(format!(
+                "cannot enroll runner pid {pid}: it runs as uid {} — not the daemon's uid {}",
+                root.uid, self.daemon_uid
+            )));
+        }
+        if let Some(e) = self
+            .enrollments
+            .iter()
+            .find(|e| e.root == root || e.runner.as_deref() == Some(runner_id))
+        {
+            return Err(Error::rejected(format!(
+                "cannot enroll runner {runner_id} (pid {pid}): already enrolled as {}",
+                e.id
+            )));
+        }
+        let id = format!("enr-{}", Uuid::new_v4().simple());
+        let mut next = self.enrollments.clone();
+        next.push(Enrollment {
+            id: id.clone(),
+            owner_actor: lane.to_string(),
+            owner_generation: format!("runner:{runner_id}:{digest}"),
+            runner: Some(runner_id.to_string()),
+            root,
+            worker: root,
+            issued_epoch: clk.wall,
+            expires_epoch: clk.wall + ENROLLMENT_TTL_SECS,
+            expires_at: clk.mono + ENROLLMENT_TTL_SECS,
+            auth: AuthState::Active,
+        });
+        self.commit(next, self.held.clone())?;
+        let event = (
+            lane.to_string(),
+            "slot_runner_enrolled",
+            json!({"enrollment_id": id, "runner_id": runner_id, "root_pid": pid}),
+        );
+        Ok((id, root, vec![event]))
+    }
+
+    /// One queue poll for runner enrollment `enrollment_id`: a strict,
+    /// exec-bound request for its exact root process under the
+    /// runner's lane, `request_id` = the runner id. The root must still
+    /// be the enrolled process (pid AND starttime) — a recycled pid is
+    /// refused, never queued or granted.
+    pub fn acquire_runner(
+        &mut self,
+        enrollment_id: &str,
+        kind: SlotKind,
+        clk: SlotClock,
+    ) -> Result<(Value, Vec<SlotEvent>)> {
+        if let Some(b) = &self.blocked {
+            return Err(strict_unavailable(&b.reason));
+        }
+        let e = self
+            .enrollments
+            .iter()
+            .find(|e| e.id == enrollment_id)
+            .ok_or_else(|| Error::rejected("Runner enrollment is gone"))?;
+        let Some(runner_id) = e.runner.clone() else {
+            return Err(Error::rejected(format!(
+                "Enrollment {enrollment_id} is not a runner's"
+            )));
+        };
+        if e.auth != AuthState::Active || clk.mono >= e.expires_at {
+            return Err(Error::rejected(format!(
+                "Runner enrollment {enrollment_id} is no longer active"
+            )));
+        }
+        let (lane, owner_generation, root) =
+            (e.owner_actor.clone(), e.owner_generation.clone(), e.root);
+        let holder = self
+            .proc
+            .identity(root.pid)
+            .map_err(|why| Error::rejected(format!("runner pid {}: {why}", root.pid)))?;
+        if holder != root {
+            return Err(Error::rejected(format!(
+                "runner pid {} is no longer the enrolled process",
+                root.pid
+            )));
+        }
+        self.acquire_as(
+            kind,
+            &lane,
+            root.pid,
+            &runner_id,
+            false,
+            clk,
+            Some(StrictBind {
+                enrollment_id: enrollment_id.to_string(),
+                owner_generation,
+                holder,
+                liveness: Liveness::Alive,
+                exec_bound: true,
+            }),
+        )
+    }
+
+    /// The runner ended — its process exited and was reaped by the
+    /// daemon, or never started. Frees its hold only through the
+    /// tri-state rule (the holder must read `dead`), drops its waiter,
+    /// and revokes the enrollment, which [`Self::commit`] prunes once
+    /// nothing holds under it.
+    pub fn end_runner(&mut self, enrollment_id: &str, reason: &str, now: f64) -> Vec<SlotEvent> {
+        let mut events = self.reap_strict_holds(now);
+        self.waiting
+            .retain(|w| w.strict.as_ref().map(|b| b.enrollment_id.as_str()) != Some(enrollment_id));
+        let reason = reason.to_string();
+        events.extend(self.revoke_where(|e| e.id == enrollment_id, |_| reason.clone()));
+        events
+    }
+}
+
+/// A slot call from inside a daemon-launched runner's process tree.
+fn runner_tree_refused(runner: &str) -> Error {
+    Error::rejected(format!(
+        "This process runs under daemon-launched runner {runner}, which already \
+         holds its slot — a recipe must not nest build-slot acquire/run/release \
+         or launch; its hold ends when the runner exits"
+    ))
 }
 
 /// An exec-bound request claiming anything but the connection peer.

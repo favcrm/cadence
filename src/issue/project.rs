@@ -1,5 +1,6 @@
 //! `<pm>/<key>/project.yaml` and project resolution for the CLI.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,11 +25,37 @@ pub struct Repo {
 /// `<repo>/.cadence/target/shared`, `"per-worktree"` keeps the
 /// classic fully-private `target/` (the opt-out for hosts where the
 /// cargo lock queue costs more than the disk it saves).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `recipes` (CAD-230b) are the only commands the daemon will launch
+/// for this project (`cadence build-slot launch <name>`): a fixed argv,
+/// a repo-relative cwd and an environment allowlist — never anything a
+/// caller supplies.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Build {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recipes: BTreeMap<String, Recipe>,
+}
+
+/// One `build.recipes.<name>` entry — see [`crate::runner`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Recipe {
+    /// The exact command; `argv[0]` is resolved against the allowlisted
+    /// `PATH` (or the shell's default when `PATH` is not allowlisted).
+    pub argv: Vec<String>,
+    /// Repo-relative working directory (default: the checkout root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Environment NAMES passed through from the daemon's environment;
+    /// nothing else reaches the command (`CADENCE_*` is refused).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+    /// The slot pool: `build` (default), `test` or `suite`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

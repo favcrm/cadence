@@ -209,6 +209,11 @@ fn epoch_secs() -> f64 {
 /// How often the daemon re-reads strict holders (CAD-230b).
 const SLOT_WATCH_TICK: Duration = Duration::from_secs(1);
 
+/// A launched runner queues this long for its slot unless asked
+/// otherwise (`wait_secs`), and never longer than the cap.
+const RUNNER_WAIT_SECS: u64 = 600;
+const RUNNER_MAX_WAIT_SECS: u64 = 86_400;
+
 /// Monotonic seconds since an arbitrary process-local epoch — the
 /// slot clock. NTP steps and wall-clock jumps cannot age a waiter or
 /// expire a hold; the wall epoch rides alongside only for restart
@@ -527,6 +532,16 @@ impl Shared {
         // see which daemon opened them. The value is an instance id,
         // not a credential, and it stays in this daemon's provider env.
         shared.provider_env.set("CADENCE_DAEMON_ID", daemon_id);
+        // CAD-230b: a runner in flight when the last daemon stopped is
+        // `unknown` and incomplete — reported, never relaunched.
+        for r in crate::runner::recover(state_dir, epoch_secs()) {
+            let _ = shared.store.event_public(
+                &r.requester.lane,
+                "runner_unknown",
+                json!({"runner_id": r.runner_id, "recipe": r.recipe,
+                       "last_state": r.last_state, "reason": r.reason}),
+            );
+        }
         Ok(shared)
     }
 
@@ -1843,6 +1858,8 @@ impl Shared {
             "slot_release" => self.rpc_slot_release(params, peer_pid),
             "slot_status" => self.rpc_slot_status(params, peer_pid),
             "slot_reconcile" => self.rpc_slot_reconcile(params, peer_pid),
+            "slot_launch" => self.rpc_slot_launch(params, peer_pid),
+            "slot_runner" => self.rpc_slot_runner(params, peer_pid),
             "approval_record" => self.rpc_approval_record(params, peer_pid),
             "approval_revoke" => self.rpc_approval_revoke(params, peer_pid),
             other => Err(Error::rejected(format!("Unknown method '{other}'"))),
@@ -2273,14 +2290,25 @@ impl Shared {
     /// [`crate::peer::operator_proof`] for the checks; anything
     /// unreadable or ambiguous refuses.
     fn proven_operator(&self, verb: &str, peer_pid: u32) -> Result<()> {
+        self.operator_evidence(peer_pid).map_err(|why| {
+            Error::rejected(format!(
+                "{verb} is an operator action — this connection is not \
+                 provably the operator: {why}; run it from an attached operator \
+                 shell outside every pane and managed endpoint"
+            ))
+        })
+    }
+
+    /// [`crate::peer::operator_proof`] against the live panes and
+    /// enrollments — `Err` names the first check that failed.
+    fn operator_evidence(&self, peer_pid: u32) -> std::result::Result<(), String> {
         let panes: HashMap<u32, String> = self
             .store
             .pty_endpoint_facts()
             .map_err(|e| {
-                Error::rejected(format!(
-                    "{verb} is an operator action — the registered panes \
-                     cannot be read to prove this connection is not one ({e})"
-                ))
+                format!(
+                    "the registered panes cannot be read to prove this connection is not one ({e})"
+                )
             })?
             .into_iter()
             .map(|(alias, (_, pane_pid, _))| (pane_pid, alias))
@@ -2293,13 +2321,6 @@ impl Shared {
             &panes,
             |pid| slots.nearest_enrolled_root(&[pid]).is_some(),
         )
-        .map_err(|why| {
-            Error::rejected(format!(
-                "{verb} is an operator action — this connection is not \
-                 provably the operator: {why}; run it from an attached operator \
-                 shell outside every pane and managed endpoint"
-            ))
-        })
     }
 
     /// `slot_reconcile` — the one mutating operator path over a strict
@@ -2340,6 +2361,329 @@ impl Shared {
             .reconcile(enrollment, token, evidence, (self.slot_clock)())?;
         self.emit_slot_events(events);
         Ok(result)
+    }
+
+    /// Who may ask the daemon to launch a runner (CAD-230b), from the
+    /// connection alone: a pane agent (the legacy derivation), an ACTIVE
+    /// enrolled managed endpoint (phase a), or — deriving neither — the
+    /// proven operator ([`crate::peer::operator_proof`]). A runner's own
+    /// process tree, a revoked or expired endpoint, a failed strict
+    /// verification and anything unproven are refused, naming the rule.
+    fn launch_requester(&self, peer_pid: u32) -> Result<crate::runner::Requester> {
+        let requester = |kind: &str, lane: String| crate::runner::Requester {
+            kind: kind.to_string(),
+            lane,
+        };
+        match self.slot_identity(peer_pid)? {
+            Some(SlotWho::Pane { lane, .. }) => Ok(requester("pane", lane)),
+            Some(SlotWho::Strict(caller)) => {
+                let lane = self
+                    .slots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .launch_lane(&caller, (self.slot_clock)())?;
+                Ok(requester("managed", lane))
+            }
+            None => match self.operator_evidence(peer_pid) {
+                Ok(()) => Ok(requester("operator", "operator".to_string())),
+                Err(why) => Err(Error::rejected(format!(
+                    "build-slot launch needs a pane agent, an enrolled managed \
+                     endpoint or the proven operator — this connection derives no \
+                     slot identity and is not provably the operator: {why}. Launch \
+                     from an agent's pane or managed endpoint, or from an attached \
+                     operator shell"
+                ))),
+            },
+        }
+    }
+
+    /// The tracker dir recipes are read from: this daemon's own
+    /// `CADENCE_PM_DIR` (its per-instance env — tests), else the
+    /// process default.
+    fn pm_dir(&self) -> Result<PathBuf> {
+        match self.provider_env.var("CADENCE_PM_DIR") {
+            Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
+            _ => crate::issue::default_dir(),
+        }
+    }
+
+    /// `slot_launch` (CAD-230b) — run one of a project's recipes as a
+    /// daemon-launched runner. The request names only the recipe, the
+    /// project, optionally a checkout of one of its registered repos and
+    /// how long to queue; anything command- or identity-shaped is
+    /// refused. The daemon resolves the launch intent from project
+    /// config, writes its digest bound to a fresh runner id BEFORE
+    /// spawning, spawns the gated process (its own process group, output
+    /// to `<state>/runners/<id>.log`), enrolls it as root = worker and
+    /// hands the queue wait, the grant, the gate and the exit receipt to
+    /// a runner thread. Answers at once with the runner id; the CLI
+    /// polls `slot_runner`.
+    fn rpc_slot_launch(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        const FIELDS: [&str; 4] = ["recipe", "project", "worktree", "wait_secs"];
+        if let Some(extra) = params
+            .as_object()
+            .and_then(|o| o.keys().find(|k| !FIELDS.contains(&k.as_str())))
+        {
+            return Err(Error::rejected(format!(
+                "build-slot launch takes only recipe, project, worktree and \
+                 wait_secs — '{extra}' is refused: a recipe's argv, cwd and env \
+                 come only from project config, and who is asking only from the \
+                 connection"
+            )));
+        }
+        self.revalidate_enrollments()?;
+        let requester = self.launch_requester(peer_pid)?;
+        let recipe = required_str(params, "recipe")?;
+        let project = required_str(params, "project")?;
+        let worktree = optional_text(params, "worktree")?.map(Path::new);
+        let wait_secs = match params.get("wait_secs") {
+            None | Some(Value::Null) => RUNNER_WAIT_SECS,
+            Some(v) => v
+                .as_u64()
+                .ok_or_else(|| Error::rejected("wait_secs must be a whole number of seconds"))?
+                .min(RUNNER_MAX_WAIT_SECS),
+        };
+        let intent = crate::runner::resolve(&self.pm_dir()?, project, recipe, worktree)?;
+        let log = crate::runner::log_path(&self.state_dir, &intent.runner_id);
+        let mut receipt =
+            crate::runner::Receipt::pending(&intent, requester.clone(), &log, epoch_secs());
+        // The digest is bound to the runner id durably before anything
+        // is spawned.
+        crate::runner::write_receipt(&self.state_dir, &receipt)?;
+        let env: Vec<(String, String)> = intent
+            .env
+            .iter()
+            .filter_map(|name| self.provider_env.var(name).map(|v| (name.clone(), v)))
+            .collect();
+        let child = match crate::runner::spawn_gated(&intent, &env, &log) {
+            Ok(child) => child,
+            Err(e) => {
+                receipt.finish("refused", Some(e.to_string()), epoch_secs());
+                let _ = crate::runner::write_receipt(&self.state_dir, &receipt);
+                return Err(e);
+            }
+        };
+        // The gate holds the recipe until the go line; any refusal from
+        // here on closes it, so nothing ever runs unenrolled or unslotted.
+        let refuse = |mut child: std::process::Child,
+                      mut receipt: crate::runner::Receipt,
+                      e: Error|
+         -> Result<Value> {
+            drop(child.stdin.take());
+            let _ = child.wait();
+            receipt.finish("refused", Some(e.to_string()), epoch_secs());
+            let _ = crate::runner::write_receipt(&self.state_dir, &receipt);
+            Err(e)
+        };
+        let clk = crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs());
+        let enrolled = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enroll_runner(
+                &requester.lane,
+                &intent.runner_id,
+                &intent.digest,
+                child.id(),
+                clk,
+            );
+        let (enrollment_id, root, events) = match enrolled {
+            Ok(enrolled) => enrolled,
+            Err(e) => return refuse(child, receipt, e),
+        };
+        self.emit_slot_events(events);
+        receipt.state = "queued".into();
+        receipt.pid = Some(root.pid);
+        receipt.starttime = Some(root.starttime);
+        receipt.enrollment_id = Some(enrollment_id.clone());
+        if let Err(e) = crate::runner::write_receipt(&self.state_dir, &receipt) {
+            let events = self
+                .slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .end_runner(
+                    &enrollment_id,
+                    "runner receipt unwritable",
+                    (self.slot_clock)(),
+                );
+            self.emit_slot_events(events);
+            return refuse(child, receipt, e);
+        }
+        let answer = json!({
+            "runner_id": intent.runner_id, "state": "queued",
+            "project": intent.project, "recipe": intent.recipe,
+            "kind": intent.kind.as_str(), "digest": intent.digest,
+            "head_sha": intent.head_sha, "log_path": receipt.log_path,
+            "lane": requester.lane, "requester": requester.kind,
+        });
+        let shared = Arc::clone(self);
+        let kind = intent.kind;
+        thread::spawn(move || shared.run_runner(child, receipt, kind, wait_secs));
+        Ok(answer)
+    }
+
+    /// One runner's life after launch (CAD-230b): queue for its slot as
+    /// the exact enrolled process, and only once granted record
+    /// `running` and open the gate — a crash after that write reads as
+    /// `unknown`, never as "never ran". Then wait for the exit (the
+    /// daemon is the parent, so it reaps), record the exit receipt, let
+    /// the tri-state reaper free the hold on the now-dead holder, and
+    /// revoke the enrollment. A refusal, a queue timeout or a closing
+    /// daemon closes the gate instead: the recipe never starts.
+    fn run_runner(
+        self: Arc<Self>,
+        mut child: std::process::Child,
+        mut receipt: crate::runner::Receipt,
+        kind: SlotKind,
+        wait_secs: u64,
+    ) {
+        let enrollment = receipt.enrollment_id.clone().unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_secs(wait_secs);
+        let mut gate = child.stdin.take();
+        let queued: std::result::Result<(), (&str, String)> = loop {
+            if self.closing.load(Ordering::SeqCst) {
+                break Err((
+                    "cancelled",
+                    "the daemon is shutting down — the gate never opened".into(),
+                ));
+            }
+            let clk = crate::slots::SlotClock::at((self.slot_clock)(), epoch_secs());
+            let polled = self
+                .slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .acquire_runner(&enrollment, kind, clk);
+            match polled {
+                Ok((answer, events)) => {
+                    self.emit_slot_events(events);
+                    if answer["granted"].as_bool() == Some(true) {
+                        break Ok(());
+                    }
+                }
+                Err(e) => break Err(("refused", e.to_string())),
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                break Err((
+                    "refused",
+                    format!("the runner process ended before its slot was granted ({status})"),
+                ));
+            }
+            if Instant::now() >= deadline {
+                break Err((
+                    "timed_out",
+                    format!(
+                        "no {} slot within {wait_secs}s — the gate never opened",
+                        kind.as_str()
+                    ),
+                ));
+            }
+            thread::sleep(Duration::from_millis(250));
+        };
+        match queued {
+            Err((state, why)) => {
+                drop(gate.take());
+                let _ = child.wait();
+                receipt.finish(state, Some(why), epoch_secs());
+            }
+            Ok(()) => {
+                // The digest names a source HEAD; a checkout that moved
+                // while this runner queued is not that source.
+                let head = crate::runner::head_of(Path::new(&receipt.worktree));
+                if head.as_deref() != Some(receipt.head_sha.as_str()) {
+                    drop(gate.take());
+                    let _ = child.wait();
+                    receipt.finish(
+                        "refused",
+                        Some(format!(
+                            "the checkout's HEAD moved while queued ({} → {}) — the \
+                             gate never opened; launch again to bind the new source",
+                            receipt.head_sha,
+                            head.as_deref().unwrap_or("unreadable")
+                        )),
+                        epoch_secs(),
+                    );
+                    return self.finish_runner(&enrollment, receipt);
+                }
+                receipt.state = "running".into();
+                receipt.started = Some(epoch_secs());
+                let opened = crate::runner::write_receipt(&self.state_dir, &receipt).is_ok()
+                    && gate.as_mut().is_some_and(|g| {
+                        g.write_all(crate::runner::go_line(&receipt.runner_id).as_bytes())
+                            .and_then(|_| g.flush())
+                            .is_ok()
+                    });
+                drop(gate.take());
+                let status = child.wait();
+                match (opened, status) {
+                    (false, _) => receipt.finish(
+                        "refused",
+                        Some(
+                            "the running receipt could not be written — the gate stayed closed"
+                                .into(),
+                        ),
+                        epoch_secs(),
+                    ),
+                    (true, Ok(status)) => {
+                        use std::os::unix::process::ExitStatusExt;
+                        receipt.exit_code = status.code();
+                        receipt.signal = status.signal();
+                        receipt.finish("exited", None, epoch_secs());
+                    }
+                    (true, Err(e)) => receipt.finish(
+                        "unknown",
+                        Some(format!("waiting for the runner failed: {e}")),
+                        epoch_secs(),
+                    ),
+                }
+            }
+        }
+        self.finish_runner(&enrollment, receipt);
+    }
+
+    /// Close a runner: free its hold (proof of death only), revoke its
+    /// enrollment, write the exit receipt and tell the requester's lane.
+    fn finish_runner(&self, enrollment: &str, receipt: crate::runner::Receipt) {
+        // A daemon that is closing owns no state any more — its successor
+        // does, once the singleton frees. It writes nothing: the next boot
+        // reports this runner `unknown` rather than race that daemon's
+        // `slots.json` and receipt.
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let reason = format!("runner {} {}", receipt.runner_id, receipt.state);
+        let events = self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .end_runner(enrollment, &reason, (self.slot_clock)());
+        self.emit_slot_events(events);
+        if let Err(e) = crate::runner::write_receipt(&self.state_dir, &receipt) {
+            eprintln!(
+                "runner {}: exit receipt write failed: {e}",
+                receipt.runner_id
+            );
+        }
+        let _ = self.store.event_public(
+            &receipt.requester.lane,
+            "runner_finished",
+            json!({"runner_id": receipt.runner_id, "recipe": receipt.recipe,
+                   "project": receipt.project, "state": receipt.state,
+                   "exit_code": receipt.exit_code, "signal": receipt.signal,
+                   "digest": receipt.digest, "head_sha": receipt.head_sha}),
+        );
+        self.wake();
+    }
+
+    /// `slot_runner` — one runner's receipt. Readable by whoever may ask
+    /// about slots at all: any connection with a slot identity, or the
+    /// proven operator. Receipts carry no credential (never a token).
+    fn rpc_slot_runner(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        if self.slot_identity(peer_pid)?.is_none() {
+            self.proven_operator("slot runner", peer_pid)?;
+        }
+        let id = required_str(params, "runner_id")?;
+        let receipt = crate::runner::read_receipt(&self.state_dir, id)?;
+        serde_json::to_value(&receipt).map_err(|e| Error::internal(e.to_string()))
     }
 
     /// CAD-230b: a strict hold ends with its exact holder, observed by

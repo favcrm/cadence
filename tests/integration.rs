@@ -28392,7 +28392,7 @@ fn slot_managed_tool_cannot_bind_the_provider_root() {
     assert!(d.events("wk").iter().any(|e| e["kind"] == "slot_acquired"));
 }
 
-// ---------- CAD-230 phase b1: exec-bound run ----------
+// ---------- CAD-230 phase b: exec-bound run, daemon-launched runners ----------
 
 /// CAD-230 phase b1 ACCEPTANCE: a managed endpoint's `build-slot run`
 /// holds a strict, exec-bound slot naming exactly the process it execs
@@ -28498,6 +28498,441 @@ fn build_slot_run_exec_bound_hold_ends_with_the_command() {
             .is_empty(),
         "{s}"
     );
+}
+
+/// A tracker project `p` for runner tests (CAD-230b): one git repo with
+/// a commit and `recipes` (YAML, already indented) under
+/// `build.recipes`. This test's daemon — and every CLI and lane shell
+/// spawned after this call — reads the tracker through its own
+/// `CADENCE_PM_DIR`.
+fn runner_project(recipes: &str) -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README"), "runner fixture\n").unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["add", "."],
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+    ] {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+    let pm = dir.path().join("pm");
+    std::fs::create_dir_all(pm.join("p")).unwrap();
+    std::fs::write(
+        pm.join("p/project.yaml"),
+        format!(
+            "key: p\nprefix: P\nrepos:\n- path: {}\nbuild:\n  recipes:\n{recipes}",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    test_env().set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    (dir, repo)
+}
+
+/// One recipe line: `name` running `sh -c script` with `env` allowlisted.
+fn sh_recipe(name: &str, script: &str, env: &[&str]) -> String {
+    format!(
+        "    {name}:\n      argv: [sh, -c, {}]\n      env: {}\n",
+        serde_json::to_string(script).unwrap(),
+        serde_json::to_string(env).unwrap()
+    )
+}
+
+/// The runner id a `build-slot launch` announced on stderr.
+fn launched_runner(stderr: &str) -> String {
+    stderr
+        .split_whitespace()
+        .find(|w| w.starts_with("run-"))
+        .unwrap_or_else(|| panic!("no runner id in: {stderr}"))
+        .to_string()
+}
+
+/// CAD-230 phase b2 ACCEPTANCE: an authorized pane agent launches a
+/// project's fixed recipe. The daemon runs it under a strict,
+/// exec-bound slot held by exactly the process it spawned (the
+/// recipe's `$$`), accounted to the requester's lane; the recipe's own
+/// tree may read status but may not nest a slot request; the CLI
+/// streams the log and exits with the recipe's code; the receipt binds
+/// recipe, launch digest and source HEAD; and the exit frees the slot
+/// and prunes the runner's enrollment.
+#[test]
+fn build_slot_launch_runs_a_fixed_recipe_under_an_exec_bound_slot() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let cadence = env!("CARGO_BIN_EXE_cadence");
+    let state = d.state.display();
+    let status = out.path().join("status.json");
+    let nested = out.path().join("nested.txt");
+    let script = format!(
+        "echo ok; echo \"pid $$\"; {cadence} --state-dir {state} build-slot status --json \
+         > {}; {cadence} --state-dir {state} build-slot acquire build --pid $$ > {} 2>&1; \
+         exit 3",
+        status.display(),
+        nested.display()
+    );
+    let (_proj, repo) = runner_project(&sh_recipe("ok", &script, &["PATH", "HOME"]));
+    let run = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "launch", "ok", "--project", "p"],
+    );
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&run.stdout).to_string(),
+        String::from_utf8_lossy(&run.stderr).to_string(),
+    );
+    assert_eq!(run.status.code(), Some(3), "{stdout}\n{stderr}");
+    assert!(stdout.starts_with("ok\n"), "the log streams: {stdout}");
+    let id = launched_runner(&stderr);
+    let r = cadence_at(home.path(), &d.state, &["build-slot", "runner", &id]);
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    let receipt: Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(receipt["state"], "exited", "{receipt}");
+    assert_eq!(receipt["exit_code"], 3);
+    assert_eq!(receipt["complete"], true);
+    assert_eq!(
+        (receipt["project"].as_str(), receipt["recipe"].as_str()),
+        (Some("p"), Some("ok"))
+    );
+    assert_eq!(
+        receipt["requester"],
+        json!({"kind": "pane", "lane": SELF_LANE})
+    );
+    assert_eq!(receipt["argv"], json!(["sh", "-c", script]));
+    assert_eq!(receipt["digest"].as_str().unwrap().len(), 64);
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        receipt["head_sha"].as_str().unwrap(),
+        String::from_utf8_lossy(&head.stdout).trim()
+    );
+    assert!(receipt["started"].as_f64().is_some() && receipt["ended"].as_f64().is_some());
+    assert_eq!(receipt["dirty"], false);
+    let pid = receipt["pid"].as_u64().unwrap();
+    let log = std::fs::read_to_string(receipt["log_path"].as_str().unwrap()).unwrap();
+    assert!(log.contains("ok\n"), "{log}");
+    // The exec'd recipe is the enrolled process: exec kept the pid.
+    assert!(log.contains(&format!("pid {pid}\n")), "{log}");
+    // While it ran: one strict, exec-bound hold on the requester's lane,
+    // held by exactly that process under the runner's enrollment.
+    let s: Value = serde_json::from_str(&std::fs::read_to_string(&status).unwrap()).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "{s}");
+    assert_eq!(held[0]["pid"], pid);
+    assert_eq!(held[0]["lane"], SELF_LANE);
+    assert_eq!(held[0]["binding"], "strict");
+    assert_eq!(held[0]["exec_bound"], true);
+    assert_eq!(held[0]["enrollment_id"], receipt["enrollment_id"]);
+    assert!(s["enrollments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["runner_id"] == id.as_str() && e["root"]["pid"] == pid));
+    let nested = std::fs::read_to_string(&nested).unwrap();
+    assert!(nested.contains("already holds its slot"), "{nested}");
+    // After: the slot is free and the runner's enrollment is gone.
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert!(
+        s["pools"]["build"]["held"].as_array().unwrap().is_empty(),
+        "{s}"
+    );
+    assert!(!s["enrollments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["runner_id"] == id.as_str()));
+    assert!(d
+        .events(SELF_LANE)
+        .iter()
+        .any(|e| e["kind"] == "runner_finished" && e["payload"]["runner_id"] == id.as_str()));
+}
+
+/// CAD-230 phase b2 ACCEPTANCE: the refusals. An unknown recipe names
+/// what the project defines; a request carrying any command-,
+/// environment- or identity-shaped field is refused (the caller never
+/// supplies argv, cwd or env); trailing CLI argv is refused; a caller
+/// with no pane, no enrolled endpoint and no operator proof is refused
+/// with the rule named; and none of it launches anything. The same
+/// recipe launches for the pane agent and for an enrolled managed
+/// endpoint.
+#[test]
+fn build_slot_launch_refuses_unknown_recipes_injection_and_unproven_callers() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    let home = TempDir::new().unwrap();
+    let (proj, _repo) = runner_project(&sh_recipe("ok", "echo fixed", &[]));
+    let mut agent = LaneShell::spawn(home.path());
+    plant_pane(&d, "dev-1", agent.pid());
+    let (rc, out) = agent.cadence(&d.state, "build-slot launch nope --project p");
+    assert_ne!(rc, 0, "{out}");
+    assert!(
+        out.contains("Unknown recipe 'nope'") && out.contains("it defines: ok"),
+        "{out}"
+    );
+    for (field, value) in [
+        ("argv", json!(["sh", "-c", "echo injected"])),
+        ("cmd", json!("echo injected")),
+        ("env", json!({"LD_PRELOAD": "x"})),
+        ("cwd", json!("/")),
+        ("lane", json!("dev-1")),
+        ("alias", json!("dev-1")),
+        ("pid", json!(1)),
+    ] {
+        let mut params = json!({"recipe": "ok", "project": "p"});
+        params[field] = value;
+        let r = agent.rpc(&d.state, "slot_launch", params);
+        assert_eq!(r["ok"], false, "{field}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains(&format!("'{field}' is refused")),
+            "{field}: {msg}"
+        );
+    }
+    let (rc, out) = agent.cadence(
+        &d.state,
+        "build-slot launch ok --project p -- echo injected",
+    );
+    assert_ne!(rc, 0, "trailing argv is refused: {out}");
+    let mut stray = LaneShell::spawn(home.path());
+    let r = stray.rpc(
+        &d.state,
+        "slot_launch",
+        json!({"recipe": "ok", "project": "p"}),
+    );
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("needs a pane agent, an enrolled managed endpoint or the proven operator"),
+        "{r}"
+    );
+    let receipts = |state: &Path| {
+        std::fs::read_dir(cadence_agent::runner::runners_dir(state))
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    assert_eq!(receipts(&d.state), 0, "no refusal launched anything");
+    // The same recipe, for callers the daemon can admit.
+    let (rc, out) = agent.cadence(&d.state, "build-slot launch ok --project p");
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("fixed"), "{out}");
+    let mut wk = ManagedWorker::start(&d, "wk");
+    let pm = proj.path().join("pm");
+    let r = wk.exec(&[
+        "env",
+        &format!("CADENCE_PM_DIR={}", pm.display()),
+        env!("CARGO_BIN_EXE_cadence"),
+        "--state-dir",
+        d.state.to_str().unwrap(),
+        "build-slot",
+        "launch",
+        "ok",
+        "--project",
+        "p",
+    ]);
+    assert_eq!(r["rc"], 0, "{r}");
+    assert!(r["out"].as_str().unwrap().contains("fixed"), "{r}");
+    assert_eq!(receipts(&d.state), 2);
+}
+
+/// CAD-230 phase b2: a launch queues like any other request — behind a
+/// held slot it waits, and when its wait runs out the gate never opens:
+/// the recipe never starts, the receipt says `timed_out`, and the queue
+/// keeps no waiter for it.
+#[test]
+fn build_slot_launch_times_out_in_the_queue_without_running() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let (_proj, _repo) = runner_project(&sh_recipe("ok", "echo RAN", &[]));
+    let g = slot_acquire(&d, "build", SELF_LANE, "hold");
+    assert_eq!(g["granted"], true);
+    let run = cadence_at(
+        home.path(),
+        &d.state,
+        &[
+            "build-slot",
+            "launch",
+            "ok",
+            "--project",
+            "p",
+            "--wait-secs",
+            "1",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    assert!(!run.status.success(), "{stderr}");
+    assert!(stderr.contains("timed_out"), "{stderr}");
+    let id = launched_runner(&stderr);
+    let receipt = cadence_agent::runner::read_receipt(&d.state, &id).unwrap();
+    assert_eq!(receipt.state, "timed_out");
+    assert_eq!((receipt.exit_code, receipt.started), (None, None));
+    let log = std::fs::read_to_string(&receipt.log_path).unwrap();
+    assert!(!log.contains("RAN"), "the gate never opened: {log}");
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert!(s["waiting"].as_array().unwrap().is_empty(), "{s}");
+    assert_eq!(s["pools"]["build"]["held"].as_array().unwrap().len(), 1);
+}
+
+/// CAD-230 phase b2: the launch digest names the checkout's HEAD, so a
+/// checkout that moves while the runner queues is not the source it
+/// bound — the gate never opens and the receipt says why. A dirty tree
+/// at launch is recorded, never hidden.
+#[test]
+fn build_slot_launch_refuses_a_source_that_moved_while_queued() {
+    let d = TestDaemon::start_opts(slot_opts(1, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let (_proj, repo) = runner_project(&sh_recipe("ok", "echo RAN", &[]));
+    std::fs::write(repo.join("README"), "edited, uncommitted\n").unwrap();
+    let hold = slot_acquire(&d, "build", SELF_LANE, "hold");
+    let run = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "launch", "ok", "--project", "p", "--detach"],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    let r = cadence_agent::runner::read_receipt(&d.state, &id).unwrap();
+    assert!(r.dirty, "an uncommitted edit is recorded: {r:?}");
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["commit", "-qam", "moved"]);
+    slot_release(
+        &d,
+        hold["token"].as_str().unwrap(),
+        SELF_LANE,
+        std::process::id(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let r = loop {
+        let r = cadence_agent::runner::read_receipt(&d.state, &id).unwrap();
+        if r.is_terminal() {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "runner never ended: {r:?}");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(r.state, "refused", "{r:?}");
+    assert!(r.reason.as_deref().unwrap().contains("HEAD moved"), "{r:?}");
+    assert_eq!(r.started, None);
+    let log = std::fs::read_to_string(&r.log_path).unwrap();
+    assert!(!log.contains("RAN"), "the gate never opened: {log}");
+    let s = d.rpc("slot_status", json!({})).unwrap();
+    assert!(
+        s["pools"]["build"]["held"].as_array().unwrap().is_empty(),
+        "{s}"
+    );
+}
+
+/// CAD-230 phase b2 restart semantics: a runner in flight when the
+/// daemon restarts is reported `unknown` with its receipt incomplete —
+/// never relaunched. Its hold stays accounted (the process lives) under
+/// a revoked enrollment, until the process is proven dead.
+#[test]
+fn build_slot_launch_in_flight_at_restart_is_unknown_never_relaunched() {
+    let state = TempDir::new().unwrap();
+    let d = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    plant_self(&d);
+    let home = TempDir::new().unwrap();
+    let marks = TempDir::new().unwrap();
+    let marker = marks.path().join("starts");
+    let script = format!("echo start >> {}; sleep 60", marker.display());
+    let (_proj, _repo) = runner_project(&sh_recipe("long", &script, &[]));
+    let run = cadence_at(
+        home.path(),
+        &d.state,
+        &["build-slot", "launch", "long", "--project", "p", "--detach"],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let id = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let pid = loop {
+        let r = cadence_agent::runner::read_receipt(&d.state, &id).unwrap();
+        if r.state == "running" && marker.exists() {
+            break r.pid.unwrap();
+        }
+        assert!(Instant::now() < deadline, "runner never ran: {r:?}");
+        thread::sleep(Duration::from_millis(50));
+    };
+    drop(d);
+    let d2 = TestDaemon::start_on_opts(state.path().to_path_buf(), slot_opts(2, 1, 900, &[]));
+    plant_pane(&d2, SELF_LANE, std::process::id());
+    let r = cadence_agent::runner::read_receipt(&d2.state, &id).unwrap();
+    assert_eq!(r.state, "unknown", "{r:?}");
+    assert!(!r.complete);
+    assert_eq!(r.last_state.as_deref(), Some("running"));
+    assert!(d2
+        .events(SELF_LANE)
+        .iter()
+        .any(|e| e["kind"] == "runner_unknown" && e["payload"]["runner_id"] == id.as_str()));
+    let s = d2.rpc("slot_status", json!({})).unwrap();
+    let held = s["pools"]["build"]["held"].as_array().unwrap();
+    assert_eq!(held.len(), 1, "the live runner stays accounted: {s}");
+    assert_eq!(held[0]["pid"], pid);
+    assert_eq!(held[0]["liveness"], "alive");
+    assert_eq!(held[0]["auth_state"], "revoked");
+    thread::sleep(Duration::from_millis(1500));
+    let starts = std::fs::read_to_string(&marker).unwrap();
+    assert_eq!(starts.lines().count(), 1, "never relaunched: {starts}");
+    // Cleanup: end the orphan; proof of its death frees the hold.
+    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = d2.rpc("slot_status", json!({})).unwrap();
+        if s["pools"]["build"]["held"].as_array().unwrap().is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the dead runner's hold stayed: {s}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// `starve_secs` promotes a long waiter ahead of a priority lane:
