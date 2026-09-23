@@ -4533,18 +4533,23 @@ fn issue_start_repo_resolution() {
     assert!(ok, "{out}");
     assert!(out["worktree"].as_str().unwrap().ends_with("d-1-explicit"));
 
-    // cwd inside the repo resolves without --repo.
+    // cwd inside the repo resolves without --repo. Each case starts
+    // its own issue: D-1 already has an open lane, and a second
+    // `--name` on it is refused (CAD-274).
+    for id in ["D-2", "D-3"] {
+        assert!(cli(&pm, &state, &["issue", "new", id, "--project", "demo"]).0);
+    }
     let (ok, out) = cli_dir(
         &pm,
         &state,
         &repo,
-        &["issue", "start", "D-1", "--name", "from-cwd"],
+        &["issue", "start", "D-2", "--name", "from-cwd"],
     );
     assert!(ok, "{out}");
-    assert!(out["worktree"].as_str().unwrap().ends_with("d-1-from-cwd"));
+    assert!(out["worktree"].as_str().unwrap().ends_with("d-2-from-cwd"));
 
     // Single-repo fallback (cwd is the test process — not a project repo).
-    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1", "--name", "single"]);
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-3", "--name", "single"]);
     assert!(ok, "{out}");
 
     // Ambiguous: a second repo on a second project refuses with the list.
@@ -5208,6 +5213,284 @@ fn issue_finish_pr_merge_via_gh() {
         "{err}"
     );
     assert!(wt.is_dir());
+}
+
+// ---- CAD-274: one issue, one open lane ----
+
+/// The refs of `id` from `issue show --json`.
+fn refs_of(pm: &Path, state: &Path, id: &str) -> Vec<Value> {
+    let (ok, show) = cli(pm, state, &["issue", "show", id, "--json"]);
+    assert!(ok, "{show}");
+    show["refs"].as_array().cloned().unwrap_or_default()
+}
+
+/// The `cadence/*` branches in `repo`.
+fn lane_branches(repo: &Path) -> Vec<String> {
+    git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/cadence/",
+        ],
+    )
+    .1
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
+/// CAD-274: with exactly one open worktree ref, `issue start` reuses
+/// that lane whether or not `--name` is given — even after the title
+/// (and so the default slug) changed, the CAD-270 repro. It re-applies
+/// the cargo target, fixes a stale recorded one in one commit, and
+/// mints no worktree, branch or ref. A `--name` for a different slug
+/// is refused, naming the open lane.
+#[test]
+fn issue_start_reuses_the_one_open_lane() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &["issue", "new", "Skill Kickoff Lessons", "--project", "demo"]
+        )
+        .0
+    );
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let wt = out["worktree"].as_str().unwrap().to_string();
+    assert!(wt.ends_with("d-1-skill-kickoff-lessons"), "{out}");
+    assert!(
+        cli(
+            &pm,
+            &state,
+            &[
+                "issue",
+                "set",
+                "D-1",
+                "title=Cadence skill kickoff checklist"
+            ]
+        )
+        .0
+    );
+    // A stale recorded cargo target — the re-start's job is to fix it.
+    let md = pm.join("demo/D-1/issue.md");
+    let front = std::fs::read_to_string(&md).unwrap();
+    let planted = front.replace(
+        &format!("path: {wt}\n"),
+        &format!("path: {wt}\n  cargo_target: /stale/target\n"),
+    );
+    assert_ne!(planted, front, "fixture: {front}");
+    std::fs::write(&md, planted).unwrap();
+    assert!(
+        git(
+            &pm,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qam",
+                "stale target"
+            ]
+        )
+        .0
+    );
+    let refs_before = refs_of(&pm, &state, "D-1").len();
+
+    let before = commits(&pm);
+    let (ok, again) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{again}");
+    assert_eq!(again["created"], false, "{again}");
+    assert_eq!(again["worktree"], out["worktree"], "{again}");
+    assert_eq!(again["branch"], out["branch"], "{again}");
+    assert_eq!(commits(&pm), before + 1, "one commit fixes the target");
+    let (_, body) = git(&pm, &["log", "-1", "--format=%B"]);
+    assert!(body.contains("(refs refreshed)"), "{body}");
+    let refs = refs_of(&pm, &state, "D-1");
+    assert_eq!(refs.len(), refs_before, "no new ref: {refs:?}");
+    assert!(
+        refs.iter().all(|r| r["cargo_target"].is_null()),
+        "the stale target is corrected (not a cargo repo): {refs:?}"
+    );
+    assert_eq!(
+        lane_branches(&repo),
+        vec!["cadence/d-1-skill-kickoff-lessons"]
+    );
+    let lanes = std::fs::read_dir(repo.join(".cadence/wt")).unwrap().count();
+    assert_eq!(lanes, 1, "no second worktree");
+
+    // Idempotent now; `--name` naming the open slug reuses it too.
+    let before = commits(&pm);
+    for args in [
+        &["issue", "start", "D-1"][..],
+        &["issue", "start", "D-1", "--name", "skill-kickoff-lessons"][..],
+    ] {
+        let (ok, out) = cli(&pm, &state, args);
+        assert!(ok && out["created"] == false, "{args:?}: {out}");
+        assert_eq!(out["worktree"].as_str().unwrap(), wt, "{args:?}");
+    }
+    assert_eq!(commits(&pm), before);
+
+    // A different --name would fork the work — refused, nothing made.
+    let (ok, err) = cli(&pm, &state, &["issue", "start", "D-1", "--name", "other"]);
+    assert!(!ok, "{err}");
+    let msg = err["error"].as_str().unwrap();
+    assert!(
+        msg.contains("'skill-kickoff-lessons'") && msg.contains(&wt) && msg.contains("--worktree"),
+        "{msg}"
+    );
+    assert!(!repo.join(".cadence/wt/d-1-other").exists());
+    assert_eq!(
+        lane_branches(&repo),
+        vec!["cadence/d-1-skill-kickoff-lessons"]
+    );
+    assert_eq!(commits(&pm), before);
+}
+
+/// CAD-274: two or more open worktree refs make `issue start` and a
+/// bare `issue finish` refuse, listing them; `issue finish <ID>
+/// --worktree <path>` closes exactly one — for a lane whose dir (and
+/// branch) are already gone it only marks the refs closed, in one
+/// tracker commit, keeping any surviving branch. The remaining lane
+/// is then reused by `issue start`.
+#[test]
+fn issue_several_open_lanes_refuse_and_finish_one_by_path() {
+    let (_tmp, pm, state, repo) = start_fx();
+    assert!(cli(&pm, &state, &["issue", "new", "Lanes", "--project", "demo"]).0);
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok, "{out}");
+    let live = out["worktree"].as_str().unwrap().to_string();
+    // What the pre-CAD-274 start left behind: an extra pair whose dir
+    // and branch were removed by hand, and one whose dir is gone but
+    // whose branch still holds unmerged work.
+    let ghost = repo.join(".cadence/wt/d-1-ghost");
+    let ghost_s = ghost.to_str().unwrap().to_string();
+    let stale = repo.join(".cadence/wt/d-1-stale");
+    let stale_s = stale.to_str().unwrap().to_string();
+    assert!(
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "cadence/d-1-stale", &stale_s]
+        )
+        .0
+    );
+    std::fs::write(stale.join("s.txt"), "s\n").unwrap();
+    assert!(git(&stale, &["add", "-A"]).0);
+    assert!(git(&stale, &["commit", "-qm", "stale work"]).0);
+    std::fs::remove_dir_all(&stale).unwrap();
+    assert!(git(&repo, &["worktree", "prune"]).0);
+    for (kind, target) in [
+        ("branch", "cadence/d-1-ghost"),
+        ("worktree", ghost_s.as_str()),
+        ("branch", "cadence/d-1-stale"),
+        ("worktree", stale_s.as_str()),
+    ] {
+        let (ok, out) = cli(&pm, &state, &["issue", "ref", "D-1", kind, target]);
+        assert!(ok, "{out}");
+    }
+
+    let before = commits(&pm);
+    for args in [
+        &["issue", "start", "D-1"][..],
+        &["issue", "finish", "D-1"][..],
+    ] {
+        let (ok, err) = cli(&pm, &state, args);
+        assert!(!ok, "{args:?}: {err}");
+        let msg = err["error"].as_str().unwrap();
+        assert!(
+            msg.contains("3 open worktree refs")
+                && msg.contains(&live)
+                && msg.contains(&ghost_s)
+                && msg.contains(&stale_s)
+                && msg.contains("--worktree"),
+            "{args:?}: {msg}"
+        );
+    }
+    assert_eq!(commits(&pm), before);
+
+    // Dir and branch both gone: the refs close, nothing else moves.
+    let (ok, out) = cli(
+        &pm,
+        &state,
+        &["issue", "finish", "D-1", "--worktree", &ghost_s],
+    );
+    assert!(ok, "{out}");
+    assert!(
+        out["finished"] == true
+            && out["refs_only"] == true
+            && out["removed_worktree"] == false
+            && out["deleted_branch"] == false
+            && out["overrode"] == json!([]),
+        "{out}"
+    );
+    assert_eq!(commits(&pm), before + 1, "one tracker commit");
+    let (_, body) = git(&pm, &["log", "-1", "--format=%B"]);
+    assert!(body.contains("D-1: finish cadence/d-1-ghost"), "{body}");
+    // Dir gone, branch alive with unmerged work: refs close, the
+    // branch is kept — nothing is deleted, so nothing is lost.
+    let (ok, out) = cli(
+        &pm,
+        &state,
+        &["issue", "finish", "D-1", "--worktree", &stale_s],
+    );
+    assert!(ok, "{out}");
+    assert!(
+        out["finished"] == true && out["deleted_branch"] == false,
+        "{out}"
+    );
+    assert!(
+        out["branch_note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refs closed only"),
+        "{out}"
+    );
+    assert!(
+        git(
+            &repo,
+            &["rev-parse", "--verify", "--quiet", "cadence/d-1-stale"]
+        )
+        .0
+    );
+    assert_eq!(commits(&pm), before + 2);
+    let refs = refs_of(&pm, &state, "D-1");
+    for r in &refs {
+        let path = r["path"].as_str().unwrap_or_default();
+        let closed = r["closed"] == true;
+        let extra = path.contains("d-1-ghost") || path.contains("d-1-stale");
+        assert_eq!(closed, extra, "{path}: {refs:?}");
+    }
+    assert!(Path::new(&live).is_dir(), "the live lane is untouched");
+
+    // Finishing a closed lane again is the idempotent no-op; a path
+    // the issue never recorded refuses.
+    let (ok, out) = cli(
+        &pm,
+        &state,
+        &["issue", "finish", "D-1", "--worktree", &ghost_s],
+    );
+    assert!(ok && out["finished"] == false, "{out}");
+    let (ok, err) = cli(
+        &pm,
+        &state,
+        &["issue", "finish", "D-1", "--worktree", "/nope/wt"],
+    );
+    assert!(!ok, "{err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("records no open worktree"),
+        "{err}"
+    );
+
+    // One open lane left — start reuses it.
+    let (ok, out) = cli(&pm, &state, &["issue", "start", "D-1"]);
+    assert!(ok && out["created"] == false, "{out}");
+    assert_eq!(out["worktree"].as_str().unwrap(), live);
 }
 
 /// Dispatch pre-flight refuses before anything is created: no return

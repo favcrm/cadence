@@ -193,6 +193,12 @@ pub enum IssueAction {
     Finish {
         /// Issue id — required unless --merged.
         id: Option<String>,
+        /// Finish exactly this worktree ref — required when the issue
+        /// has several open. A directory already gone only closes its
+        /// worktree/branch refs (one tracker commit); no git state is
+        /// touched and the branch, if any, is kept.
+        #[arg(long, conflicts_with = "merged")]
+        worktree: Option<PathBuf>,
         /// Override the in-use, dirty and unmerged refusals —
         /// recorded on the finish commit and in the output. A branch
         /// whose tip no merge/push evidence covers is still kept, and
@@ -641,6 +647,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         }
         IssueAction::Finish {
             id,
+            worktree,
             force,
             keep_branch,
             remote,
@@ -691,16 +698,14 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     "issue finish needs an id — or --merged to sweep",
                 ));
             };
-            print_json(&finish::run(
-                &pm_dir,
-                id,
-                *force,
-                *keep_branch,
-                *remote,
-                "",
-                state_dir,
-                None,
-            )?);
+            let args = finish::FinishArgs {
+                force: *force,
+                keep_branch: *keep_branch,
+                remote: *remote,
+                worktree: worktree.as_deref(),
+                close_if_gone: worktree.is_some(),
+            };
+            print_json(&finish::run(&pm_dir, id, &args, "", state_dir, None)?);
             Ok(0)
         }
         IssueAction::Show { id, json } => {

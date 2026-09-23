@@ -16404,12 +16404,15 @@ fn finish_guard_per_worktree() {
         err["error"].as_str().unwrap().contains(&msg_d6),
         "a non-owner recipient's bound message still blocks: {err}"
     );
-    // Re-start under --name: the old pair still refuses; the new
-    // pair is not bound to a message scoped to the old worktree.
-    let (ok, out) = cli(&["issue", "start", "D-6", "--name", "scd"]);
-    assert!(ok, "{out}");
-    let (ok, err) = cli(&["issue", "finish", "D-6"]);
-    assert!(!ok, "the first open pair still refuses: {err}");
+    // Re-start under a new --name while the old pair is open would
+    // fork the issue's work — refused, naming the open lane (CAD-274).
+    // Once the old pair is force-finished, the re-started pair is not
+    // bound to a message scoped to the old worktree.
+    let (ok, err) = cli(&["issue", "start", "D-6", "--name", "scd"]);
+    assert!(
+        !ok && err["error"].as_str().unwrap().contains("d-6-"),
+        "a second lane under --name is refused: {err}"
+    );
     let (ok, out) = cli(&["issue", "finish", "D-6", "--force"]);
     assert!(
         ok && out["overrode"]
@@ -16419,10 +16422,16 @@ fn finish_guard_per_worktree() {
             .any(|o| o == "bound-message"),
         "the bound-message block is what --force overrode: {out}"
     );
-    // The new pair's branch sits at the base tip (merged by
-    // ancestry) and the still-live message is scoped to the removed
-    // pair — the finish succeeds clean.
+    let (ok, out) = cli(&["issue", "start", "D-6", "--name", "scd"]);
+    assert!(ok, "{out}");
+    // The new pair's work is merged by ancestry and the still-live
+    // message is scoped to the removed pair — the finish succeeds
+    // clean.
     let wt_scd = repo.join(".cadence/wt/d-6-scd");
+    std::fs::write(wt_scd.join("scd.txt"), "x").unwrap();
+    git(&wt_scd, &["add", "-A"]);
+    git(&wt_scd, &["commit", "-qm", "scd work"]);
+    git(&repo, &["merge", "-q", "cadence/d-6-scd"]);
     let (ok, out) = cli(&["issue", "finish", "D-6"]);
     assert!(
         ok && out["finished"] == true && out["overrode"] == json!([]),
