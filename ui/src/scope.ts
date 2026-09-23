@@ -4,7 +4,9 @@ import type { Agent, IssueCard } from "./types";
  * The issue side of the agent ↔ project join, built once per issue list.
  * `ownedBy` mirrors the CLI `cadence status` ISSUES column
  * (`status_view` in src/main.rs): an issue belongs to its `owner` alias
- * while its derived status is `doing` or `review`.
+ * while its derived status is `doing` or `review`. One known gap: card
+ * status here includes the job overlay (`views_with_jobs`), the CLI reads
+ * notes-only `views`, so a job-overlaid status can differ between them.
  */
 export interface IssueIndex {
   projectOf: Map<string, string>;
