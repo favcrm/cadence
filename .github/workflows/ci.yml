@@ -2,6 +2,11 @@ name: ci
 
 on:
   pull_request:
+  # GitHub merge queue (CAD-290): each queued PR is tested on top of main
+  # (and of the PRs ahead of it) on a gh-readonly-queue/* ref, so a PR
+  # no longer needs a manual update-branch + rerun every time main moves.
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main, 'feat/**']
 
@@ -13,6 +18,8 @@ on:
 #   `queue: max` keeps up to 100 pending runs instead of GitHub's default
 #   single pending slot, where a newer push cancelled the older pending run
 #   with zero jobs. Only a 101st waiting push is cancelled.
+# - merge_group: each queue entry has its own gh-readonly-queue/* ref, so
+#   it gets its own group, is never cancelled, and uses `queue: max`.
 # GitHub rejects `queue: max` together with `cancel-in-progress: true`, so
 # both are chosen by event and never meet in one run.
 concurrency:
