@@ -162,6 +162,9 @@ const DAEMON_ALIAS: &str = Store::DAEMON_STREAM;
 /// How an approval-evidence writer was authorized — the daemon's own
 /// statement, stamped on every record (CAD-217).
 const APPROVAL_RECORDED_VIA: &str = "operator-connection";
+/// Who a model-defaults change is recorded as: the only caller
+/// `model_defaults_set` accepts (CAD-337).
+const MODEL_DEFAULTS_ATTRIBUTION: &str = "operator";
 /// CAD-250 N3: how long a nudge may wait in the queue (a busy or
 /// menu-blocked pane) before it is cancelled as stale steering.
 const NUDGE_TTL_SECS: u64 = 900;
@@ -1818,7 +1821,7 @@ impl Shared {
             }
             "agent_register" => self.rpc_register(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
-            "model_defaults_set" => self.rpc_model_defaults_set(params),
+            "model_defaults_set" => self.rpc_model_defaults_set(params, peer_pid),
             "agent_list" => {
                 let mut agents = Vec::new();
                 // CAD-96: one grouped read tells auto-stopped rows apart.
@@ -3264,18 +3267,19 @@ impl Shared {
         }
     }
 
-    /// Operator authority for the approval-evidence verbs (CAD-217):
-    /// exactly the connection-bound rule `slot_reconcile` applies. A
+    /// Operator authority for the approval-evidence verbs (CAD-217) and
+    /// `model_defaults_set` (CAD-337): exactly the connection-bound rule
+    /// `slot_reconcile` applies. A
     /// caller whose `SO_PEERCRED` ancestry reaches a registered pane or
     /// an enrolled managed endpoint is an agent and is refused, and so
     /// is one that is not provably the operator
     /// ([`Self::proven_operator`]). Identity-shaped request fields are
     /// refused rather than read — a worker's output or message can
-    /// never name who recorded the evidence. Residual (CAD-276's, see
+    /// never name who recorded the evidence or made the change. Residual (CAD-276's, see
     /// docs/AUDIT.md; CAD-280 replaces the rule): a same-uid process
     /// that leaves every agent's ancestry without orphaning its session
     /// and scrubs its env and stdio still passes.
-    fn approval_operator(&self, verb: &str, params: &Value, peer_pid: u32) -> Result<()> {
+    fn operator_connection(&self, verb: &str, params: &Value, peer_pid: u32) -> Result<()> {
         for field in [
             "by",
             "operator",
@@ -3285,6 +3289,7 @@ impl Shared {
             "pid",
             "pane",
             "recorded_via",
+            "attribution",
         ] {
             if params.get(field).is_some() {
                 return Err(Error::rejected(format!(
@@ -3308,7 +3313,7 @@ impl Shared {
     /// fresh default, see `Store::record_approval`). It grants nothing: dispatch and
     /// merge never read it; `cadence audit` binds it to the landed head.
     fn rpc_approval_record(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        self.approval_operator("approval record", params, peer_pid)?;
+        self.operator_connection("approval record", params, peer_pid)?;
         let pr = params
             .get("pr")
             .and_then(Value::as_u64)
@@ -3339,7 +3344,7 @@ impl Shared {
     /// `approval_revoke` — the only way an approval is withdrawn. A
     /// cancelled or superseded message never reaches this.
     fn rpc_approval_revoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        self.approval_operator("approval revoke", params, peer_pid)?;
+        self.operator_connection("approval revoke", params, peer_pid)?;
         let id = required_str(params, "id")?;
         let source = required_str(params, "source")?;
         let reason = required_str(params, "reason")?;
@@ -3435,7 +3440,7 @@ impl Shared {
 
     /// CAD-360 `plan_approve` / `plan_reject` — operator only, exactly
     /// the connection-bound rule of the approval-evidence verbs
-    /// ([`Self::approval_operator`]): an agent caller is refused, and a
+    /// ([`Self::operator_connection`]): an agent caller is refused, and a
     /// caller with no agent identity must be the proven operator
     /// (CAD-276). The decision is a tracker commit; approval moves the
     /// plan's backlog tickets to ready.
@@ -3445,7 +3450,7 @@ impl Shared {
         } else {
             "plan reject"
         };
-        self.approval_operator(verb, params, peer_pid)?;
+        self.operator_connection(verb, params, peer_pid)?;
         let epic = required_str(params, "epic")?;
         let pm = crate::issue::Pm::at(&self.pm_dir()?)?;
         let out = crate::issue::write::decide_plan(
@@ -3531,7 +3536,12 @@ impl Shared {
         self.model_defaults_snapshot()
     }
 
-    fn rpc_model_defaults_set(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    /// Model defaults pick the model every agent launches with, so the
+    /// write is operator authority ([`Self::operator_connection`],
+    /// CAD-337) and the audit names the connection that proved it —
+    /// never a caller-supplied attribution, which is refused.
+    fn rpc_model_defaults_set(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
+        self.operator_connection("model defaults set", params, peer_pid)?;
         let document = match params.get("document") {
             Some(Value::String(raw)) => raw.as_str(),
             Some(_) => {
@@ -3547,8 +3557,8 @@ impl Shared {
                 ))
             }
         };
-        let attribution = optional_text(params, "attribution")?;
-        self.store.replace_model_defaults(document, attribution)?;
+        self.store
+            .replace_model_defaults(document, Some(MODEL_DEFAULTS_ATTRIBUTION))?;
         self.model_defaults_snapshot()
     }
 

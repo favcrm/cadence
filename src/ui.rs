@@ -1530,10 +1530,22 @@ fn model_defaults_post(request: &mut Request, state_dir: &Path, opts: &ServeOpts
     if let Err(resp) = require_model_defaults(state_dir) {
         return resp;
     }
-    let caller = match write_caller(request, state_dir, opts) {
-        Ok(caller) => caller,
+    // The relay below is the board's own connection, which the daemon's
+    // operator gate sees instead of this caller (CAD-337): an agent is
+    // refused here or it would land as the operator.
+    match write_caller(request, state_dir, opts) {
+        Ok(WriteCaller::Operator(_)) => {}
+        Ok(WriteCaller::Agent(alias)) => {
+            return guard_fail(
+                "operator_only",
+                &format!(
+                    "model defaults are an operator setting — this caller is \
+                     agent '{alias}'; change them from the operator's browser"
+                ),
+            )
+        }
         Err(resp) => return resp,
-    };
+    }
     let bytes = match read_settings_body(request) {
         Ok(bytes) => bytes,
         Err(resp) => return resp,
@@ -1552,7 +1564,7 @@ fn model_defaults_post(request: &mut Request, state_dir: &Path, opts: &ServeOpts
     match client::rpc(
         state_dir,
         "model_defaults_set",
-        json!({"document": document, "attribution": caller.actor()}),
+        json!({"document": document}),
     ) {
         Ok(mut snapshot) => {
             if let Some(obj) = snapshot.as_object_mut() {
